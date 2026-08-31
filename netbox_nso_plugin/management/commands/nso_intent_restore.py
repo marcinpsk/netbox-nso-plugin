@@ -5,12 +5,29 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import adapter_client, delivery, drain, outbox
 from netbox_nso_plugin.deployment import gate_bypass, quiesce, resume
 from netbox_nso_plugin.restore import advance_static_route_pk
+
+
+@contextmanager
+def _gate_failure_guidance(*, created):
+    """Name the manual recovery for a restore that deliberately fails closed."""
+    try:
+        yield
+    except CommandError as exc:
+        if created:
+            recovery = (
+                "Fix the cause, rerun nso_intent_restore, then run nso_intent_deployment_gate --abort "
+                "after the restore succeeds."
+            )
+        else:
+            recovery = "Fix the cause and rerun nso_intent_restore. The gate's owning operation must release it."
+        raise CommandError(f"{exc}. The deployment gate remains closed. {recovery}") from exc
 
 
 def _document(document):
@@ -105,7 +122,7 @@ class Command(BaseCommand):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxState
 
         created = quiesce()
-        with gate_bypass():
+        with _gate_failure_guidance(created=created), gate_bypass():
             global_document = _document(adapter_client.get_intent_receipts())
             max_push_seq = _watermark(global_document["global_max_push_seq"], "global_max_push_seq")
             max_route_id = _watermark(global_document["global_max_route_id"], "global_max_route_id")

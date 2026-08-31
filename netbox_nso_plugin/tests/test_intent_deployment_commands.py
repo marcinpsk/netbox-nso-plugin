@@ -44,6 +44,27 @@ class TestReceiptSelectors(SimpleTestCase):
 
         self.assertIsNone(_key_receipt(document, adapter_device_id=1, section="vlan"))
 
+    def test_restore_failure_guidance_requires_reconciliation_before_abort(self):
+        from netbox_nso_plugin.management.commands.nso_intent_restore import _gate_failure_guidance
+
+        with self.assertRaises(CommandError) as raised:
+            with _gate_failure_guidance(created=True):
+                raise CommandError("Restore failed closed")
+
+        message = str(raised.exception)
+        self.assertLess(message.index("nso_intent_restore"), message.index("nso_intent_deployment_gate --abort"))
+
+    def test_restore_does_not_tell_the_operator_to_abort_a_preexisting_gate(self):
+        from netbox_nso_plugin.management.commands.nso_intent_restore import _gate_failure_guidance
+
+        with self.assertRaises(CommandError) as raised:
+            with _gate_failure_guidance(created=False):
+                raise CommandError("Restore failed closed")
+
+        message = str(raised.exception)
+        self.assertIn("owning operation", message)
+        self.assertNotIn("nso_intent_deployment_gate --abort", message)
+
 
 class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """O3.16: every dirty-key shape blocks, while the complete healthy sequence passes."""
@@ -858,15 +879,21 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         assert state_of(self.device, "static_route").push_seq is None
 
     def test_restore_rejects_invalid_persisted_claim_flags(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
         claim, _url = self._lost_vlan_response(938)
         state = state_of(self.device, "vlan")
         state.claim_flags = {**state.claim_flags, "marking_mode": "corrupt"}
         state.save(update_fields=["claim_flags"])
 
-        with self.assertRaisesRegex(CommandError, rf"{self.device.pk}/vlan.*invalid claim flags"):
+        with self.assertRaises(CommandError) as raised:
             self._restore()
 
+        self.assertIn(f"{self.device.pk}/vlan", str(raised.exception))
+        self.assertIn("invalid claim flags", str(raised.exception))
+        self.assertIn("nso_intent_deployment_gate --abort", str(raised.exception))
         assert state_of(self.device, "vlan").push_seq == claim.push_seq
+        assert is_quiesced(), "failed restore resumed the deployment gate"
 
     def test_non_boolean_receipt_modes_fail_closed(self):
         from netbox_nso_plugin.management.commands.nso_intent_restore import _normalize

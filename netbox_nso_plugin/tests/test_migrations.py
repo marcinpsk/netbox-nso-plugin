@@ -23,6 +23,7 @@ from .mixins import _CascadeFlushMixin
 APP = "netbox_nso_plugin"
 OUTBOX = "0018_intent_outbox"
 PRE_OUTBOX = "0017_settlement_cursor_epoch"
+DEPLOYMENT_CONTROL = "0019_intent_deployment_control"
 
 
 class TestMigrationGraph(SimpleTestCase):
@@ -69,6 +70,54 @@ class TestMigrationsMatchTheModels(TestCase):
             call_command("makemigrations", APP, check=True, dry_run=True, verbosity=1, stdout=out)
         except SystemExit:
             self.fail(f"{APP} has model changes with no migration:\n{out.getvalue()}")
+
+
+class TestDeploymentControlMigration(TestCase):
+    def test_active_legacy_claims_gain_their_original_marking_mode_and_identity(self):
+        from django.apps import apps
+
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        from ._outbox_case import make_managed
+
+        deployment_control = importlib.import_module(f"netbox_nso_plugin.migrations.{DEPLOYMENT_CONTROL}")
+        device, management = make_managed("claimflags-migration", 7804)
+        payload = {"routes": []}
+        state = NSOIntentOutboxState.objects.create(
+            device=device,
+            scope="static_route",
+            push_seq=41,
+            claim_payload=payload,
+            claim_deletions=[],
+            claim_flags={"mode": delivery.MODE_NORMAL, "mark_any": False, "force": False},
+            claim_identity="legacy-identity",
+            claim_mark=False,
+        )
+
+        deployment_control.backfill_active_claim_flags(apps, None)
+
+        state.refresh_from_db()
+        self.assertEqual(
+            state.claim_flags,
+            {
+                "mode": delivery.MODE_NORMAL,
+                "marking_mode": delivery.MARKING_QUERY_FLAG,
+                "mark_any": False,
+                "force": False,
+            },
+        )
+        self.assertEqual(
+            state.claim_identity,
+            drain.request_identity(
+                payload,
+                mode=delivery.MODE_NORMAL,
+                marking_mode=delivery.MARKING_QUERY_FLAG,
+                deletions=[],
+                mark=False,
+                epoch=drain.mapping_epoch(management),
+            ),
+        )
 
 
 class TestThePushSequenceOutlivesARollback(_CascadeFlushMixin, TransactionTestCase):
