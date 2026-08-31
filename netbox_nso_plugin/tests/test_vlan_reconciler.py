@@ -112,7 +112,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
     def test_vlan_footprint_does_not_create_the_device_group(self):
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_footprint
 
-        footprint = vlan_reconcile_footprint(self.device, {"vlans": [{"vlan_id": 1627}]})
+        footprint = vlan_reconcile_footprint(self.device, {"vlans": [{"vlan_id": 1627, "name": ""}]})
 
         self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
         self.assertFalse(any(namespace == "vlan-slot" for namespace, _key in footprint.shared_keys))
@@ -140,7 +140,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
     def test_native_vlan_preflight_is_read_only(self):
         from netbox_nso_plugin.reconcile import _native_vlan_footprint
 
-        _native_vlan_footprint(self.device, {"vlans": [{"vlan_id": 1627}]}, "vlan")
+        _native_vlan_footprint(self.device, {"vlans": [{"vlan_id": 1627, "name": ""}]}, "vlan")
 
         self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
 
@@ -170,6 +170,18 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 100.9, "name": "INVALID"}]})
 
         self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
+
+    def test_vlan_reconciler_rejects_a_missing_or_non_string_name(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        for entry in ({"vlan_id": 100}, {"vlan_id": 100, "name": None}):
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(AdapterError, "name must be a string") as raised:
+                    reconcile_vlan_database(self.device, {"vlans": [entry]})
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
 
     def test_switchport_reconciler_rejects_a_non_list_document(self):
         from netbox_nso_plugin.adapter_client import AdapterError
@@ -232,6 +244,32 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_response")
 
+    def test_switchport_reconciler_rejects_an_omitted_untagged_vlan(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        group = VLANGroup.objects.create(name="Strict switchport", slug="strict-switchport")
+        vlan = VLAN.objects.create(group=group, vid=100, name="STRICT")
+        Interface.objects.filter(pk=self.interface.pk).update(untagged_vlan=vlan)
+
+        with self.assertRaisesRegex(AdapterError, "untagged_vlan is required") as raised:
+            reconcile_switchport(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": self.interface.name,
+                            "mode": "access",
+                            "tagged_vlans": [],
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.untagged_vlan_id, vlan.pk)
+
     def test_switchport_reconciler_rejects_unknown_modes(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
@@ -264,6 +302,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                     {
                         "interface_name": self.interface.name,
                         "mode": "",
+                        "untagged_vlan": None,
                         "tagged_vlans": [],
                     }
                 ]
@@ -382,6 +421,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                     {
                         "interface_name": self.interface.name,
                         "mode": "trunk",
+                        "untagged_vlan": None,
                         "tagged_vlans": [1623],
                     }
                 ]
@@ -1075,7 +1115,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         """
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
-        rows = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}, {"vlan_id": 6}]})
+        rows = reconcile_vlan_database(
+            self.device,
+            {"vlans": [{"vlan_id": 5, "name": ""}, {"vlan_id": 6, "name": ""}]},
+        )
         self.assertEqual(len(rows), 2)
         self.assertEqual({r.status for r in rows}, {"imported"})
         group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
@@ -1224,7 +1267,16 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_switchport(
             self.device,
-            {"interfaces": [{"interface_name": "GigabitEthernet0/1", "mode": "trunk", "tagged_vlans": [10]}]},
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1",
+                        "mode": "trunk",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [10],
+                    }
+                ]
+            },
         )
         self.interface.refresh_from_db()
         self.assertEqual(VLAN.objects.filter(vid=10).count(), 1)
@@ -1847,7 +1899,12 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             interface.tagged_vlans.add(vlan)
         payload = {
             "interfaces": [
-                {"interface_name": interface.name, "mode": "trunk", "tagged_vlans": [47]}
+                {
+                    "interface_name": interface.name,
+                    "mode": "trunk",
+                    "untagged_vlan": None,
+                    "tagged_vlans": [47],
+                }
                 for interface in (self.interface, peer)
             ]
         }

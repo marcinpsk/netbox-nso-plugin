@@ -35,6 +35,28 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(manifest.native_id, vlan.pk)
         self.assertIn(("vlan", replacement.pk), completed)
 
+    def test_rescoped_owned_vlan_remains_owned_during_the_next_audit(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        state = own_vlan(self.management, 1717, "ownership-rescope")
+        shared = VLANGroup.objects.create(name="Ownership shared", slug="ownership-shared")
+        VLAN.objects.filter(pk=state.vlan_id).update(group=shared)
+
+        reconcile_scope_ownership(self.device.pk, ["vlan"])
+
+        state.refresh_from_db()
+        manifest = NSOOwnershipManifest.objects.get(
+            device_id=self.device.pk,
+            scope="vlan",
+            native_id=state.vlan_id,
+            ownership_state="owned",
+        )
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(manifest.native_key["group_id"], shared.pk)
+
     def test_native_delete_retracts_through_scope_deletion_authority(self):
         from ipam.models import VLAN
 
@@ -352,6 +374,40 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(manifest.ownership_state, "retired")
         self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bfd").exists())
         self.assertIn(("bfd", manifest.pk), completed)
+
+    def test_foreign_ospf_process_overlay_delete_does_not_fabricate_intent(self):
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOSPFInstanceState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        ospf_instance = OSPFInstance.objects.create(
+            device=self.device,
+            process_id="18",
+            name="18",
+            router_id="198.18.174.1",
+        )
+        state = NSOOSPFInstanceState.objects.create(
+            management=self.management,
+            ospf_instance=ospf_instance,
+            process_id="18",
+            router_id="198.18.174.1",
+            areas=[{"area-id": "0.0.0.18", "area-type": "stub"}],
+            enabled=False,
+            status="accepted",
+        )
+        reconcile_scope_ownership(self.device.pk, ["ospf"])
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="ospf")
+        NSOOSPFInstanceState.objects.filter(pk=state.pk).delete()
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="ospf").delete()
+
+        completed = reconcile_scope_ownership(self.device.pk, ["ospf"])
+
+        manifest.refresh_from_db()
+        self.assertFalse(NSOOSPFInstanceState.objects.filter(ospf_instance=ospf_instance).exists())
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="ospf").exists())
+        self.assertIn(("ospf", manifest.pk), completed)
 
     def test_scope_reconciliation_stays_device_scoped_as_the_fleet_grows(self):
         from django.contrib.contenttypes.models import ContentType
@@ -804,7 +860,9 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(NSOBGPPeerState.objects.get(bgp_peer=peer).status, "accepted")
         self.assertEqual(NSOISISInstanceState.objects.get(isis_instance=isis_instance).status, "accepted")
         self.assertEqual(NSOISISInterfaceState.objects.get(isis_interface=isis_interface).metric, 17)
-        self.assertEqual(NSOOSPFInstanceState.objects.get(ospf_instance=ospf_instance).router_id, "198.18.173.1")
+        ospf_state = NSOOSPFInstanceState.objects.get(ospf_instance=ospf_instance)
+        self.assertEqual(ospf_state.router_id, "198.18.173.1")
+        self.assertEqual(ospf_state.areas, [{"area-id": "0.0.0.0", "area-type": "standard"}])
         self.assertEqual(NSOOSPFInterfaceState.objects.get(interface=interface).cost, 17)
         self.assertEqual(NSORedistributionState.objects.get(redistribution=redistribution).dest_protocol, "isis")
 
