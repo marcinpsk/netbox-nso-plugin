@@ -19,8 +19,8 @@ class NSOPluginConfig(PluginConfig):
     default_settings = {
         "adapter_url": "",
         "adapter_token": "",
-        # Keep one device in one audit batch. The cap defaults to the delivery registry
-        # size, so a new delivery key cannot fail the pre-capture gates closed.
+        # Leave one minute of the five-minute audit cadence for other maintenance work.
+        # renderer_audit derives the separate scope cap from the delivery registry.
         "renderer_audit_tick_budget_seconds": 240,
         # A 'deploying' row that outlives a SUCCEEDED apply by this long without the
         # device ever showing its value escalates to apply_failed (silent drop, #26).
