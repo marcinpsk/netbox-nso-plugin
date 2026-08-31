@@ -293,7 +293,6 @@ class TestRendererWriterStructure(SimpleTestCase):
         self.assertEqual(sorted(_REVIEWED_MUTATION_SITES - live), [])
 
     def test_no_process_global_sql_or_implicit_permit_guard_remains(self):
-        package = Path(__file__).resolve().parents[1]
         forbidden = {
             "_IMPLICIT_PERMITS",
             "_authorize_dml",
@@ -307,10 +306,7 @@ class TestRendererWriterStructure(SimpleTestCase):
             "_parse_dml_target",
         }
         found = set()
-        for path in package.rglob("*.py"):
-            relative = path.relative_to(package).as_posix()
-            if relative.startswith(("migrations/", "tests/")):
-                continue
+        for path, _relative in _production_modules():
             tree = ast.parse(path.read_text(), filename=str(path))
             found.update(node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id in forbidden)
 
