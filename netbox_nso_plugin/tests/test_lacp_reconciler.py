@@ -130,7 +130,7 @@ class TestReconcileLagConfig(TestCase):
         assert NSOLACPBundleState.objects.filter(interface=self.lag).count() == 1
 
     def test_plan_query_count_does_not_grow_with_overlay_rows(self):
-        from netbox_nso_plugin.lacp_reconciler import lag_config_reconcile_plan
+        from netbox_nso_plugin.lacp_reconciler import lacp_reconcile_plan
 
         one_member = _payload(
             [
@@ -152,14 +152,40 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, one_member)
 
         with CaptureQueriesContext(connection) as one_member_queries:
-            one_member_plan = lag_config_reconcile_plan(self.device, one_member)
+            one_member_plan = lacp_reconcile_plan(self.device, one_member)
         reconcile_lag_config(self.device, two_members)
         with CaptureQueriesContext(connection) as two_member_queries:
-            plan = lag_config_reconcile_plan(self.device, two_members)
+            plan = lacp_reconcile_plan(self.device, two_members)
 
         self.assertEqual(len(two_member_queries), len(one_member_queries))
         self.assertFalse(one_member_plan.changes_content)
         self.assertFalse(plan.changes_content)
+
+    def test_stale_bundle_planning_does_not_probe_each_interface(self):
+        from netbox_nso_plugin.lacp_reconciler import lacp_reconcile_plan
+
+        second = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        third = Interface.objects.create(device=self.device, name="Port-channel3", type="lag")
+        reconcile_lag_config(
+            self.device,
+            _payload(
+                [
+                    self._bundle(),
+                    self._bundle(name=second.name, lag_id=2),
+                    self._bundle(name=third.name, lag_id=3),
+                ]
+            ),
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            lacp_reconcile_plan(self.device, _payload([]))
+
+        lag_probes = [
+            query["sql"]
+            for query in queries
+            if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
+        ]
+        self.assertEqual(lag_probes, [])
 
     def test_missing_interface_skipped(self):
         reconcile_lag_config(self.device, _payload([{"name": "Port-channel99", "lag_id": 99, "members": []}]))
