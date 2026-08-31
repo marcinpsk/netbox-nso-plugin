@@ -65,7 +65,7 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
     """Validate and normalize a complete adapter VLAN document."""
     if not isinstance(payload, dict):
         raise AdapterError("VLAN payload must be an object", code="invalid_response")
-    items = payload.get("vlans", [])
+    items = payload.get("vlans")
     if not isinstance(items, list):
         raise AdapterError("VLAN payload vlans must be a list", code="invalid_response")
     normalized = []
@@ -91,7 +91,7 @@ def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
     """Validate and normalize a complete adapter switchport document."""
     if not isinstance(payload, dict):
         raise AdapterError("switchport payload must be an object", code="invalid_response")
-    items = payload.get("interfaces", [])
+    items = payload.get("interfaces")
     if not isinstance(items, list):
         raise AdapterError("switchport payload interfaces must be a list", code="invalid_response")
     normalized = []
@@ -110,7 +110,7 @@ def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
                 f"switchport payload contains duplicate interface_name {name}",
                 code="invalid_response",
             )
-        tagged = item.get("tagged_vlans") or []
+        tagged = item.get("tagged_vlans")
         if not isinstance(tagged, list):
             raise AdapterError("switchport payload entry tagged_vlans must be a list", code="invalid_response")
         tagged = [_validated_vlan_id(value, "tagged_vlans entry") for value in tagged]
@@ -123,8 +123,8 @@ def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
         if untagged is not None:
             untagged = _validated_vlan_id(untagged, "untagged_vlan")
         mode = item.get("mode")
-        if mode is not None and not isinstance(mode, str):
-            raise AdapterError("switchport payload entry mode must be a string or null", code="invalid_response")
+        if not isinstance(mode, str) or mode not in {"", *_NSO_TO_NETBOX_MODE}:
+            raise AdapterError("switchport payload entry mode is invalid", code="invalid_response")
         seen.add(name)
         normalized.append({**item, "untagged_vlan": untagged, "tagged_vlans": tagged})
     return tuple(normalized)
