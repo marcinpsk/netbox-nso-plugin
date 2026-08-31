@@ -444,12 +444,19 @@ def advance_provisioning(mgmt) -> dict:
 def _fail_untracked_provisioning(mgmt) -> dict:
     """Terminate a provisioning row that no open provision attempt can ever complete."""
     from .management_lifecycle import save_management
+    from .models import NSODeviceManagement
 
-    logger.warning("advance_provisioning: no open provision attempt tracks management row %s", mgmt.pk)
-    mgmt.onboard_status = "provision_failed"
-    mgmt.onboard_error = "No provision attempt is tracking this onboard."
-    save_management(mgmt, update_fields=["onboard_status", "onboard_error"])
-    return {"status": "provision_failed", "error": mgmt.onboard_error}
+    with transaction.atomic():
+        current = NSODeviceManagement.objects.select_for_update().filter(pk=mgmt.pk).first()
+        if current is None:
+            return {"status": "deleted", "error": None}
+        if current.onboard_status != "provisioning":
+            return {"status": current.onboard_status or "ready", "error": current.onboard_error}
+        logger.warning("advance_provisioning: no open provision attempt tracks management row %s", current.pk)
+        current.onboard_status = "provision_failed"
+        current.onboard_error = "No provision attempt is tracking this onboard."
+        save_management(current, update_fields=["onboard_status", "onboard_error"])
+        return {"status": "provision_failed", "error": current.onboard_error}
 
 
 def advance_stale_onboarding_rows() -> tuple:
