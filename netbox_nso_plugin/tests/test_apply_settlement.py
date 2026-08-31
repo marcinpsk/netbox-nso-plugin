@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -34,7 +34,7 @@ def _generation(generation_id, status, selected, *, result=None, error=None):
         "carrier_job_status": "failed" if status in {"failed", "outcome_unknown"} else "succeeded",
         "carrier_job_result": result,
         "carrier_job_error": error,
-        "updated_at": "2026-08-01T10:01:00Z",
+        "updated_at": (timezone.now() - timedelta(days=1)).isoformat(),
     }
 
 
@@ -218,6 +218,15 @@ class TestAttemptSettlement(TestCase):
         for value in ("2026-08-01T10:01:00Z", "2026-08-01T10:01:00.123456Z"):
             with self.subTest(value=value):
                 self.assertEqual(_parse_time(value).utcoffset().total_seconds(), 0)
+
+    def test_generation_fixture_is_aged_relative_to_the_current_time(self):
+        from netbox_nso_plugin.apply_settlement import _parse_time
+
+        current = datetime(2026, 7, 1, tzinfo=UTC)
+        with patch("netbox_nso_plugin.tests.test_apply_settlement.timezone.now", return_value=current):
+            generation = _generation(1, "settled", {"vlan": 1})
+
+        self.assertLess(_parse_time(generation["updated_at"]), current)
 
     def test_latest_route_policy_carrier_ignores_malformed_attempt_shapes(self):
         from netbox_nso_plugin.apply_settlement import latest_route_policy_carrier

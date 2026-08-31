@@ -696,7 +696,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
 
-        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
         from netbox_nso_plugin.models import NSOBGPPeerTemplateState
 
         rm_a = RouteMap.objects.create(name="RM-A")
@@ -711,6 +711,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         # Device moves RM-A -> RM-B; NetBox never touched → auto-mirror.
         pg_b = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-B"}]}
+        self.assertTrue(bgp_reconcile_plan(self.device, self._scope_with_peer_groups([pg_b])).changes_content)
         _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg_b]))
         paf.refresh_from_db()
         self.assertEqual(paf.routemap_in.name, "RM-B")  # mirrored to new device value

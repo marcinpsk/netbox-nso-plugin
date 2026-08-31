@@ -106,13 +106,6 @@ def bgp_reconcile_plan(device, payload: dict):
             | Q(name__in=template_remote_as)
         ).order_by("pk")
     )
-    if not changes_content:
-        changes_content = _bgp_shared_graph_changes_content(
-            routers,
-            templates,
-            template_remote_as,
-            payload,
-        )
     address_families = tuple(BGPAddressFamily.objects.filter(scope__in=scopes).order_by("pk"))
     peer_type = ContentType.objects.get_for_model(BGPPeer)
     template_type = ContentType.objects.get_for_model(BGPPeerTemplate)
@@ -120,8 +113,19 @@ def bgp_reconcile_plan(device, payload: dict):
         BGPPeerAddressFamily.objects.filter(
             Q(assigned_object_type=peer_type, assigned_object_id__in={peer.pk for peer in peers})
             | Q(assigned_object_type=template_type, assigned_object_id__in={template.pk for template in templates})
-        ).order_by("pk")
+        )
+        .select_related("address_family")
+        .order_by("pk")
     )
+    if not changes_content:
+        changes_content = _bgp_shared_graph_changes_content(
+            routers,
+            templates,
+            template_remote_as,
+            template_type,
+            peer_address_families,
+            payload,
+        )
     asn_values = {
         int(value)
         for router in payload.get("routers", []) or []
@@ -178,7 +182,14 @@ def bgp_reconcile_plan(device, payload: dict):
     )
 
 
-def _bgp_shared_graph_changes_content(routers, templates, template_remote_as, payload) -> bool:
+def _bgp_shared_graph_changes_content(
+    routers,
+    templates,
+    template_remote_as,
+    template_type,
+    peer_address_families,
+    payload,
+) -> bool:
     """Predict router-id and shared-template changes visible to owned peers."""
     import copy
 
@@ -191,6 +202,19 @@ def _bgp_shared_graph_changes_content(routers, templates, template_remote_as, pa
         for item in payload.get("routers", []) or []
         if isinstance(item, dict) and item.get("asn") not in (None, "")
     }
+    reported_template_afs = {
+        group.get("name"): group.get("address_families") or []
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for scope in router.get("scopes", []) or []
+        if isinstance(scope, dict)
+        for group in scope.get("peer_groups", []) or []
+        if isinstance(group, dict) and group.get("name")
+    }
+    stored_template_afs = {}
+    for row in peer_address_families:
+        if row.assigned_object_type_id == template_type.pk:
+            stored_template_afs.setdefault(row.assigned_object_id, []).append(row)
     for router in routers:
         reported_router_id = reported_routers.get(str(router.asn.asn), {}).get("router_id")
         if reported_router_id and not router.router_id:
@@ -199,6 +223,11 @@ def _bgp_shared_graph_changes_content(routers, templates, template_remote_as, pa
             if canonical_fragment(router) != canonical_fragment(candidate):
                 return True
     for template in templates:
+        reported_afs = reported_template_afs.get(template.name)
+        if reported_afs is not None:
+            stored_afs = _af_rows_content(stored_template_afs.get(template.pk, ()))
+            if stored_afs != _af_device_content(reported_afs):
+                return True
         remote_as = template_remote_as.get(template.name)
         if remote_as in (None, ""):
             continue
@@ -512,16 +541,10 @@ def _af_device_content(af_list: list) -> list:
     return sorted(afs, key=lambda a: a["af"])
 
 
-def _af_object_content(owner_obj) -> list:
-    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
-    from django.contrib.contenttypes.models import ContentType
-    from netbox_routing.models import BGPPeerAddressFamily
-
-    ct = ContentType.objects.get_for_model(owner_obj.__class__)
+def _af_rows_content(rows) -> list:
+    """Canonical per-AF policy content from preloaded peer address-family rows."""
     afs = []
-    for paf in BGPPeerAddressFamily.objects.filter(
-        assigned_object_type=ct, assigned_object_id=owner_obj.pk
-    ).select_related("address_family"):
+    for paf in rows:
         afs.append(
             {
                 "af": paf.address_family.address_family,
@@ -533,6 +556,20 @@ def _af_object_content(owner_obj) -> list:
             }
         )
     return sorted(afs, key=lambda a: a["af"])
+
+
+def _af_object_content(owner_obj) -> list:
+    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
+    from django.contrib.contenttypes.models import ContentType
+    from netbox_routing.models import BGPPeerAddressFamily
+
+    ct = ContentType.objects.get_for_model(owner_obj.__class__)
+    return _af_rows_content(
+        BGPPeerAddressFamily.objects.filter(
+            assigned_object_type=ct,
+            assigned_object_id=owner_obj.pk,
+        ).select_related("address_family")
+    )
 
 
 def _drop_unset_update_source(content: dict) -> None:
