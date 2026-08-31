@@ -78,7 +78,7 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
         except AdapterError as exc:
             raise AdapterError(f"VLAN payload entry is invalid: {exc}", code="invalid_response") from exc
         if vlan_id in seen:
-            raise AdapterError(f"VLAN payload contains duplicate vlan_id {vlan_id}", code="invalid_response")
+            continue
         name = item.get("name")
         if name is not None and not isinstance(name, str):
             raise AdapterError("VLAN payload entry name must be a string or null", code="invalid_response")
