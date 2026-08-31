@@ -915,7 +915,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         # Device moves RM-A -> RM-B; NetBox never touched → auto-mirror.
         pg_b = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast", "routemap_in": "RM-B"}]}
-        self.assertTrue(bgp_reconcile_plan(self.device, self._scope_with_peer_groups([pg_b])).changes_content)
+        # The imported template has no rendered consumer, so the exact plan is content-neutral.
+        self.assertFalse(bgp_reconcile_plan(self.device, self._scope_with_peer_groups([pg_b])).changes_content)
         _reconcile_bgp_config(self.device, self._scope_with_peer_groups([pg_b]))
         paf.refresh_from_db()
         self.assertEqual(paf.routemap_in.name, "RM-B")  # mirrored to new device value
