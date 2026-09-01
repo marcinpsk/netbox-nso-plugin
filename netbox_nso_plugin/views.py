@@ -2856,10 +2856,12 @@ def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
                     )
                 )
                 for row in rows:
-                    row.status = previous_status
-                    row.apply_attempt_id = None
-                    with suppress_intent_push(), mirror_refresh(row, {"status", "apply_attempt_id"}):
-                        row.save(update_fields=["status", "apply_attempt_id"])
+                    with suppress_intent_push(), mirror_refresh(row, {"status", "apply_attempt_id"}) as locked:
+                        if locked is None:
+                            continue
+                        locked.status = previous_status
+                        locked.apply_attempt_id = None
+                        locked.save(update_fields=["status", "apply_attempt_id"])
         except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
             logger.warning("Apply rollback failed: %s", exc)
 

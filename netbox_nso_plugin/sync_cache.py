@@ -257,33 +257,39 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         if attempted >= MAX_RELINKS_PER_RUN:
             _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
-        # Stamp for being TRIED, not for succeeding, and before the try: whether the
-        # re-onboard worked is not observable here (it happens in an on_commit callback that
-        # logs and returns), so a stamp conditional on success would never move a
-        # permanently broken row to the back of the queue. Through .update(), which does not
-        # re-fire the row's push handler.
-        attempted += 1
-        _mirror_management(mgmt, adapter_link_attempted_at=now)
+        expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name)
         try:
-            if state is _MOVED:
-                logger.warning(
-                    "Adapter device for %s moved from id %s to %s — adopting",
-                    mgmt.nso_device_name,
-                    mgmt.adapter_device_id,
-                    adapter_device["id"],
-                )
-                _mirror_management(mgmt, adapter_device_id=adapter_device["id"])
-            elif state is _REUSED:
-                logger.warning(
-                    "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
-                    mgmt.adapter_device_id,
-                    mgmt.nso_device_name,
-                )
-                _mirror_management(mgmt, adapter_device_id=None)
             from .intent_state import footprint_for_instance, intent_transaction
 
             with intent_transaction(footprint_for_instance(mgmt)):
-                mgmt.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+                current = type(mgmt).objects.get(pk=mgmt.pk)
+                if (
+                    current.source_rekey_pending
+                    or (current.nso_instance_id, current.nso_device_name) != expected_source
+                ):
+                    continue
+                # Stamp for being TRIED, not for succeeding, and before the try: whether the
+                # re-onboard worked is not observable here (it happens in an on_commit callback
+                # that logs and returns), so a stamp conditional on success would never move a
+                # permanently broken row to the back of the queue.
+                attempted += 1
+                _mirror_management(current, adapter_link_attempted_at=now)
+                if state is _MOVED:
+                    logger.warning(
+                        "Adapter device for %s moved from id %s to %s — adopting",
+                        current.nso_device_name,
+                        current.adapter_device_id,
+                        adapter_device["id"],
+                    )
+                    _mirror_management(current, adapter_device_id=adapter_device["id"])
+                elif state is _REUSED:
+                    logger.warning(
+                        "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
+                        current.adapter_device_id,
+                        current.nso_device_name,
+                    )
+                    _mirror_management(current, adapter_device_id=None)
+                current.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue

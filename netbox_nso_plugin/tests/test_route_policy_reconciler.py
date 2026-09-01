@@ -77,6 +77,30 @@ class TestReconcileRoutePolicy(TestCase):
         }
         self.assertTrue(route_policy_reconcile_plan(self.device, changed).changes_content)
 
+    def test_reconcile_plan_marks_empty_shell_fills_as_content_changes(self):
+        from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        cases = (
+            ("prefix_lists", PrefixList.objects.create(name="PL-EMPTY"), {"name": "PL-EMPTY", "family": 4}),
+            ("community_lists", CommunityList.objects.create(name="CL-EMPTY"), {"name": "CL-EMPTY"}),
+            ("as_paths", ASPath.objects.create(name="AP-EMPTY"), {"name": "AP-EMPTY"}),
+            ("route_maps", RouteMap.objects.create(name="RM-EMPTY"), {"name": "RM-EMPTY"}),
+        )
+
+        for payload_key, _empty_shell, captured in cases:
+            with self.subTest(payload_key=payload_key):
+                payload = {
+                    "prefix_lists": [],
+                    "community_lists": [],
+                    "as_paths": [],
+                    "route_maps": [],
+                    payload_key: [{**captured, "entries": []}],
+                }
+                self.assertTrue(route_policy_reconcile_plan(self.device, payload).changes_content)
+
     def test_case_insensitive_name_adopts_existing_object(self):
         """A device object whose name differs only in CASE from an existing netbox_routing
         object must ADOPT it, not crash on the Lower(name) unique constraint.

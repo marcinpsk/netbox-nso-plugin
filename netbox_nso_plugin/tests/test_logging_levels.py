@@ -450,11 +450,11 @@ class TestLoggingLevelsViews(LevelsTestBase):
 
 
 class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
-    """codex P4b triage: the levels singleton must ride the device Apply lifecycle.
+    """The levels singleton rides the device Apply lifecycle.
 
     Without these, an accepted levels intent whose accept-time PUT was swallowed
-    (adapter down) is silently skipped by Apply forever, and a gate-off apply
-    failure (`logging_count_by_outcome.apply_failed`) never reaches the row.
+    (adapter down) is silently skipped by Apply forever. Generic attempt settlement
+    covers gate-off failures for every deploying overlay.
     """
 
     def test_deploying_row_settles_in_sync_when_device_matches(self):

@@ -249,15 +249,15 @@ def promote_current_intent(
                 pks = []
                 for row in selected_rows:
                     fields = {"status", "apply_attempt_id", "last_apply_at", "last_apply_error"}
-                    with suppress_intent_push(), mirror_refresh(row, fields) as locked:
-                        if locked is None:
+                    with suppress_intent_push(), mirror_refresh(row, fields) as locked_row:
+                        if locked_row is None:
                             continue
-                        locked.status = sm.advance(previous_status, sm.APPLY)
-                        locked.apply_attempt_id = attempt.pk
-                        locked.last_apply_at = now
-                        locked.last_apply_error = ""
-                        locked.save(update_fields=fields)
-                        pks.append(locked.pk)
+                        locked_row.status = sm.advance(previous_status, sm.APPLY)
+                        locked_row.apply_attempt_id = attempt.pk
+                        locked_row.last_apply_at = now
+                        locked_row.last_apply_error = ""
+                        locked_row.save(update_fields=fields)
+                        pks.append(locked_row.pk)
                 if pks:
                     moved.append((section, model, pks, previous_status))
     return attempt, moved

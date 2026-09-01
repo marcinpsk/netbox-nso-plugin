@@ -1137,20 +1137,14 @@ def _route_policy_group_changes_content(management, family: str, name: str, capt
 
     if family == "prefix_list":
         family_changed = captured.get("family") in (4, 6) and obj.family != captured["family"]
-        return (
-            family_changed or bool(_entries(captured)) and not PrefixListEntry.objects.filter(prefix_list=obj).exists()
-        )
+        return family_changed or not PrefixListEntry.objects.filter(prefix_list=obj).exists()
     if family == "community_list":
         invert_changed = obj.invert_match != bool(captured.get("invert_match", False))
-        return (
-            invert_changed
-            or bool(_entries(captured))
-            and not CommunityListEntry.objects.filter(community_list=obj).exists()
-        )
+        return invert_changed or not CommunityListEntry.objects.filter(community_list=obj).exists()
     if family == "as_path":
-        return bool(_entries(captured)) and not ASPathEntry.objects.filter(aspath=obj).exists()
+        return not ASPathEntry.objects.filter(aspath=obj).exists()
     if family == "route_map":
-        return bool(_entries(captured)) and not RouteMapEntry.objects.filter(route_map=obj).exists()
+        return not RouteMapEntry.objects.filter(route_map=obj).exists()
     return False
 
 

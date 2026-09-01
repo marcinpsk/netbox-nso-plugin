@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
 from netbox_nso_plugin.models import (
@@ -97,7 +99,14 @@ class TestReconcileLagConfig(TestCase):
     def test_plan_query_count_does_not_grow_with_overlay_rows(self):
         from netbox_nso_plugin.lacp_reconciler import lag_config_reconcile_plan
 
-        data = _payload(
+        one_member = _payload(
+            [
+                self._bundle(
+                    members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}],
+                )
+            ]
+        )
+        two_members = _payload(
             [
                 self._bundle(
                     members=[
@@ -107,11 +116,16 @@ class TestReconcileLagConfig(TestCase):
                 )
             ]
         )
-        reconcile_lag_config(self.device, data)
+        reconcile_lag_config(self.device, one_member)
 
-        with self.assertNumQueries(4):
-            plan = lag_config_reconcile_plan(self.device, data)
+        with CaptureQueriesContext(connection) as one_member_queries:
+            one_member_plan = lag_config_reconcile_plan(self.device, one_member)
+        reconcile_lag_config(self.device, two_members)
+        with CaptureQueriesContext(connection) as two_member_queries:
+            plan = lag_config_reconcile_plan(self.device, two_members)
 
+        self.assertEqual(len(two_member_queries), len(one_member_queries))
+        self.assertFalse(one_member_plan.changes_content)
         self.assertFalse(plan.changes_content)
 
     def test_missing_interface_skipped(self):

@@ -368,7 +368,7 @@ def bump_intent_revision(device_id: int, scope: str) -> int:
     table = connection.ops.quote_name(NSOIntentRevision._meta.db_table)
     with connection.cursor() as cursor:
         cursor.execute(
-            f"INSERT INTO {table} "
+            f"INSERT INTO {table} "  # noqa: S608 (quoted model metadata, not input)
             "(device_id, scope, revision, updated_at) VALUES (%s, %s, 1, NOW()) "
             "ON CONFLICT (device_id, scope) DO UPDATE SET "
             f"revision = {table}.revision + 1, updated_at = NOW() "

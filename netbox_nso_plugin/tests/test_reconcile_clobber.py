@@ -23,8 +23,9 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
-from ._outbox_case import without_commit_drain
+from ._outbox_case import content_bulk_update, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .test_sync_cache import _SyncCacheTestBase
 
 PREFIX = "10.90.0.0/16"
 NEXT_HOP = "10.90.0.1"
@@ -236,3 +237,36 @@ class TestTheMirrorAllowList(SimpleTestCase):
             set(_STATIC_ROUTE_ARMED_FIELDS)
             | {"status", "expected_generation", "expected_fingerprint", "accepted_at", "last_apply_at"}
         )
+
+
+class TestLinkReconcileCannotRestoreSourceState(_SyncCacheTestBase):
+    """A link sweep that read before a rekey cannot restore the stale source."""
+
+    def test_a_stale_snapshot_cannot_overwrite_a_rekey(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-stale-source", 196)
+        snapshot = ([mgmt], {}, {})
+        content_bulk_update(
+            NSODeviceManagement.objects.get(pk=mgmt.pk),
+            nso_device_name="cache-rekeyed",
+            source_rekey_pending=True,
+        )
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify") as notify,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
+
+        self.assertEqual((broken, attempted), (1, 0))
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        notify.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.nso_device_name, "cache-rekeyed")
+        self.assertTrue(mgmt.source_rekey_pending)
+        self.assertEqual(mgmt.adapter_device_id, 196)
