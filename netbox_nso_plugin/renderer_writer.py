@@ -683,13 +683,23 @@ def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):
         **{row_kind: (SourceRow(through._meta.label_lower, None),)},
     )
     footprint = MutationFootprint.merge(owner_footprint, *related_footprints, through_footprint)
+    membership_keys = set()
     if instance._meta.label_lower == "netbox_routing.staticroute" and proposed.field_name == "devices":
+        from . import signals
         from .models import NSODeviceManagement, NSOStaticRouteState
 
         device_ids = set(existing)
         device_ids.update(row.pk for row in proposed.related if row.pk is not None)
         managed_ids = set(
             NSODeviceManagement.objects.filter(device_id__in=device_ids).values_list("device_id", flat=True)
+        )
+        membership_keys.update(
+            (device_id, "static_route")
+            for device_id in NSOStaticRouteState.objects.filter(
+                signals.PUSHED_STATIC_ROUTE_FILTER,
+                management__device_id__in=persisted_pks,
+                static_route_id=instance.pk,
+            ).values_list("management__device_id", flat=True)
         )
         overlay_rows = (
             NSOStaticRouteState.objects.filter(
@@ -721,6 +731,7 @@ def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):
         if canonical_fragment(instance, owner_spec) != ABSENT
         else set()
     )
+    keys.update(membership_keys)
     write = RendererWrite(
         operation="m2m_add",
         model_label=instance._meta.label_lower,

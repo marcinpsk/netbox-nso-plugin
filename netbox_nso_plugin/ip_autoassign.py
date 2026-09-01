@@ -601,13 +601,16 @@ def _single_family_occupied(interface, family: str) -> bool:
     ).exists()
 
 
-def _single_ip_allocation_footprint(mgmt):
+def _single_ip_allocation_footprint(mgmt, interface):
     """Declare the new rows that one single-ended allocation can create."""
     from .intent_state import MutationFootprint, SourceRow
 
     return MutationFootprint.for_keys(
         {(mgmt.device_id, "ip")},
-        source_rows=(SourceRow("ipam.ipaddress", None),),
+        source_rows=(
+            SourceRow("dcim.interface", interface.pk),
+            SourceRow("ipam.ipaddress", None),
+        ),
         overlay_rows=(SourceRow("netbox_nso_plugin.nsointerfaceipstate", None),),
     )
 
@@ -644,7 +647,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     try:
         with transaction.atomic():
             pool = Prefix.objects.select_for_update().get(pk=pool.pk)
-            with intent_transaction(_single_ip_allocation_footprint(mgmt)):
+            with intent_transaction(_single_ip_allocation_footprint(mgmt, interface)):
                 if _single_family_occupied(interface, family):
                     raise _AllocationNoOp(
                         "skipped",

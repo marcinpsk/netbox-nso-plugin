@@ -409,6 +409,8 @@ class TestOptionalRoutingDependencyPlans(TestCase):
     """Preflight keeps the reconcilers' optional dependency boundary."""
 
     def test_missing_netbox_routing_returns_empty_plans(self):
+        from django.apps import apps
+
         from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
         from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
         from netbox_nso_plugin.intent_state import MutationFootprint
@@ -451,9 +453,11 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             ),
         )
 
-        for planner, payload in planners:
-            with self.subTest(control=planner.__name__):
-                self.assertTrue(planner(device, payload).write_set)
+        config = apps.get_app_config("netbox_nso_plugin")
+        with patch.object(config, "_static_route_auto_create", True):
+            for planner, payload in planners:
+                with self.subTest(control=planner.__name__):
+                    self.assertTrue(planner(device, payload).write_set)
 
         with patch.dict(sys.modules, {"netbox_routing.models": None}):
             for planner, payload in planners:
