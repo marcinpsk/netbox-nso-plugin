@@ -455,6 +455,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             )
             if candidate.status != sm.CONFLICT:
                 candidate.content_hash = entries_hash
+        if current.status == sm.DEPLOYING and candidate.status == sm.IN_SYNC:
+            candidate.apply_attempt_id = None
         candidate.captured = captured
         candidate.last_sync_at = self.planned_at
         candidate.content_type = self.ContentType.objects.get_for_model(type(root))
@@ -475,6 +477,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             return
         fields = (
             "status",
+            "apply_attempt_id",
             "content_hash",
             "captured",
             "last_sync_at",
