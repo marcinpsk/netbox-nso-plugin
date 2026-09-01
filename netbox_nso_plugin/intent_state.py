@@ -10,6 +10,7 @@ import copy
 import functools
 import operator
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -446,6 +447,7 @@ class ReconcileMutationPlan:
 
     footprint: MutationFootprint
     changes_content: bool = False
+    validate_after_acquire: Callable[[], None] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1758,6 +1760,8 @@ def reconcile_transaction(plan: ReconcileMutationPlan):
     """Acquire a read plan with the permit required by its canonical fragment delta."""
     mutation = intent_transaction if plan.changes_content else mirror_transaction
     with mutation(plan.footprint) as permit:
+        if plan.validate_after_acquire is not None:
+            plan.validate_after_acquire()
         yield permit
 
 

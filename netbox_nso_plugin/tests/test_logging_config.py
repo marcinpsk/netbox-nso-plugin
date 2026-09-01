@@ -188,6 +188,7 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
                 return
             fired.append(True)
             content_bulk_update(instance, severity="error")
+            instance.severity = "warning"
 
         post_init.connect(_concurrent_editor, sender=NSOLoggingHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOLoggingHostState)
@@ -229,6 +230,7 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
                 return
             fired.append(True)
             content_bulk_update(instance, address="198.18.0.98")
+            instance.address = "198.18.0.26"
 
         post_init.connect(_concurrent_renamer, sender=NSOLoggingHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOLoggingHostState)

@@ -16,21 +16,84 @@ import hashlib
 import ipaddress
 import json
 import logging
+from dataclasses import replace
 
 from .intent_state import mirror_reconciler
 
 logger = logging.getLogger(__name__)
 
 
-def _bgp_plan_peer_dependencies(device, states, reported):
+def _validate_bgp_policy_resolutions(expected):
+    """Reject a named policy lookup that changed after discovery."""
+    from netbox_routing.models import PrefixList, RouteMap
+
+    from .intent_state import RendererTargetsChanged
+
+    expected = tuple(expected)
+    names_by_family = {
+        family: {name for expected_family, name, _pk in expected if expected_family == family}
+        for family in ("route_map", "prefix_list")
+    }
+    models = {"route_map": RouteMap, "prefix_list": PrefixList}
+    current = []
+    for family, names in names_by_family.items():
+        rows_by_name = {row.name: row.pk for row in models[family].objects.filter(name__in=names)}
+        current.extend((family, name, rows_by_name.get(name)) for name in names)
+    if tuple(sorted(current)) != expected:
+        raise RendererTargetsChanged("BGP route-policy resolutions changed during acquisition")
+
+
+def _bgp_plan_peer_dependencies(device, states, reported, payload):
     """Load the peer dependencies used by the BGP content predictor in fixed queries."""
     from dcim.models import Interface
     from django.contrib.contenttypes.models import ContentType
     from django.db.models import Q
     from ipam.models import ASN, IPAddress
-    from netbox_routing.models import BGPPeer, BGPPeerAddressFamily, BGPPeerTemplate
+    from netbox_routing.models import BGPPeer, BGPPeerAddressFamily, BGPPeerTemplate, PrefixList, RouteMap
+
+    from .intent_state import route_policy_footprint
 
     peer_entries = tuple(reported.values())
+    peer_group_entries = tuple(
+        group
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for scope in router.get("scopes", []) or []
+        if isinstance(scope, dict)
+        for group in scope.get("peer_groups", []) or []
+        if isinstance(group, dict)
+    )
+    af_entries = tuple(
+        af
+        for owner in (*peer_entries, *peer_group_entries)
+        for af in owner.get("address_families", []) or []
+        if isinstance(af, dict)
+    )
+    policy_groups = {
+        (family, af.get(field))
+        for af in af_entries
+        for family, fields in (
+            ("route_map", ("routemap_in", "routemap_out")),
+            ("prefix_list", ("prefixlist_in", "prefixlist_out")),
+        )
+        for field in fields
+        if af.get(field)
+    }
+    route_map_names = {name for family, name in policy_groups if family == "route_map"}
+    prefix_list_names = {name for family, name in policy_groups if family == "prefix_list"}
+    route_maps_by_name = {row.name: row for row in RouteMap.objects.filter(name__in=route_map_names)}
+    prefix_lists_by_name = {row.name: row for row in PrefixList.objects.filter(name__in=prefix_list_names)}
+    policy_resolutions = tuple(
+        sorted(
+            (family, name, objects_by_name.get(name).pk if name in objects_by_name else None)
+            for family, names, objects_by_name in (
+                ("route_map", route_map_names, route_maps_by_name),
+                ("prefix_list", prefix_list_names, prefix_lists_by_name),
+            )
+            for name in names
+        )
+    )
+    policy_footprint = route_policy_footprint(policy_groups)
     dependency_asns = {
         int(value)
         for peer in peer_entries
@@ -70,6 +133,10 @@ def _bgp_plan_peer_dependencies(device, states, reported):
         addresses_by_host,
         interfaces_by_name,
         peer_address_families_by_peer,
+        route_maps_by_name,
+        prefix_lists_by_name,
+        policy_footprint,
+        policy_resolutions,
     )
 
 
@@ -114,7 +181,11 @@ def bgp_reconcile_plan(device, payload: dict):
         addresses_by_host,
         interfaces_by_name,
         peer_address_families_by_peer,
-    ) = _bgp_plan_peer_dependencies(device, states, reported)
+        route_maps_by_name,
+        prefix_lists_by_name,
+        policy_footprint,
+        policy_resolutions,
+    ) = _bgp_plan_peer_dependencies(device, states, reported, payload)
     changes_content = False
     for state in states:
         peer = reported.get((state.asn_str, state.vrf_name, state.peer_address_str))
@@ -137,6 +208,8 @@ def bgp_reconcile_plan(device, payload: dict):
             addresses_by_host=addresses_by_host,
             interfaces_by_name=interfaces_by_name,
             peer_address_families=peer_address_families_by_peer.get(state.bgp_peer_id, ()),
+            route_maps_by_name=route_maps_by_name,
+            prefix_lists_by_name=prefix_lists_by_name,
         ):
             changes_content = True
             break
@@ -194,6 +267,8 @@ def bgp_reconcile_plan(device, payload: dict):
             template_type,
             peer_address_families,
             payload,
+            route_maps_by_name,
+            prefix_lists_by_name,
         )
     asn_values = {
         int(value)
@@ -235,19 +310,32 @@ def bgp_reconcile_plan(device, payload: dict):
         "netbox_routing.bgpaddressfamily": address_families,
         "netbox_routing.bgppeeraddressfamily": peer_address_families,
     }
-    return ReconcileMutationPlan(
-        MutationFootprint.for_keys(
-            {(device.pk, "bgp")},
-            source_rows=(
-                *(SourceRow(label, None) for label in source_models),
-                *(SourceRow(label, row.pk) for label, rows in source_models.items() for row in rows),
-            ),
-            overlay_rows=(
-                SourceRow("netbox_nso_plugin.nsobgppeerstate", None),
-                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
-            ),
+    bgp_footprint = MutationFootprint.for_keys(
+        {(device.pk, "bgp")},
+        source_rows=(
+            *(SourceRow(label, None) for label in source_models),
+            *(SourceRow(label, row.pk) for label, rows in source_models.items() for row in rows),
         ),
+        overlay_rows=(
+            SourceRow("netbox_nso_plugin.nsobgppeerstate", None),
+            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+        ),
+    )
+    policy_dependencies = MutationFootprint.for_keys(
+        (),
+        shared_keys=policy_footprint.shared_keys,
+        source_rows=policy_footprint.source_rows,
+        overlay_rows=policy_footprint.overlay_rows,
+    )
+    footprint = MutationFootprint.merge(bgp_footprint, policy_dependencies)
+    footprint = replace(
+        footprint,
+        device_ids=tuple(sorted({*footprint.device_ids, *policy_footprint.device_ids})),
+    )
+    return ReconcileMutationPlan(
+        footprint,
         changes_content=changes_content,
+        validate_after_acquire=lambda: _validate_bgp_policy_resolutions(policy_resolutions),
     )
 
 
@@ -258,6 +346,8 @@ def _bgp_shared_graph_changes_content(
     template_type,
     peer_address_families,
     payload,
+    route_maps_by_name,
+    prefix_lists_by_name,
 ) -> bool:
     """Predict router-id and shared-template changes visible to owned peers."""
     import copy
@@ -295,7 +385,11 @@ def _bgp_shared_graph_changes_content(
         reported_afs = reported_template_afs.get(template.name)
         if reported_afs is not None:
             stored_afs = _af_rows_content(stored_template_afs.get(template.pk, ()))
-            if stored_afs != _af_device_content(reported_afs):
+            if stored_afs != _af_device_content(
+                reported_afs,
+                route_maps_by_name=route_maps_by_name,
+                prefix_lists_by_name=prefix_lists_by_name,
+            ):
                 return True
         remote_as = template_remote_as.get(template.name)
         if remote_as in (None, ""):
@@ -538,6 +632,8 @@ def _peer_plan_changes_native_content(
     addresses_by_host,
     interfaces_by_name,
     peer_address_families,
+    route_maps_by_name,
+    prefix_lists_by_name,
 ) -> bool:
     """Predict the existing-peer auto-mirror branch without creating dependencies."""
     from . import status_machine as sm
@@ -593,17 +689,37 @@ def _peer_plan_changes_native_content(
     )
     if unresolved:
         return True
-    desired_hash = _content_hash(_peer_device_content(desired, peer_entry.get("address_families") or []))
+    desired_hash = _content_hash(
+        _peer_device_content(
+            desired,
+            peer_entry.get("address_families") or [],
+            route_maps_by_name=route_maps_by_name,
+            prefix_lists_by_name=prefix_lists_by_name,
+        )
+    )
     return desired_hash != state.device_base_hash
 
 
-def _af_device_content(af_list: list) -> list:
+def _af_device_content(
+    af_list: list,
+    *,
+    route_maps_by_name=None,
+    prefix_lists_by_name=None,
+) -> list:
     """Canonical per-AF policy content from the device payload (FKs resolved to pks).
 
     Shared by the BGP peer and the peer-group TEMPLATE 3-way merges — both carry the
     same per-AF route-map / prefix-list policy shape.
     """
     afs = []
+
+    def resolve(name, objects_by_name, resolver):
+        if not name:
+            return None
+        if objects_by_name is not None:
+            return objects_by_name.get(name)
+        return resolver(name)
+
     for paf in af_list or []:
         af_str = paf.get("af") or ""
         if not af_str:
@@ -612,10 +728,10 @@ def _af_device_content(af_list: list) -> list:
             {
                 "af": af_str,
                 "enabled": bool(paf.get("enabled", True)),
-                "routemap_in": _pk(_resolve_routemap(paf.get("routemap_in"))),
-                "routemap_out": _pk(_resolve_routemap(paf.get("routemap_out"))),
-                "prefixlist_in": _pk(_resolve_prefixlist(paf.get("prefixlist_in"))),
-                "prefixlist_out": _pk(_resolve_prefixlist(paf.get("prefixlist_out"))),
+                "routemap_in": _pk(resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)),
+                "routemap_out": _pk(resolve(paf.get("routemap_out"), route_maps_by_name, _resolve_routemap)),
+                "prefixlist_in": _pk(resolve(paf.get("prefixlist_in"), prefix_lists_by_name, _resolve_prefixlist)),
+                "prefixlist_out": _pk(resolve(paf.get("prefixlist_out"), prefix_lists_by_name, _resolve_prefixlist)),
             }
         )
     return sorted(afs, key=lambda a: a["af"])
@@ -667,11 +783,21 @@ def _drop_unset_update_source(content: dict) -> None:
         content.pop("update_source", None)
 
 
-def _peer_device_content(desired: dict, af_list: list) -> dict:
+def _peer_device_content(
+    desired: dict,
+    af_list: list,
+    *,
+    route_maps_by_name=None,
+    prefix_lists_by_name=None,
+) -> dict:
     """Build canonical device-desired content (peer fields + AF policies), FKs as pks."""
     content = {f: (_pk(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
     _drop_unset_update_source(content)
-    content["afs"] = _af_device_content(af_list)
+    content["afs"] = _af_device_content(
+        af_list,
+        route_maps_by_name=route_maps_by_name,
+        prefix_lists_by_name=prefix_lists_by_name,
+    )
     return content
 
 

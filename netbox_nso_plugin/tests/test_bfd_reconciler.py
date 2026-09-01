@@ -142,6 +142,30 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         assert NSOBFDInterfaceState.objects.get(interface=self.iface).status == "accepted"
 
+    def test_empty_interface_name_does_not_use_bound_port_only_in_the_plan(self):
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        full = {
+            "interface_name": "Port-channel1",
+            "bound_port": "Port-channel1",
+            "micro_bfd": True,
+            "min_tx": 300,
+            "min_rx": 300,
+            "multiplier": 3,
+        }
+        reconcile_bfd(self.device, [full])
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        state.status = "in_sync"
+        state.save(update_fields=["status"])
+
+        empty_name = [{**full, "interface_name": ""}]
+        self.assertTrue(bfd_reconcile_plan(self.device, empty_name).changes_content)
+        reconcile_bfd(self.device, empty_name)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+
     def test_nokia_default_timer_omission_preserves_owned_profile_without_false_settle(self):
         """Omission preserves intent but cannot prove an explicit-default push landed."""
         from netbox_routing.models import BFDInterface

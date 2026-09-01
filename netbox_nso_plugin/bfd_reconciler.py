@@ -39,7 +39,10 @@ def bfd_reconcile_plan(device, interfaces: list):
     for entry in interfaces or []:
         if not isinstance(entry, dict):
             continue
-        interface = interface_by_name.get(entry.get("interface_name") or "")
+        interface_name = entry.get("interface_name") or ""
+        if not interface_name:
+            continue
+        interface = interface_by_name.get(interface_name)
         if interface is None:
             interface = interface_by_name.get(entry.get("bound_port") or "")
         if interface is not None:

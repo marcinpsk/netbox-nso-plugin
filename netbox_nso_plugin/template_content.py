@@ -1119,8 +1119,9 @@ def _static_route_reconcile_footprint(device, payload):
 
     mgmt = NSODeviceManagement.objects.filter(device=device).first()
     if mgmt is None:
-        return MutationFootprint()
+        return MutationFootprint(), set()
     route_ids = set(NSOStaticRouteState.objects.filter(management=mgmt).values_list("static_route_id", flat=True))
+    reported_route_ids = set()
     vrf_ids = set()
     try:
         from ipam.models import VRF
@@ -1141,21 +1142,27 @@ def _static_route_reconcile_footprint(device, payload):
         lookup = {"vrf": vrf, "prefix": prefix, "next_hop": next_hop}
         if next_hop is None:
             lookup["interface_next_hop"] = interface_next_hop
-        route_ids.update(StaticRoute.objects.filter(**lookup).values_list("pk", flat=True))
+        resolved_route_id = StaticRoute.objects.filter(**lookup).values_list("pk", flat=True).first()
+        if resolved_route_id is not None:
+            route_ids.add(resolved_route_id)
+            reported_route_ids.add(resolved_route_id)
     overlay_ids = NSOStaticRouteState.objects.filter(management=mgmt).values_list("pk", flat=True)
-    return MutationFootprint.for_keys(
-        {(device.pk, "static_route")},
-        source_rows=(
-            SourceRow("ipam.vrf", None),
-            *(SourceRow("ipam.vrf", pk) for pk in vrf_ids),
-            SourceRow("netbox_routing.staticroute", None),
-            SourceRow("netbox_routing.staticroute_devices", None),
-            *(SourceRow("netbox_routing.staticroute", pk) for pk in route_ids),
+    return (
+        MutationFootprint.for_keys(
+            {(device.pk, "static_route")},
+            source_rows=(
+                SourceRow("ipam.vrf", None),
+                *(SourceRow("ipam.vrf", pk) for pk in vrf_ids),
+                SourceRow("netbox_routing.staticroute", None),
+                SourceRow("netbox_routing.staticroute_devices", None),
+                *(SourceRow("netbox_routing.staticroute", pk) for pk in route_ids),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsostaticroutestate", None),
+                *(SourceRow("netbox_nso_plugin.nsostaticroutestate", pk) for pk in overlay_ids),
+            ),
         ),
-        overlay_rows=(
-            SourceRow("netbox_nso_plugin.nsostaticroutestate", None),
-            *(SourceRow("netbox_nso_plugin.nsostaticroutestate", pk) for pk in overlay_ids),
-        ),
+        reported_route_ids,
     )
 
 
@@ -1165,26 +1172,16 @@ def _static_route_reconcile_plan(device, payload):
         from netbox_routing.models import StaticRoute
     except ImportError:
         StaticRoute = None
-    try:
-        from ipam.models import VRF
-    except ImportError:
-        VRF = None
-
     from . import signals
     from .intent_state import MutationFootprint, ReconcileMutationPlan
     from .models import NSODeviceManagement, NSOStaticRouteState
 
     if StaticRoute is None:
         return ReconcileMutationPlan(MutationFootprint())
-    footprint = _static_route_reconcile_footprint(device, payload)
+    footprint, reported_route_ids = _static_route_reconcile_footprint(device, payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return ReconcileMutationPlan(footprint)
-    reported_route_ids = set()
-    for entry in payload.get("routes") or []:
-        route, _created = _resolve_static_route(entry, StaticRoute, VRF, False, False, device, logger)
-        if route is not None:
-            reported_route_ids.add(route.pk)
     changes_content = (
         NSOStaticRouteState.objects.filter(
             signals.PUSHED_STATIC_ROUTE_FILTER,

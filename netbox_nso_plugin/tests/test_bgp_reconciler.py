@@ -933,17 +933,36 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         from django.test.utils import CaptureQueriesContext
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.intent_state import SourceRow
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         mgmt = self._make_mgmt()
-        peers = [self._peer_entry(f"10.0.2.{index}", remote_as=str(65200 + index)) for index in range(1, 5)]
+        peers = [
+            self._peer_entry(
+                f"10.0.2.{index}",
+                remote_as=str(65200 + index),
+                address_families=[
+                    {
+                        "af": "ipv4-unicast",
+                        "enabled": True,
+                        "routemap_in": "RM-BATCH",
+                        "prefixlist_out": "PL-BATCH",
+                    }
+                ],
+            )
+            for index in range(1, 5)
+        ]
         payload = self._payload(self._router_payload(peers=peers))
         _reconcile_bgp_config(self.device, payload)
         states = list(NSOBGPPeerState.objects.filter(management=mgmt).order_by("peer_address_str"))
         content_update(states[0], status="in_sync")
 
         one_peer = self._payload(self._router_payload(peers=peers[:1]))
-        bgp_reconcile_plan(self.device, one_peer)
+        plan = bgp_reconcile_plan(self.device, one_peer)
+        self.assertIn(("route-policy", "route_map:rm-batch"), plan.footprint.shared_keys)
+        self.assertIn(("route-policy", "prefix_list:pl-batch"), plan.footprint.shared_keys)
+        self.assertIn(SourceRow("netbox_routing.routemap", None), plan.footprint.source_rows)
+        self.assertIn(SourceRow("netbox_routing.prefixlist", None), plan.footprint.source_rows)
         with CaptureQueriesContext(connection) as one_queries:
             bgp_reconcile_plan(self.device, one_peer)
         for state in states[1:]:
@@ -952,6 +971,73 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             bgp_reconcile_plan(self.device, payload)
 
         self.assertEqual(len(four_queries), len(one_queries))
+
+    def test_plan_revalidates_a_missing_route_map_after_lock_acquisition(self):
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
+
+        self._make_mgmt()
+        payload = self._payload(
+            self._router_payload(
+                peers=[
+                    self._peer_entry(
+                        address_families=[
+                            {
+                                "af": "ipv4-unicast",
+                                "enabled": True,
+                                "routemap_in": "RM-RACE",
+                            }
+                        ]
+                    )
+                ]
+            )
+        )
+        plan = bgp_reconcile_plan(self.device, payload)
+        RouteMap.objects.create(name="RM-RACE")
+
+        with self.assertRaises(RendererTargetsChanged), reconcile_transaction(plan):
+            pass
+
+    def test_plan_locks_all_devices_that_share_a_route_map_without_expanding_revisions(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        self._make_mgmt()
+        other_device = _make_bgp_device("policy-target")
+        other_management = self._make_mgmt(other_device)
+        route_map = RouteMap.objects.create(name="RM-SHARED")
+        NSORoutePolicyState.objects.create(
+            management=other_management,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            family="route_map",
+            object_name=route_map.name,
+        )
+        payload = self._payload(
+            self._router_payload(
+                peers=[
+                    self._peer_entry(
+                        address_families=[
+                            {
+                                "af": "ipv4-unicast",
+                                "enabled": True,
+                                "routemap_in": route_map.name,
+                            }
+                        ]
+                    )
+                ]
+            )
+        )
+
+        footprint = bgp_reconcile_plan(self.device, payload).footprint
+
+        self.assertEqual(set(footprint.device_ids), {self.device.pk, other_device.pk})
+        self.assertEqual(set(footprint.revision_keys), {(self.device.pk, "bgp")})
 
     def test_plan_ignores_address_family_rows_owned_by_another_content_type(self):
         self._make_mgmt()
