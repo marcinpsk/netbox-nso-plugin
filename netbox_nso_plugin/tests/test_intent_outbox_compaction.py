@@ -347,6 +347,19 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         assert folded.queued == {}
         assert folded.lineage_carry == {4300: TRIPLE_A}, "O1.30(b)'s [A, C] lineage can no longer form"
 
+    def test_compaction_preserves_lineage_across_an_interleaved_repair(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4301, last_acked=TRIPLE_A, current=TRIPLE_A))
+        self.append(self.revoke_of(4301), kind=outbox.CONTRIBUTION_KIND_REPAIR)
+        self.append(self.delete_of(4301, last_acked=None, current=TRIPLE_C))
+
+        drain.compact(self.device.pk, "static_route")
+
+        folded = outbox.fold_transitions(self.transitions())
+        assert folded.lineage_carry == {4301: TRIPLE_A}
+        assert folded.queued[4301]["triples"] == [TRIPLE_C]
+
     def test_a_string_route_id_reuses_the_integer_route_lineage_when_reducing(self):
         from netbox_nso_plugin import drain, outbox
 

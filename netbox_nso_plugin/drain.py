@@ -42,7 +42,6 @@ from .deployment import guarded as _deployment_guarded
 from .deployment import operation as _deployment_operation
 from .outbox import (
     CONTRIBUTION_KIND_ORDINARY,
-    CONTRIBUTION_KIND_REPAIR,
     OP_REVOKE,
     advance_push_seq,
     allocate_push_seq,
@@ -723,19 +722,28 @@ def _compact_locked(device_id, scope) -> int:
     state = _lock_state(device_id, scope)
     held = {int(record["route_id"]) for record in state.claim_deletions or []}
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
-    compactable = [row for row in rows if _compactable(row, held)]
-    partitions = (
-        [row for row in compactable if row.kind == CONTRIBUTION_KIND_ORDINARY],
-        [row for row in compactable if row.kind == CONTRIBUTION_KIND_REPAIR],
-    )
+    spans = []
+    current = []
+    for row in rows:
+        row_is_compactable = _compactable(row, held)
+        if not row_is_compactable or (current and row.kind != current[-1].kind):
+            if current:
+                spans.append(current)
+            current = []
+        if row_is_compactable:
+            current.append(row)
+    if current:
+        spans.append(current)
+
     retired_count = 0
-    for inputs in partitions:
+    for inputs in spans:
         if len(inputs) < 2:
             continue
 
-        # The HIGHEST-id input, updated in place. A minted row would take an id above anything
-        # that committed while this ran, so the later fold would apply that entry's transition
-        # before the compacted one and reverse the real order.
+        # Compact only contiguous rows of one kind. Crossing a repair or held row would move
+        # transitions across it and could discard lineage that the interleaved row carries.
+        # Update the HIGHEST-id input in place. A minted row would take an id above anything
+        # that committed while this ran and reverse the real order during the later fold.
         survivor, retired = inputs[-1], [row.pk for row in inputs[:-1]]
         mark, mark_any = _contribution_marks(inputs)
         updated = NSOIntentOutboxEntry.objects.filter(pk=survivor.pk, consumed_by_push_seq__isnull=True).update(
