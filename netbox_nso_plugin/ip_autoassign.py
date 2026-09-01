@@ -572,62 +572,68 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     from .models import NSOInterfaceIPState
     from .signals import _schedule_intent_push
 
-    available_str = pool.get_first_available_ip()
-    if available_str is None:
-        result["errors"].append(
-            {
-                "interface": str(interface),
-                "family": family,
-                "reason": f"Pool {pool} is exhausted (no available IPs)",
-            }
-        )
-        return
-
     # One transaction, so the reservation, the overlay and the outbox entry they schedule
     # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
+    failed_step = None
     try:
         with intent_transaction(_ip_allocation_footprint(mgmt)):
-            failed_step = "IPAddress"
-            try:
-                with transaction.atomic():
-                    # Reserve the IPAddress so concurrent allocations do not collide.
-                    ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
-                    ip_obj.assigned_object = interface
-                    ip_obj.save()
-
-                    vrf_name = pool.vrf.name if pool.vrf else ""
-                    failed_step = "NSOInterfaceIPState"
-                    state, _ = NSOInterfaceIPState.objects.update_or_create(
-                        interface=interface,
-                        address=available_str,
-                        vrf=vrf_name,
-                        defaults={
-                            "family": family,
-                            "status": "accepted",
-                            "auto_assigned": True,
-                            "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_SINGLE,
-                            "source_pool": pool,
-                            "accepted_at": timezone.now(),
-                        },
-                    )
-            except Exception as exc:
-                result["errors"].append(
+            if _single_family_occupied(interface, family):
+                result["skipped"].append(
                     {
                         "interface": str(interface),
                         "family": family,
-                        "reason": f"Failed to create {failed_step}: {exc}",
+                        "reason": "Already has a managed IP in this family",
                     }
                 )
                 return
 
+            failed_step = "IPAddress"
+            available_str = pool.get_first_available_ip()
+            if available_str is None:
+                result["errors"].append(
+                    {
+                        "interface": str(interface),
+                        "family": family,
+                        "reason": f"Pool {pool} is exhausted (no available IPs)",
+                    }
+                )
+                return
+
+            with transaction.atomic():
+                # Reserve the IPAddress so concurrent allocations do not collide.
+                ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
+                ip_obj.assigned_object = interface
+                ip_obj.save()
+
+                vrf_name = pool.vrf.name if pool.vrf else ""
+                failed_step = "NSOInterfaceIPState"
+                state, _ = NSOInterfaceIPState.objects.update_or_create(
+                    interface=interface,
+                    address=available_str,
+                    vrf=vrf_name,
+                    defaults={
+                        "family": family,
+                        "status": "accepted",
+                        "auto_assigned": True,
+                        "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_SINGLE,
+                        "source_pool": pool,
+                        "accepted_at": timezone.now(),
+                    },
+                )
+
+            failed_step = None
             if push:
                 _schedule_intent_push((mgmt.device_id, "ip"))
     except Exception as exc:
+        if failed_step is not None:
+            reason = f"Failed to create {failed_step}: {exc}"
+        else:
+            reason = f"Failed to schedule the IP intent push: {exc}"
         result["errors"].append(
             {
                 "interface": str(interface),
                 "family": family,
-                "reason": f"Failed to schedule the IP intent push: {exc}",
+                "reason": reason,
             }
         )
         return

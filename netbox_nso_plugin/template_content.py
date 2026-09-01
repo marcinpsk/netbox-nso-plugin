@@ -792,7 +792,7 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
                 status=state.status,
                 **{f: getattr(state, f) for f in dev},
             ),
-            status=sm.on_reconcile(state.status, matches=matches),
+            status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
             last_sync_at=now,
         )
         if state is None:
@@ -1191,6 +1191,13 @@ def _static_route_reconcile_plan(device, payload):
         .exclude(static_route_id__in=reported_route_ids)
         .exists()
     )
+    if not changes_content and _adapter_setting("static_route_auto_create"):
+        owned_reported_route_ids = NSOStaticRouteState.objects.filter(
+            signals.PUSHED_STATIC_ROUTE_FILTER,
+            management=management,
+            static_route_id__in=reported_route_ids,
+        ).values_list("static_route_id", flat=True)
+        changes_content = StaticRoute.objects.filter(pk__in=owned_reported_route_ids).exclude(devices=device).exists()
     return ReconcileMutationPlan(footprint, changes_content=changes_content)
 
 

@@ -340,11 +340,31 @@ class TestOptionalRoutingDependencyPlans(TestCase):
 
         device, _management = _make("missing-routing")
         empty_plan = ReconcileMutationPlan(MutationFootprint())
+        bgp_payload = {
+            "routers": [
+                {
+                    "asn": "64512",
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "peers": [{"peer_address": "198.18.0.1", "remote_as": "64513"}],
+                        }
+                    ],
+                }
+            ]
+        }
         planners = (
-            (bgp_reconcile_plan, {}),
+            (bgp_reconcile_plan, bgp_payload),
             (route_policy_reconcile_plan, {"prefix_lists": [{"name": "PL", "entries": []}]}),
-            (_static_route_reconcile_plan, {"routes": []}),
+            (
+                _static_route_reconcile_plan,
+                {"routes": [{"prefix": "198.18.0.0/15", "next_hop": "198.18.0.1", "metric": 1}]},
+            ),
         )
+
+        for planner, payload in planners:
+            with self.subTest(control=planner.__name__):
+                self.assertNotEqual(planner(device, payload), empty_plan)
 
         with patch.dict(sys.modules, {"netbox_routing.models": None}):
             for planner, payload in planners:

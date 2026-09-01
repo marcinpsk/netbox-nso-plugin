@@ -188,7 +188,7 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
         # unknown result stands the backstop down, which removes this test's premise.
         self.adapter.store.add_device(nso_instance="se-idle-inst", nso_device_name="nso-se-idle", device_id=63)
         sr = _route("10.39.0.0/16", "10.39.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=121)
+        state = _own(sr, mgmt, generation=121, orphan=True)
         _stale_clock(state)
 
         with _repair_before_the_lock(mgmt.pk, 63):
@@ -267,7 +267,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
         mgmt = _make_mgmt(device, "nopush", 42)
         self.adapter.store.add_device(nso_instance="se-nopush-inst", nso_device_name="nso-se-nopush", device_id=42)
         sr = _route("10.36.0.0/16", "10.36.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=112)
+        state = _own(sr, mgmt, generation=112, orphan=True)
         _stale_clock(state)
         # An empty feed: drained, so the backstop may judge, and nothing else can push.
         # The worker that runs this has never pushed for this device, so its change-detection

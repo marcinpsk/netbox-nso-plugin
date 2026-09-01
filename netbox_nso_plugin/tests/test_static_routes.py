@@ -233,6 +233,22 @@ class TestReconcileStaticRoutes(TestCase):
 
         self.assertEqual(NSOStaticRouteState.objects.filter(status="changed").count(), 1)
 
+    def test_plan_marks_an_auto_created_device_membership_as_content(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+
+        management = self._make_mgmt(self.device, nso_device_name="sr-plan-membership")
+        route = StaticRoute.objects.create(prefix="198.18.44.0/24", next_hop="198.18.0.44", metric=1)
+        NSOStaticRouteState.objects.create(management=management, static_route=route, status="in_sync")
+        payload = self._route_payload(self._route_entry(str(route.prefix), str(route.next_hop)))
+
+        with self._auto_create_ctx(True):
+            plan = _static_route_reconcile_plan(self.device, payload)
+
+        self.assertTrue(plan.changes_content)
+
     def test_nokia_omitted_preference_seeds_its_ned_default(self):
         """Nokia's omitted next-hop preference is 5, not StaticRoute's default 1."""
         from netbox_routing.models import StaticRoute

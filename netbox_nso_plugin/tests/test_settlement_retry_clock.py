@@ -176,6 +176,25 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
 
         self._settle_after_repair("reonboard", 3, 300, 1, seed=seed)
 
+    def test_a_drained_result_for_the_old_adapter_id_does_not_settle_attempts(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.settlement import ConsumeResult, sweep_static_route_settlements
+
+        device = _make_device("remapped-after-drain")
+        mgmt = _make_mgmt(device, "remapped-after-drain", 70)
+        route = _route("198.18.70.0/24", "198.18.0.70", devices=[device])
+        _own(route, mgmt, generation=270)
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=71)
+        old_epoch = ConsumeResult(70, 1, False, False, False, 1, drained=True)
+
+        with (
+            patch("netbox_nso_plugin.settlement.settle_static_routes", return_value=old_epoch),
+            patch("netbox_nso_plugin.apply_settlement.settle_device_apply_attempts") as settle_attempts,
+        ):
+            self.assertEqual(sweep_static_route_settlements(), (1, 0))
+
+        settle_attempts.assert_not_called()
+
 
 class TestTheRepairCapRotates(_SettlementCase):
     """S5.6d — a bounded loop over a fleet needs a durable least-recently-attempted order."""
@@ -262,7 +281,7 @@ class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
             device_id=15,
         )
         sr = _route("10.46.0.0/16", "10.46.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=207, expected=False)
+        state = _own(sr, mgmt, generation=207, expected=False, orphan=True)
         _stale_clock(state)
         self.adapter.store.terminal_job(15, results=[_result(sr.pk, 207)])
         self.adapter.store.intent_status = 503  # this result can never be correlated

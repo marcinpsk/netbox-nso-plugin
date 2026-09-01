@@ -2345,6 +2345,7 @@ class TestNSOBulkAcceptView(ViewTestBase):
 
         self.assertEqual(response.status_code, 302)
         self.iface_state.refresh_from_db()
+        self.assertEqual(self.iface_state.status, "accepted")
         self.assertEqual(self.iface_state.accepted_at, original)
 
 

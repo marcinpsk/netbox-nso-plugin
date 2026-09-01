@@ -134,8 +134,12 @@ def sweep_static_route_settlements() -> tuple[int, int]:
             if outcome.drained and outcome.adapter_device_id is not None:
                 from .apply_settlement import settle_device_apply_attempts
 
-                management = NSODeviceManagement.objects.get(pk=pk)
-                settle_device_apply_attempts(management, static_route_feed_drained=True)
+                management = NSODeviceManagement.objects.filter(
+                    pk=pk,
+                    adapter_device_id=outcome.adapter_device_id,
+                ).first()
+                if management is not None:
+                    settle_device_apply_attempts(management, static_route_feed_drained=True)
         except Exception:  # noqa: BLE001 — one device's adapter must not abort the fleet sweep
             logger.exception("static-route settlement sweep failed for management row %s", pk)
             failed += 1

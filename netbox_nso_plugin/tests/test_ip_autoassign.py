@@ -219,11 +219,13 @@ class TestAutoAssignIP(TestCase):
         from django.db import IntegrityError
 
         from netbox_nso_plugin.ip_autoassign import _reserve_single
-        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOInterfaceIPState
 
         pool = Prefix.objects.get(pk=self.pool_lo4.pk)
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback151", type="virtual")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        before = revision.revision
         result = {"allocated": [], "errors": [], "skipped": []}
         with (
             patch.object(NSOInterfaceIPState.objects, "update_or_create", side_effect=IntegrityError("duplicate")),
@@ -234,7 +236,38 @@ class TestAutoAssignIP(TestCase):
         assert result["errors"]
         assert "Failed to create NSOInterfaceIPState" in result["errors"][0]["reason"]
         assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
+        revision.refresh_from_db()
+        assert revision.revision == before, "a failed reservation committed an intent revision"
         delete.assert_not_called()
+
+    def test_reserve_single_rechecks_fill_empty_under_the_intent_lock(self):
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback153", type="virtual")
+        existing = NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="10.100.0.99/24",
+            family="ipv4",
+            status="accepted",
+        )
+        result = {"allocated": [], "errors": [], "skipped": []}
+
+        _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
+
+        assert result["allocated"] == []
+        assert result["errors"] == []
+        assert result["skipped"] == [
+            {
+                "interface": str(iface),
+                "family": "ipv4",
+                "reason": "Already has a managed IP in this family",
+            }
+        ]
+        assert list(NSOInterfaceIPState.objects.filter(interface=iface)) == [existing]
+        assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
 
     def test_push_schedule_failure_rolls_back_the_reservation(self):
         from netbox_nso_plugin.ip_autoassign import _reserve_single

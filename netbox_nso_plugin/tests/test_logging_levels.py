@@ -457,7 +457,7 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
     covers gate-off failures for every deploying overlay.
     """
 
-    def test_deploying_row_settles_in_sync_when_device_matches(self):
+    def test_deploying_row_waits_for_attempt_evidence_when_device_matches(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         row = self._row(
@@ -470,7 +470,8 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
             self.device, {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
         )
         row.refresh_from_db()
-        self.assertEqual(row.status, "in_sync")
+        self.assertEqual(row.status, "deploying")
+        self.assertIsNotNone(row.apply_attempt_id)
 
 
 class TestLoggingLevelsInlineClearGuard(LevelsTestBase):

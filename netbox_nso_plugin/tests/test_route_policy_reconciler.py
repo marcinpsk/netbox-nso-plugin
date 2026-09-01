@@ -154,6 +154,7 @@ class TestReconcileRoutePolicy(TestCase):
         reconcile_route_policy(self.device, self._payload())  # object still present → settle
         st.refresh_from_db()
         self.assertEqual(st.status, "in_sync")
+        self.assertIsNone(st.apply_attempt_id)
 
     def test_reconciles_all_families(self):
         """One object per family → created in netbox_routing + a state row each."""
