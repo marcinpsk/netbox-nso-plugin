@@ -11,7 +11,7 @@ import threading
 from collections import namedtuple
 
 from django.db.models import Q
-from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
+from django.db.models.signals import m2m_changed, post_delete, post_init, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
@@ -263,6 +263,31 @@ def _clear_management_teardown(sender, instance, **kwargs):
     from . import outbox
 
     outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
+
+
+def _capture_intent_field_change(sender, instance, *, scope, **kwargs):
+    """Compare wire-visible fields before a save so its post-save hook can re-pend safely."""
+    from .apply_state import capture_intent_field_change
+
+    instance._nso_intent_previous_status = None
+    instance._nso_intent_forced_status = None
+    if _is_intent_push_suppressed() or _is_render_request():
+        return
+    capture_intent_field_change(instance, scope, update_fields=kwargs.get("update_fields"))
+
+
+def _remember_intent_status(sender, instance, **kwargs):
+    """Track the status this instance loaded or most recently persisted."""
+    from .apply_state import remember_loaded_status
+
+    remember_loaded_status(instance)
+
+
+def _finalise_intent_field_change(sender, instance, *, scope, **kwargs):
+    """Persist lifecycle changes even when the caller excluded status from its save."""
+    from .apply_state import repend_changed_row
+
+    repend_changed_row(instance, scope)
 
 
 def _schedule_intent_push(key, transitions=()) -> None:
@@ -818,7 +843,13 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         # Surface the failure on the row instead of only logging it: otherwise the device looks
         # managed in NetBox while silently unlinked from the adapter (adapter_device_id stays None),
         # with nothing mirrored/applied and no operator-visible signal. .update() avoids recursion.
-        message = str(exc) or repr(exc)
+        from .adapter_client import public_error_message
+
+        message = (
+            public_error_message(exc)
+            if isinstance(exc, AdapterError)
+            else "The adapter link failed. See the server log."
+        )
         instance.adapter_link_error = message
         # Persist for the tab banner ONLY if the failure didn't already break the surrounding
         # transaction: a DB-origin error in the try (e.g. a bad adapter response fed into the
@@ -1011,7 +1042,7 @@ def _recompute_on_interface_save(sender, instance, created, **kwargs):
 
 
 def _stash_interface_old_values(sender, instance, **kwargs):
-    """Capture pre-save description/enabled for the Decision-G edit signal.
+    """Capture and lock native interface fields rendered by intent.
 
     Lets :func:`_push_intent_on_interface_edit` tell which attribute the operator
     actually changed. Without it, every save would promote *every* managed attribute
@@ -1020,8 +1051,86 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     """
     if not instance.pk:
         instance._nso_old_values = None
+        instance._nso_name_intent_rows = {}
+        instance._nso_name_intent_management = None
         return
-    instance._nso_old_values = sender.objects.filter(pk=instance.pk).values("description", "enabled").first()
+    fields = ("name", "description", "enabled")
+    instance._nso_old_values = sender.objects.filter(pk=instance.pk).values(*fields).first()
+    instance._nso_name_intent_rows = {}
+    instance._nso_name_intent_management = None
+    update_fields = kwargs.get("update_fields")
+    if (
+        _is_intent_push_suppressed()
+        or _is_render_request()
+        or _is_adapter_origin_write()
+        or (update_fields is not None and "name" not in update_fields)
+    ):
+        return
+
+    from .apply_state import DeferredIntentFieldStale, lock_interface_intent_rows
+
+    locked, management, rows = lock_interface_intent_rows(instance.pk)
+    if locked is None or management is None or not any(rows.values()):
+        return
+    current = {field: getattr(locked, field) for field in fields}
+    instance._nso_old_values = current
+    loaded_name = getattr(instance, "_nso_loaded_interface_name", None)
+    if loaded_name is None:
+        deferred_name = instance.__dict__.get("name", current["name"])
+        if deferred_name != current["name"]:
+            raise DeferredIntentFieldStale("deferred interface name changed before save")
+        loaded_name = current["name"]
+        if "name" not in instance.__dict__:
+            instance.name = current["name"]
+    if loaded_name != current["name"] and instance.name == loaded_name:
+        instance.name = current["name"]
+        return
+    if instance.name != current["name"]:
+        instance._nso_name_intent_rows = rows
+        instance._nso_name_intent_management = management
+
+
+@_skip_on_render
+def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
+    """Re-pend each Apply scope whose payload contains a renamed interface."""
+    if created:
+        return
+    rows = getattr(instance, "_nso_name_intent_rows", {})
+    management = getattr(instance, "_nso_name_intent_management", None)
+    if management is None or not any(rows.values()):
+        return
+
+    from . import delivery
+    from . import status_machine as sm
+
+    targets = set()
+    with suppress_intent_push():
+        for scope, states in rows.items():
+            for state in states:
+                was_owned = sm.is_owned(state.status)
+                new_status = (
+                    "accepted"
+                    if state.status == "deploying"
+                    else sm.on_reconcile(
+                        state.status,
+                        matches=False,
+                    )
+                )
+                if new_status != state.status:
+                    state.status = new_status
+                    state.save(update_fields=["status"])
+                entry = delivery.delivery_keys()[scope]
+                may_deliver = entry.in_protocol or management.auto_apply
+                if was_owned and management.adapter_device_id is not None and may_deliver:
+                    targets.add((management.device_id, scope))
+    for key in sorted(targets):
+        _schedule_intent_push(key)
+
+
+def _remember_interface_name(sender, instance, **kwargs):
+    """Record the native name represented by this interface instance."""
+    if "name" in instance.__dict__:
+        instance._nso_loaded_interface_name = instance.__dict__["name"]
 
 
 @_skip_on_render
@@ -1599,7 +1708,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOVLANState
-    from .vlan_reconciler import is_placeholder_vlan_name
+    from .vlan_reconciler import rendered_vlan_name
 
     vlans = []
     for row in NSOVLANState.objects.filter(
@@ -1608,11 +1717,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     ).select_related("vlan"):
         if row.vlan is None:
             continue
-        # A nameless device VLAN was imported under a fabricated "VLAN <vid>" placeholder
-        # (NetBox cannot hold two name='' VLANs in one group). Pushing it verbatim would
-        # write a name the device never had; the writer omits the name when it is empty.
-        name = "" if is_placeholder_vlan_name(row) else (row.vlan.name or "")
-        vlans.append({"vlan_id": row.vlan.vid, "name": name})
+        vlans.append({"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row)})
 
     _push_changed(
         (device_id, "vlan"),
@@ -1639,29 +1744,106 @@ def _on_vlan_state_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
-def _on_vlan_change(sender, instance, **kwargs):
-    """Surface a NetBox VLAN rename as overlay drift immediately (visibility only).
+def _on_vlan_pre_save(sender, instance, **kwargs):
+    """Lock and record changes to fields rendered by VLAN or SVI intent.
 
-    Renaming an ``ipam.VLAN`` fires no NSOVLANState signal, so the overlay would
-    otherwise sit at a stale ``in_sync``/``imported`` until the next full reconcile.
-    Re-evaluate each linked overlay's drift here (the editable value is the VLAN
-    name, compared against the device-observed name) so a rename shows as ``changed``
-    (unowned) / re-pends to ``accepted`` (owned) right away — and renaming back to the
-    device value clears the drift. The device push still happens on Apply (force-push),
-    so this stays side-effect free under suppress_intent_push().
+    A VID-only save can require a new fabricated display name while ``update_fields``
+    excludes ``name``. The direct update keeps that derived placeholder consistent without
+    recording it as a separate operator edit. Adding ``name`` to the captured changed fields
+    makes the post-save path re-pend every affected intent row.
     """
-    from . import status_machine as sm
-
-    states = list(instance.nso_vlan_states.all())
-    if not states:
+    update_fields = kwargs.get("update_fields")
+    candidate_fields = {"name", "vid"}
+    if update_fields is not None:
+        candidate_fields.intersection_update(update_fields)
+    instance._nso_vlan_changed_fields = frozenset()
+    instance._nso_vlan_intent_rows = {}
+    if instance._state.adding or not candidate_fields:
         return
+
+    from .apply_state import lock_vlan_intent_rows
+
+    scopes = ("vlan", "svi", "switchport") if "vid" in candidate_fields else ("vlan",)
+    locked_vlan, rows = lock_vlan_intent_rows(instance.pk, scopes)
+    if locked_vlan is None:
+        return
+    changed_fields = {field for field in candidate_fields if getattr(locked_vlan, field) != getattr(instance, field)}
+    if "vid" in changed_fields and "name" not in changed_fields and rows.get("vlan"):
+        from .vlan_reconciler import placeholder_vlan_name
+
+        display_placeholder = locked_vlan.name == placeholder_vlan_name(locked_vlan.vid) and all(
+            not state.device_name for state in rows["vlan"]
+        )
+        derived_name = placeholder_vlan_name(instance.vid)
+        name_taken = (
+            locked_vlan.group_id is not None
+            and sender.objects.filter(
+                group_id=locked_vlan.group_id,
+                name=derived_name,
+            )
+            .exclude(pk=instance.pk)
+            .exists()
+        ) or (
+            locked_vlan.qinq_svlan_id is not None
+            and sender.objects.filter(
+                qinq_svlan_id=locked_vlan.qinq_svlan_id,
+                name=derived_name,
+            )
+            .exclude(pk=instance.pk)
+            .exists()
+        )
+        if display_placeholder and not name_taken:
+            instance.name = derived_name
+            if update_fields is not None and "name" not in update_fields:
+                sender.objects.filter(pk=instance.pk).update(name=instance.name)
+            changed_fields.add("name")
+    instance._nso_vlan_changed_fields = frozenset(changed_fields)
+    instance._nso_vlan_intent_rows = rows
+
+
+@_skip_on_render
+def _on_vlan_change(sender, instance, **kwargs):
+    """Surface a NetBox VLAN intent change and queue each affected snapshot.
+
+    Editing an ``ipam.VLAN`` fires no NSOVLANState signal, so the overlay would
+    otherwise sit at a stale ``in_sync``/``imported`` until the next full reconcile.
+    A name change affects VLAN intent. A VID change affects VLAN, SVI, and switchport intent.
+    The pre-save locks serialize these shared native fields with Apply promotion.
+    """
+    changed_fields = getattr(instance, "_nso_vlan_changed_fields", frozenset())
+    if not changed_fields:
+        return
+
+    from . import delivery
+    from . import status_machine as sm
+    from .vlan_reconciler import is_placeholder_vlan_name
+
+    rows = getattr(instance, "_nso_vlan_intent_rows", {})
+    vid_changed = "vid" in changed_fields
+    targets = set()
     with suppress_intent_push():
-        for state in states:
-            matches = (not state.device_name) or instance.name == state.device_name
-            new_status = sm.on_reconcile(state.status, matches=matches)
-            if new_status != state.status:
-                state.status = new_status
-                state.save(update_fields=["status"])
+        for scope, states in rows.items():
+            if scope in ("svi", "switchport") and not vid_changed:
+                continue
+            for state in states:
+                was_owned = sm.is_owned(state.status)
+                matches = False
+                if scope == "vlan" and not vid_changed:
+                    matches = instance.name == state.device_name or (
+                        not state.device_name and is_placeholder_vlan_name(state)
+                    )
+                new_status = (
+                    "accepted" if state.status == "deploying" else sm.on_reconcile(state.status, matches=matches)
+                )
+                if new_status != state.status:
+                    state.status = new_status
+                    state.save(update_fields=["status"])
+                entry = delivery.delivery_keys()[scope]
+                may_deliver = entry.in_protocol or state.management.auto_apply
+                if was_owned and state.management.adapter_device_id is not None and may_deliver:
+                    targets.add((state.management.device_id, scope))
+    for key in sorted(targets):
+        _schedule_intent_push(key)
 
 
 @_skip_on_render
@@ -2010,6 +2192,24 @@ def _on_static_route_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "static_route"))
 
 
+@_skip_on_render
+def _on_static_route_state_delete(sender, instance, **kwargs):
+    """Push a reduced static-route snapshot with this row's deletion authority."""
+    from .models import NSODeviceManagement
+
+    if instance.status not in _OWNED_PUSH_STATUSES:
+        return
+    try:
+        mgmt = instance.management
+    except NSODeviceManagement.DoesNotExist:
+        return
+    if mgmt.adapter_device_id is None:
+        return
+
+    transition = _static_route_delete_transition(instance, instance.static_route_id)
+    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=[transition])
+
+
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
 #
 # The reconcile path only ever creates an NSOStaticRouteState overlay for a route the
@@ -2191,6 +2391,9 @@ def _accept_static_route_for_device(static_route, device) -> None:
     state.nso_prefix = str(static_route.prefix or "")
     state.nso_next_hop = str(static_route.next_hop or "")
     state.last_sync_at = timezone.now()
+    from .apply_state import mark_explicit_accept
+
+    mark_explicit_accept(state)
     state.save()  # → _on_static_route_state_save schedules the push
     if not was_owned:
         from . import outbox
@@ -2202,7 +2405,7 @@ def _accept_static_route_for_device(static_route, device) -> None:
         _schedule_intent_push((device_id, "static_route"), transitions=[outbox.revoke_transition(static_route.pk)])
 
 
-def _static_route_delete_transition(row, static_route):
+def _static_route_delete_transition(row, static_route_id):
     """Record what is leaving, from the overlay that still mirrors it.
 
     The lineage leads with the triple the adapter last ACKNOWLEDGED, because a content edit
@@ -2212,7 +2415,7 @@ def _static_route_delete_transition(row, static_route):
     from . import outbox
 
     return outbox.delete_transition(
-        static_route.pk,
+        static_route_id,
         last_acked=row.last_acked_triple,
         current=outbox.triple_of(row.nso_vrf, row.nso_prefix, row.nso_next_hop),
     )
@@ -2229,11 +2432,7 @@ def _remove_static_route_for_device(static_route, device) -> None:
     if mgmt.adapter_device_id is None:
         return
     rows = NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route)
-    # Captured here because this is the last moment the mirror is alive: the next statement
-    # deletes it, and a removed route's content cannot be re-rendered from anything else.
-    transitions = [_static_route_delete_transition(row, static_route) for row in rows]
     rows.delete()
-    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=transitions)
 
 
 def _on_routing_static_route_pre_save(sender, instance, **kwargs):
@@ -3600,6 +3799,9 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
         # imported / unknown — device matches NetBox (no drift) → safe to adopt.
         state.content_type, state.object_id = ct, obj.pk
         state.status, state.accepted_at = "accepted", now
+        from .apply_state import mark_explicit_accept
+
+        mark_explicit_accept(state)
         state.save()
     return CascadeResult(drifted=drifted, cross_device=cross_device)
 
@@ -3607,27 +3809,32 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
 def _accept_route_policy_object(obj) -> None:
     """Re-own + push every OWNED overlay attached to a saved route-policy object."""
     from django.contrib.contenttypes.models import ContentType
+    from django.db import transaction
 
     from .models import NSORoutePolicyState
 
     is_route_map = hasattr(obj, "route_map_entries")
     ct = ContentType.objects.get_for_model(type(obj))
-    states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
-    for state in states:
-        mgmt = state.management
-        if mgmt.adapter_device_id is None:
-            continue
-        # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
-        # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
-        if state.status not in _OWNED_PUSH_STATUSES:
-            continue
-        if state.status != "accepted":
-            state.status = "accepted"
-        state.last_sync_at = timezone.now()
-        state.save()  # → _on_route_policy_state_save schedules the intent push
-        if is_route_map:
-            # Owning a route-map owns its contributors (else dangling device references).
-            _own_route_map_contributors(mgmt, obj)
+    with transaction.atomic():
+        states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
+        for state in states:
+            mgmt = state.management
+            if mgmt.adapter_device_id is None:
+                continue
+            # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
+            # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
+            if state.status not in _OWNED_PUSH_STATUSES:
+                continue
+            if state.status != "accepted":
+                state.status = "accepted"
+            state.last_sync_at = timezone.now()
+            from .apply_state import mark_explicit_accept
+
+            mark_explicit_accept(state)
+            state.save()  # → _on_route_policy_state_save schedules the intent push
+            if is_route_map:
+                # Owning a route-map owns its contributors (else dangling device references).
+                _own_route_map_contributors(mgmt, obj)
 
 
 @_skip_on_render
@@ -4063,6 +4270,11 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_iface_stash_old_values",
     )
     post_save.connect(
+        _repend_intent_on_interface_rename,
+        sender=Interface,
+        dispatch_uid="nso_plugin_iface_intent_name",
+    )
+    post_save.connect(
         _push_intent_on_interface_edit,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_g_activated",
@@ -4087,6 +4299,18 @@ def _connect_g_activated():  # pragma: no cover
         _create_greenfield_subif_state,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_greenfield_subif",
+    )
+    post_init.connect(
+        _remember_interface_name,
+        sender=Interface,
+        dispatch_uid="nso_plugin_iface_name_post_init",
+        weak=False,
+    )
+    post_save.connect(
+        _remember_interface_name,
+        sender=Interface,
+        dispatch_uid="nso_plugin_iface_name_post_save",
+        weak=False,
     )
     pre_save.connect(
         _on_ip_address_pre_save,
@@ -4226,6 +4450,11 @@ def _connect_g_activated():  # pragma: no cover
     # ipam.VLAN rename → overlay drift visibility (no NSOVLANState signal otherwise)
     from ipam.models import VLAN
 
+    pre_save.connect(
+        _on_vlan_pre_save,
+        sender=VLAN,
+        dispatch_uid="nso_plugin_ipam_vlan_pre_save",
+    )
     post_save.connect(
         _on_vlan_change,
         sender=VLAN,
@@ -4262,7 +4491,7 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_static_route_state_post_save",
     )
     post_delete.connect(
-        _as_delete_origin(_on_static_route_state_save),
+        _as_delete_origin(_on_static_route_state_delete),
         sender=NSOStaticRouteState,
         dispatch_uid="nso_plugin_static_route_state_post_delete",
         weak=False,
@@ -4402,6 +4631,45 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_route_policy_state_post_delete",
         weak=False,
     )
+
+    # Capture only wire-visible field changes before the post-save hooks run. Reconcile
+    # functions often call save() for status and timestamps; those writes must not detach a
+    # deploying row from its Apply. A real overlay edit still re-pends that exact row.
+    for scope, model in (
+        ("logging", NSOLoggingLevelState),
+        ("svi", NSOSVIState),
+        ("subinterface", NSOSubinterfaceState),
+        ("interface_mtu", NSOInterfaceMtuState),
+        ("vlan", NSOVLANState),
+        ("bfd", NSOBFDInterfaceState),
+        ("static_route", NSOStaticRouteState),
+        ("l2_sap", NSOL2SapState),
+        ("route_policy", NSORoutePolicyState),
+    ):
+        pre_save.connect(
+            functools.partial(_capture_intent_field_change, scope=scope),
+            sender=model,
+            dispatch_uid=f"nso_plugin_{scope}_intent_change_pre_save",
+            weak=False,
+        )
+        post_init.connect(
+            _remember_intent_status,
+            sender=model,
+            dispatch_uid=f"nso_plugin_{scope}_intent_status_post_init",
+            weak=False,
+        )
+        post_save.connect(
+            functools.partial(_finalise_intent_field_change, scope=scope),
+            sender=model,
+            dispatch_uid=f"nso_plugin_{scope}_intent_change_post_save",
+            weak=False,
+        )
+        post_save.connect(
+            _remember_intent_status,
+            sender=model,
+            dispatch_uid=f"nso_plugin_{scope}_intent_status_post_save",
+            weak=False,
+        )
 
     # netbox_routing policy object deletion → drop overlays + push removal (full-replace)
     try:

@@ -24,7 +24,7 @@ import uuid
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
@@ -1404,6 +1404,76 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
 
     def tearDown(self):
         self.conn.delete(self.key)
+
+    def test_publication_takes_the_device_intent_lock_before_running_the_body(self):
+        """Serialize reconciliation bodies with native intent edits before either writes."""
+        from netbox_nso_plugin import read_gate
+        from netbox_nso_plugin.apply_state import lock_device_intent_transaction
+        from netbox_nso_plugin.read_gate import RAN, gated_family_run
+
+        identity_checked = threading.Event()
+        intent_locked = threading.Event()
+        release_intent = threading.Event()
+        body_started = threading.Event()
+        errors = []
+        outcome = {}
+
+        original_identity_check = read_gate._publication_identity_current
+
+        def pause_after_identity_check(*args, **kwargs):
+            current = original_identity_check(*args, **kwargs)
+            identity_checked.set()
+            self.assertTrue(intent_locked.wait(20), "the competing writer did not lock device intent")
+            return current
+
+        def hold_intent():
+            try:
+                self.assertTrue(identity_checked.wait(20), "publication did not finish its identity check")
+                with transaction.atomic():
+                    lock_device_intent_transaction(self.mgmt.device_id)
+                    intent_locked.set()
+                    self.assertTrue(release_intent.wait(20), "publication did not inspect the lock order")
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                _close_thread_db()
+
+        def body():
+            body_started.set()
+
+        def publish():
+            try:
+                with patch.object(read_gate, "_publication_identity_current", side_effect=pause_after_identity_check):
+                    outcome["result"] = gated_family_run(
+                        self.mgmt,
+                        "bfd",
+                        _rs(attempt_id=5),
+                        body,
+                        epoch=self.epoch,
+                    )
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                _close_thread_db()
+
+        holder = threading.Thread(target=hold_intent)
+        publisher = threading.Thread(target=publish)
+        holder.start()
+        publisher.start()
+        try:
+            self.assertTrue(intent_locked.wait(20), "the competing writer did not lock device intent")
+            self.assertFalse(body_started.wait(1), "publication ran its body before it locked device intent")
+        finally:
+            release_intent.set()
+            holder.join(30)
+            publisher.join(30)
+
+        self.assertFalse(holder.is_alive())
+        self.assertFalse(publisher.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(outcome["result"].disposition, RAN)
+        self.assertTrue(body_started.is_set())
 
     def test_old_starts_new_finishes_old_resumes_cannot_overwrite(self):
         """A stalls with the lease past expiry; B (successor) applies attempt 6;

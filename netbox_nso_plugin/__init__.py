@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from netbox.plugins import PluginConfig
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 class NSOPluginConfig(PluginConfig):
@@ -15,6 +15,7 @@ class NSOPluginConfig(PluginConfig):
     base_url = "nso"
     min_version = "4.6.0"
     required_settings = []
+    middleware = ["netbox_nso_plugin.middleware.IntentDeploymentMiddleware"]
     default_settings = {
         "adapter_url": "",
         "adapter_token": "",

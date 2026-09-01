@@ -67,9 +67,10 @@ class SettlementStore:
         #: That page is the apply-activity probe, and it fails independently of the feed:
         #: a walk can drain while the probe times out.
         self.jobs_error_devices: set[int] = set()
+        self.generations: dict[int, list[dict]] = {}
         #: ids of jobs the ASCENDING page serves even though they hold no sequence: the
         #: feed contract broken the way only the adapter itself can break it
-        self.unsequenced_in_feed: set[str] = set()
+        self.unsequenced_in_feed: set[int] = set()
         #: every feed request the consumer made, as ``(device_id, after_settle_seq, limit)``
         self.feed_requests: list[tuple[int, int, int]] = []
         self.readback_requests: list[int] = []
@@ -102,7 +103,10 @@ class SettlementStore:
         if extra:
             result = {**(result or {}), **extra}
         return {
-            "id": f"job-{self._next_id}",
+            # An integer, like JobOut.id and DeviceGenerationOut.job_id in
+            # ../nso-adapter/tests/api/openapi_snapshot.json: the settlers pivot on job-id
+            # equality across those two surfaces and render the id into operator text.
+            "id": self._next_id,
             "type": job_type,
             "device_id": device_id,
             "status": status,
@@ -133,6 +137,40 @@ class SettlementStore:
         job = self._job(device_id, settle_seq=None, status="queued", results=None, job_type=job_type)
         self.jobs.append(job)
         return job
+
+    def add_generation(
+        self,
+        device_id: int,
+        *,
+        generation_id: int,
+        seq: int,
+        status: str,
+        job_id: int | None,
+        mode: str,
+        settlement_cohort: int | None,
+        digest: str,
+        stream_revisions: dict[str, int],
+        source_push_seq: dict[str, int | None],
+    ) -> dict:
+        """Add one complete device-generation response row."""
+        # Copied from ../nso-adapter/docs/api-contract.md, GET devices/{id}/generations.
+        # Required fields match ../nso-adapter/tests/api/openapi_snapshot.json, DeviceGenerationOut.
+        row = {
+            "generation_id": generation_id,
+            "seq": seq,
+            "status": status,
+            "job_id": job_id,
+            "mode": mode,
+            "settlement_cohort": settlement_cohort,
+            "digest": digest,
+            "stream_revisions": stream_revisions,
+            "source_push_seq": source_push_seq,
+            "created_at": "2026-08-12T09:15:00Z",
+            "updated_at": "2026-08-12T09:30:00Z",
+        }
+        self.generations.setdefault(device_id, []).append(row)
+        self.generations[device_id].sort(key=lambda generation: generation["seq"])
+        return row
 
     def unsequenced_job(self, device_id: int, *, results=None, job_type="apply") -> dict:
         """Add a TERMINAL job that the ascending feed serves with no sequence.
@@ -286,6 +324,18 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 rows = store.recent(int(device_id), limit)
             self._send(200, rows, headers={STORE_INCARNATION_HEADER: store.incarnation})
+            return
+
+        if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/generations"):
+            device_id = self._device_id_from_path(parsed)
+            if device_id not in store.devices:
+                self._send(404, {"error": {"code": "not_found", "message": "Device not found"}})
+                return
+            # Model the paginated contract: since_seq is exclusive, limit caps the page.
+            cursor = int(query.get("since_seq") or 0)
+            limit = int(query.get("limit") or 100)
+            rows = [row for row in store.generations.get(device_id, []) if row["seq"] > cursor]
+            self._send(200, rows[:limit])
             return
 
         if parsed.path.startswith("/api/v1/devices/") and parsed.path.endswith("/static-route-intent"):

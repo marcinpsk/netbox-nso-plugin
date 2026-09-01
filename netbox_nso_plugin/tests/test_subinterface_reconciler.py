@@ -187,6 +187,9 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
                 "status": status,
             },
         )
+        if state.status != status:
+            NSOSubinterfaceState.objects.filter(pk=state.pk).update(status=status)
+            state.status = status
         return state
 
     def test_reconcile_preserves_owned_status(self):

@@ -156,16 +156,13 @@ class TestOnLacpStateSave(_LacpBase):
     def test_save_triggers_intent_push_in_auto_apply(self):
         """In auto-apply mode, accept commits to the device immediately."""
         from netbox_nso_plugin.models import NSOLACPBundleState
-        from netbox_nso_plugin.signals import _on_lacp_state_save
 
         mgmt = self._make_mgmt(auto_apply=True)
-        # Unsaved instance (mirrors the L2 SAP signal test) so the real post_save
-        # doesn't schedule a push outside the captured on-commit block.
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
             with self.captureOnCommitCallbacks(execute=True):
-                _on_lacp_state_save(sender=NSOLACPBundleState, instance=bundle)
+                bundle.save()
             mock_apply.assert_called_once()
             assert mock_apply.call_args[0][0] == mgmt.adapter_device_id
 
@@ -173,19 +170,17 @@ class TestOnLacpStateSave(_LacpBase):
         """Default (deferred) flow: accept marks owned but does NOT commit — the
         single device Apply commits later."""
         from netbox_nso_plugin.models import NSOLACPBundleState
-        from netbox_nso_plugin.signals import _on_lacp_state_save
 
         mgmt = self._make_mgmt(auto_apply=False)
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
             with self.captureOnCommitCallbacks(execute=True):
-                _on_lacp_state_save(sender=NSOLACPBundleState, instance=bundle)
+                bundle.save()
             mock_apply.assert_not_called()
 
     def test_no_push_without_adapter_device_id(self):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOLACPBundleState
-        from netbox_nso_plugin.signals import _on_lacp_state_save
 
         inst, _ = NSOInstance.objects.get_or_create(
             name="lacp-noid-inst", defaults={"adapter_instance_id": "lacp-noid-inst"}
@@ -201,7 +196,8 @@ class TestOnLacpStateSave(_LacpBase):
         bundle = NSOLACPBundleState(management=mgmt, interface=lag, lag_id=1, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
-            _on_lacp_state_save(sender=NSOLACPBundleState, instance=bundle)
+            with self.captureOnCommitCallbacks(execute=True):
+                bundle.save()
             mock_apply.assert_not_called()
 
 

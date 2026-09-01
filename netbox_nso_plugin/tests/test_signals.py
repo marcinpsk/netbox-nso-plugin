@@ -103,6 +103,83 @@ class _SignalDBBase(IntentPushDeliveryMixin, TestCase):
         return state
 
 
+class TestDeferredSignalMarkers(_SignalDBBase):
+    def test_interface_post_init_does_not_load_a_deferred_name(self):
+        from dcim.models import Interface
+
+        with self.assertNumQueries(1):
+            interface = Interface.objects.only("pk").get(pk=self.iface.pk)
+
+        self.assertNotIn("_nso_loaded_interface_name", interface.__dict__)
+
+    def test_overlay_post_init_does_not_load_a_deferred_status(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        management = self._make_mgmt()
+        vlan = VLAN.objects.create(vid=409, name="deferred-status")
+        with suppress_intent_push():
+            state = NSOVLANState.objects.create(
+                management=management,
+                vlan=vlan,
+                device_name=vlan.name,
+                status="imported",
+            )
+
+        with self.assertNumQueries(1):
+            deferred = NSOVLANState.objects.only("pk").get(pk=state.pk)
+
+        self.assertNotIn("_nso_loaded_status", deferred.__dict__)
+
+    def test_a_lazy_deferred_interface_name_cannot_overwrite_a_concurrent_rename(self):
+        from dcim.models import Interface
+        from django.db import transaction
+
+        from netbox_nso_plugin.apply_state import DeferredIntentFieldStale
+
+        self._make_mgmt()
+        self._accepted_state(self.iface, "description", nso_value=self.iface.description)
+        interface = Interface.objects.only("pk").get(pk=self.iface.pk)
+        self.assertEqual(interface.name, "GigabitEthernet0/0")
+        Interface.objects.filter(pk=self.iface.pk).update(name="GigabitEthernet0/1")
+
+        interface.description = "changed description"
+        with self.assertRaises(DeferredIntentFieldStale), transaction.atomic():
+            interface.save()
+
+        self.assertEqual(Interface.objects.get(pk=self.iface.pk).name, "GigabitEthernet0/1")
+
+    def test_a_lazy_deferred_overlay_status_cannot_overwrite_a_concurrent_transition(self):
+        from django.db import transaction
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.apply_state import DeferredIntentFieldStale
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        management = self._make_mgmt()
+        vlan = VLAN.objects.create(vid=410, name="deferred-stale-status")
+        with suppress_intent_push():
+            state = NSOVLANState.objects.create(
+                management=management,
+                vlan=vlan,
+                device_name=vlan.name,
+                status="imported",
+            )
+        deferred = NSOVLANState.objects.only("pk").get(pk=state.pk)
+        self.assertEqual(deferred.status, "imported")
+        self.assertNotIn("_nso_loaded_status", deferred.__dict__)
+        NSOVLANState.objects.filter(pk=state.pk).update(status="accepted")
+
+        deferred.device_name = "changed device name"
+        with self.assertRaises(DeferredIntentFieldStale), transaction.atomic():
+            deferred.save()
+
+        self.assertEqual(NSOVLANState.objects.get(pk=state.pk).status, "accepted")
+
+
 class TestSyncScopeToAdapter(_SignalDBBase):
     """Tests for the sync_scope_to_adapter signal handler (real NSODeviceManagement row)."""
 
@@ -281,7 +358,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         self.assertEqual(mgmt.adapter_source_epoch, 4)
         self.assertTrue(mgmt.source_epoch_aware)
         self.assertTrue(mgmt.source_rekey_pending)
-        self.assertIn("omitted source_epoch", mgmt.adapter_link_error)
+        self.assertEqual(mgmt.adapter_link_error, "The adapter link failed. See the server log.")
 
     def test_old_wire_rekey_cannot_reopen_legacy_admission(self):
         from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
@@ -435,7 +512,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             self._sync_scope(mgmt, created=True)
 
         mgmt.refresh_from_db()
-        self.assertIn("nso down", mgmt.adapter_link_error)  # recorded, not swallowed
+        self.assertEqual(mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
         self.assertIsNone(mgmt.adapter_device_id)  # still unlinked
 
     def test_successful_link_clears_prior_error(self):
@@ -1385,6 +1462,74 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             )
         self._delete_pushes(row, "put_static_route_intent")
 
+    def test_static_route_overlay_delete_records_per_object_authority(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.98.0/24", next_hop="198.18.0.1", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOStaticRouteState.objects.create(
+                management=mgmt,
+                static_route=route,
+                nso_prefix="198.18.98.0/24",
+                status="accepted",
+            )
+
+        with self.captureOnCommitCallbacks(execute=False):
+            row.delete()
+
+        entry = NSOIntentOutboxEntry.objects.get(
+            device=self.device,
+            scope="static_route",
+            consumed_by_push_seq__isnull=True,
+        )
+        self.assertTrue(entry.mark_and)
+        self.assertEqual(
+            entry.transitions,
+            [
+                {
+                    "op": "delete",
+                    "route_id": route.pk,
+                    "triples": [{"vrf": "", "prefix": "198.18.98.0/24", "next_hop": ""}],
+                    "unverified": True,
+                }
+            ],
+        )
+
+    def test_unowned_static_route_overlay_delete_records_no_authority(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+
+        mgmt = self._mgmt()
+        route = StaticRoute.objects.create(prefix="198.18.97.0/24", next_hop="198.18.0.1", metric=1)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOStaticRouteState.objects.create(
+                management=mgmt,
+                static_route=route,
+                nso_prefix="198.18.97.0/24",
+                status="imported",
+            )
+
+        with self.captureOnCommitCallbacks(execute=False):
+            row.delete()
+
+        self.assertFalse(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device,
+                scope="static_route",
+                consumed_by_push_seq__isnull=True,
+            ).exists()
+        )
+
     def test_l2_sap_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOL2SapState
 
@@ -1607,10 +1752,10 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
 
 class TestDeleteOriginMarking(_SignalDBBase):
-    """#106: only pushes born from a DELETION may let the adapter retract from the
-    device. The adapter treats every UNMARKED intent shrink as an un-own and DETACHES
-    (no-networking + sync-from, device untouched) — so deletion-driven pushes must
-    carry ``?delete_origin=true``, and un-own pushes must not.
+    """#106/#1503: only proven deletion authority may let the adapter retract.
+
+    Query-mode scopes carry ``?delete_origin=true``. Activated static-route pushes carry
+    per-object authority in ``deleted_routes`` and never send that query parameter.
     """
 
     _CFG = {
@@ -1628,8 +1773,8 @@ class TestDeleteOriginMarking(_SignalDBBase):
             device=self.device, nso_instance=self.nso_instance, nso_device_name="core-rtr-01", adapter_device_id=43
         )
 
-    def _recorded_calls(self, act):
-        """Run *act* with the adapter HTTP transport recorded → [(method, url, params), ...]."""
+    def _recorded_requests(self, act):
+        """Run *act* with the adapter HTTP transport recorded."""
         from ._adapter_http import make_response, make_session
 
         session = make_session(response=make_response(200, json_data={}))
@@ -1639,7 +1784,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             act()
-        return [(c.args[0], c.args[1], c.kwargs.get("params") or {}) for c in session.request.call_args_list]
+        return [
+            (c.args[0], c.args[1], c.kwargs.get("params") or {}, c.kwargs.get("json"))
+            for c in session.request.call_args_list
+        ]
+
+    def _recorded_calls(self, act):
+        """Run *act* and return its adapter method, URL, and query parameters."""
+        return [(method, url, params) for method, url, params, _body in self._recorded_requests(act)]
 
     def _recorded_params(self, act):
         """Run *act* with the adapter HTTP transport recorded → list of params dicts."""
@@ -1658,6 +1810,12 @@ class TestDeleteOriginMarking(_SignalDBBase):
         from netbox_nso_plugin.signals import suppress_intent_push
 
         return suppress_intent_push()
+
+    @staticmethod
+    def _body_deletes_route(body, route_id):
+        return isinstance(body, dict) and any(
+            isinstance(record, dict) and record.get("route_id") == route_id for record in body.get("deleted_routes", [])
+        )
 
     def _owned_svi(self, mgmt):
         from ipam.models import VLAN
@@ -1695,9 +1853,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
             f"an un-own push must stay unmarked (detach-safe); saw params {params}",
         )
 
-    def test_native_static_route_delete_is_marked(self):
-        """The native pre_delete safety-net path (routing.StaticRoute) is a deletion —
-        its reduced push must carry the mark too."""
+    def test_native_static_route_delete_uses_no_query_flag(self):
+        """The native pre_delete safety-net path (routing.StaticRoute) is a deletion, so
+        its activated push must leave the legacy query flag off."""
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -1705,14 +1863,22 @@ class TestDeleteOriginMarking(_SignalDBBase):
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
         with self._arranged():
+            route.devices.add(mgmt.device)
             NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
             )
-        params = self._recorded_params(route.delete)
+        route_id = route.pk
+        requests = self._recorded_requests(route.delete)
+        params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "the native delete must push")
+        self.assertFalse(
+            any("delete_origin" in item for item in params),
+            f"activated static-route pushes must not use the query flag; saw params {params}",
+        )
+        bodies = [body for _method, _url, _params, body in requests]
         self.assertTrue(
-            any(p.get("delete_origin") == "true" for p in params),
-            f"native-delete push must be marked delete_origin; saw params {params}",
+            any(self._body_deletes_route(body, route_id) for body in bodies),
+            f"the deleted route must carry per-object authority; saw bodies {bodies}",
         )
 
     def test_assigning_a_device_to_a_static_route_is_unmarked(self):
@@ -1733,8 +1899,8 @@ class TestDeleteOriginMarking(_SignalDBBase):
             f"an ADD is not a deletion — its push must stay unmarked; saw params {params}",
         )
 
-    def test_unassigning_a_device_from_a_static_route_is_marked(self):
-        """post_remove IS a deletion — the reduced snapshot must still carry the mark."""
+    def test_unassigning_a_device_from_a_static_route_uses_no_query_flag(self):
+        """post_remove is a deletion, but its activated push uses no legacy query flag."""
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.signals import _accept_static_route_for_device
@@ -1746,11 +1912,17 @@ class TestDeleteOriginMarking(_SignalDBBase):
             route.devices.add(mgmt.device)
             _accept_static_route_for_device(route, mgmt.device)
 
-        params = self._recorded_params(lambda: route.devices.remove(mgmt.device))
+        requests = self._recorded_requests(lambda: route.devices.remove(mgmt.device))
+        params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "un-assigning the device must push the reduced snapshot")
+        self.assertFalse(
+            any("delete_origin" in item for item in params),
+            f"activated static-route pushes must not use the query flag; saw params {params}",
+        )
+        bodies = [body for _method, _url, _params, body in requests]
         self.assertTrue(
-            any(p.get("delete_origin") == "true" for p in params),
-            f"un-assigning is a deletion — its push must be marked; saw params {params}",
+            any(self._body_deletes_route(body, route.pk) for body in bodies),
+            f"the unassigned route must carry per-object authority; saw bodies {bodies}",
         )
 
     # ── teardown must never be read as a retraction ───────────────────────────

@@ -7,6 +7,7 @@ and the remaining API call functions not covered by test_models.py.
 import sys
 import threading
 import unittest
+from types import MappingProxyType
 from unittest.mock import patch
 
 import requests
@@ -771,6 +772,148 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_reject_a_malformed_listing(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
+
+        self.addCleanup(reset_session)
+        # The first two fail the shape check; the rest reach the per-row seq guard, which is
+        # what stops a repeated or out-of-order page from looping the cursor forever.
+        for payload in (
+            {"generations": []},
+            [None],
+            [{"generation_id": 1, "status": "pending", "settlement_cohort": None}],
+            [{"seq": 1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "status": "pending"}],
+            [{"generation_id": 1, "seq": 1, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "status": None, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "status": 123, "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "status": "", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "job_id": "501", "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "job_id": 0, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "job_id": -1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "job_id": True, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": "1", "seq": 1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": True, "seq": 1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 0, "seq": 1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": -1, "seq": 1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 0, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": -1, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": True, "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": "1", "status": "pending", "settlement_cohort": None}],
+            [{"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": 0}],
+            [{"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": -1}],
+            [
+                {"generation_id": 2, "seq": 2, "status": "pending", "settlement_cohort": None},
+                {"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": None},
+            ],
+            [
+                {"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": 73},
+                {"generation_id": 1, "seq": 2, "status": "pending", "settlement_cohort": 73},
+            ],
+        ):
+            with self.subTest(payload=payload):
+                reset_session()
+                mock_s.return_value = self._make_session(200, payload)
+
+                with self.assertRaisesRegex(AdapterError, "malformed generations listing") as raised:
+                    list_device_generations(5)
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_the_page_limit_stays_within_what_the_adapter_accepts(self):
+        """The one thing deriving the fixtures from the constant cannot check: its VALUE.
+
+        The adapter caps a page at ``LIMIT_MAX`` (../nso-adapter/nso_adapter/api/pagination.py)
+        and answers 422 rather than clamping, so raising this past it fails every generations
+        read at runtime while the derived tests above stay green.
+        """
+        from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
+
+        self.assertLessEqual(_GENERATION_PAGE_LIMIT, 500)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_reads_every_ascending_page(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT, list_device_generations
+
+        # A page of exactly the limit is what makes the reader ask for another; the short one stops it.
+        last_full_seq = _GENERATION_PAGE_LIMIT
+        first_page = [
+            {"generation_id": seq, "seq": seq, "status": "pending", "settlement_cohort": None}
+            for seq in range(1, last_full_seq + 1)
+        ]
+        final_page = [
+            {
+                "generation_id": last_full_seq + 1,
+                "seq": last_full_seq + 1,
+                "job_id": None,
+                "status": "pending",
+                "settlement_cohort": None,
+            }
+        ]
+        session = make_session()
+        session.request.side_effect = [
+            make_response(200, first_page),
+            make_response(200, final_page),
+        ]
+        mock_s.return_value = session
+
+        generations = list_device_generations(5)
+
+        self.assertEqual([row["seq"] for row in generations], list(range(1, last_full_seq + 2)))
+        self.assertEqual(
+            [call.kwargs["params"] for call in session.request.call_args_list],
+            [
+                {"limit": _GENERATION_PAGE_LIMIT},
+                {"limit": _GENERATION_PAGE_LIMIT, "since_seq": last_full_seq},
+            ],
+        )
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_refuses_an_unbounded_history(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import (
+            _GENERATION_PAGE_LIMIT,
+            _GENERATION_PAGE_MAX,
+            AdapterError,
+            list_device_generations,
+        )
+
+        self.assertLessEqual(_GENERATION_PAGE_MAX, 20)
+
+        page_number = 0
+
+        def full_page(*_args, **_kwargs):
+            nonlocal page_number
+            page_number += 1
+            if page_number > _GENERATION_PAGE_MAX:
+                raise AssertionError("the generations reader requested an unbounded page")
+            first_seq = (page_number - 1) * _GENERATION_PAGE_LIMIT + 1
+            return make_response(
+                200,
+                [
+                    {
+                        "generation_id": seq,
+                        "seq": seq,
+                        "status": "pending",
+                        "settlement_cohort": None,
+                    }
+                    for seq in range(first_seq, first_seq + _GENERATION_PAGE_LIMIT)
+                ],
+            )
+
+        session = make_session()
+        session.request.side_effect = full_page
+        mock_s.return_value = session
+
+        with self.assertRaisesRegex(AdapterError, "more generation pages") as raised:
+            list_device_generations(5)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(session.request.call_count, _GENERATION_PAGE_MAX)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_put_intent(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import put_intent
 
@@ -803,18 +946,73 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
         _, kwargs = session.request.call_args
         self.assertEqual(kwargs["json"]["routes"], [])
+        self.assertEqual(kwargs["json"]["deleted_routes"], [])
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_trigger_apply(self, mock_s, _cfg):
+    def test_trigger_apply_sends_the_frozen_selector_and_returns_the_generation_chain(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import trigger_apply
 
-        session = self._make_session(202, {"job_id": 20})
+        # Copied from ../nso-adapter/docs/api-contract.md, actions/apply 202 response,
+        # with the fields pinned by ActionApplyGenerationOut in openapi_snapshot.json.
+        promoted = {
+            "device_id": 5,
+            "outcome": "promoted",
+            "selected": {"vlan": 4711},
+            "skipped": {},
+            "generations": [
+                {
+                    "generation_id": 81,
+                    "seq": 4,
+                    "job_id": 501,
+                    "mode": "networked",
+                    "source_push_seq": {"vlan": 4711},
+                    "stream_revisions": {"vlan": 7},
+                    "digest": "a" * 64,
+                },
+                {
+                    "generation_id": 82,
+                    "seq": 5,
+                    "job_id": None,
+                    "mode": "detach",
+                    "source_push_seq": {"vlan": 4711},
+                    "stream_revisions": {"vlan": 7},
+                    "digest": "b" * 64,
+                },
+            ],
+        }
+        session = self._make_session(202, promoted)
         mock_s.return_value = session
-        result = trigger_apply(5)
-        self.assertEqual(result["job_id"], 20)
+        selector = MappingProxyType({"vlan": 4711})
+
+        result = trigger_apply(5, selector)
+
+        self.assertEqual(result, promoted)
         _, kwargs = session.request.call_args
-        self.assertTrue(kwargs["json"]["force"])
+        self.assertEqual(kwargs["json"], {"selected": {"vlan": 4711}})
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_trigger_apply_propagates_the_adapters_bad_selector_response(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, trigger_apply
+
+        # Copied from ../nso-adapter/tests/api/openapi_snapshot.json,
+        # actions/apply 422 ErrorEnvelope response.
+        bad_selector = {
+            "error": {
+                "code": "validation_error",
+                "message": "Request validation failed",
+                "detail": {"errors": [{"loc": ["body", "selected", "unknown"], "type": "value_error"}]},
+            }
+        }
+        session = self._make_session(422, bad_selector)
+        mock_s.return_value = session
+
+        with self.assertRaises(AdapterError) as raised:
+            trigger_apply(5, MappingProxyType({"unknown": 9}))
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(raised.exception.code, "validation_error")
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")

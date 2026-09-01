@@ -153,7 +153,7 @@ class TestReconcileL2Services(TestCase):
         state = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
         state.status = "accepted"
         state.service_type = "epipe"
-        state.save()
+        state.save(update_fields=["status", "service_type"])
 
         reconcile_l2_services(
             self.device,

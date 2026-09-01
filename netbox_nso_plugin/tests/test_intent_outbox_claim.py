@@ -241,7 +241,12 @@ class TestFailureKeepsTheWorkAndTheBaseline(_ClaimCase):
         assert row.push_seq is None and row.attempts == 0
         rendered = delivery.render("vlan", self.device.pk, self.adapter_device_id)
         assert row.last_success_identity == drain.request_identity(
-            rendered.payload, mode="normal", deletions=[], mark=None, epoch=drain.mapping_epoch(self.mgmt)
+            rendered.payload,
+            mode="normal",
+            marking_mode=delivery.MARKING_QUERY_FLAG,
+            deletions=[],
+            mark=None,
+            epoch=drain.mapping_epoch(self.mgmt),
         )
         assert self.adapter.sequences[0] == failed_seq, "the failed operation is replayed, never reallocated"
 
@@ -431,6 +436,31 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         assert self.drain() == drain.SUCCEEDED
 
         assert self.adapter.sequences == [stale]
+
+    def test_a_quiesced_latency_tail_does_not_reclassify_a_settled_success(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.deployment import DeploymentQuiesced
+
+        own_vlan(self.mgmt, 880, self.tag)
+        claimed = drain.claim(self.device.pk, "vlan")
+        assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
+
+        with (
+            patch.object(drain, "_answered_other_work", return_value=False),
+            patch.object(drain, "_pending", return_value=True),
+            patch.object(drain, "_drain_once", side_effect=DeploymentQuiesced("deployment started")),
+        ):
+            continued = drain._after_success(
+                claimed,
+                mode=delivery.MODE_NORMAL,
+                force=False,
+                chain=1,
+                deadline=None,
+                deadline_at=None,
+                chained=False,
+            )
+
+        assert continued is None
 
 
 class TestUnmanagedClaimIsParked(_ClaimCase):
@@ -649,3 +679,61 @@ class TestTheBaselineSeesARebuiltStoreBeforeAnythingAdoptsIt(_ClaimCase):
 
         assert self.drain() == drain.SUCCEEDED
         assert len(self.adapter.requests) == sent + 1
+
+
+class TestTheCapturedSequenceNamesTheCallersOwnClaim(_ClaimCase):
+    """§4.2's selector identifies the claim the caller settled, not a later chained one."""
+
+    tag = "cap"
+    adapter_device_id = 7509
+
+    def test_a_chained_normal_drain_does_not_overwrite_the_captured_sequence(self):
+        from netbox_nso_plugin import delivery, drain
+
+        own_vlan(self.mgmt, 881, self.tag)
+
+        # A save that lands while the first claim is in flight leaves work pending, which is
+        # what makes the MODE_NORMAL chain run a second successful pass.
+        real_send = delivery.send
+        appended = []
+
+        def send_then_append(*args, **kwargs):
+            answer = real_send(*args, **kwargs)
+            if not appended:
+                appended.append(True)
+                # A real second operation: the render differs, so the chained pass is not
+                # dropped as digest-equal against the acknowledged baseline.
+                with without_commit_drain():
+                    own_vlan(self.mgmt, 882, self.tag)
+            return answer
+
+        config, session = self.adapter.patches()
+        with config, session, patch("netbox_nso_plugin.delivery.send", new=send_then_append):
+            with drain.capture_successful_pushes() as pushed:
+                outcome = drain.drain_key(self.device.pk, "vlan")
+
+        assert outcome == drain.SUCCEEDED
+        assert len(self.adapter.sequences) == 2, "the chain ran a second pass"
+        assert pushed["vlan"].push_seq == self.adapter.sequences[0], (
+            "the selector must name the caller's own claim, not the chained one"
+        )
+
+    def test_a_second_call_in_one_capture_still_names_its_own_later_claim(self):
+        """Apply captures across several calls, and each one re-settles the scope for real."""
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 883, self.tag)
+
+        config, session = self.adapter.patches()
+        with config, session:
+            with drain.capture_successful_pushes() as pushed:
+                assert drain.drain_key(self.device.pk, "vlan") == drain.SUCCEEDED
+                first = pushed["vlan"].push_seq
+                with without_commit_drain():
+                    own_vlan(self.mgmt, 884, self.tag)
+                assert drain.drain_key(self.device.pk, "vlan") == drain.SUCCEEDED
+
+        assert first == self.adapter.sequences[0]
+        assert pushed["vlan"].push_seq == self.adapter.sequences[-1], (
+            "a caller-owned re-settle supersedes the sequence the earlier call named"
+        )

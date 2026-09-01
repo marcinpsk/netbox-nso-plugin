@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 
+from .deployment import guarded as _deployment_guarded
+
 logger = logging.getLogger(__name__)
 
 
@@ -248,6 +250,7 @@ def compute_intent_drift(device, mgmt) -> list[dict]:
     return drift
 
 
+@_deployment_guarded("intent resync")
 def resync_intent(device, mgmt, keys: list[str] | None = None) -> tuple[list[str], list[str]]:
     """Re-push the owned intent for *keys* (default: all orphaned/partial scopes) → clears them.
 
@@ -415,6 +418,7 @@ def _restore_static_route_generations(before: list[dict]) -> int:
     return restored
 
 
+@_deployment_guarded("intent resync")
 def resync_static_route_intent_fleet(device_ids: list[int] | None = None) -> list[dict]:
     """Push every managed device's static-route intent once, so the adapter backfills ``route_id``.
 

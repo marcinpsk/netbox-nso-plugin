@@ -149,7 +149,8 @@ class TestCommunitySecretSet(_SecretBase):
         mgmt = self._make_mgmt()
         row = self._community(mgmt)
         old_hash = row.community_hash
-        session = make_session(status_code=502, json_data={"error": {"code": "vault_error", "message": "denied"}})
+        supplied = "Traceback: private Vault path"
+        session = make_session(status_code=502, json_data={"error": {"code": "vault_error", "message": supplied}})
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
@@ -161,8 +162,10 @@ class TestCommunitySecretSet(_SecretBase):
         row.refresh_from_db()
         self.assertEqual(row.community_hash, old_hash)  # nothing saved
         self.assertEqual(row.vault_ref, "")
-        # the error text never carries the submitted value
-        self.assertNotIn("s3cr3t-value", str(form.errors))
+        errors = str(form.errors)
+        self.assertIn("The NSO adapter request failed. See the server log.", errors)
+        self.assertNotIn(supplied, errors)
+        self.assertNotIn("s3cr3t-value", errors)
 
     def test_short_ref_is_qualified_from_settings(self):
         mgmt = self._make_mgmt()
@@ -262,6 +265,24 @@ class TestV3SecretSet(_SecretBase):
         self.assertFalse(row.vault_has_priv)
         # merge semantics live in the adapter; only 'auth' was sent
         self.assertEqual(session.request.call_args.kwargs["json"]["values"], {"auth": "auth-pw"})
+
+    def test_adapter_error_becomes_a_fixed_public_form_error(self):
+        mgmt = self._make_mgmt()
+        row = self._v3(mgmt)
+        supplied = "Traceback: private Vault path"
+        session = make_session(status_code=502, json_data={"error": {"code": "vault_error", "message": supplied}})
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            form = self._form(row, {"auth_protocol": "sha", "auth_secret_value": "auth-pw"})
+            self.assertFalse(form.is_valid())
+
+        errors = str(form.errors)
+        self.assertIn("The NSO adapter request failed. See the server log.", errors)
+        self.assertNotIn(supplied, errors)
+        self.assertNotIn("auth-pw", errors)
 
     def test_secret_requires_protocol_and_priv_requires_auth(self):
         mgmt = self._make_mgmt()
