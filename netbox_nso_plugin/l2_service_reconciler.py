@@ -50,9 +50,9 @@ def l2_service_reconcile_plan(device, payload: dict):
             service, sap = observed
             if not sm.is_owned(state.status):
                 candidate.service_type = service.get("service_type", "")
-            candidate.port = sap.get("port", "")
-            candidate.outer_tag = sap.get("outer_tag")
-            candidate.inner_tag = sap.get("inner_tag")
+                candidate.port = sap.get("port", "")
+                candidate.outer_tag = sap.get("outer_tag")
+                candidate.inner_tag = sap.get("inner_tag")
         if canonical_fragment(state) != canonical_fragment(candidate):
             changes_content = True
             break
@@ -97,19 +97,20 @@ def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface
         defaults={"service_type": svc.get("service_type", ""), "port": sap.get("port", "")},
     )
     observed_service_type = svc.get("service_type", "")
+    observed_port = sap.get("port", "")
+    observed_outer_tag = sap.get("outer_tag")
+    observed_inner_tag = sap.get("inner_tag")
     owned = sm.is_owned(state.status)
     if not owned:
         state.service_type = observed_service_type
+        state.port = observed_port
+        state.outer_tag = observed_outer_tag
+        state.inner_tag = observed_inner_tag
     state.service_id = svc.get("service_id")
-    # These are a decomposition of the immutable SAP key, not independent
-    # writer inputs: the Nokia NED creates the SAP from ``sap_id`` itself.
-    state.port = sap.get("port", "")
-    state.outer_tag = sap.get("outer_tag")
-    state.inner_tag = sap.get("inner_tag")
     state.l2vpn = l2vpn
     state.last_sync_at = now
 
-    iface = iface_map.get(state.port)
+    iface = iface_map.get(observed_port)
     conflict = False
     if iface is None:
         # Port not present in NetBox — can't terminate; adoption ambiguity.
@@ -128,7 +129,17 @@ def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface
             state.termination = term
     # FK overlay: 'matches'=termination materialized (not device confirmation) →
     # settles_owned=False. Unowned: conflict→conflict, else imported. Owned preserved.
-    matches = not conflict and state.service_type == observed_service_type
+    matches = not conflict and (
+        state.service_type,
+        state.port,
+        state.outer_tag,
+        state.inner_tag,
+    ) == (
+        observed_service_type,
+        observed_port,
+        observed_outer_tag,
+        observed_inner_tag,
+    )
     state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict, settles_owned=False)
     state.save()
 

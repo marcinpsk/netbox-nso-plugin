@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
 
-from ._outbox_case import mirror_update
+from ._outbox_case import content_update, mirror_update
 
 User = get_user_model()
 
@@ -68,6 +68,30 @@ class TestL2ServicesReconcileAndCount(TestCase):
         rows = {r.service_name: r for r in ctx["l2_sap_states"]}
         assert set(rows) == {"TL", "701"}
         assert rows["701"].status == "imported"  # port exists → terminated, unowned → imported
+
+    def test_reconcile_category_preserves_accepted_sap_intent(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_PAYLOAD):
+            reconcile_category(self.device, self.mgmt, "l2_services")
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
+        content_update(
+            state,
+            status="accepted",
+            service_type="epipe",
+            port="lag-60",
+            outer_tag=3999,
+            inner_tag=4000,
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_PAYLOAD):
+            reconcile_category(self.device, self.mgmt, "l2_services")
+
+        state.refresh_from_db()
+        self.assertEqual(
+            (state.service_type, state.port, state.outer_tag, state.inner_tag, state.status),
+            ("epipe", "lag-60", 3999, 4000, "accepted"),
+        )
 
     def test_category_counts_from_overlay(self):
         from netbox_nso_plugin.reconcile import reconcile_category
