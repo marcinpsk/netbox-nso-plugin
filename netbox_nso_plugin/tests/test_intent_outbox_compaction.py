@@ -353,9 +353,11 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         self.append(self.delete_of(4301, last_acked=TRIPLE_A, current=TRIPLE_A))
         self.append(self.revoke_of(4301), kind=outbox.CONTRIBUTION_KIND_REPAIR)
         self.append(self.delete_of(4301, last_acked=None, current=TRIPLE_C))
+        self.append(self.delete_of(4301, last_acked=None, current=TRIPLE_C))
 
-        drain.compact(self.device.pk, "static_route")
+        retired = drain.compact(self.device.pk, "static_route")
 
+        assert retired == 1, "the test did not exercise compaction"
         folded = outbox.fold_transitions(self.transitions())
         assert folded.lineage_carry == {4301: TRIPLE_A}
         assert folded.queued[4301]["triples"] == [TRIPLE_C]
