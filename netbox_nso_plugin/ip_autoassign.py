@@ -370,6 +370,15 @@ def _ip_allocation_footprint(*managements):
     )
 
 
+class _AllocationNoOp(Exception):
+    """Exit an allocation transaction before recording its non-write result."""
+
+    def __init__(self, result_key, entry):
+        super().__init__(entry["reason"])
+        self.result_key = result_key
+        self.entry = entry
+
+
 def _assign_one_p2p_family(
     interface,
     peer_iface,
@@ -416,10 +425,10 @@ def _assign_one_p2p_family(
         with intent_transaction(_ip_allocation_footprint(mgmt, peer_mgmt)):
             pool = pool_finder(family, site)
             if pool is None:
-                result["errors"].append(
-                    {"interface": str(interface), "family": family, "reason": no_pool_reason(family)}
+                raise _AllocationNoOp(
+                    "errors",
+                    {"interface": str(interface), "family": family, "reason": no_pool_reason(family)},
                 )
-                return
             # Row-level lock on the pool prefix: serializes concurrent carves for the same
             # pool without blocking unrelated allocations.
             pool = Prefix.objects.select_for_update().get(pk=pool.pk)
@@ -428,24 +437,24 @@ def _assign_one_p2p_family(
                 family=family,
                 status__in=_OCCUPIED,
             ).exists():
-                result["skipped"].append(
+                raise _AllocationNoOp(
+                    "skipped",
                     {
                         "interface": str(interface),
                         "family": family,
                         "reason": f"One or both P2P ends already have a managed {family} IP",
-                    }
+                    },
                 )
-                return
             carved = carve_p2p_child(pool, family, override_mask)
             if carved is None:
-                result["errors"].append(
+                raise _AllocationNoOp(
+                    "errors",
                     {
                         "interface": str(interface),
                         "family": family,
                         "reason": f"P2P pool {pool} has no available space for a child prefix",
-                    }
+                    },
                 )
-                return
             child_prefix, host_a_str, host_b_str = carved
             vrf_name = pool.vrf.name if pool.vrf else ""
             with _suppress_ip_intent_push():
@@ -490,6 +499,9 @@ def _assign_one_p2p_family(
                 # a claimed, sequenced operation, and the drain runs on this commit.
                 for dev_id in (mgmt.device_id, peer_mgmt.device_id):
                     _schedule_intent_push((dev_id, "ip"))
+    except _AllocationNoOp as exc:
+        result[exc.result_key].append(exc.entry)
+        return
     except Exception as exc:
         result["errors"].append(
             {"interface": str(interface), "family": family, "reason": f"P2P allocation failed: {exc}"}
@@ -578,26 +590,26 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     try:
         with intent_transaction(_ip_allocation_footprint(mgmt)):
             if _single_family_occupied(interface, family):
-                result["skipped"].append(
+                raise _AllocationNoOp(
+                    "skipped",
                     {
                         "interface": str(interface),
                         "family": family,
                         "reason": "Already has a managed IP in this family",
-                    }
+                    },
                 )
-                return
 
             failed_step = "IPAddress"
             available_str = pool.get_first_available_ip()
             if available_str is None:
-                result["errors"].append(
+                raise _AllocationNoOp(
+                    "errors",
                     {
                         "interface": str(interface),
                         "family": family,
                         "reason": f"Pool {pool} is exhausted (no available IPs)",
-                    }
+                    },
                 )
-                return
 
             with transaction.atomic():
                 # Reserve the IPAddress so concurrent allocations do not collide.
@@ -624,6 +636,9 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
             failed_step = None
             if push:
                 _schedule_intent_push((mgmt.device_id, "ip"))
+    except _AllocationNoOp as exc:
+        result[exc.result_key].append(exc.entry)
+        return
     except Exception as exc:
         if failed_step is not None:
             reason = f"Failed to create {failed_step}: {exc}"

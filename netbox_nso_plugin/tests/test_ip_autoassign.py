@@ -242,7 +242,7 @@ class TestAutoAssignIP(TestCase):
 
     def test_reserve_single_rechecks_fill_empty_under_the_intent_lock(self):
         from netbox_nso_plugin.ip_autoassign import _reserve_single
-        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOInterfaceIPState
 
         pool = Prefix.objects.get(pk=self.pool_lo4.pk)
         mgmt = self._make_mgmt()
@@ -253,6 +253,8 @@ class TestAutoAssignIP(TestCase):
             family="ipv4",
             status="accepted",
         )
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        before = revision.revision
         result = {"allocated": [], "errors": [], "skipped": []}
 
         _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
@@ -268,6 +270,26 @@ class TestAutoAssignIP(TestCase):
         ]
         assert list(NSOInterfaceIPState.objects.filter(interface=iface)) == [existing]
         assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
+        revision.refresh_from_db()
+        assert revision.revision == before
+
+    def test_reserve_single_exhaustion_does_not_advance_revision(self):
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback154", type="virtual")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        before = revision.revision
+        result = {"allocated": [], "errors": [], "skipped": []}
+
+        with patch.object(pool, "get_first_available_ip", return_value=None):
+            _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
+
+        assert result["errors"]
+        revision.refresh_from_db()
+        assert revision.revision == before
 
     def test_push_schedule_failure_rolls_back_the_reservation(self):
         from netbox_nso_plugin.ip_autoassign import _reserve_single
@@ -822,6 +844,7 @@ class TestAutoAssignIPP2P(TestCase):
         from extras.models import Tag
 
         from netbox_nso_plugin.ip_autoassign import auto_assign_ip
+        from netbox_nso_plugin.models import NSOIntentRevision
 
         mgmt_a = self._make_mgmt(self.device_a, "p2p-dev-a3")
         mgmt_b = self._make_mgmt(self.device_b, "p2p-dev-b3")
@@ -833,6 +856,12 @@ class TestAutoAssignIPP2P(TestCase):
 
         tag = Tag.objects.get_or_create(name="p2p-core-asg", slug="p2p-core")[0]
         iface_a.tags.add(tag)
+        revisions = list(
+            NSOIntentRevision.objects.filter(device__in=(self.device_a, self.device_b), scope="ip").order_by(
+                "device_id"
+            )
+        )
+        before = [(revision.pk, revision.revision) for revision in revisions]
 
         with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
             with patch("netbox_nso_plugin.ip_autoassign.find_pool", return_value=None):
@@ -840,6 +869,14 @@ class TestAutoAssignIPP2P(TestCase):
 
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("No ipv4 p2p-core pool found", result["errors"][0]["reason"])
+        self.assertEqual(
+            list(
+                NSOIntentRevision.objects.filter(pk__in=[revision.pk for revision in revisions])
+                .order_by("device_id")
+                .values_list("pk", "revision")
+            ),
+            before,
+        )
 
         mgmt_a.delete()
         mgmt_b.delete()
