@@ -460,18 +460,19 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
     def test_deploying_row_waits_for_attempt_evidence_when_device_matches(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
+        attempt_id = uuid4()
         row = self._row(
             console_severity="CRITICAL",
             status="deploying",
             accepted_at=timezone.now(),
-            apply_attempt_id=uuid4(),
+            apply_attempt_id=attempt_id,
         )
         _reconcile_logging_config(
             self.device, {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
         )
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
-        self.assertIsNotNone(row.apply_attempt_id)
+        self.assertEqual(row.apply_attempt_id, attempt_id)
 
 
 class TestLoggingLevelsInlineClearGuard(LevelsTestBase):
