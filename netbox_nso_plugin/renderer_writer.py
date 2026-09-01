@@ -51,7 +51,7 @@ class RendererWrite:
     values: tuple[tuple[str, Any], ...] = ()
     before_values: tuple[tuple[str, Any], ...] = ()
     selected_pks: tuple[Any, ...] = ()
-    selected_preimages: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...] = ()
+    selected_before_values: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...] = ()
     cascade: bool = False
     force_insert: bool = False
 
@@ -98,7 +98,7 @@ class RendererSetUpdate:
 
     model_label: str
     selected_pks: tuple[Any, ...]
-    selected_preimages: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...]
+    selected_before_values: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...]
     values: tuple[tuple[str, Any], ...]
 
 
@@ -150,7 +150,7 @@ def planned_delete(instance) -> RendererDelete:
 def planned_set_update(queryset, **values) -> RendererSetUpdate:
     """Freeze one queryset and its exact set-based update values."""
     model = queryset.model
-    selected_rows = tuple(queryset.order_by("pk"))
+    selected = tuple(queryset.order_by("pk"))
     normalized = tuple(
         sorted(
             (
@@ -162,8 +162,8 @@ def planned_set_update(queryset, **values) -> RendererSetUpdate:
     )
     return RendererSetUpdate(
         model_label=model._meta.label_lower,
-        selected_pks=tuple(row.pk for row in selected_rows),
-        selected_preimages=tuple((row.pk, _field_values(row, None)) for row in selected_rows),
+        selected_pks=tuple(row.pk for row in selected),
+        selected_before_values=tuple((row.pk, _field_values(row, None)) for row in selected),
         values=normalized,
     )
 
@@ -709,7 +709,13 @@ def _plan_set_update(proposed: RendererSetUpdate):
     selected_rows = _load_frozen_set_rows(model, proposed)
     footprints = []
     changed_keys = set()
-    for before in selected_rows:
+    selected = tuple(model._default_manager.filter(pk__in=proposed.selected_pks).order_by("pk"))
+    if tuple(row.pk for row in selected) != proposed.selected_pks:
+        raise IntentPlanStaleError("the frozen set-based update lost a selected row during planning")
+    expected_before = dict(proposed.selected_before_values)
+    for before in selected:
+        if _field_values(before, None) != expected_before[before.pk]:
+            raise IntentPlanStaleError(f"{proposed.model_label} row {before.pk!r} changed during planning")
         after = copy.copy(before)
         for attname, value in values.items():
             setattr(after, attname, value)
@@ -723,7 +729,7 @@ def _plan_set_update(proposed: RendererSetUpdate):
         update_fields=tuple(sorted(values)),
         values=proposed.values,
         selected_pks=proposed.selected_pks,
-        selected_preimages=proposed.selected_preimages,
+        selected_before_values=proposed.selected_before_values,
     )
     footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
     return write, footprint, changed_keys
@@ -1253,7 +1259,13 @@ class RendererWriter:
             or operation.values != normalized
         ):
             raise IntentMutationProtocolError("set-based update is outside the frozen write set")
-        _load_frozen_set_rows(model, operation)
+        selected = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
+        if tuple(row.pk for row in selected) != operation.selected_pks:
+            raise IntentPlanStaleError("the frozen set-based update lost a selected row")
+        expected_before = dict(operation.selected_before_values)
+        for row in selected:
+            if _field_values(row, None) != expected_before[row.pk]:
+                raise IntentPlanStaleError(f"{operation.model_label} row {row.pk!r} changed after planning")
         updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")

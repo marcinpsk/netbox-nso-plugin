@@ -604,6 +604,34 @@ class TestProvisionOffboardFence(_CascadeFlushMixin, TransactionTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(observed, [True])
 
+    def test_adapter_post_does_not_hold_the_device_row_lock(self):
+        from dcim.models import Interface
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInstance
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = make_device("provision-unlocked-post")
+        interface = Interface.objects.create(device=device, name="mgmt0", type="virtual")
+        address = IPAddress.objects.create(address="198.18.72.1/24", assigned_object=interface)
+        device.primary_ip4 = address
+        device.save(update_fields=["primary_ip4"])
+        instance = NSOInstance.objects.create(
+            name="provision-unlocked-post-nso",
+            adapter_instance_id="provision-unlocked-post-nso",
+        )
+        observed = []
+
+        def provision(**_request):
+            observed.append(_device_is_editable(device.pk))
+            return {"job_id": "73", "status": "queued"}
+
+        with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=provision):
+            result = onboard_candidate(device, instance, ned_id="cisco-ios-cli-6.114")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(observed, [True])
+
     def test_reonboard_waits_while_old_attempt_is_offboarding(self):
         from dcim.models import Interface
         from ipam.models import IPAddress

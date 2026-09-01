@@ -231,6 +231,32 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         assert planned_row.last_apply_error == "planned"
         assert late_row.last_apply_error == ""
 
+    def test_set_update_rejects_a_selected_row_changed_after_planning(self):
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_set_update,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-set-stale", 16272)
+        row = own_vlan(management, 1629, "writer-set-stale")
+        plan = RendererMutationPlan.build(
+            set_updates=(
+                planned_set_update(
+                    NSOVLANState.objects.filter(pk=row.pk),
+                    last_apply_error="planned",
+                ),
+            )
+        )
+        mirror_update(row, last_apply_error="raced")
+
+        with self.assertRaises(IntentPlanStaleError), renderer_mirror_writes(plan) as writer:
+            writer.set_update(NSOVLANState, plan.write_set[0], last_apply_error="planned")
+
+        row.refresh_from_db()
+        self.assertEqual(row.last_apply_error, "raced")
+
 
 class TestRendererContentWriter(IntentPushResetMixin, TestCase):
     def test_effective_after_clears_a_stale_relation_cache(self):

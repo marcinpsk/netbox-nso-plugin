@@ -190,8 +190,8 @@ def _default_authgroup() -> str:
     return "network"
 
 
-def _lock_provision_identity(device_id, instance, nso_name):
-    """Lock one logical provision identity and return its device or a public conflict."""
+def _provision_identity(device_id, instance, nso_name, *, lock_device):
+    """Lock one tombstone identity and optionally its device row."""
     from dcim.models import Device
 
     from .models import NSODeviceManagement, NSOProvisionTombstone
@@ -207,7 +207,8 @@ def _lock_provision_identity(device_id, instance, nso_name):
         )
         .values_list("provision_attempt_id", flat=True)
     )
-    device = Device.objects.select_for_update().filter(pk=device_id).first()
+    devices = Device.objects.select_for_update() if lock_device else Device.objects
+    device = devices.filter(pk=device_id).first()
     if device is None:
         return None, "Device no longer exists."
     if NSODeviceManagement.objects.filter(device=device).exists():
@@ -220,6 +221,16 @@ def _lock_provision_identity(device_id, instance, nso_name):
     if clash is not None:
         return None, f"NSO device name '{nso_name}' is already used by {clash.device} on this instance."
     return device, None
+
+
+def _lock_provision_identity(device_id, instance, nso_name):
+    """Lock one provision identity, including its NetBox device row."""
+    return _provision_identity(device_id, instance, nso_name, lock_device=True)
+
+
+def _lock_provision_tombstone_identity(device_id, instance, nso_name):
+    """Lock one in-flight identity without locking its NetBox device row."""
+    return _provision_identity(device_id, instance, nso_name, lock_device=False)
 
 
 @_deployment_guarded("provisioning")
@@ -324,7 +335,7 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     job_id = ""
     try:
         with transaction.atomic():
-            locked_device, conflict = _lock_provision_identity(device.pk, instance, nso_name)
+            locked_device, conflict = _lock_provision_tombstone_identity(device.pk, instance, nso_name)
             if conflict is not None:
                 result["error"] = conflict
                 return result
