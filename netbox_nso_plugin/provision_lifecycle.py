@@ -15,6 +15,7 @@ from .deployment import DeploymentQuiesced
 from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
 
 # One fleet tick polls at most this many attempts. Attempted rows rotate to the back.
 _FLEET_SWEEP_LIMIT = 100
@@ -142,7 +143,7 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
     checked = 0
     closed = 0
     for tombstone_id in tombstones.values_list("provision_attempt_id", flat=True)[:_FLEET_SWEEP_LIMIT]:
-        if deadline is not None and time.monotonic() >= deadline:
+        if deadline is not None and _monotonic() >= deadline:
             break
         checked += 1
         try:
