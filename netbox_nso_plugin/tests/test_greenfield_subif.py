@@ -8,8 +8,11 @@ Interface create is not ownership evidence and must not create an overlay as a s
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
+from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSubinterfaceState
 
@@ -39,3 +42,43 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
         """A plain interface (no dot1q suffix) must NOT be treated as a subinterface."""
         Interface.objects.create(device=self.device, name="ae100", type="lag")
         self.assertFalse(NSOSubinterfaceState.objects.filter(interface__name="ae100").exists())
+
+    def test_exact_writer_creates_its_preplanned_subinterface_state(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        planned_at = timezone.now()
+        subinterface = Interface(device=self.device, name="ae99.998", type="virtual", parent=self.parent)
+        subinterface._site = self.device.site
+        subinterface._location = self.device.location
+        subinterface._rack = self.device.rack
+        state = NSOSubinterfaceState(
+            management=self.mgmt,
+            interface=subinterface,
+            parent_interface=self.parent,
+            dot1q_vlan=998,
+            status="accepted",
+            accepted_at=planned_at,
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(subinterface, force_insert=True, natural_key=("device", "name")),
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "interface"),
+                    references=(("interface", subinterface),),
+                ),
+            ),
+            planned_at=planned_at,
+        )
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_subinterface_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+            renderer_writes(plan) as writer,
+        ):
+            writer.save(subinterface, force_insert=True)
+
+        created = NSOSubinterfaceState.objects.get(interface=subinterface)
+        self.assertEqual(created.parent_interface, self.parent)
+        self.assertEqual((created.dot1q_vlan, created.status), (998, "accepted"))

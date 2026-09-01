@@ -327,12 +327,16 @@ def _natural_key(instance, fields, creation_refs=None, reference_fields=()):
 
 def _creation_refs(save_states):
     references = {}
+    planned_creations = {id(proposed.instance) for proposed, before in save_states if before is None}
     for proposed, before in save_states:
         instance = proposed.instance
         if before is not None:
             continue
         if not proposed.natural_key_fields:
             continue
+        for _attname, related in proposed.reference_fields:
+            if related.pk is None and id(related) in planned_creations and id(related) not in references:
+                raise IntentMutationProtocolError(f"{instance._meta.label_lower} references a row planned after it")
         references[id(instance)] = RendererCreationRef(
             model_label=instance._meta.label_lower,
             natural_key=_natural_key(
@@ -872,18 +876,6 @@ class RendererWriter:
         if related is None or related._meta.label_lower != reference.model_label:
             return False
         return all(self._value_matches(related, attname, expected) for attname, expected in reference.natural_key)
-
-    def _resolve_reference(self, reference):
-        model = apps.get_model(reference.model_label)
-        filters = {}
-        for attname, expected in reference.natural_key:
-            if isinstance(expected, RendererCreationRef):
-                related = self._resolve_reference(expected)
-                if related is None:
-                    return None
-                expected = related.pk
-            filters[attname] = expected
-        return model._default_manager.filter(**filters).first()
 
     def _value_matches(self, instance, attname, expected):
         if isinstance(expected, RendererCreationRef):

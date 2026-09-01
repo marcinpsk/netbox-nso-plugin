@@ -193,7 +193,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             RouteMapEntrySetCommunity,
         )
 
-        from .models import NSODeviceManagement, NSORoutePolicyState
+        from .models import NSODeviceManagement, NSORoutePolicyObjectClass, NSORoutePolicyState
 
         self.device = device
         self.payload = payload
@@ -231,19 +231,28 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             for entry in row.get("entries") or []
             if entry.get("community") and entry.get("community").strip()
         }
+        planned_reference_keys = set()
         for route_map in payload.get("route_maps") or []:
             for entry in route_map.get("entries") or []:
-                root_names["prefix_list"].update(entry.get("match_prefix_lists") or [])
-                root_names["community_list"].update(entry.get("match_community_lists") or [])
-                root_names["as_path"].update(entry.get("match_as_paths") or [])
+                for family, key in (
+                    ("prefix_list", "match_prefix_lists"),
+                    ("community_list", "match_community_lists"),
+                    ("as_path", "match_as_paths"),
+                ):
+                    names = entry.get(key) or []
+                    root_names[family].update(names)
+                    planned_reference_keys.update((family, name.casefold()) for name in names if name)
                 structured = structure_entry(_load_json(entry.get("match")), _load_json(entry.get("set")))
                 if structured.call_policy:
                     root_names["route_map"].add(structured.call_policy)
+                    planned_reference_keys.add(("route_map", structured.call_policy.casefold()))
                 for action in structured.set_communities:
                     if _looks_like_community_literal(action.name):
                         community_values.add(action.name)
                     else:
                         root_names["community_list"].add(action.name)
+                        planned_reference_keys.add(("community_list", action.name.casefold()))
+        self.planned_reference_keys = planned_reference_keys
 
         from django.db.models import Q
 
@@ -256,6 +265,37 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         self.roots = {
             family: {row.name.casefold(): row for row in referenced_roots(model, root_names[family])}
             for family, model in self.models.items()
+        }
+        from django.db.models.functions import Lower
+
+        normalized_names = {name.casefold() for names in root_names.values() for name in names}
+        self.group_modes = {
+            (row.family, row.object_name.casefold()): row.mode
+            for row in NSORoutePolicyObjectClass.objects.annotate(name_key=Lower("object_name")).filter(
+                family__in=root_names,
+                name_key__in=normalized_names,
+            )
+        }
+        self.materialized_owner_keys = {
+            (family, name.casefold())
+            for family, name in NSORoutePolicyState.objects.filter(is_materialized=True)
+            .annotate(name_key=Lower("object_name"))
+            .filter(family__in=root_names, name_key__in=normalized_names)
+            .values_list("family", "object_name")
+        }
+        entry_models = {
+            "prefix_list": (self.PrefixListEntry, "prefix_list_id"),
+            "community_list": (self.CommunityListEntry, "community_list_id"),
+            "as_path": (self.ASPathEntry, "aspath_id"),
+            "route_map": (self.RouteMapEntry, "route_map_id"),
+        }
+        self.root_pks_with_entries = {
+            family: set(
+                entry_model.objects.filter(
+                    **{f"{root_field}__in": [root.pk for root in self.roots[family].values()]}
+                ).values_list(root_field, flat=True)
+            )
+            for family, (entry_model, root_field) in entry_models.items()
         }
         self.states = (
             {
@@ -344,16 +384,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         return ownership.hash_captured(family, captured)
 
     def _root_has_entries(self, family, root):
-        if root.pk is None:
-            return False
-        lookups = {
-            "prefix_list": (self.PrefixListEntry, {"prefix_list": root}),
-            "community_list": (self.CommunityListEntry, {"community_list": root}),
-            "as_path": (self.ASPathEntry, {"aspath": root}),
-            "route_map": (self.RouteMapEntry, {"route_map": root}),
-        }
-        model, filters = lookups[family]
-        return model.objects.filter(**filters).exists()
+        return root.pk in self.root_pks_with_entries[family]
 
     def _existing_entries(self, family, root):
         if root.pk is None:
@@ -369,10 +400,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         return tuple(rows.order_by("pk"))
 
     def _group_mode(self, family, name):
-        from .models import NSORoutePolicyObjectClass
-
-        row = NSORoutePolicyObjectClass.objects.filter(family=family, object_name__iexact=name).first()
-        return row.mode if row is not None else "master"
+        return self.group_modes.get((family, name.casefold()), "master")
 
     def _canonical_hash(self, family, name):
         return ownership.canonical_hash(self.NSORoutePolicyState, family, name)
@@ -484,11 +512,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             root = self.models[family](**kwargs)
             self.roots[family][name.casefold()] = root
         self.name_maps[family][name] = root
-        has_materialized_owner = self.NSORoutePolicyState.objects.filter(
-            family=family,
-            object_name__iexact=name,
-            is_materialized=True,
-        ).exists()
+        has_materialized_owner = key in self.materialized_owner_keys
         state, created_state, should_fill, refresh_owner = self._state_candidate(family, name, root, captured)
         fill = refresh_owner or (
             should_fill and (not has_materialized_owner or created_root or not self._root_has_entries(family, root))
@@ -530,6 +554,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             elif family == "as_path":
                 self.plan_as_path_entries(root, captured.get("entries") or [])
             else:
+                self._resolve_route_map_name_maps(captured.get("entries") or [])
                 self.plan_route_map_entries(root, captured.get("entries") or [])
             if created_state or refresh_owner or not has_materialized_owner:
                 state.is_materialized = True
@@ -621,7 +646,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 if state.is_materialized:
                     self.plan_rematerialize(live[0], root, group, state.pk)
                 continue
-            if root is not None and _object_referenced(root, state.family):
+            if root is not None and (key in self.planned_reference_keys or _object_referenced(root, state.family)):
                 for row in group:
                     identity = (row.management_id, row.family, row.object_name.casefold())
                     if identity not in self.modified_state_pks:
@@ -638,23 +663,33 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
 
     def _resolve_route_map_name_maps(self, entries):
         for entry in entries:
-            for family, key in (
-                ("prefix_list", "match_prefix_lists"),
-                ("community_list", "match_community_lists"),
-                ("as_path", "match_as_paths"),
-            ):
-                for name in entry.get(key) or []:
-                    root = self.roots[family].get(name.casefold())
-                    if root is not None:
-                        self.name_maps[family][name] = root
-                        if family == "community_list" and name not in self.community_members:
-                            self.community_members[name] = tuple(
-                                row.community
-                                for row in self.CommunityListEntry.objects.filter(community_list=root).select_related(
-                                    "community"
-                                )
-                                if row.community_id
+            references = [
+                (family, name)
+                for family, key in (
+                    ("prefix_list", "match_prefix_lists"),
+                    ("community_list", "match_community_lists"),
+                    ("as_path", "match_as_paths"),
+                )
+                for name in entry.get(key) or []
+            ]
+            structured = structure_entry(_load_json(entry.get("match")), _load_json(entry.get("set")))
+            references.extend(
+                ("community_list", action.name)
+                for action in structured.set_communities
+                if not _looks_like_community_literal(action.name)
+            )
+            for family, name in references:
+                root = self.roots[family].get(name.casefold())
+                if root is not None:
+                    self.name_maps[family][name] = root
+                    if family == "community_list" and name not in self.community_members:
+                        self.community_members[name] = tuple(
+                            row.community
+                            for row in self.CommunityListEntry.objects.filter(community_list=root).select_related(
+                                "community"
                             )
+                            if row.community_id
+                        )
 
     def plan_replace_root(self, family, root, captured):
         for entry in self._existing_entries(family, root):

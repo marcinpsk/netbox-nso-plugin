@@ -299,6 +299,48 @@ class TestInterfaceSaveHandler(TestCase):
         iface1_after = Interface.objects.get(pk=iface1.pk)
         self.assertEqual(iface1_after.description, "[auto]")
 
+    def test_unplanned_description_recompute_does_not_abort_the_planned_save(self):
+        import copy
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        from ._outbox_case import without_commit_drain
+
+        iface1 = _make_iface(self.dev1, "Gi0/4-planned")
+        iface2 = _make_iface(self.dev2, "Gi0/5-planned")
+        _make_cable(iface1, iface2)
+        iface1.description = "[auto]"
+        iface1.save(update_fields=["description"])
+        nso = NSOInstance.objects.create(name="ifsave-nso", adapter_instance_id="ifsave-nso")
+        NSODeviceManagement.objects.create(
+            device=self.dev1,
+            nso_instance=nso,
+            nso_device_name=self.dev1.name,
+            adapter_device_id=16234,
+        )
+        NSOInterfaceState.objects.create(
+            interface=iface1,
+            attribute="enabled",
+            status="accepted",
+            nso_value="true",
+        )
+        _configure_templates(TEMPLATES)
+        candidate = copy.copy(Interface.objects.get(pk=iface1.pk))
+        candidate.enabled = False
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("enabled",)),))
+
+        with (
+            self.assertLogs("netbox_nso_plugin.signals", level=logging.WARNING),
+            without_commit_drain(),
+            renderer_writes(plan) as writer,
+        ):
+            writer.save(candidate, update_fields=("enabled",))
+
+        iface1.refresh_from_db()
+        self.assertFalse(iface1.enabled)
+        self.assertEqual(iface1.description, "[auto]")
+
     def test_interface_save_noop_when_feature_off(self):
         iface = _make_iface(self.dev1, "Gi0/3-off")
         iface.description = "[auto]"

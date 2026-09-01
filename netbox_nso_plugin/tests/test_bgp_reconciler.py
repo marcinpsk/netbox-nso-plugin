@@ -1230,9 +1230,10 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
     def test_plan_batches_owned_peer_dependency_lookups(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
+        from django.utils import timezone
         from netbox_routing.models import PrefixList, RouteMap
 
-        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.bgp_reconciler import _BGPGraphPlanner, _reconcile_bgp_config, bgp_reconcile_plan
         from netbox_nso_plugin.intent_state import SourceRow
         from netbox_nso_plugin.models import NSOBGPPeerState
 
@@ -1264,16 +1265,18 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertIn(SourceRow("netbox_routing.routemap", None), plan.lock_footprint.source_rows)
         self.assertIn(SourceRow("netbox_routing.prefixlist", None), plan.lock_footprint.source_rows)
         with CaptureQueriesContext(connection) as one_queries:
-            bgp_reconcile_plan(self.device, one_peer)
+            _BGPGraphPlanner(self.device, one_peer, timezone.now()).build()
         for state in states[1:]:
             content_update(state, status="in_sync")
         with CaptureQueriesContext(connection) as four_queries:
-            bgp_reconcile_plan(self.device, payload)
+            _BGPGraphPlanner(self.device, payload, timezone.now()).build()
 
         policy_tables = (RouteMap._meta.db_table, PrefixList._meta.db_table)
-        one_policy_queries = [query for query in one_queries if any(table in query["sql"] for table in policy_tables)]
+        one_policy_queries = [
+            query for query in one_queries if any(f'FROM "{table}"' in query["sql"] for table in policy_tables)
+        ]
         four_policy_queries = [
-            query for query in four_queries if any(table in query["sql"] for table in policy_tables)
+            query for query in four_queries if any(f'FROM "{table}"' in query["sql"] for table in policy_tables)
         ]
         self.assertEqual(len(four_policy_queries), len(one_policy_queries))
         self.assertEqual(len(one_policy_queries), 2)

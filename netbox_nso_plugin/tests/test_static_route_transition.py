@@ -163,6 +163,7 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         put.assert_not_called()
 
     def test_a_created_route_carries_no_stash(self):
+        """A native creation needs no pre-save receiver or temporary content stash."""
         """P2.6 — a create has no pre-save row, so nothing may be read as its baseline."""
         from netbox_routing.models import StaticRoute
 

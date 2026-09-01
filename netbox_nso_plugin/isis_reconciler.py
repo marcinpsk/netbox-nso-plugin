@@ -706,6 +706,16 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
 
             process_tag = state.process_tag
             native_instance = prospective_instances.get(process_tag)
+            if process_tag in prospective_instances and native_instance is None:
+                state.isis_interface = None
+                state.status = sm.on_reconcile(state.status, matches=False)
+                _state_save(
+                    operations,
+                    state,
+                    created_state,
+                    ("management", "interface", "af"),
+                )
+                continue
             if native_instance is None:
                 native_instance = ISISInstance(device=device, process_tag=process_tag)
                 prospective_instances[process_tag] = native_instance
