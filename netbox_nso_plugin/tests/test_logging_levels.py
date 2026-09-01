@@ -22,7 +22,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from ._adapter_http import make_session
-from ._outbox_case import mirror_update, without_commit_drain
+from ._outbox_case import content_bulk_update, mirror_update, without_commit_drain
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 User = get_user_model()
@@ -199,6 +199,31 @@ class TestReconcileLoggingLevels(LevelsTestBase):
 
         self.assertEqual(deleted, [True])
         self.assertIsNone(res["local_levels"])
+
+    def test_owned_singleton_concurrent_edit_returns_the_persisted_row(self):
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = self._row(console_severity="WARNING", status="accepted", accepted_at=timezone.now())
+        edited = []
+
+        def edit_after_load(sender, instance, **kwargs):
+            if edited or instance.pk != row.pk:
+                return
+            edited.append(True)
+            content_bulk_update(instance, console_severity="ERROR")
+            instance.console_severity = "WARNING"
+
+        post_init.connect(edit_after_load, sender=NSOLoggingLevelState, weak=False)
+        self.addCleanup(post_init.disconnect, edit_after_load, sender=NSOLoggingLevelState)
+
+        res = self._reconcile(self._payload(local_levels={"console_severity": "WARNING"}))
+
+        self.assertEqual(edited, [True])
+        self.assertIsNotNone(res["local_levels"])
+        self.assertEqual(res["local_levels"].console_severity, "ERROR")
+        self.assertEqual(res["local_levels"].status, "accepted")
 
     def test_no_mgmt_returns_none(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config

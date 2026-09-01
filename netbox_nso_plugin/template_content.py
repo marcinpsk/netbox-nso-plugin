@@ -576,7 +576,7 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
             last_sync_at=now,
         )
         if state is None:
-            return None
+            state = NSOSnmpSystemInfoState.objects.filter(management=mgmt).first()
     else:
         state.last_sync_at = now
         state.location = dev_location
@@ -796,7 +796,7 @@ def _reconcile_logging_levels(mgmt, levels_data: dict, now):
             last_sync_at=now,
         )
         if state is None:
-            return None
+            state = NSOLoggingLevelState.objects.filter(management=mgmt).first()
     else:
         state.last_sync_at = now
         for f, v in dev.items():
@@ -1119,9 +1119,9 @@ def _static_route_reconcile_footprint(device, payload):
 
     mgmt = NSODeviceManagement.objects.filter(device=device).first()
     if mgmt is None:
-        return MutationFootprint(), set()
+        return MutationFootprint(), {}
     route_ids = set(NSOStaticRouteState.objects.filter(management=mgmt).values_list("static_route_id", flat=True))
-    reported_route_ids = set()
+    reported_routes = {}
     vrf_ids = set()
     try:
         from ipam.models import VRF
@@ -1145,7 +1145,7 @@ def _static_route_reconcile_footprint(device, payload):
         resolved_route_id = StaticRoute.objects.filter(**lookup).values_list("pk", flat=True).first()
         if resolved_route_id is not None:
             route_ids.add(resolved_route_id)
-            reported_route_ids.add(resolved_route_id)
+            reported_routes[resolved_route_id] = entry
     overlay_ids = NSOStaticRouteState.objects.filter(management=mgmt).values_list("pk", flat=True)
     return (
         MutationFootprint.for_keys(
@@ -1162,7 +1162,7 @@ def _static_route_reconcile_footprint(device, payload):
                 *(SourceRow("netbox_nso_plugin.nsostaticroutestate", pk) for pk in overlay_ids),
             ),
         ),
-        reported_route_ids,
+        reported_routes,
     )
 
 
@@ -1178,7 +1178,8 @@ def _static_route_reconcile_plan(device, payload):
 
     if StaticRoute is None:
         return ReconcileMutationPlan(MutationFootprint())
-    footprint, reported_route_ids = _static_route_reconcile_footprint(device, payload)
+    footprint, reported_routes = _static_route_reconcile_footprint(device, payload)
+    reported_route_ids = set(reported_routes)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return ReconcileMutationPlan(footprint)
@@ -1191,6 +1192,18 @@ def _static_route_reconcile_plan(device, payload):
         .exclude(static_route_id__in=reported_route_ids)
         .exists()
     )
+    if not changes_content:
+        reported_owned_states = NSOStaticRouteState.objects.filter(
+            signals.PUSHED_STATIC_ROUTE_FILTER,
+            management=management,
+            status="in_sync",
+            static_route_id__in=reported_route_ids,
+        ).select_related("static_route")
+        changes_content = any(
+            state.static_route.metric != _static_route_metric(reported_routes[state.static_route_id], device)
+            or state.static_route.tag != reported_routes[state.static_route_id].get("tag")
+            for state in reported_owned_states
+        )
     if not changes_content and _adapter_setting("static_route_auto_create"):
         owned_reported_route_ids = NSOStaticRouteState.objects.filter(
             signals.PUSHED_STATIC_ROUTE_FILTER,

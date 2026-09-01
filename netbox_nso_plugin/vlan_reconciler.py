@@ -232,9 +232,11 @@ def switchport_reconcile_footprint(device, payload: dict):
 
 def switchport_reconcile_plan(device, payload: dict):
     """Classify a switchport refresh from its predicted rendered membership."""
+    import copy
+
     from ipam.models import VLAN
 
-    from .intent_state import ReconcileMutationPlan, _normal, canonical_fragment
+    from .intent_state import ReconcileMutationPlan, canonical_fragment
     from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
     from .status_machine import is_owned
 
@@ -278,16 +280,13 @@ def switchport_reconcile_plan(device, payload: dict):
             )
             if vlan is not None
         )
-        after = _normal(
-            {
-                "interface_name": state.interface.name,
-                "mode": item.get("mode") if item.get("mode") in _NSO_TO_NETBOX_MODE else "",
-                "untagged_vlan": untagged.vid if untagged is not None else None,
-                "tagged_vlans": sorted(vlan.vid for vlan in tagged),
-            }
-        )
         before = canonical_fragment(state)
-        if before != after:
+        candidate = copy.copy(state)
+        candidate.mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
+        candidate.untagged_vlan = untagged
+        candidate._prefetched_objects_cache = dict(state._prefetched_objects_cache)
+        candidate._prefetched_objects_cache["tagged_vlans"] = tagged
+        if before != canonical_fragment(candidate):
             changes_content = True
             break
     return ReconcileMutationPlan(footprint, changes_content=changes_content)

@@ -257,6 +257,46 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(deleted, [True])
         self.assertIsNone(result["system_info"])
 
+    def test_system_info_concurrent_edit_returns_the_persisted_row(self):
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=mgmt,
+            location="Test rack",
+            contact="noc@example.invalid",
+            status="accepted",
+        )
+        edited = []
+
+        def edit_after_load(sender, instance, **kwargs):
+            if edited or instance.pk != row.pk:
+                return
+            edited.append(True)
+            content_bulk_update(instance, location="Operator rack")
+            instance.location = "Test rack"
+
+        post_init.connect(edit_after_load, sender=NSOSnmpSystemInfoState, weak=False)
+        self.addCleanup(post_init.disconnect, edit_after_load, sender=NSOSnmpSystemInfoState)
+
+        result = _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [],
+                "system_info": {"location": "Test rack", "contact": "noc@example.invalid"},
+            },
+        )
+
+        self.assertEqual(edited, [True])
+        self.assertIsNotNone(result["system_info"])
+        self.assertEqual(result["system_info"].location, "Operator rack")
+        self.assertEqual(result["system_info"].status, "accepted")
+
     def test_omitted_default_trap_port_matches_owned_intent(self):
         from netbox_nso_plugin.models import NSOSnmpHostState
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
