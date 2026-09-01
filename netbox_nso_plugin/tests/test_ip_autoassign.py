@@ -904,13 +904,24 @@ class TestRollbackAutoAssigned(TestCase):
 
     @classmethod
     def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
         manufacturer = Manufacturer.objects.create(name="RbMfg", slug="rbmfg")
         device_type = DeviceType.objects.create(manufacturer=manufacturer, model="RbDev", slug="rbdev")
         role = DeviceRole.objects.create(name="RbRole", slug="rbrole")
         site = Site.objects.create(name="RbSite", slug="rbsite")
         cls.device = Device.objects.create(name="rb-router", device_type=device_type, role=role, site=site)
+        nso = NSOInstance.objects.create(name="rb-nso", adapter_instance_id="rb-nso-inst")
+        NSODeviceManagement.objects.create(
+            device=cls.device,
+            nso_instance=nso,
+            nso_device_name="rb-router",
+            adapter_device_id=1,
+        )
 
     def test_rollback_deletes_ip_and_state(self):
+        from unittest.mock import patch
+
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
@@ -926,10 +937,12 @@ class TestRollbackAutoAssigned(TestCase):
             auto_assigned=True,
         )
 
-        rollback_auto_assigned(state)
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            rollback_auto_assigned(state)
 
         self.assertFalse(IPAddress.objects.filter(address="10.200.0.1/32").exists())
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state.pk).exists())
+        schedule.assert_any_call((self.device.pk, "ip"))
 
     def test_single_address_rollback_preserves_the_shared_source_pool(self):
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned

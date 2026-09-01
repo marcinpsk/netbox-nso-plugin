@@ -2026,14 +2026,7 @@ def _on_ip_address_change(sender, instance, **kwargs):
     """Schedule only the IP keys declared by the active exact writer."""
     if getattr(_p2p_allocation_active, "active", False):
         return
-    from .renderer_writer import active_renderer_writer
-
-    writer = active_renderer_writer()
-    if writer is None:
-        return
-    for device_id, scope in writer.plan.content_keys:
-        if scope == "ip" and _converted_writer_owns_content(device_id, scope):
-            _schedule_intent_push((device_id, scope))
+    _schedule_exact_writer_scope("ip")
 
 
 @_skip_on_render
@@ -2414,12 +2407,14 @@ def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_routing_isis_flex_algo_save(sender, instance, **kwargs):
-    """Keep foreign native Flex-Algo saves outside synchronous bookkeeping."""
+    """Schedule native Flex-Algo saves only for their exact writer."""
+    _schedule_exact_writer_scope("isis_flex_algo")
 
 
 @_skip_on_render
 def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
-    """Keep foreign native Flex-Algo deletes outside synchronous bookkeeping."""
+    """Schedule native Flex-Algo deletes only for their exact writer."""
+    _schedule_exact_writer_scope("isis_flex_algo")
 
 
 def l2_sap_intent_item(row):
@@ -3463,8 +3458,6 @@ def _route_map_contributors(route_maps):
 
 def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()):
     """Freeze explicit root acquisitions and eligible route-map contributors."""
-    import copy
-
     from django.contrib.contenttypes.models import ContentType
 
     from .models import NSORoutePolicyState

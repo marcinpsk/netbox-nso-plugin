@@ -298,7 +298,7 @@ def rollback_auto_assigned(state) -> None:
         renderer_mirror_writes,
         renderer_writes,
     )
-    from .signals import suppress_intent_push
+    from .signals import _schedule_exact_writer_scope, suppress_intent_push
 
     if not state.auto_assigned:
         return
@@ -327,44 +327,47 @@ def rollback_auto_assigned(state) -> None:
         if ip_address is not None:
             ip_addresses.append(ip_address)
 
-    with transaction.atomic(), suppress_intent_push():
-        if is_p2p and source_pool is not None:
-            source_pool = type(source_pool).objects.select_for_update().get(pk=source_pool.pk)
-            pool_plan = RendererMutationPlan.build(deletes=(planned_delete(source_pool),))
-            pool_mutation = (
-                renderer_writes(pool_plan) if pool_plan.changes_content else renderer_mirror_writes(pool_plan)
-            )
-            with pool_mutation as writer:
-                writer.delete(source_pool)
-            source_pool = None
-            states = list(type(state).objects.filter(pk__in=[candidate.pk for candidate in states]).order_by("pk"))
+    with transaction.atomic():
+        with suppress_intent_push():
+            if is_p2p and source_pool is not None:
+                source_pool = type(source_pool).objects.select_for_update().get(pk=source_pool.pk)
+                pool_plan = RendererMutationPlan.build(deletes=(planned_delete(source_pool),))
+                pool_mutation = (
+                    renderer_writes(pool_plan) if pool_plan.changes_content else renderer_mirror_writes(pool_plan)
+                )
+                with pool_mutation as writer:
+                    writer.delete(source_pool)
+                source_pool = None
+                states = list(type(state).objects.filter(pk__in=[candidate.pk for candidate in states]).order_by("pk"))
 
-        if len(states) > 1:
-            clear_plan = RendererMutationPlan.build(
-                set_updates=(
-                    planned_set_update(
-                        type(state).objects.filter(pk__in=[candidate.pk for candidate in states]),
-                        peer_state=None,
+            if len(states) > 1:
+                clear_plan = RendererMutationPlan.build(
+                    set_updates=(
+                        planned_set_update(
+                            type(state).objects.filter(pk__in=[candidate.pk for candidate in states]),
+                            peer_state=None,
+                        ),
                     ),
-                ),
-            )
-            clear_mutation = (
-                renderer_writes(clear_plan) if clear_plan.changes_content else renderer_mirror_writes(clear_plan)
-            )
-            with clear_mutation as writer:
-                clear_write = next(write for write in clear_plan.write_set if write.operation == "set_update")
-                writer.set_update(type(state), clear_write, peer_state=None)
-            states = list(type(state).objects.filter(pk__in=[candidate.pk for candidate in states]).order_by("pk"))
+                )
+                clear_mutation = (
+                    renderer_writes(clear_plan) if clear_plan.changes_content else renderer_mirror_writes(clear_plan)
+                )
+                with clear_mutation as writer:
+                    clear_write = next(write for write in clear_plan.write_set if write.operation == "set_update")
+                    writer.set_update(type(state), clear_write, peer_state=None)
+                states = list(type(state).objects.filter(pk__in=[candidate.pk for candidate in states]).order_by("pk"))
 
         plan = RendererMutationPlan.build(
             deletes=(planned_delete(candidate) for candidate in (*ip_addresses, *states)),
         )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
-            for ip_address in ip_addresses:
-                writer.delete(ip_address)
-            for candidate in states:
-                writer.delete(candidate)
+            with suppress_intent_push():
+                for ip_address in ip_addresses:
+                    writer.delete(ip_address)
+                for candidate in states:
+                    writer.delete(candidate)
+            _schedule_exact_writer_scope("ip")
 
 
 # ── P2P allocation helper ─────────────────────────────────────────────────────

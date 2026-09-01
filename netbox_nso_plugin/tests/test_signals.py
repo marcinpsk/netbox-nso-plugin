@@ -1173,6 +1173,24 @@ class TestSkipOnRenderGuard(_SignalDBBase):
         self._fire_with_method(None).assert_called_once()
 
 
+class TestExactWriterNativeNotifications(unittest.TestCase):
+    def test_flex_algo_save_schedules_the_exact_writer_scope(self):
+        from netbox_nso_plugin.signals import _on_routing_isis_flex_algo_save
+
+        with patch("netbox_nso_plugin.signals._schedule_exact_writer_scope") as schedule:
+            _on_routing_isis_flex_algo_save(sender=None, instance=None)
+
+        schedule.assert_called_once_with("isis_flex_algo")
+
+    def test_flex_algo_delete_schedules_the_exact_writer_scope(self):
+        from netbox_nso_plugin.signals import _on_routing_isis_flex_algo_pre_delete
+
+        with patch("netbox_nso_plugin.signals._schedule_exact_writer_scope") as schedule:
+            _on_routing_isis_flex_algo_pre_delete(sender=None, instance=None)
+
+        schedule.assert_called_once_with("isis_flex_algo")
+
+
 # ---------------------------------------------------------------------------
 # TestIPAddressSignals — Django DB integration tests for the IP signal path
 # ---------------------------------------------------------------------------

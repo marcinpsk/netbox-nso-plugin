@@ -73,6 +73,21 @@ class TestReconcileBfd(TestCase):
         self.assertIsNone(bi.bfd_profile_id)
         self.assertTrue(bi.micro_bfd)
 
+    def test_existing_native_without_profile_receives_a_new_profile(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+
+        native = BFDInterface.objects.create(interface=self.ae1, bfd_profile=None, micro_bfd=False, enabled=True)
+        self.assertIsNone(native.bfd_profile_id)
+        self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
+
+        reconcile_bfd(self.device, [self._entry("ae1", tx=333, rx=444, mult=5)])
+
+        native = BFDInterface.objects.get(interface=self.ae1)
+        self.assertIsNotNone(native.bfd_profile_id)
+        self.assertEqual(native.bfd_profile.name, "bfd-333-444-x5")
+
     def test_stale_pruned(self):
         """An interface that stops reporting BFD has its BFDInterface removed."""
         from netbox_routing.models import BFDInterface

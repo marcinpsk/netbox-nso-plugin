@@ -1148,10 +1148,12 @@ def _route_map_consumer_rows(instance):
 def _route_map_consumer_keys(instance) -> set[tuple[int, str]]:
     """Resolve route-map consumers to their actual delivery scopes."""
     keys = set()
+    supported_scopes = set(_REGISTRY[instance._meta.label_lower].scopes)
     for row in _route_map_consumer_rows(instance):
         if row._meta.label_lower == "netbox_nso_plugin.nsobgppeerstate":
-            keys.add((row.management.device_id, "bgp"))
-        else:
+            if "bgp" in supported_scopes:
+                keys.add((row.management.device_id, "bgp"))
+        elif row.dest_protocol in supported_scopes:
             keys.add((row.management.device_id, row.dest_protocol))
     return keys
 
