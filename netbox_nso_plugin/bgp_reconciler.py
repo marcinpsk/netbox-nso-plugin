@@ -178,9 +178,7 @@ def _af_device_content(
             {
                 "af": af_str,
                 "enabled": bool(paf.get("enabled", True)),
-                "routemap_in": _bgp_fk_identity(
-                    resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)
-                ),
+                "routemap_in": _bgp_fk_identity(resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)),
                 "routemap_out": _bgp_fk_identity(
                     resolve(paf.get("routemap_out"), route_maps_by_name, _resolve_routemap)
                 ),
@@ -550,9 +548,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         route_map_names = {name for family, name in policy_groups if family == "route_map"}
         prefix_list_names = {name for family, name in policy_groups if family == "prefix_list"}
         self.route_maps_by_name = {row.name: row for row in RouteMap.objects.filter(name__in=route_map_names)}
-        self.prefix_lists_by_name = {
-            row.name: row for row in PrefixList.objects.filter(name__in=prefix_list_names)
-        }
+        self.prefix_lists_by_name = {row.name: row for row in PrefixList.objects.filter(name__in=prefix_list_names)}
         self.operations.policy_footprint = route_policy_footprint(policy_groups)
 
     def save(self, *args, **kwargs):
