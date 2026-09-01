@@ -199,6 +199,12 @@ class TestNSODeviceManagementModelMethods(TestCase):
         expected = reverse("plugins:netbox_nso_plugin:nsodevicemanagement", args=[self.mgmt.pk])
         self.assertEqual(self.mgmt.get_absolute_url(), expected)
 
+    def test_direct_delete_rejects_database_options(self):
+        with self.assertRaisesRegex(TypeError, "does not accept delete options"):
+            self.mgmt.delete(using="default")
+
+        self.assertTrue(type(self.mgmt).objects.filter(pk=self.mgmt.pk).exists())
+
     def test_managed_attributes_none(self):
         """managed_attributes returns empty list when both flags are False."""
         self.mgmt.manage_description = False

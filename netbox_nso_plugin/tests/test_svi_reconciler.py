@@ -408,3 +408,32 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
             native_key={"device_id": state.interface.device_id, "name": state.interface.name},
             ownership_state="owned",
         ).exists()
+
+    def test_exhausted_stale_accept_retry_returns_an_operator_error(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        state = self._state(name="Vlan301", vid=301, status="conflict")
+        user = get_user_model().objects.create_superuser(
+            username="svi-stale-admin",
+            password="pw",  # noqa: S106
+            email="stale-svi@example.test",
+        )
+        self.client.force_login(user)
+
+        with patch(
+            "netbox_nso_plugin.renderer_writer.RendererWriter.save",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ) as save:
+            response = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(save.call_count, 2)
+        self.assertIn(
+            "Routing state changed. Refresh the page and try again.",
+            [str(message) for message in get_messages(response.wsgi_request)],
+        )

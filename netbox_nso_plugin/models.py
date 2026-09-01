@@ -702,10 +702,10 @@ class NSODeviceManagement(NetBoxModel):
 
     def delete(self, *args, **kwargs):
         """Route sanctioned management CRUD deletes through the exact writer."""
-        from .management_lifecycle import delete_management, management_crud_is_active
+        from .management_lifecycle import delete_management
         from .renderer_writer import active_renderer_writer
 
-        if management_crud_is_active() and active_renderer_writer() is None:
+        if active_renderer_writer() is None:
             if args or kwargs:
                 raise TypeError("the management CRUD writer does not accept delete options")
             return delete_management(self)

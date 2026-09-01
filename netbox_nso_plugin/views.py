@@ -4435,8 +4435,9 @@ def _save_owned_svi_edit(obj, old_values):
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
     candidate = copy.copy(obj)
+    planned_at = timezone.now()
     if not sm.is_owned(candidate.status):
-        candidate.accepted_at = timezone.now()
+        candidate.accepted_at = planned_at
     candidate.status = sm.on_operator_edit(candidate.status)
     update_fields = {
         field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
@@ -4447,7 +4448,7 @@ def _save_owned_svi_edit(obj, old_values):
         update_fields.add("accepted_at")
     plan = RendererMutationPlan.build(
         saves=(planned_save(candidate, update_fields=update_fields),),
-        planned_at=candidate.accepted_at,
+        planned_at=planned_at,
     )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
@@ -6491,24 +6492,37 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         """Accept one converted overlay through its exact renderer plan."""
         import copy
 
-        blocker = self.push_blocker(state)
-        if blocker:
-            messages.error(request, f"Cannot accept {state}: {blocker}")
-            return redirect(_device_nso_tab_url(state.management.device_id))
-        candidate = copy.copy(state)
-        candidate.status = _status_after_accept(state.status)
-        candidate.accepted_at = timezone.now()
-
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+        from .renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
 
         fields = ("status", "accepted_at")
-        plan = RendererMutationPlan.build(
-            saves=(planned_save(candidate, update_fields=fields),),
-            planned_at=candidate.accepted_at,
-        )
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
-            writer.save(candidate, update_fields=fields)
+        for attempt in range(2):
+            current = get_object_or_404(self.model_class, pk=state.pk)
+            blocker = self.push_blocker(current)
+            if blocker:
+                messages.error(request, f"Cannot accept {current}: {blocker}")
+                return redirect(_device_nso_tab_url(current.management.device_id))
+            candidate = copy.copy(current)
+            candidate.status = _status_after_accept(current.status)
+            candidate.accepted_at = timezone.now()
+            plan = RendererMutationPlan.build(
+                saves=(planned_save(candidate, update_fields=fields),),
+                planned_at=candidate.accepted_at,
+            )
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            try:
+                with mutation as writer:
+                    writer.save(candidate, update_fields=fields)
+                break
+            except IntentPlanStaleError:
+                if attempt:
+                    messages.error(request, "Routing state changed. Refresh the page and try again.")
+                    return redirect(_device_nso_tab_url(current.management.device_id))
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 

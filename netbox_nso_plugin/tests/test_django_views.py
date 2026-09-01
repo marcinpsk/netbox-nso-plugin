@@ -4898,11 +4898,14 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(revision.revision, revisions_after_delete[0])
 
     def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
+        from datetime import timedelta
+
         from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOSVIState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
 
         group = VLANGroup.objects.create(name="Inline SVI VLANs", slug="inline-svi-vlans")
         vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
@@ -4914,13 +4917,19 @@ class TestOverlayFieldEditView(ViewTestBase):
             svi_type="svi",
             vrf="OLD-VRF",
             status="deploying",
-            accepted_at=timezone.now(),
+            accepted_at=timezone.now() - timedelta(days=3),
             apply_attempt_id=uuid4(),
         )
+        planned_at = timezone.now()
 
-        response = self.client.post(self._url("svi", state.pk), {"vrf": "CUSTOMER"})
+        with (
+            patch("netbox_nso_plugin.views.timezone.now", return_value=planned_at),
+            patch.object(RendererMutationPlan, "build", wraps=RendererMutationPlan.build) as build,
+        ):
+            response = self.client.post(self._url("svi", state.pk), {"vrf": "CUSTOMER"})
 
         self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(build.call_args.kwargs["planned_at"], planned_at)
         state.refresh_from_db()
         self.assertEqual(state.vrf, "CUSTOMER")
         self.assertEqual(state.status, "accepted")
