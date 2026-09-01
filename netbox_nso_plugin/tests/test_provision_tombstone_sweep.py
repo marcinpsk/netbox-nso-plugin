@@ -484,7 +484,7 @@ class TestProvisionSweepBudget(TestCase):
 
         with (
             patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=poll),
-            patch("time.monotonic", side_effect=(0.0, 1.0)),
+            patch("netbox_nso_plugin.provision_lifecycle._monotonic", side_effect=(0.0, 1.0)),
         ):
             checked, closed = sweep_provision_tombstones(deadline=1.0)
 
