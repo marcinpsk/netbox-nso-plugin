@@ -145,13 +145,17 @@ def content_bulk_update(instance, **values):
 
 def own_vlan(mgmt, vid: int, tag: str):
     """One owned VLAN overlay, which is what a VLAN render puts on the wire."""
-    from ipam.models import VLAN
+    from ipam.models import VLAN, VLANGroup
 
     from netbox_nso_plugin.models import NSOVLANState
     from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
     with without_commit_drain(), transaction.atomic():
-        vlan = VLAN.objects.create(vid=vid, name=f"cl-{tag}-v{vid}")
+        group, _ = VLANGroup.objects.get_or_create(
+            slug=f"nso-{mgmt.device_id}",
+            defaults={"name": f"NSO {mgmt.device.name}"},
+        )
+        vlan = VLAN.objects.create(group=group, vid=vid, name=f"cl-{tag}-v{vid}")
         state = NSOVLANState(management=mgmt, vlan=vlan, status="accepted")
         plan = RendererMutationPlan.build(
             saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),)
