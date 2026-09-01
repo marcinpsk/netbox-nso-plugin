@@ -123,6 +123,60 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
 
 class TestRendererContentWriter(IntentPushResetMixin, TestCase):
+    def test_effective_after_clears_a_stale_relation_cache(self):
+        from netbox_nso_plugin.intent_state import _effective_after
+        from netbox_nso_plugin.models import NSOLoggingHostState
+
+        _first_device, first_management = make_managed("writer-relation-first", 16289)
+        _second_device, second_management = make_managed("writer-relation-second", 16290)
+        state = NSOLoggingHostState.objects.create(
+            management=first_management,
+            address="198.18.0.89",
+        )
+        before = NSOLoggingHostState.objects.select_related("management").get(pk=state.pk)
+        candidate = copy.copy(before)
+        candidate.management_id = second_management.pk
+
+        effective = _effective_after(candidate, before, ("management",))
+
+        self.assertEqual(effective.management_id, second_management.pk)
+        self.assertEqual(effective.management.pk, second_management.pk)
+
+    def test_renderer_writer_declares_one_reference_resolver(self):
+        import ast
+        import inspect
+
+        from netbox_nso_plugin.renderer_writer import RendererWriter
+
+        renderer_writer = ast.parse(inspect.getsource(RendererWriter)).body[0]
+        resolvers = [
+            node
+            for node in renderer_writer.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_resolve_reference"
+        ]
+
+        self.assertEqual(len(resolvers), 1)
+
+    def test_route_map_consumers_ignore_undeclared_redistribution_scopes(self):
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        device, management = make_managed("writer-route-map-scope", 16291)
+        route_map = RouteMap.objects.create(name="RM-WRITER-SCOPE")
+        NSORedistributionState.objects.create(
+            management=management,
+            dest_protocol="undeclared",
+            source_protocol="static",
+            route_map=route_map.name,
+            status="accepted",
+        )
+
+        footprint = footprint_for_instance(route_map)
+
+        self.assertNotIn((device.pk, "undeclared"), footprint.revision_keys)
+
     def test_stale_plan_error_is_a_renderer_protocol_error(self):
         from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
@@ -379,7 +433,26 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             writer.save(vlan, force_insert=True)
 
         self.assertEqual(vlan.group_id, winner.pk)
+    def test_plan_rejects_a_forward_creation_reference(self):
+        from ipam.models import VLANGroup
 
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        group = VLANGroup(name="Writer forward group", slug="writer-forward-group")
+        vlan = VLAN(group=group, vid=1640, name="writer-forward-vlan")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "references a row planned after it"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        vlan,
+                        force_insert=True,
+                        natural_key=("group", "vid"),
+                        references=(("group", group),),
+                    ),
+                    planned_save(group, force_insert=True, natural_key=("slug",)),
+                )
+            )
     def test_plan_refuses_an_unreferenced_support_row(self):
         from tenancy.models import Tenant
 

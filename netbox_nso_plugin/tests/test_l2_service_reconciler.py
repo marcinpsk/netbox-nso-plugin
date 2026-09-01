@@ -130,6 +130,26 @@ class TestReconcileL2Services(TestCase):
         assert L2VPNTermination.objects.filter(assigned_object_id=self.port.pk).count() == 1
         assert NSOL2SapState.objects.filter(management=self.mgmt, service_name="701").count() == 1
 
+    def test_duplicate_services_and_saps_use_the_first_observation(self):
+        service = {
+            "service_name": "DUPLICATE",
+            "service_type": "vpls",
+            "service_id": 701,
+            "saps": [
+                {"sap_id": "1/1/c31/3:701", "port": "1/1/c31/3", "outer_tag": 701},
+                {"sap_id": "1/1/c31/3:701", "port": "lag-60", "outer_tag": 999},
+            ],
+        }
+        duplicate = {**service, "service_type": "epipe", "service_id": 999}
+
+        rows = reconcile_l2_services(self.device, _payload([service, duplicate]))
+
+        self.assertEqual(len(rows), 1)
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name="DUPLICATE")
+        self.assertEqual((state.port, state.outer_tag), ("1/1/c31/3", 701))
+        l2vpn = L2VPN.objects.get(slug=f"nso-{self.device.pk}-DUPLICATE")
+        self.assertEqual((l2vpn.type, l2vpn.identifier), ("vpls", 701))
+
     def test_owned_sap_keeps_service_type_intent_when_device_differs(self):
         reconcile_l2_services(
             self.device,

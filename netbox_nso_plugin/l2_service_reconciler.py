@@ -75,6 +75,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
     saves = []
     operations = []
     reported = set()
+    reported_services = set()
 
     def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
         saves.append(
@@ -91,8 +92,9 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
         if not isinstance(service, dict):
             continue
         service_name = service.get("service_name")
-        if not service_name:
+        if not service_name or service_name in reported_services:
             continue
+        reported_services.add(service_name)
         service_type = service.get("service_type", "")
         l2vpn_type = _L2VPN_TYPE.get(service_type, "vpls")
         slug = f"nso-{device.pk}-{service_name}"
@@ -128,6 +130,8 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
             if not isinstance(sap, dict) or not sap.get("sap_id"):
                 continue
             key = (service_name, sap["sap_id"])
+            if key in reported:
+                continue
             reported.add(key)
             current_state = states.get(key)
             state = (

@@ -1144,7 +1144,13 @@ def _recompute_one(interface, templates):
     # active here. Opening one of its own from a signal is the thing that rule forbids.
     if active is None:
         raise IntentMutationProtocolError("a derived description recompute requires an active renderer writer")
-    active.save(candidate, update_fields=("description",))
+    try:
+        active.save(candidate, update_fields=("description",))
+    except IntentMutationProtocolError:
+        logger.warning(
+            "derived_intent.unplanned_write field=description interface_id=%s",
+            interface.pk,
+        )
 
 
 def _recompute_on_cable_change(sender, instance, **kwargs):
@@ -1288,16 +1294,20 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
     if not _converted_writer_owns_content(instance.device_id, "subinterface"):
         return
 
-    # Brand-new interface → no prior state; create + own it. The post_save signal on the
-    # new state pushes the device's full subinterface intent snapshot to the adapter.
-    NSOSubinterfaceState.objects.create(
+    from .renderer_writer import active_renderer_writer
+
+    active = active_renderer_writer()
+    if active is None:
+        return
+    candidate = NSOSubinterfaceState(
         management=mgmt,
         interface=instance,
         parent_interface=instance.parent,
         dot1q_vlan=int(suffix),
         status="accepted",
-        accepted_at=timezone.now(),
+        accepted_at=active.plan.planned_at,
     )
+    active.save(candidate, force_insert=True)
 
 
 def interface_ip_intent_item(row):
@@ -2329,21 +2339,10 @@ def _remove_static_route_for_device(static_route, device) -> None:
     rows.delete()
 
 
-def _on_routing_static_route_pre_save(sender, instance, **kwargs):
-    """Treat a native save event as neither ownership evidence nor a mutation planner."""
-
-
 @_skip_on_render
 def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
     """Schedule only the static-route keys declared by the active exact writer."""
-    from .renderer_writer import active_renderer_writer
-
-    writer = active_renderer_writer()
-    if writer is None:
-        return
-    for device_id, scope in writer.plan.content_keys:
-        if scope == "static_route" and _converted_writer_owns_content(device_id, scope):
-            _schedule_intent_push((device_id, scope))
+    _schedule_exact_writer_scope("static_route")
 
 
 @_close_renderer_m2m_permit
@@ -2352,27 +2351,13 @@ def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, r
     """Schedule only exact-writer assignment changes, without acquiring in the signal."""
     if not action.startswith("post_"):
         return
-    from .renderer_writer import active_renderer_writer
-
-    writer = active_renderer_writer()
-    if writer is None:
-        return
-    for device_id, scope in writer.plan.content_keys:
-        if scope == "static_route" and _converted_writer_owns_content(device_id, scope):
-            _schedule_intent_push((device_id, scope))
+    _schedule_exact_writer_scope("static_route")
 
 
 @_skip_on_render
 def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
     """Schedule only exact-writer route deletions, without mutating overlays."""
-    from .renderer_writer import active_renderer_writer
-
-    writer = active_renderer_writer()
-    if writer is None:
-        return
-    for device_id, scope in writer.plan.content_keys:
-        if scope == "static_route" and _converted_writer_owns_content(device_id, scope):
-            _schedule_intent_push((device_id, scope))
+    _schedule_exact_writer_scope("static_route")
 
 
 # ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────
@@ -4225,13 +4210,6 @@ def _connect_g_activated():  # pragma: no cover
     try:
         from netbox_routing.models import StaticRoute
 
-        # The pre_save stash is what makes post_save delta-gated; without it every save
-        # (including one that touched only ``name``) would bump a generation and push.
-        pre_save.connect(
-            _on_routing_static_route_pre_save,
-            sender=StaticRoute,
-            dispatch_uid="nso_plugin_routing_static_route_pre_save",
-        )
         post_save.connect(
             _on_routing_static_route_save,
             sender=StaticRoute,

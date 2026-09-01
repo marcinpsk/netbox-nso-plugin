@@ -1417,8 +1417,11 @@ def _effective_after(instance, before, update_fields):
     for field_name in update_fields:
         field = instance._meta.get_field(field_name)
         setattr(effective, field.attname, getattr(instance, field.attname))
-        if field.is_relation and field.is_cached(instance):
-            field.set_cached_value(effective, field.get_cached_value(instance))
+        if field.is_relation:
+            if field.is_cached(instance):
+                field.set_cached_value(effective, field.get_cached_value(instance))
+            elif field.is_cached(effective):
+                field.delete_cached_value(effective)
     return effective
 
 

@@ -463,6 +463,31 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(state.status, "accepted")
         self.assertIsNone(state.isis_interface_id)
 
+    def test_owned_process_without_native_is_not_materialized_from_interface_data(self):
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        management = self._make_mgmt()
+        process_state = NSOISISInstanceState.objects.create(
+            management=management,
+            process_tag="CORE",
+            status="accepted",
+        )
+
+        reconcile_isis(
+            self.device,
+            {
+                "processes": [{"process_tag": "CORE", "net": "49.0001.0000.0000.0001.00"}],
+                "interfaces": [self._entry(process_tag="CORE")],
+            },
+        )
+
+        process_state.refresh_from_db()
+        self.assertIsNone(process_state.isis_instance_id)
+        self.assertFalse(ISISInstance.objects.filter(device=self.device, process_tag="CORE").exists())
+
     def test_owned_overlay_metric_network_type_not_clobbered(self):
         """A reconcile must not wipe an owned IS-IS row's pushed metric/network-type.
 

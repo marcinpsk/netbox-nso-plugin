@@ -19,6 +19,26 @@ from django.urls import reverse
 
 
 class TestReconcileRoutePolicy(TestCase):
+    def test_object_classification_lookups_are_batched(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from django.utils import timezone
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
+        from netbox_nso_plugin.route_policy_reconciler import _RoutePolicyGraphPlanner
+
+        self._make_mgmt(self.device)
+        payload = {"prefix_lists": [{"name": f"CLASS-BATCH-{index}", "entries": []} for index in range(4)]}
+        PrefixList.objects.bulk_create(PrefixList(name=row["name"]) for row in payload["prefix_lists"])
+
+        with CaptureQueriesContext(connection) as captured:
+            _RoutePolicyGraphPlanner(self.device, payload, timezone.now()).build()
+
+        class_table = NSORoutePolicyObjectClass._meta.db_table
+        class_queries = [query for query in captured if class_table in query["sql"]]
+        self.assertEqual(len(class_queries), 1)
+
     def test_prefix_unit_owner_lookup_is_batched(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
@@ -1271,6 +1291,84 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(rme.set, {"local_preference": 200})
         self.assertEqual([p.name for p in rme.match_prefix_list.all()], ["PL-A"])
         self.assertEqual([a.name for a in rme.match_aspath.all()], ["AP-A"])
+
+    def test_route_map_keeps_existing_policy_references_absent_from_its_payload(self):
+        from netbox_routing.models import CommunityList, PrefixList, RouteMapEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        PrefixList.objects.create(name="PL-EXISTING")
+        CommunityList.objects.create(name="CL-EXISTING")
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-EXISTING-REFERENCE",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match_prefix_lists": ["PL-EXISTING"],
+                                "set": '{"community_add": ["CL-EXISTING"]}',
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        entry = RouteMapEntry.objects.get(route_map__name="RM-EXISTING-REFERENCE")
+        self.assertEqual(list(entry.match_prefix_list.values_list("name", flat=True)), ["PL-EXISTING"])
+        self.assertEqual(
+            list(entry.set_communities.values_list("community_list__name", flat=True)),
+            ["CL-EXISTING"],
+        )
+
+    def test_new_route_map_reference_keeps_an_unreported_materialized_object(self):
+        from netbox_routing.models import PrefixList, RouteMapEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {
+                        "name": "PL-NEW-REFERENCE",
+                        "entries": [{"sequence": 10, "action": "permit", "prefix": "198.18.0.0/24"}],
+                    }
+                ]
+            },
+        )
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-NEW-REFERENCE",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match_prefix_lists": ["PL-NEW-REFERENCE"],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-NEW-REFERENCE")
+        self.assertFalse(state.device_present)
+        self.assertTrue(PrefixList.objects.filter(name="PL-NEW-REFERENCE").exists())
+        entry = RouteMapEntry.objects.get(route_map__name="RM-NEW-REFERENCE")
+        self.assertEqual(list(entry.match_prefix_list.values_list("name", flat=True)), ["PL-NEW-REFERENCE"])
 
     def test_flow_control_lifted_from_set_json(self):
         """flow_control (IOS continue) rides in set-json → lifted into the field and
