@@ -450,7 +450,8 @@ class TestAutoAssignIP(TestCase):
         iface = Interface.objects.create(device=self.device, name="Loopback153", type="virtual")
         result = {"allocated": [], "errors": [], "skipped": []}
 
-        _reserve_single(iface, mgmt, "ipv4", pool, result, push=True)
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+            _reserve_single(iface, mgmt, "ipv4", pool, result, push=True)
 
         self.assertTrue(result["allocated"], result)
         self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="ip").exists())
@@ -942,7 +943,7 @@ class TestRollbackAutoAssigned(TestCase):
 
         self.assertFalse(IPAddress.objects.filter(address="10.200.0.1/32").exists())
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state.pk).exists())
-        schedule.assert_any_call((self.device.pk, "ip"))
+        schedule.assert_called_once_with((self.device.pk, "ip"))
 
     def test_single_address_rollback_preserves_the_shared_source_pool(self):
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
