@@ -59,7 +59,7 @@ def lacp_reconcile_plan(device, payload: dict):
 
     for bundle_data in payload.get("bundles", []) or []:
         lag_interface = interfaces.get(bundle_data.get("name") or "")
-        if lag_interface is None:
+        if lag_interface is None or lag_interface.pk in seen_bundles:
             continue
         current = bundle_states.get(lag_interface.pk)
         candidate = (
@@ -181,6 +181,11 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
 
     bundles = payload.get("bundles", []) or []
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
+    bundle_states = {row.interface_id: row for row in NSOLACPBundleState.objects.filter(management=mgmt).order_by("pk")}
+    member_states = {
+        row.interface_id: row
+        for row in NSOLACPMemberState.objects.filter(management=mgmt).select_related("interface").order_by("pk")
+    }
     now = planned_at
     seen_bundles: set[int] = set()
     seen_members: set[int] = set()
@@ -194,8 +199,10 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
         if lag_iface is None:
             dropped.append(bundle_name)
             continue
+        if lag_iface.pk in seen_bundles:
+            continue
 
-        state = NSOLACPBundleState.objects.filter(management=mgmt, interface=lag_iface).first()
+        state = bundle_states.get(lag_iface.pk)
         created = state is None
         if created:
             state = NSOLACPBundleState(management=mgmt, interface=lag_iface, status="unknown")
@@ -224,7 +231,7 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
             if member_iface.pk in seen_members:
                 continue
 
-            m_state = NSOLACPMemberState.objects.filter(management=mgmt, interface=member_iface).first()
+            m_state = member_states.get(member_iface.pk)
             member_created = m_state is None
             if member_created:
                 m_state = NSOLACPMemberState(management=mgmt, interface=member_iface, status="unknown")
@@ -240,7 +247,8 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
     # native interfaces untouched). A stale bundle is vestigial when its LAG interface has
     # no members left; a stale member when its interface is no longer assigned to any LAG.
     _finalise_stale_lacp(
-        mgmt,
+        bundle_states.values(),
+        member_states.values(),
         seen_bundles,
         seen_members,
         _member_bearing_lag_ids(iface_map.values()),
@@ -259,19 +267,26 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
     return list(NSOLACPBundleState.objects.filter(management=mgmt).select_related("interface"))
 
 
-def _finalise_stale_lacp(management, seen_bundles, seen_members, member_bearing_lag_ids, writer, now) -> None:
+def _finalise_stale_lacp(
+    bundle_states,
+    member_states,
+    seen_bundles,
+    seen_members,
+    member_bearing_lag_ids,
+    writer,
+    now,
+) -> None:
     """Apply the planned stale-row outcomes for one LACP snapshot."""
     from . import status_machine as sm
-    from .models import NSOLACPBundleState, NSOLACPMemberState
 
     groups = (
         (
-            NSOLACPBundleState.objects.filter(management=management),
+            bundle_states,
             seen_bundles,
             lambda row: row.interface_id not in member_bearing_lag_ids,
         ),
         (
-            NSOLACPMemberState.objects.filter(management=management).select_related("interface"),
+            member_states,
             seen_members,
             lambda row: row.interface.lag_id is None,
         ),

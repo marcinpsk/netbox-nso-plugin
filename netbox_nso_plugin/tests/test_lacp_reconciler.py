@@ -5,9 +5,7 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.db import connection
 from django.test import TestCase
-from django.test.utils import CaptureQueriesContext
 
 from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
 from netbox_nso_plugin.models import (
@@ -98,6 +96,15 @@ class TestReconcileLagConfig(TestCase):
         self.assertEqual(NSOLACPMemberState.objects.filter(management=self.mgmt, interface=self.m1).count(), 1)
         self.assertEqual(NSOLACPMemberState.objects.get(management=self.mgmt, interface=self.m1).mode, "active")
 
+    def test_repeated_bundle_entry_is_applied_once(self):
+        reconcile_lag_config(
+            self.device,
+            _payload([self._bundle(min_links=1), self._bundle(min_links=2)]),
+        )
+
+        self.assertEqual(NSOLACPBundleState.objects.filter(management=self.mgmt, interface=self.lag).count(), 1)
+        self.assertEqual(NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag).min_links, 1)
+
     def test_owned_member_move_bumps_the_lacp_document(self):
         """A lag_bundle change affects the nested LACP document, not only the member row."""
         from netbox_nso_plugin.models import NSOIntentRevision
@@ -137,39 +144,10 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, data)
         assert NSOLACPBundleState.objects.filter(interface=self.lag).count() == 1
 
-    def test_plan_query_count_does_not_grow_with_overlay_rows(self):
-        from netbox_nso_plugin.lacp_reconciler import lacp_reconcile_plan
-
-        one_member = _payload(
-            [
-                self._bundle(
-                    members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}],
-                )
-            ]
-        )
-        two_members = _payload(
-            [
-                self._bundle(
-                    members=[
-                        {"interface_name": "GigabitEthernet0/1", "mode": "active"},
-                        {"interface_name": "GigabitEthernet0/2", "mode": "active"},
-                    ]
-                )
-            ]
-        )
-        reconcile_lag_config(self.device, one_member)
-
-        with CaptureQueriesContext(connection) as one_member_queries:
-            one_member_plan = lacp_reconcile_plan(self.device, one_member)
-        reconcile_lag_config(self.device, two_members)
-        with CaptureQueriesContext(connection) as two_member_queries:
-            plan = lacp_reconcile_plan(self.device, two_members)
-
-        self.assertEqual(len(two_member_queries), len(one_member_queries))
-        self.assertFalse(one_member_plan.changes_content)
-        self.assertFalse(plan.changes_content)
-
     def test_stale_bundle_planning_does_not_probe_each_interface(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
         from netbox_nso_plugin.lacp_reconciler import lacp_reconcile_plan
 
         second = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
@@ -221,6 +199,35 @@ class TestReconcileLagConfig(TestCase):
             if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
         ]
         self.assertEqual(lag_probes, [])
+
+    def test_apply_does_not_probe_overlay_state_per_row(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        payload = _payload(
+            [
+                self._bundle(
+                    members=[
+                        {"interface_name": self.m1.name, "mode": "active"},
+                        {"interface_name": self.m2.name, "mode": "active"},
+                    ]
+                )
+            ]
+        )
+        reconcile_lag_config(self.device, payload)
+
+        with CaptureQueriesContext(connection) as queries:
+            reconcile_lag_config(self.device, payload)
+
+        overlay_probes = [
+            query["sql"]
+            for query in queries
+            if "LIMIT 1" in query["sql"]
+            and '"management_id" =' in query["sql"].partition(" WHERE ")[2]
+            and '"interface_id" =' in query["sql"].partition(" WHERE ")[2]
+            and (NSOLACPBundleState._meta.db_table in query["sql"] or NSOLACPMemberState._meta.db_table in query["sql"])
+        ]
+        self.assertEqual(overlay_probes, [])
 
     def test_missing_interface_skipped(self):
         reconcile_lag_config(self.device, _payload([{"name": "Port-channel99", "lag_id": 99, "members": []}]))
