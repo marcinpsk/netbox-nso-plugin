@@ -129,6 +129,26 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertIsNotNone(tombstone.closed_at)
         offboard.assert_not_called()
 
+    def test_success_evidence_does_not_save_unrelated_management_fields(self):
+        from netbox_nso_plugin.provision_lifecycle import _apply_terminal_evidence
+
+        _device, _instance, management, tombstone = self._attempt(
+            "provision-success-fields",
+            with_management=True,
+        )
+        stored_name = management.nso_device_name
+        management.nso_device_name = "stale-in-memory-name"
+
+        with (
+            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter") as sync,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            _apply_terminal_evidence(management, tombstone)
+
+        management.refresh_from_db()
+        self.assertEqual(management.nso_device_name, stored_name)
+        sync.assert_called_once_with(type(management), management.pk, False)
+
     def test_terminal_orphan_is_offboarded_and_closed(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
@@ -280,6 +300,24 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertEqual(tombstone.state, "closed")
         poll.assert_called_once_with(tombstone.provision_attempt_id)
         offboard.assert_not_called()
+
+    def test_malformed_open_attempt_evidence_is_an_adapter_error(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, tombstone = self._attempt(
+            "provision-invalid-attempt",
+            with_management=False,
+            state="open",
+        )
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value={"status": []}),
+            self.assertRaises(AdapterError) as caught,
+        ):
+            sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual(caught.exception.code, "invalid_response")
 
     def test_open_attempt_recovers_the_adapter_job_id_from_its_receipt(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones

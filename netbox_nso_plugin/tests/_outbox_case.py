@@ -27,6 +27,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
 
 from netbox_nso_plugin.adapter_client import AdapterError
+from netbox_nso_plugin.outbox import CONTRIBUTION_KIND_ORDINARY
 
 from ._adapter_http import _REAL_SESSION, make_response
 
@@ -256,7 +257,7 @@ def expire_claim(device, scope) -> bool:
     return True
 
 
-def enqueue(device, scope, *, transitions=(), delete_origin=False, kind="ordinary"):
+def enqueue(device, scope, *, transitions=(), delete_origin=False, kind=CONTRIBUTION_KIND_ORDINARY):
     """Append one entry the way an operator transaction does, without a render."""
     from netbox_nso_plugin import outbox
     from netbox_nso_plugin.intent_state import content_mutation
