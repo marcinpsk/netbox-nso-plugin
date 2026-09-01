@@ -53,14 +53,12 @@ _BINDING_PASSES = 3
 #: an already-listed module is a new key and fails the guard until it is reviewed and added.
 _REVIEWED_MUTATION_SITES = frozenset(
     {
-        ("apply_state.py", "promote_current_intent", "locked.save"),
         ("drain.py", "_stamp_last_acked", "NSOStaticRouteState.objects.bulk_update"),
         ("drain.py", "clear_acknowledged_lineage", "NSOStaticRouteState.objects.exclude().update"),
         ("link_role.py", "apply_description_for_role", "NSOInterfaceState.objects.update_or_create"),
         ("link_role.py", "enable_igp_for_role", "NSOISISInterfaceState.objects.update_or_create"),
         ("link_role.py", "enable_igp_for_role", "NSOOSPFInterfaceState.objects.update_or_create"),
         ("onboarding.py", "onboard_candidate", "NSOPlatformNedMapping.objects.get_or_create"),
-        ("signals.py", "_create_greenfield_subif_state", "NSOSubinterfaceState.objects.create"),
         ("template_content.py", "_reconcile_lag_topology", "stale.save"),
     }
 )
