@@ -14,6 +14,8 @@ from .renderer_writer import (
     renderer_writes,
 )
 
+ONBOARD_EVIDENCE_FIELDS = ("onboard_status", "onboard_steps", "onboard_error")
+
 
 def save_management(instance, *, update_fields=None, force_insert=False):
     """Save one management row with an exact precomputed mutation plan."""

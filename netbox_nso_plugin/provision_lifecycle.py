@@ -185,7 +185,10 @@ def _poll_open_attempt(tombstone) -> bool:
 
     provision_attempt_id = tombstone.provision_attempt_id
     try:
-        evidence = validate_provision_evidence(adapter_client.get_provision_attempt(provision_attempt_id))
+        try:
+            evidence = validate_provision_evidence(adapter_client.get_provision_attempt(provision_attempt_id))
+        except ValueError as exc:
+            raise _invalid_adapter_response(f"Provision attempt evidence is invalid: {exc}") from exc
     except AdapterError as exc:
         if not _is_not_found(exc):
             raise
@@ -356,7 +359,7 @@ def _close_tombstone(provision_attempt_id, *, expected_state: str) -> bool:
 
 
 def _apply_terminal_evidence(management, tombstone) -> None:
-    from .management_lifecycle import save_management
+    from .management_lifecycle import ONBOARD_EVIDENCE_FIELDS, save_management
 
     evidence = tombstone.terminal_evidence if isinstance(tombstone.terminal_evidence, dict) else {}
     result = evidence.get("result") if isinstance(evidence.get("result"), dict) else {}
@@ -365,12 +368,12 @@ def _apply_terminal_evidence(management, tombstone) -> None:
     if tombstone.terminal_status == "succeeded" and result.get("ok"):
         management.onboard_status = ""
         management.onboard_error = ""
-        save_management(management)
+        save_management(management, update_fields=ONBOARD_EVIDENCE_FIELDS)
         return
 
     management.onboard_status = "provision_failed"
     management.onboard_error = "Provisioning failed. See the server log."
     save_management(
         management,
-        update_fields=["onboard_status", "onboard_steps", "onboard_error"],
+        update_fields=ONBOARD_EVIDENCE_FIELDS,
     )
