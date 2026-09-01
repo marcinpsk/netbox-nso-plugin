@@ -277,11 +277,13 @@ def invalidate_delivery_baselines(device_id: int) -> None:
 
     from . import delivery
     from .apply_state import lock_intent_revisions
+    from .intent_state import revision_was_acquired
     from .models import NSOIntentRevision
 
     scopes = tuple(delivery.delivery_keys())
     with transaction.atomic():
-        lock_intent_revisions(device_id, scopes)
+        if not all(revision_was_acquired(device_id, scope) for scope in scopes):
+            lock_intent_revisions(device_id, scopes)
         NSOIntentRevision.objects.filter(device_id=device_id, scope__in=scopes).update(
             verified_revision=None,
             verified_fingerprint=None,
@@ -289,7 +291,7 @@ def invalidate_delivery_baselines(device_id: int) -> None:
         )
 
 
-def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
+def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C901
     """Repair rows whose ``adapter_device_id`` no longer resolves to their own adapter device.
 
     An adapter device row can disappear under a live management row — a provision that rolled
