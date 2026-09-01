@@ -74,9 +74,9 @@ def content_update(instance, **values):
     """Persist a fixture's rendered change through its exact content footprint."""
     from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
-    footprint = footprint_for_instance(instance)
+    current = type(instance).objects.get(pk=instance.pk)
+    footprint = footprint_for_instance(current)
     with without_commit_drain(), intent_transaction(footprint):
-        current = type(instance).objects.get(pk=instance.pk)
         for field_name, value in values.items():
             setattr(current, field_name, value)
         current.save(update_fields=set(values))
@@ -89,8 +89,9 @@ def content_bulk_update(instance, **values):
     """Persist exact rendered fixture DML without firing model signals."""
     from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
-    with without_commit_drain(), intent_transaction(footprint_for_instance(instance)):
-        type(instance).objects.filter(pk=instance.pk).update(**values)
+    current = type(instance).objects.get(pk=instance.pk)
+    with without_commit_drain(), intent_transaction(footprint_for_instance(current)):
+        type(current).objects.filter(pk=current.pk).update(**values)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
     return type(instance).objects.get(pk=instance.pk)

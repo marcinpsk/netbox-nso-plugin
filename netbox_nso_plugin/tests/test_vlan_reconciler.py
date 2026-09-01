@@ -238,6 +238,26 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertEqual(mock_put.call_args[0][1], [{"vlan_id": 5, "name": "STORAGE"}])
 
+    def test_plan_uses_the_shared_name_match_for_a_nameless_vlan(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.vlan_reconciler import (
+            reconcile_vlan_database,
+            vlan_name_matches,
+            vlan_reconcile_plan,
+        )
+
+        (row,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
+        row.vlan.name = "STORAGE"
+        row.vlan.save()
+
+        with patch("netbox_nso_plugin.vlan_reconciler.vlan_name_matches", wraps=vlan_name_matches) as name_matches:
+            vlan_reconcile_plan(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
+
+        candidate = name_matches.call_args.args[0]
+        self.assertEqual(candidate.device_name, "")
+        self.assertEqual(candidate.vlan.name, "STORAGE")
+
     def test_operator_rename_is_drift_not_clobbered(self):
         """Renaming a VLAN in NetBox must surface as drift, not be reverted to the device name."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database

@@ -165,7 +165,7 @@ def vlan_reconcile_plan(device, payload: dict):
             candidate.device_name = name
             candidate.status = sm.on_reconcile(
                 state.status,
-                matches=(not name) or state.vlan.name == name,
+                matches=vlan_name_matches(candidate),
             )
         else:
             candidate.status = sm.on_reconcile(state.status, present=False)
