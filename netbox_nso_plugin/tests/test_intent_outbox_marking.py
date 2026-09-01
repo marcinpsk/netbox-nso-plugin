@@ -30,6 +30,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -270,10 +271,16 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
         real_render = delivery.render
         started = threading.Event()
         committed = threading.Event()
+        writer_pid: list[int] = []
         errors: list[BaseException] = []
         workers = []
 
         def append_after_claim():
+            from django.db import connection
+
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                writer_pid.append(cursor.fetchone()[0])
             started.set()
             try:
                 _append_in_its_own_transaction(self.device.pk)
@@ -289,7 +296,7 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
             workers.append(worker)
             self.addCleanup(worker.join, 30)
             assert started.wait(timeout=30)
-            assert not committed.wait(timeout=1), "the writer crossed the claim's revision lock"
+            wait_until_postgres_blocks(writer_pid[0], "the writer")
             return rendered
 
         with patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit):

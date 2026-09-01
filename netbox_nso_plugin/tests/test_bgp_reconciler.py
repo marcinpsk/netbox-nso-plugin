@@ -718,6 +718,86 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
         self.assertEqual(state.status, "imported")  # unowned + matches → no drift
 
+    def test_duplicate_peer_group_plan_uses_reconcile_traversal_order(self):
+        """The plan and reconcile select the same last duplicate peer-group definition."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+
+        ipv4 = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast"}]}
+        initial = self._payload(
+            self._scope_with_peer_groups([ipv4], asn="65100")["routers"][0],
+            self._scope_with_peer_groups([ipv4], asn="65200")["routers"][0],
+        )
+        _reconcile_bgp_config(self.device, initial)
+
+        ipv6 = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv6-unicast"}]}
+        reordered = self._payload(
+            self._scope_with_peer_groups([ipv6], asn="65200")["routers"][0],
+            self._scope_with_peer_groups([ipv4], asn="65100")["routers"][0],
+        )
+
+        self.assertTrue(bgp_reconcile_plan(self.device, reordered).changes_content)
+
+    def test_duplicate_peer_group_remote_as_uses_reconcile_traversal_order(self):
+        """The plan and reconcile select the same remote AS for a duplicate name."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        low = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast"}]}
+        high = {"name": "PG", "remote_as": "65200", "address_families": [{"af": "ipv4-unicast"}]}
+        peer = self._peer_entry("198.18.0.2", remote_as="65100", peer_group="PG")
+        low_router = self._scope_with_peer_groups([low], asn="65100")["routers"][0]
+        low_router["scopes"][0]["peers"] = [peer]
+        initial = self._payload(
+            low_router,
+            self._scope_with_peer_groups([low], asn="65200")["routers"][0],
+        )
+        _reconcile_bgp_config(self.device, initial)
+        peer_state = NSOBGPPeerState.objects.get(peer_address_str="198.18.0.2")
+        peer_state.status = "accepted"
+        peer_state.save(update_fields=["status"])
+
+        reordered_low_router = self._scope_with_peer_groups([low], asn="65100")["routers"][0]
+        reordered_low_router["scopes"][0]["peers"] = [peer]
+        reordered = self._payload(
+            self._scope_with_peer_groups([high], asn="65200")["routers"][0],
+            reordered_low_router,
+        )
+
+        self.assertTrue(bgp_reconcile_plan(self.device, reordered).changes_content)
+
+    def test_invalid_peer_cannot_override_reported_template_remote_as(self):
+        """The plan ignores a peer that reconciliation skips before its peer-group write."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        anchor = self._peer_entry("198.18.0.3", remote_as="65200", peer_group="PG")
+        imported = self._peer_entry("198.18.0.4", remote_as="65200", peer_group="PG")
+        initial = self._payload(self._router_payload(peers=[anchor, imported]))
+        _reconcile_bgp_config(self.device, initial)
+        peer_state = NSOBGPPeerState.objects.get(peer_address_str="198.18.0.3")
+        peer_state.status = "accepted"
+        peer_state.save(update_fields=["status"])
+        changed = self._payload(
+            self._router_payload(
+                peers=[
+                    self._peer_entry("198.18.0.4", remote_as="65100", peer_group="PG"),
+                    self._peer_entry("not-an-address", remote_as="65200", peer_group="PG"),
+                ]
+            )
+        )
+
+        self.assertTrue(bgp_reconcile_plan(self.device, changed).changes_content)
+        _reconcile_bgp_config(self.device, changed)
+        self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65100)
+
     def test_peer_group_template_both_moved_is_conflict(self):
         """3-way templates: NetBox edited AND device changed since base → conflict, edit kept."""
         self._make_mgmt()

@@ -23,6 +23,30 @@ from .intent_state import mirror_reconciler
 logger = logging.getLogger(__name__)
 
 
+def _reported_template_values(payload):
+    """Select peer-group values in the same deterministic order as reconciliation."""
+    remote_as = {}
+    address_families = {}
+    routers = [row for row in payload.get("routers", []) or [] if isinstance(row, dict)]
+    for router in sorted(routers, key=lambda row: str(row.get("asn") or "")):
+        scopes = [row for row in router.get("scopes", []) or [] if isinstance(row, dict)]
+        for scope in sorted(scopes, key=lambda row: row.get("vrf") or ""):
+            peers = [row for row in scope.get("peers", []) or [] if isinstance(row, dict)]
+            for peer in sorted(peers, key=lambda row: row.get("peer_address") or ""):
+                try:
+                    ipaddress.ip_address(peer.get("peer_address") or "")
+                except ValueError:
+                    continue
+                if peer.get("peer_group"):
+                    remote_as[peer["peer_group"]] = peer.get("remote_as")
+            groups = [row for row in scope.get("peer_groups", []) or [] if isinstance(row, dict)]
+            for group in sorted(groups, key=lambda row: (row.get("name") or "").casefold()):
+                if group.get("name"):
+                    remote_as[group["name"]] = group.get("remote_as")
+                    address_families[group["name"]] = group.get("address_families") or []
+    return remote_as, address_families
+
+
 def _validate_bgp_policy_resolutions(expected):
     """Reject a named policy lookup that changed after discovery."""
     from netbox_routing.models import PrefixList, RouteMap
@@ -222,26 +246,7 @@ def bgp_reconcile_plan(device, payload: dict):
     )
     scopes = tuple(BGPScope.objects.filter(router__in=routers).order_by("pk"))
     peers = tuple(BGPPeer.objects.filter(scope__in=scopes).order_by("pk"))
-    template_remote_as = {
-        peer.get("peer_group"): peer.get("remote_as")
-        for router in payload.get("routers", []) or []
-        if isinstance(router, dict)
-        for scope in router.get("scopes", []) or []
-        if isinstance(scope, dict)
-        for peer in scope.get("peers", []) or []
-        if isinstance(peer, dict) and peer.get("peer_group")
-    }
-    template_remote_as.update(
-        {
-            group.get("name"): group.get("remote_as")
-            for router in payload.get("routers", []) or []
-            if isinstance(router, dict)
-            for scope in router.get("scopes", []) or []
-            if isinstance(scope, dict)
-            for group in scope.get("peer_groups", []) or []
-            if isinstance(group, dict) and group.get("name")
-        }
-    )
+    template_remote_as, reported_template_afs = _reported_template_values(payload)
     templates = tuple(
         BGPPeerTemplate.objects.filter(
             Q(pk__in={peer.peer_group_id for peer in peers if peer.peer_group_id is not None})
@@ -266,6 +271,7 @@ def bgp_reconcile_plan(device, payload: dict):
             template_remote_as,
             template_type,
             peer_address_families,
+            reported_template_afs,
             payload,
             route_maps_by_name,
             prefix_lists_by_name,
@@ -345,6 +351,7 @@ def _bgp_shared_graph_changes_content(
     template_remote_as,
     template_type,
     peer_address_families,
+    reported_template_afs,
     payload,
     route_maps_by_name,
     prefix_lists_by_name,
@@ -360,15 +367,6 @@ def _bgp_shared_graph_changes_content(
         str(item.get("asn") or ""): item
         for item in payload.get("routers", []) or []
         if isinstance(item, dict) and item.get("asn") not in (None, "")
-    }
-    reported_template_afs = {
-        group.get("name"): group.get("address_families") or []
-        for router in payload.get("routers", []) or []
-        if isinstance(router, dict)
-        for scope in router.get("scopes", []) or []
-        if isinstance(scope, dict)
-        for group in scope.get("peer_groups", []) or []
-        if isinstance(group, dict) and group.get("name")
     }
     stored_template_afs = {}
     for row in peer_address_families:

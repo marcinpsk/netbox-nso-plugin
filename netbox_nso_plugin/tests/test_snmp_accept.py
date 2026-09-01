@@ -162,10 +162,13 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         protocols — so an imported v3 user always arrives with auth_protocol=''. Accepting it
         as-is pushed auth_protocol=null and the apply rewrote an authPriv user as
         noAuthNoPriv: a silent security downgrade of the live device."""
+        from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt()
         user = self._v3_user(mgmt)
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="snmp")
+        before = revision.revision
         self.client.force_login(_superuser())
         reset_intent_push_state()
 
@@ -176,7 +179,9 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
 
         assert resp.status_code == 302
         user.refresh_from_db()
+        revision.refresh_from_db()
         assert user.status == "imported", f"the accept must be refused, not recorded (status={user.status})"
+        assert revision.revision == before, "a refused accept committed an intent revision"
         mock_put.assert_not_called()
 
     def test_accepting_a_v3_user_with_its_protocols_declared_pushes_them(self):

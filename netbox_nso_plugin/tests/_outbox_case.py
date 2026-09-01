@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -189,6 +190,23 @@ def in_thread(work, timeout=30):
     assert not worker.is_alive(), "the worker transaction never finished"
     if errors:
         raise errors[0]
+
+
+def wait_until_postgres_blocks(pid: int, description: str, timeout: float = 5.0) -> None:
+    """Wait until PostgreSQL reports that one test connection is waiting for a lock."""
+    from django.db import connection
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted)",
+                [pid],
+            )
+            if cursor.fetchone()[0]:
+                return
+        time.sleep(0.01)
+    raise AssertionError(f"{description} never blocked on the footprint lock")
 
 
 _commit_drain_patch_lock = threading.Lock()

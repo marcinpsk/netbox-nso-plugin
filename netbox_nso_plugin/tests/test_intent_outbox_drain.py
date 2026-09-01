@@ -29,6 +29,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -511,22 +512,27 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         assert inserted.wait(timeout=30)
 
         claims: list = []
-        claim_done = threading.Event()
+        claim_started = threading.Event()
+        claimant_pid: list[int] = []
 
         def claim():
             try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    claimant_pid.append(cursor.fetchone()[0])
+                claim_started.set()
                 claims.append(drain.claim(device.pk, "static_route"))
             except BaseException as exc:  # noqa: BLE001 (reported, not swallowed)
                 errors.append(exc)
             finally:
-                claim_done.set()
                 connection.close()
 
         claimant = threading.Thread(target=claim)
         claimant.start()
         self.addCleanup(claimant.join, 30)
         self.addCleanup(release.set)
-        assert not claim_done.wait(timeout=0.2), "the claim bypassed the open revision mutation"
+        assert claim_started.wait(timeout=30), "the claimant never opened its database connection"
+        wait_until_postgres_blocks(claimant_pid[0], "the claim")
 
         release.set()
         writer.join(timeout=30)

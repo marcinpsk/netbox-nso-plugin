@@ -3785,6 +3785,14 @@ def _status_after_accept(source_status: str) -> str:
     return "in_sync" if source_status in _MATCHING_SOURCE_STATUSES else "accepted"
 
 
+class _IntentTransactionNoOp(Exception):
+    """Unwind an intent transaction when a locked precondition rejects the request."""
+
+    def __init__(self, result=None):
+        super().__init__()
+        self.result = result
+
+
 class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
     """Accept a single interface attribute as NetBox intent."""
 
@@ -4614,43 +4622,50 @@ def _save_vlan_name_edit(obj):
     from .signals import suppress_intent_push
     from .vlan_reconciler import vlan_name_matches
 
+    vlan_model = type(obj.vlan)
     desired_name = obj.vlan.name
+    missing_error = {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
+    if not vlan_model.objects.filter(pk=obj.vlan_id).exists():
+        return missing_error
     footprint = vlan_footprint(obj.vlan_id, ("vlan",))
-    with intent_transaction(footprint):
-        vlan = type(obj.vlan).objects.filter(pk=obj.vlan_id).first()
-        if vlan is None:
-            return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
-        vlan.name = desired_name
-        states = list(NSOVLANState.objects.filter(vlan=vlan).order_by("pk"))
-        try:
-            with transaction.atomic(), suppress_intent_push():
-                vlan.save(update_fields=["name"])
-        except IntegrityError:
-            from django.db.models import Q
+    try:
+        with intent_transaction(footprint):
+            vlan = vlan_model.objects.filter(pk=obj.vlan_id).first()
+            if vlan is None:
+                raise _IntentTransactionNoOp(missing_error)
+            vlan.name = desired_name
+            states = list(NSOVLANState.objects.filter(vlan=vlan).order_by("pk"))
+            try:
+                with transaction.atomic(), suppress_intent_push():
+                    vlan.save(update_fields=["name"])
+            except IntegrityError:
+                from django.db.models import Q
 
-            collision_scope = Q(group_id=vlan.group_id)
-            if vlan.qinq_svlan_id is not None:
-                collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
-            collision = type(vlan).objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
-            if collision.exists():
-                return {"name": ["A VLAN with this name already exists in this VLAN scope."]}
-            raise
+                collision_scope = Q(group_id=vlan.group_id)
+                if vlan.qinq_svlan_id is not None:
+                    collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
+                collision = vlan_model.objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
+                if collision.exists():
+                    raise _IntentTransactionNoOp({"name": ["A VLAN with this name already exists in this VLAN scope."]})
+                raise
 
-        now = timezone.now()
-        for state in states:
-            state.vlan = vlan
-            was_deploying = state.status == "deploying"
-            if not sm.is_owned(state.status):
-                state.accepted_at = now
-            matches = vlan_name_matches(state)
-            state.status = (
-                sm.on_operator_edit(state.status)
-                if state.status == "deploying"
-                else ("in_sync" if matches else "accepted")
-            )
-            if was_deploying:
-                state.apply_attempt_id = None
-            state.save()
+            now = timezone.now()
+            for state in states:
+                state.vlan = vlan
+                was_deploying = state.status == "deploying"
+                if not sm.is_owned(state.status):
+                    state.accepted_at = now
+                matches = vlan_name_matches(state)
+                state.status = (
+                    sm.on_operator_edit(state.status)
+                    if state.status == "deploying"
+                    else ("in_sync" if matches else "accepted")
+                )
+                if was_deploying:
+                    state.apply_attempt_id = None
+                state.save()
+    except _IntentTransactionNoOp as exc:
+        return exc.result
     return None
 
 
@@ -6282,15 +6297,18 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         from .intent_state import footprint_for_instance, intent_transaction
 
         footprint = footprint_for_instance(state)
-        with intent_transaction(footprint):
-            state = get_object_or_404(self.model_class, pk=state.pk)
-            blocker = self.push_blocker(state)
-            if blocker:
-                messages.error(request, f"Cannot accept {state}: {blocker}")
-                return redirect(_device_nso_tab_url(state.management.device_id))
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        try:
+            with intent_transaction(footprint):
+                state = get_object_or_404(self.model_class, pk=state.pk)
+                blocker = self.push_blocker(state)
+                if blocker:
+                    raise _IntentTransactionNoOp(blocker)
+                state.status = _status_after_accept(state.status)
+                state.accepted_at = timezone.now()
+                state.save(update_fields=["status", "accepted_at"])
+        except _IntentTransactionNoOp as exc:
+            messages.error(request, f"Cannot accept {state}: {exc.result}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -6947,25 +6965,31 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         except (TypeError, ValueError):
             messages.error(request, "Select a valid VLAN.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
+        if not VLAN.objects.filter(pk=vlan_id).exists():
+            messages.error(request, "The selected VLAN is no longer available.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
         from .intent_state import intent_transaction, vlan_footprint
 
         footprint = vlan_footprint(vlan_id, ("vlan",), extra_device_ids=(mgmt.device_id,))
-        with intent_transaction(footprint):
-            vlan = VLAN.objects.filter(pk=vlan_id).first()
-            if vlan is None:
-                messages.error(request, "The selected VLAN is no longer available.")
-                return redirect(_device_nso_tab_url(mgmt.device_id))
+        try:
+            with intent_transaction(footprint):
+                vlan = VLAN.objects.filter(pk=vlan_id).first()
+                if vlan is None:
+                    raise _IntentTransactionNoOp
 
-            state, created = NSOVLANState.objects.get_or_create(
-                management=mgmt,
-                vlan=vlan,
-                defaults={"status": "accepted", "accepted_at": timezone.now()},
-            )
-            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-                state.status = "accepted"
-                state.accepted_at = timezone.now()
-            state.last_sync_at = timezone.now()
-            state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+                state, created = NSOVLANState.objects.get_or_create(
+                    management=mgmt,
+                    vlan=vlan,
+                    defaults={"status": "accepted", "accepted_at": timezone.now()},
+                )
+                if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+                    state.status = "accepted"
+                    state.accepted_at = timezone.now()
+                state.last_sync_at = timezone.now()
+                state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+        except _IntentTransactionNoOp:
+            messages.error(request, "The selected VLAN is no longer available.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
         messages.success(
             request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
         )

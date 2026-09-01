@@ -35,6 +35,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     state_of,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -143,7 +144,8 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
         real_render = delivery.render
         render_started = threading.Event()
         release_render = threading.Event()
-        removal_done = threading.Event()
+        remover_started = threading.Event()
+        remover_pid: list[int] = []
         claimed: list = []
         failures: list[BaseException] = []
 
@@ -162,12 +164,15 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
 
         def remove():
             try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    remover_pid.append(cursor.fetchone()[0])
+                remover_started.set()
                 with transaction.atomic():
                     route.devices.remove(self.device)
             except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
                 failures.append(exc)
             finally:
-                removal_done.set()
                 connections.close_all()
 
         with (
@@ -183,7 +188,8 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
             remover = threading.Thread(target=remove)
             remover.start()
             self.addCleanup(remover.join, 30)
-            assert not removal_done.wait(timeout=0.2), "the deletion bypassed the claim's footprint lock"
+            assert remover_started.wait(timeout=30), "the remover never opened its database connection"
+            wait_until_postgres_blocks(remover_pid[0], "the deletion")
 
             release_render.set()
             claimant.join(timeout=30)

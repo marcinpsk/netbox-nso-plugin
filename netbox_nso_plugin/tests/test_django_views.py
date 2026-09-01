@@ -4783,7 +4783,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction, vlan_footprint
-        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         group = VLANGroup.objects.create(name="Removed Inline VLANs", slug="removed-inline-vlans")
@@ -4794,11 +4794,13 @@ class TestOverlayFieldEditView(ViewTestBase):
             device_name="REMOVED-NAME",
             status="imported",
         )
+        revisions_after_delete = []
 
         def delete_then_resolve(vlan_id, scopes, **kwargs):
             doomed = VLAN.objects.get(pk=vlan_id)
             with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
                 doomed.delete()
+            revisions_after_delete.append(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision)
             return vlan_footprint(vlan_id, scopes, **kwargs)
 
         with patch("netbox_nso_plugin.intent_state.vlan_footprint", new=delete_then_resolve):
@@ -4810,6 +4812,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertFalse(VLAN.objects.filter(pk=vlan.pk).exists())
         self.assertFalse(NSOVLANState.objects.filter(pk=state.pk).exists())
         self.assertFalse(VLAN.objects.filter(name="UNSAVED-NAME").exists())
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        self.assertEqual(revision.revision, revisions_after_delete[0])
 
     def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
         from django.utils import timezone

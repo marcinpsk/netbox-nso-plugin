@@ -163,14 +163,178 @@ class TestReconcileRedistribution(TestCase):
         from netbox_routing.models import ISISInstance, Redistribution
 
         ISISInstance.objects.create(device=self.device, process_tag="")
-        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
 
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         # Device changes metric 10→20; object never edited → auto-mirror.
+        self.assertFalse(
+            redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]}).changes_content
+        )
         states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
         Redistribution.objects.get(source_protocol="static").refresh_from_db()
         self.assertEqual(Redistribution.objects.get(source_protocol="static").metric, 20)
         self.assertEqual(states[0].status, "imported")
+
+    def test_device_change_to_native_row_used_by_owned_intent_changes_content(self):
+        """A native mirror changes content when another owned overlay renders the row."""
+        management = self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.models import NSODeviceManagement, NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        redistribution = Redistribution.objects.get(source_protocol="static")
+        other_device = Device.objects.create(
+            name="rd-router-owned",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        other_management = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=management.nso_instance,
+            nso_device_name=other_device.name,
+        )
+        NSORedistributionState.objects.create(
+            management=other_management,
+            dest_protocol="isis",
+            source_protocol="static",
+            redistribution=redistribution,
+            status="accepted",
+        )
+
+        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+
+        self.assertTrue(plan.changes_content)
+        self.assertIn((other_device.pk, "isis"), plan.footprint.revision_keys)
+        self.assertIsNotNone(plan.validate_after_acquire)
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+
+        redistribution.metric = 99
+        redistribution.save(update_fields=["metric"])
+        with self.assertRaises(RendererTargetsChanged):
+            plan.validate_after_acquire()
+
+    def test_plan_validation_detects_destination_deletion(self):
+        """The plan rejects a destination that disappears before acquisition."""
+        management = self._make_mgmt()
+        from django.db import transaction
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged, offline_mutation
+        from netbox_nso_plugin.models import NSODeviceManagement, NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        redistribution = Redistribution.objects.get(source_protocol="static")
+        other_device = Device.objects.create(
+            name="rd-router-destination-lock",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        other_management = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=management.nso_instance,
+            nso_device_name=other_device.name,
+        )
+        NSORedistributionState.objects.create(
+            management=other_management,
+            dest_protocol="isis",
+            source_protocol="static",
+            redistribution=redistribution,
+            status="accepted",
+        )
+        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+
+        with transaction.atomic(), offline_mutation():
+            destination.delete()
+
+        with self.assertRaises(RendererTargetsChanged):
+            plan.validate_after_acquire()
+
+    def test_plan_validation_detects_equal_content_relink(self):
+        """The prediction identifies native rows even when their content is equal."""
+        self._make_mgmt()
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+
+        state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
+        other_device = Device.objects.create(
+            name="rd-router-equal-relink",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        other_destination = ISISInstance.objects.create(device=other_device, process_tag="")
+        other_redistribution = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(other_destination),
+            destination_id=other_destination.pk,
+            source_protocol="static",
+            metric=10,
+        )
+        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=10)]})
+
+        state.redistribution = other_redistribution
+        state.save(update_fields=["redistribution"])
+
+        with self.assertRaises(RendererTargetsChanged):
+            plan.validate_after_acquire()
+
+    def test_overlay_footprint_serializes_current_and_proposed_redistributions(self):
+        """A relink locks both native redistribution dependencies."""
+        self._make_mgmt()
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.intent_state import SourceRow, footprint_for_instance
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
+        current_id = state.redistribution_id
+        proposed = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(destination),
+            destination_id=destination.pk,
+            source_protocol="connected",
+            metric=10,
+        )
+        state.redistribution = proposed
+
+        footprint = footprint_for_instance(state)
+
+        self.assertIn(("redistribution", str(current_id)), footprint.shared_keys)
+        self.assertIn(("redistribution", str(proposed.pk)), footprint.shared_keys)
+        self.assertIn(SourceRow("netbox_routing.redistribution", current_id), footprint.source_rows)
+        self.assertIn(SourceRow("netbox_routing.redistribution", proposed.pk), footprint.source_rows)
+
+    def test_ospf_destination_plan_acquires_its_source_row(self):
+        """An OSPF destination participates in the declared source lock order."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInstance
+
+        OSPFInstance.objects.create(
+            name="process-1",
+            router_id="198.18.0.1",
+            process_id="1",
+            device=self.device,
+        )
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+
+        entry = self._entry(dest_protocol="ospf", dest_ref="1", metric_type="1")
+        reconcile_redistribution(self.device, {"entries": [entry]})
+        plan = redistribution_reconcile_plan(self.device, {"entries": [entry]})
+
+        with reconcile_transaction(plan):
+            pass
 
     def test_omitted_default_metric_type_migrates_prior_mirrored_default_to_absence(self):
         """A corrected reader omits a default-only metric-type.

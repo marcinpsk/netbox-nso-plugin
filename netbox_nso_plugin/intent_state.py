@@ -55,6 +55,7 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.routemapentry_match_prefix_list",
     "netbox_routing.staticroute",
     "netbox_routing.staticroute_devices",
+    "netbox_routing.ospfinstance",
     "netbox_routing.isisinstance",
     "netbox_routing.isislevel",
     "netbox_routing.bgprouter",
@@ -1427,6 +1428,40 @@ def _regular_instance_footprint(instance, spec) -> MutationFootprint:
         future_overlays = (
             *future_overlays,
             *(overlay for interface in interfaces for overlay in _interface_overlay_rows(interface.pk)),
+        )
+    if instance._meta.label_lower == "netbox_nso_plugin.nsoredistributionstate":
+        current_redistribution_id = (
+            type(instance).objects.filter(pk=instance.pk).values_list("redistribution_id", flat=True).first()
+            if instance.pk is not None
+            else None
+        )
+        redistribution_ids = {
+            redistribution_id
+            for redistribution_id in (instance.redistribution_id, current_redistribution_id)
+            if redistribution_id is not None
+        }
+        dependent_states = tuple(
+            type(instance)
+            .objects.filter(redistribution_id__in=redistribution_ids)
+            .select_related("management")
+            .order_by("pk")
+        )
+        keys.update(
+            (state.management.device_id, state.dest_protocol)
+            for state in dependent_states
+            if state.dest_protocol in spec.scopes
+        )
+        return MutationFootprint.for_keys(
+            keys,
+            shared_keys=(("redistribution", str(redistribution_id)) for redistribution_id in redistribution_ids),
+            source_rows=(
+                SourceRow("netbox_routing.redistribution", redistribution_id)
+                for redistribution_id in redistribution_ids
+            ),
+            overlay_rows=(
+                *row,
+                *(SourceRow(state._meta.label_lower, state.pk) for state in dependent_states),
+            ),
         )
     if instance._meta.label_lower in OVERLAY_MODEL_RANKS:
         return MutationFootprint.for_keys(keys, shared_keys=shared_keys, overlay_rows=row)
