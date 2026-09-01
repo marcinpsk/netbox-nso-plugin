@@ -39,6 +39,8 @@ _ADAPTER_LOG = "netbox_nso_plugin.adapter_client"
 _ONBOARDING_LOG = "netbox_nso_plugin.onboarding"
 _VIEWS_LOG = "netbox_nso_plugin.views"
 _AJAX = {"HTTP_X_REQUESTED_WITH": "XMLHttpRequest"}
+_PUBLIC_ADAPTER_ERROR = "The NSO adapter request failed. See the server log."
+_PUBLIC_INVALID_RESPONSE = "The NSO adapter returned an invalid response. See the server log."
 _PLUGINS_CONFIG = {
     "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"}
 }
@@ -141,7 +143,7 @@ class TestAdapterTransportLogRedaction(TestCase):
 
 
 class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase):
-    """Every view that renders an adapter failure serves the envelope, never the transport text."""
+    """Every view maps adapter failures to a fixed public message."""
 
     @classmethod
     def setUpTestData(cls):
@@ -177,8 +179,8 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
             ),
         ]
 
-    def test_no_response_carries_the_transport_exception_text(self):
-        """Each site reports the failure by exception type, in the body and in the log alike."""
+    def test_no_response_carries_exception_derived_text(self):
+        """Each site serves an allowlisted message, while the server log keeps diagnostics."""
         for label, url, method, data in self._response_cases():
             with self.subTest(site=label):
                 with self.assertLogs(_ADAPTER_LOG, level="WARNING") as logs:
@@ -186,10 +188,13 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
                         resp = self.client.get(url, **_AJAX)
                     else:
                         resp = self.client.post(url, data, **_AJAX)
-                self.assertEnvelopeOnly(resp.content.decode())
+                body = resp.content.decode()
+                self.assertNotIn(_LEAK, body)
+                self.assertNotIn("ConnectionError", body)
+                self.assertIn(_PUBLIC_ADAPTER_ERROR, body)
                 self.assertFalse(any(_LEAK in line for line in logs.output))
 
-    def test_onboard_status_poll_reports_the_type_not_the_transport_text(self):
+    def test_onboard_status_poll_reports_a_fixed_public_error(self):
         """A transient adapter outage while polling keeps the row provisioning, with no leak."""
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
             onboard_status="provisioning", onboard_job_id="job-42"
@@ -200,7 +205,17 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
 
         body = resp.json()
         self.assertEqual(body["status"], "provisioning")
-        self.assertEnvelopeOnly(body["poll_error"])
+        self.assertEqual(body["poll_error"], _PUBLIC_ADAPTER_ERROR)
+
+    def test_onboarding_api_reports_a_fixed_public_error(self):
+        """The API must not copy the dashboard's caught exception into its response."""
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboarding_candidates")
+
+        with self.assertLogs(_ADAPTER_LOG, level="WARNING"):
+            resp = self.client.get(url, {"instance": self.nso_instance.adapter_instance_id})
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["error"], _PUBLIC_ADAPTER_ERROR)
 
 
 @override_settings(PLUGINS_CONFIG=_PLUGINS_CONFIG)
@@ -400,7 +415,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
                 resp = self._get(view, **kwargs)
 
                 self.assertEqual(resp.status_code, 502)
-                self.assertIn("malformed", json.loads(resp.content)["error"])
+                self.assertEqual(json.loads(resp.content)["error"], _PUBLIC_INVALID_RESPONSE)
 
     def test_the_onboarding_poll_stays_retryable_instead_of_failing_the_row(self):
         """A malformed poll answer is undecided, not a terminal verdict.
@@ -419,6 +434,6 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
         result = advance_provisioning(self.mgmt)
 
         self.assertEqual(result["status"], "provisioning")
-        self.assertIn("malformed", result["poll_error"])
+        self.assertEqual(result["poll_error"], _PUBLIC_INVALID_RESPONSE)
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.onboard_status, "provisioning")

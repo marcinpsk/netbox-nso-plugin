@@ -413,3 +413,34 @@ class TestCategoryViewSkipFallback(TestCase):
         html = resp.content.decode()
         self.assertIn("lag-60:390", html)  # last-known row STAYS VISIBLE
         self.assertEqual(_sap_names(self.mgmt), ["TL"])  # and was not cleared
+
+    def test_a_quiesced_gate_renders_last_known_rows_not_a_500(self):
+        """codex O3b review P2: a deployment window degrades a GET, it never breaks it."""
+        from netbox_nso_plugin.deployment import quiesce, resume
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_l2_services",
+            return_value=_l2_payload(("TL",), read_state=_rs(attempt_id=1)),
+        ):
+            reconcile_category(self.device, self.mgmt, "l2_services")
+
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "l2_services"},
+        )
+        activated = quiesce()
+        try:
+            with patch(
+                "netbox_nso_plugin.adapter_client.get_l2_services",
+                return_value=_l2_payload(("TL",), read_state=_rs(attempt_id=2)),
+            ) as live_read:
+                resp = self.client.get(url, {"refresh": "1"})
+        finally:
+            if activated:
+                resume()
+        self.assertEqual(resp.status_code, 200)
+        live_read.assert_not_called()  # the window blocks the live read, it never 500s
+        html = resp.content.decode()
+        self.assertIn("lag-60:390", html)  # persisted state renders under the banner
+        self.assertIn("Intent deployment is temporarily unavailable. See the server log.", html)

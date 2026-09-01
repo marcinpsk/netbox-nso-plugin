@@ -10,9 +10,10 @@ greenfield attach + delete signals.
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
-from .mixins import IntentPushDeliveryMixin
+from ._outbox_case import make_managed, without_commit_drain
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
 class _RPBase(IntentPushDeliveryMixin, TestCase):
@@ -46,6 +47,67 @@ class _RPBase(IntentPushDeliveryMixin, TestCase):
             action="permit",
         )
         return pl
+
+
+class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.device, self.management = make_managed("route-policy-save", 16230)
+
+    def _owned_prefix_list(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        prefix_list = PrefixList.objects.create(name="TESTNSO-PL-SAVE")
+        with suppress_intent_push():
+            state = NSORoutePolicyState.objects.create(
+                management=self.management,
+                family="prefix_list",
+                object_name=prefix_list.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=prefix_list.pk,
+                status="imported",
+            )
+        NSORoutePolicyState.objects.filter(pk=state.pk).update(status="in_sync")
+        return prefix_list, state
+
+    def test_an_owned_policy_object_save_reaccepts_the_overlay_in_autocommit(self):
+        prefix_list, state = self._owned_prefix_list()
+
+        with without_commit_drain():
+            prefix_list.description = "changed"
+            prefix_list.save(update_fields=["description"])
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+
+    def test_an_owned_policy_entry_save_reaccepts_the_overlay_in_autocommit(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CustomPrefix, PrefixListEntry
+
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        prefix_list, state = self._owned_prefix_list()
+        custom_prefix = CustomPrefix.objects.create(prefix="198.18.64.0/24")
+        entry = PrefixListEntry.objects.create(
+            prefix_list=prefix_list,
+            assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
+            assigned_prefix_id=custom_prefix.pk,
+            sequence=10,
+            action="permit",
+        )
+        with suppress_intent_push():
+            type(state).objects.filter(pk=state.pk).update(status="in_sync")
+
+        with without_commit_drain():
+            entry.action = "deny"
+            entry.save(update_fields=["action"])
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
 
 
 class TestRoutePolicyIntentAcceptedFlag(_RPBase):

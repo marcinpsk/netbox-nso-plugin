@@ -100,7 +100,7 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
         state = NSOLACPBundleState.objects.get(interface=self.lag)
         state.status = "accepted"
-        state.save()
+        state.save(update_fields=["status"])
         # identical re-read must not revert accepted → imported
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
         state.refresh_from_db()

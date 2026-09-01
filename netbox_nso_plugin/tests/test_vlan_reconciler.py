@@ -224,6 +224,20 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertNotEqual(state.status, "changed")
 
+    def test_unrelated_vlan_save_does_not_repend_an_apply(self):
+        """A field outside the rendered name and VID does not change VLAN intent."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 32, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=32)
+        NSOVLANState.objects.filter(pk=state.pk).update(status="deploying")
+
+        state.vlan.description = "Operator note"
+        state.vlan.save(update_fields=["description"])
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+
     def test_rescope_move_to_empty_group(self):
         """Re-scoping into a group with no collision just moves the VLAN (stays synced)."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
@@ -245,6 +259,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
     def test_rescope_merge_onto_shared_vlan(self):
         """Re-scoping into a group that already has the vid merges onto the shared VLAN."""
+        from unittest.mock import patch
+
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 41, "name": "MGMT"}]})
@@ -261,16 +277,48 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
         shared = VLAN.objects.create(group=site, vid=41, name="SHARED_MGMT")
 
-        action, surviving = rescope_vlan(state, site)
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=41)
+        NSOVLANState.objects.filter(pk=state.pk).update(status="in_sync")
+        state.refresh_from_db()
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            action, surviving = rescope_vlan(state, site)
         self.assertEqual(action, "merged")
         self.assertEqual(surviving.pk, shared.pk)
         # Overlay + native interface re-pointed onto the shared VLAN; duplicate gone.
         state.refresh_from_db()
         self.assertEqual(state.vlan_id, shared.pk)
+        self.assertEqual(state.status, "accepted")
+        schedule.assert_called_once_with((self.device.pk, "vlan"))
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.untagged_vlan_id, shared.pk)
         self.assertFalse(VLAN.objects.filter(pk=per_device_vlan.pk).exists())
         self.assertEqual(VLAN.objects.filter(group=site, vid=41).count(), 1)
+
+    def test_rescope_merge_repends_an_owned_placeholder_when_its_wire_name_changes(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        (source_state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 41, "name": ""}]})
+        NSOVLANState.objects.filter(pk=source_state.pk).update(status="in_sync")
+        source_state.refresh_from_db()
+        target_group = VLANGroup.objects.create(name="Rendered Name Target", slug="rendered-name-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=41, name=source_state.vlan.name)
+        target_state = NSOVLANState.objects.create(
+            management=self.management,
+            vlan=target_vlan,
+            device_name=target_vlan.name,
+            status="in_sync",
+        )
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=41)
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            action, surviving = rescope_vlan(source_state, target_group)
+
+        self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
+        target_state.refresh_from_db()
+        self.assertEqual(target_state.status, "accepted")
+        schedule.assert_called_once_with((self.device.pk, "vlan"))
 
     def test_rescope_noop_same_group(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
@@ -279,6 +327,108 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         state = NSOVLANState.objects.get(management=self.management, vlan__vid=42)
         action, _ = rescope_vlan(state, state.vlan.group)
         self.assertEqual(action, "noop")
+
+    def test_rescope_merge_transfers_ownership_to_a_same_name_duplicate(self):
+        from netbox_nso_plugin.status_machine import is_owned
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 42, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=42)
+        source_state.status = "deploying"
+        source_state.save(update_fields=["status"])
+        target_group = VLANGroup.objects.create(name="Same Name Target", slug="same-name-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=42, name="MGMT")
+        surviving_state = NSOVLANState.objects.create(
+            management=self.management,
+            vlan=target_vlan,
+            device_name="MGMT",
+            status="imported",
+        )
+
+        action, surviving_vlan = rescope_vlan(source_state, target_group)
+
+        self.assertEqual((action, surviving_vlan.pk), ("merged", target_vlan.pk))
+        surviving_state.refresh_from_db()
+        self.assertTrue(is_owned(surviving_state.status))
+        self.assertEqual(surviving_state.status, "accepted")
+        self.assertFalse(NSOVLANState.objects.filter(pk=source_state.pk).exists())
+
+    def test_rescope_rejects_a_source_vlan_identity_change_while_waiting(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
+            reconcile_vlan_database,
+            rescope_vlan,
+        )
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 43, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=43)
+        target_group = VLANGroup.objects.create(name="Identity Target", slug="identity-target")
+        VLAN.objects.create(group=target_group, vid=43, name="MGMT")
+        original_lock = apply_state.lock_vlan_intent_transaction
+        changed = False
+
+        def change_source_before_native_lock(vlan_id):
+            nonlocal changed
+            if not changed and vlan_id == source_state.vlan_id:
+                changed = True
+                VLAN.objects.filter(pk=vlan_id).update(vid=1043)
+            original_lock(vlan_id)
+
+        with (
+            patch(
+                "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
+                side_effect=change_source_before_native_lock,
+            ),
+            self.assertRaises(VLANRescopeConflict),
+        ):
+            rescope_vlan(source_state, target_group)
+
+    def test_rescope_rejects_a_device_that_attaches_before_membership_locking(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
+            reconcile_vlan_database,
+            rescope_vlan,
+        )
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=44)
+        target_group = VLANGroup.objects.create(name="Membership Target", slug="membership-target")
+        VLAN.objects.create(group=target_group, vid=44, name="MGMT")
+        late_device = _make_device("late-membership")
+        late_management = NSODeviceManagement.objects.create(
+            device=late_device,
+            nso_instance=self.instance,
+            nso_device_name="late-membership",
+        )
+        original_lock = apply_state.lock_vlan_membership_transaction
+        attached = False
+
+        def attach_before_membership_lock(vlan_id):
+            nonlocal attached
+            if not attached and vlan_id == source_state.vlan_id:
+                attached = True
+                NSOVLANState.objects.create(
+                    management=late_management,
+                    vlan=source_state.vlan,
+                    device_name="MGMT",
+                    status="imported",
+                )
+            original_lock(vlan_id)
+
+        with (
+            patch(
+                "netbox_nso_plugin.apply_state.lock_vlan_membership_transaction",
+                side_effect=attach_before_membership_lock,
+            ),
+            self.assertRaises(VLANRescopeConflict),
+        ):
+            rescope_vlan(source_state, target_group)
 
     def test_switchport_seeded_when_pristine(self):
         """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
@@ -515,3 +665,22 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
             _prepare_apply(self.management)
         mock_vlan.assert_called_once()
         self.assertEqual(mock_vlan.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
+
+    def test_vlan_rename_requires_the_outbox_transaction(self):
+        vlan = self.state.vlan
+        vlan.name = "UNTRANSACTIONAL"
+
+        with self.assertRaisesRegex(RuntimeError, "VLAN intent edit must be saved inside a transaction"):
+            vlan.save(update_fields=["name"])
+
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, "OLD")
+
+    def test_unmanaged_vlan_rename_does_not_require_an_outbox_transaction(self):
+        vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2214, name="UNMANAGED")
+
+        vlan.name = "RENAMED"
+        vlan.save(update_fields=["name"])
+
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, "RENAMED")

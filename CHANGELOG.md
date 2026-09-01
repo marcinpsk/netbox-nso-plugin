@@ -2,6 +2,335 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-09-01)
+
+### Bug Fixes
+
+- **adapter**: Reject non-positive generation identities
+  ([`2f18c02`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2f18c0249d9bf6e4f289d09d850150988a342791))
+
+- **adapter**: Resolve generation review findings
+  ([`0cc5e77`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0cc5e77cd4cff2d44747255c39ffd9730a13ae0b))
+
+- **adapter**: Validate generation identities
+  ([`9c2e2bd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9c2e2bde7187330901720acc97741f6934fdc1f8))
+
+- **adapter-client**: Reject wrong-typed settlement_cohort values
+  ([`43d2aac`](https://github.com/marcinpsk/netbox-nso-plugin/commit/43d2aacc9126877f14d706adff771d330841e1fb))
+
+- **apply**: Close the promotion, accept, and VLAN lock-order hazards
+  ([`645c9c0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/645c9c0a1998c3848f8623573f622349628589d3))
+
+- **apply**: Release the rows no generation promoted when the head job is bad
+  ([`5b13c13`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5b13c13b80fa7fa4a5c9b17e97da5816a21d4c61))
+
+- **apply**: Resolve review findings
+  ([`2800646`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2800646717681c2e95b99c948eb6d1196886cacc))
+
+- **apply**: Resolve the PR #20 review wave on the repair subsystem
+  ([`7a7f535`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7a7f5352b10d68a270a9250c449ab91881f6acee))
+
+- **apply**: Resolve the PR #20 second and third review waves
+  ([`2394ff5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2394ff54c48ea1ab1dd7c43fd601db282c57714f))
+
+- **apply**: Roll back malformed no-op partitions
+  ([`282eade`](https://github.com/marcinpsk/netbox-nso-plugin/commit/282eadef4cec025ced56cd1e10ad3fd6bbc4055c))
+
+- **apply**: Roll back malformed no-op results
+  ([`9b2a5b5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9b2a5b5ee07960c73e6769d68ae7ce5351ec0e4b))
+
+- **apply**: Type the Apply refusals so the handler can rebuild their wording
+  ([`0352888`](https://github.com/marcinpsk/netbox-nso-plugin/commit/035288860b77dabd30d730970377e1897cc8d14a))
+
+- **commands**: Bound the watermark advance and name a stall
+  ([`dea1efc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/dea1efc01e8eed226f3157a8bea1b21f119c8e6a))
+
+- **contract**: Advance generation endpoint pin
+  ([`6be3a53`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6be3a538b2fb7b6115003bf5ba9aafc8de086f30))
+
+- **deploy**: Preserve active claim recovery
+  ([`426430e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/426430eb4bb51bec7d1f028539f40eaecadaf784))
+
+- **deployment**: Bound gate transitions
+  ([`779fa7d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/779fa7d82aafc6642fd0bc59f8eb5a6e2f2ad590))
+
+- **deployment**: Keep plugin delivery outside transactions
+  ([`e4e3e36`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e4e3e3616158e8d1cc9f5b915216906a345e3437))
+
+- **deployment**: Roll back refused HTTP mutations
+  ([`f9d22af`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f9d22af7fa82a9d5ddac98cfdfae215064302573))
+
+- **drain**: Keep the first successful sequence the selector names
+  ([`882ca87`](https://github.com/marcinpsk/netbox-nso-plugin/commit/882ca87fdcb5c73ef33b09a095874a536dceda73))
+
+- **drain**: Keep the latency chain out of the caller's capture
+  ([`2bf1283`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2bf1283759f8031442710eebd24627858caae80a))
+
+- **drain**: Restore the recorder the Apply selector reads
+  ([`f542fc1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f542fc18f04419a62b7c9c384494a9c1b88170cb))
+
+- **gate**: Return the quiesce refusal as json the tab can read
+  ([`09af80b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/09af80b91c42ee56ec781f12c3049eb10c739df0))
+
+- **intent**: Close review race gaps
+  ([`12db008`](https://github.com/marcinpsk/netbox-nso-plugin/commit/12db00880322f911a70d9fde2400d83ab9205105))
+
+- **intent**: Enforce deletion and edit invariants
+  ([`b3d3a4c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b3d3a4c5e01760dfbd239e39c78db18e0cb8cc46))
+
+- **intent**: Preserve deployment claim semantics
+  ([`28fdbc0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/28fdbc0df4420d2b83328e8d54cbd95600a4edfc))
+
+- **intent**: Preserve scoped deployment state
+  ([`c91f35a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c91f35aeeefdbaffad0206703347e615a0d5b009))
+
+- **o3c**: Redact the store credential from the adapter log text
+  ([`6bc2795`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6bc279548a6824f8928a9d87ae749cef1adff77c))
+
+- **outbox**: Clarify maintenance operations
+  ([`88d9f8e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/88d9f8ecab33fb621cccf9321a6d61f49c7cea4a))
+
+- **outbox**: Harden deployment boundary handling
+  ([`3a02560`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3a025608b333fb9d351863d7d396a6b247e1c655))
+
+- **reconcile**: Run the step-4 settlers under the intent-push suppression
+  ([`78b2fd7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/78b2fd754723dcbce80cce6b24a26b040db9097f))
+
+- **reconcile**: Write both coarse verdicts through a compare-and-set
+  ([`89dab38`](https://github.com/marcinpsk/netbox-nso-plugin/commit/89dab38c17cc31de6a9b0753991e757072e88025))
+
+- **restore**: Preserve adapter failure guidance
+  ([`51a0da2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/51a0da2875d7dc80feb9f46595b6ea81b663818d))
+
+- **review**: Bound apply polling and repair regressions
+  ([`a32d181`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a32d1816bfd9794a6ebf790fed2cbe238010a048))
+
+- **review**: Close apply boundary gaps
+  ([`657962b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/657962ba05baa1e8445e9f9b90c078e5fd908e2c))
+
+- **review**: Close deployment gate review gaps
+  ([`6cd426c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6cd426cee1e5eac97f0adb54903236be79cfa8c1))
+
+- **review**: Harden apply generation handling
+  ([`b9be568`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b9be568b95c817a8f5b31b910b141e90edd41fd7))
+
+- **review**: Harden deployment activation
+  ([`0675ecb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0675ecb7255c0aa3ef97f4136e477b25604c4bcd))
+
+- **review**: Harden deployment and outbox test seams
+  ([`adfe7a8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/adfe7a86b8d6b1e22d28fd4f77400c46bc3ddb98))
+
+- **review**: Make deployment locking fair
+  ([`8ac2170`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8ac2170985e582856e5c8248016ca4df7a3cce7f))
+
+- **review**: Pause scheduled maintenance cleanly
+  ([`7f3c6cb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7f3c6cb0422f8c5195ab7695e8950db8a2a6c7b9))
+
+- **review**: Require a valid apply head job
+  ([`2fb6458`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2fb6458d7967cac6ec59103c243898b81fc83734))
+
+- **review**: Resolve the apply-selector review findings
+  ([`39a741a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/39a741a7a6f6ce1dbec810d1da61201753de499d))
+
+- **review**: Resolve the o3 review findings and guard outage compaction
+  ([`07e7426`](https://github.com/marcinpsk/netbox-nso-plugin/commit/07e742626c6355f94f5f58b778cf2db40f202be4))
+
+- **review**: Scope deployment waiters to the database
+  ([`2c454c6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2c454c6bd89324b67ca49e57b177c8cab7f389a4))
+
+- **review**: Tolerate successful outbox worker exit
+  ([`7d10299`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7d102998215a3b3bd3199813ecdacd3cfcfb042d))
+
+- **review**: Verify apply generation provenance
+  ([`61949d1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/61949d1ba8c138248093f2a22ce863e1481449f4))
+
+- **tab**: Refresh the categories on any terminal chain outcome
+  ([`249294e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/249294e9fe6a95bd486f4498e509a8573280279a))
+
+- **test**: Floor the push sequence before fabricating a lower receipt
+  ([`17e4f7a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/17e4f7ad012330f2228e691602e67faa73a507b5))
+
+- **test**: Keep delivery seam state read-only
+  ([`d0c8fb7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d0c8fb7fa46c8765c71189d815af2eb0ec2c6d32))
+
+- **test**: Narrow adapter port allocation race
+  ([`8c9dc70`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8c9dc700ad39ded38275a0f2f064edc5fea3fb94))
+
+- **test**: Restore apply polling timeout spy
+  ([`cda2dad`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cda2dad235b940c179f95cb7e8c9fe49b4d3c149))
+
+- **vlan**: Harden native intent locking
+  ([`12a54c0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/12a54c0328e665e9ff7f2e5b781694e879c91c20))
+
+- **vlan**: Reject late rescope attachments
+  ([`8a470bb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8a470bb6bf614f098b627109f4aff7b6f2f9e8e6))
+
+- **vlan**: Report qinq name collisions
+  ([`a515d29`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a515d29da84acb67ad81e09fdbd4f7f03a82881f))
+
+### Chores
+
+- **deps**: Bump pymdown-extensions from 10.21.3 to 11.0.1
+  ([`bf3c383`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bf3c3832a98e087f404e06995fdfd8dd4361e703))
+
+- **deps**: Bump sqlparse from 0.5.5 to 0.6.0
+  ([`bdf5a73`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bdf5a73e29739eb5244320e20725752a009be9ca))
+
+### Code Style
+
+- Drop the em-dashes from the two review-fix comments
+  ([`d8e7a06`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d8e7a068bc728a70bf460d63631b957303950bc0))
+
+- **test**: Drop the shadowing local requests import
+  ([`ae2e1b0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ae2e1b0c4d42f291d33806908f0cd8d6f9087dd6))
+
+### Documentation
+
+- Name trigger_apply's real signature
+  ([`a97395a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a97395af1600ac3d6ee6ed92f3e611a857b21333))
+
+- **ui**: Truthful conflict wording for the heterogeneous admission rules
+  ([`6e1ba50`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6e1ba50e713b4a35181a2f52d1e3f7a91ca4d686))
+
+### Features
+
+- **apply**: Join the manual Apply to the adapter selector contract (#1558 2c)
+  ([`ddac90e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ddac90e2ffb0132b158308bf148bc2f5a254900a))
+
+- **outbox**: Activate per-object deletion authority for static routes
+  ([`0ce36cb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0ce36cb38277d9ced6ff14b37d042b29d8d66f5e))
+
+- **outbox**: Add the deployment gate and restore commands
+  ([`0ca2162`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0ca2162ee5b93a973cf9d23b3bc705acc1de9a76))
+
+### Refactoring
+
+- **intent**: Validate persisted claim flags
+  ([`331a6a5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/331a6a5a2427a04639485cebe311fef1e43c89cd))
+
+- **outbox**: Share state authority folding
+  ([`17c2335`](https://github.com/marcinpsk/netbox-nso-plugin/commit/17c2335ba02336e93fcca25b143918738b7c89c5))
+
+### Testing
+
+- Drop the routing patches isolate_other_scopes already installs
+  ([`8dc48e1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8dc48e126bd2f3de11da997c5619a88ea30189fd))
+
+- Exercise registered review paths
+  ([`56d9c01`](https://github.com/marcinpsk/netbox-nso-plugin/commit/56d9c01e2f77fcb24d73bcd122a8dce912c27c73))
+
+- **adapter-client**: Pin the deleted_routes default on the wire
+  ([`67b04f9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/67b04f9b0f64a201e92cb6854a28316c3ec1a2ad))
+
+- **apply**: Derive page limits and drain verdicts from their constants
+  ([`27250ed`](https://github.com/marcinpsk/netbox-nso-plugin/commit/27250edcbf13473186f340f31e5d8e694ece4d58))
+
+- **apply**: Follow the device-action conflict to 409 on this branch
+  ([`715f233`](https://github.com/marcinpsk/netbox-nso-plugin/commit/715f2333a74fcb2f1970cd152fde265b6600f46b))
+
+- **apply**: Pin fail-fast SNMP ordering
+  ([`24c988c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/24c988ce31e6b8e67a978c6e01586d0797dfefb7))
+
+- **apply-selector**: Patch the drain send clock the Apply now reads
+  ([`d7f78df`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d7f78df54bc64c2e72423229e094d99fe81beebb))
+
+- **contract**: Pin generation listing support
+  ([`b5b5ca8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b5b5ca8f869de55096954f228fba0342e4e87e10))
+
+- **contract**: Send required push sequence
+  ([`6ac0a72`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6ac0a72b08f4086b7fea6fabbf7298fabdfcda2f))
+
+- **delivery**: Scan the receipt-literal guard on the plugin-relative path
+  ([`e9b70d6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e9b70d6d1ab0d264aadd4f2ef43efe1d18192953))
+
+- **deployment**: Harden lock worker cleanup
+  ([`96ac699`](https://github.com/marcinpsk/netbox-nso-plugin/commit/96ac699b666bbe9a61f13584dc4892da2ea73c95))
+
+- **drain**: Assert the tick's durations from the rendered log record
+  ([`1f7062f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1f7062fea615e4d745c4799bffa0a6cee52cf0e8))
+
+- **drain**: Let the gate pin's own diagnostic reach the runner
+  ([`54a57b0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/54a57b08cb462e3968634ef3b379c10e5a79d5d0))
+
+- **intent**: Strengthen review regression pins
+  ([`802e2ef`](https://github.com/marcinpsk/netbox-nso-plugin/commit/802e2ef77d475aafd60054244a016d01edd2f65b))
+
+- **intent**: Use exact model save paths
+  ([`3077a72`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3077a729f443e3518f77ba773bcceef1a15b885b))
+
+- **lacp**: Execute deferred no-device check
+  ([`5b17ad6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5b17ad6253ac513247b97ef6e3ba775da43be7e5))
+
+- **o3c**: Name a missing pinned-checkout file
+  ([`b335129`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b335129466b4c0ac024f838972030ac45969d779))
+
+- **o3c**: Redact before truncating, and release every resource
+  ([`675d6a6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/675d6a67957c34a4860fe9e05a0dbce18a12aa95))
+
+- **o3c**: Release every resource when the adapter will not die
+  ([`eea75a7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/eea75a7798d52173a3c53902b4aa6a4b421a71bf))
+
+- **o3c**: Release failed class setup
+  ([`c6a139b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c6a139bd239974543a7181f6d52ff96ea7953d89))
+
+- **o3c**: Skip the joined class when the adapter worktree is missing
+  ([`d392a4e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d392a4e91b40a11438dae860f51568368b30f72d))
+
+- **outbox**: Assert the maintenance gate refusal
+  ([`5c8a3bc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5c8a3bc1d97c2e08323ca40e64dedf1c47be34fd))
+
+- **outbox**: Derive migration parent from the graph
+  ([`d2129c5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d2129c514889bea5113f5cd678e06db46a01858e))
+
+- **outbox**: Exercise state cleanup on delivery
+  ([`a4feeb2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a4feeb2f42f98dc4fe5a0ad5dbf915b0e92d4e96))
+
+- **outbox**: Expect preparatory backfill outcome
+  ([`760a699`](https://github.com/marcinpsk/netbox-nso-plugin/commit/760a6993fadf5986de34304fa4cd6e9e1e088382))
+
+- **outbox**: Inject transport failures as requests errors
+  ([`ba65404`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ba65404f755be0eeaf111c33e4736dd4b42ef9ab))
+
+- **outbox**: Pin the joined cross-repository deletion authority (O3c)
+  ([`0277c10`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0277c10e9bf13997073af511c2ea2960428f8e89))
+
+- **outbox**: Pin the stale-key path on the send seam
+  ([`bd32465`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bd32465b321dbac32c2e28b8344d8cb9be83b2a0))
+
+- **outbox**: Point the delivery-double tests at the send seam
+  ([`c547908`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c54790898d4d164e5e2e84910ecd3eccdce9ca57))
+
+- **outbox**: Preserve authority in signal harness
+  ([`9e6c6d5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9e6c6d5d5b829e68933d216ab18a4eeca4907e51))
+
+- **outbox**: Prove the send seam is reached in the failure cases
+  ([`df0c600`](https://github.com/marcinpsk/netbox-nso-plugin/commit/df0c600fae8698569f90c7e975c9e8ec62e88446))
+
+- **reconcile**: Name the drain outcome by its constant
+  ([`bb93ed0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bb93ed0d69743def114d7a8aa6e19a1383cb1ea8))
+
+- **reconcile**: Release only the deployment gate this test activated
+  ([`dc7f65d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/dc7f65d25757a9765922427c3c05766dbf782ff4))
+
+- **review**: Isolate local process regression traffic
+  ([`2cbfa15`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2cbfa15ba58881348c8d8ffe03afe222f216f065))
+
+- **review**: Strengthen deployment pin checks
+  ([`9039ea4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9039ea4db06516aa01682ca9ea688b591a597fec))
+
+- **settlement**: Give the doubles the adapter's own job-id and device-id types
+  ([`c073482`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c07348290645cd60ec7883ad964c63efdf93fee8))
+
+- **settlement**: Model the paginated generations contract in the fake
+  ([`5635ee8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5635ee85059b4f9405ff0be0d0797721af42a767))
+
+- **tab**: Give the Apply-chain fixtures the real response shape
+  ([`d0d9e80`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d0d9e80f879fc831b7c637565f9ef66962ad071b))
+
+- **ui**: Accept uppercase script tags
+  ([`cf2ef25`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cf2ef252821f79b0a51b9880fbfb28aea4269fa6))
+
+
 ## v1.0.0 (2026-08-23)
 
 ### Bug Fixes
@@ -545,11 +874,11 @@
     pass that backfills `route_id` into the adapter's store, and demotes a
     pre-existing `deploying` row to `accepted` so no result is owed for a
     generation that was never sent.
-  - **Not included: deletion semantics.** The removed-device arm — a push that lists
-    the dropped route in `deleted_route_ids` and an adapter tombstone marked
-    `delete_origin` — ships with the intent-outbox work and is still open. Until it
-    lands, a combined identity-plus-membership edit settles only the **retained**
-    device.
+  - **Per-object static-route deletion authority is active end to end.** The intent
+    outbox retains each removed route and its acknowledged identity until delivery.
+    Static-route pushes carry the authority in `deleted_routes`, the adapter records a
+    `delete_origin` tombstone, and its removal worker executes the networked retraction.
+    A combined identity and membership edit settles only the retained device.
 
 ### Added — operations
 
@@ -559,6 +888,13 @@
   connection, Apply — with client-side job polling and status strip.
 - REST API at `/api/plugins/nso/device-management/` consumed by the
   adapter's reconcile loop.
+- Deployment-window tooling for adapter store restores:
+  `nso_intent_deployment_gate` (`--prepare`/`--verify`/`--abort`) quiesces
+  plugin-side writes behind a durable gate while a restore runs, with mutating
+  HTTP requests answering 503 until the gate lifts, and `nso_intent_restore`
+  rebuilds the outbox from the adapter's replayed receipts: it advances the
+  push-seq and static-route pk namespaces past everything the store
+  acknowledged, clears delivery lineage, and resolves open claims.
 
 ### Changed
 

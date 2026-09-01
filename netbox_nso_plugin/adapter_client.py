@@ -66,6 +66,10 @@ def delete_origin_pushes():
 # It is expressly NOT a delivery mechanism: it accepts no content and carries no authority.
 _backfill_only_push = contextvars.ContextVar("nso_backfill_only_push", default=False)
 
+# Static-route per-object deletion authority. The default is the required empty list, so
+# direct client users and claims with no deletion both send the activated body shape.
+_static_route_deletions = contextvars.ContextVar("nso_static_route_deletions", default=())
+
 
 @contextmanager
 def backfill_only_pushes():
@@ -75,6 +79,16 @@ def backfill_only_pushes():
         yield
     finally:
         _backfill_only_push.reset(token)
+
+
+@contextmanager
+def static_route_deletions(records):
+    """Put one claim's folded static-route deletion records on its request body."""
+    token = _static_route_deletions.set(tuple(records))
+    try:
+        yield
+    finally:
+        _static_route_deletions.reset(token)
 
 
 # The logical operation a request belongs to (#1503 Appendix O, §4.4). It rides in a header
@@ -108,6 +122,9 @@ _CONNECT_TIMEOUT = 5  # seconds
 # The live store incarnation, served on the job collection's 200s. Named once here so the
 # consumer and the adapter cannot drift on the spelling.
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
+_GENERATION_PAGE_LIMIT = 500
+# One UI poll can hold at most 10,000 generation rows.
+_GENERATION_PAGE_MAX = 20
 
 # Process-wide pooled session, reused across calls so connections to the (internal)
 # adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
@@ -295,10 +312,23 @@ def reset_config_cache():
 class AdapterError(Exception):
     """Raised when the nso-adapter returns an error or is unreachable."""
 
-    def __init__(self, message, code=None, detail=None):
+    def __init__(self, message, code=None, detail=None, status_code=None):
         super().__init__(message)
         self.code = code
         self.detail = detail
+        self.status_code = status_code
+
+
+_PUBLIC_ERROR_MESSAGES = {
+    "configuration_error": "The NSO adapter is not configured. See the server log.",
+    "invalid_response": "The NSO adapter returned an invalid response. See the server log.",
+}
+_PUBLIC_ERROR_DEFAULT = "The NSO adapter request failed. See the server log."
+
+
+def public_error_message(error: AdapterError) -> str:
+    """Map an adapter failure code to fixed text that is safe for HTTP responses."""
+    return _PUBLIC_ERROR_MESSAGES.get(error.code, _PUBLIC_ERROR_DEFAULT)
 
 
 def _resolve_config() -> dict:
@@ -509,6 +539,7 @@ def _request_response(method, path, **kwargs):
             err.get("message") or resp.text,
             code=str(err.get("code") or resp.status_code),
             detail=detail if isinstance(detail, dict) else None,
+            status_code=resp.status_code,
         )
     return resp
 
@@ -620,6 +651,16 @@ def get_device(adapter_device_id):
 def list_devices():
     """GET /api/v1/devices — every device the adapter knows, across all NSO instances."""
     return _request("GET", "/api/v1/devices")
+
+
+def get_intent_receipts(*, device_id: int | None = None, section: str | None = None) -> dict:
+    """GET the adapter's per-key receipts and fleet-wide restore watermarks."""
+    params = {}
+    if device_id is not None:
+        params["device_id"] = int(device_id)
+    if section is not None:
+        params["section"] = section
+    return _request("GET", "/api/v1/intent-receipts", params=params)
 
 
 def get_interfaces(adapter_device_id):
@@ -937,8 +978,7 @@ def sync_notify(adapter_device_id):
     """POST /api/v1/devices/{id}/sync-notify — notify adapter of scope/intent change.
 
     Triggers an immediate sync so the user sees results without waiting for the
-    scheduled poll. Returns the job dict, or None if no job was started (e.g. 409).
-    A 409 (job already running) is not an error — log it and return the existing job id.
+    scheduled poll. A 409 conflict returns the adapter's detail payload, which names the queued incumbent.
     """
     try:
         return _request("POST", f"/api/v1/devices/{adapter_device_id}/sync-notify")
@@ -988,6 +1028,48 @@ def get_job(job_id):
 def list_jobs(adapter_device_id):
     """GET /api/v1/jobs?device_id={id} — the device's jobs, most-recent-first."""
     return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
+
+
+def list_device_generations(adapter_device_id, *, since_seq=None):
+    """GET a bounded set of ascending generation pages after ``since_seq``."""
+    if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
+        raise ValueError("since_seq must be a non-negative integer")
+    generations = []
+    generation_ids = set()
+    last_seq = since_seq
+    for _ in range(_GENERATION_PAGE_MAX):
+        params = {"limit": _GENERATION_PAGE_LIMIT}
+        if last_seq is not None:
+            params["since_seq"] = last_seq
+        page = _request("GET", f"/api/v1/devices/{adapter_device_id}/generations", params=params)
+        if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+            raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+        for row in page:
+            generation_id = row.get("generation_id")
+            seq = row.get("seq")
+            job_id = row.get("job_id")
+            status = row.get("status")
+            settlement_cohort = row.get("settlement_cohort")
+            if (
+                "settlement_cohort" not in row
+                or type(generation_id) is not int
+                or generation_id <= 0
+                or generation_id in generation_ids
+                or type(seq) is not int
+                or seq <= 0
+                or (job_id is not None and (type(job_id) is not int or job_id <= 0))
+                or not isinstance(status, str)
+                or not status
+                or (last_seq is not None and seq <= last_seq)
+                or (settlement_cohort is not None and (type(settlement_cohort) is not int or settlement_cohort <= 0))
+            ):
+                raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+            generation_ids.add(generation_id)
+            last_seq = seq
+        generations.extend(page)
+        if len(page) < _GENERATION_PAGE_LIMIT:
+            return generations
+    raise AdapterError("Adapter returned more generation pages than one read may fetch.", code="invalid_response")
 
 
 def get_settlement_feed(adapter_device_id, *, after_settle_seq, limit):
@@ -1142,13 +1224,15 @@ def put_static_route_intent(adapter_device_id, routes):
       [{"vrf": "", "prefix": "10.0.0.0/8", "next_hop": "192.168.1.1",
         "metric": None, "permanent": None, "tag": None,
         "accepted_at": "...Z"}, ...]
+    ``deleted_routes`` comes from the active claim's deletion context. It is always present,
+    including as an empty list for direct callers and store-only or backfill-only pushes.
     An empty ``routes`` list clears all static route intent for the device.
     Returns {"device_id": ..., "count": N}.
     """
     return _request(
         "PUT",
         f"/api/v1/devices/{adapter_device_id}/static-route-intent",
-        json={"routes": routes},
+        json={"routes": routes, "deleted_routes": list(_static_route_deletions.get())},
     )
 
 
@@ -1365,16 +1449,15 @@ def preflight_route_policy(
         return {"known": False, "fully_supported": True, "unsupported": [], "coverage_unknown": False}
 
 
-def trigger_apply(adapter_device_id, force=True):
-    """POST /api/v1/devices/{id}/actions/apply → job_id.
+def trigger_apply(adapter_device_id, selected):
+    """Promote the exact stored intent receipts named by a frozen selector.
 
-    ``force=True`` (default) pushes all eligible attributes including in_sync.
-    Returns the job dict, or raises AdapterError on conflict (existing job running).
+    Raise AdapterError when a device job is already queued or running.
     """
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/actions/apply",
-        json={"force": force},
+        json={"selected": dict(selected)},
     )
 
 

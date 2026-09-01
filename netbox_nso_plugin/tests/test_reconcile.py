@@ -2,9 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for the off-request reconcile job and the sync-complete callback endpoint."""
 
-import contextlib
 import os
 import threading
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -13,6 +13,7 @@ from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from utilities.testing import APITestCase
 
+from netbox_nso_plugin import drain
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._outbox_case import without_commit_drain
@@ -28,21 +29,21 @@ def _make_device(name="rec-dev"):
     return Device.objects.create(name=name, device_type=dt, role=role, site=site)
 
 
-@contextlib.contextmanager
+@contextmanager
 def _patch_apply_pushes(answers=None):
-    """Double the forced claims the Apply takes, keyed by delivery scope.
+    """Double the forced preparation claims, keyed by delivery scope.
 
-    Apply routes SNMP through ``drain_key`` and every other scope through ``push_now``.
-    *answers* maps a scope to its answer. Every other scope answers ``None``.
+    Apply routes every scope except SNMP through ``drain.push_now``. SNMP uses
+    ``drain_key`` because its acknowledgement is an outcome. *answers* maps a scope to
+    the answer from ``push_now``. Every other required scope succeeds.
     """
     answers = answers or {}
-
-    def side_effect(device_id, scope, **kwargs):
-        return answers.get(scope)
-
     with (
-        patch("netbox_nso_plugin.drain.push_now", side_effect=side_effect) as push,
-        patch("netbox_nso_plugin.drain.drain_key", side_effect=side_effect),
+        patch(
+            "netbox_nso_plugin.drain.push_now",
+            side_effect=lambda device_id, scope, **kwargs: answers.get(scope, {"status": "deployed"}),
+        ) as push,
+        patch("netbox_nso_plugin.drain.drain_key", return_value=drain.SUCCEEDED),
     ):
         yield push
 
@@ -80,6 +81,23 @@ class TestRunDeviceReconcile(APITestCase):
             result = reconcile.run_device_reconcile(device.pk)
         self.assertIn("error", result)
         self.assertEqual(result["device_id"], device.pk)
+
+    def test_deployment_quiescence_is_returned_without_failing_the_worker(self):
+        from netbox_nso_plugin import reconcile
+        from netbox_nso_plugin.deployment import quiesce, resume
+
+        device = _make_device("rec-quiesced")
+        activated = quiesce()
+        try:
+            self.assertTrue(activated)
+            result = reconcile.run_device_reconcile(device.pk)
+        finally:
+            if activated:
+                resume()
+
+        self.assertIn("error", result)
+        self.assertEqual(result["device_id"], device.pk)
+        self.assertIn("quiesced", result["error"])
 
     def test_an_unmanaged_device_is_not_reported_as_a_settle_failure(self):
         """Step 4 has nothing to settle for a device with no management row, and says nothing.
@@ -389,9 +407,11 @@ class TestEscalateStuckDeploying(APITestCase):
 
         mgmt, row = self._setup()
         jobs = [self._job(minutes_ago=30)]
+        # Empty list is the landed GET devices/{id}/generations list shape before any promotion.
         with (
             patch.object(reconcile, "reconcile_device", return_value={}),
             patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=[]),
         ):
             reconcile.run_device_reconcile(mgmt.device_id)
         row.refresh_from_db()
@@ -407,13 +427,236 @@ class TestEscalateStuckDeploying(APITestCase):
             {"id": 901, "type": "apply", "status": "running", "updated_at": None, "result": None},
             self._job(minutes_ago=30),
         ]
+        # Empty list is the landed GET devices/{id}/generations list shape before any promotion.
         with (
             patch.object(reconcile, "reconcile_device", return_value={}),
             patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=[]),
         ):
             reconcile.run_device_reconcile(mgmt.device_id)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
+
+    def test_stale_nonterminal_generation_does_not_mask_the_current_terminal_cohort(self):
+        from netbox_nso_plugin import reconcile
+
+        mgmt, row = self._setup()
+        jobs = [self._job(minutes_ago=30)]
+        generations = [
+            {"generation_id": 81, "seq": 4, "status": "pending", "settlement_cohort": 70},
+            {"generation_id": 82, "seq": 5, "status": "settled", "settlement_cohort": 71},
+        ]
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=generations),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+
+    def test_nonterminal_member_of_the_current_cohort_keeps_escalation_stood_down(self):
+        from netbox_nso_plugin import reconcile
+
+        mgmt, row = self._setup()
+        jobs = [self._job(minutes_ago=30)]
+        generations = [
+            {"generation_id": 81, "seq": 4, "status": "running", "settlement_cohort": 71},
+            {"generation_id": 82, "seq": 5, "status": "settled", "settlement_cohort": 71},
+        ]
+        with (
+            patch.object(reconcile, "reconcile_device", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.list_jobs", return_value=jobs),
+            patch("netbox_nso_plugin.adapter_client.list_device_generations", return_value=generations),
+        ):
+            reconcile.run_device_reconcile(mgmt.device_id)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+
+class TestStepFourWritesUnderTheIntentPushSuppression(_SettlementCase):
+    """Step 4 mirrors adapter results, so none of its writes may re-enter the intent outbox.
+
+    The rqworker runs Step 4 in autocommit and the outbox append refuses outside the
+    writer's own transaction, so the route-policy journal's ``last_apply_at`` stamp raised
+    on its push-on-save and Step 4's best-effort guard swallowed the rest of the step.
+    """
+
+    def test_every_route_policy_row_gets_its_apply_stamp(self):
+        """Two owned rows: the first one's refusal is what strands the second.
+
+        In autocommit the first row's UPDATE has already committed when its post_save
+        raises, so only a SECOND row proves the step ran to the end.
+        """
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        device = _make_device("rec-suppress")
+        mgmt = _make_mgmt(device, "suppress", 82)
+        self.adapter.store.add_device(nso_instance="se-suppress-inst", nso_device_name="nso-se-suppress", device_id=82)
+        self.adapter.store.terminal_job(82, extra={"route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0}})
+        with suppress_intent_push(), transaction.atomic():
+            for name in ("SeSuppressCL1", "SeSuppressCL2"):
+                community_list = CommunityList.objects.create(name=name)
+                NSORoutePolicyState.objects.create(
+                    management=mgmt,
+                    content_type=ContentType.objects.get_for_model(community_list),
+                    object_id=community_list.pk,
+                    family="community_list",
+                    object_name=name,
+                    status="accepted",
+                )
+
+        with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
+            run_device_reconcile(device.pk)
+
+        stamped = NSORoutePolicyState.objects.filter(management=mgmt, last_apply_at__isnull=False).count()
+        self.assertEqual(stamped, 2, "the first stamp's push-on-save took the rest of Step 4 with it")
+
+
+class _LoggingChainCase(_SettlementCase):
+    """One deploying ``NSOLoggingLevelState`` on a device the adapter double serves.
+
+    Both coarse settlers judge such a row by the last *apply* job's per-scope counters, so
+    a case adds the jobs it wants judged and then runs the real Step 4 over them.
+    """
+
+    tag = "logchain"
+
+    def _device(self, adapter_device_id):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        device = _make_device(f"{self.tag}{adapter_device_id}")
+        mgmt = _make_mgmt(device, f"{self.tag}{adapter_device_id}", adapter_device_id)
+        # The generation probe must find the device, or the chain read stands the settle down.
+        self.adapter.store.add_device(
+            nso_instance=f"se-{self.tag}{adapter_device_id}-inst",
+            nso_device_name=f"nso-se-{self.tag}{adapter_device_id}",
+            device_id=adapter_device_id,
+        )
+        with transaction.atomic():
+            row = NSOLoggingLevelState.objects.create(management=mgmt, console_severity="", status="deploying")
+        return device, row
+
+    def _reconcile(self, device):
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
+            run_device_reconcile(device.pk)
+
+
+class TestTheCoarseSettlersWriteThroughACompareAndSet(_LoggingChainCase):
+    """Neither coarse channel may overwrite a row the device proved in its write window.
+
+    Both read the deploying rows and write them back in a second statement, and the
+    value-match settle writes the same rows from another reconcile. A row that reached
+    in_sync in between has device truth behind it; a coarse verdict has a job counter.
+    """
+
+    tag = "coarsecas"
+
+    def _settle_on_load(self, row):
+        """Flip *row* to in_sync the moment a settler SELECTs it, once."""
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        settled = []
+
+        def _settle_after_load(sender, instance, **kwargs):
+            # post_init = the settler has just SELECTed the row; the concurrent verdict
+            # lands before its write. Queryset update: no post_init, hence no recursion.
+            if settled or instance.pk != row.pk:
+                return
+            settled.append(True)
+            NSOLoggingLevelState.objects.filter(pk=instance.pk).update(status="in_sync")
+
+        post_init.connect(_settle_after_load, sender=NSOLoggingLevelState, weak=False)
+        self.addCleanup(post_init.disconnect, _settle_after_load, sender=NSOLoggingLevelState)
+        return settled
+
+    def test_a_failed_apply_scope_does_not_overwrite_a_row_that_settled_in_sync(self):
+        """The per-scope counters say the apply failed, not that THIS row never landed."""
+        device, row = self._device(80)
+        self.adapter.store.terminal_job(
+            80, status="failed", extra={"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+        )
+        settled = self._settle_on_load(row)
+
+        self._reconcile(device)
+
+        self.assertEqual(settled, [True])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync", "the failed scope overwrote a row the device had proved")
+        self.assertEqual(row.last_apply_error, "")
+
+    def test_a_silent_drop_escalation_does_not_overwrite_a_row_that_settled_in_sync(self):
+        """The escalation exists because the row never landed, which this row just disproved."""
+        device, row = self._device(81)
+        # A succeeded apply that carried the scope, finished long before the grace.
+        self.adapter.store.terminal_job(81, extra={"logging_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        settled = self._settle_on_load(row)
+
+        self._reconcile(device)
+
+        self.assertEqual(settled, [True])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync", "the silent-drop backstop overwrote a row the device had proved")
+        self.assertEqual(row.last_apply_error, "")
+
+
+class TestTheCoarseVerdictsStampLastUpdated(_LoggingChainCase):
+    """A queryset update skips ``auto_now``, and the REST serializers expose last_updated.
+
+    Both settlers write through ``.update()``, so each has to stamp what a save would have
+    stamped; otherwise an apply_failed transition is invisible to an API consumer.
+    """
+
+    tag = "lastupdated"
+
+    def test_a_failed_apply_scope_stamps_last_updated(self):
+        device, row = self._device(84)
+        self.adapter.store.terminal_job(
+            84, status="failed", extra={"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
+        )
+        before = row.last_updated
+
+        self._reconcile(device)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertGreater(row.last_updated, before)
+
+    def test_a_silent_drop_escalation_stamps_last_updated(self):
+        device, row = self._device(85)
+        # A succeeded apply that carried the scope, finished long before the grace.
+        self.adapter.store.terminal_job(85, extra={"logging_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
+        before = row.last_updated
+
+        self._reconcile(device)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "apply_failed")
+        self.assertGreater(row.last_updated, before)
+
+
+class TestSettlementAdapterContract(_SettlementCase):
+    """The real-socket settlement double rejects unknown adapter devices."""
+
+    def test_unknown_device_generations_return_not_found(self):
+        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations
+
+        with self.assertRaises(AdapterError) as raised:
+            list_device_generations(404)
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.code, "not_found")
 
 
 def _during_settlement(action):
@@ -513,6 +756,11 @@ class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
         self._aged(
             self.adapter.store.terminal_job(70, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
         )
+        self.adapter.store.add_device(
+            nso_instance="se-repair-active-inst",
+            nso_device_name="nso-se-repair-active",
+            device_id=71,
+        )
         self.adapter.store.queued_job(71)
 
         self._reconcile(mgmt, _commit_link_repair(mgmt.pk, 71))
@@ -550,7 +798,7 @@ class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
         )
         self.assertEqual(
             mgmt.last_journaled_apply_job,
-            repaired["id"],
+            str(repaired["id"]),  # the idempotency key is a CharField; the job id is an integer
             "the apply journal recorded adapter device 72's job for a device that now holds 73",
         )
 
@@ -581,6 +829,11 @@ class TestStepFourRereadsAfterTheSettlement(_SettlementCase):
         this case, which is the common one.
         """
         mgmt, row = self._setup("rec-apply-starts", 75)
+        self.adapter.store.add_device(
+            nso_instance="se-apply-starts-inst",
+            nso_device_name="nso-se-apply-starts",
+            device_id=75,
+        )
         # A stale succeeded apply: an escalation verdict, until 75's next apply starts.
         self._aged(
             self.adapter.store.terminal_job(75, extra={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}})
@@ -926,9 +1179,7 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
 
 class TestApplyRollbackOnAdapterError(APITestCase):
-    """A failed Apply (adapter unreachable / 500 — no job enqueued) must roll the rows
-    _prepare_apply moved accepted→deploying back to accepted. Otherwise they are stuck
-    'applying' forever: no apply job exists for _settle_apply_failures to ever settle."""
+    """Apply rollback follows whether the POST definitely failed before enqueue."""
 
     def _setup(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
@@ -945,25 +1196,55 @@ class TestApplyRollbackOnAdapterError(APITestCase):
         )
         return mgmt, row
 
-    def test_non_conflict_adapter_error_rolls_back_deploying(self):
+    def _post_with_error(self, mgmt, error):
         from django.contrib.auth import get_user_model
 
-        from netbox_nso_plugin.adapter_client import AdapterError
-
-        mgmt, row = self._setup()
         admin = get_user_model().objects.create_superuser(username="apply-rb-admin", password="pw", email="a@x.y")  # noqa: S106
         self.client.force_login(admin)
         with (
             _patch_apply_pushes(),
             patch(
                 "netbox_nso_plugin.adapter_client.trigger_apply",
-                side_effect=AdapterError("adapter unreachable", code="unreachable"),
+                side_effect=error,
             ),
         ):
-            resp = self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
+            return self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
+
+    def test_an_ambiguous_transport_failure_keeps_deploying_for_reconciliation(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        resp = self._post_with_error(mgmt, AdapterError("socket closed after send", code="nso_unreachable"))
+
         self.assertEqual(resp.status_code, 302)
         row.refresh_from_db()
-        self.assertEqual(row.status, "accepted")  # rolled back — NOT stuck in deploying
+        self.assertEqual(row.status, "deploying")
+
+    def test_an_ambiguous_http_server_error_keeps_deploying_for_reconciliation(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        resp = self._post_with_error(
+            mgmt,
+            AdapterError("gateway failed after forwarding Apply", code="bad_gateway", status_code=502),
+        )
+
+        self.assertEqual(resp.status_code, 302)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_a_definite_http_client_rejection_rolls_back_deploying(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        mgmt, row = self._setup()
+        resp = self._post_with_error(
+            mgmt,
+            AdapterError("adapter rejected the request shape", code="validation_error", status_code=422),
+        )
+
+        self.assertEqual(resp.status_code, 302)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
 
 
 class TestApplyPreviewInterfaceScope(APITestCase):
