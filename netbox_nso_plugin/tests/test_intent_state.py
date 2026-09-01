@@ -110,7 +110,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(locked.pk, self.state.pk)
     def test_owned_vlan_fixture_reuses_the_production_vlan_group(self):
         group = self.state.vlan.group
-        group.name = f"NSO {self.device.name}"
+        group.name = "Operator renamed group"
         group.save(update_fields=["name"])
 
         second = own_vlan(self.management, 1624, "intent-permit-second")

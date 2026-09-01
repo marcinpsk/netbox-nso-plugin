@@ -15,6 +15,8 @@ from .renderer_writer import (
     renderer_writes,
 )
 
+ONBOARD_EVIDENCE_FIELDS = ("onboard_status", "onboard_steps", "onboard_error")
+
 _MANAGEMENT_CRUD_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "nso_management_crud_active",
     default=False,

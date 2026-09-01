@@ -830,8 +830,13 @@ def _queue_scope_sync(sender, instance, created, *, update_fields=None):
     """Queue the adapter-link work for one sanctioned management-row save."""
     from django.db import transaction
 
-    if update_fields and set(update_fields) <= _MANAGEMENT_MIRROR_FIELDS:
-        return
+    fields = set(update_fields or ())
+    if fields and fields <= _MANAGEMENT_MIRROR_FIELDS:
+        from .management_lifecycle import ONBOARD_EVIDENCE_FIELDS
+
+        completed_provision = fields == set(ONBOARD_EVIDENCE_FIELDS) and not instance.onboard_status
+        if not completed_provision:
+            return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
     transaction.on_commit(lambda: _sync_committed_scope_to_adapter(sender, instance.pk, created))
