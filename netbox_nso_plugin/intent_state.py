@@ -2353,16 +2353,22 @@ def locked_mirror_refresh(instance, update_fields):
 
 
 def update_mirror_fields(instance, **values):
-    """Lock and save lifecycle fields through the instance yielded by ``mirror_refresh``."""
+    """Lock and save lifecycle fields, guarding registered renderer inputs."""
     from .signals import suppress_intent_push
 
     fields = frozenset(values)
-    with transaction.atomic(), suppress_intent_push(), mirror_refresh(instance, fields) as locked:
-        if locked is None:
-            return None
-        for field_name, value in values.items():
-            setattr(locked, field_name, value)
-        locked.save(update_fields=fields)
+    with transaction.atomic(), suppress_intent_push():
+        if instance._meta.label_lower in _REGISTRY:
+            refresh = mirror_refresh(instance, fields)
+        else:
+            locked = type(instance).objects.select_for_update(of=("self",)).filter(pk=instance.pk).first()
+            refresh = contextlib.nullcontext(locked)
+        with refresh as locked:
+            if locked is None:
+                return None
+            for field_name, value in values.items():
+                setattr(locked, field_name, value)
+            locked.save(update_fields=fields)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
     return locked
