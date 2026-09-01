@@ -82,7 +82,7 @@ parse_squash_commits = false
 dev = [
     "build",
     "reuse",
-    "ruff==0.15.4",
+    "ruff==0.16.4",
     "pre-commit",
     "pytest",
     "pytest-django",
