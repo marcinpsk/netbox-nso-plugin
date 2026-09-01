@@ -483,6 +483,9 @@ class TestTheEscalationReusesStep4sJobState(_SettlementCase):
 
         device = _make_device("step4")
         mgmt = _make_mgmt(device, "step4", 97)
+        # The generation probe must succeed. An unknown result stands the backstop down and
+        # removes the premise that this test reaches escalation.
+        self.adapter.store.add_device(nso_instance="se-step4-inst", nso_device_name="nso-se-step4", device_id=97)
         sr = _route("10.61.0.0/16", "10.61.0.1", devices=[device])
         state = _own(sr, mgmt, generation=320)
         _stale_clock(state)

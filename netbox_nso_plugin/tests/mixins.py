@@ -73,13 +73,13 @@ def _deliver_scheduled_keys():
 
     So inside a transaction this does what the callback does MINUS the claim: it takes the
     keys the transaction appended to and renders and sends each one through the same choke
-    point, carrying the AND of the entries' marks exactly as the fold would. It asserts
+    point, carrying the entries' folded deletion authority and marking AND. It asserts
     nothing about durability, replay or sequencing — the claim protocol has its own
     ``TransactionTestCase`` pins for those (``test_intent_outbox_*``). Outside a transaction
     it is not used at all: the real drain runs.
     """
-    from netbox_nso_plugin import delivery, signals
-    from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxEntry
+    from netbox_nso_plugin import delivery, outbox, signals
+    from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentOutboxEntry, NSOIntentOutboxState
 
     keys = signals._pending_intent_keys()
     claimed = sorted(keys)
@@ -92,20 +92,29 @@ def _deliver_scheduled_keys():
         )
         if adapter_device_id is None:
             continue
-        entries = list(
-            NSOIntentOutboxEntry.objects.filter(
-                device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True
-            ).values_list("id", "mark_and")
+        rows = list(
+            NSOIntentOutboxEntry.objects.filter(device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True)
+            .order_by("id")
+            .values("id", "mark_and", "transitions")
         )
-        if not entries:
+        if not rows:
             continue
-        entry_ids = [entry_id for entry_id, _mark in entries]
+        entry_ids = [row["id"] for row in rows]
+        state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).first() or NSOIntentOutboxState()
+        folded = outbox.fold_state_transitions([record for row in rows for record in row["transitions"]], state)
         try:
-            delivery.deliver(scope, device_id, adapter_device_id, mark=all(mark for _entry_id, mark in entries))
+            rendered = delivery.render(scope, device_id, adapter_device_id)
+            delivery.send(
+                rendered,
+                rendered.payload,
+                mark=all(row["mark_and"] for row in rows),
+                deletions=list(folded.queued.values()),
+            )
         except Exception:  # noqa: BLE001 (one key's failure must not abort its siblings)
             logger.exception("test delivery failed for %s/%s", device_id, scope)
             continue
         NSOIntentOutboxEntry.objects.filter(id__in=entry_ids).update(consumed_by_push_seq=_TEST_DELIVERY_PUSH_SEQ)
+        NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).delete()
 
 
 class IntentPushDeliveryMixin(IntentPushResetMixin):

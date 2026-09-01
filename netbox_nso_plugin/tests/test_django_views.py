@@ -323,9 +323,11 @@ class TestOnboardStatusView(ViewTestBase):
         mgmt = self._provisioning_mgmt("prov-stepfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
+        self.assertEqual(resp.json()["error"], "Provisioning failed. See the server log.")
+        self.assertNotIn("timeout", resp.content.decode())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provision_failed")
-        self.assertIn("fetch_host_keys", mgmt.onboard_error)
+        self.assertEqual(mgmt.onboard_error, "Provisioning failed. See the server log.")
 
     @patch(
         "netbox_nso_plugin.adapter_client.get_job",
@@ -335,9 +337,11 @@ class TestOnboardStatusView(ViewTestBase):
         mgmt = self._provisioning_mgmt("prov-jobfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
+        self.assertEqual(resp.json()["error"], "Provisioning failed. See the server log.")
+        self.assertNotIn("600s", resp.content.decode())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provision_failed")
-        self.assertIn("600s", mgmt.onboard_error)
+        self.assertEqual(mgmt.onboard_error, "Provisioning failed. See the server log.")
 
     def test_already_terminal_is_idempotent(self):
         """A row that already reached a terminal state just reports it (no adapter poll)."""
@@ -1229,7 +1233,7 @@ class TestNSODeviceActionView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_sync_conflict_ajax(self, mock_session_cls, mock_cfg):
-        """AJAX POST returns conflict JSON when a job is already running."""
+        """AJAX POST reports that the conflicting sync job is queued."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1243,7 +1247,14 @@ class TestNSODeviceActionView(ViewTestBase):
         }
         session = make_session(
             response=make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
             )
         )
         mock_session_cls.return_value = session
@@ -1251,8 +1262,15 @@ class TestNSODeviceActionView(ViewTestBase):
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 409)
-        data = json.loads(response.content)
-        self.assertEqual(data["status"], "conflict")
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "conflict",
+                "message": "A job is already queued for this device. (Job ID: 3)",
+                "job_id": 3,
+                "job_type": None,
+            },
+        )
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1290,10 +1308,8 @@ class TestNSODeviceActionView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_post_conflict_reports_incumbent_type(self, mock_session_cls, mock_cfg):
-        """S5a C (codex R1-F7): a 409 must name the INCUMBENT job's type — today the UI
-        polls the incumbent under the CLICKED action's label ('Sync from NSO running…'
-        while an Apply runs)."""
+    def test_post_sync_conflict_reports_queued_incumbent_type(self, mock_session_cls, mock_cfg):
+        """A sync conflict names its queued incumbent without calling it running."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1308,9 +1324,16 @@ class TestNSODeviceActionView(ViewTestBase):
         session = make_session()
         session.request.side_effect = [
             make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
             ),
-            make_response(200, json_data={"id": 3, "type": "apply", "status": "running"}),
+            make_response(200, json_data={"id": 3, "type": "sync", "status": "queued"}),
         ]
         mock_session_cls.return_value = session
 
@@ -1319,8 +1342,9 @@ class TestNSODeviceActionView(ViewTestBase):
         self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
+        self.assertEqual(data["message"], "Another job is already queued: sync. (Job ID: 3)")
         self.assertEqual(data["job_id"], 3)
-        self.assertEqual(data["job_type"], "apply")
+        self.assertEqual(data["job_type"], "sync")
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1344,7 +1368,14 @@ class TestNSODeviceActionView(ViewTestBase):
         session = make_session()
         session.request.side_effect = [
             make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
             ),
             make_response(500, content=b"boom"),
         ]
@@ -1355,6 +1386,7 @@ class TestNSODeviceActionView(ViewTestBase):
         self.assertEqual(response.status_code, 409)
         data = json.loads(response.content)
         self.assertEqual(data["status"], "conflict")
+        self.assertEqual(data["message"], "A job is already queued for this device. (Job ID: 3)")
         self.assertIsNone(data["job_type"])
 
         mgmt.adapter_device_id = None
@@ -1375,7 +1407,14 @@ class TestNSODeviceActionView(ViewTestBase):
         }
         mock_session_cls.return_value = make_session(
             response=make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": ["busy"]}}
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": ["busy"],
+                    }
+                },
             )
         )
 
@@ -1383,7 +1422,76 @@ class TestNSODeviceActionView(ViewTestBase):
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json(), {"status": "conflict", "job_id": None, "job_type": None})
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "conflict",
+                "message": "A job is already queued for this device.",
+                "job_id": None,
+                "job_type": None,
+            },
+        )
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_conflict_does_not_reflect_an_invalid_job_id(self, mock_session_cls, mock_cfg):
+        supplied = "Traceback: private job path"
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=10)
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        mock_session_cls.return_value = make_session(
+            response=make_response(
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "busy",
+                        "detail": {"job_id": supplied},
+                    }
+                },
+            )
+        )
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "sync"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["job_id"], None)
+        self.assertNotIn(supplied, response.content.decode())
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_conflict_does_not_reflect_an_invalid_job_type(self, mock_session_cls, mock_cfg):
+        supplied = "private_adapter_job"
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=10)
+        mock_cfg.return_value = {
+            "url": "http://adapter",
+            "token": "tok",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        session = make_session()
+        session.request.side_effect = [
+            make_response(
+                409,
+                json_data={"error": {"code": "conflict", "message": "busy", "detail": {"job_id": 3}}},
+            ),
+            make_response(200, json_data={"id": 3, "type": supplied, "status": "queued"}),
+        ]
+        mock_session_cls.return_value = session
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "sync"])
+        response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIsNone(response.json()["job_type"])
+        self.assertNotIn(supplied, response.content.decode())
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -1440,7 +1548,13 @@ class TestNSODeviceActionView(ViewTestBase):
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
-        """Non-AJAX conflict POST redirects with warning."""
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config")
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_post_sync_conflict_non_ajax_uses_queued_wording(self, mock_session_cls, mock_cfg):
+        """A non-AJAX sync conflict redirects with truthful queued wording."""
+        from django.contrib.messages import get_messages
+
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
@@ -1452,16 +1566,29 @@ class TestNSODeviceActionView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = make_session(
-            response=make_response(
-                409, json_data={"error": {"code": "conflict", "message": "running", "detail": {"job_id": 3}}}
-            )
-        )
+        session = make_session()
+        session.request.side_effect = [
+            make_response(
+                409,
+                json_data={
+                    "error": {
+                        "code": "conflict",
+                        "message": "A job of the requested type is already queued for this device",
+                        "detail": {"job_id": 3},
+                    }
+                },
+            ),
+            make_response(200, json_data={"id": 3, "type": "sync", "status": "queued"}),
+        ]
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync"])
         response = self.client.post(url)
         self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["Another job is already queued: sync. (Job ID: 3)"],
+        )
 
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
@@ -2192,6 +2319,19 @@ class TestNSOBulkAcceptView(ViewTestBase):
 
 class TestDeviceNSOTabView(ViewTestBase):
     """Tests for DeviceNSOTabView (device NSO tab)."""
+
+    def test_job_activity_uses_active_and_polled_status_wording(self):
+        """The tab does not describe every queued or active job as running."""
+        response = self.client.get(reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertIn("</strong> active", body)
+        self.assertIn("label + ' ' + job.status + '…", body)
+        self.assertIn("label + ' active across ' + expected", body)
+        self.assertIn("label + ' active across ' + data.generations.length", body)
+        self.assertIn("label + ' queued… (Job #'", body)
+        self.assertNotIn("already running", body)
 
     def test_device_nso_tab_no_mgmt(self):
         """Device without NSODeviceManagement returns 200 with empty context."""
@@ -4539,6 +4679,47 @@ class TestOverlayFieldEditView(ViewTestBase):
         member_state.refresh_from_db()
         self.assertEqual((member_state.mode, member_state.port_priority), ("passive", 65535))
 
+    def test_edit_lacp_member_repends_the_deploying_bundle(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
+        edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/11", type="1000base-t")
+        sibling = Interface.objects.create(device=self.device, name="GigabitEthernet0/12", type="1000base-t")
+        bundle = NSOLACPBundleState.objects.create(
+            management=self.mgmt,
+            interface=lag,
+            lag_id=11,
+            min_links=1,
+            status="deploying",
+        )
+        edited_state = NSOLACPMemberState.objects.create(
+            management=self.mgmt,
+            interface=edited,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=100,
+            status="deploying",
+        )
+        sibling_state = NSOLACPMemberState.objects.create(
+            management=self.mgmt,
+            interface=sibling,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=200,
+            status="deploying",
+        )
+
+        response = self.client.post(
+            self._url("lacp_member", edited_state.pk),
+            {"mode": "passive"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        bundle.refresh_from_db()
+        edited_state.refresh_from_db()
+        sibling_state.refresh_from_db()
+        self.assertEqual((bundle.status, edited_state.status, sibling_state.status), ("accepted",) * 3)
+
     def test_edit_shared_vlan_name_updates_native_object_and_owns_every_attached_device(self):
         from ipam.models import VLAN, VLANGroup
 
@@ -4580,6 +4761,40 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((first.status, second.status), ("accepted", "accepted"))
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
+
+    def test_edit_vlan_name_reports_when_the_vlan_is_deleted_before_save(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Removed Inline VLANs", slug="removed-inline-vlans")
+        vlan = VLAN.objects.create(group=group, vid=123, name="REMOVED-NAME")
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="REMOVED-NAME",
+            status="imported",
+        )
+
+        original_lock = apply_state.lock_vlan_intent_transaction
+
+        def lock_then_delete(vlan_id):
+            original_lock(vlan_id)
+            VLAN.objects.filter(pk=vlan_id).delete()
+
+        with patch(
+            "netbox_nso_plugin.apply_state.lock_vlan_intent_transaction",
+            side_effect=lock_then_delete,
+        ):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "UNSAVED-NAME"})
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("no longer exists", " ".join(response.json()["errors"]["name"]).lower())
+        self.assertFalse(VLAN.objects.filter(pk=vlan.pk).exists())
+        self.assertFalse(NSOVLANState.objects.filter(pk=state.pk).exists())
+        self.assertFalse(VLAN.objects.filter(name="UNSAVED-NAME").exists())
 
     def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
         from ipam.models import VLAN, VLANGroup
@@ -4718,6 +4933,82 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(vlan.name, "KEEP-NAME")
         self.assertEqual(state.status, "imported")
 
+    def test_edit_vlan_name_reports_a_qinq_collision_created_after_validation(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOVLANState
+
+        first_group = VLANGroup.objects.create(name="First Q-in-Q Group", slug="first-qinq-group")
+        second_group = VLANGroup.objects.create(name="Second Q-in-Q Group", slug="second-qinq-group")
+        service_vlan = VLAN.objects.create(vid=3000, name="SERVICE", qinq_role="svlan")
+        vlan = VLAN.objects.create(
+            group=first_group,
+            vid=121,
+            name="KEEP-NAME",
+            qinq_role="cvlan",
+            qinq_svlan=service_vlan,
+        )
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="KEEP-NAME",
+            status="imported",
+        )
+        original_lock = apply_state.lock_vlan_intent_rows
+
+        def lock_then_collide(vlan_id, scopes):
+            result = original_lock(vlan_id, scopes)
+            VLAN.objects.create(
+                group=second_group,
+                vid=122,
+                name="TAKEN-NAME",
+                qinq_role="cvlan",
+                qinq_svlan=service_vlan,
+            )
+            return result
+
+        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", side_effect=lock_then_collide):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "TAKEN-NAME"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("name", response.json()["errors"])
+        vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(vlan.name, "KEEP-NAME")
+        self.assertEqual(state.status, "imported")
+
+    def test_edit_vlan_name_reports_a_collision_created_after_validation(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOVLANState
+
+        group = VLANGroup.objects.create(name="Raced Inline VLANs", slug="raced-inline-vlans")
+        vlan = VLAN.objects.create(group=group, vid=124, name="KEEP-NAME")
+        state = NSOVLANState.objects.create(
+            management=self.mgmt,
+            vlan=vlan,
+            device_name="KEEP-NAME",
+            status="imported",
+        )
+        original_lock = apply_state.lock_vlan_intent_rows
+
+        def lock_then_collide(vlan_id, scopes):
+            result = original_lock(vlan_id, scopes)
+            VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
+            return result
+
+        with patch("netbox_nso_plugin.apply_state.lock_vlan_intent_rows", side_effect=lock_then_collide):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "RACED-NAME"})
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("name", response.json()["errors"])
+        vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(vlan.name, "KEEP-NAME")
+        self.assertEqual(state.status, "imported")
+
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
@@ -4791,6 +5082,36 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(put_policy.call_args.args[1][0]["name"], "RM-INLINE-NEW")
         ospf_payload = put_ospf.call_args.args[1]
         self.assertEqual(ospf_payload["instances"][0]["redistribution"][0]["route_map"], "RM-INLINE-NEW")
+
+    def test_edit_route_map_name_repends_a_deploying_row(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin import status_machine as sm
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import _save_route_map_name_edit
+
+        route_map = RouteMap.objects.create(name="RM-IN-FLIGHT-OLD")
+        row = NSORoutePolicyState.objects.create(
+            management=self.mgmt,
+            family="route_map",
+            object_name=route_map.name,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            status="deploying",
+        )
+
+        row.object_name = "RM-IN-FLIGHT-NEW"
+        with suppress_intent_push():
+            _save_route_map_name_edit(row, route_map.name)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        row.status = sm.on_apply_result(row.status, ok=True)
+        row.save(update_fields=["status"])
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
 
     def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
         from django.contrib.contenttypes.models import ContentType
@@ -5345,7 +5666,7 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
         onboard.assert_not_called()
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_device_id, 196)  # mapping left alone
-        self.assertIn("adapter down", self.mgmt.adapter_link_error)
+        self.assertEqual(self.mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
 
     def test_retry_failure_refreshes_error(self):
         NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
@@ -5358,8 +5679,25 @@ class TestNSOAdapterLinkRetryView(ViewTestBase):
             resp = self.client.post(self._url())
         self.assertEqual(resp.status_code, 302)
         self.mgmt.refresh_from_db()
-        self.assertIn("still down", self.mgmt.adapter_link_error)  # surfaced for the banner
+        self.assertEqual(self.mgmt.adapter_link_error, "The NSO adapter request failed. See the server log.")
         self.assertIsNone(self.mgmt.adapter_device_id)  # still unlinked
+
+
+class TestNSOIntentResyncView(ViewTestBase):
+    def test_unexpected_failure_uses_a_fixed_public_message(self):
+        from django.contrib.messages import get_messages
+
+        supplied = "Traceback: private resync path"
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=196)
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_intent_resync", args=[self.mgmt.pk])
+
+        with patch("netbox_nso_plugin.intent_drift.resync_intent", side_effect=RuntimeError(supplied)):
+            response = self.client.post(url)
+
+        rendered = " ".join(str(message) for message in get_messages(response.wsgi_request))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("Intent re-sync failed. See the server log.", rendered)
+        self.assertNotIn(supplied, rendered)
 
 
 class TestBfdGrid(ViewTestBase):
@@ -5682,7 +6020,8 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
             resp = self._get("logging")
 
         body = resp.content.decode()
-        self.assertIn("adapter is down", body)  # the banner
+        self.assertIn("The NSO adapter request failed. See the server log.", body)
+        self.assertNotIn("adapter is down", body)
         self.assertNotIn("No remote syslog servers configured", body)
         self.assertIn("192.0.2.99", body)  # persisted rows still render
 

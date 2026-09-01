@@ -16,6 +16,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def lock_svi_reconcile_dependencies(device, payload: dict) -> None:
+    """Lock native VLANs before the device lock and SVI overlay writes."""
+    from .models import NSOSVIState
+    from .vlan_reconciler import _lock_reconcile_vlan_dependencies
+
+    def collect_overlay_vlan_ids(management, _vids):
+        return NSOSVIState.objects.filter(management=management, vlan__isnull=False).values_list(
+            "vlan_id",
+            flat=True,
+        )
+
+    _lock_reconcile_vlan_dependencies(
+        device,
+        payload,
+        payload_key="interfaces",
+        vid_fields=("vlan_id",),
+        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
+    )
+
+
 def reconcile_svi(device, payload: dict) -> list:
     """Create/update virtual SVI/IRB interfaces + NSOSVIState from the adapter payload."""
     from dcim.models import Interface

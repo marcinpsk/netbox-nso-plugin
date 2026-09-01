@@ -498,6 +498,25 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         payload = self._grid()
         self.assertEqual(payload["push_error"]["detail"]["reason"], "duplicate_triple")
 
+    def test_the_category_payload_does_not_expose_persisted_exception_text(self):
+        supplied = "private_adapter_path"
+        self.mgmt.intent_push_errors = {
+            "static_route": {
+                "code": "nso_error",
+                "message": supplied,
+                "detail": {"reason": supplied},
+                "attempt": 4,
+                "at": "2026-08-24T10:00:00+00:00",
+            }
+        }
+        self.mgmt.save(update_fields=["intent_push_errors"])
+
+        payload = self._grid()["push_error"]
+
+        self.assertNotIn(supplied, str(payload))
+        self.assertEqual(payload["message"], "The NSO adapter request failed. See the server log.")
+        self.assertEqual(payload["detail"], {})
+
     def test_the_banner_is_a_live_region(self):
         """nso-grid.js un-hides the container after an in-grid reload, with no page render, so
         the rejection only reaches assistive technology if the container is an alert region."""

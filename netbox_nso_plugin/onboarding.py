@@ -23,6 +23,9 @@ from __future__ import annotations
 import logging
 import re
 
+from .deployment import DeploymentQuiesced
+from .deployment import guarded as _deployment_guarded
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +93,7 @@ def build_onboarding_dashboard(instance) -> dict:
     failure ``error`` is set and the lists are empty (the view renders the banner).
     """
     from . import adapter_client as client
-    from .adapter_client import AdapterError
+    from .adapter_client import AdapterError, public_error_message
     from .models import NSOPlatformNedMapping
 
     out: dict = {
@@ -106,7 +109,7 @@ def build_onboarding_dashboard(instance) -> dict:
     try:
         nso_devices = client.list_instance_devices(instance.adapter_instance_id)
     except AdapterError as exc:
-        out["error"] = str(exc)
+        out["error"] = public_error_message(exc)
         return out
     except Exception as exc:  # defensive — never 500 the dashboard
         logger.exception("build_onboarding_dashboard: listing devices for instance %s failed", instance.pk)
@@ -185,6 +188,7 @@ def _default_authgroup() -> str:
     return "network"
 
 
+@_deployment_guarded("provisioning")
 def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", sync=True) -> dict:
     """Onboard one NetBox device into NSO (the write action).
 
@@ -319,17 +323,10 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     return result
 
 
-def _summarize_provision_failure(steps) -> str:
-    """Build a one-line summary of the first failed step in a provision result."""
-    for step in steps or []:
-        if not isinstance(step, dict):
-            continue
-        if step.get("status") == "failed":
-            detail = step.get("detail")
-            return f"{step.get('step')} failed" + (f": {detail}" if detail else "")
-    return "Provisioning failed."
+_PROVISION_FAILURE_PUBLIC_MESSAGE = "Provisioning failed. See the server log."
 
 
+@_deployment_guarded("provisioning")
 def advance_provisioning(mgmt) -> dict:
     """Poll a provisioning row's adapter job and advance it. Idempotent + best-effort.
 
@@ -345,7 +342,7 @@ def advance_provisioning(mgmt) -> dict:
     ``poll_error`` on a transient adapter outage (the row is kept provisioning so callers retry).
     """
     from . import adapter_client as client
-    from .adapter_client import AdapterError
+    from .adapter_client import AdapterError, public_error_message
 
     # Terminal or ready row → just report it (never re-poll). Keeps the sweep/tab cheap and
     # the poll endpoint idempotent.
@@ -362,7 +359,7 @@ def advance_provisioning(mgmt) -> dict:
         job = client.get_job(mgmt.onboard_job_id)
     except AdapterError as exc:
         # Transient — leave the row provisioning so the next poll/tab/sweep retries.
-        return {"status": "provisioning", "poll_error": str(exc)}
+        return {"status": "provisioning", "poll_error": public_error_message(exc)}
 
     job_status = (job or {}).get("status")
     if job_status in ("queued", "running"):
@@ -383,14 +380,27 @@ def advance_provisioning(mgmt) -> dict:
             return {"status": "ready"}
         mgmt.onboard_status = "provision_failed"
         mgmt.onboard_steps = steps
-        mgmt.onboard_error = _summarize_provision_failure(steps)
+        mgmt.onboard_error = _PROVISION_FAILURE_PUBLIC_MESSAGE
+        logger.warning(
+            "Provisioning job %s returned an unsuccessful result for management row %s: %r",
+            mgmt.onboard_job_id,
+            mgmt.pk,
+            result,
+        )
         mgmt.save(update_fields=["onboard_status", "onboard_steps", "onboard_error"])
         return {"status": "provision_failed", "error": mgmt.onboard_error}
 
     # failed / timeout / unknown-terminal
     err = (job or {}).get("error") or {}
     mgmt.onboard_status = "provision_failed"
-    mgmt.onboard_error = err.get("message") or "Provision job failed."
+    mgmt.onboard_error = _PROVISION_FAILURE_PUBLIC_MESSAGE
+    logger.warning(
+        "Provisioning job %s finished with status %r for management row %s: %r",
+        mgmt.onboard_job_id,
+        job_status,
+        mgmt.pk,
+        err,
+    )
     mgmt.save(update_fields=["onboard_status", "onboard_error"])
     return {"status": "provision_failed", "error": mgmt.onboard_error}
 
@@ -410,6 +420,8 @@ def advance_stale_onboarding_rows() -> tuple:
     for mgmt in rows:
         try:
             res = advance_provisioning(mgmt)
+        except DeploymentQuiesced:
+            raise
         except Exception:  # noqa: BLE001 — one bad row must not abort the whole sweep
             logger.exception("advance_stale_onboarding_rows: failed for mgmt %s", mgmt.pk)
             continue

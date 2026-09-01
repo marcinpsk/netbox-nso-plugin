@@ -125,19 +125,26 @@ class TestStateMachineSpec(SimpleTestCase):
     def test_allowed_rejects_illegal_transition(self):
         # A reconcile must never pull an owned 'in_sync' row back to 'imported'.
         self.assertNotIn(sm.IMPORTED, sm.allowed(sm.RECONCILE, sm.IN_SYNC))
-        # Apply only proceeds from accepted.
+        # Apply proceeds from accepted and retries a failed owned row.
         self.assertEqual(sm.allowed(sm.APPLY, sm.ACCEPTED), {sm.DEPLOYING})
+        self.assertEqual(sm.allowed(sm.APPLY, sm.APPLY_FAILED), {sm.DEPLOYING})
         self.assertEqual(sm.allowed(sm.APPLY, sm.IMPORTED), frozenset())
 
 
 class TestAdvanceEngine(SimpleTestCase):
     """The runtime guard. Pure functions — no DB."""
 
+    def test_operator_edit_repends_every_existing_status(self):
+        for current in sm.STATES:
+            with self.subTest(current=current):
+                self.assertEqual(sm.on_operator_edit(current), sm.ACCEPTED)
+
     def test_deterministic_edges_infer_target(self):
         self.assertEqual(sm.advance(sm.IMPORTED, sm.ACCEPT), sm.ACCEPTED)
         self.assertEqual(sm.advance(sm.CHANGED, sm.ACCEPT), sm.ACCEPTED)
         self.assertEqual(sm.advance(sm.CONFLICT, sm.ACCEPT), sm.ACCEPTED)
         self.assertEqual(sm.advance(sm.ACCEPTED, sm.APPLY), sm.DEPLOYING)
+        self.assertEqual(sm.advance(sm.APPLY_FAILED, sm.APPLY), sm.DEPLOYING)
         self.assertEqual(sm.advance(sm.ACCEPTED, sm.REVERT), sm.IMPORTED)
         self.assertEqual(sm.advance(sm.DEPLOYING, sm.APPLY_OK), sm.IN_SYNC)
 
@@ -159,7 +166,7 @@ class TestAdvanceEngine(SimpleTestCase):
         with self.assertRaises(sm.IllegalTransition):
             sm.advance(sm.IN_SYNC, sm.RECONCILE, to=sm.IMPORTED)
 
-    def test_apply_only_from_accepted(self):
+    def test_apply_rejects_unowned_and_settled_states(self):
         with self.assertRaises(sm.IllegalTransition):
             sm.advance(sm.IMPORTED, sm.APPLY)
         with self.assertRaises(sm.IllegalTransition):
@@ -182,6 +189,7 @@ class TestAdvanceEngine(SimpleTestCase):
     def test_can_mirrors_advance_legality(self):
         self.assertTrue(sm.can(sm.APPLY, sm.ACCEPTED))
         self.assertTrue(sm.can(sm.APPLY, sm.ACCEPTED, to=sm.DEPLOYING))
+        self.assertTrue(sm.can(sm.APPLY, sm.APPLY_FAILED, to=sm.DEPLOYING))
         self.assertFalse(sm.can(sm.APPLY, sm.IMPORTED))
         self.assertFalse(sm.can(sm.RECONCILE, sm.ACCEPTED, to=sm.IMPORTED))
 

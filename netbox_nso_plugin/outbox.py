@@ -177,6 +177,17 @@ def fold_transitions(transitions, *, claim_deletions=(), queued=(), revoked=(), 
     return folded
 
 
+def fold_state_transitions(transitions, state) -> FoldedAuthority:
+    """Fold *transitions* with every authority value held on *state*."""
+    return fold_transitions(
+        transitions,
+        claim_deletions=[route_id_of(record["route_id"]) for record in state.claim_deletions or []],
+        queued=state.queued_deletions,
+        revoked=state.revoked_ids,
+        lineage_carry=state.lineage_carry,
+    )
+
+
 def carried_triple(route_id, *, transitions=(), queued=(), claim_deletions=(), lineage_carry=None) -> dict | None:
     """Return the acknowledged triple a re-ownership of *route_id* inherits (§4.3(b)).
 
@@ -350,9 +361,11 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     """Append this transaction's contribution to ``(device_id, scope)``.
 
     Writes nothing for a reconcile or render write (those mirror the adapter and are not
-    operator intent) and nothing for a device whose teardown is in progress. Takes no lock:
-    two transactions appending to two keys, in either order, never meet.
+    operator intent) and nothing for a device whose teardown is in progress. Takes the
+    deployment gate's shared transaction lock, so transactions appending to different keys
+    remain compatible in either order.
     """
+    from .deployment import lock_mutation
     from .models import NSOIntentOutboxEntry
     from .signals import _is_intent_push_suppressed, _is_render_request
 
@@ -365,6 +378,7 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     if scope not in delivery_keys():
         raise ValueError(f"unknown intent outbox scope {scope!r}")
     _refuse_outside_a_transaction()
+    lock_mutation()
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return
