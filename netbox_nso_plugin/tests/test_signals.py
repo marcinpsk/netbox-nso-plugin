@@ -1106,9 +1106,12 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
     def test_skips_unknown_attribute(self):
         """An owned row outside the wire schema schedules no interface behavior."""
+        from netbox_nso_plugin.signals import interface_intent_item
+
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "mtu", nso_value="1500")
 
+        self.assertIsNone(interface_intent_item(state))
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
                 _invoke_push_intent_on_accept(state)

@@ -3502,9 +3502,6 @@ def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()
                 accepted_at=planned_at,
             )
             fields = None
-            owner = materialized_row(NSORoutePolicyState, family, obj.name)
-            if owner is not None and owner.management.device_id != mgmt.device_id:
-                cross_device.append((family, obj.name, owner.management.device.name))
         elif state.status in _OWNED_PUSH_STATUSES:
             continue  # already owned → nothing to do
         elif state.status in (CHANGED, CONFLICT):
@@ -3517,6 +3514,9 @@ def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()
             candidate.status = "accepted"
             candidate.accepted_at = planned_at
             fields = ("content_type", "object_id", "status", "accepted_at")
+        owner = materialized_row(NSORoutePolicyState, family, obj.name)
+        if owner is not None and owner.management.device_id != mgmt.device_id:
+            cross_device.append((family, obj.name, owner.management.device.name))
         saves.append(
             planned_save(
                 candidate,

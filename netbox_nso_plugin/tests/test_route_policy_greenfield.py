@@ -798,6 +798,56 @@ class TestOwnershipCascade(_RPBase):
         # …but its cross-device provenance is reported (family, name, source device name).
         assert ("prefix_list", pl.name, other_dev.name) in cascade.cross_device
 
+    def test_cascade_reports_cross_device_provenance_for_imported_reference(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
+
+        mgmt = self._mgmt()
+        route_map, _as_path, _community_list, prefix_list = self._route_map_with_refs()
+        _save_without_push(
+            NSORoutePolicyState(
+                management=mgmt,
+                family="prefix_list",
+                object_name=prefix_list.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=prefix_list.pk,
+                status="imported",
+            )
+        )
+        other_device = Device.objects.create(
+            name="rp-imported-source",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        instance, _ = NSOInstance.objects.get_or_create(
+            name="rp-inst",
+            defaults={"adapter_instance_id": "rp-inst"},
+        )
+        other_management = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=instance,
+            nso_device_name="nso-rp-imported-source",
+            adapter_device_id=298,
+        )
+        _save_without_push(
+            NSORoutePolicyState(
+                management=other_management,
+                family="prefix_list",
+                object_name=prefix_list.name,
+                content_type=ContentType.objects.get_for_model(PrefixList),
+                object_id=prefix_list.pk,
+                status="in_sync",
+                is_materialized=True,
+            )
+        )
+
+        cascade = _execute_route_map_acquisition(mgmt, route_map)
+
+        assert ("prefix_list", prefix_list.name, other_device.name) in cascade.cross_device
+
     def test_foreign_owned_route_map_edit_does_not_acquire_new_reference(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import ASPath, RouteMap, RouteMapEntry
