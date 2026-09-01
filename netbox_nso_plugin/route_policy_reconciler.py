@@ -22,6 +22,7 @@ import json
 import logging
 from contextlib import nullcontext
 from contextvars import ContextVar
+from dataclasses import replace
 
 from . import shared_object_ownership as ownership
 from .route_policy_structure import canonical_route_map, prefix_list_entry_unit, structure_entry
@@ -49,6 +50,8 @@ class _Operations:
         self.deletes = []
         self.m2m_writes = []
         self.operations = []
+        self.content_groups = set()
+        self.device_ids = set()
 
     def save(self, instance, *, update_fields=None, force_insert=False, natural_key=(), references=()):
         from .renderer_writer import planned_save
@@ -104,12 +107,7 @@ def _route_policy_reconcile_plan_and_operations(device, payload):
         operations = _route_policy_reconcile_operations(device, payload, planned_at)
     except ImportError:
         return RendererMutationPlan.build(planned_at=planned_at), _Operations()
-    plan = RendererMutationPlan.build(
-        saves=operations.saves,
-        deletes=operations.deletes,
-        m2m_writes=operations.m2m_writes,
-        planned_at=planned_at,
-    )
+    plan = _mutation_plan(operations, planned_at)
     return plan, operations
 
 
@@ -534,6 +532,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.name_maps[family][name] = root
                 changed_fields.append("invert_match")
         if fill and not created_root:
+            if not self._root_has_entries(family, root):
+                self.operations.content_groups.add(key)
+                self.operations.device_ids.add(self.device.pk)
             for entry in self._existing_entries(family, root):
                 self.operations.delete(entry)
         if fill and family == "route_map":
@@ -644,6 +645,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.operations.delete(state)
                 self.modified_state_pks.add((state.management_id, state.family, state.object_name.casefold()))
                 if state.is_materialized:
+                    # Re-pointing refills the shared object from the sibling capture.
+                    self.operations.content_groups.add(key)
+                    self.operations.device_ids.add(self.device.pk)
                     self.plan_rematerialize(live[0], root, group, state.pk)
                 continue
             if root is not None and (key in self.planned_reference_keys or _object_referenced(root, state.family)):
@@ -659,6 +663,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.operations.delete(row)
                 self.modified_state_pks.add(identity)
             if root is not None:
+                # The last capture is gone and nothing references the root: it and its entries go.
+                self.operations.content_groups.add(key)
+                self.operations.device_ids.add(self.device.pk)
                 self.operations.delete(root)
 
     def _resolve_route_map_name_maps(self, entries):
@@ -975,13 +982,22 @@ def _route_policy_reconcile_operations(device, payload, planned_at):
 
 
 def _mutation_plan(operations, planned_at):
+    from .intent_state import MutationFootprint, route_policy_footprint
     from .renderer_writer import RendererMutationPlan
 
-    return RendererMutationPlan.build(
+    plan = RendererMutationPlan.build(
         saves=operations.saves,
         deletes=operations.deletes,
         m2m_writes=operations.m2m_writes,
         planned_at=planned_at,
+    )
+    if not operations.content_groups:
+        return plan
+    content_footprint = route_policy_footprint(operations.content_groups, device_ids=operations.device_ids)
+    return replace(
+        plan,
+        lock_footprint=MutationFootprint.merge(plan.lock_footprint, content_footprint),
+        content_keys=tuple(sorted(set(plan.content_keys) | set(content_footprint.revision_keys))),
     )
 
 
