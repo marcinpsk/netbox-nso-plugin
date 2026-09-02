@@ -67,6 +67,20 @@ class TestRendererFleetAudit(_FleetCase):
             (3, 3, 3, 3, 0),
         )
 
+    def test_the_pass_skips_management_rows_without_adapter_identity(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
+
+        NSODeviceManagement.objects.filter(device_id=self.device_ids[1]).update(adapter_device_id=None)
+        reached = []
+        audit = self._canned(audited=("vlan",), record=reached)
+
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit):
+            result = audit_renderer_fleet()
+
+        self.assertEqual(reached, [self.device_ids[0], self.device_ids[2]])
+        self.assertEqual(result.devices, 2)
+
     def test_the_shared_deadline_defers_the_devices_the_tick_could_not_reach(self):
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.renderer_audit import audit_renderer_fleet

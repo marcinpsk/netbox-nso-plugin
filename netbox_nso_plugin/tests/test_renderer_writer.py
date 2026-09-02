@@ -587,6 +587,31 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == expected
 
+    def test_a_reverse_m2m_add_cannot_bypass_the_forward_plan(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_add,
+            renderer_mirror_writes,
+        )
+
+        device, management = make_managed("writer-reverse-m2m", 16278)
+        interface = Interface.objects.create(device=device, name="Ethernet1/8", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=management,
+            interface=interface,
+            mode="tagged",
+            status="imported",
+        )
+        vlan = VLAN.objects.create(vid=1637, name="writer-reverse-m2m")
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),))
+
+        with renderer_mirror_writes(plan) as writer:
+            with self.assertRaisesRegex(IntentMutationProtocolError, "reverse M2M"), transaction.atomic():
+                vlan.nso_switchport_tagged_states.add(state)
+            writer.m2m_add(state, "tagged_vlans", (vlan,))
+
     def test_m2m_plan_refuses_an_unregistered_related_model(self):
         from extras.models import Tag
 

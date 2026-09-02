@@ -1454,15 +1454,16 @@ def _drain_once(
     _refuse_in_transaction("drain")
     from .renderer_audit import audit_renderer_scopes
 
+    if deadline is not None and _deadline_at is None:
+        _deadline_at = _send_clock() + deadline
     if _audit:
         audit_renderer_scopes(
             device_id,
             (scope,),
             trigger="drain._drain_once",
             pre_capture=True,
+            deadline=_deadline_at,
         )
-    if deadline is not None and _deadline_at is None:
-        _deadline_at = _send_clock() + deadline
     if not delivery.delivery_keys()[scope].in_protocol:
         return _deliver_direct(device_id, scope, mode=mode, force=force, deadline_at=_deadline_at)
     # The mode THIS attempt may send in. The caller's own mode is what a re-form or a chain

@@ -415,6 +415,77 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
         self.assertEqual(unfiltered, [])
 
+    def test_audit_footprint_batches_overlay_loads_by_model(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+
+        table = self.state._meta.db_table
+
+        def overlay_queries():
+            with CaptureQueriesContext(connection) as captured:
+                audit_scope_footprint(self.device.pk, ("vlan",))
+            return [
+                query["sql"]
+                for query in captured.captured_queries
+                if f'FROM "{table}"' in query["sql"]
+                and f'"{table}"."id" IN (' in query["sql"]
+                and f'ORDER BY "{table}"."id" ASC' in query["sql"]
+            ]
+
+        own_vlan(self.management, 1624, "intent-permit-second")
+        own_vlan(self.management, 1625, "intent-permit-third")
+
+        self.assertEqual(len(overlay_queries()), 1)
+
+    def test_audit_footprint_passes_each_dependency_candidate_once(self):
+        from dataclasses import replace
+
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.intent_state import audit_scope_footprint
+        from netbox_nso_plugin.models import NSOSwitchportState
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet1623/2", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=self.management,
+            interface=interface,
+            mode="tagged",
+            status="accepted",
+        )
+        state.tagged_vlans.add(self.state.vlan)
+        specs = renderer_input_specs()
+        spec = specs[state._meta.label_lower]
+        resolver = spec.dependency_resolver
+        calls = []
+
+        def record(before, after, candidate_spec):
+            calls.append((before, after))
+            return resolver(before, after, candidate_spec)
+
+        with patch.dict(specs, {state._meta.label_lower: replace(spec, dependency_resolver=record)}):
+            audit_scope_footprint(self.device.pk, ("switchport",))
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0][0])
+        self.assertEqual(calls[0][1].pk, state.pk)
+
+    def test_detected_reconcile_does_not_add_retired_permit_state(self):
+        from netbox_nso_plugin.intent_state import _Permit, _upgrade_detected_reconcile
+
+        footprint = MutationFootprint.for_keys({(self.device.pk, "vlan")})
+        permit = _Permit(
+            footprint=footprint,
+            dml_kind="reconcile",
+            detect_reconcile_content=True,
+        )
+
+        with patch("netbox_nso_plugin.outbox.bump_intent_revision"):
+            _upgrade_detected_reconcile(permit, footprint)
+
+        self.assertNotIn("bump_revisions", vars(permit))
+
     def test_device_delete_footprint_includes_assigned_native_addresses(self):
         from dcim.models import Device, Interface
         from ipam.models import IPAddress

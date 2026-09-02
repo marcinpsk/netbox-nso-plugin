@@ -562,22 +562,23 @@ def audit_scope_footprint(device_id: int, scopes) -> MutationFootprint:
     # and every scan wider than the device fronts an Apply, a drain and a deliver.
     base = reconcile_family_footprint(device_id, requested)
     footprints = [base]
+    pks_by_label: dict[str, set[Any]] = {}
     for row in base.overlay_rows:
-        spec = _REGISTRY.get(row.model_label)
-        if row.pk is None or spec is None:
+        if row.pk is None or row.model_label not in _REGISTRY:
             continue
-        instance = apps.get_model(row.model_label)._default_manager.filter(pk=row.pk).first()
-        if instance is None:
-            continue
-        footprint = footprint_for_instance(instance, spec)
-        if not requested_keys.intersection(footprint.revision_keys):
-            continue
-        footprints.append(footprint)
-        if spec.dependency_resolver is not None:
-            # The declared dependencies are how a native anchor a repair may write
-            # through (a shared VLAN, a LAG, a tagged-VLAN edge) enters the footprint.
-            dependency_footprint, _changed = spec.dependency_resolver(instance, instance, spec)
-            footprints.append(dependency_footprint)
+        pks_by_label.setdefault(row.model_label, set()).add(row.pk)
+    for label, pks in sorted(pks_by_label.items()):
+        spec = _REGISTRY[label]
+        for instance in apps.get_model(label)._default_manager.filter(pk__in=pks).order_by("pk"):
+            footprint = footprint_for_instance(instance, spec)
+            if not requested_keys.intersection(footprint.revision_keys):
+                continue
+            footprints.append(footprint)
+            if spec.dependency_resolver is not None:
+                # The declared dependencies are how a native anchor a repair may write
+                # through (a shared VLAN, a LAG, a tagged-VLAN edge) enters the footprint.
+                dependency_footprint, _changed = spec.dependency_resolver(None, instance, spec)
+                footprints.append(dependency_footprint)
     return MutationFootprint.merge(*footprints)
 
 
@@ -2169,7 +2170,6 @@ def _upgrade_detected_reconcile(
         bump_intent_revision(device_id, scope)
     permit.deferred_repend_rows = permit.initial_deploying_rows
     permit.dml_kind = "content"
-    permit.bump_revisions = True
     permit.detect_reconcile_content = False
 
 
@@ -2432,12 +2432,14 @@ def _validate_explicit_delete(sender, instance, **kwargs):
 
 def _validate_explicit_m2m(sender, instance, action, reverse=False, pk_set=None, **kwargs):
     """Validate a registered M2M operation only while an explicit writer is active."""
-    if reverse or not action.startswith("pre_"):
+    if not action.startswith("pre_"):
         return
     from .renderer_writer import active_renderer_writer, require_planned_m2m_signal
 
     if active_renderer_writer() is None:
         return
+    if reverse:
+        raise IntentMutationProtocolError("a reverse M2M mutation bypassed the active renderer writer")
     field_name = next(
         (field.name for field in instance._meta.many_to_many if field.remote_field.through is sender),
         None,
