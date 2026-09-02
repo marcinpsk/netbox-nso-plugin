@@ -998,6 +998,12 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
 
     Returns a list of NSOBGPPeerState instances for this device.
     """
+    try:
+        from netbox_routing.models import BGPRouter  # noqa: F401
+    except ImportError:
+        logger.warning("netbox_routing not installed; skipping BGP reconcile")
+        return []
+
     from .models import NSOBGPPeerState, NSODeviceManagement
     from .renderer_writer import (
         active_renderer_writer,
@@ -1012,11 +1018,11 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
         return []
     active = active_renderer_writer()
     plan = active.plan if active is not None else bgp_reconcile_plan(device, payload)
+    operations = _bgp_reconcile_operations(device, payload, plan.planned_at)
     mutation = contextlib.nullcontext(active)
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
-        operations = _bgp_reconcile_operations(device, payload, plan.planned_at)
         for operation, instance, update_fields, force_insert, references in operations.operations:
             if operation == "delete":
                 writer.delete(instance)
