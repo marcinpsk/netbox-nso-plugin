@@ -722,6 +722,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         """The plan and reconcile select the same last duplicate peer-group definition."""
         self._make_mgmt()
 
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate
+
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
 
         ipv4 = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast"}]}
@@ -738,10 +740,20 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         )
 
         self.assertTrue(bgp_reconcile_plan(self.device, reordered).changes_content)
+        _reconcile_bgp_config(self.device, reordered)
+
+        template = BGPPeerTemplate.objects.get(name="PG")
+        address_families = BGPPeerAddressFamily.objects.filter(
+            assigned_object_type__model="bgppeertemplate",
+            assigned_object_id=template.pk,
+        ).values_list("address_family__address_family", flat=True)
+        self.assertEqual(set(address_families), {"ipv6-unicast"})
 
     def test_duplicate_peer_group_remote_as_uses_reconcile_traversal_order(self):
         """The plan and reconcile select the same remote AS for a duplicate name."""
         self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerTemplate
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
         from netbox_nso_plugin.models import NSOBGPPeerState
@@ -768,6 +780,9 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         )
 
         self.assertTrue(bgp_reconcile_plan(self.device, reordered).changes_content)
+        _reconcile_bgp_config(self.device, reordered)
+
+        self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65200)
 
     def test_invalid_peer_cannot_override_reported_template_remote_as(self):
         """The plan ignores a peer that reconciliation skips before its peer-group write."""

@@ -9,12 +9,26 @@ NSORedistributionState overlay row to it.
 """
 
 import logging
+from typing import NamedTuple
 
 from .intent_state import mirror_reconciler
 
 logger = logging.getLogger(__name__)
 
 _DESTINATION_PROTOCOLS = ("bgp", "isis", "ospf")
+
+
+class _MirrorPrediction(NamedTuple):
+    """Describe one reported state's predicted native mirror action."""
+
+    action: str
+    destination_label: str | None
+    destination_id: object | None
+    current_redistribution_id: int | None
+    target_redistribution_id: int | None
+    route_map_id: int | None
+    before: object
+    after: object
 
 
 def redistribution_reconcile_plan(device, payload: dict):
@@ -60,7 +74,7 @@ def redistribution_reconcile_plan(device, payload: dict):
     redistribution_ids = {
         redistribution_id
         for _state_pk, _key, prediction in mirror_predictions
-        for redistribution_id in prediction[3:5]
+        for redistribution_id in (prediction.current_redistribution_id, prediction.target_redistribution_id)
         if redistribution_id is not None
     }
     redistribution_ids.update(state.redistribution_id for state in states if state.redistribution_id is not None)
@@ -113,9 +127,9 @@ def redistribution_reconcile_plan(device, payload: dict):
             SourceRow("netbox_routing.redistribution", None),
             *(SourceRow("netbox_routing.redistribution", pk) for pk in redistribution_ids),
             *(
-                SourceRow(prediction[1], prediction[2])
+                SourceRow(prediction.destination_label, prediction.destination_id)
                 for _state_pk, _key, prediction in mirror_predictions
-                if prediction[1] is not None and prediction[2] is not None
+                if prediction.destination_label is not None and prediction.destination_id is not None
             ),
         ),
         overlay_rows=(
@@ -255,7 +269,7 @@ def _reported_redist_mirror_prediction(state, entry: dict, device):
     try:
         from netbox_routing.models import Redistribution, RouteMap
     except ImportError:
-        return "unavailable", None, None, state.redistribution_id, None, None, ABSENT, ABSENT
+        return _MirrorPrediction("unavailable", None, None, state.redistribution_id, None, None, ABSENT, ABSENT)
 
     from . import merge_util
 
@@ -264,7 +278,7 @@ def _reported_redist_mirror_prediction(state, entry: dict, device):
     destination_id = getattr(destination, "pk", None)
     target_id = getattr(redistribution, "pk", None)
     if destination is None:
-        return "no_destination", None, None, state.redistribution_id, None, None, ABSENT, ABSENT
+        return _MirrorPrediction("no_destination", None, None, state.redistribution_id, None, None, ABSENT, ABSENT)
     route_map = RouteMap.objects.filter(name=entry.get("route_map") or "").first() if entry.get("route_map") else None
     route_map_id = getattr(route_map, "pk", None)
     if is_owned(state.status):
@@ -281,7 +295,7 @@ def _reported_redist_mirror_prediction(state, entry: dict, device):
                 metric_type=_redist_metric_type(entry),
             )
         candidate_state.redistribution = redistribution
-        return (
+        return _MirrorPrediction(
             "owned",
             destination_label,
             destination_id,
@@ -292,7 +306,7 @@ def _reported_redist_mirror_prediction(state, entry: dict, device):
             canonical_fragment(candidate_state),
         )
     if redistribution is None:
-        return (
+        return _MirrorPrediction(
             "create",
             destination_label,
             destination_id,
@@ -315,7 +329,7 @@ def _reported_redist_mirror_prediction(state, entry: dict, device):
     candidate.route_map = route_map
     candidate.metric = entry.get("metric")
     candidate.metric_type = _redist_metric_type(entry)
-    return (
+    return _MirrorPrediction(
         action,
         destination_label,
         destination_id,
@@ -340,9 +354,9 @@ def _redistribution_mirror_predictions(states, reported, device):
     return tuple(predictions)
 
 
-def _mirror_prediction_changes_content(prediction) -> bool:
+def _mirror_prediction_changes_content(prediction: _MirrorPrediction) -> bool:
     """Return whether one mirror prediction changes its exact rendered fragment."""
-    return prediction[0] in {"mirror", "owned"} and prediction[6] != prediction[7]
+    return prediction.action in {"mirror", "owned"} and prediction.before != prediction.after
 
 
 def _redistribution_dependency_snapshot(redistribution_ids):

@@ -188,6 +188,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
             remover = threading.Thread(target=remove)
             remover.start()
             self.addCleanup(remover.join, 30)
+            self.addCleanup(release_render.set)
             assert remover_started.wait(timeout=30), "the remover never opened its database connection"
             wait_until_postgres_blocks(remover_pid[0], "the deletion")
 
