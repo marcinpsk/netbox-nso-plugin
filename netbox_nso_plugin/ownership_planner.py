@@ -687,7 +687,7 @@ def retire_overlay_manifest(instance) -> None:
     ).update(ownership_state="retired")
 
 
-def _manifest_state_key(scope, native_model_label, native_key, state_model_label, state_key):
+def _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key):
     return (
         scope,
         native_model_label,
@@ -701,7 +701,7 @@ def _manifest_states(device_id, requested):
     from .models import NSOOwnershipManifest
 
     return {
-        _manifest_state_key(scope, native_model_label, native_key, state_model_label, state_key): ownership_state
+        _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key): ownership_state
         for scope, native_model_label, native_key, state_model_label, state_key, ownership_state in (
             NSOOwnershipManifest.objects.filter(
                 device_id=device_id,
@@ -738,7 +738,7 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
     if scope not in requested or bound_device_id != device_id:
         return None
     manifest_state = manifest_states.get(
-        _manifest_state_key(scope, native_model_label, native_key, state_model_label, state_key)
+        _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key)
     )
     action = plan_ownership(
         rule,

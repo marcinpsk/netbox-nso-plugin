@@ -200,7 +200,9 @@ class TestManifestRetirement(TestCase):
             "device_id": 1627,
             "scope": "vlan",
             "native_model_label": "ipam.vlan",
+            "native_id": 27,
             "native_key": {"group_id": 16, "vid": 27},
+            "state_model_label": "netbox_nso_plugin.nsovlanstate",
         }
         owned = NSOOwnershipManifest.objects.create(**identity)
         detached = NSOOwnershipManifest.objects.create(
@@ -209,7 +211,10 @@ class TestManifestRetirement(TestCase):
         )
 
         retire_manifest_identity(
-            device_ids={1627, 1628}, **{key: identity[key] for key in identity if key != "device_id"}
+            device_ids={1627, 1628},
+            scope=identity["scope"],
+            native_model_label=identity["native_model_label"],
+            native_key=identity["native_key"],
         )
 
         owned.refresh_from_db()
