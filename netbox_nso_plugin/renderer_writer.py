@@ -23,7 +23,6 @@ from .intent_state import (
     IntentMutationProtocolError,
     MutationFootprint,
     SourceRow,
-    _authorize_dml,
     _effective_after,
     _intent_transaction,
     _normal,
@@ -1106,21 +1105,6 @@ class RendererWriter:
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
             raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
-        from django.db.models.deletion import Collector
-
-        collector = Collector(using=instance._state.db or "default", origin=instance)
-        collector.collect([instance])
-        # _begin_delete_implicit substitutes the cascade ORIGIN on every child pre_delete,
-        # so child tables never accrue credits; the reconcile path has no footprint_tables
-        # (content-only), leaving this loop as the child tables' sole authorization.
-        for model_label in {write.model_label for write in closure if write.operation == "delete"}:
-            _authorize_dml(self.permit, apps.get_model(model_label)._meta.db_table)
-        for (_field, _value), querysets in collector.field_updates.items():
-            for rows in querysets:
-                model, _materialized = _materialize_field_update_rows(rows)
-                if model is None:
-                    continue
-                _authorize_dml(self.permit, model._meta.db_table)
         with self._operation(index):
             result = instance.delete()
         self._consumed.update(matched)

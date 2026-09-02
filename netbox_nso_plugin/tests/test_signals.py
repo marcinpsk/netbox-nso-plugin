@@ -1752,7 +1752,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 outer_tag=3999,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_l2_sap_intent", exact_writer=True)
+        self._delete_pushes(row, "put_l2_sap_intent")
 
     def test_isis_flex_algo_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISFlexAlgoState

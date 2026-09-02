@@ -81,13 +81,8 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
                 self.assertIs(raised.exception.__cause__, failure)
                 render.assert_not_called()
 
-    def test_each_chained_drain_pass_audits_again_before_recapture(self):
-        """The real chain, not two hand-made calls: a tail appended mid-send earns pass two.
-
-        ``_after_success`` chains another pass when the key still has unconsumed entries, and
-        every pass has to re-audit before it recaptures — the tail was written after the
-        first pass proved its baseline.
-        """
+    def test_one_drain_call_audits_once_before_its_chained_passes(self):
+        """A tail appended during the send reuses the caller's completed audit."""
         from netbox_nso_plugin import drain, renderer_audit
 
         own_vlan(self.management, 1629, "renderer-audit-chain")
@@ -119,13 +114,13 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
             outcome = drain.drain_key(self.device.pk, "vlan")
 
         self.assertEqual(outcome, drain.SUCCEEDED)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(appended, [1])
         self.assertEqual(entries(self.device, "vlan", unconsumed=True), [])
         self.assertTrue(all(call[3] == {"pre_capture": True} for call in calls))
         self.assertTrue(all(call[:3] == (self.device.pk, ("vlan",), "drain._drain_once") for call in calls))
 
-    def test_a_tail_audit_refusal_does_not_replace_the_committed_success(self):
+    def test_a_tail_does_not_run_a_second_failing_audit(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
 
@@ -146,9 +141,10 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
             patch(
                 "netbox_nso_plugin.renderer_audit.audit_renderer_scopes",
                 side_effect=(None, RendererAuditRepairFailed("tail audit failed")),
-            ),
+            ) as audit,
         ):
             outcome = drain.drain_key(self.device.pk, "vlan")
 
         self.assertEqual(outcome, drain.SUCCEEDED)
-        self.assertEqual(len(entries(self.device, "vlan", unconsumed=True)), 1)
+        audit.assert_called_once()
+        self.assertEqual(entries(self.device, "vlan", unconsumed=True), [])

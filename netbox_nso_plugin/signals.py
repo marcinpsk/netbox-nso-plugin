@@ -1920,14 +1920,10 @@ def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
     by the time it runs (post-commit) the overlays are gone, so the snapshot omits this
     vid and the adapter PUT-replaces the vlan-reconciler instance → FASTMAP reverts it.
     """
-    from .intent_state import revision_was_acquired
-
     targets = []
     for state in instance.nso_vlan_states.select_related("management").all():
         mgmt = state.management
-        if mgmt.adapter_device_id is not None and (
-            _converted_writer_owns_content(mgmt.device_id, "vlan") or revision_was_acquired(mgmt.device_id, "vlan")
-        ):
+        if mgmt.adapter_device_id is not None and _converted_writer_owns_content(mgmt.device_id, "vlan"):
             targets.append((mgmt.device_id, mgmt.adapter_device_id))
     for device_id, adapter_device_id in targets:
         _schedule_intent_push((device_id, "vlan"))
