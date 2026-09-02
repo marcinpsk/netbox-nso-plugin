@@ -685,6 +685,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "ipam.vlangroup",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
+                "netbox_routing.ospfinstance",
                 "netbox_routing.staticroute_devices",
             },
         )
