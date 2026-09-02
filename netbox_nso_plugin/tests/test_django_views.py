@@ -4764,7 +4764,9 @@ class TestOverlayFieldEditView(ViewTestBase):
             management=other_mgmt,
             vlan=vlan,
             device_name="OLD-NAME",
-            status="imported",
+            status="apply_failed",
+            accepted_at=timezone.now(),
+            apply_attempt_id=uuid4(),
         )
 
         response = self.client.post(self._url("vlan_name", first.pk), {"name": "CUSTOMER-A"})
@@ -4776,6 +4778,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(vlan.name, "CUSTOMER-A")
         self.assertEqual((first.status, second.status), ("accepted", "accepted"))
         self.assertIsNone(first.apply_attempt_id)
+        self.assertIsNone(second.apply_attempt_id)
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
 

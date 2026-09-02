@@ -259,6 +259,25 @@ class TestReconcileRedistribution(TestCase):
         with self.assertRaises(RendererTargetsChanged):
             plan.validate_after_acquire()
 
+    def test_new_reported_entry_locks_and_revalidates_its_destination(self):
+        """A reported entry without an overlay still protects its destination."""
+        self._make_mgmt()
+        from django.db import transaction
+        from netbox_routing.models import ISISInstance
+
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged, SourceRow, offline_mutation
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+
+        self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.footprint.source_rows)
+        with transaction.atomic(), offline_mutation():
+            destination.delete()
+
+        with self.assertRaises(RendererTargetsChanged):
+            plan.validate_after_acquire()
+
     def test_plan_validation_detects_equal_content_relink(self):
         """The prediction identifies native rows even when their content is equal."""
         self._make_mgmt()

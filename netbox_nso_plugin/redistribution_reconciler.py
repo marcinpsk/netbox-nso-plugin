@@ -62,7 +62,7 @@ def redistribution_reconcile_plan(device, payload: dict):
         for entry in payload.get("entries", []) or []
         if isinstance(entry, dict) and entry.get("dest_protocol") and entry.get("source_protocol")
     }
-    mirror_predictions = _redistribution_mirror_predictions(states, reported, device)
+    mirror_predictions = _redistribution_mirror_predictions(states, reported, device, management.pk)
     protocols = {
         protocol
         for protocol in (
@@ -341,14 +341,24 @@ def _reported_redist_mirror_prediction(state, entry: dict, device):
     )
 
 
-def _redistribution_mirror_predictions(states, reported, device):
-    """Snapshot every reported state's mirror classification and dependencies."""
+def _redistribution_mirror_predictions(states, reported, device, management_id):
+    """Snapshot every reported entry's mirror classification and dependencies."""
+    from .models import NSORedistributionState
+
+    states_by_key = {
+        (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref): state for state in states
+    }
     predictions = []
-    for state in states:
-        key = (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref)
-        entry = reported.get(key)
-        if entry is None:
-            continue
+    for key, entry in sorted(reported.items()):
+        state = states_by_key.get(key)
+        if state is None:
+            state = NSORedistributionState(
+                management_id=management_id,
+                dest_protocol=key[0],
+                dest_ref=key[1],
+                source_protocol=key[2],
+                source_ref=key[3],
+            )
         prediction = _reported_redist_mirror_prediction(state, entry, device)
         predictions.append((state.pk, key, prediction))
     return tuple(predictions)
@@ -388,7 +398,7 @@ def _validate_redistribution_mirror_predictions(
         .order_by("pk")
     )
     if (
-        _redistribution_mirror_predictions(current, reported, device) != expected
+        _redistribution_mirror_predictions(current, reported, device, management_id) != expected
         or _redistribution_dependency_snapshot(redistribution_ids) != expected_dependents
     ):
         raise RendererTargetsChanged("redistribution mirror dependencies changed during acquisition")

@@ -4771,7 +4771,6 @@ def _save_vlan_name_edit(obj):
             now = timezone.now()
             for state in states:
                 state.vlan = vlan
-                was_deploying = state.status == "deploying"
                 if not sm.is_owned(state.status):
                     state.accepted_at = now
                 matches = vlan_name_matches(state)
@@ -4780,8 +4779,7 @@ def _save_vlan_name_edit(obj):
                     if state.status == "deploying"
                     else ("in_sync" if matches else "accepted")
                 )
-                if was_deploying:
-                    state.apply_attempt_id = None
+                state.apply_attempt_id = None
                 state.save()
     except _IntentTransactionNoOp as exc:
         return exc.result
