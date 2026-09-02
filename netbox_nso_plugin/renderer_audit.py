@@ -439,7 +439,11 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
     )
     deadline = _monotonic() + budget
     scopes = tuple(delivery.delivery_keys())
-    device_ids = tuple(NSODeviceManagement.objects.order_by("device_id").values_list("device_id", flat=True))
+    device_ids = tuple(
+        NSODeviceManagement.objects.filter(adapter_device_id__isnull=False)
+        .order_by("device_id")
+        .values_list("device_id", flat=True)
+    )
     ordered = _fleet_rotation(device_ids)
     audited_devices = repaired = deferred = unknown = failed = 0
     for index, device_id in enumerate(ordered):
