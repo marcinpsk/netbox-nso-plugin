@@ -233,11 +233,11 @@ class TestReconcileStaticRoutes(TestCase):
 
         self.assertTrue(plan.changes_content)
 
-    def test_plan_marks_reported_owned_metric_or_tag_drift_as_content(self):
+    def test_plan_marks_reported_owned_wire_drift_as_content(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-drift")
         route = StaticRoute.objects.create(prefix="198.18.45.0/24", next_hop="198.18.0.45", metric=1)
@@ -251,9 +251,9 @@ class TestReconcileStaticRoutes(TestCase):
         )
         entry = self._route_entry(str(route.prefix), str(route.next_hop))
 
-        for changed_entry in (dict(entry, metric=2), dict(entry, tag=42)):
+        for changed_entry in (dict(entry, metric=2), dict(entry, permanent=True), dict(entry, tag=42)):
             with self.subTest(changed_entry=changed_entry):
-                plan = _static_route_reconcile_plan(self.device, self._route_payload(changed_entry))
+                plan = static_route_reconcile_plan(self.device, self._route_payload(changed_entry))
                 self.assertTrue(plan.changes_content)
 
     def test_nokia_omitted_preference_seeds_its_ned_default(self):
