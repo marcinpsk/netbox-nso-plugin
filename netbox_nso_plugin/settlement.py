@@ -322,8 +322,8 @@ def _settle_job(row, device_id: int, job: dict, readback: _Readback) -> bool:
         # apply that touched no static route says nothing about this device's routes.
         return True
 
-    # Re-read (the verdicts are written through ``.update()``), but only the routes this
-    # job's results name — the rest of the device's overlay is not evidence about them.
+    # Re-read before guarded verdict writes, but only the routes this job's results name.
+    # The rest of the device's overlay is not evidence about them.
     named = {
         entry["route_id"] for entry in results if isinstance(entry, dict) and isinstance(entry.get("route_id"), int)
     }
@@ -427,18 +427,14 @@ def _apply_verdict(device_id: int, job: dict, entry: dict, state) -> None:
 
 
 def _write_verdict(state, **fields) -> bool:
-    """Write *fields* under a compare-and-set on everything the verdict was computed from.
+    """Write *fields* only when the locked row still matches the verdict inputs.
 
-    The consumer locks the **management** row, not the overlay, and it makes an HTTP
-    read-back call while holding a copy of it — so an operator Accept or content edit can
-    allocate a new generation and reset the status in that window. A plain save would then
-    put an old result's verdict on new intent: a green badge for content the device has not
-    been asked for yet. The CAS is the same shape ``_record_static_route_expectations``
-    already uses on this table, and ``.update()`` also keeps the write from re-firing the
-    row's intent push, which a settlement must never do.
+    A verdict can be based on an instance read before a newer operator transaction commits.
+    Lock the current overlay and compare every verdict input before saving. The suppressed
+    save must never re-fire the row's intent push.
 
-    Returns whether the row still matched. Zero rows means a newer writer won, and the next
-    pass recomputes from a fresh read.
+    Return whether the locked row still matched. A mismatch means a newer writer won. The
+    next pass recomputes from a fresh read.
     """
     from django.db import transaction
 

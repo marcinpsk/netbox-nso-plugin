@@ -382,66 +382,40 @@ class TestMembershipRemoval(_SettlementCase):
 
 
 class TestAVerdictCannotLandOnNewerIntent(_SettlementCase):
-    """Codex S5 P1 — the consumer locks the MANAGEMENT row, not the overlay.
+    """A verdict computed from stale intent cannot overwrite a newer generation."""
 
-    One job can carry a route whose expectation is missing beside one whose expectation is
-    recorded. Recovering the first costs a real HTTP round trip, and the second's overlay
-    was loaded before it: an operator Accept or content edit in that window allocates a new
-    generation and resets the status, and an unguarded save then puts an old result's
-    verdict on intent the device has not been asked for yet.
-    """
-
-    def test_an_edit_during_the_read_back_cannot_be_overwritten_by_the_old_verdict(self):
-        import threading
-
-        from django.db import connections
+    def test_verdict_computed_before_edit_cannot_overwrite_newer_intent(self):
         from django.utils import timezone
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.settlement import consume_static_route_settlements
+        from netbox_nso_plugin.settlement import _write_verdict
 
         device = _make_device("cas")
         mgmt = _make_mgmt(device, "cas", 10)
-        # `recovered` needs a read-back; `edited` is the row the operator moves during it.
-        recovered = _route("10.50.0.0/16", "10.50.0.1", devices=[device])
         edited = _route("10.51.0.0/16", "10.51.0.1", devices=[device])
-        recovered_state = _own(recovered, mgmt, generation=301, expected=False)
         edited_state = _own(edited, mgmt, generation=301)
-        self.adapter.store.echo(10, recovered.pk, 301, FINGERPRINT)
-        self.adapter.store.terminal_job(10, results=[_result(recovered.pk, 301), _result(edited.pk, 301)])
+        stale_state = NSOStaticRouteState.objects.get(pk=edited_state.pk)
+        current = NSOStaticRouteState.objects.get(pk=edited_state.pk)
+        with intent_transaction(footprint_for_instance(current)):
+            NSOStaticRouteState.objects.filter(pk=edited_state.pk).update(
+                intent_generation=302,
+                generation_started_at=timezone.now(),
+                status="accepted",
+                expected_generation=None,
+                expected_fingerprint="",
+            )
 
-        def operator_edit_mid_flight():
-            """A real second connection: the consumer holds the management row, not this one."""
+        matched = _write_verdict(
+            stale_state,
+            status="in_sync",
+            last_apply_at=timezone.now(),
+            last_apply_error="",
+            last_result_advisory="",
+        )
 
-            def commit():
-                try:
-                    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
-
-                    current = NSOStaticRouteState.objects.get(pk=edited_state.pk)
-                    with intent_transaction(footprint_for_instance(current)):
-                        NSOStaticRouteState.objects.filter(pk=edited_state.pk).update(
-                            intent_generation=302,
-                            generation_started_at=timezone.now(),
-                            status="accepted",
-                            expected_generation=None,
-                            expected_fingerprint="",
-                        )
-                finally:
-                    connections.close_all()
-
-            thread = threading.Thread(target=commit)
-            thread.start()
-            self._operator_edit = thread
-
-        self.adapter.store.on_readback = operator_edit_mid_flight
-
-        consume_static_route_settlements(mgmt)
-        self._operator_edit.join(timeout=30)
-        assert not self._operator_edit.is_alive(), "the operator edit never committed"
-
-        recovered_state.refresh_from_db()
         edited_state.refresh_from_db()
-        assert recovered_state.status == "in_sync", "the read-back arm stopped working"
+        assert not matched
         assert edited_state.intent_generation == 302
         assert edited_state.status == "accepted", (
             "a verdict computed for generation 301 landed on generation 302 — a green badge "

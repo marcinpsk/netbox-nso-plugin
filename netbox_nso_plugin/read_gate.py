@@ -908,6 +908,7 @@ def gated_family_run(
         return GateResult(decision.disposition)
     if not _publication_identity_current(mgmt, family, decision, epoch):
         return GateResult(SKIPPED_STALE_ATTEMPT)
+    from .intent_state import RendererTargetsChanged
     from .models import NSODeviceManagement, NSOFamilyReadState
 
     try:
@@ -941,7 +942,7 @@ def gated_family_run(
                     "last_updated",
                 ]
             )
-    except _SupersededPublication:
+    except (RendererTargetsChanged, _SupersededPublication):
         return GateResult(SKIPPED_STALE_ATTEMPT)
     except Exception as exc:
         # The body transaction is already rolled back. Only the still-current

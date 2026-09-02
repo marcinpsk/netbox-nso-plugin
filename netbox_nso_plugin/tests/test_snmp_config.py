@@ -219,6 +219,54 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
 
+    def test_matching_read_does_not_settle_generation_correlated_deploying_rows(self):
+        from netbox_nso_plugin.models import (
+            NSOSnmpCommunityState,
+            NSOSnmpHostState,
+            NSOSnmpSystemInfoState,
+            NSOSnmpV3UserState,
+        )
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        NSOSnmpCommunityState.objects.create(
+            management=mgmt,
+            community_hash="abcd1234abcd1234",
+            vault_secret_hash="abcd1234abcd1234",
+            status="deploying",
+        )
+        NSOSnmpV3UserState.objects.create(
+            management=mgmt,
+            username="nms-user",
+            has_auth_secret=True,
+            has_priv_secret=True,
+            status="deploying",
+        )
+        NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="10.0.0.100",
+            version="v2c",
+            notify_type="trap",
+            community_hash="abcd1234abcd1234",
+            status="deploying",
+        )
+        NSOSnmpSystemInfoState.objects.create(
+            management=mgmt,
+            location="DC-01 Rack A",
+            contact="noc@example.com",
+            status="deploying",
+        )
+
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+
+        self.assertEqual(
+            NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234").status,
+            "deploying",
+        )
+        self.assertEqual(NSOSnmpV3UserState.objects.get(management=mgmt, username="nms-user").status, "deploying")
+        self.assertEqual(NSOSnmpHostState.objects.get(management=mgmt, address="10.0.0.100").status, "deploying")
+        self.assertEqual(NSOSnmpSystemInfoState.objects.get(management=mgmt).status, "deploying")
+
     def test_system_info_deleted_after_load_returns_none(self):
         """A concurrent singleton deletion must not crash the read reconciliation."""
         from django.db.models.signals import post_init

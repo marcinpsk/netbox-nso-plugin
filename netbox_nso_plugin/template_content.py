@@ -572,7 +572,7 @@ def _reconcile_snmp_system_info(mgmt, sys_data: dict, now):
                 location=state.location,
                 contact=state.contact,
             ),
-            status=sm.on_reconcile(state.status, matches=matches),
+            status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
             last_sync_at=now,
         )
         if state is None:
@@ -648,7 +648,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
                     acl=state.acl,
                     vault_secret_hash=state.vault_secret_hash,
                 ),
-                status=sm.on_reconcile(state.status, matches=matches),
+                status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
                 last_sync_at=now,
                 has_secret=dev_has_secret,
             )
@@ -676,7 +676,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
         state.has_auth_secret = bool(entry.get("has_auth_secret", False))
         state.has_priv_secret = bool(entry.get("has_priv_secret", False))
         state.last_sync_at = now
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+        state.status = sm.on_reconcile(state.status, matches=None, settles_deploying=False)  # mirror overlay
         state.save(update_fields=["has_auth_secret", "has_priv_secret", "last_sync_at", "status"])
     _retire_absent_snmp_rows(NSOSnmpV3UserState, mgmt, "username", incoming_usernames)
 
@@ -717,7 +717,7 @@ def _reconcile_snmp_config(device, payload: dict) -> dict:
                     status=state.status,
                     **{f: getattr(state, f) for f in dev},
                 ),
-                status=sm.on_reconcile(state.status, matches=matches),
+                status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
                 last_sync_at=now,
             )
         else:
@@ -975,7 +975,7 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
                     status=state.status,
                     **{f: getattr(state, f) for f in dev},
                 ),
-                status=sm.on_reconcile(state.status, matches=matches),
+                status=sm.on_reconcile(state.status, matches=matches, settles_deploying=False),
                 last_sync_at=now,
             )
         else:

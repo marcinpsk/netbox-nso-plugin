@@ -184,6 +184,29 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         assert revision.revision == before, "a refused accept committed an intent revision"
         mock_put.assert_not_called()
 
+    def test_refused_v3_user_accept_does_not_create_an_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt)
+        # Model creation initializes the scope. Remove that setup artifact to exercise
+        # a refused accept against an imported row whose revision has not been created.
+        NSOIntentRevision.objects.filter(device=mgmt.device, scope="snmp").delete()
+        assert not NSOIntentRevision.objects.filter(device=mgmt.device, scope="snmp").exists()
+        self.client.force_login(_superuser())
+        reset_intent_push_state()
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{user.pk}/accept/")
+
+        assert resp.status_code == 302
+        user.refresh_from_db()
+        assert user.status == "imported"
+        assert not NSOIntentRevision.objects.filter(device=mgmt.device, scope="snmp").exists()
+        mock_put.assert_not_called()
+
     def test_accepting_a_v3_user_with_its_protocols_declared_pushes_them(self):
         from netbox_nso_plugin.signals import reset_intent_push_state
 

@@ -6296,6 +6296,10 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         state = get_object_or_404(self.model_class, pk=pk)
         from .intent_state import footprint_for_instance, intent_transaction
 
+        blocker = self.push_blocker(state)
+        if blocker:
+            messages.error(request, f"Cannot accept {state}: {blocker}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         footprint = footprint_for_instance(state)
         try:
             with intent_transaction(footprint):

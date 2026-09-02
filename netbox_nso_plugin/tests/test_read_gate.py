@@ -343,6 +343,31 @@ class TestGateTransitions(TestCase):
 
         self.assertEqual(raised.exception._nso_publication_guard[0], "bfd")
 
+    def test_changed_renderer_targets_skip_the_admitted_publication(self):
+        from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan, RendererTargetsChanged
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
+
+        def targets_changed():
+            raise RendererTargetsChanged("renderer targets changed during acquisition")
+
+        body = _Recorder()
+        plan = ReconcileMutationPlan(
+            MutationFootprint.for_keys({(self.mgmt.device_id, "bfd")}),
+            validate_after_acquire=targets_changed,
+        )
+        result = gated_family_run(
+            self.mgmt,
+            "bfd",
+            _rs(attempt_id=8),
+            body,
+            epoch=self.epoch,
+            pre_body=lambda: plan,
+        )
+
+        self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+        self.assertEqual(body.calls, 0)
+        self.assertIsNone(self._row().applied_attempt_id)
+
     def test_late_synthesized_null_loses(self):
         self._run(_rs(attempt_id=5))
         from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT

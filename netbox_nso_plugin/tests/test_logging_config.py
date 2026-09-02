@@ -103,6 +103,22 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(row.port, 514)
         self.assertEqual(row.status, "in_sync")
 
+    def test_matching_read_does_not_settle_generation_correlated_deploying_host(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.19",
+            status="deploying",
+        )
+
+        _reconcile_logging_config(self.device, self._payload({"address": row.address}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
     def test_omitted_provenance_explicit_facility_does_not_false_settle(self):
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
         from netbox_nso_plugin.template_content import _reconcile_logging_config
