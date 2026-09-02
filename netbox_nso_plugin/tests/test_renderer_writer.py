@@ -275,6 +275,25 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         with self.assertRaisesRegex(IntentMutationProtocolError, "unregistered.*related"):
             RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tags", (tag,)),))
 
+    def test_m2m_set_refuses_a_previously_attached_unregistered_related_model(self):
+        from extras.models import Tag
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set
+
+        device, management = make_managed("writer-unregistered-existing-m2m", 16290)
+        interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=management,
+            interface=interface,
+            mode="tagged",
+            status="imported",
+        )
+        tag = Tag.objects.create(name="existing unregistered relation", slug="existing-unregistered-relation")
+        state.tags.add(tag)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "unregistered.*related"):
+            RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tags", ()),))
+
     def test_an_unchanged_m2m_set_is_content_neutral_across_digit_widths(self):
         from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow, mirror_transaction
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes

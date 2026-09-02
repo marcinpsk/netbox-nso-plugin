@@ -75,9 +75,14 @@ class TestVlanAttachView(_VlanGreenfieldBase):
         revision, _created = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="vlan")
         before = revision.revision
         original_build = RendererMutationPlan.build
+        deleted = False
 
         def plan_then_delete(**kwargs):
+            nonlocal deleted
             plan = original_build(**kwargs)
+            if deleted:
+                return plan
+            deleted = True
             doomed = type(vlan).objects.get(pk=vlan.pk)
             with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
                 doomed.delete()
@@ -126,3 +131,27 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
         assert adapter_ids == [196, 197]
         assert all(v == [] for _, v in pushed)
         assert NSOVLANState.objects.filter(vlan__vid=3366).count() == 0
+
+    def test_implicit_vlan_delete_pushes_after_acquiring_the_revision(self):
+        from netbox_nso_plugin.intent_state import intent_transaction, vlan_footprint
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        m3 = self._mgmt(self.sw3, 196)
+        m4 = self._mgmt(self.sw4, 197)
+        vlan = self._shared_vlan()
+        footprint = vlan_footprint(vlan.pk, ("vlan",), extra_device_ids=(self.sw3.pk, self.sw4.pk))
+        with suppress_intent_push(), intent_transaction(footprint):
+            NSOVLANState.objects.create(management=m3, vlan=vlan, status="in_sync")
+            NSOVLANState.objects.create(management=m4, vlan=vlan, status="in_sync")
+
+        pushed = []
+        with patch(
+            "netbox_nso_plugin.adapter_client.put_vlan_intent",
+            side_effect=lambda adapter_id, vlans: pushed.append((adapter_id, vlans)),
+        ):
+            with self.captureOnCommitCallbacks(execute=True):
+                type(vlan).objects.get(pk=vlan.pk).delete()
+
+        self.assertEqual(sorted(adapter_id for adapter_id, _vlans in pushed), [196, 197])
+        self.assertTrue(all(vlans == [] for _adapter_id, vlans in pushed))
