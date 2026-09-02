@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Pure ownership lifecycle rules for the first converted scopes."""
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 
 class TestOwnershipStateSignatures(SimpleTestCase):
@@ -110,6 +110,89 @@ class TestOwnershipStateSignatures(SimpleTestCase):
         )
 
         assert action is OwnershipAction.RECORD_MANIFEST
+
+    def test_owned_manifest_and_overlay_need_no_transition(self):
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            OwnershipSignature,
+            converted_scope_rules,
+            plan_ownership,
+        )
+
+        action = plan_ownership(
+            converted_scope_rules()["vlan"],
+            OwnershipSignature(
+                native_present=True,
+                native_qualifies=True,
+                overlay_present=True,
+                overlay_owned=True,
+                manifest_state="owned",
+            ),
+        )
+
+        assert action is OwnershipAction.NONE
+
+    def test_owned_overlay_without_native_content_retracts(self):
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            OwnershipSignature,
+            converted_scope_rules,
+            plan_ownership,
+        )
+
+        action = plan_ownership(
+            converted_scope_rules()["svi"],
+            OwnershipSignature(
+                native_present=False,
+                native_qualifies=False,
+                overlay_present=True,
+                overlay_owned=True,
+            ),
+        )
+
+        assert action is OwnershipAction.RETRACT
+
+    def test_absent_unowned_identity_needs_no_transition(self):
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            OwnershipSignature,
+            converted_scope_rules,
+            plan_ownership,
+        )
+
+        action = plan_ownership(
+            converted_scope_rules()["switchport"],
+            OwnershipSignature(native_present=False, native_qualifies=False),
+        )
+
+        assert action is OwnershipAction.NONE
+
+
+class TestManifestRetirement(TestCase):
+    def test_retire_manifest_identity_only_retires_the_owned_match(self):
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import retire_manifest_identity
+
+        identity = {
+            "device_id": 1627,
+            "scope": "vlan",
+            "native_model_label": "ipam.vlan",
+            "native_key": {"group_id": 16, "vid": 27},
+        }
+        owned = NSOOwnershipManifest.objects.create(**identity)
+        detached = NSOOwnershipManifest.objects.create(
+            **{**identity, "device_id": 1628},
+            ownership_state="detached",
+        )
+
+        retire_manifest_identity(
+            device_ids={1627, 1628}, **{key: identity[key] for key in identity if key != "device_id"}
+        )
+
+        owned.refresh_from_db()
+        detached.refresh_from_db()
+        self.assertEqual(owned.ownership_state, "retired")
+        self.assertEqual(detached.ownership_state, "detached")
 
 
 class TestConvertedScopeRuleTable(SimpleTestCase):

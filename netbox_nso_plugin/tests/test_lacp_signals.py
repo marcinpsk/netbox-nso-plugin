@@ -41,7 +41,7 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
             mgmt.save(update_fields=["auto_apply"])
         return mgmt
 
-    def _bundle(self, mgmt, status="accepted"):
+    def _bundle(self, mgmt, status="accepted", **fields):
         from netbox_nso_plugin.models import NSOLACPBundleState
 
         return NSOLACPBundleState.objects.create(
@@ -52,9 +52,10 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
             system_priority=100,
             timer="fast",
             status=status,
+            **fields,
         )
 
-    def _member(self, mgmt, status="accepted"):
+    def _member(self, mgmt, status="accepted", **fields):
         from netbox_nso_plugin.models import NSOLACPMemberState
 
         return NSOLACPMemberState.objects.create(
@@ -64,6 +65,7 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
             mode="active",
             port_priority=128,
             status=status,
+            **fields,
         )
 
 
@@ -213,7 +215,11 @@ class TestOnLacpStateSave(_LacpBase):
         dev = Device.objects.create(name="lacp-noid-rtr", device_type=dt, role=role, site=site)
         lag = Interface.objects.create(device=dev, name="Port-channel1", type="lag")
         mgmt = NSODeviceManagement.objects.create(
-            device=dev, nso_instance=inst, nso_device_name="nso-lacp-noid", adapter_device_id=None
+            device=dev,
+            nso_instance=inst,
+            nso_device_name="nso-lacp-noid",
+            adapter_device_id=None,
+            auto_apply=True,
         )
         bundle = NSOLACPBundleState(management=mgmt, interface=lag, lag_id=1, status="accepted")
         plan = RendererMutationPlan.build(
@@ -246,6 +252,27 @@ class TestLacpAcceptView(_LacpBase):
         member = NSOLACPMemberState.objects.get(interface=self.m1)
         assert member.status == "accepted"
         assert member.accepted_at is not None
+
+    def test_reaccept_preserves_the_first_ownership_timestamp(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOLACPMemberState
+
+        accepted_at = timezone.now() - timedelta(days=3)
+        mgmt = self._make_mgmt()
+        bundle = self._bundle(mgmt, status="changed", accepted_at=accepted_at)
+        self._member(mgmt, status="changed", accepted_at=accepted_at)
+
+        self.client.force_login(_superuser())
+        response = self.client.post(f"/plugins/nso/lacp/bundle-state/{bundle.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        bundle.refresh_from_db()
+        member = NSOLACPMemberState.objects.get(interface=self.m1)
+        self.assertEqual(bundle.accepted_at, accepted_at)
+        self.assertEqual(member.accepted_at, accepted_at)
 
 
 def _superuser():

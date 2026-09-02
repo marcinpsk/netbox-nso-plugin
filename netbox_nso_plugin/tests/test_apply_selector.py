@@ -2101,10 +2101,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(interface.device_id, other_device.pk)
         self.assertEqual(state.status, "imported")
 
-    def test_switchport_accept_retries_when_the_interface_vanishes_before_locking(self):
+    def test_switchport_accept_plan_refuses_an_interface_deleted_before_locking(self):
         from dcim.models import Interface
 
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged
         from netbox_nso_plugin.models import NSOSwitchportState
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
@@ -2129,7 +2129,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with without_commit_drain(), delete_mutation(delete_plan) as writer:
             writer.delete(interface)
 
-        with self.assertRaisesRegex(IntentMutationProtocolError, r"dcim\.interface row .* disappeared"):
+        with self.assertRaisesRegex(RendererTargetsChanged, r"dcim\.interface row .* disappeared"):
             with renderer_writes(plan) as writer:
                 writer.save(candidate_interface, update_fields=("mode", "untagged_vlan"))
                 writer.save(candidate_state, update_fields=("status", "accepted_at"))
