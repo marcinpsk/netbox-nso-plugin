@@ -111,6 +111,37 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
             [{"kind": "repair", "mark_and": False, "mark_any": False, "transitions": []}],
         )
 
+    def test_an_unlinked_management_row_is_not_audited(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(adapter_device_id=None)
+        with (
+            patch("netbox_nso_plugin.renderer_audit.delivery.render") as render,
+            patch("netbox_nso_plugin.ownership_planner.reconcile_scope_ownership") as reconcile_ownership,
+        ):
+            result = audit_renderer_scopes(self.device.pk, ("vlan",), trigger="test", pre_capture=True)
+
+        self.assertEqual(result.repaired, ())
+        render.assert_not_called()
+        reconcile_ownership.assert_not_called()
+
+    def test_bgp_repair_demotes_the_lifecycle_only_peer_template(self):
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+        from netbox_nso_plugin.renderer_audit import _repair_plan
+
+        state = NSOBGPPeerTemplateState.objects.create(
+            management=self.management,
+            template_name="AUDIT-PEERS",
+            status="deploying",
+        )
+
+        plan = _repair_plan(self.device.pk, "bgp")
+
+        write = next(write for write in plan.write_set if write.model_label == state._meta.label_lower)
+        self.assertEqual(dict(write.values)["status"], "accepted")
+        self.assertEqual(plan.content_keys, ())
+
     def test_a_repair_schedules_its_contribution_for_immediate_drain(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
