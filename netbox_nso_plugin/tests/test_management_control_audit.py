@@ -305,3 +305,14 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             audit_renderer_scopes(self.device.pk, ("vlan",), trigger="cadence")
 
         self.assertEqual(order, ["control", "fingerprint"])
+
+    def test_a_non_cadence_audit_does_not_reconcile_control_state(self):
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        with (
+            patch("netbox_nso_plugin.management_lifecycle.reconcile_management_control") as control,
+            patch("netbox_nso_plugin.renderer_audit._optimistic_candidates", return_value=((), ())),
+        ):
+            audit_renderer_scopes(self.device.pk, ("vlan",), trigger="test", pre_capture=True)
+
+        control.assert_not_called()

@@ -52,7 +52,7 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
         with (
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
-            patch("netbox_nso_plugin.delivery.time.monotonic", return_value=12.5),
+            patch("netbox_nso_plugin.delivery._monotonic", return_value=12.5),
             patch("netbox_nso_plugin.delivery.render", side_effect=render),
             self.assertRaisesRegex(RuntimeError, "stop after capture ordering"),
         ):
@@ -60,6 +60,25 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
         self.assertEqual(order, ["audit", "render"])
         self.assertEqual(audits[0][1]["deadline"], 12.5 + drain.SEND_DEADLINE.total_seconds())
+
+    def test_drain_includes_the_audit_in_the_caller_deadline(self):
+        from netbox_nso_plugin import delivery, drain
+
+        with (
+            patch("netbox_nso_plugin.drain._send_clock", return_value=12.5),
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes") as audit,
+            patch("netbox_nso_plugin.drain._claim_or_compact", return_value=(None, False)),
+        ):
+            outcome, answer = drain._drain_once(
+                self.device.pk,
+                "vlan",
+                mode=delivery.MODE_NORMAL,
+                force=False,
+                deadline=7,
+            )
+
+        self.assertEqual((outcome, answer), (drain.NOTHING, None))
+        self.assertEqual(audit.call_args.kwargs["deadline"], 19.5)
 
     def test_delivery_translates_audit_refusals_to_adapter_errors(self):
         from netbox_nso_plugin import delivery
@@ -117,7 +136,7 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
         self.assertEqual(len(calls), 1)
         self.assertEqual(appended, [1])
         self.assertEqual(entries(self.device, "vlan", unconsumed=True), [])
-        self.assertTrue(all(call[3] == {"pre_capture": True} for call in calls))
+        self.assertTrue(all(call[3] == {"pre_capture": True, "deadline": None} for call in calls))
         self.assertTrue(all(call[:3] == (self.device.pk, ("vlan",), "drain._drain_once") for call in calls))
 
     def test_a_tail_does_not_run_a_second_failing_audit(self):
