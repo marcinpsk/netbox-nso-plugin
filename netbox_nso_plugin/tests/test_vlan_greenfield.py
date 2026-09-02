@@ -229,17 +229,23 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
         assert NSOVLANState.objects.filter(vlan__vid=3366).count() == 0
 
     def test_implicit_vlan_delete_pushes_after_acquiring_the_revision(self):
-        from netbox_nso_plugin.intent_state import intent_transaction, vlan_footprint
         from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
         from netbox_nso_plugin.signals import suppress_intent_push
 
         m3 = self._mgmt(self.sw3, 196)
         m4 = self._mgmt(self.sw4, 197)
         vlan = self._shared_vlan()
-        footprint = vlan_footprint(vlan.pk, ("vlan",), extra_device_ids=(self.sw3.pk, self.sw4.pk))
-        with suppress_intent_push(), intent_transaction(footprint):
-            NSOVLANState.objects.create(management=m3, vlan=vlan, status="in_sync")
-            NSOVLANState.objects.create(management=m4, vlan=vlan, status="in_sync")
+        states = (
+            NSOVLANState(management=m3, vlan=vlan, status="in_sync"),
+            NSOVLANState(management=m4, vlan=vlan, status="in_sync"),
+        )
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")) for state in states),
+        )
+        with suppress_intent_push(), renderer_writes(plan) as writer:
+            for state in states:
+                writer.save(state, force_insert=True)
 
         pushed = []
         with patch(
