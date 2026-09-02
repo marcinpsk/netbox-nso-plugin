@@ -37,7 +37,7 @@ class SharedObjectSpec:
     hash_captured: Callable[[dict], str]
     label: str = ""
     renderer_models: tuple[str, ...] = ()
-    # Reverse of fill: the CURRENT NetBox object content in device-capture shape, for the
+    # The current NetBox object content in device-capture shape, for the
     # device-caught-up settle (#93). None = the family cannot compare (settle skipped).
     extract: Callable[[object], dict] | None = None
 

@@ -210,6 +210,27 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
         state.refresh_from_db()
         self.assertEqual(state.accepted_at, first_accepted_at)
 
+    def test_reaccept_in_sync_sap_is_a_noop(self):
+        self.client.force_login(self.user)
+        accepted_at = timezone.now() - timezone.timedelta(days=3)
+        state = NSOL2SapState.objects.create(
+            management=self.mgmt,
+            service_name="ALREADY-SYNCED",
+            service_type="epipe",
+            sap_id="lag-60:101",
+            port="lag-60",
+            outer_tag=101,
+            status="in_sync",
+            accepted_at=accepted_at,
+        )
+
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:l2_accept_sap", kwargs={"pk": state.pk}))
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.accepted_at, accepted_at)
+
     def test_accept_rejects_service_types_the_writer_cannot_apply(self):
         self.client.force_login(self.user)
         state = NSOL2SapState.objects.create(
