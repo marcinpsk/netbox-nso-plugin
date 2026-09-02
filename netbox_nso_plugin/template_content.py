@@ -5,6 +5,7 @@
 import contextlib
 import copy
 import logging
+from dataclasses import replace
 from datetime import datetime
 
 from django.apps import apps
@@ -1195,10 +1196,11 @@ def static_route_reconcile_plan(device, payload: dict):
 
 def _static_route_plan_and_operations(device, payload, planned_at, *, resolve_status=True):
     """Build one exact static-route plan and its matching replay operations."""
+    from .intent_state import MutationFootprint
     from .renderer_writer import RendererMutationPlan
 
     try:
-        saves, deletes, m2m_writes, operations = _static_route_reconcile_operations(
+        saves, deletes, m2m_writes, operations, confirmed_drift = _static_route_reconcile_operations(
             device,
             payload,
             planned_at,
@@ -1212,6 +1214,13 @@ def _static_route_plan_and_operations(device, payload, planned_at, *, resolve_st
         m2m_writes=m2m_writes,
         planned_at=planned_at,
     )
+    if confirmed_drift:
+        content_footprint = MutationFootprint.for_keys(((device.pk, "static_route"),))
+        plan = replace(
+            plan,
+            lock_footprint=MutationFootprint.merge(plan.lock_footprint, content_footprint),
+            content_keys=tuple(sorted(set(plan.content_keys) | set(content_footprint.revision_keys))),
+        )
     return plan, operations
 
 
@@ -1225,7 +1234,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
-        return [], [], [], []
+        return [], [], [], [], False
 
     auto_create = _adapter_setting("static_route_auto_create")
     vrf_auto_create = _adapter_setting("vrf_auto_create")
@@ -1243,6 +1252,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
     m2m_writes = []
     operations = []
     seen_state_pks = set()
+    confirmed_drift = False
 
     def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
         saves.append(
@@ -1336,16 +1346,26 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
             operations.append(("m2m_add", route, None, False, (device,)))
 
+        reported_matches = (
+            route.metric == _static_route_metric(entry, device)
+            and bool(route.permanent) == bool(entry.get("permanent", False))
+            and route.tag == entry.get("tag")
+        )
         if resolve_status:
             state.status = sm.on_reconcile(
                 state.status,
-                matches=(
-                    on_device and route.metric == _static_route_metric(entry, device) and route.tag == entry.get("tag")
-                ),
+                matches=(on_device and reported_matches),
                 conflict=not on_device,
                 settles_owned=False,
                 settles_deploying=False,
             )
+            if (
+                current_state is not None
+                and current_state.status == sm.IN_SYNC
+                and not reported_matches
+                and route.next_hop is not None
+            ):
+                confirmed_drift = True
         state_created = current_state is None
         save(
             state,
@@ -1362,6 +1382,8 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
         if sm.is_owned(current.status):
             new_status = sm.on_reconcile(current.status, present=False) if resolve_status else current.status
             if new_status != current.status or not resolve_status:
+                if resolve_status and current.status == sm.IN_SYNC and current.static_route.next_hop is not None:
+                    confirmed_drift = True
                 candidate = copy.copy(current)
                 candidate.status = new_status
                 save(candidate, update_fields=("status",))
@@ -1373,7 +1395,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
         deletes.append(planned_delete(current))
         operations.append(("delete", current, None, False, None))
 
-    return saves, deletes, m2m_writes, operations
+    return saves, deletes, m2m_writes, operations, confirmed_drift
 
 
 @mirror_reconciler
@@ -1390,7 +1412,7 @@ def _reconcile_static_routes(device, payload: dict) -> list:
     active = active_renderer_writer()
     if active is not None:
         plan = active.plan
-        _saves, _deletes, _m2m_writes, operations = _static_route_reconcile_operations(
+        _saves, _deletes, _m2m_writes, operations, _confirmed_drift = _static_route_reconcile_operations(
             device,
             payload,
             plan.planned_at,
