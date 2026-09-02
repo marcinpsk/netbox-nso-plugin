@@ -144,6 +144,29 @@ class _SyncCacheTestBase(TestCase):
         )
 
 
+class TestInvalidateDeliveryBaselines(_SyncCacheTestBase):
+    def test_a_partially_held_scope_set_locks_only_the_remaining_revisions(self):
+        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin.intent_state import MutationFootprint, mirror_transaction
+        from netbox_nso_plugin.sync_cache import invalidate_delivery_baselines
+
+        management = self._mgmt("cache-partial-baseline-lock", 618)
+        _stamp_verified_baselines(management)
+        scopes = tuple(delivery.delivery_keys())
+        self.assertGreater(len(scopes), 1)
+        held = min(scopes)
+        unlocked = tuple(scope for scope in scopes if scope != held)
+
+        with mirror_transaction(MutationFootprint.for_keys(((management.device_id, held),))):
+            with patch(
+                "netbox_nso_plugin.apply_state.lock_intent_revisions",
+                wraps=apply_state.lock_intent_revisions,
+            ) as lock_revisions:
+                invalidate_delivery_baselines(management.device_id)
+
+        lock_revisions.assert_called_once_with(management.device_id, unlocked)
+
+
 class TestRefreshSyncCaches(_SyncCacheTestBase):
     """refresh_sync_caches(): mirror the adapter's last-sync state onto the NetBox rows."""
 

@@ -2264,7 +2264,10 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
                 f"Provisioning {device} into NSO ({instance.name})… this list updates automatically.",
             )
         else:
-            messages.error(request, f"Could not onboard {device}: {result['error']}")
+            error = result["error"]
+            if isinstance(error, dict):
+                error = error.get("message") or "A provision attempt is already active."
+            messages.error(request, f"Could not onboard {device}: {error}")
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
 
@@ -5538,9 +5541,11 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             try:
                 errors = _save_overlay_edit(obj, key, old_values)
             except (IntentPlanStaleError, RendererTargetsChanged):
-                # A competing write moved a frozen preimage; the plan rolled back whole.
-                message = "This row changed. Refresh the page and try again."
-                errors = {field: [message] for field in changed}
+                # A retried plan still found a moved preimage; the plan rolled back whole.
+                return JsonResponse(
+                    {"status": "error", "message": "Routing state changed. Refresh the page and try again."},
+                    status=409,
+                )
             if errors:
                 return JsonResponse({"status": "error", "errors": errors}, status=400)
         return JsonResponse({"status": "ok", "changed": changed})
@@ -7476,8 +7481,14 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
         return candidate
 
     def post(self, request, pk):  # noqa: D102
+        from .renderer_writer import IntentPlanStaleError
+
         state = get_object_or_404(self.model_class.objects.select_related("interface", "management"), pk=pk)
-        candidate = self._accept(state)
+        try:
+            candidate = self._accept(state)
+        except IntentPlanStaleError:
+            messages.error(request, "Routing state changed. Refresh the page and try again.")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 

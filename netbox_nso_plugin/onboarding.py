@@ -233,6 +233,97 @@ def _lock_provision_tombstone_identity(device_id, instance, nso_name):
     return _provision_identity(device_id, instance, nso_name, lock_device=False)
 
 
+def _provision_conflict(result, *, code="conflict", message, detail=None):
+    """Return the onboarding result shape for one active provision conflict."""
+    result["error"] = {
+        "code": str(code or "conflict"),
+        "message": message,
+        "detail": detail if isinstance(detail, dict) else {},
+    }
+    result["_http_status"] = 409
+    return result
+
+
+def _claim_provision_attempt(locked_device, instance, nso_name, request_body):
+    """Reuse one identical open attempt, create one, or return conflict detail."""
+    from .models import NSOProvisionTombstone
+
+    tombstone = (
+        NSOProvisionTombstone.objects.filter(state="open")
+        .filter(
+            Q(netbox_device_id=locked_device.pk)
+            | Q(nso_instance=instance.adapter_instance_id, nso_device_name=nso_name)
+        )
+        .order_by("created_at", "provision_attempt_id")
+        .first()
+    )
+    if tombstone is not None:
+        canonical_body = {
+            key: value for key, value in tombstone.canonical_request.items() if key != "provision_attempt_id"
+        }
+        exact_identity = (
+            tombstone.netbox_device_id == locked_device.pk
+            and tombstone.nso_instance == instance.adapter_instance_id
+            and tombstone.nso_device_name == nso_name
+        )
+        if exact_identity and canonical_body == request_body:
+            return tombstone, None
+        detail = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+        if tombstone.adapter_job_id:
+            detail["job_id"] = tombstone.adapter_job_id
+        return None, detail
+
+    tombstone = NSOProvisionTombstone(
+        netbox_device_id=locked_device.pk,
+        nso_instance=instance.adapter_instance_id,
+        nso_device_name=nso_name,
+        canonical_request={},
+    )
+    tombstone.canonical_request = {
+        **request_body,
+        "provision_attempt_id": str(tombstone.provision_attempt_id),
+    }
+    tombstone.save(force_insert=True)
+    return tombstone, None
+
+
+def _provision_failure(result, *, nso_name, job_id, exc):
+    """Record one non-conflict provision failure without exposing exception text."""
+    if not job_id:
+        logger.exception("onboard_candidate: provision request failed for %s", nso_name)
+        result["error"] = f"Provisioning request failed ({type(exc).__name__}); see the server log."
+        return result
+    logger.exception(
+        "onboard_candidate: provision job %s started but tracking-row create failed for %s",
+        job_id,
+        nso_name,
+    )
+    result.update(
+        error=(
+            f"Provision job {job_id} started, but the NetBox tracking row could not be created "
+            f"({type(exc).__name__}; see the server log). The NSO node may still be provisioning. "
+            f"Recover through job {job_id}."
+        ),
+        job_id=job_id,
+    )
+    return result
+
+
+def _adapter_provision_failure(result, *, nso_name, job_id, exc):
+    """Preserve a conflicting adapter receipt, or use the generic failure envelope."""
+    from . import adapter_client as client
+
+    if not job_id and exc.status_code == 409:
+        logger.info("onboard_candidate: adapter conflict for %s", nso_name)
+        return _provision_conflict(
+            result,
+            code=exc.code,
+            message=client.public_error_message(exc),
+            detail=exc.detail,
+        )
+    return _provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
+
+
 @_deployment_guarded("provisioning")
 def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", sync=True) -> dict:
     """Onboard one NetBox device into NSO (the write action).
@@ -304,32 +395,13 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
             result["error"] = conflict
             return result
 
-        tombstone = next(
-            (
-                row
-                for row in NSOProvisionTombstone.objects.filter(
-                    netbox_device_id=locked_device.pk,
-                    nso_instance=instance.adapter_instance_id,
-                    nso_device_name=nso_name,
-                    state="open",
-                ).order_by("created_at", "provision_attempt_id")
-                if {key: value for key, value in row.canonical_request.items() if key != "provision_attempt_id"}
-                == request_body
-            ),
-            None,
-        )
-        if tombstone is None:
-            tombstone = NSOProvisionTombstone(
-                netbox_device_id=locked_device.pk,
-                nso_instance=instance.adapter_instance_id,
-                nso_device_name=nso_name,
-                canonical_request={},
+        tombstone, active_conflict = _claim_provision_attempt(locked_device, instance, nso_name, request_body)
+        if active_conflict is not None:
+            return _provision_conflict(
+                result,
+                message="A different provision attempt is already active for this device or NSO name.",
+                detail=active_conflict,
             )
-            tombstone.canonical_request = {
-                **request_body,
-                "provision_attempt_id": str(tombstone.provision_attempt_id),
-            }
-            tombstone.save(force_insert=True)
     provision_request = dict(tombstone.canonical_request)
 
     job_id = ""
@@ -381,25 +453,10 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
                     defaults={"ned_id": chosen_ned},
                 )
                 result["mapping_created"] = created
+    except client.AdapterError as exc:
+        return _adapter_provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
     except Exception as exc:
-        if not job_id:
-            logger.exception("onboard_candidate: provision request failed for %s", nso_name)
-            result["error"] = f"Provisioning request failed ({type(exc).__name__}); see the server log."
-            return result
-        logger.exception(
-            "onboard_candidate: provision job %s started but tracking-row create failed for %s",
-            job_id,
-            nso_name,
-        )
-        result.update(
-            error=(
-                f"Provision job {job_id} started, but the NetBox tracking row could not be created "
-                f"({type(exc).__name__}; see the server log). The NSO node may still be provisioning. "
-                f"Recover through job {job_id}."
-            ),
-            job_id=job_id,
-        )
-        return result
+        return _provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
 
     result["ok"] = True
     result["provisioning"] = True
