@@ -67,6 +67,11 @@ class DeliveryKey:
 _REGISTRY: dict[str, DeliveryKey] = {}
 
 
+def _monotonic() -> float:
+    """Return the delivery clock without exposing the shared module to test patches."""
+    return time.monotonic()
+
+
 def _build() -> dict[str, DeliveryKey]:
     # (key, label, in_protocol, push_name)
     keys = [
@@ -338,7 +343,7 @@ def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, 
             (key,),
             trigger="delivery.deliver",
             pre_capture=True,
-            deadline=time.monotonic() + SEND_DEADLINE.total_seconds(),
+            deadline=_monotonic() + SEND_DEADLINE.total_seconds(),
         )
     except (RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
         raise adapter_client.AdapterError("Renderer audit failed.", code="renderer_audit_failed") from exc
