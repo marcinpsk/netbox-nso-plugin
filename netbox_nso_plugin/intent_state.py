@@ -1763,7 +1763,7 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
 
 
 def _deploying_scope_rows(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
-    """Resolve the complete Apply-in-flight set after its revision locks are held."""
+    """Discover candidate Apply-in-flight rows after their revision locks are held."""
     from .apply_state import deploying_models
 
     models_by_scope = deploying_models()
@@ -1784,6 +1784,21 @@ def _deploying_scope_rows(footprint: MutationFootprint) -> tuple[SourceRow, ...]
     return tuple(rows)
 
 
+def _still_deploying_rows(rows: tuple[SourceRow, ...]) -> tuple[SourceRow, ...]:
+    """Keep candidates whose locked row version is still deploying."""
+    current = set()
+    labels = {row.model_label for row in rows}
+    for label in OVERLAY_MODEL_RANKS:
+        if label not in labels:
+            continue
+        pks = {row.pk for row in rows if row.model_label == label and row.pk is not None}
+        current.update(
+            SourceRow(label, pk)
+            for pk in apps.get_model(label).objects.filter(pk__in=pks, status="deploying").values_list("pk", flat=True)
+        )
+    return tuple(row for row in rows if row in current)
+
+
 def _bump_and_lock_deploying(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
     """Advance locked revisions and lock the complete promoted scope."""
     from .outbox import bump_intent_revision
@@ -1793,7 +1808,7 @@ def _bump_and_lock_deploying(footprint: MutationFootprint) -> tuple[SourceRow, .
     deploying_rows = _deploying_scope_rows(footprint)
     locked_overlay_rows = tuple(set(footprint.overlay_rows) | set(deploying_rows))
     _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
-    return deploying_rows
+    return _still_deploying_rows(deploying_rows)
 
 
 def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
@@ -1875,7 +1890,7 @@ def _acquire(
         return deploying_rows
     deploying_rows = _deploying_scope_rows(footprint) if capture_deploying else ()
     _lock_rows(tuple(set(footprint.overlay_rows) | set(deploying_rows)), level=8, ranks=OVERLAY_MODEL_RANKS)
-    return deploying_rows
+    return _still_deploying_rows(deploying_rows)
 
 
 def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -> None:
