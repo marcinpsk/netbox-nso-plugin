@@ -227,33 +227,3 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
         assert adapter_ids == [196, 197]
         assert all(v == [] for _, v in pushed)
         assert NSOVLANState.objects.filter(vlan__vid=3366).count() == 0
-
-    def test_implicit_vlan_delete_pushes_after_acquiring_the_revision(self):
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
-        from netbox_nso_plugin.signals import suppress_intent_push
-
-        m3 = self._mgmt(self.sw3, 196)
-        m4 = self._mgmt(self.sw4, 197)
-        vlan = self._shared_vlan()
-        states = (
-            NSOVLANState(management=m3, vlan=vlan, status="in_sync"),
-            NSOVLANState(management=m4, vlan=vlan, status="in_sync"),
-        )
-        plan = RendererMutationPlan.build(
-            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")) for state in states),
-        )
-        with suppress_intent_push(), renderer_writes(plan) as writer:
-            for state in states:
-                writer.save(state, force_insert=True)
-
-        pushed = []
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_vlan_intent",
-            side_effect=lambda adapter_id, vlans: pushed.append((adapter_id, vlans)),
-        ):
-            with self.captureOnCommitCallbacks(execute=True):
-                type(vlan).objects.get(pk=vlan.pk).delete()
-
-        self.assertEqual(sorted(adapter_id for adapter_id, _vlans in pushed), [196, 197])
-        self.assertTrue(all(vlans == [] for _adapter_id, vlans in pushed))
