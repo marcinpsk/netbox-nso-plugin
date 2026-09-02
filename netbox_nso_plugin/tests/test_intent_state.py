@@ -542,6 +542,108 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "in_sync")
 
+    def test_detected_reconcile_does_not_repend_a_row_settled_while_waiting_for_its_lock(self):
+        """A reconcile must capture the deploying predicate from the locked row version."""
+        import threading
+        import time
+
+        from django.db import connections
+
+        from netbox_nso_plugin.intent_state import _upgrade_detected_reconcile
+
+        self.state.status = "deploying"
+        self.state.apply_attempt_id = uuid4()
+        with (
+            transaction.atomic(),
+            suppress_intent_push(),
+            mirror_refresh(
+                self.state,
+                {"status", "apply_attempt_id"},
+            ) as locked,
+        ):
+            locked.status = self.state.status
+            locked.apply_attempt_id = self.state.apply_attempt_id
+            locked.save(update_fields=["status", "apply_attempt_id"])
+        footprint = MutationFootprint.for_keys({(self.device.pk, "vlan")})
+        settlement_ready = threading.Event()
+        release_settlement = threading.Event()
+        reconcile_started = threading.Event()
+        reconcile_pid = []
+        failures = []
+
+        def settle():
+            try:
+                with transaction.atomic():
+                    current = type(self.state).objects.select_for_update(of=("self",)).get(pk=self.state.pk)
+                    with (
+                        suppress_intent_push(),
+                        mirror_refresh(
+                            current,
+                            {"status", "apply_attempt_id"},
+                        ) as locked,
+                    ):
+                        locked.status = "in_sync"
+                        locked.apply_attempt_id = None
+                        locked.save(update_fields=["status", "apply_attempt_id"])
+                    settlement_ready.set()
+                    if not release_settlement.wait(10):
+                        raise AssertionError("the settlement worker was not released")
+            except Exception as exc:  # noqa: BLE001 - the main test re-raises worker failures
+                failures.append(exc)
+            finally:
+                connections.close_all()
+
+        def reconcile():
+            try:
+                with connections["default"].cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    reconcile_pid.append(cursor.fetchone()[0])
+                reconcile_started.set()
+                with (
+                    without_commit_drain(),
+                    mirror_transaction(
+                        footprint,
+                        detect_content_changes=True,
+                    ) as permit,
+                ):
+                    _upgrade_detected_reconcile(permit, footprint)
+            except Exception as exc:  # noqa: BLE001 - the main test re-raises worker failures
+                failures.append(exc)
+            finally:
+                connections.close_all()
+
+        settlement_worker = threading.Thread(target=settle)
+        settlement_worker.start()
+        self.assertTrue(settlement_ready.wait(10), "the settlement worker did not acquire the row lock")
+        reconcile_worker = threading.Thread(target=reconcile)
+        reconcile_worker.start()
+        self.assertTrue(reconcile_started.wait(10), "the reconcile worker did not start")
+        try:
+            deadline = time.monotonic() + 3
+            blocked = False
+            while time.monotonic() < deadline:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted)",
+                        [reconcile_pid[0]],
+                    )
+                    if cursor.fetchone()[0]:
+                        blocked = True
+                        break
+                time.sleep(0.01)
+            self.assertTrue(blocked, "the detected reconcile did not wait for the settlement row lock")
+        finally:
+            release_settlement.set()
+
+        settlement_worker.join(10)
+        reconcile_worker.join(10)
+        self.assertFalse(settlement_worker.is_alive())
+        self.assertFalse(reconcile_worker.is_alive())
+        if failures:
+            raise failures[0]
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.status, "in_sync")
+
     def test_savepoint_rollback_does_not_authorize_a_later_enqueue(self):
         key = (self.device.pk, "vlan")
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
