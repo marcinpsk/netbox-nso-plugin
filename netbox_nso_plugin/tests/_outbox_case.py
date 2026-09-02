@@ -45,6 +45,22 @@ def make_device(tag: str, index: int = 1):
     return Device.objects.create(name=f"cl-{tag}-rtr-{index}", device_type=dt, role=role, site=site)
 
 
+def open_provision_attempt(management):
+    """Create the canonical open provision attempt for one management row."""
+    from netbox_nso_plugin.models import NSOProvisionTombstone
+
+    tombstone = NSOProvisionTombstone(
+        netbox_device_id=management.device_id,
+        nso_instance=management.nso_instance.adapter_instance_id,
+        nso_device_name=management.nso_device_name,
+        canonical_request={},
+        adapter_job_id=management.onboard_job_id,
+    )
+    tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+    tombstone.save(force_insert=True)
+    return tombstone
+
+
 def make_mgmt(device, tag: str, adapter_device_id: int):
     from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
