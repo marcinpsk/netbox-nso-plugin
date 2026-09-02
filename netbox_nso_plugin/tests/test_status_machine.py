@@ -10,10 +10,6 @@ guard is fully green (the historical ``apply_failed`` / ``error`` gaps are wired
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from types import SimpleNamespace
-from unittest.mock import patch
-
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
 from django.test import SimpleTestCase
@@ -349,20 +345,6 @@ class _FakeRow:
         self.saved_fields = list(update_fields) if update_fields else None
 
 
-class _ContendedRow(_FakeRow):
-    """A persisted-shaped row whose status changes before each attempted row lock."""
-
-    _meta = SimpleNamespace(label_lower="netbox_nso_plugin.teststate")
-    pk = 37
-
-    def __init__(self):
-        super().__init__(sm.IMPORTED)
-        self._statuses = iter((sm.ACCEPTED, sm.DEPLOYING, sm.IN_SYNC, sm.APPLY_FAILED))
-
-    def refresh_from_db(self):
-        self.status = next(self._statuses)
-
-
 class TestFinaliseStaleOverlay(SimpleTestCase):
     """Shared stale-loop tail: prune vestigial unowned ghosts, mark genuine removals changed."""
 
@@ -405,17 +387,3 @@ class TestFinaliseStaleOverlay(SimpleTestCase):
         row = _FakeRow(sm.CHANGED)
         sm.finalise_stale_overlay(row, vestigial=False)
         self.assertIsNone(row.saved_fields)
-
-    def test_repeated_status_contention_is_left_for_the_next_reconcile(self):
-        row = _ContendedRow()
-        with (
-            patch("netbox_nso_plugin.intent_state.footprint_for_instance", return_value=object()),
-            patch("netbox_nso_plugin.intent_state.reconcile_transaction", side_effect=lambda _plan: nullcontext()),
-            self.assertLogs("netbox_nso_plugin.status_machine", level="WARNING") as logs,
-        ):
-            sm.finalise_stale_overlay(row, vestigial=False)
-
-        self.assertEqual(row.status, sm.APPLY_FAILED)
-        self.assertFalse(row.deleted)
-        self.assertIsNone(row.saved_fields)
-        self.assertIn("next reconcile will retry", logs.output[0])

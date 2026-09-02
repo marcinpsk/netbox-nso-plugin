@@ -16,14 +16,18 @@ from __future__ import annotations
 
 import sys
 import uuid
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
+
+from ._outbox_case import content_update
 
 User = get_user_model()
 
@@ -149,6 +153,16 @@ class TestGatedReconcileBehavior(_L2Base):
         ctx = self._reconcile(_l2_payload(("NEW",), read_state=_rs(freshness="stale", attempt_id=2)))
         self.assertIn("NEW", _sap_names(self.mgmt))  # degraded-success still replaces
         self.assertEqual(ctx["_gate"]["l2_service"], "ran")
+
+    def test_matching_read_does_not_settle_a_deploying_sap(self):
+        self._prime()
+        row = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
+        content_update(row, status="deploying")
+
+        self._reconcile(_l2_payload(("TL",), read_state=_rs(attempt_id=2)))
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
 
     def test_missing_read_state_key_is_legacy_and_runs(self):
         self._prime()
@@ -541,6 +555,47 @@ class TestContentionDispositions(TestCase):
         self.assertEqual(ctx["_gate"]["l2_service"], "skipped_lock_unavailable")
         row = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
         self.assertNotEqual(row.status, "error")
+
+
+class _ContendedStaleRow:
+    """A persisted-shaped row whose status changes before each attempted row lock."""
+
+    _meta = SimpleNamespace(label_lower="netbox_nso_plugin.teststate")
+    pk = 37
+
+    def __init__(self):
+        self.status = "imported"
+        self.last_sync_at = None
+        self.deleted = False
+        self.saved_fields = None
+        self._statuses = iter(("accepted", "deploying", "in_sync", "apply_failed"))
+
+    def refresh_from_db(self):
+        self.status = next(self._statuses)
+
+    def delete(self):
+        self.deleted = True
+
+    def save(self, update_fields=None):
+        self.saved_fields = list(update_fields) if update_fields else None
+
+
+class TestStaleOverlayContention(SimpleTestCase):
+    def test_repeated_contention_is_left_for_the_next_reconcile(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        row = _ContendedStaleRow()
+        with (
+            patch("netbox_nso_plugin.intent_state.footprint_for_instance", return_value=object()),
+            patch("netbox_nso_plugin.intent_state.reconcile_transaction", side_effect=lambda _plan: nullcontext()),
+            self.assertLogs("netbox_nso_plugin.status_machine", level="WARNING") as logs,
+        ):
+            sm.finalise_stale_overlay(row, vestigial=False)
+
+        self.assertEqual(row.status, sm.APPLY_FAILED)
+        self.assertFalse(row.deleted)
+        self.assertIsNone(row.saved_fields)
+        self.assertIn("next reconcile will retry", logs.output[0])
 
 
 class TestCategoryViewSkipFallback(TestCase):
