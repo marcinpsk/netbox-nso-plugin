@@ -1005,6 +1005,8 @@ def abandon_generation(adapter_device_id: int, generation_id: int) -> dict:
 
 def get_device_apply_state(adapter_device_id: int) -> dict:
     """Return the device-wide executable Apply head and barrier state."""
+    from .apply_settlement import GENERATION_DISPOSITIONS
+
     state = _request("GET", f"/api/v1/devices/{adapter_device_id}/apply-state")
     if not isinstance(state, dict):
         raise AdapterError("Adapter returned a malformed Apply state.", code="invalid_response")
@@ -1032,7 +1034,11 @@ def get_device_apply_state(adapter_device_id: int) -> dict:
         or any(not isinstance(section, str) for section in head["sections"])
     ):
         raise AdapterError("Adapter returned a malformed Apply state head.", code="invalid_response")
-    blocked = head is not None and head["status"] in {"failed", "outcome_unknown"}
+    try:
+        disposition = None if head is None else GENERATION_DISPOSITIONS[head["status"]]
+    except KeyError:
+        raise AdapterError("Adapter returned an unknown Apply generation status.", code="invalid_response") from None
+    blocked = disposition == "blocked"
     if state["blocked"] is not blocked:
         raise AdapterError("Adapter returned an inconsistent blocked Apply state.", code="invalid_response")
     if any(type(job_id) is not int for job_id in state["held_jobs"]) or state["pending_generations"] < 0:
