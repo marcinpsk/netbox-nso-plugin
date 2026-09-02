@@ -468,6 +468,24 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(self.state.last_apply_error, "second")
         self.assertEqual(parse_calls, 2)
 
+    def test_unregistered_insert_shape_is_never_parsed(self):
+        statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
+        real_parse = sqlparse.parse
+        parse_calls = 0
+
+        def counting_parse(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_parse(*args, **kwargs)
+
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE TEMP TABLE intent_guard_parse_cache (value integer)")
+            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
+                cursor.execute(statement, [1])
+                cursor.execute(statement, [2])
+
+        self.assertEqual(parse_calls, 0)
+
     def test_repeated_registered_dml_shape_caches_column_classification(self):
         from netbox_nso_plugin.intent_state import _dml_columns, _parse_dml_target
 

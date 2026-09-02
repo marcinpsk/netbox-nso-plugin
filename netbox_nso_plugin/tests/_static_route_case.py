@@ -219,6 +219,7 @@ def _edit_owned_route(route, **values):
         RendererMutationPlan,
         planned_save,
         renderer_mirror_writes,
+        renderer_writes,
     )
     from netbox_nso_plugin.views import _save_owned_static_route_edit
 
@@ -230,7 +231,8 @@ def _edit_owned_route(route, **values):
             setattr(candidate, field_name, value)
         fields = tuple(values)
         plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
-        with renderer_mirror_writes(plan) as writer:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
             writer.save(candidate, update_fields=fields)
         route.refresh_from_db()
         return

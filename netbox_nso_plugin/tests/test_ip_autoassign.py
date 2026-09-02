@@ -350,7 +350,7 @@ class TestAutoAssignIP(TestCase):
         pool = Prefix.objects.get(pk=self.pool_lo4.pk)
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback151", type="virtual")
-        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="ip")
         before = revision.revision
         result = {"allocated": [], "errors": [], "skipped": []}
         with (
