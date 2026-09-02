@@ -140,3 +140,20 @@ def retire_manifest_identity(*, device_ids, scope, native_model_label, native_ke
         native_key=native_key,
         ownership_state="owned",
     ).update(ownership_state="retired")
+
+
+def retire_device_manifests(device_id: int) -> None:
+    """Retire each owned manifest identity for a device teardown."""
+    from .models import NSOOwnershipManifest
+
+    manifests = NSOOwnershipManifest.objects.filter(
+        device_id=device_id,
+        ownership_state="owned",
+    ).only("scope", "native_model_label", "native_key")
+    for manifest in manifests.iterator():
+        retire_manifest_identity(
+            device_ids=(device_id,),
+            scope=manifest.scope,
+            native_model_label=manifest.native_model_label,
+            native_key=manifest.native_key,
+        )

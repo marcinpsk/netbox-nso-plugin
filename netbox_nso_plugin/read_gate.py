@@ -949,8 +949,6 @@ def gated_family_run(
         if isinstance(plan, RendererMutationPlan):
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         else:
-            from .intent_state import reconcile_transaction
-
             mutation = reconcile_transaction(plan)
         with mutation:
             current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)

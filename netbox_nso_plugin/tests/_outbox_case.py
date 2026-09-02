@@ -120,14 +120,20 @@ def write_vlan_state(state, **values):
     """Persist one owned VLAN-overlay mutation through the converted writer seam."""
     import copy
 
-    from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
     candidate = copy.copy(type(state).objects.get(pk=state.pk))
     for field_name, value in values.items():
         setattr(candidate, field_name, value)
     fields = tuple(sorted(values))
     plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
-    with renderer_writes(plan) as writer:
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
         writer.save(candidate, update_fields=fields)
     for field_name, value in values.items():
         setattr(state, field_name, value)

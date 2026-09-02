@@ -714,11 +714,14 @@ def _lacp_bundle_dependencies(before, after, spec):
     Member = apps.get_model("netbox_nso_plugin.nsolacpmemberstate")
     candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
     pairs = {(row.management_id, row.interface_id) for row in candidates}
-    members = tuple(
-        Member.objects.filter(management_id=management_id, lag_bundle_id=interface_id).order_by("pk")
+    member_rows = tuple(
+        member
         for management_id, interface_id in sorted(pairs)
+        for member in Member.objects.filter(
+            management_id=management_id,
+            lag_bundle_id=interface_id,
+        ).order_by("pk")
     )
-    member_rows = tuple(member for queryset in members for member in queryset)
     interface_ids = {
         interface_id for row in candidates for interface_id in (row.interface_id,) if interface_id is not None
     }
@@ -3422,12 +3425,12 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         "netbox_nso_plugin.nsosvistate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsoswitchportstate": _switchport_fragment,
     }
+    dependency_resolvers = {
+        "netbox_nso_plugin.nsolacpmemberstate": _lacp_member_dependencies,
+        "netbox_nso_plugin.nsosvistate": _svi_dependencies,
+        "netbox_nso_plugin.nsoswitchportstate": _switchport_dependencies,
+    }
     for label, fragment in exact_direct_fragments.items():
-        dependency_resolvers = {
-            "netbox_nso_plugin.nsolacpmemberstate": _lacp_member_dependencies,
-            "netbox_nso_plugin.nsosvistate": _svi_dependencies,
-            "netbox_nso_plugin.nsoswitchportstate": _switchport_dependencies,
-        }
         _REGISTRY[label] = replace(
             _REGISTRY[label],
             fragment=fragment,

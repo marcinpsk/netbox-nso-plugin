@@ -347,6 +347,16 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs):
     return write, footprint, _changed_keys(before, after, spec, dependency_changed)
 
 
+def _materialize_field_update_rows(rows):
+    """Return one field-update container's model and stable row tuple."""
+    if hasattr(rows, "model"):
+        return rows.model, tuple(rows.order_by("pk"))
+    materialized = tuple(rows)
+    if not materialized:
+        return None, ()
+    return type(materialized[0]), materialized
+
+
 def _collector_writes(instance):
     from django.db.models.deletion import Collector
 
@@ -395,14 +405,9 @@ def _collector_writes(instance):
             record_change(row, None)
     for (field, value), querysets in collector.field_updates.items():
         for rows in querysets:
-            if hasattr(rows, "values_list"):
-                model = rows.model
-                materialized = tuple(rows.order_by("pk"))
-            else:
-                materialized = tuple(rows)
-                if not materialized:
-                    continue
-                model = type(materialized[0])
+            model, materialized = _materialize_field_update_rows(rows)
+            if model is None:
+                continue
             for row in materialized:
                 writes.append(
                     RendererWrite(
@@ -566,9 +571,13 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
         values=(("before_pks", before_pks), *add_write.values),
     )
     previous_related = related_model._default_manager.filter(pk__in=before_pks).order_by("pk")
+    try:
+        previous_footprints = tuple(footprint_for_instance(row) for row in previous_related)
+    except KeyError as exc:
+        raise IntentMutationProtocolError(f"unregistered M2M related model {exc.args[0]}") from exc
     footprint = MutationFootprint.merge(
         footprint,
-        *(footprint_for_instance(row) for row in previous_related),
+        *previous_footprints,
     )
     if set(before_pks) == set(related_identities):
         keys = set()
@@ -837,13 +846,9 @@ class RendererWriter:
         collector.collect([instance])
         for (_field, _value), querysets in collector.field_updates.items():
             for rows in querysets:
-                if hasattr(rows, "model"):
-                    model = rows.model
-                else:
-                    materialized = tuple(rows)
-                    if not materialized:
-                        continue
-                    model = type(materialized[0])
+                model, _materialized = _materialize_field_update_rows(rows)
+                if model is None:
+                    continue
                 _authorize_dml(self.permit, model._meta.db_table)
         with self._operation(index):
             result = instance.delete()

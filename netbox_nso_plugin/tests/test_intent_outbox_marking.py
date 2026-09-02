@@ -108,6 +108,21 @@ class _MarkCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
 class TestOneTransactionOneMarkedPush(_MarkCase):
     """O1.5(a): two marked contributors in one transaction cost one marked send."""
 
+    def test_fixture_writer_accepts_a_lifecycle_only_update(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        state = own_vlan(self.mgmt, 7699, self.tag)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        before = revision.revision
+
+        with without_commit_drain(), transaction.atomic():
+            written = write_vlan_state(state, last_apply_error="retry required")
+
+        persisted = type(state).objects.get(pk=written.pk)
+        revision.refresh_from_db()
+        self.assertEqual(persisted.last_apply_error, "retry required")
+        self.assertEqual(revision.revision, before)
+
     tag = "onetx"
     adapter_device_id = 7701
 
