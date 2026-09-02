@@ -155,9 +155,12 @@ class TestGatedReconcileBehavior(_L2Base):
         self.assertEqual(ctx["_gate"]["l2_service"], "ran")
 
     def test_matching_read_does_not_settle_a_deploying_sap(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
         self._prime()
         row = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
-        content_update(row, status="deploying")
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
+        content_update(row, status="deploying", apply_attempt_id=attempt.pk)
 
         self._reconcile(_l2_payload(("TL",), read_state=_rs(attempt_id=2)))
 
