@@ -504,6 +504,16 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                     self.assertEqual(plan.lock_footprint, MutationFootprint())
                     self.assertFalse(plan.changes_content)
 
+    def test_missing_netbox_routing_returns_an_empty_bgp_reconcile_result(self):
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        device, _management = _make("missing-routing-bgp-entry")
+
+        with patch.dict(sys.modules, {"netbox_routing.models": None}):
+            result = _reconcile_bgp_config(device, {"routers": []})
+
+        self.assertEqual(result, [])
+
     def test_missing_netbox_routing_skips_reconcile_entry_points(self):
         from netbox_nso_plugin.isis_reconciler import reconcile_isis
         from netbox_nso_plugin.ospf_reconciler import reconcile_ospf
