@@ -124,6 +124,22 @@ class TestRecomputeOne(TestCase):
         iface1_after = Interface.objects.get(pk=iface1.pk)
         self.assertEqual(iface1_after.description, "[auto] to rcp-dev2:Gi0/2-rcp")
 
+    def test_recompute_propagates_an_unplanned_writer_save(self):
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, renderer_mirror_writes
+
+        from ._outbox_case import without_commit_drain
+
+        iface1 = _make_iface(self.dev1, "Gi0/9-unplanned")
+        iface2 = _make_iface(self.dev2, "Gi0/10-unplanned")
+        _make_cable(iface1, iface2)
+        iface1.description = "[auto]"
+        iface1.save(update_fields=["description"])
+
+        with without_commit_drain(), renderer_mirror_writes(RendererMutationPlan.build()):
+            with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+                _recompute_one(Interface.objects.get(pk=iface1.pk), TEMPLATES)
+
     def test_recompute_skips_unmanaged_interface(self):
         iface = _make_iface(self.dev1, "Gi0/3-unmanaged")
         iface.description = "static description"

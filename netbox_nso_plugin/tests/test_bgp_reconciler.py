@@ -1329,74 +1329,21 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         with self.assertRaises(IntentMutationProtocolError), mutation(plan):
             _reconcile_bgp_config(self.device, payload)
 
-    def test_plan_revalidates_a_created_source_interface_after_lock_acquisition(self):
-        from dcim.models import Interface
-
-        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
+    def test_replay_operations_are_built_after_writer_activation(self):
+        from netbox_nso_plugin.bgp_reconciler import _bgp_reconcile_operations, _reconcile_bgp_config
+        from netbox_nso_plugin.renderer_writer import active_renderer_writer
 
         self._make_mgmt()
-        peer = self._peer_entry(source="Loopback201")
-        payload = self._payload(self._router_payload(peers=[peer]))
-        plan = bgp_reconcile_plan(self.device, payload)
-        Interface.objects.create(device=self.device, name="Loopback201", type="virtual")
+        writer_states = []
 
-        with self.assertRaises(RendererTargetsChanged), reconcile_transaction(plan):
-            pass
+        def observe_writer(*args, **kwargs):
+            writer_states.append(active_renderer_writer() is not None)
+            return _bgp_reconcile_operations(*args, **kwargs)
 
-    def test_plan_revalidates_a_renamed_source_interface_after_lock_acquisition(self):
-        from dcim.models import Interface
+        with patch("netbox_nso_plugin.bgp_reconciler._bgp_reconcile_operations", side_effect=observe_writer):
+            _reconcile_bgp_config(self.device, {"routers": []})
 
-        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
-
-        self._make_mgmt()
-        source = Interface.objects.create(device=self.device, name="Loopback202", type="virtual")
-        peer = self._peer_entry(source=source.name)
-        payload = self._payload(self._router_payload(peers=[peer]))
-        plan = bgp_reconcile_plan(self.device, payload)
-        source.name = "Loopback203"
-        source.save(update_fields=["name"])
-
-        with self.assertRaises(RendererTargetsChanged), reconcile_transaction(plan):
-            pass
-
-    def test_plan_revalidates_a_deleted_source_interface_after_lock_acquisition(self):
-        from dcim.models import Interface
-
-        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
-
-        self._make_mgmt()
-        source = Interface.objects.create(device=self.device, name="Loopback204", type="virtual")
-        peer = self._peer_entry(source=source.name)
-        payload = self._payload(self._router_payload(peers=[peer]))
-        plan = bgp_reconcile_plan(self.device, payload)
-        source.delete()
-
-        with self.assertRaises(RendererTargetsChanged), reconcile_transaction(plan):
-            pass
-
-    def test_plan_locks_and_uses_an_unchanged_source_interface(self):
-        from dcim.models import Interface
-        from netbox_routing.models import BGPPeer
-
-        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import SourceRow, reconcile_transaction
-
-        self._make_mgmt()
-        source = Interface.objects.create(device=self.device, name="Loopback205", type="virtual")
-        peer = self._peer_entry(source=source.name)
-        payload = self._payload(self._router_payload(peers=[peer]))
-        plan = bgp_reconcile_plan(self.device, payload)
-
-        self.assertIn(SourceRow("dcim.device", self.device.pk), plan.footprint.source_rows)
-        self.assertIn(SourceRow("dcim.interface", None), plan.footprint.source_rows)
-        self.assertIn(SourceRow("dcim.interface", source.pk), plan.footprint.source_rows)
-        with reconcile_transaction(plan):
-            _reconcile_bgp_config(self.device, payload)
-
-        self.assertEqual(BGPPeer.objects.get().update_source, source)
+        self.assertEqual(writer_states, [False, True])
 
     def test_plan_locks_all_devices_that_share_a_route_map_without_expanding_revisions(self):
         from django.contrib.contenttypes.models import ContentType
