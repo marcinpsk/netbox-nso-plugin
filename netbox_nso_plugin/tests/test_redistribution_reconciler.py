@@ -79,6 +79,34 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(r.metric, 10)
         self.assertEqual(r.metric_type, "external")
 
+    def test_owned_state_recreates_a_missing_native_redistribution(self):
+        from django.db import transaction
+        from django.utils import timezone
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        self._make_mgmt()
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        state = NSORedistributionState.objects.get()
+        state.status = "accepted"
+        state.accepted_at = timezone.now()
+        state.save(update_fields=["status", "accepted_at"])
+
+        with transaction.atomic(), offline_mutation(), suppress_intent_push():
+            state.redistribution.delete()
+        state.refresh_from_db()
+        self.assertIsNone(state.redistribution_id)
+
+        reconciled = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
+
+        self.assertIsNotNone(reconciled.redistribution_id)
+        self.assertEqual(Redistribution.objects.count(), 1)
+
     def test_category_reconcile_declares_its_native_and_overlay_writes(self):
         management = self._make_mgmt()
         from netbox_routing.models import ISISInstance, Redistribution

@@ -154,20 +154,21 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
     dependencies = {}
     seen = set()
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), references=()):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                references=references,
             )
         )
-        operations.append(("save", instance, update_fields, force_insert))
+        operations.append(("save", instance, update_fields, force_insert, references))
 
     def delete(instance):
         deletes.append(planned_delete(instance))
-        operations.append(("delete", instance, None, False))
+        operations.append(("delete", instance, None, False, ()))
 
     for entry in payload.get("entries") or []:
         destination_protocol = entry.get("dest_protocol") or ""
@@ -232,6 +233,17 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
             device_hash = merge_util.content_hash(_redist_device_content(entry, route_map))
             object_hash = merge_util.content_hash(_redist_object_content(native))
             if owned:
+                if created_native:
+                    save(
+                        native,
+                        force_insert=True,
+                        natural_key=(
+                            "destination_type",
+                            "destination_id",
+                            "source_protocol",
+                            "source_ref",
+                        ),
+                    )
                 matches = object_hash == device_hash
             else:
                 action = merge_util.three_way(
@@ -295,6 +307,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
                 "source_protocol",
                 "source_ref",
             ),
+            references=(("redistribution", native),) if destination is not None and created_native else (),
         )
 
     deleting_state_pks = {
@@ -334,7 +347,12 @@ def reconcile_redistribution(device, payload: dict) -> list:
         return []
 
     from .models import NSODeviceManagement, NSORedistributionState
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import (
+        active_renderer_writer,
+        renderer_mirror_writes,
+        renderer_writes,
+        replay_creation_references,
+    )
     from .signals import suppress_intent_push
 
     management = NSODeviceManagement.objects.filter(device=device).first()
@@ -351,9 +369,10 @@ def reconcile_redistribution(device, payload: dict) -> list:
             payload,
             plan.planned_at,
         )
-        for operation, instance, update_fields, force_insert in operations:
+        for operation, instance, update_fields, force_insert, references in operations:
             if operation == "delete":
                 writer.delete(instance)
             else:
+                replay_creation_references(instance, references)
                 writer.save(instance, update_fields=update_fields, force_insert=force_insert)
     return list(NSORedistributionState.objects.filter(management=management))

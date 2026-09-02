@@ -1918,6 +1918,7 @@ class TestNSOInterfaceStateDeleteView(ViewTestBase):
         )
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("pk", response.context["form"].errors)
         self.assertTrue(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
 
     def test_delete_rejects_a_protocol_relative_return_url(self):

@@ -1144,13 +1144,7 @@ def _recompute_one(interface, templates):
     # active here. Opening one of its own from a signal is the thing that rule forbids.
     if active is None:
         raise IntentMutationProtocolError("a derived description recompute requires an active renderer writer")
-    try:
-        active.save(candidate, update_fields=("description",))
-    except IntentMutationProtocolError:
-        logger.warning(
-            "derived_intent.unplanned_write field=description interface_id=%s",
-            interface.pk,
-        )
+    active.save(candidate, update_fields=("description",))
 
 
 def _recompute_on_cable_change(sender, instance, **kwargs):
@@ -2453,11 +2447,6 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
 def _on_l2_sap_state_save(sender, instance, **kwargs):
     """Schedule L2 SAP intent only for an active exact content writer."""
     from .models import NSODeviceManagement
-    from .renderer_writer import active_renderer_writer
-
-    writer = active_renderer_writer()
-    if writer is None:
-        return
 
     try:
         mgmt = instance.management
@@ -3443,7 +3432,13 @@ def _route_map_contributors(route_maps):
             referenced.append((family, obj))
 
     for route_map in route_maps:
-        for entry in route_map.route_map_entries.all():
+        entries = route_map.route_map_entries.prefetch_related(
+            "match_prefix_list",
+            "match_community_list",
+            "match_aspath",
+            "set_communities__community_list",
+        )
+        for entry in entries:
             for obj in entry.match_prefix_list.all():
                 _add_ref("prefix_list", obj)
             for obj in entry.match_community_list.all():

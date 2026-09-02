@@ -587,6 +587,40 @@ class TestOwnershipCascade(_RPBase):
         assert owned.get(("community_list", "CL-CASCADE")) == "accepted"
         assert owned.get(("prefix_list", "PL-CASCADE")) == "accepted"
 
+    def test_contributor_queries_do_not_grow_with_route_map_entries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import RouteMapEntry, RouteMapEntrySetCommunity
+
+        from netbox_nso_plugin.signals import _route_map_contributors, suppress_intent_push
+
+        route_map, as_path, community_list, prefix_list = self._route_map_with_refs("RM-QUERY-SCALE")
+        entry = RouteMapEntry.objects.create(route_map=route_map, sequence=20, action="permit")
+        with suppress_intent_push():
+            entry.match_prefix_list.add(prefix_list)
+            entry.match_community_list.add(community_list)
+            entry.match_aspath.add(as_path)
+        _save_without_push(
+            RouteMapEntrySetCommunity(
+                route_map_entry=entry,
+                operation="add",
+                community_list=community_list,
+            )
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            contributors = _route_map_contributors((route_map,))
+
+        self.assertEqual(len(queries), 6)
+        self.assertEqual(
+            {(family, obj.name) for family, obj in contributors},
+            {
+                ("prefix_list", prefix_list.name),
+                ("community_list", community_list.name),
+                ("as_path", as_path.name),
+            },
+        )
+
     def test_cascade_does_not_clobber_already_owned_contributor(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import ASPath
