@@ -2024,6 +2024,8 @@ def _bump_and_lock_deploying(
     """Lock the promoted scope, then advance the revisions its locked content changes."""
     from .outbox import bump_intent_revision
 
+    if bump_keys is not None:
+        _refuse_unacquired_keys(bump_keys, footprint, "the requested revision bump")
     deploying_rows = _deploying_scope_rows(footprint)
     locked_overlay_rows = tuple(set(footprint.overlay_rows) | set(deploying_rows))
     _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
