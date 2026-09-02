@@ -18,7 +18,10 @@ def ospf_reconcile_plan(device, payload):
     from .renderer_writer import RendererMutationPlan
 
     planned_at = timezone.now()
-    saves, deletes, _operations, _dropped = _ospf_reconcile_operations(device, payload, planned_at)
+    try:
+        saves, deletes, _operations, _dropped = _ospf_reconcile_operations(device, payload, planned_at)
+    except ImportError:
+        return RendererMutationPlan.build(planned_at=planned_at)
     return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
 
 
@@ -409,6 +412,12 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
 
 def reconcile_ospf(device, payload):
     """Apply one frozen OSPF reconciliation through the renderer writer."""
+    try:
+        from netbox_routing.models import OSPFInstance  # noqa: F401
+    except ImportError:
+        logger.warning("netbox_routing not installed; skipping OSPF reconcile")
+        return {"instances": [], "interfaces": []}
+
     from .models import NSODeviceManagement, NSOOSPFInstanceState, NSOOSPFInterfaceState
     from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push

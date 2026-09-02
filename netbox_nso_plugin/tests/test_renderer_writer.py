@@ -433,6 +433,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             writer.save(vlan, force_insert=True)
 
         self.assertEqual(vlan.group_id, winner.pk)
+
     def test_plan_rejects_a_forward_creation_reference(self):
         from ipam.models import VLANGroup
 
@@ -453,6 +454,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                     planned_save(group, force_insert=True, natural_key=("slug",)),
                 )
             )
+
     def test_plan_refuses_an_unreferenced_support_row(self):
         from tenancy.models import Tenant
 

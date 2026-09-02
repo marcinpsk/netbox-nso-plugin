@@ -4,6 +4,9 @@
 
 import contextlib
 import copy
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def redistribution_reconcile_plan(device, payload):
@@ -13,8 +16,16 @@ def redistribution_reconcile_plan(device, payload):
     from .renderer_writer import RendererMutationPlan
 
     planned_at = timezone.now()
-    saves, deletes, _operations = _redistribution_reconcile_operations(device, payload, planned_at)
-    return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    try:
+        saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, payload, planned_at)
+    except ImportError:
+        return RendererMutationPlan.build(planned_at=planned_at)
+    return RendererMutationPlan.build(
+        saves=saves,
+        deletes=deletes,
+        read_dependencies=dependencies,
+        planned_at=planned_at,
+    )
 
 
 def redistribution_reconcile_footprint(device, payload=None):
@@ -112,7 +123,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
-        return [], [], []
+        return [], [], [], []
     states = {
         (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref): row
         for row in NSORedistributionState.objects.filter(management=management)
@@ -122,6 +133,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
     saves = []
     deletes = []
     operations = []
+    dependencies = {}
     seen = set()
 
     def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
@@ -172,9 +184,12 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
 
         destination = _resolve_redist_destination(device, destination_protocol, destination_ref)
         if destination is not None:
+            dependencies[(destination._meta.label_lower, destination.pk)] = destination
             route_map = (
                 RouteMap.objects.filter(name=entry.get("route_map") or "").first() if entry.get("route_map") else None
             )
+            if route_map is not None:
+                dependencies[(route_map._meta.label_lower, route_map.pk)] = route_map
             destination_type = ContentType.objects.get_for_model(type(destination))
             current_native = Redistribution.objects.filter(
                 destination_type=destination_type,
@@ -264,6 +279,10 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
             ),
         )
 
+    deleting_state_pks = {
+        state.pk for key, state in states.items() if key not in seen and not sm.is_owned(state.status)
+    }
+    deleting_natives = {}
     for key, stale in states.items():
         if key in seen:
             continue
@@ -279,14 +298,23 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
             continue
         native = stale.redistribution
         delete(stale)
-        if native is not None and not native.nso_redistribution_states.exclude(pk=stale.pk).exists():
-            delete(native)
+        if native is not None and not native.nso_redistribution_states.exclude(pk__in=deleting_state_pks).exists():
+            deleting_natives[native.pk] = native
 
-    return saves, deletes, operations
+    for native in deleting_natives.values():
+        delete(native)
+
+    return saves, deletes, operations, tuple(dependencies.values())
 
 
 def reconcile_redistribution(device, payload: dict) -> list:
     """Apply one frozen redistribution reconciliation through the renderer writer."""
+    try:
+        from netbox_routing.models import Redistribution  # noqa: F401
+    except ImportError:
+        logger.warning("netbox_routing not installed; skipping redistribution reconcile")
+        return []
+
     from .models import NSODeviceManagement, NSORedistributionState
     from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
@@ -300,7 +328,11 @@ def reconcile_redistribution(device, payload: dict) -> list:
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
-        _saves, _deletes, operations = _redistribution_reconcile_operations(device, payload, plan.planned_at)
+        _saves, _deletes, operations, _dependencies = _redistribution_reconcile_operations(
+            device,
+            payload,
+            plan.planned_at,
+        )
         for operation, instance, update_fields, force_insert in operations:
             if operation == "delete":
                 writer.delete(instance)

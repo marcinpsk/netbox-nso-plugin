@@ -1118,7 +1118,16 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             isis_payload = client.get_isis_interfaces(dev_id)
 
             def _isis_body():
-                result = reconcile_isis(device, isis_payload)
+                _safe_reconcile(
+                    ctx,
+                    "isis_data",
+                    mgmt,
+                    ("NSOISISInstanceState", "NSOISISInterfaceState"),
+                    reconcile_isis,
+                    device,
+                    isis_payload,
+                )
+                result = ctx.pop("isis_data")
                 ctx["isis_interfaces"] = result["interfaces"]
                 ctx["isis_processes"] = result["processes"]
 

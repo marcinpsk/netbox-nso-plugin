@@ -5953,7 +5953,7 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         import copy
 
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         state = get_object_or_404(NSOL2SapState, pk=pk)
         if state.service_type not in ("epipe", "vpls"):
@@ -5969,7 +5969,8 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
             candidate.accepted_at = timezone.now()
         fields = ("status", "accepted_at")
         plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
-        with renderer_writes(plan) as writer:
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
             writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))

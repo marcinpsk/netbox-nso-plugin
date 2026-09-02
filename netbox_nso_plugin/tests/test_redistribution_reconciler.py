@@ -267,14 +267,17 @@ class TestReconcileRedistribution(TestCase):
         plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
 
         self.assertTrue(plan.changes_content)
-        self.assertIn((other_device.pk, "isis"), plan.footprint.revision_keys)
-        self.assertIsNotNone(plan.validate_after_acquire)
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+        self.assertIn((other_device.pk, "isis"), plan.lock_footprint.revision_keys)
+        from django.db import transaction
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError, renderer_writes
 
         redistribution.metric = 99
-        redistribution.save(update_fields=["metric"])
-        with self.assertRaises(RendererTargetsChanged):
-            plan.validate_after_acquire()
+        with transaction.atomic(), intent_transaction(footprint_for_instance(redistribution)):
+            redistribution.save(update_fields=["metric"])
+        with self.assertRaises(IntentPlanStaleError), renderer_writes(plan):
+            reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
 
     def test_plan_validation_detects_destination_deletion(self):
         """The plan rejects a destination that disappears before acquisition."""
@@ -286,6 +289,7 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.intent_state import RendererTargetsChanged, offline_mutation
         from netbox_nso_plugin.models import NSODeviceManagement, NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import renderer_writes
 
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         redistribution = Redistribution.objects.get(source_protocol="static")
@@ -312,8 +316,8 @@ class TestReconcileRedistribution(TestCase):
         with transaction.atomic(), offline_mutation():
             destination.delete()
 
-        with self.assertRaises(RendererTargetsChanged):
-            plan.validate_after_acquire()
+        with self.assertRaises(RendererTargetsChanged), renderer_writes(plan):
+            reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
 
     def test_new_reported_entry_locks_and_revalidates_its_destination(self):
         """A reported entry without an overlay still protects its destination."""
@@ -323,16 +327,17 @@ class TestReconcileRedistribution(TestCase):
 
         destination = ISISInstance.objects.create(device=self.device, process_tag="")
         from netbox_nso_plugin.intent_state import RendererTargetsChanged, SourceRow, offline_mutation
-        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
 
         plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
 
-        self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.footprint.source_rows)
+        self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.lock_footprint.source_rows)
         with transaction.atomic(), offline_mutation():
             destination.delete()
 
-        with self.assertRaises(RendererTargetsChanged):
-            plan.validate_after_acquire()
+        with self.assertRaises(RendererTargetsChanged), renderer_mirror_writes(plan):
+            reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})
 
     def test_plan_validation_detects_equal_content_relink(self):
         """The prediction identifies native rows even when their content is equal."""
@@ -341,8 +346,11 @@ class TestReconcileRedistribution(TestCase):
         from netbox_routing.models import ISISInstance, Redistribution
 
         ISISInstance.objects.create(device=self.device, process_tag="")
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+        from django.db import transaction
+
+        from netbox_nso_plugin.intent_state import offline_mutation
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError, renderer_mirror_writes
 
         state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
         other_device = Device.objects.create(
@@ -361,10 +369,11 @@ class TestReconcileRedistribution(TestCase):
         plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=10)]})
 
         state.redistribution = other_redistribution
-        state.save(update_fields=["redistribution"])
+        with transaction.atomic(), offline_mutation():
+            state.save(update_fields=["redistribution"])
 
-        with self.assertRaises(RendererTargetsChanged):
-            plan.validate_after_acquire()
+        with self.assertRaises(IntentPlanStaleError), renderer_mirror_writes(plan):
+            reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
 
     def test_overlay_footprint_serializes_current_and_proposed_redistributions(self):
         """A relink locks both native redistribution dependencies."""
@@ -404,7 +413,7 @@ class TestReconcileRedistribution(TestCase):
             process_id="1",
             device=self.device,
         )
-        from netbox_nso_plugin.intent_state import SourceRow, reconcile_transaction
+        from netbox_nso_plugin.intent_state import SourceRow
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
 
         entry = self._entry(dest_protocol="ospf", dest_ref="1", metric_type="1")
@@ -415,8 +424,8 @@ class TestReconcileRedistribution(TestCase):
             plan.footprint.source_rows,
         )
 
-        with reconcile_transaction(plan):
-            pass
+        destination = OSPFInstance.objects.get(device=self.device, process_id="1")
+        self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.lock_footprint.source_rows)
 
     def test_omitted_default_metric_type_migrates_prior_mirrored_default_to_absence(self):
         """A corrected reader omits a default-only metric-type.
@@ -545,6 +554,35 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": []})  # device removed it
         self.assertEqual(NSORedistributionState.objects.count(), 0)  # overlay gone
         self.assertEqual(Redistribution.objects.count(), 0)  # object gone
+
+    def test_shared_native_is_deleted_when_all_stale_overlays_are_deleted(self):
+        management = self._make_mgmt()
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(destination),
+            destination_id=destination.pk,
+            source_protocol="static",
+        )
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        for source_ref in ("first", "second"):
+            NSORedistributionState.objects.create(
+                management=management,
+                dest_protocol="isis",
+                source_protocol="static",
+                source_ref=source_ref,
+                redistribution=native,
+                status="imported",
+            )
+
+        reconcile_redistribution(self.device, {"entries": []})
+
+        self.assertFalse(NSORedistributionState.objects.exists())
+        self.assertFalse(Redistribution.objects.filter(pk=native.pk).exists())
 
     def test_gated_removal_locks_and_deletes_the_native_redistribution(self):
         mgmt = self._make_mgmt()

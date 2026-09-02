@@ -61,7 +61,10 @@ def isis_reconcile_plan(device, payload):
     from .renderer_writer import RendererMutationPlan
 
     planned_at = timezone.now()
-    operations, _dropped = _isis_reconcile_operations(device, payload, planned_at)
+    try:
+        operations, _dropped = _isis_reconcile_operations(device, payload, planned_at)
+    except ImportError:
+        return RendererMutationPlan.build(planned_at=planned_at)
     return RendererMutationPlan.build(
         saves=operations.saves,
         deletes=operations.deletes,
@@ -828,6 +831,12 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
 
 def reconcile_isis(device, payload):
     """Apply one preflighted IS-IS graph reconciliation."""
+    try:
+        from netbox_routing.models import ISISInstance  # noqa: F401
+    except ImportError:
+        logger.warning("netbox_routing not installed; skipping IS-IS reconcile")
+        return {"processes": [], "interfaces": []}
+
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
     from .renderer_writer import (
         active_renderer_writer,

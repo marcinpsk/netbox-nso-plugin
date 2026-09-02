@@ -82,6 +82,15 @@ class RendererDelete:
 
 
 @dataclass(frozen=True)
+class RendererRead:
+    """One persisted row whose exact state a frozen plan depends on."""
+
+    model_label: str
+    pk: Any
+    values: tuple[tuple[str, Any], ...]
+
+
+@dataclass(frozen=True)
 class RendererSetUpdate:
     """A set-based update whose selected primary keys are already frozen."""
 
@@ -170,6 +179,7 @@ class RendererMutationPlan:
     """An immutable exact write set and its mechanically derived lock footprint."""
 
     write_set: tuple[RendererWrite, ...]
+    read_set: tuple[RendererRead, ...]
     lock_footprint: MutationFootprint
     content_keys: tuple[tuple[int, str], ...]
     planned_at: Any
@@ -187,8 +197,8 @@ class RendererMutationPlan:
         deletes=(),
         set_updates=(),
         m2m_writes=(),
+        read_dependencies=(),
         planned_at=None,
-        settles_deploying=True,
     ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
@@ -197,6 +207,7 @@ class RendererMutationPlan:
         creation_refs = _creation_refs(save_states)
         support_refs = _referenced_support_refs(save_states, creation_refs)
         writes: list[RendererWrite] = []
+        reads: list[RendererRead] = []
         footprints: list[MutationFootprint] = []
         content_keys: set[tuple[int, str]] = set()
         effective_saves = []
@@ -234,12 +245,22 @@ class RendererMutationPlan:
             writes.append(write)
             footprints.append(footprint)
             content_keys.update(changed_keys)
+        read_identities = set()
+        for instance in read_dependencies:
+            read, footprint = _plan_read(instance)
+            identity = (read.model_label, read.pk)
+            if identity in read_identities:
+                continue
+            reads.append(read)
+            footprints.append(footprint)
+            read_identities.add(identity)
 
         content_keys.update(_prospective_visibility_keys(effective_saves))
 
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
         return cls(
             write_set=tuple(writes),
+            read_set=tuple(reads),
             lock_footprint=lock_footprint,
             content_keys=tuple(sorted(content_keys)),
             planned_at=planned_at,
@@ -307,6 +328,28 @@ def _field_values(instance, update_fields, creation_refs=None, reference_fields=
             for field in fields
         )
     )
+
+
+def _plan_read(instance):
+    """Freeze and lock one persisted ranked renderer dependency."""
+    stored = _stored_instance(instance)
+    if stored is None:
+        raise IntentMutationProtocolError(
+            f"cannot plan read dependency for missing {instance._meta.label_lower} row {instance.pk!r}"
+        )
+    label = stored._meta.label_lower
+    if label in SOURCE_MODEL_RANKS:
+        row_kind = "source_rows"
+    elif label in OVERLAY_MODEL_RANKS:
+        row_kind = "overlay_rows"
+    else:
+        raise IntentMutationProtocolError(f"{label} is not a ranked renderer dependency")
+    read = RendererRead(model_label=label, pk=stored.pk, values=_field_values(stored, None))
+    footprint = MutationFootprint.for_keys(
+        (),
+        **{row_kind: (SourceRow(label, stored.pk),)},
+    )
+    return read, footprint
 
 
 def _natural_key(instance, fields, creation_refs=None, reference_fields=()):
@@ -902,28 +945,18 @@ class RendererWriter:
     def _fields_match(self, expected_values, instance):
         return all(self._value_matches(instance, attname, expected) for attname, expected in expected_values)
 
-    def assert_preimages_current(self):
-        """Reject a frozen plan whose persisted inputs changed before execution."""
+    def validate_dependencies(self):
+        """Reject frozen inputs that changed before their locks were acquired."""
         for write in self.plan.write_set:
-            model = apps.get_model(write.model_label)
-            if write.operation in {"save", "delete"} and write.pk is not None:
-                current = model._default_manager.filter(pk=write.pk).first()
-                if current is None or not self._fields_match(write.before_values, current):
-                    raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
-            elif write.operation == "set_update" and write.selected_preimages:
-                selected = tuple(model._default_manager.filter(pk__in=write.selected_pks).order_by("pk"))
-                preimages = tuple((row.pk, _field_values(row, None)) for row in selected)
-                if tuple(row.pk for row in selected) != write.selected_pks or preimages != write.selected_preimages:
-                    raise IntentPlanStaleError(f"{write.model_label} selected rows changed after planning")
-            elif write.operation == "m2m_set" and not isinstance(write.pk, RendererCreationRef):
-                current = model._default_manager.filter(pk=write.pk).first()
-                field_name = dict(write.natural_key)["field_name"]
-                before_pks = dict(write.values)["before_pks"]
-                if (
-                    current is None
-                    or tuple(sorted(getattr(current, field_name).values_list("pk", flat=True))) != before_pks
-                ):
-                    raise IntentPlanStaleError("the M2M edge set changed after planning")
+            if write.pk is None or not write.before_values:
+                continue
+            current = apps.get_model(write.model_label)._default_manager.filter(pk=write.pk).first()
+            if current is None or not self._fields_match(write.before_values, current):
+                raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
+        for read in self.plan.read_set:
+            current = apps.get_model(read.model_label)._default_manager.filter(pk=read.pk).first()
+            if current is None or not self._fields_match(read.values, current):
+                raise IntentPlanStaleError(f"{read.model_label} row {read.pk!r} changed after planning")
 
     def _identity_matches(self, write, instance):
         if write.pk is not None:
@@ -1385,6 +1418,7 @@ def renderer_writes(plan: RendererMutationPlan):
                 bump_keys=plan.content_keys,
             )
         writer = RendererWriter(plan, content=True, permit=permit)
+        writer.validate_dependencies()
         token = _ACTIVE_WRITER.set(writer)
         try:
             yield writer
@@ -1403,6 +1437,7 @@ def renderer_mirror_writes(plan: RendererMutationPlan):
         raise IntentMutationProtocolError("renderer writer contexts cannot nest")
     with mirror_transaction(plan.lock_footprint, settles_deploying=plan.settles_deploying) as permit:
         writer = RendererWriter(plan, content=False, permit=permit)
+        writer.validate_dependencies()
         token = _ACTIVE_WRITER.set(writer)
         try:
             yield writer
