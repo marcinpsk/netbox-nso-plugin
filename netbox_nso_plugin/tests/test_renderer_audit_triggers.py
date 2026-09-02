@@ -35,12 +35,15 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
         self.assertEqual(claimed.revision, before_revision + 1)
 
     def test_delivery_audits_inside_the_public_api_before_rendering(self):
-        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin import delivery, drain
 
         own_vlan(self.management, 1628, "renderer-audit-deliver")
         order = []
 
+        audits = []
+
         def audit(*args, **kwargs):
+            audits.append((args, kwargs))
             order.append("audit")
 
         def render(*args, **kwargs):
@@ -49,12 +52,34 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
         with (
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=audit),
+            patch("netbox_nso_plugin.delivery.time.monotonic", return_value=12.5),
             patch("netbox_nso_plugin.delivery.render", side_effect=render),
             self.assertRaisesRegex(RuntimeError, "stop after capture ordering"),
         ):
             delivery.deliver("vlan", self.device.pk, self.management.adapter_device_id)
 
         self.assertEqual(order, ["audit", "render"])
+        self.assertEqual(audits[0][1]["deadline"], 12.5 + drain.SEND_DEADLINE.total_seconds())
+
+    def test_delivery_translates_audit_refusals_to_adapter_errors(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
+
+        for failure in (
+            RendererAuditBudgetExceeded("audit deadline expired"),
+            RendererAuditRepairFailed("audit repair failed"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                with (
+                    patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=failure),
+                    patch("netbox_nso_plugin.delivery.render") as render,
+                    self.assertRaises(AdapterError) as raised,
+                ):
+                    delivery.deliver("vlan", self.device.pk, self.management.adapter_device_id)
+
+                self.assertIs(raised.exception.__cause__, failure)
+                render.assert_not_called()
 
     def test_each_chained_drain_pass_audits_again_before_recapture(self):
         """The real chain, not two hand-made calls: a tail appended mid-send earns pass two.
@@ -99,3 +124,31 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
         self.assertEqual(entries(self.device, "vlan", unconsumed=True), [])
         self.assertTrue(all(call[3] == {"pre_capture": True} for call in calls))
         self.assertTrue(all(call[:3] == (self.device.pk, ("vlan",), "drain._drain_once") for call in calls))
+
+    def test_a_tail_audit_refusal_does_not_replace_the_committed_success(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
+
+        own_vlan(self.management, 1630, "renderer-audit-tail-refusal")
+        adapter = ReceiptAdapter()
+        real_respond = adapter._respond
+
+        def respond(body):
+            if len(adapter.requests) == 1:
+                in_thread(lambda: enqueue(self.device, "vlan"))
+            return real_respond(body)
+
+        adapter._respond = respond
+        config, session = adapter.patches()
+        with (
+            config,
+            session,
+            patch(
+                "netbox_nso_plugin.renderer_audit.audit_renderer_scopes",
+                side_effect=(None, RendererAuditRepairFailed("tail audit failed")),
+            ),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan")
+
+        self.assertEqual(outcome, drain.SUCCEEDED)
+        self.assertEqual(len(entries(self.device, "vlan", unconsumed=True)), 1)
