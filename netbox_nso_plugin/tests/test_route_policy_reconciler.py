@@ -1774,6 +1774,45 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(st.is_materialized)
         self.assertEqual(st.status, "imported")
 
+    def test_group_lock_rechecks_an_owner_that_finished_after_discovery(self):
+        from contextlib import contextmanager
+
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        name = "PL-OWNER-RACE"
+        reconcile_route_policy(self.d1, self._pl(name, ["198.18.0.0/24"]))
+        owner = NSORoutePolicyState.objects.get(management__device=self.d1, object_name=name)
+        content_update(owner, is_materialized=False)
+
+        from netbox_nso_plugin import route_policy_reconciler
+
+        group_content_mutation = route_policy_reconciler._group_content_mutation
+
+        @contextmanager
+        def owner_finishes_before_content_write(family, object_name):
+            with group_content_mutation(family, object_name):
+                NSORoutePolicyState.objects.filter(pk=owner.pk).update(is_materialized=True)
+                yield
+
+        with patch(
+            "netbox_nso_plugin.route_policy_reconciler._group_content_mutation",
+            owner_finishes_before_content_write,
+        ):
+            reconcile_route_policy(self.d2, self._pl(name, ["198.18.1.0/24"]))
+
+        owner.refresh_from_db()
+        root = PrefixList.objects.get(name=name)
+        prefixes = {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list=root)}
+        self.assertTrue(owner.is_materialized)
+        self.assertEqual(prefixes, {"198.18.0.0/24"})
+
     def test_first_prefix_list_capture_replaces_a_populated_unowned_root(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry
