@@ -427,6 +427,44 @@ class TestReconcileRedistribution(TestCase):
         destination = OSPFInstance.objects.get(device=self.device, process_id="1")
         self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.lock_footprint.source_rows)
 
+    def test_plan_locks_devices_that_share_a_route_map_without_expanding_revisions(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, RouteMap
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        self._make_mgmt()
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        route_map = RouteMap.objects.create(name="RM-SHARED-REDIST")
+        other_device = Device.objects.create(
+            name="rd-router-policy-target",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        instance = NSOInstance.objects.get(name="rd-inst")
+        other_management = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=instance,
+            nso_device_name=other_device.name,
+        )
+        NSORoutePolicyState.objects.create(
+            management=other_management,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            family="route_map",
+            object_name=route_map.name,
+        )
+
+        plan = redistribution_reconcile_plan(
+            self.device,
+            {"entries": [self._entry(route_map=route_map.name, metric=10)]},
+        )
+
+        self.assertEqual(set(plan.lock_footprint.device_ids), {self.device.pk, other_device.pk})
+        self.assertNotIn((other_device.pk, "route_policy"), plan.lock_footprint.revision_keys)
+
     def test_omitted_default_metric_type_migrates_prior_mirrored_default_to_absence(self):
         """A corrected reader omits a default-only metric-type.
 
