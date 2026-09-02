@@ -5,6 +5,7 @@
 import contextlib
 import copy
 import logging
+from dataclasses import replace
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,7 @@ def redistribution_reconcile_plan(device, payload):
     """Freeze every native and overlay redistribution write before reconciliation."""
     from django.utils import timezone
 
+    from .intent_state import MutationFootprint, route_policy_footprint
     from .renderer_writer import RendererMutationPlan
 
     planned_at = timezone.now()
@@ -20,12 +22,28 @@ def redistribution_reconcile_plan(device, payload):
         saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, payload, planned_at)
     except ImportError:
         return RendererMutationPlan.build(planned_at=planned_at)
-    return RendererMutationPlan.build(
+    plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
         read_dependencies=dependencies,
         planned_at=planned_at,
     )
+    route_map_groups = {
+        ("route_map", entry.get("route_map")) for entry in payload.get("entries") or [] if entry.get("route_map")
+    }
+    policy_footprint = route_policy_footprint(route_map_groups)
+    policy_dependencies = MutationFootprint.for_keys(
+        (),
+        shared_keys=policy_footprint.shared_keys,
+        source_rows=policy_footprint.source_rows,
+        overlay_rows=policy_footprint.overlay_rows,
+    )
+    lock_footprint = MutationFootprint.merge(plan.lock_footprint, policy_dependencies)
+    lock_footprint = replace(
+        lock_footprint,
+        device_ids=tuple(sorted({*lock_footprint.device_ids, *policy_footprint.device_ids})),
+    )
+    return replace(plan, lock_footprint=lock_footprint)
 
 
 def redistribution_reconcile_footprint(device, payload=None):
