@@ -347,6 +347,11 @@
     </div>
   </div>
 
+  <div id="nso-apply-state-error" class="alert alert-warning mb-3 d-none" role="alert">
+    <span class="mdi mdi-alert-outline me-1"></span>
+    Apply state is unavailable: <span data-slot="message"></span>
+  </div>
+
   {# The poll fills this panel only when the executable Apply head is blocked. #}
   <div id="nso-blocked-generation" class="alert alert-danger mb-3 d-none" role="alert">
     <div class="d-flex align-items-start">
@@ -485,7 +490,12 @@
       }
     }
     var applyStateBox = document.getElementById('nso-blocked-generation');
-    function renderApplyState(state) {
+    var applyStateErrorBox = document.getElementById('nso-apply-state-error');
+    function renderApplyState(state, error) {
+      if (applyStateErrorBox) {
+        applyStateErrorBox.querySelector('[data-slot="message"]').textContent = error || '';
+        applyStateErrorBox.classList.toggle('d-none', !error);
+      }
       var head = state && state.head;
       if (!applyStateBox) return;
       if (!state || !state.blocked || !head) { applyStateBox.classList.add('d-none'); return; }
@@ -556,7 +566,7 @@
         .then(function (r) { return r.json(); })
         .then(function (d) {
           render(d);
-          renderApplyState(d && d.apply_state);
+          renderApplyState(d && d.apply_state, d && d.apply_state_error);
           renderBlocked(d && d.blocked_removals);
           renderResidue(d && d.residue_removals);
           var running = !!(d && d.running);

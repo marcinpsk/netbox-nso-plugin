@@ -256,6 +256,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         data = self._get_jobs(jobs, apply_state_status=503)
 
         self.assertIsNone(data["apply_state"])
+        self.assertEqual(data["apply_state_error"], "The NSO adapter request failed. See the server log.")
         self.assertEqual(data["jobs"], jobs)
         self.assertEqual(data["running"], running)
         self.assertEqual(data["last"], blocked)

@@ -1005,7 +1005,36 @@ def abandon_generation(adapter_device_id: int, generation_id: int) -> dict:
 
 def get_device_apply_state(adapter_device_id: int) -> dict:
     """Return the device-wide executable Apply head and barrier state."""
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/apply-state")
+    state = _request("GET", f"/api/v1/devices/{adapter_device_id}/apply-state")
+    if not isinstance(state, dict):
+        raise AdapterError("Adapter returned a malformed Apply state.", code="invalid_response")
+    expected_types = {
+        "device_id": int,
+        "blocked": bool,
+        "write_work_pending": bool,
+        "held_jobs": list,
+        "pending_generations": int,
+    }
+    for field_name, expected_type in expected_types.items():
+        if type(state.get(field_name)) is not expected_type:
+            raise AdapterError(
+                f"Adapter returned a malformed Apply state: {field_name} has an invalid type.",
+                code="invalid_response",
+            )
+    head = state.get("head")
+    if head is not None and (
+        not isinstance(head, dict)
+        or type(head.get("generation_id")) is not int
+        or not isinstance(head.get("status"), str)
+        or not isinstance(head.get("sections"), list)
+        or any(not isinstance(section, str) for section in head["sections"])
+    ):
+        raise AdapterError("Adapter returned a malformed Apply state head.", code="invalid_response")
+    if state["blocked"] and head is None:
+        raise AdapterError("Adapter returned a blocked Apply state without a head.", code="invalid_response")
+    if any(type(job_id) is not int for job_id in state["held_jobs"]) or state["pending_generations"] < 0:
+        raise AdapterError("Adapter returned malformed Apply state counters.", code="invalid_response")
+    return state
 
 
 def sync_notify(adapter_device_id):
