@@ -1547,6 +1547,8 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
+        from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
+
         try:
             _drain_once(
                 device_id,
@@ -1558,8 +1560,8 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
                 _deadline_at=deadline_at,
                 _chained=True,
             )
-        except DeploymentQuiesced:
-            logger.info("%s/%s left its tail to the tick because a deployment started", device_id, scope)
+        except (DeploymentQuiesced, RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
+            logger.info("%s/%s left its tail to the tick: %s", device_id, scope, exc)
     return None
 
 

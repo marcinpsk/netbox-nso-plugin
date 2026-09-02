@@ -352,7 +352,10 @@ def audit_renderer_scopes(
             float,
         )
         deadline = _monotonic() + budget
-    management = NSODeviceManagement.objects.filter(device_id=device_id).first()
+    management = NSODeviceManagement.objects.filter(
+        device_id=device_id,
+        adapter_device_id__isnull=False,
+    ).first()
     if management is None:
         return RendererAuditResult(selected, (), deferred)
 

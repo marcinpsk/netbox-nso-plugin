@@ -168,6 +168,7 @@ _PROMOTED_CONTENT_FIELDS = {
         "vrf",
         "source",
     },
+    "netbox_nso_plugin.nsobgppeertemplatestate": set(),
     "netbox_nso_plugin.nsovlanstate": {"management", "vlan"},
     "netbox_nso_plugin.nsoswitchportstate": {
         "management",
@@ -634,6 +635,11 @@ def _declared_fields_fragment(instance):
         (name, _normal(getattr(instance, instance._meta.get_field(name).attname)))
         for name in sorted(spec.content_fields)
     )
+
+
+def _lifecycle_only_fragment(instance):
+    """Exclude one tracked compliance row that does not contribute to the wire body."""
+    return ABSENT
 
 
 def canonical_fragment(instance, spec: RendererInputSpec | None = None):
@@ -2525,7 +2531,7 @@ def _register(
             content_fields=content,
             lifecycle_fields=lifecycle,
             resolver=_generic_keys,
-            required_trace_fixtures=tuple(fixtures or scopes),
+            required_trace_fixtures=tuple(scopes if fixtures is None else fixtures),
             fragment=_declared_fields_fragment,
             shared_kind=shared_kind,
         ),
@@ -2594,6 +2600,7 @@ def register_builtin_renderer_inputs() -> None:
         "netbox_nso_plugin.nsoisisinstancestate": ("isis",),
         "netbox_nso_plugin.nsoisisinterfacestate": ("isis",),
         "netbox_nso_plugin.nsobgppeerstate": ("bgp",),
+        "netbox_nso_plugin.nsobgppeertemplatestate": ("bgp",),
         "netbox_nso_plugin.nsoredistributionstate": ("bgp", "isis", "ospf"),
         "netbox_nso_plugin.nsoroutepolicystate": ("route_policy",),
         "netbox_nso_plugin.nsoospfinstancestate": ("ospf",),
@@ -2635,6 +2642,7 @@ def register_builtin_renderer_inputs() -> None:
             scopes,
             model=model,
             content_fields=content_fields,
+            fixtures=() if label == "netbox_nso_plugin.nsobgppeertemplatestate" else None,
         )
     _register_auto_through(
         apps.get_model("netbox_nso_plugin.nsoswitchportstate"),
@@ -2665,6 +2673,7 @@ def register_builtin_renderer_inputs() -> None:
     exact_direct_fragments = {
         "netbox_nso_plugin.nsobfdinterfacestate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsobgppeerstate": _direct_overlay_fragment,
+        "netbox_nso_plugin.nsobgppeertemplatestate": _lifecycle_only_fragment,
         "netbox_nso_plugin.nsointerfaceipstate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsointerfacemtustate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsoisisflexalgostate": _direct_overlay_fragment,

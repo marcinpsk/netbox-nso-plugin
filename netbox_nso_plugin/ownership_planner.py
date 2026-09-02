@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import dataclass
 from enum import Enum
 
@@ -528,6 +529,13 @@ def _manifest_record_actions(device_id, requested):
 
     planned = []
     seen = set()
+    manifest_states = {
+        (scope, native_model_label, json.dumps(native_key, sort_keys=True)): ownership_state
+        for scope, native_model_label, native_key, ownership_state in NSOOwnershipManifest.objects.filter(
+            device_id=device_id,
+            scope__in=tuple(requested),
+        ).values_list("scope", "native_model_label", "native_key", "ownership_state")
+    }
     for spec in renderer_input_specs().values():
         if requested.isdisjoint(spec.scopes) or spec.model_label not in OVERLAY_MODEL_RANKS:
             continue
@@ -552,16 +560,7 @@ def _manifest_record_actions(device_id, requested):
             rule, scope, bound_device_id, native_model_label, native_key = binding
             if scope not in requested or bound_device_id != device_id:
                 continue
-            manifest_state = (
-                NSOOwnershipManifest.objects.filter(
-                    device_id=device_id,
-                    scope=scope,
-                    native_model_label=native_model_label,
-                    native_key=native_key,
-                )
-                .values_list("ownership_state", flat=True)
-                .first()
-            )
+            manifest_state = manifest_states.get((scope, native_model_label, json.dumps(native_key, sort_keys=True)))
             action = plan_ownership(
                 rule,
                 OwnershipSignature(

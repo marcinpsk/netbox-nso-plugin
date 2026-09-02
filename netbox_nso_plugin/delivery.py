@@ -27,6 +27,7 @@ import dataclasses
 import hashlib
 import json
 import threading
+import time
 from collections.abc import Callable
 
 MODE_NORMAL = "normal"
@@ -327,13 +328,19 @@ def send(
 
 def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, mark: bool = False):
     """Render *key* for one device and send it straight away, outside the claim protocol."""
-    from .renderer_audit import audit_renderer_scopes
+    from . import adapter_client
+    from .drain import SEND_DEADLINE
+    from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed, audit_renderer_scopes
 
-    audit_renderer_scopes(
-        device_id,
-        (key,),
-        trigger="delivery.deliver",
-        pre_capture=True,
-    )
+    try:
+        audit_renderer_scopes(
+            device_id,
+            (key,),
+            trigger="delivery.deliver",
+            pre_capture=True,
+            deadline=time.monotonic() + SEND_DEADLINE.total_seconds(),
+        )
+    except (RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
+        raise adapter_client.AdapterError("Renderer audit failed.", code="renderer_audit_failed") from exc
     rendered = render(key, device_id, adapter_device_id)
     return send(rendered, rendered.payload, mode=mode, mark=mark)

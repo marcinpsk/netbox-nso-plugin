@@ -816,7 +816,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "dcim.interface_tagged_vlans",
                 "ipam.rir",
                 "ipam.vlangroup",
-                "netbox_nso_plugin.nsobgppeertemplatestate",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.ospfinstance",
@@ -837,7 +836,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "vpn.l2vpntermination",
             },
         )
-        self.assertTrue(all(spec.required_trace_fixtures for spec in renderer_input_specs().values()))
+        self.assertTrue(
+            all(spec.required_trace_fixtures or not spec.content_fields for spec in renderer_input_specs().values())
+        )
 
     def test_reconcile_footprint_rejects_a_registered_model_without_a_lock_rank(self):
         from netbox_nso_plugin import intent_state
@@ -1070,6 +1071,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(observed - declared, set(), f"undeclared renderer sources: {sorted(observed - declared)}")
         for label, spec in renderer_input_specs().items():
             with self.subTest(label=label):
+                if not spec.required_trace_fixtures:
+                    self.assertFalse(spec.content_fields)
+                    continue
                 exercised = {
                     fixture
                     for fixture in spec.required_trace_fixtures

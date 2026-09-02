@@ -154,6 +154,18 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             sync_before_apply=False,
         )
 
+        def assert_source_locks():
+            self.assertIsInstance(_probe_lock(Device.objects.filter(pk=self.device.pk)), OperationalError)
+            self.assertIsInstance(_probe_lock(IPAddress.objects.filter(pk=primary.pk)), OperationalError)
+
+        def get_device(*args, **kwargs):
+            assert_source_locks()
+            return {"failover": None}
+
+        def get_scope(*args, **kwargs):
+            assert_source_locks()
+            return {"attributes": [], "auto_apply": False, "sync_before_apply": True}
+
         def assert_lock_window(*args, **kwargs):
             self.assertTrue(connection.in_atomic_block)
             self.assertEqual(args, (self.management.adapter_device_id, ["description", "enabled"]))
@@ -169,11 +181,8 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
             return {}
 
         with (
-            patch("netbox_nso_plugin.adapter_client.get_device", return_value={"failover": None}),
-            patch(
-                "netbox_nso_plugin.adapter_client.get_scope",
-                return_value={"attributes": [], "auto_apply": False, "sync_before_apply": True},
-            ),
+            patch("netbox_nso_plugin.adapter_client.get_device", side_effect=get_device),
+            patch("netbox_nso_plugin.adapter_client.get_scope", side_effect=get_scope),
             patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=assert_lock_window) as set_scope,
         ):
             self.assertTrue(reconcile_management_control(self.device.pk))

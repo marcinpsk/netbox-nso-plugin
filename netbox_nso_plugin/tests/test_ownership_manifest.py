@@ -2,6 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """#1627: durable ownership manifest schema."""
 
+from unittest.mock import patch
+
 from django.test import SimpleTestCase, TestCase
 
 
@@ -129,10 +131,18 @@ class TestOwnershipManifestMaintenance(TestCase):
             ]
             NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="vlan").delete()
 
-            with CaptureQueriesContext(connection) as queries:
+            with (
+                patch.object(
+                    ownership_planner,
+                    "_manifest_record_actions",
+                    wraps=ownership_planner._manifest_record_actions,
+                ) as record_actions,
+                CaptureQueriesContext(connection) as queries,
+            ):
                 completed = ownership_planner.reconcile_scope_ownership(device.pk, {"vlan"})
 
             self.assertCountEqual(completed, (("vlan", state.pk) for state in states))
+            self.assertEqual(record_actions.call_count, 2)
             query_counts.append(len(queries))
 
         self.assertEqual(query_counts[2] - query_counts[1], query_counts[1] - query_counts[0])
