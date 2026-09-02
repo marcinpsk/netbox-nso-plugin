@@ -1454,6 +1454,7 @@ def _drain_once(
     deadline=None,
     _deadline_at=None,
     _chained=False,
+    _audit=True,
 ) -> tuple[str, object]:
     """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``.
 
@@ -1463,12 +1464,13 @@ def _drain_once(
     _refuse_in_transaction("drain")
     from .renderer_audit import audit_renderer_scopes
 
-    audit_renderer_scopes(
-        device_id,
-        (scope,),
-        trigger="drain._drain_once",
-        pre_capture=True,
-    )
+    if _audit:
+        audit_renderer_scopes(
+            device_id,
+            (scope,),
+            trigger="drain._drain_once",
+            pre_capture=True,
+        )
     if deadline is not None and _deadline_at is None:
         _deadline_at = _send_clock() + deadline
     if not delivery.delivery_keys()[scope].in_protocol:
@@ -1504,6 +1506,7 @@ def _drain_once(
             deadline=deadline,
             _deadline_at=_deadline_at,
             _chained=_chained,
+            _audit=False,
         )
     if answer is _PARKED_SEND:
         return PARKED, None
@@ -1554,6 +1557,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
             deadline=deadline,
             _deadline_at=deadline_at,
             _chained=chained,
+            _audit=False,
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
@@ -1569,6 +1573,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
                 deadline=deadline,
                 _deadline_at=deadline_at,
                 _chained=True,
+                _audit=False,
             )
         except (DeploymentQuiesced, RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
             logger.info("%s/%s left its tail to the tick: %s", device_id, scope, exc)
