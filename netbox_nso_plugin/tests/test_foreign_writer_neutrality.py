@@ -169,13 +169,13 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
         table = NSOVLANState._meta.db_table
         vlan = VLAN.objects.create(vid=1672, name="foreign-raw-target")
         with connection.cursor() as cursor:
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'UPDATE "{table}" SET device_name = %s WHERE id = %s',
                 ["foreign-raw-update", self.state.pk],
             )
             self.assertEqual(self.device_name_of(self.state.pk), "foreign-raw-update")
 
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'WITH target AS (SELECT id FROM "{table}" WHERE id = %s) '
                 f'UPDATE "{table}" AS state SET device_name = %s FROM target WHERE state.id = target.id',
                 [self.state.pk, "foreign-update-from"],
@@ -183,7 +183,7 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
             self.assertEqual(self.device_name_of(self.state.pk), "foreign-update-from")
 
             columns, terms, params = self.raw_columns(f'"{table}"', vlan_id=vlan.pk, device_name="insert-select")
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'INSERT INTO "{table}" ({columns}) SELECT {terms} FROM "{table}" WHERE id = %s',
                 [*params, self.state.pk],
             )
@@ -191,21 +191,24 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
             self.assertEqual(inserted.device_name, "insert-select")
 
             columns, terms, params = self.raw_columns(vlan_id=vlan.pk, device_name="conflict-do-nothing")
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'INSERT INTO "{table}" ({columns}) VALUES ({terms}) ON CONFLICT (management_id, vlan_id) DO NOTHING',
                 params,
             )
             self.assertEqual(self.device_name_of(inserted.pk), "insert-select")
 
             columns, terms, params = self.raw_columns(vlan_id=vlan.pk, device_name="conflict-do-update")
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'INSERT INTO "{table}" ({columns}) VALUES ({terms}) '
                 "ON CONFLICT (management_id, vlan_id) DO UPDATE SET device_name = EXCLUDED.device_name",
                 params,
             )
             self.assertEqual(self.device_name_of(inserted.pk), "conflict-do-update")
 
-            cursor.execute(f'DELETE FROM "{table}" WHERE id = %s', [inserted.pk])
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
+                f'DELETE FROM "{table}" WHERE id = %s',
+                [inserted.pk],
+            )
 
         self.state.refresh_from_db()
         self.assertEqual(self.state.device_name, "foreign-update-from")
@@ -223,17 +226,20 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
         vlans = [VLAN.objects.create(vid=1680 + index, name=f"foreign-values-{index}") for index in range(4)]
         with connection.cursor() as cursor:
             columns, terms, params = self.raw_columns(vlan_id=vlans[0].pk, device_name="values-single")
-            cursor.execute(f'INSERT INTO "{table}" ({columns}) VALUES ({terms})', params)
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
+                f'INSERT INTO "{table}" ({columns}) VALUES ({terms})',
+                params,
+            )
 
             columns, terms, first = self.raw_columns(vlan_id=vlans[1].pk, device_name="values-first")
             _columns, _terms, second = self.raw_columns(vlan_id=vlans[2].pk, device_name="values-second")
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'INSERT INTO "{table}" ({columns}) VALUES ({terms}), ({terms})',
                 [*first, *second],
             )
 
             columns, terms, params = self.raw_columns("source", vlan_id=vlans[3].pk, device_name="cte-insert")
-            cursor.execute(
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
                 f'WITH source AS (SELECT * FROM "{table}" WHERE id = %s) '
                 f'INSERT INTO "{table}" ({columns}) SELECT {terms} FROM source',
                 [self.state.pk, *params],

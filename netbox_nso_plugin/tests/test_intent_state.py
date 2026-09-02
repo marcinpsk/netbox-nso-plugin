@@ -1150,7 +1150,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "dcim.interface_tagged_vlans",
                 "ipam.rir",
                 "ipam.vlangroup",
-                "netbox_nso_plugin.nsobgppeertemplatestate",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.bfdinterface",
@@ -1170,9 +1169,18 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             },
         )
         # A protocol-only input declares no render-trace fixture: nothing renders from it.
+        protocol_only = {label for label, spec in renderer_input_specs().items() if not spec.required_trace_fixtures}
         self.assertEqual(
-            {label for label, spec in renderer_input_specs().items() if not spec.required_trace_fixtures},
-            {"netbox_routing.ospfinstance"},
+            protocol_only,
+            {"netbox_nso_plugin.nsobgppeertemplatestate", "netbox_routing.ospfinstance"},
+        )
+        self.assertTrue(
+            all(
+                spec.required_trace_fixtures or not spec.content_fields
+                for label, spec in renderer_input_specs().items()
+                # The OSPF instance is registered for its collector plan alone, so its content never renders.
+                if label != "netbox_routing.ospfinstance"
+            )
         )
 
     def test_reconcile_footprint_rejects_a_registered_model_without_a_lock_rank(self):
