@@ -134,11 +134,11 @@ def _bgp_plan_peer_dependencies(device, states, reported, payload):
         if not source:
             continue
         try:
-            ipaddress.ip_address(source)
+            parsed_source = ipaddress.ip_address(source)
         except ValueError:
             source_interfaces.add(source)
         else:
-            source_ips.add(source)
+            source_ips.add(str(parsed_source))
     address_filter = Q(pk__in=[])
     for source in source_ips:
         address_filter |= Q(address__net_host=source)
@@ -671,11 +671,11 @@ def _peer_plan_changes_native_content(
     source_ip = update_source = None
     if source:
         try:
-            ipaddress.ip_address(source)
+            parsed_source = ipaddress.ip_address(source)
         except ValueError:
             update_source = interfaces_by_name.get(source)
         else:
-            source_ip = addresses_by_host.get(source)
+            source_ip = addresses_by_host.get(str(parsed_source))
             unresolved = unresolved or source_ip is None
     desired = _peer_desired(
         peer_entry,

@@ -38,7 +38,10 @@ Write side (operator-driven):
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 # --- States -----------------------------------------------------------------
 
@@ -488,7 +491,6 @@ def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
 
     if hasattr(stale, "_meta"):
         from .intent_state import (
-            IntentMutationProtocolError,
             ReconcileMutationPlan,
             footprint_for_instance,
             reconcile_transaction,
@@ -509,5 +511,9 @@ def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
                 return
             except _StaleOverlayStatusChanged:
                 stale.refresh_from_db()
-        raise IntentMutationProtocolError("a stale overlay changed status during finalization")
+        logger.warning(
+            "Stale overlay %s changed status twice during finalization. The next reconcile will retry it.",
+            stale.pk,
+        )
+        return
     finalise_locked()

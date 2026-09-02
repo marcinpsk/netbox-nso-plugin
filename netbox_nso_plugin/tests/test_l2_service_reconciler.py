@@ -130,6 +130,30 @@ class TestReconcileL2Services(TestCase):
         assert L2VPNTermination.objects.filter(assigned_object_id=self.port.pk).count() == 1
         assert NSOL2SapState.objects.filter(management=self.mgmt, service_name="701").count() == 1
 
+    def test_matching_read_does_not_settle_a_deploying_sap(self):
+        from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        payload = _payload(
+            [
+                {
+                    "service_name": "701",
+                    "service_type": "vpls",
+                    "saps": [{"sap_id": "1/1/c31/3:701", "port": "1/1/c31/3", "outer_tag": 701}],
+                }
+            ]
+        )
+        reconcile_l2_services(self.device, payload)
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
+        content_update(state, status="deploying")
+
+        self.assertFalse(l2_service_reconcile_plan(self.device, payload).changes_content)
+        reconcile_l2_services(self.device, payload)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+
     def test_owned_sap_keeps_service_type_intent_when_device_differs(self):
         reconcile_l2_services(
             self.device,

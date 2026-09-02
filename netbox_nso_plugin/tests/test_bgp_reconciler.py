@@ -1023,6 +1023,20 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         self.assertTrue(bgp_reconcile_plan(self.device, payload).changes_content)
 
+    def test_plan_normalizes_equivalent_source_ip_text(self):
+        mgmt = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        peer = self._peer_entry()
+        peer["source"] = "2001:0DB8:0000:0000:0000:0000:0000:0001"
+        payload = self._payload(self._router_payload(peers=[peer]))
+        _reconcile_bgp_config(self.device, payload)
+        content_update(NSOBGPPeerState.objects.get(management=mgmt), status="in_sync")
+
+        self.assertFalse(bgp_reconcile_plan(self.device, payload).changes_content)
+
     def test_plan_batches_owned_peer_dependency_lookups(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

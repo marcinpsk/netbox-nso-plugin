@@ -4480,7 +4480,7 @@ def _save_route_map_name_edit(state, old_name):
         intent_transaction,
         route_policy_footprint,
     )
-    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .models import NSORedistributionState, NSORoutePolicyObjectClass, NSORoutePolicyState
     from .signals import suppress_intent_push
 
     route_map = state.assigned_object
@@ -4501,11 +4501,13 @@ def _save_route_map_name_edit(state, old_name):
         classes = list(
             NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
         )
-        fallback_redistribution = [
-            row
-            for row in redistribution_states
-            if row.redistribution_id is None and row.route_map.casefold() == old_name.casefold()
-        ]
+        fallback_redistribution = list(
+            NSORedistributionState.objects.filter(
+                pk__in=[row.pk for row in redistribution_states],
+                redistribution__isnull=True,
+                route_map__iexact=old_name,
+            ).order_by("pk")
+        )
         now = timezone.now()
         with suppress_intent_push():
             for attached_state in attached:

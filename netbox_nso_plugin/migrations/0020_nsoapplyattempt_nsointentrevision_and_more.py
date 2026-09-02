@@ -96,6 +96,7 @@ class Migration(migrations.Migration):
                     ("p2p", "Auto-assigned P2P pair"),
                 ],
                 default="manual",
+                help_text="The allocation shape that owns cleanup of the source pool.",
                 max_length=16,
             ),
         ),

@@ -5152,6 +5152,47 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.status, "accepted")
 
+    def test_edit_route_map_name_rechecks_fallback_references_after_locking(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import intent_transaction, offline_mutation
+        from netbox_nso_plugin.models import NSORedistributionState, NSORoutePolicyState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import _save_route_map_name_edit
+
+        route_map = RouteMap.objects.create(name="RM-RACE-OLD")
+        state = NSORoutePolicyState.objects.create(
+            management=self.mgmt,
+            family="route_map",
+            object_name=route_map.name,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            status="accepted",
+        )
+        fallback = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="ospf",
+            source_protocol="connected",
+            route_map=route_map.name,
+            status="accepted",
+        )
+
+        def acquire_after_competing_edit(footprint):
+            with offline_mutation():
+                NSORedistributionState.objects.filter(pk=fallback.pk).update(route_map="RM-RACE-OTHER")
+            return intent_transaction(footprint)
+
+        state.object_name = "RM-RACE-NEW"
+        with (
+            suppress_intent_push(),
+            patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=acquire_after_competing_edit),
+        ):
+            _save_route_map_name_edit(state, route_map.name)
+
+        fallback.refresh_from_db()
+        self.assertEqual(fallback.route_map, "RM-RACE-OTHER")
+
     def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import RouteMap

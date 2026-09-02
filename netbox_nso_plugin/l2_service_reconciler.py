@@ -140,7 +140,13 @@ def _reconcile_sap(NSOL2SapState, L2VPNTermination, mgmt, l2vpn, svc, sap, iface
         observed_outer_tag,
         observed_inner_tag,
     )
-    state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict, settles_owned=False)
+    state.status = sm.on_reconcile(
+        state.status,
+        matches=matches,
+        conflict=conflict,
+        settles_owned=False,
+        settles_deploying=False,
+    )
     state.save()
 
 

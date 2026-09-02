@@ -1424,7 +1424,7 @@ class TestQueuedCarrierArbiter(TestCase):
 
 class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
     def setUp(self):
-        with transaction.atomic():
+        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), transaction.atomic():
             self.mgmt = _make_mgmt(_make_device(f"rg-orch-{uuid.uuid4().hex[:8]}"))
         self.epoch = self.mgmt.adapter_device_id
         self.conn = _redis()

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
 from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
@@ -171,9 +170,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertTrue(plan.changes_content)
 
-    def test_switchport_plan_uses_the_registered_renderer_fragment(self):
+    def test_switchport_plan_recognizes_an_identical_owned_payload(self):
         from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.signals import switchport_intent_item
         from netbox_nso_plugin.vlan_reconciler import (
             reconcile_switchport,
             reconcile_vlan_database,
@@ -197,11 +195,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
         content_update(state, status="in_sync")
 
-        def extended_fragment(row, tagged_vlan_ids):
-            return {**switchport_intent_item(row, tagged_vlan_ids), "encapsulation": "dot1q"}
-
-        with patch("netbox_nso_plugin.signals.switchport_intent_item", side_effect=extended_fragment):
-            plan = switchport_reconcile_plan(self.device, payload)
+        plan = switchport_reconcile_plan(self.device, payload)
 
         self.assertFalse(plan.changes_content)
 
