@@ -411,7 +411,6 @@ class TestReconcileStaticRoutes(TestCase):
         from netbox_nso_plugin.template_content import _reconcile_static_routes
 
         mgmt = self._make_mgmt(self.device, nso_device_name="sr-tag-owned")
-        baseline_entries = []
         for i, (owned, expected) in enumerate(
             (
                 ("accepted", "accepted"),
@@ -431,14 +430,14 @@ class TestReconcileStaticRoutes(TestCase):
                 entry = self._route_entry(str(route.prefix), str(route.next_hop))
 
                 entry_tag = dict(entry, tag=42)
-                _reconcile_static_routes(self.device, self._route_payload(*baseline_entries, entry_tag))
+                _reconcile_static_routes(self.device, self._route_payload(entry_tag))
                 state.refresh_from_db()
                 tag_result = state.status
 
                 # the same row driven by a METRIC mismatch instead — must land identically
                 state.status = owned
                 state.save(update_fields=["status"])
-                _reconcile_static_routes(self.device, self._route_payload(*baseline_entries, dict(entry, metric=99)))
+                _reconcile_static_routes(self.device, self._route_payload(dict(entry, metric=99)))
                 state.refresh_from_db()
 
                 self.assertEqual(tag_result, expected)

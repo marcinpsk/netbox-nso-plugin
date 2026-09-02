@@ -924,7 +924,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "imported")  # unowned + matches → no drift
 
     def test_duplicate_peer_group_plan_uses_reconcile_traversal_order(self):
-        """The plan and reconcile select the same last duplicate peer-group definition."""
+        """The content-neutral plan and reconcile select the last peer-group definition."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate
@@ -944,7 +944,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             self._scope_with_peer_groups([ipv4], asn="65100")["routers"][0],
         )
 
-        self.assertTrue(bgp_reconcile_plan(self.device, reordered).changes_content)
+        self.assertFalse(bgp_reconcile_plan(self.device, reordered).changes_content)
         _reconcile_bgp_config(self.device, reordered)
 
         template = BGPPeerTemplate.objects.get(name="PG")
@@ -952,7 +952,24 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             assigned_object_type__model="bgppeertemplate",
             assigned_object_id=template.pk,
         ).values_list("address_family__address_family", flat=True)
-        self.assertEqual(set(address_families), {"ipv6-unicast"})
+        self.assertEqual(list(address_families), ["ipv6-unicast"])
+
+    def test_invalid_router_peer_group_does_not_hide_valid_template(self):
+        """A skipped router cannot prevent a valid peer-group reconciliation."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        group = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast"}]}
+        valid_router = self._scope_with_peer_groups([group], asn="65100")["routers"][0]
+        _reconcile_bgp_config(self.device, self._payload(valid_router))
+
+        invalid_router = self._scope_with_peer_groups([group], asn="not-a-number")["routers"][0]
+        _reconcile_bgp_config(self.device, self._payload(valid_router, invalid_router))
+
+        state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
+        self.assertEqual(state.status, "imported")
 
     def test_duplicate_peer_group_remote_as_uses_reconcile_traversal_order(self):
         """The plan and reconcile select the same remote AS for a duplicate name."""

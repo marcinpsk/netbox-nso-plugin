@@ -543,8 +543,6 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
     def test_a_second_writer_of_one_route_waits_on_the_first(self):
         """The overlay row is the serialization point, which is what the id order rests on."""
-        from ._static_route_case import _accept_with_permit
-
         route = own_route(self.mgmt, "198.51.100.144/28", "198.51.100.10")
         self.clear_entries()
         deleted = threading.Event()

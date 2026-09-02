@@ -1892,7 +1892,7 @@ def deletion_footprint_for_instance(instance) -> MutationFootprint:
 
     def add(model, pks, *, future=False):
         label = model._meta.label_lower
-        if label not in _REGISTRY or label == "netbox_nso_plugin.nsodevicemanagement":
+        if label not in _REGISTRY:
             return
         target = overlay_rows if label in OVERLAY_MODEL_RANKS else source_rows
         if future:

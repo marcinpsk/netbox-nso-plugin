@@ -255,21 +255,35 @@ class _ExactOverlayFormMixin:
     }
 
     def save(self, commit=True):
+        from django.utils import timezone
+
+        from . import status_machine as sm
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         obj = super().save(commit=False)
         if not commit:
             return obj
         created = obj.pk is None or obj._state.adding
-        plan = RendererMutationPlan.build(
-            saves=(
-                planned_save(
-                    obj,
-                    force_insert=created,
-                    natural_key=self._NATURAL_KEYS[obj._meta.label_lower],
-                ),
+
+        def build_plan():
+            return RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        obj,
+                        force_insert=created,
+                        natural_key=self._NATURAL_KEYS[obj._meta.label_lower],
+                    ),
+                )
             )
-        )
+
+        changed_content = bool(set(self.changed_data) - {"tags"})
+        if not created and changed_content:
+            obj.status = sm.on_operator_edit(obj.status)
+            if hasattr(obj, "apply_attempt_id"):
+                obj.apply_attempt_id = None
+            if obj.accepted_at is None:
+                obj.accepted_at = timezone.now()
+        plan = build_plan()
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
             writer.save(obj, force_insert=created)

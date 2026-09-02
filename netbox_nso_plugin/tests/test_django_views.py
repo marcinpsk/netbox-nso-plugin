@@ -4010,6 +4010,29 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNone(row.apply_attempt_id)
 
+    def test_full_logging_level_edit_takes_ownership_of_an_imported_row(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = NSOLoggingLevelState.objects.create(
+            management=self.mgmt,
+            console_severity="WARNING",
+            status="imported",
+        )
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsologginglevelstate_edit", kwargs={"pk": row.pk}),
+            {
+                "console_severity": "INFORMATIONAL",
+                "monitor_severity": "",
+                "module_severity": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302, response.content)
+        row.refresh_from_db()
+        self.assertEqual(row.console_severity, "INFORMATIONAL")
+        self.assertEqual(row.status, "accepted")
+
     def test_logging_host_rejects_port_outside_writer_uint16(self):
         from netbox_nso_plugin.models import NSOLoggingHostState
 

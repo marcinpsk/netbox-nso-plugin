@@ -1858,6 +1858,25 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row.delete()
         push.assert_not_called()
 
+    def test_l2_sap_delete_pushes_reduced_snapshot(self):
+        from netbox_nso_plugin.models import NSOL2SapState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOL2SapState.objects.create(
+                management=mgmt,
+                service_name="TL",
+                service_type="epipe",
+                sap_id="lag-60:3999",
+                port="lag-60",
+                outer_tag=3999,
+                status="accepted",
+            )
+        self._delete_pushes(row, "put_l2_sap_intent", exact_writer=True)
+
     def test_isis_flex_algo_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
 
