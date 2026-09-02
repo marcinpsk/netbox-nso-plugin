@@ -309,6 +309,8 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
         _update_management_mirror(mgmt, adapter_link_error="adapter unavailable")
 
+        self.assertFalse(type(mgmt).objects.filter(pk=mgmt.pk).exists())
+
     def test_created_onboards_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=None)
 
@@ -2145,6 +2147,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
             pre_delete.disconnect(capture_origin, sender=NSOSVIState)
 
         self.assertEqual(origins, [self.device])
+        self._assert_teardown_touched_only_the_offboard(calls)
+
+    def test_bulk_deleting_a_device_pushes_no_intent(self):
+        mgmt = self._mgmt()
+        self._owned_svi(mgmt)
+
+        calls = self._recorded_calls(lambda: type(self.device).objects.filter(pk=self.device.pk).delete())
+
         self._assert_teardown_touched_only_the_offboard(calls)
 
 

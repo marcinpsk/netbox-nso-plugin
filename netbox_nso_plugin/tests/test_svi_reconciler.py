@@ -409,13 +409,13 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
             ownership_state="owned",
         ).exists()
 
-    def test_exhausted_stale_accept_retry_returns_an_operator_error(self):
+    def test_exhausted_protocol_error_retry_returns_an_operator_error(self):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
         from django.contrib.messages import get_messages
 
-        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged
 
         state = self._state(name="Vlan301", vid=301, status="conflict")
         user = get_user_model().objects.create_superuser(
@@ -427,7 +427,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
 
         with patch(
             "netbox_nso_plugin.renderer_writer.RendererWriter.save",
-            side_effect=IntentPlanStaleError("changed after planning"),
+            side_effect=RendererTargetsChanged("changed its renderer targets"),
         ) as save:
             response = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
 

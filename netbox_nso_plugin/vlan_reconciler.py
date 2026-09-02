@@ -39,6 +39,33 @@ def _rescope_plan_ready(plan):
 _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagged-all"}
 
 
+def _validated_switchport_items(payload) -> list[dict]:
+    """Return complete switchport entries or reject the invalid adapter document."""
+    from .adapter_client import AdapterError
+
+    items = payload.get("interfaces") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise AdapterError("Adapter returned malformed switchport interfaces.", code="invalid_response")
+    for item in items:
+        valid_tagged = isinstance(item, dict) and isinstance(item.get("tagged_vlans"), list)
+        if valid_tagged:
+            valid_tagged = all(isinstance(vid, int) and not isinstance(vid, bool) for vid in item["tagged_vlans"])
+        valid_untagged = isinstance(item, dict) and (
+            item.get("untagged_vlan") is None
+            or (isinstance(item.get("untagged_vlan"), int) and not isinstance(item.get("untagged_vlan"), bool))
+        )
+        if not (
+            isinstance(item, dict)
+            and isinstance(item.get("interface_name"), str)
+            and item["interface_name"]
+            and item.get("mode") in _NSO_TO_NETBOX_MODE
+            and valid_untagged
+            and valid_tagged
+        ):
+            raise AdapterError("Adapter returned a malformed switchport entry.", code="invalid_response")
+    return items
+
+
 def _device_vlan_group(device, *, create=True):
     """Per-device VLAN group — the default landing spot for newly-imported vids."""
     from ipam.models import VLANGroup
@@ -351,7 +378,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], [], [], []
-    items = _switchport_items(payload)
+    items = _validated_switchport_items(payload)
     group = _device_vlan_group(device, create=False)
     tagged_vlans = Prefetch(
         "tagged_vlans",
@@ -811,7 +838,16 @@ def reconcile_vlan_database(device, payload: dict) -> list:
 def _reconcile_vlan_database(device, payload: dict, writer, planned_at) -> list:
     """Execute the VLAN operations after their exact write set is frozen."""
     _saves, operations, reported_rows = _vlan_reconcile_operations(device, payload, planned_at)
+    raced_rows = set()
+    for row in reported_rows:
+        if row.vlan.group_id is not None:
+            writer.consume_existing_creation(row.vlan.group)
+        writer.consume_existing_creation(row.vlan)
+        if writer.consume_existing_creation(row):
+            raced_rows.add(id(row))
     for instance, update_fields, force_insert in operations:
+        if id(instance) in raced_rows:
+            continue
         writer.save(instance, update_fields=update_fields, force_insert=force_insert)
     return reported_rows
 
@@ -944,11 +980,41 @@ def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_p
         planned_at,
         interface_pks,
     )
+    raced_rows = set()
+    consumed_m2m = set()
+    for row in rows:
+        interface = row.interface
+        state_tagged = () if row.pk is None else _ordered_tagged_vlans(row)
+        writer.consume_applied_save(interface)
+        if writer.consume_applied_m2m_set(interface, "tagged_vlans"):
+            consumed_m2m.add((id(interface), "tagged_vlans"))
+        related_vlans = {
+            vlan.pk: vlan
+            for vlan in (
+                interface.untagged_vlan,
+                row.untagged_vlan,
+                *_ordered_tagged_vlans(interface),
+                *state_tagged,
+            )
+            if vlan is not None and vlan.pk is not None
+        }
+        for vlan in related_vlans.values():
+            if vlan.group_id is not None:
+                writer.consume_existing_creation(vlan.group)
+            writer.consume_existing_creation(vlan)
+        if writer.consume_existing_creation(row) or writer.consume_applied_save(row):
+            raced_rows.add(id(row))
+        if row.pk is not None and writer.consume_applied_m2m_set(row, "tagged_vlans"):
+            consumed_m2m.add((id(row), "tagged_vlans"))
     for operation, instance, update_fields, force_insert, field_name, related in operations:
         if operation == "save":
+            if id(instance) in raced_rows:
+                continue
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
         elif operation == "delete":
             writer.delete(instance)
         else:
+            if (id(instance), field_name) in consumed_m2m:
+                continue
             writer.m2m_set(instance, field_name, related)
     return rows

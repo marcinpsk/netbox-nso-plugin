@@ -1899,7 +1899,7 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
             continue
         instance = apps.get_model(row.model_label).objects.filter(pk=row.pk).first()
         if instance is None:
-            raise IntentMutationProtocolError(f"{row.model_label} row {row.pk!r} disappeared during acquisition")
+            raise RendererTargetsChanged(f"{row.model_label} row {row.pk!r} disappeared during acquisition")
         resolved_devices = {device_id for device_id, _scope in spec.resolver(instance, spec)}
         if not resolved_devices <= expected_devices:
             raise RendererTargetsChanged(

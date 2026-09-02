@@ -145,6 +145,32 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         assert vlan.group_id == group.pk
 
+    def test_referenced_support_creation_adopts_a_natural_key_race_winner(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        group = VLANGroup(name="Writer raced support group", slug="writer-raced-support-group")
+        vlan = VLAN(group=group, vid=1644, name="writer-raced-support-vlan")
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(group, force_insert=True, natural_key=("slug",)),
+                planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
+            )
+        )
+        winner = VLANGroup.objects.create(name=group.name, slug=group.slug)
+        vlan.group = winner
+
+        with renderer_mirror_writes(plan) as writer:
+            self.assertTrue(writer.consume_existing_creation(winner))
+            writer.save(vlan, force_insert=True)
+
+        self.assertEqual(vlan.group_id, winner.pk)
+
     def test_plan_refuses_an_unreferenced_support_row(self):
         from ipam.models import VLANGroup
 
@@ -422,6 +448,38 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert type(management).objects.filter(pk=management.pk).exists()
         assert NSOStaticRouteState.objects.filter(pk=state.pk).exists()
         assert type(device).objects.filter(pk=device.pk).exists()
+
+    def test_delete_plan_orders_each_collector_model_by_primary_key(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete
+
+        _device, management = make_managed("writer-cascade-order", 16292)
+        routes = [
+            StaticRoute.objects.create(
+                prefix=f"198.18.{octet}.0/24",
+                next_hop="198.18.0.1",
+                metric=1,
+            )
+            for octet in (51, 52, 53)
+        ]
+        states = [
+            NSOStaticRouteState.objects.create(
+                management=management,
+                static_route=route,
+                status="imported",
+            )
+            for route in reversed(routes)
+        ]
+
+        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        state_pks = [
+            write.pk
+            for write in plan.write_set
+            if write.operation == "delete" and write.model_label == states[0]._meta.label_lower
+        ]
+
+        self.assertEqual(state_pks, sorted(state_pks))
 
     def test_delete_plan_records_collector_set_null_updates(self):
         from netbox_nso_plugin.models import NSOSVIState

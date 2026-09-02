@@ -136,6 +136,25 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             ],
         )
 
+    def test_vlan_reconcile_adopts_a_completed_creation_plan(self):
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.vlan_reconciler import (
+            _reconcile_vlan_database,
+            vlan_reconcile_plan,
+        )
+
+        payload = {"vlans": [{"vlan_id": 1645, "name": "RACE"}]}
+        waiting_plan = vlan_reconcile_plan(self.device, payload)
+        winner_plan = vlan_reconcile_plan(self.device, payload)
+        with renderer_mirror_writes(winner_plan) as writer:
+            _reconcile_vlan_database(self.device, payload, writer, winner_plan.planned_at)
+
+        with renderer_mirror_writes(waiting_plan) as writer:
+            rows = _reconcile_vlan_database(self.device, payload, writer, waiting_plan.planned_at)
+
+        self.assertEqual([row.vlan.vid for row in rows], [1645])
+        self.assertEqual(NSOVLANState.objects.filter(management=self.management, vlan__vid=1645).count(), 1)
+
     def test_direct_vlan_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
@@ -200,6 +219,75 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 ("save", "netbox_nso_plugin.nsoswitchportstate"),
             ],
         )
+
+    def test_switchport_reconcile_adopts_a_completed_creation_plan(self):
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.vlan_reconciler import (
+            _reconcile_switchport,
+            prepare_switchport_reconcile,
+        )
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "trunk",
+                    "untagged_vlan": 1646,
+                    "tagged_vlans": [1647],
+                }
+            ]
+        }
+        waiting = prepare_switchport_reconcile(self.device, payload)
+        winner = prepare_switchport_reconcile(self.device, payload)
+        with renderer_mirror_writes(winner.plan) as writer:
+            _reconcile_switchport(self.device, payload, writer, winner.plan.planned_at, winner.interface_pks)
+
+        with renderer_mirror_writes(waiting.plan) as writer:
+            rows = _reconcile_switchport(self.device, payload, writer, waiting.plan.planned_at, waiting.interface_pks)
+
+        self.assertEqual([row.interface_id for row in rows], [self.interface.pk])
+
+    def test_switchport_reconcile_rejects_malformed_tagged_vlan_values(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_switchport(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": self.interface.name,
+                            "mode": "trunk",
+                            "untagged_vlan": None,
+                            "tagged_vlans": 1648,
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_switchport_reconcile_rejects_an_unknown_mode(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_switchport(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": self.interface.name,
+                            "mode": "acess",
+                            "untagged_vlan": None,
+                            "tagged_vlans": [],
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_switchport_overlay_plan_references_vlans_created_for_the_native_mirror(self):
         from netbox_nso_plugin.renderer_writer import RendererCreationRef

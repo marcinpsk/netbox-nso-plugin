@@ -959,7 +959,8 @@ def offboard_device_from_adapter(sender, instance, **kwargs):
     from .renderer_writer import active_renderer_writer
 
     origin = kwargs.get("origin")
-    cascaded_from_device = getattr(getattr(origin, "_meta", None), "label_lower", None) == "dcim.device"
+    origin_meta = getattr(origin, "_meta", None) or getattr(getattr(origin, "model", None), "_meta", None)
+    cascaded_from_device = getattr(origin_meta, "label_lower", None) == "dcim.device"
     if active_renderer_writer() is None and not cascaded_from_device:
         return
     _queue_adapter_offboard(instance)
@@ -1401,6 +1402,11 @@ def snmp_v3_user_push_blocker(row) -> str:
         )
     if row.priv_protocol and not row.auth_protocol:
         return "privacy requires authentication — set an auth protocol as well."
+    if not row.vault_ref:
+        return (
+            "this SNMPv3 user has no Vault reference — the full-replace snapshot would omit it. "
+            "Set the Vault reference first."
+        )
     return ""
 
 

@@ -64,9 +64,9 @@ class TestVlanAttachView(_VlanGreenfieldBase):
         mock_put.assert_called()
 
     def test_unavailable_vlan_does_not_advance_the_intent_revision(self):
-        from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt(self.sw3, 196)
@@ -74,17 +74,17 @@ class TestVlanAttachView(_VlanGreenfieldBase):
         self.client.force_login(__import__("users").models.User.objects.create_user("vgmissing", is_superuser=True))
         revision, _created = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="vlan")
         before = revision.revision
-        original_footprint = intent_state.vlan_footprint
+        original_build = RendererMutationPlan.build
 
-        def resolve_then_delete(vlan_id, scopes, **kwargs):
-            footprint = original_footprint(vlan_id, scopes, **kwargs)
-            doomed = type(vlan).objects.get(pk=vlan_id)
+        def plan_then_delete(**kwargs):
+            plan = original_build(**kwargs)
+            doomed = type(vlan).objects.get(pk=vlan.pk)
             with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
                 doomed.delete()
-            return footprint
+            return plan
 
         url = reverse("plugins:netbox_nso_plugin:vlan_attach", kwargs={"device_pk": self.sw3.pk})
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_delete):
+        with patch.object(RendererMutationPlan, "build", side_effect=plan_then_delete):
             response = self.client.post(url, {"vlan": vlan.pk})
 
         assert response.status_code == 302

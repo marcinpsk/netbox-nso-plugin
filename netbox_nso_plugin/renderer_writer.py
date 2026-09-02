@@ -219,7 +219,10 @@ def _effective_after(instance, before, update_fields):
     effective = copy.copy(before)
     for name in update_fields:
         field = instance._meta.get_field(name)
-        setattr(effective, field.attname, getattr(instance, field.attname))
+        if field.is_relation and field.many_to_one and field.is_cached(instance):
+            setattr(effective, field.name, field.get_cached_value(instance))
+        else:
+            setattr(effective, field.attname, getattr(instance, field.attname))
     return effective
 
 
@@ -367,7 +370,7 @@ def _collector_writes(instance):
         changed_keys.update(_changed_keys(before, after, spec, dependency_changed))
 
     for model, rows in collector.data.items():
-        for row in rows:
+        for row in sorted(rows, key=lambda instance: instance.pk):
             writes.append(
                 RendererWrite(
                     operation="delete",
@@ -686,7 +689,7 @@ class RendererWriter:
     def _creation_matches(self, write, instance):
         spec = renderer_input_specs().get(write.model_label)
         if spec is None:
-            return False
+            return bool(write.natural_key) and self._fields_match(write.natural_key, instance)
         content_attnames = {spec.model._meta.get_field(field_name).attname for field_name in spec.content_fields}
         expected = tuple((attname, value) for attname, value in write.values if attname in content_attnames)
         return self._fields_match(expected, instance)
@@ -714,6 +717,52 @@ class RendererWriter:
             raise IntentPlanStaleError(f"{write.model_label} creation {write.natural_key!r} changed after planning")
         self._consumed.add(index)
         return True
+
+    def consume_applied_save(self, instance) -> bool:
+        """Consume a frozen update that another writer applied exactly."""
+        for index, write in enumerate(self.plan.write_set):
+            if (
+                index in self._consumed
+                or write.operation != "save"
+                or write.force_insert
+                or write.model_label != instance._meta.label_lower
+                or not self._identity_matches(write, instance)
+            ):
+                continue
+            current = type(instance)._default_manager.filter(pk=write.pk).first()
+            expected = dict(write.before_values)
+            expected.update(write.values)
+            if current is not None and self._fields_match(tuple(expected.items()), current):
+                self._consumed.add(index)
+                return True
+        return False
+
+    def consume_applied_m2m_set(self, instance, field_name) -> bool:
+        """Consume a frozen M2M replacement that another writer applied exactly."""
+        identity = (("field_name", field_name),)
+        for index, write in enumerate(self.plan.write_set):
+            if (
+                index in self._consumed
+                or write.operation != "m2m_set"
+                or write.model_label != instance._meta.label_lower
+                or not self._owner_matches(write.pk, instance)
+                or write.natural_key != identity
+            ):
+                continue
+            expected = []
+            for related_identity in write.selected_pks:
+                if isinstance(related_identity, RendererCreationRef):
+                    related = self._resolve_reference(related_identity)
+                    if related is None:
+                        return False
+                    expected.append(related.pk)
+                else:
+                    expected.append(related_identity)
+            current = tuple(sorted(getattr(instance, field_name).values_list("pk", flat=True)))
+            if current == tuple(sorted(expected)):
+                self._consumed.add(index)
+                return True
+        return False
 
     @contextlib.contextmanager
     def _operation(self, index):

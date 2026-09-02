@@ -5596,11 +5596,13 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
         ).order_by("pk"):
             candidate = copy.copy(member)
             candidate.status = _status_after_accept(member.status)
-            candidate.accepted_at = now
+            if candidate.accepted_at is None:
+                candidate.accepted_at = now
             candidates.append(candidate)
         bundle_candidate = copy.copy(state)
         bundle_candidate.status = _status_after_accept(state.status)
-        bundle_candidate.accepted_at = now
+        if bundle_candidate.accepted_at is None:
+            bundle_candidate.accepted_at = now
         candidates.append(bundle_candidate)
         plan = RendererMutationPlan.build(
             saves=(planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates),
@@ -6492,6 +6494,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         """Accept one converted overlay through its exact renderer plan."""
         import copy
 
+        from .intent_state import RendererTargetsChanged
         from .renderer_writer import (
             IntentPlanStaleError,
             RendererMutationPlan,
@@ -6519,7 +6522,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
                 with mutation as writer:
                     writer.save(candidate, update_fields=fields)
                 break
-            except IntentPlanStaleError:
+            except (IntentPlanStaleError, RendererTargetsChanged):
                 if attempt:
                     messages.error(request, "Routing state changed. Refresh the page and try again.")
                     return redirect(_device_nso_tab_url(current.management.device_id))
@@ -7203,6 +7206,7 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
             state.accepted_at = now
         state.last_sync_at = now
 
+        from .intent_state import RendererTargetsChanged
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         update_fields = None if created else ("status", "accepted_at", "last_sync_at")
@@ -7218,8 +7222,12 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
             planned_at=now,
         )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
-            writer.save(state, update_fields=update_fields, force_insert=created)
+        try:
+            with mutation as writer:
+                writer.save(state, update_fields=update_fields, force_insert=created)
+        except RendererTargetsChanged:
+            messages.error(request, "The selected VLAN is no longer available.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
         messages.success(
             request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
         )
