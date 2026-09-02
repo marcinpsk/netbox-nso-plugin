@@ -21,8 +21,9 @@ function jobActivityScript() {
   return body;
 }
 
-function mountTab(applyState) {
+function mountTab(applyState, applyStateError = null) {
   document.body.innerHTML = `
+    <div id="nso-apply-state-error" class="d-none"><span data-slot="message"></span></div>
     <div id="nso-blocked-generation" class="d-none">
       <span data-slot="generation"></span>
       <span data-slot="status"></span>
@@ -49,6 +50,7 @@ function mountTab(applyState) {
         blocked_removals: [],
         residue_removals: [],
         apply_state: applyState,
+        apply_state_error: applyStateError,
       }),
     })),
   );
@@ -109,6 +111,15 @@ describe("the device tab's blocked Apply head panel", () => {
     });
 
     await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    expect(panel.classList.contains("d-none")).toBe(true);
+  });
+
+  it("shows an Apply-state polling failure without fabricating an unblocked state", async () => {
+    const panel = mountTab(null, "Adapter returned HTTP 503.");
+    const error = document.getElementById("nso-apply-state-error");
+
+    await vi.waitFor(() => expect(error.classList.contains("d-none")).toBe(false));
+    expect(error.querySelector('[data-slot="message"]').textContent).toBe("Adapter returned HTTP 503.");
     expect(panel.classList.contains("d-none")).toBe(true);
   });
 });

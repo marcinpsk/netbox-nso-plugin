@@ -3668,6 +3668,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                     "jobs": [],
                     "generations": [],
                     "apply_state": None,
+                    "apply_state_error": None,
                     "blocked_removals": [],
                     "residue_removals": [],
                 }
@@ -3693,11 +3694,13 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             )
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
+        apply_state_error = None
         try:
             apply_state = client.get_device_apply_state(mgmt.adapter_device_id)
-        except AdapterError:
+        except AdapterError as exc:
             logger.warning("Apply-state poll failed for device %s", pk, exc_info=True)
             apply_state = None
+            apply_state_error = public_error_message(exc)
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
         serialized_jobs = jobs
         if generation_ids:
@@ -3715,6 +3718,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                 "jobs": serialized_jobs,
                 "generations": generations,
                 "apply_state": apply_state,
+                "apply_state_error": apply_state_error,
                 "blocked_removals": _blocked_removals(jobs),
                 "residue_removals": _residue_removals(jobs),
             }
