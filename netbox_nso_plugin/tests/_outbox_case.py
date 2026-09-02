@@ -215,7 +215,7 @@ def wait_until_postgres_blocks(
             if cursor.fetchone()[0]:
                 return
         time.sleep(0.01)
-    raise AssertionError(f"{description} never blocked on the footprint lock")
+    raise AssertionError(f"{description} never blocked on a database lock")
 
 
 _commit_drain_patch_lock = threading.Lock()
