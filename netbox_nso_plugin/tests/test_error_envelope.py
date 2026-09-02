@@ -24,10 +24,10 @@ from django.urls import reverse
 from ipam.models import IPAddress
 
 from netbox_nso_plugin.adapter_client import AdapterError
-from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping, NSOProvisionTombstone
+from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping
 
 from ._adapter_http import make_response
-from ._outbox_case import mirror_update
+from ._outbox_case import mirror_update, open_provision_attempt
 from .test_django_views import ViewTestBase
 
 # Shaped like something that must never be echoed to a client: a requests transport error
@@ -47,19 +47,6 @@ _PLUGINS_CONFIG = {
     **settings.PLUGINS_CONFIG,
     "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"},
 }
-
-
-def _open_provision_attempt(mgmt):
-    tombstone = NSOProvisionTombstone(
-        netbox_device_id=mgmt.device_id,
-        nso_instance=mgmt.nso_instance.adapter_instance_id,
-        nso_device_name=mgmt.nso_device_name,
-        canonical_request={},
-        adapter_job_id=mgmt.onboard_job_id,
-    )
-    tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
-    tombstone.save(force_insert=True)
-    return tombstone
 
 
 class _LeakingSession(requests.Session):
@@ -214,7 +201,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
         """A transient attempt lookup failure keeps the row provisioning, with no leak."""
         mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
         self.mgmt.refresh_from_db()
-        _open_provision_attempt(self.mgmt)
+        open_provision_attempt(self.mgmt)
 
         with self.assertLogs(_ADAPTER_LOG, level="WARNING"):
             resp = self.client.post(self._url("onboard_status", pk=self.mgmt.pk), **_AJAX)
@@ -445,7 +432,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
 
         mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
         self.mgmt.refresh_from_db()
-        _open_provision_attempt(self.mgmt)
+        open_provision_attempt(self.mgmt)
 
         result = advance_provisioning(self.mgmt)
 

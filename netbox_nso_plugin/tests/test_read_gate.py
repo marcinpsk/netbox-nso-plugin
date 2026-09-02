@@ -635,7 +635,9 @@ class TestIncarnationAdoption(TestCase):
         from netbox_nso_plugin.models import NSOIntentRevision
 
         self._run(_rs(attempt_id=5), family="bfd")
-        for scope in delivery.delivery_keys():
+        scopes = tuple(delivery.delivery_keys())
+        self.assertTrue(scopes)
+        for scope in scopes:
             NSOIntentRevision.objects.update_or_create(
                 device=self.mgmt.device,
                 scope=scope,

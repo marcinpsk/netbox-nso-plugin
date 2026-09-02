@@ -282,8 +282,9 @@ def invalidate_delivery_baselines(device_id: int) -> None:
 
     scopes = tuple(delivery.delivery_keys())
     with transaction.atomic():
-        if not all(revision_was_acquired(device_id, scope) for scope in scopes):
-            lock_intent_revisions(device_id, scopes)
+        unlocked_scopes = tuple(scope for scope in scopes if not revision_was_acquired(device_id, scope))
+        if unlocked_scopes:
+            lock_intent_revisions(device_id, unlocked_scopes)
         NSOIntentRevision.objects.filter(device_id=device_id, scope__in=scopes).update(
             verified_revision=None,
             verified_fingerprint=None,

@@ -194,6 +194,7 @@ class TestOwnershipManifestDurability(TestCase):
             device_id=device_id,
             scope="interface",
             native_model_label="dcim.interface",
+            native_id=device_id,
             native_key={"device_id": device_id, "name": "Ethernet1"},
         )
 

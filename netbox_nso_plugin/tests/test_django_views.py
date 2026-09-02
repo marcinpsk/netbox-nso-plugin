@@ -35,6 +35,7 @@ from ._outbox_case import (
     in_thread,
     make_managed,
     mirror_update,
+    open_provision_attempt,
     without_commit_drain,
 )
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -281,8 +282,6 @@ class TestOnboardStatusView(ViewTestBase):
         dev = Device.objects.create(
             name=name, device_type=self.device.device_type, role=self.device.role, site=self.device.site
         )
-        from netbox_nso_plugin.models import NSOProvisionTombstone
-
         mgmt = NSODeviceManagement.objects.create(
             device=dev,
             nso_instance=self.nso_instance,
@@ -290,15 +289,7 @@ class TestOnboardStatusView(ViewTestBase):
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
-        tombstone = NSOProvisionTombstone(
-            netbox_device_id=dev.pk,
-            nso_instance=self.nso_instance.adapter_instance_id,
-            nso_device_name=name,
-            canonical_request={},
-            adapter_job_id=job_id,
-        )
-        tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
-        tombstone.save(force_insert=True)
+        open_provision_attempt(mgmt)
         return mgmt
 
     def _post_status(self, mgmt):
@@ -425,8 +416,8 @@ class TestOnboardStatusView(ViewTestBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
 
-    def test_a_row_no_attempt_tracks_marks_failed(self):
-        """A provisioning row no open attempt can complete must reach a terminal verdict."""
+    def test_a_row_with_no_attempt_is_marked_failed(self):
+        """A provisioning row with no open attempt reaches a terminal verdict."""
         from netbox_nso_plugin.models import NSOProvisionTombstone
 
         mgmt = self._provisioning_mgmt("prov-untracked")
@@ -4261,6 +4252,42 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.l2_mtu, 9100)
         self.assertEqual(row.status, "accepted")
+
+    def test_edit_mtu_returns_conflict_after_two_stale_plans(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        with patch(
+            "netbox_nso_plugin.views._write_owned_interface_mtu",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ):
+            response = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "9100"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json(),
+            {"status": "error", "message": "Routing state changed. Refresh the page and try again."},
+        )
+
+    def test_accept_mtu_redirects_after_two_stale_plans(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        url = reverse("plugins:netbox_nso_plugin:interface_mtu_accept", args=[row.pk])
+        with patch(
+            "netbox_nso_plugin.views._write_owned_interface_mtu",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ):
+            response = self.client.post(url, follow=True)
+
+        self.assertEqual(response.redirect_chain[0][1], 302)
+        self.assertContains(response, "Routing state changed. Refresh the page and try again.")
 
     def test_edit_bfd_updates_overlay_and_native_profile(self):
         from netbox_routing.models import BFDInterface, BFDProfile

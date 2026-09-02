@@ -266,7 +266,10 @@ class OnboardView(APIView):
             return Response({"detail": "no NSO instance configured"}, status=status.HTTP_404_NOT_FOUND)
 
         result = onboard_candidate(device, instance)
-        code = status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST
+        code = result.pop(
+            "_http_status",
+            status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,
+        )
         return Response(result, status=code)
 
 

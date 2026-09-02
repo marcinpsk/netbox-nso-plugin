@@ -353,6 +353,22 @@ _PLAN_BUILDER = "RendererMutationPlan.build"
 #: A helper may front the seed (``_demotion_plan``) and a local name may alias another
 #: (``plan = plans[scope]``), so both derivations are re-read until they settle.
 _BUILDER_PASSES = 3
+_NESTED_SCOPES = (*_FUNCTION_SCOPES, ast.ClassDef, ast.Lambda)
+
+
+def _owned_nodes(node):
+    """Yield a node's lexical subtree without entering nested function scopes."""
+    if isinstance(node, _NESTED_SCOPES):
+        return
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _owned_nodes(child)
+
+
+def _owned_body_nodes(body):
+    """Yield nodes owned by one statement body."""
+    for statement in body:
+        yield from _owned_nodes(statement)
 
 
 def _dotted(node) -> str:
@@ -366,7 +382,7 @@ def _dotted(node) -> str:
 
 def _builds_a_plan(node, builders) -> bool:
     """Whether *node*'s subtree calls anything that hands back a freshly frozen plan."""
-    return any(isinstance(child, ast.Call) and _dotted(child.func) in builders for child in ast.walk(node))
+    return any(isinstance(child, ast.Call) and _dotted(child.func) in builders for child in _owned_nodes(node))
 
 
 def _root_name(node):
@@ -378,7 +394,7 @@ def _root_name(node):
 
 def _bindings(node):
     """Every ``(targets, value)`` pair *node*'s subtree binds, in the three binding forms."""
-    for child in ast.walk(node):
+    for child in _owned_nodes(node):
         if isinstance(child, ast.Assign):
             yield child.targets, child.value
         elif isinstance(child, (ast.For, ast.AsyncFor, ast.comprehension)):
@@ -444,7 +460,7 @@ def _statement_bodies(statement):
 
 
 def _contains_node(statement, target) -> bool:
-    return any(node is target for node in ast.walk(statement))
+    return any(node is target for node in _owned_nodes(statement))
 
 
 def _statements_before(body, target):
@@ -470,7 +486,9 @@ def _plan_builders(tree) -> set:
     for _ in range(_BUILDER_PASSES):
         for function in functions:
             names = _plan_names(function.body, builders)
-            returned = [node.value for node in ast.walk(function) if isinstance(node, ast.Return) and node.value]
+            returned = [
+                node.value for node in _owned_body_nodes(function.body) if isinstance(node, ast.Return) and node.value
+            ]
             hands_one_back = any(
                 _builds_a_plan(value, builders)
                 or any(isinstance(part, ast.Name) and part.id in names for part in ast.walk(value))
@@ -517,7 +535,7 @@ def _stale_plan_source(source, module) -> list:
     pending = _consumers(tree)
     offenders = []
     for statement in _lock_contexts(tree):
-        inside = {node for item in statement.body for node in ast.walk(item)}
+        inside = set(_owned_body_nodes(statement.body))
         for call in [node for node in pending if node in inside]:
             pending.remove(call)
             plan = call.args[0]
@@ -554,6 +572,39 @@ def repair():
         self.assertEqual(
             _stale_plan_source(source, "fixture.py"),
             [("fixture.py", "plan", 5)],
+        )
+
+    def test_a_nested_plan_return_does_not_make_its_outer_function_a_builder(self):
+        source = """
+def outer():
+    def nested():
+        return RendererMutationPlan.build()
+    return None
+
+def repair():
+    with intent_transaction(footprint):
+        plan = outer()
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 10)],
+        )
+
+    def test_a_deferred_nested_consumer_is_not_inside_its_defining_lock(self):
+        source = """
+def repair():
+    plan = RendererMutationPlan.build()
+    with intent_transaction(footprint):
+        def later():
+            consume_renderer_plan(plan, permit)
+    return later
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
         )
 
     def test_the_guard_still_reaches_the_call_sites_it_polices(self):
