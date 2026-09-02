@@ -1952,6 +1952,8 @@ def _bump_and_lock_deploying(footprint: MutationFootprint, revision_keys=None) -
     from .outbox import bump_intent_revision
 
     revision_keys = tuple(footprint.revision_keys if revision_keys is None else revision_keys)
+    if not set(revision_keys) <= set(footprint.revision_keys):
+        raise IntentMutationProtocolError("a bump key was not locked by this footprint")
     for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
     deploying_rows = _deploying_scope_rows(footprint, revision_keys)

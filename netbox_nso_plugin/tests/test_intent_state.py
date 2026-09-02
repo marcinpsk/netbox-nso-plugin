@@ -497,6 +497,20 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(self.state.status, "accepted")
         self.assertIsNone(self.state.apply_attempt_id)
 
+    def test_content_mutation_rejects_a_bump_key_outside_its_locked_footprint(self):
+        from netbox_nso_plugin.intent_state import _bump_and_lock_deploying
+
+        footprint = MutationFootprint.for_keys({(self.device.pk, "vlan")})
+
+        with (
+            patch("netbox_nso_plugin.outbox.bump_intent_revision") as bump,
+            self.assertRaisesRegex(IntentMutationProtocolError, "not locked"),
+            transaction.atomic(),
+        ):
+            _bump_and_lock_deploying(footprint, ((self.device.pk, "bgp"),))
+
+        bump.assert_not_called()
+
     def test_detected_reconcile_can_delete_a_captured_deploying_row(self):
         attempt_id = uuid4()
         self.state.status = "deploying"
