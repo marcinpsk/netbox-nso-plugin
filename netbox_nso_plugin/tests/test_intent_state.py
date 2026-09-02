@@ -306,7 +306,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(updated, ("after",))
         self.assertEqual(parse_calls, 0)
 
-    def test_repeated_insert_shape_is_parsed_at_most_once(self):
+    def test_unregistered_insert_shape_is_never_parsed(self):
         statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
         real_parse = sqlparse.parse
         parse_calls = 0
@@ -322,7 +322,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 cursor.execute(statement, [1])
                 cursor.execute(statement, [2])
 
-        self.assertLessEqual(parse_calls, 1)
+        self.assertEqual(parse_calls, 0)
 
     def test_repeated_registered_dml_shape_caches_column_classification(self):
         table = NSOVLANState._meta.db_table
