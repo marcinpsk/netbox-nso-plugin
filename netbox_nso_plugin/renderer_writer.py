@@ -945,14 +945,24 @@ class RendererWriter:
     def _fields_match(self, expected_values, instance):
         return all(self._value_matches(instance, attname, expected) for attname, expected in expected_values)
 
+    def _save_target_matches(self, write, instance):
+        expected = dict(write.before_values)
+        expected.update(write.values)
+        return self._fields_match(expected.items(), instance)
+
     def validate_dependencies(self):
         """Reject frozen inputs that changed before their locks were acquired."""
         for write in self.plan.write_set:
             if write.pk is None or not write.before_values:
                 continue
             current = apps.get_model(write.model_label)._default_manager.filter(pk=write.pk).first()
-            if current is None or not self._fields_match(write.before_values, current):
+            if current is None:
                 raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
+            if self._fields_match(write.before_values, current):
+                continue
+            if write.operation == "save" and not write.force_insert and self._save_target_matches(write, current):
+                continue
+            raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
         for read in self.plan.read_set:
             current = apps.get_model(read.model_label)._default_manager.filter(pk=read.pk).first()
             if current is None or not self._fields_match(read.values, current):
@@ -1046,9 +1056,7 @@ class RendererWriter:
             ):
                 continue
             current = type(instance)._default_manager.filter(pk=write.pk).first()
-            expected = dict(write.before_values)
-            expected.update(write.values)
-            if current is not None and self._fields_match(tuple(expected.items()), current):
+            if current is not None and self._save_target_matches(write, current):
                 self._consumed.add(index)
                 return True
         return False
