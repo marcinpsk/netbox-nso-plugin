@@ -1821,6 +1821,7 @@ def _acquire(
     bump: bool = True,
     join_deployment_gate: bool = True,
     defer_repend: bool = False,
+    capture_deploying: bool = False,
 ) -> tuple[SourceRow, ...]:
     from .apply_state import (
         _enter_level,
@@ -1872,8 +1873,9 @@ def _acquire(
         if not defer_repend:
             _repend_locked_rows(deploying_rows)
         return deploying_rows
-    _lock_rows(footprint.overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
-    return ()
+    deploying_rows = _deploying_scope_rows(footprint) if capture_deploying else ()
+    _lock_rows(tuple(set(footprint.overlay_rows) | set(deploying_rows)), level=8, ranks=OVERLAY_MODEL_RANKS)
+    return deploying_rows
 
 
 def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -> None:
@@ -1946,9 +1948,11 @@ def mirror_transaction(footprint: MutationFootprint, *, detect_content_changes: 
         )
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint, bump=False)
-            if detect_content_changes:
-                permit.initial_deploying_rows = _deploying_scope_rows(footprint)
+            permit.initial_deploying_rows = _acquire(
+                footprint,
+                bump=False,
+                capture_deploying=detect_content_changes,
+            )
             yield permit
             if permit.deferred_repend_rows:
                 _repend_locked_rows(permit.deferred_repend_rows)
