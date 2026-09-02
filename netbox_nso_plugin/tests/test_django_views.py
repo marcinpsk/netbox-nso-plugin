@@ -5448,12 +5448,13 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.status, "accepted")
 
-    def test_edit_route_map_name_rechecks_fallback_references_after_locking(self):
+    def test_edit_route_map_name_rejects_a_stale_fallback_reference(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import RouteMap
 
         from netbox_nso_plugin.intent_state import intent_transaction, offline_mutation
         from netbox_nso_plugin.models import NSORedistributionState, NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import _save_route_map_name_edit
 
@@ -5484,10 +5485,15 @@ class TestOverlayFieldEditView(ViewTestBase):
             suppress_intent_push(),
             patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=acquire_after_competing_edit),
         ):
-            _save_route_map_name_edit(state, route_map.name)
+            with self.assertRaises(IntentPlanStaleError):
+                _save_route_map_name_edit(state, route_map.name)
 
         fallback.refresh_from_db()
+        route_map.refresh_from_db()
+        state.refresh_from_db()
         self.assertEqual(fallback.route_map, "RM-RACE-OTHER")
+        self.assertEqual(route_map.name, "RM-RACE-OLD")
+        self.assertEqual(state.object_name, "RM-RACE-OLD")
 
     def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
         from django.contrib.contenttypes.models import ContentType
