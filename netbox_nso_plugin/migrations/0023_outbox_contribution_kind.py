@@ -14,6 +14,10 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="nsointentoutboxentry",
             name="kind",
-            field=models.CharField(default="ordinary", max_length=16),
+            field=models.CharField(
+                choices=[("ordinary", "Ordinary"), ("repair", "Repair")],
+                default="ordinary",
+                max_length=16,
+            ),
         ),
     ]
