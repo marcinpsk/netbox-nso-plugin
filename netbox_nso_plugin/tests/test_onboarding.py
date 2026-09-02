@@ -234,6 +234,45 @@ class TestOnboardCandidate(TestCase):
         self.assertEqual(first_request, second_request)
         self.assertEqual(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).count(), 1)
 
+    def test_changed_retry_is_refused_while_the_original_attempt_is_open(self):
+        """A changed retry cannot create a second claim for the same device."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("changed-retry-provision")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            side_effect=RuntimeError("response lost"),
+        ) as provision:
+            first = onboard_candidate(device, self.instance)
+            second = onboard_candidate(device, self.instance, ned_id="test-ned:test-ned")
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["_http_status"], 409)
+        self.assertEqual(second["error"]["code"], "conflict")
+        provision.assert_called_once()
+        self.assertEqual(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).count(), 1)
+
+    def test_adapter_conflict_preserves_the_running_job(self):
+        """An adapter conflict remains a 409 envelope with its recovery job id."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("adapter-conflict-provision")
+        conflict = AdapterError(
+            "job running",
+            code="conflict",
+            detail={"job_id": 73},
+            status_code=409,
+        )
+        with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=conflict):
+            result = onboard_candidate(device, self.instance)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_http_status"], 409)
+        self.assertEqual(result["error"]["detail"]["job_id"], 73)
+
     def test_no_mapping_but_explicit_ned_onboards(self):
         """No mapping is fine when an explicit ned_id is given (override / no mapping)."""
         from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision, NSOPlatformNedMapping
