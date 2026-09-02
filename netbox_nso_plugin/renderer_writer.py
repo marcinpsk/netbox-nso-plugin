@@ -205,15 +205,18 @@ class RendererMutationPlan:
         saves = tuple(saves)
         save_states = tuple((proposed, _stored_instance(proposed.instance)) for proposed in saves)
         creation_refs = _creation_refs(save_states)
-        support_refs = _referenced_support_refs(save_states, creation_refs)
+        effective_save_states = tuple(
+            (proposed, before, _effective_after(proposed.instance, before, proposed.update_fields))
+            for proposed, before in save_states
+        )
+        support_refs = _referenced_support_refs(effective_save_states, creation_refs)
         writes: list[RendererWrite] = []
         reads: list[RendererRead] = []
         footprints: list[MutationFootprint] = []
         content_keys: set[tuple[int, str]] = set()
         effective_saves = []
 
-        for proposed, before in save_states:
-            after = _effective_after(proposed.instance, before, proposed.update_fields)
+        for proposed, before, after in effective_save_states:
             write, footprint, changed_keys = _plan_save(
                 proposed,
                 creation_refs,
@@ -392,13 +395,12 @@ def _creation_refs(save_states):
     return references
 
 
-def _referenced_support_refs(save_states, creation_refs):
+def _referenced_support_refs(effective_save_states, creation_refs):
     references = set()
     specs = renderer_input_specs()
-    for proposed, before in save_states:
+    for proposed, _before, after in effective_save_states:
         if proposed.instance._meta.label_lower not in specs:
             continue
-        after = _effective_after(proposed.instance, before, proposed.update_fields)
         values = _field_values(
             after,
             proposed.update_fields,

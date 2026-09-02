@@ -803,7 +803,7 @@ def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
                 system_result.last_sync_at = planned_at
                 save(system_result, update_fields=("status", "last_sync_at"))
             else:
-                system_result = None
+                system_result = NSOSnmpSystemInfoState.objects.filter(pk=current_system.pk).first()
         else:
             system_result.location = location
             system_result.contact = contact
@@ -1101,7 +1101,7 @@ def _logging_reconcile_operations(device, payload, planned_at):  # noqa: C901
                 level_result.last_sync_at = planned_at
                 save(level_result, update_fields=("status", "last_sync_at"))
             else:
-                level_result = None
+                level_result = NSOLoggingLevelState.objects.filter(pk=current_level.pk).first()
         else:
             for field, value in device_levels.items():
                 setattr(level_result, field, value)

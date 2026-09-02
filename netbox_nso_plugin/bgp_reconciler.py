@@ -928,6 +928,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if self.management is None:
             return self.operations
         routers = sorted(self.payload.get("routers") or [], key=lambda row: str(row.get("asn") or ""))
+        reported_templates = {}
         for value in sorted(self.reported_asns, key=lambda item: (len(item), item)):
             self.asn(value)
         for router_entry in routers:
@@ -948,7 +949,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                     scope_entry.get("peer_groups") or [],
                     key=lambda row: (row.get("name") or "").casefold(),
                 ):
-                    self.reconcile_template(scope, entry)
+                    name = entry.get("name") or ""
+                    if name:
+                        reported_templates[name] = (scope, entry)
+        for name in sorted(reported_templates, key=str.casefold):
+            self.reconcile_template(*reported_templates[name])
         self.plan_stale_states()
         return self.operations
 
