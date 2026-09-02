@@ -1902,6 +1902,7 @@ def _acquire(
     join_deployment_gate: bool = True,
     settles_deploying: bool = True,
     defer_repend: bool = False,
+    capture_deploying: bool = False,
 ) -> _Acquired:
     from .apply_state import (
         _enter_level,
@@ -1960,8 +1961,9 @@ def _acquire(
             return _Acquired(bumped, deploying_rows)
         _repend_locked_rows(deploying_rows)
         return _Acquired(bumped)
-    _lock_rows(footprint.overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
-    return _Acquired()
+    deploying_rows = _deploying_scope_rows(footprint) if capture_deploying else ()
+    _lock_rows(tuple(set(footprint.overlay_rows) | set(deploying_rows)), level=8, ranks=OVERLAY_MODEL_RANKS)
+    return _Acquired(frozenset(), deploying_rows)
 
 
 def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -> None:
@@ -2041,9 +2043,11 @@ def mirror_transaction(footprint: MutationFootprint, *, detect_content_changes: 
         )
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint, bump_keys=frozenset())
-            if detect_content_changes:
-                permit.initial_deploying_rows = _deploying_scope_rows(footprint)
+            permit.initial_deploying_rows = _acquire(
+                footprint,
+                bump_keys=frozenset(),
+                capture_deploying=detect_content_changes,
+            ).deploying_rows
             yield permit
             if permit.deferred_repend_rows:
                 _repend_locked_rows(permit.deferred_repend_rows)
