@@ -4940,8 +4940,19 @@ def _route_map_name_errors(state, old_name):
         route_map._meta.get_field("name").clean(state.object_name, route_map)
     except ValidationError as exc:
         errors["object_name"] = [str(message) for message in exc.messages]
-    if type(route_map).objects.filter(name__iexact=state.object_name).exclude(pk=route_map.pk).exists():
-        errors.setdefault("object_name", []).append("A route map with this name already exists.")
+    old_class_ids = tuple(
+        NSORoutePolicyObjectClass.objects.filter(
+            family="route_map",
+            object_name__iexact=old_name,
+        ).values_list("pk", flat=True)
+    )
+    for field_name, messages_list in _route_map_name_collision_errors(
+        type(route_map),
+        route_map.pk,
+        state.object_name,
+        old_class_ids,
+    ).items():
+        errors.setdefault(field_name, []).extend(messages_list)
 
     attached = NSORoutePolicyState.objects.filter(
         content_type_id=state.content_type_id,
@@ -4959,13 +4970,6 @@ def _route_map_name_errors(state, old_name):
     ):
         errors.setdefault("object_name", []).append("A route-map row with this name already exists on a device.")
 
-    old_class = NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name)
-    if old_class.exists() and (
-        NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=state.object_name)
-        .exclude(pk__in=old_class.values("pk"))
-        .exists()
-    ):
-        errors.setdefault("object_name", []).append("A route-map classification with this name already exists.")
     return errors
 
 
@@ -5000,6 +5004,24 @@ def _route_map_rename_dependents(route_map, old_name):
     return bgp_states, redistribution_states, dependent_groups
 
 
+def _route_map_name_collision_errors(route_map_model, route_map_pk, new_name, class_ids):
+    """Return case-insensitive native and classification rename conflicts."""
+    from .models import NSORoutePolicyObjectClass
+
+    if route_map_model.objects.filter(name__iexact=new_name).exclude(pk=route_map_pk).exists():
+        return {"object_name": ["A route map with this name already exists."]}
+    if class_ids and (
+        NSORoutePolicyObjectClass.objects.filter(
+            family="route_map",
+            object_name__iexact=new_name,
+        )
+        .exclude(pk__in=class_ids)
+        .exists()
+    ):
+        return {"object_name": ["A route-map classification with this name already exists."]}
+    return {}
+
+
 def _route_map_name_edit_operations(state, old_name, planned_at):
     """Build one prospective route-map rename and its dependent targets."""
     import copy
@@ -5022,6 +5044,7 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
     classes = list(
         NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
     )
+    class_ids = tuple(policy_class.pk for policy_class in classes)
     fallback_redistribution = [
         row
         for row in redistribution_states
@@ -5050,9 +5073,15 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
         candidate = copy.copy(redistribution_state)
         candidate.route_map = new_name
         operations.append((candidate, ("route_map",)))
+
+    def validate_after_acquire():
+        if errors := _route_map_name_collision_errors(type(route_map), route_map.pk, new_name, class_ids):
+            raise _IntentTransactionNoOp(errors)
+
     plan = RendererMutationPlan.build(
         saves=(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
         planned_at=planned_at,
+        validate_after_acquire=validate_after_acquire,
     )
     dependent_route_policy_targets = set()
     for family, name in dependent_groups:
@@ -5089,6 +5118,8 @@ def _route_map_name_edit_plan(state, old_name):
 
 def _save_route_map_name_edit(state, old_name):
     """Atomically rename a shared route map and refresh every dependent intent scope."""
+    from django.db import IntegrityError
+
     from . import signals
     from .renderer_writer import renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
@@ -5096,18 +5127,27 @@ def _save_route_map_name_edit(state, old_name):
     plan, operations, targets = _route_map_name_edit_operations(state, old_name, timezone.now())
     route_policy_targets, bgp_targets, redistribution_targets = targets
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
-        with suppress_intent_push():
-            for candidate, update_fields in operations:
-                writer.save(candidate, update_fields=update_fields)
-        # Appended here, not on commit: the entry belongs to the transaction that renamed
-        # the map, and the drain it schedules still runs after that transaction commits.
-        for device_id in route_policy_targets:
-            signals._schedule_intent_push((device_id, "route_policy"))
-        for device_id in bgp_targets:
-            signals._schedule_intent_push((device_id, "bgp"))
-        for device_id, dest_protocol in redistribution_targets:
-            signals._schedule_redistribution_push(device_id, dest_protocol)
+    try:
+        with mutation as writer:
+            try:
+                with transaction.atomic(), suppress_intent_push():
+                    for candidate, update_fields in operations:
+                        writer.save(candidate, update_fields=update_fields)
+                    plan.validate_after_acquire()
+            except IntegrityError:
+                plan.validate_after_acquire()
+                raise
+            # Appended here, not on commit: the entry belongs to the transaction that renamed
+            # the map, and the drain it schedules still runs after that transaction commits.
+            for device_id in route_policy_targets:
+                signals._schedule_intent_push((device_id, "route_policy"))
+            for device_id in bgp_targets:
+                signals._schedule_intent_push((device_id, "bgp"))
+            for device_id, dest_protocol in redistribution_targets:
+                signals._schedule_redistribution_push(device_id, dest_protocol)
+    except _IntentTransactionNoOp as exc:
+        return exc.result
+    return None
 
 
 def _save_lacp_edit(obj, key, old_values):
