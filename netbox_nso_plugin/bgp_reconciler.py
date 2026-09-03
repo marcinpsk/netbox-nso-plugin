@@ -67,6 +67,20 @@ def _validate_bgp_policy_resolutions(expected):
         raise RendererTargetsChanged("BGP route-policy resolutions changed during acquisition")
 
 
+def _validate_bgp_source_resolutions(device_id, expected):
+    """Reject a source-interface lookup that changed after discovery."""
+    from dcim.models import Interface
+
+    from .intent_state import RendererTargetsChanged
+
+    expected = tuple(expected)
+    names = {name for name, _pk in expected}
+    rows_by_name = {row.name: row.pk for row in Interface.objects.filter(device_id=device_id, name__in=names)}
+    current = tuple(sorted((name, rows_by_name.get(name)) for name in names))
+    if current != expected:
+        raise RendererTargetsChanged("BGP source-interface resolutions changed during acquisition")
+
+
 def _bgp_plan_peer_dependencies(device, states, reported, payload):
     """Load the peer dependencies used by the BGP content predictor in fixed queries."""
     from dcim.models import Interface
@@ -144,6 +158,11 @@ def _bgp_plan_peer_dependencies(device, states, reported, payload):
         address_filter |= Q(address__net_host=source)
     addresses_by_host = {str(row.address.ip): row for row in IPAddress.objects.filter(address_filter)}
     interfaces_by_name = {row.name: row for row in Interface.objects.filter(device=device, name__in=source_interfaces)}
+    source_interface_resolutions = tuple(
+        sorted(
+            (name, interfaces_by_name[name].pk if name in interfaces_by_name else None) for name in source_interfaces
+        )
+    )
     peer_type = ContentType.objects.get_for_model(BGPPeer)
     peer_address_families_by_peer = {}
     for row in BGPPeerAddressFamily.objects.filter(
@@ -161,6 +180,7 @@ def _bgp_plan_peer_dependencies(device, states, reported, payload):
         prefix_lists_by_name,
         policy_footprint,
         policy_resolutions,
+        source_interface_resolutions,
     )
 
 
@@ -209,6 +229,7 @@ def bgp_reconcile_plan(device, payload: dict):
         prefix_lists_by_name,
         policy_footprint,
         policy_resolutions,
+        source_interface_resolutions,
     ) = _bgp_plan_peer_dependencies(device, states, reported, payload)
     changes_content = False
     for state in states:
@@ -308,6 +329,7 @@ def bgp_reconcile_plan(device, payload: dict):
     )
     source_models = {
         "ipam.asn": asns,
+        "dcim.interface": tuple(interfaces_by_name.values()),
         "ipam.ipaddress": addresses,
         "netbox_routing.bgprouter": routers,
         "netbox_routing.bgpscope": scopes,
@@ -319,6 +341,7 @@ def bgp_reconcile_plan(device, payload: dict):
     bgp_footprint = MutationFootprint.for_keys(
         {(device.pk, "bgp")},
         source_rows=(
+            SourceRow("dcim.device", device.pk),
             *(SourceRow(label, None) for label in source_models),
             *(SourceRow(label, row.pk) for label, rows in source_models.items() for row in rows),
         ),
@@ -338,10 +361,15 @@ def bgp_reconcile_plan(device, payload: dict):
         footprint,
         device_ids=tuple(sorted({*footprint.device_ids, *policy_footprint.device_ids})),
     )
+
+    def validate_after_acquire():
+        _validate_bgp_source_resolutions(device.pk, source_interface_resolutions)
+        _validate_bgp_policy_resolutions(policy_resolutions)
+
     return ReconcileMutationPlan(
         footprint,
         changes_content=changes_content,
-        validate_after_acquire=lambda: _validate_bgp_policy_resolutions(policy_resolutions),
+        validate_after_acquire=validate_after_acquire,
     )
 
 
