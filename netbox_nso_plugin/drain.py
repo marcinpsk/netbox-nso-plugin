@@ -1631,16 +1631,24 @@ def _rejected_at_boundary(exc) -> bool:
 
 
 def _dissolve(claim: Claim, exc) -> str:
-    """Abandon a refused body so the next claim folds the operator's correction.
+    """Retire an authority-free refused body until an operator edit records new work."""
+    from .models import NSOIntentOutboxEntry
 
-    §4.2's proven-no-effect abandon, without the withholding the fence adds: a shut fence is
-    a condition of the DEVICE that one backfill lifts, while an invalid body is a condition
-    of the request that only an operator edit changes. Replaying it would take that edit over
-    at the burned body on every later drain, so the correction could never reach the wire.
-    """
-    abandon(claim)
     with transaction.atomic():
         state = _lock_state(claim.device_id, claim.scope)
+        if state.push_seq != claim.push_seq:
+            return SUPERSEDED
+        entry_ids = list(
+            NSOIntentOutboxEntry.objects.filter(
+                device_id=claim.device_id,
+                scope=claim.scope,
+                consumed_by_push_seq=claim.push_seq,
+            ).values_list("pk", flat=True)
+        )
+        _abandon_locked(state)
+        if not claim.mark_any and not claim.deletions:
+            returned_entries = NSOIntentOutboxEntry.objects.filter(pk__in=entry_ids, consumed_by_push_seq__isnull=True)
+            _retire(returned_entries, entry_ids)
         state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
         state.last_error_at = _db_now()
         state.save()

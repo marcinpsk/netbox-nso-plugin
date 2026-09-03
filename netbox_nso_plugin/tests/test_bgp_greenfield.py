@@ -364,15 +364,24 @@ class TestBgpIncompleteSnapshotDrain(_CascadeFlushMixin, IntentPushResetMixin, T
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
             drain.drain_intent_outbox()
 
+            self.mgmt.refresh_from_db()
+            error = self.mgmt.intent_push_errors["bgp"]
+            outbox_state = state_of(self.device, "bgp")
+            attempted_at = outbox_state.last_drain_attempted_at
+            self.assertEqual(entries(self.device, "bgp", unconsumed=True), [])
+
+            drain.drain_intent_outbox()
+            drain.drain_intent_outbox()
+
         mock_put.assert_not_called()
         self.mgmt.refresh_from_db()
-        error = self.mgmt.intent_push_errors["bgp"]
+        self.assertEqual(self.mgmt.intent_push_errors["bgp"], error)
         self.assertEqual(error["code"], "validation_error")
         self.assertEqual(error["detail"]["state_id"], self.state.pk)
         outbox_state = state_of(self.device, "bgp")
         self.assertIsNone(outbox_state.push_seq)
         self.assertEqual(outbox_state.last_error_code, "validation_error")
-        self.assertEqual(len(entries(self.device, "bgp", unconsumed=True)), 1)
+        self.assertEqual(outbox_state.last_drain_attempted_at, attempted_at)
 
 
 class TestBgpPeerDeleteAfterOwnership(BgpGreenfieldBase):
