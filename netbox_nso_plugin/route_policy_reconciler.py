@@ -1277,6 +1277,22 @@ def _route_policy_omitted_group_predictions(management, payload: dict) -> list[t
     ]
 
 
+def _validate_route_policy_group_predictions(management, payload: dict, expected, expected_omitted) -> None:
+    """Reject group predictions whose materialized owner changed."""
+    from .intent_state import RendererTargetsChanged
+
+    _PL_UNIT_CACHE.set({})
+    changed = any(
+        _route_policy_group_changes_content(management, family, name, captured) != changes_content
+        for family, name, captured, changes_content in expected
+    )
+    # A group the payload omits that appeared, vanished or flipped its prediction is a change too.
+    omitted_now = _route_policy_omitted_group_predictions(management, payload)
+    changed = changed or sorted(omitted_now) != sorted(expected_omitted)
+    if changed:
+        raise RendererTargetsChanged("route-policy materialized owner changed during acquisition")
+
+
 def route_policy_reconcile_plan(device, payload: dict):
     """Declare the route-policy footprint and any materialized-content write."""
     from .intent_state import MutationFootprint, ReconcileMutationPlan
@@ -1287,17 +1303,24 @@ def route_policy_reconcile_plan(device, payload: dict):
     if management is None:
         return ReconcileMutationPlan(footprint)
     try:
-        changes_content = any(
-            _route_policy_group_changes_content(management, family, row["name"], row)
+        group_predictions = tuple(
+            (family, row["name"], row, _route_policy_group_changes_content(management, family, row["name"], row))
             for family, key in _FAMILY_PAYLOAD_KEYS.items()
             for row in payload.get(key) or []
             if isinstance(row, dict) and row.get("name")
-        ) or any(
-            prediction for _family, _name, prediction in _route_policy_omitted_group_predictions(management, payload)
         )
+        omitted_predictions = _route_policy_omitted_group_predictions(management, payload)
     except ImportError:
         return ReconcileMutationPlan(MutationFootprint())
-    return ReconcileMutationPlan(footprint, changes_content=changes_content, settles_deploying=False)
+    return ReconcileMutationPlan(
+        footprint,
+        changes_content=any(prediction[-1] for prediction in group_predictions)
+        or any(prediction for _family, _name, prediction in omitted_predictions),
+        settles_deploying=False,
+        validate_after_acquire=lambda: _validate_route_policy_group_predictions(
+            management, payload, group_predictions, omitted_predictions
+        ),
+    )
 
 
 def _reconcile_route_policy(device, payload: dict) -> list:
