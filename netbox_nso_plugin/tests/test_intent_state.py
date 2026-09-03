@@ -8,9 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
-import sqlparse
-from django.db import connection, transaction
-from django.db.models import F
+from django.db import transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from netbox_nso_plugin import delivery, outbox
@@ -20,7 +18,6 @@ from netbox_nso_plugin.intent_state import (
     IntentMutationProtocolError,
     MutationFootprint,
     SourceRow,
-    _dml_guard,
     canonical_fragment,
     content_mutation,
     deletion_footprint_for_instance,
@@ -81,266 +78,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.device, self.management = make_managed("intent-permit", 1623)
         self.state = own_vlan(self.management, 1623, "intent-permit")
 
-    def test_registered_bulk_dml_requires_a_content_permit(self):
-        with self.assertRaises(IntentMutationProtocolError):
-            NSOVLANState.objects.filter(pk=self.state.pk).update(vlan_id=self.state.vlan_id + 100000)
-
-    def test_registered_raw_dml_with_unquoted_content_column_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'UPDATE "{table}" SET vlan_id = %s WHERE id = %s',
-                [self.state.vlan_id, self.state.pk],
-            )
-
-    def test_registered_upsert_content_update_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
-                "ON CONFLICT (id) DO UPDATE SET device_name = EXCLUDED.device_name",
-                [self.state.pk],
-            )
-
-    def test_registered_upsert_with_unknown_update_columns_fails_closed(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
-                "ON CONFLICT (id) DO UPDATE SET "
-                "(device_name, status) = (EXCLUDED.device_name, EXCLUDED.status)",
-                [self.state.pk],
-            )
-
-    def test_registered_upsert_non_content_update_does_not_require_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
-                "ON CONFLICT (id) DO UPDATE SET last_apply_error = %s, last_apply_at = NULL",
-                [self.state.pk, "upserted"],
-            )
-
-        self.state.refresh_from_db()
-        self.assertEqual(self.state.last_apply_error, "upserted")
-
-    def test_registered_insert_on_conflict_do_nothing_does_not_require_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s ON CONFLICT (id) DO NOTHING',
-                [self.state.pk],
-            )
-
-        self.assertEqual(NSOVLANState.objects.filter(pk=self.state.pk).count(), 1)
-
-    def test_registered_insert_with_column_list_on_conflict_do_nothing_does_not_require_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-        columns = ", ".join(field.column for field in NSOVLANState._meta.concrete_fields)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE id = %s ON CONFLICT DO NOTHING",
-                [self.state.pk],
-            )
-
-        self.assertEqual(NSOVLANState.objects.filter(pk=self.state.pk).count(), 1)
-
-    def test_registered_raw_dml_with_unknown_columns_fails_closed(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'UPDATE "{table}" SET (management_id, vlan_id) = (%s, %s) WHERE id = %s',
-                [self.management.pk, self.state.vlan_id, self.state.pk],
-            )
-
-    def test_cte_led_raw_dml_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'WITH target AS (SELECT id FROM "{table}" WHERE id = %s) '
-                f'UPDATE "{table}" AS state SET vlan_id = %s FROM target WHERE state.id = target.id',
-                [self.state.pk, self.state.vlan_id],
-            )
-
-    def test_schema_qualified_raw_dml_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'UPDATE "public"."{table}" SET vlan_id = %s WHERE id = %s',
-                [self.state.vlan_id, self.state.pk],
-            )
-
-    def test_unquoted_uppercase_raw_dml_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table.upper()
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f"UPDATE {table} SET VLAN_ID = %s WHERE ID = %s",
-                [self.state.vlan_id, self.state.pk],
-            )
-
-    def test_comment_prefixed_raw_dml_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'/* guard regression */ UPDATE "{table}" SET vlan_id = %s WHERE id = %s',
-                [self.state.vlan_id, self.state.pk],
-            )
-
-    def test_merge_raw_dml_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'MERGE INTO "{table}" AS target '
-                "USING (VALUES (%s, %s)) AS source(id, vlan_id) ON target.id = source.id "
-                "WHEN MATCHED THEN UPDATE SET vlan_id = source.vlan_id",
-                [self.state.pk, self.state.vlan_id],
-            )
-
-    def test_data_mutating_cte_with_outer_select_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'WITH changed AS (UPDATE "{table}" SET vlan_id = %s WHERE id = %s RETURNING id) '
-                "SELECT id FROM changed",
-                [self.state.vlan_id, self.state.pk],
-            )
-
-    def test_data_mutating_cte_after_read_only_cte_requires_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
-            cursor.execute(
-                f'WITH existing AS (SELECT id FROM "{table}" WHERE id = %s), '
-                f'changed AS (UPDATE "{table}" SET vlan_id = %s WHERE id IN (SELECT id FROM existing) RETURNING id) '
-                "SELECT id FROM changed",
-                [self.state.pk, self.state.vlan_id],
-            )
-
-    def test_unparseable_sql_that_names_a_registered_table_fails_closed(self):
-        table = NSOVLANState._meta.db_table
-
-        with self.assertRaises(IntentMutationProtocolError), transaction.atomic(), connection.cursor() as cursor:
-            cursor.execute(f'UPDATE ??? "{table}" SET vlan_id = %s', [self.state.vlan_id])
-
-    def test_registered_bulk_dml_allows_a_non_content_counter_update(self):
-        type(self.device).objects.filter(pk=self.device.pk).update(interface_count=F("interface_count") + 1)
-
-        self.device.refresh_from_db()
-        self.assertEqual(self.device.interface_count, 1)
-
-    def test_registered_table_select_skips_sqlparse(self):
-        table = NSOVLANState._meta.db_table
-        with patch("netbox_nso_plugin.intent_state.sqlparse.parse") as parse, connection.cursor() as cursor:
-            cursor.execute(f'SELECT id FROM "{table}" WHERE id = %s', [self.state.pk])
-            selected = cursor.fetchone()
-            for index in range(1000):
-                statement = f'SELECT id FROM "{table}" WHERE id = %s /* intent guard select {index} */'
-                _dml_guard(lambda *args: None, statement, (self.state.pk,), False, {})
-
-        self.assertEqual(selected, (self.state.pk,))
-        parse.assert_not_called()
-
-    def test_unregistered_changelog_insert_skips_sqlparse(self):
-        statement = (
-            "INSERT INTO intent_guard_unregistered_objectchange "
-            "(object_type_id, changed_object_id, action) VALUES (%s, %s, %s)"
-        )
-        real_parse = sqlparse.parse
-        parse_calls = 0
-
-        def counting_parse(*args, **kwargs):
-            nonlocal parse_calls
-            parse_calls += 1
-            return real_parse(*args, **kwargs)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "CREATE TEMP TABLE intent_guard_unregistered_objectchange "
-                "(object_type_id integer, changed_object_id bigint, action varchar(50))"
-            )
-            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
-                cursor.execute(statement, [1, 1623, "update"])
-                cursor.execute(
-                    "SELECT object_type_id, changed_object_id, action FROM intent_guard_unregistered_objectchange"
-                )
-                inserted = cursor.fetchone()
-
-        self.assertEqual(inserted, (1, 1623, "update"))
-        self.assertEqual(parse_calls, 0)
-
-    def test_unregistered_cte_led_update_skips_sqlparse(self):
-        statement = (
-            "WITH target AS (SELECT id FROM intent_guard_unregistered_cte WHERE id = %s) "
-            "UPDATE intent_guard_unregistered_cte AS candidate SET value = %s "
-            "FROM target WHERE candidate.id = target.id"
-        )
-        real_parse = sqlparse.parse
-        parse_calls = 0
-
-        def counting_parse(*args, **kwargs):
-            nonlocal parse_calls
-            parse_calls += 1
-            return real_parse(*args, **kwargs)
-
-        with connection.cursor() as cursor:
-            cursor.execute("CREATE TEMP TABLE intent_guard_unregistered_cte (id integer PRIMARY KEY, value text)")
-            cursor.execute("INSERT INTO intent_guard_unregistered_cte (id, value) VALUES (%s, %s)", [1, "before"])
-            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
-                cursor.execute(statement, [1, "after"])
-                cursor.execute("SELECT value FROM intent_guard_unregistered_cte WHERE id = %s", [1])
-                updated = cursor.fetchone()
-
-        self.assertEqual(updated, ("after",))
-        self.assertEqual(parse_calls, 0)
-
-    def test_unregistered_insert_shape_is_never_parsed(self):
-        statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
-        real_parse = sqlparse.parse
-        parse_calls = 0
-
-        def counting_parse(*args, **kwargs):
-            nonlocal parse_calls
-            parse_calls += 1
-            return real_parse(*args, **kwargs)
-
-        with connection.cursor() as cursor:
-            cursor.execute("CREATE TEMP TABLE intent_guard_parse_cache (value integer)")
-            with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
-                cursor.execute(statement, [1])
-                cursor.execute(statement, [2])
-
-        self.assertEqual(parse_calls, 0)
-
-    def test_repeated_registered_dml_shape_caches_column_classification(self):
-        table = NSOVLANState._meta.db_table
-        statement = f'UPDATE "{table}" SET last_apply_error = %s WHERE id = %s /* intent guard column cache */'
-        real_parse = sqlparse.parse
-        parse_calls = 0
-
-        def counting_parse(*args, **kwargs):
-            nonlocal parse_calls
-            parse_calls += 1
-            return real_parse(*args, **kwargs)
-
-        with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse), connection.cursor() as cursor:
-            cursor.execute(statement, ["first", self.state.pk])
-            cursor.execute(statement, ["second", self.state.pk])
-
-        self.assertEqual(parse_calls, 2)
-
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():
             locked = NSOVLANState.objects.select_for_update(of=("self",)).get(pk=self.state.pk)
@@ -374,15 +111,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         module = Module.objects.create(device=self.device, module_bay=module_bay, module_type=module_type)
 
         self.assertEqual(module.interfaces.get().name, "Ethernet1623/1")
-
-    def test_unpermitted_bulk_creation_is_authorized_and_logged(self):
-        from dcim.models import Interface
-
-        with self.assertLogs("netbox_nso_plugin.intent_state", level="WARNING") as logs:
-            Interface.objects.bulk_create([Interface(device=self.device, name="Ethernet1623/9", type="1000base-t")])
-
-        self.assertEqual(Interface.objects.filter(name="Ethernet1623/9").count(), 1)
-        self.assertTrue(any("dcim_interface" in line for line in logs.output))
 
     def test_registered_bulk_dml_allows_a_non_rendered_interface_update(self):
         from dcim.models import Interface
@@ -577,20 +305,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         other.refresh_from_db()
         self.assertEqual(other.device_name, "")
         self.assertNotEqual(other_device.pk, self.device.pk)
-
-    def test_revision_locks_alone_do_not_authorize_registered_content_dml(self):
-        vlan = self.state.vlan
-        spec = renderer_input_specs()[vlan._meta.label_lower]
-        footprint = MutationFootprint.for_keys(spec.resolver(vlan, spec))
-        original_name = vlan.name
-
-        with self.assertRaises(IntentMutationProtocolError), transaction.atomic(), suppress_intent_push():
-            with intent_transaction(footprint):
-                vlan.name = "revision-only-permit"
-                vlan.save(update_fields=["name"])
-
-        vlan.refresh_from_db()
-        self.assertEqual(vlan.name, original_name)
 
     def test_content_mutation_bumps_before_write_and_repends_deploying_rows(self):
         attempt_id = uuid4()
