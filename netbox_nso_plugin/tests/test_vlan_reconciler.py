@@ -66,6 +66,18 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(rows[0].device_name, "FIRST")
         self.assertEqual(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).count(), 1)
 
+    def test_vlan_reconciler_validates_repeated_vlan_entries(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        payload = {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627}]}
+
+        with self.assertRaisesRegex(AdapterError, "name must be a string") as raised:
+            reconcile_vlan_database(self.device, payload)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
+
     def test_vlan_footprint_does_not_create_the_device_group(self):
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_footprint
 

@@ -2052,12 +2052,13 @@ def clear_acknowledged_lineage() -> int:
     at once. NULL is not a gap here: it IS the wire's ``unverified`` flag, and saying so is
     what keeps a later deletion attributable instead of silently moot.
     """
-    from .models import NSOIntentOutboxState, NSOStaticRouteState
+    from .models import NSOIntentOutboxState, NSOOwnershipManifest, NSOStaticRouteState
 
     # One fact, so one transaction: NULL triples beside a surviving carry would let the next
     # success stamp a triple the adapter never acknowledged.
     with transaction.atomic():
         cleared = NSOStaticRouteState.objects.exclude(last_acked_triple=None).update(last_acked_triple=None)
+        NSOOwnershipManifest.objects.exclude(acknowledged_lineage=[]).update(acknowledged_lineage=[])
         NSOIntentOutboxState.objects.filter(scope="static_route").update(lineage_carry={})
     return cleared
 
