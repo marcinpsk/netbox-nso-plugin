@@ -76,6 +76,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         plan = RendererMutationPlan.build(
             saves=(planned_save(planned, force_insert=True, natural_key=("device", "name")),)
         )
+        self.assertFalse(plan.changes_content)
         existing = Interface.objects.create(device=device, name="Loopback1627", type="virtual")
         mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
 
