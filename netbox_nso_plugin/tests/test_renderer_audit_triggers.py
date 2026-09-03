@@ -66,6 +66,7 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
 
         with (
             patch("netbox_nso_plugin.drain._send_clock", return_value=12.5),
+            patch("netbox_nso_plugin.drain.time.monotonic", return_value=20.0),
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes") as audit,
             patch("netbox_nso_plugin.drain._claim_or_compact", return_value=(None, False)),
         ):
@@ -78,7 +79,7 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
             )
 
         self.assertEqual((outcome, answer), (drain.NOTHING, None))
-        self.assertEqual(audit.call_args.kwargs["deadline"], 19.5)
+        self.assertEqual(audit.call_args.kwargs["deadline"], 27.0)
 
     def test_delivery_translates_audit_refusals_to_adapter_errors(self):
         from netbox_nso_plugin import delivery
