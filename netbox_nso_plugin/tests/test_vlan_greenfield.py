@@ -10,10 +10,11 @@ to all of them.
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
-from .mixins import IntentPushDeliveryMixin
+from ._outbox_case import in_thread
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
 class _VlanGreenfieldBase(IntentPushDeliveryMixin, TestCase):
@@ -96,6 +97,91 @@ class TestVlanAttachView(_VlanGreenfieldBase):
         assert not type(vlan).objects.filter(pk=vlan.pk).exists()
         revision.refresh_from_db()
         assert revision.revision == before, "an unavailable VLAN committed an intent revision"
+
+
+class TestVlanAttachViewConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from django.db import transaction
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOVLANState
+
+        manufacturer = Manufacturer.objects.create(name="VLAN race", slug="vlan-race")
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model="VLAN race",
+            slug="vlan-race",
+        )
+        role = DeviceRole.objects.create(name="VLAN race", slug="vlan-race")
+        site = Site.objects.create(name="VLAN race", slug="vlan-race")
+        self.device = Device.objects.create(
+            name="vlan-race-device",
+            device_type=device_type,
+            role=role,
+            site=site,
+        )
+        nso_instance = NSOInstance.objects.create(
+            name="vlan-race-instance",
+            adapter_instance_id="vlan-race-instance",
+        )
+        self.mgmt = NSODeviceManagement(
+            device=self.device,
+            nso_instance=nso_instance,
+            nso_device_name="vlan-race-device",
+            adapter_device_id=196,
+        )
+        with intent_transaction(footprint_for_instance(self.mgmt)):
+            NSODeviceManagement.objects.bulk_create([self.mgmt])
+
+        group = VLANGroup.objects.create(name="VLAN race", slug="vlan-race")
+        with transaction.atomic():
+            self.vlan = VLAN.objects.create(group=group, vid=3366, name="test-vlan")
+            self.state = NSOVLANState.objects.create(
+                management=self.mgmt,
+                vlan=self.vlan,
+                device_name="original-name",
+                status="imported",
+            )
+        user = __import__("users").models.User.objects.create_user("vlan-race-admin", is_superuser=True)
+        self.client.force_login(user)
+
+    def test_existing_overlay_conflict_uses_the_refresh_response(self):
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        original_build = RendererMutationPlan.build
+        plan_staled = False
+
+        def change_device_name():
+            current = NSOVLANState.objects.get(pk=self.state.pk)
+            with intent_transaction(footprint_for_instance(current)):
+                NSOVLANState.objects.filter(pk=current.pk).update(device_name="concurrent-name")
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal plan_staled
+            plan = original_build(*args, **kwargs)
+            if not plan_staled:
+                plan_staled = True
+                in_thread(change_device_name)
+            return plan
+
+        url = reverse("plugins:netbox_nso_plugin:vlan_attach", kwargs={"device_pk": self.device.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_stale):
+            response = self.client.post(url, {"vlan": self.vlan.pk})
+
+        self.assertEqual(response.status_code, 302)
+        message_text = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertIn("The selected VLAN is no longer available.", message_text)
+        self.assertFalse(any(message.startswith("Attached VLAN") for message in message_text))
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.device_name, "concurrent-name")
+        self.assertEqual(self.state.status, "imported")
 
 
 class TestVlanDeletePropagation(_VlanGreenfieldBase):
