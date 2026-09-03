@@ -655,7 +655,7 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        from ._outbox_case import content_update
+        from ._outbox_case import mirror_update
         from ._static_route_case import _assign_and_accept
 
         instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
@@ -671,7 +671,7 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         assert drain.drain_key(removed_device.pk, "static_route", chain=0) == drain.SUCCEEDED
         assert drain.drain_key(retained_device.pk, "static_route", chain=0) == drain.SUCCEEDED
         for state in NSOStaticRouteState.objects.filter(static_route=route):
-            content_update(state, status="in_sync")
+            mirror_update(state, status="in_sync")
         self._enable_auto_apply(removed)
         self._enable_auto_apply(retained)
 
