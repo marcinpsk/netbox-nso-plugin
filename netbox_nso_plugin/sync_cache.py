@@ -130,6 +130,10 @@ def refresh_sync_cache(mgmt, adapter_device):
     if update_fields:
         persisted = _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
         if not persisted:
+            try:
+                mgmt.refresh_from_db(fields=update_fields)
+            except NSODeviceManagement.DoesNotExist:
+                pass
             return []
     return update_fields
 
