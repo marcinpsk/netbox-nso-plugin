@@ -232,7 +232,7 @@ def _parse_ip_address(value):
 
 def canonical_bgp_peer_identity(asn, vrf, peer_address):
     """Return the canonical persisted identity for one BGP peer state."""
-    return str(_parse_asn(asn)), vrf, _parse_ip_address(peer_address).compressed
+    return str(_parse_asn(asn)), vrf, ipaddress.ip_interface(peer_address).ip.compressed
 
 
 def _canonical_source_ip(value):
