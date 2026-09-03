@@ -6251,7 +6251,11 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
 
         with without_commit_drain(), transaction.atomic():
             return NSOSnmpCommunityState.objects.create(
-                management=self.mgmt, community_hash="ab12cd34ef56ab78", access="RO", status="accepted"
+                management=self.mgmt,
+                community_hash="ab12cd34ef56ab78",
+                access="RO",
+                status="accepted",
+                vault_ref="test/snmp/community",
             )
 
     def _own_then_delete_a_community(self):

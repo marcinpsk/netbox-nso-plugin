@@ -1352,6 +1352,13 @@ def _nokia_routed_binding(interface) -> dict:
     return {"routed": True, "parent_binding": parent.name, "encap_tag": tag}
 
 
+def snmp_vault_ref_push_blocker(row) -> str:
+    """Why *row* cannot be faithfully pushed, or "" when it can."""
+    if not row.vault_ref:
+        return "this owned SNMP row has no Vault reference"
+    return ""
+
+
 def snmp_v3_user_push_blocker(row) -> str:
     """Why *row* cannot be faithfully pushed, or "" when it can.
 
@@ -1443,6 +1450,17 @@ def _drop_unpushable_snmp_rows(rows, blocker):
     return pushable
 
 
+def _snmp_push_blockers(rows, blocker):
+    """Return the reasons that prevent a complete SNMP snapshot."""
+    blocked = []
+    for row in rows:
+        reason = blocker(row)
+        if reason:
+            logger.warning("SNMP intent: %s blocks the full snapshot: %s", row, reason)
+            blocked.append(f"{row}: {reason}")
+    return blocked
+
+
 def snmp_community_intent_item(row):
     """Return one SNMP community in the adapter's exact wire shape."""
     return {
@@ -1491,24 +1509,27 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     from . import adapter_client as client
     from .models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpSystemInfoState, NSOSnmpV3UserState
 
+    owned_communities = list(
+        NSOSnmpCommunityState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management")
+    )
+    blocked = _snmp_push_blockers(owned_communities, snmp_vault_ref_push_blocker)
     communities = []
-    for row in NSOSnmpCommunityState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management"):
+    for row in owned_communities:
         if not row.vault_ref:
             continue
         communities.append(snmp_community_intent_item(row))
 
     v3_users = []
-    owned_v3 = [
-        row
-        for row in NSOSnmpV3UserState.objects.filter(
+    owned_v3 = list(
+        NSOSnmpV3UserState.objects.filter(
             management__device_id=device_id,
             status__in=_OWNED_PUSH_STATUSES,
         )
-        if row.vault_ref
-    ]
+    )
+    blocked.extend(_snmp_push_blockers(owned_v3, snmp_vault_ref_push_blocker))
     for row in _drop_unpushable_snmp_rows(owned_v3, snmp_v3_user_push_blocker):
         # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at
         # "#auth"/"#priv" by convention. A leg without its protocol is not
@@ -1539,11 +1560,20 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     except NSOSnmpSystemInfoState.DoesNotExist:
         pass
 
-    _push_changed(
-        (device_id, "snmp"),
-        [communities, v3_users, hosts, system_info],
-        lambda body: client.put_snmp_intent(adapter_device_id, *body),
-    )
+    payload = {"blocked": blocked} if blocked else [communities, v3_users, hosts, system_info]
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            from .adapter_client import AdapterError
+
+            raise AdapterError(
+                f"SNMP snapshot is blocked: {'; '.join(body['blocked'])}",
+                code="validation_error",
+                detail={"reason": "blocked_owned_row"},
+            )
+        return client.put_snmp_intent(adapter_device_id, *body)
+
+    _push_changed((device_id, "snmp"), payload, push)
 
 
 @_skip_on_render

@@ -255,6 +255,40 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         user.refresh_from_db()
         assert user.status == "error", f"the dropped row must be surfaced, not left green (status={user.status})"
 
+    def test_an_owned_community_without_a_vault_reference_blocks_the_snapshot(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        mgmt = self._make_mgmt()
+        self._community(mgmt, status="accepted", vault_ref="")
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
+
+        assert raised.exception.code == "validation_error"
+        mock_put.assert_not_called()
+
+    def test_an_owned_v3_user_without_a_vault_reference_blocks_the_snapshot(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        mgmt = self._make_mgmt()
+        self._v3_user(
+            mgmt,
+            status="accepted",
+            auth_protocol="sha",
+            priv_protocol="aes-128",
+            vault_ref="",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
+
+        assert raised.exception.code == "validation_error"
+        mock_put.assert_not_called()
+
     def test_accepting_a_v3_trap_host_is_refused(self):
         """The host overlay has no v3 username source, so a v3 host can only ever be pushed
         keyed on an empty user. It used to accept, then be dropped with a server-side log
