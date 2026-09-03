@@ -729,6 +729,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             static_route_stored=False,
         )
 
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual((first.status, second.status), ("deploying", "deploying"))
+        self.assertEqual(first.apply_attempt_id, next_attempt_id)
+        self.assertEqual(second.apply_attempt_id, next_attempt_id)
+
         with without_commit_drain(), intent_transaction(stale_footprint):
             current = NSOInterfaceMtuState.objects.get(pk=first.pk)
             current.l2_mtu = 1600
