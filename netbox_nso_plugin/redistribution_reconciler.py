@@ -505,6 +505,7 @@ def reconcile_redistribution(device, payload: dict) -> list:
     from django.utils import timezone
 
     from . import status_machine as sm
+    from .intent_state import reconcile_cascade_dml
     from .models import NSODeviceManagement, NSORedistributionState
 
     try:
@@ -575,8 +576,6 @@ def reconcile_redistribution(device, payload: dict) -> list:
             rd = stale.redistribution
             stale.delete()
             if rd is not None and not rd.nso_redistribution_states.exists():
-                from .intent_state import reconcile_cascade_dml
-
                 with reconcile_cascade_dml(NSORedistributionState):
                     rd.delete()
 
