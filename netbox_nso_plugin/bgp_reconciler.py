@@ -268,7 +268,11 @@ def _indexed_peer_states(rows):
     duplicates = []
     raw_keys = {}
     for row in rows:
-        canonical_key = (row.asn_str, row.vrf_name, _parse_ip_address(row.peer_address_str).compressed)
+        canonical_key = (
+            str(_parse_asn(row.asn_str)),
+            row.vrf_name,
+            _parse_ip_address(row.peer_address_str).compressed,
+        )
         raw_keys[(row.asn_str, row.vrf_name, row.peer_address_str)] = row
         if canonical_key in identities:
             duplicates.append(row)
@@ -277,12 +281,12 @@ def _indexed_peer_states(rows):
     return identities, duplicates, raw_keys
 
 
-def _available_peer_state_address(state, state_key, raw_keys):
-    """Return the canonical address unless another persisted state owns it."""
+def _available_peer_state_identity(state, state_key, raw_keys):
+    """Return the canonical key unless another persisted state owns it."""
     holder = raw_keys.get(state_key)
     if holder is not None and holder.pk != state.pk:
-        return state.peer_address_str
-    return state_key[2]
+        return state.asn_str, state.peer_address_str
+    return state_key[0], state_key[2]
 
 
 def _validated_bgp_document(payload):  # noqa: C901
@@ -1059,7 +1063,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if state_created
             else copy.copy(current_state)
         )
-        state.peer_address_str = _available_peer_state_address(state, state_key, self.peer_state_raw_keys)
+        state.asn_str, state.peer_address_str = _available_peer_state_identity(
+            state,
+            state_key,
+            self.peer_state_raw_keys,
+        )
         state.bgp_peer = peer
         state.remote_as_str = str(entry.get("remote_as") or "")
         state.enabled = entry.get("enabled")

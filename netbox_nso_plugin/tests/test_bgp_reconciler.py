@@ -867,6 +867,93 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         pushed_peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual([peer["peer_address"] for peer in pushed_peers], [canonical])
 
+    def test_persisted_asn_aliases_keep_lower_asplain_pk(self):
+        """The lower asplain row remains the identity when a padded alias follows it."""
+        mgmt = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
+        identity = _reconcile_bgp_config(self.device, payload)[0]
+        content_update(identity, status="accepted")
+        duplicate = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="065100",
+            vrf_name=identity.vrf_name,
+            peer_address_str=identity.peer_address_str,
+            bgp_peer=identity.bgp_peer,
+            status="in_sync",
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+
+        identity.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertLess(identity.pk, duplicate.pk)
+        self.assertEqual(identity.asn_str, "65100")
+        self.assertEqual(identity.status, "in_sync")
+        self.assertEqual(duplicate.status, "changed")
+
+    def test_persisted_asn_aliases_keep_lower_padded_pk_out_of_snapshot(self):
+        """The lower padded row remains the identity and the asplain alias becomes stale."""
+        mgmt = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
+        identity = _reconcile_bgp_config(self.device, payload)[0]
+        content_update(identity, asn_str="065100", status="accepted")
+        duplicate = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name=identity.vrf_name,
+            peer_address_str=identity.peer_address_str,
+            bgp_peer=identity.bgp_peer,
+            status="in_sync",
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+
+        identity.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertLess(identity.pk, duplicate.pk)
+        self.assertEqual(identity.asn_str, "065100")
+        self.assertEqual(identity.status, "in_sync")
+        self.assertEqual(duplicate.status, "changed")
+        captured = {}
+
+        def capture_push(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=capture_push):
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
+
+        pushed_peers = captured["routers"][0]["scopes"][0]["peers"]
+        self.assertEqual(len(pushed_peers), 1)
+
+    def test_persisted_padded_asn_state_reuses_canonical_identity(self):
+        """A sole padded ASN state keeps its identity and ownership after reconciliation."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
+        original = _reconcile_bgp_config(self.device, payload)[0]
+        content_update(original, asn_str="065100", status="in_sync")
+
+        result = _reconcile_bgp_config(self.device, payload)
+
+        state = NSOBGPPeerState.objects.get()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(state.pk, original.pk)
+        self.assertEqual(state.asn_str, "65100")
+        self.assertEqual(state.status, "in_sync")
+
     def test_persisted_peer_aliases_keep_lower_canonical_pk(self):
         """The lower canonical row remains the identity when an expanded alias follows it."""
         mgmt = self._make_mgmt()
