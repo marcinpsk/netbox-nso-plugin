@@ -1087,6 +1087,8 @@ def _reconcile_switchport(device, payload: dict, writer, plan) -> list:
     operations = execution.operations
     for operation, instance, update_fields, force_insert, field_name, related in operations:
         if operation == "save":
+            if not force_insert and writer.consume_applied_save(instance):
+                continue
             _save_reconcile_instance(writer, instance, update_fields, force_insert)
         elif operation == "delete":
             writer.delete(instance)
@@ -1094,5 +1096,7 @@ def _reconcile_switchport(device, payload: dict, writer, plan) -> list:
             _sync_cached_foreign_keys(instance)
             for related_instance in related:
                 _sync_cached_foreign_keys(related_instance)
+            if writer.consume_applied_m2m_set(instance, field_name):
+                continue
             writer.m2m_set(instance, field_name, related)
     return list(execution.rows)
