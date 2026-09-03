@@ -133,6 +133,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         with CaptureQueriesContext(connection) as captured:
             audit_scope_footprint(self.device.pk, delivery.delivery_keys())
 
+        scanned = {
+            table for query in captured.captured_queries for table in tables if f'FROM "{table}"' in query["sql"]
+        }
         unfiltered = sorted(
             {
                 table
@@ -141,6 +144,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 if f'FROM "{table}"' in query["sql"] and " WHERE " not in query["sql"]
             }
         )
+        self.assertTrue(scanned)
         self.assertEqual(unfiltered, [])
 
     def test_audit_footprint_batches_overlay_loads_by_model(self):
