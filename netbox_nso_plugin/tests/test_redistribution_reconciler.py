@@ -224,6 +224,29 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry()]})
         self.assertEqual(Redistribution.objects.filter(source_protocol="static").count(), 1)
 
+    def test_duplicate_new_entry_persists_once(self):
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        entry = self._entry()
+
+        plan = redistribution_reconcile_plan(self.device, {"entries": [entry, entry]})
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "netbox_routing.redistribution"),
+                ("save", "netbox_nso_plugin.nsoredistributionstate"),
+            ],
+        )
+        reconcile_redistribution(self.device, {"entries": [entry, entry]})
+
+        self.assertEqual(Redistribution.objects.count(), 1)
+        self.assertEqual(NSORedistributionState.objects.count(), 1)
+
     def test_edit_surfaces_as_changed_and_survives(self):
         """Editing the Redistribution object → drift, and the edit is not clobbered."""
         self._make_mgmt()

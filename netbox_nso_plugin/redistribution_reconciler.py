@@ -178,6 +178,8 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
         if not destination_protocol or not source_protocol:
             continue
         key = (destination_protocol, destination_ref, source_protocol, source_ref)
+        if key in seen:
+            continue
         seen.add(key)
         current = states.get(key)
         state = (
