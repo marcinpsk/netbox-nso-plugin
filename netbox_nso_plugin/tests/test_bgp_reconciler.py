@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for A4: adapter_client.get_bgp_config and _reconcile_bgp_config."""
 
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -144,6 +145,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
                     "vrf": vrf,
                     "address_families": address_families if address_families is not None else ["ipv4-unicast"],
                     "peers": peers if peers is not None else [],
+                    "peer_groups": [],
                 }
             ],
         }
@@ -261,6 +263,319 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         result = _reconcile_bgp_config(self.device, self._payload())
         self.assertEqual(result, [])
 
+    def test_malformed_router_entry_is_a_typed_adapter_error(self):
+        """A malformed router fails at the adapter boundary without changing stored BGP."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry()])),
+        )
+        state = NSOBGPPeerState.objects.get()
+        original = (state.pk, state.status, state.bgp_peer_id, state.device_base_hash)
+
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(self.device, {"routers": [None]})
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        state.refresh_from_db()
+        self.assertEqual((state.pk, state.status, state.bgp_peer_id, state.device_base_hash), original)
+
+    def test_missing_required_fields_are_typed_adapter_errors(self):
+        """Missing adapter fields fail before stored BGP can change."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        peer_group = {
+            "name": "GROUP",
+            "remote_as": "65200",
+            "address_families": [{"af": "ipv4-unicast"}],
+        }
+        payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
+        payload["routers"][0]["scopes"][0]["peer_groups"] = [peer_group]
+        _reconcile_bgp_config(self.device, payload)
+        state = NSOBGPPeerState.objects.get()
+        original = (state.pk, state.status, state.bgp_peer_id, state.device_base_hash)
+
+        def without(path):
+            malformed = copy.deepcopy(payload)
+            target = malformed
+            for part in path[:-1]:
+                target = target[part]
+            target.pop(path[-1])
+            return malformed
+
+        missing_fields = (
+            ("router ID", ("routers", 0, "router_id")),
+            ("router scopes", ("routers", 0, "scopes")),
+            ("scope address families", ("routers", 0, "scopes", 0, "address_families")),
+            ("scope peers", ("routers", 0, "scopes", 0, "peers")),
+            ("scope peer groups", ("routers", 0, "scopes", 0, "peer_groups")),
+            ("peer address families", ("routers", 0, "scopes", 0, "peers", 0, "address_families")),
+            (
+                "peer group address families",
+                ("routers", 0, "scopes", 0, "peer_groups", 0, "address_families"),
+            ),
+        )
+
+        for label, path in missing_fields:
+            with self.subTest(label=label):
+                with self.assertRaises(AdapterError) as raised:
+                    _reconcile_bgp_config(self.device, without(path))
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+        state.refresh_from_db()
+        self.assertEqual((state.pk, state.status, state.bgp_peer_id, state.device_base_hash), original)
+        self.assertEqual(BGPPeerAddressFamily.objects.count(), 2)
+
+    def test_malformed_scalar_fields_are_typed_adapter_errors(self):
+        """Malformed planner scalars fail before they can make existing rows stale."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry()])),
+        )
+        state = NSOBGPPeerState.objects.get()
+        original = (state.pk, state.status, state.bgp_peer_id, state.device_base_hash)
+        peer_group = {
+            "name": "GROUP",
+            "remote_as": "65200",
+            "address_families": [{"af": "ipv4-unicast"}],
+        }
+        policy_fields = ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out")
+        malformed_peer_policies = tuple(
+            (
+                f"non-string peer {field}",
+                self._payload(
+                    self._router_payload(
+                        peers=[
+                            self._peer_entry(
+                                address_families=[{"af": "ipv4-unicast", "enabled": True, field: ["invalid"]}]
+                            )
+                        ]
+                    )
+                ),
+            )
+            for field in policy_fields
+        )
+        malformed_group_policies = tuple(
+            (
+                f"non-string group {field}",
+                self._scope_with_peer_groups(
+                    [
+                        {
+                            **peer_group,
+                            "address_families": [{"af": "ipv4-unicast", field: ["invalid"]}],
+                        }
+                    ]
+                ),
+            )
+            for field in policy_fields
+        )
+        invalid_payloads = (
+            ("null router ASN", self._payload(self._router_payload(asn=None))),
+            ("invalid router ASN", self._payload(self._router_payload(asn="not-an-asn"))),
+            ("numeric router ASN", self._payload(self._router_payload(asn=65100))),
+            ("non-string router ID", self._payload(self._router_payload(router_id=["invalid"]))),
+            ("invalid router ID", self._payload(self._router_payload(router_id="not-an-ip"))),
+            ("IPv6 router ID", self._payload(self._router_payload(router_id="2001:db8::1"))),
+            ("numeric VRF", self._payload(self._router_payload(vrf=7))),
+            (
+                "non-boolean peer enabled",
+                self._payload(self._router_payload(peers=[self._peer_entry(enabled="invalid")])),
+            ),
+            (
+                "non-string peer source",
+                self._payload(self._router_payload(peers=[self._peer_entry(source=["invalid"])])),
+            ),
+            (
+                "non-integer peer TTL",
+                self._payload(self._router_payload(peers=[self._peer_entry(ttl="invalid")])),
+            ),
+            (
+                "non-string peer password",
+                self._payload(self._router_payload(peers=[self._peer_entry(password=["invalid"])])),
+            ),
+            (
+                "non-boolean peer BFD enabled",
+                self._payload(self._router_payload(peers=[self._peer_entry(bfd_enabled=1)])),
+            ),
+            (
+                "numeric peer group name",
+                self._payload(self._router_payload(peers=[self._peer_entry(peer_group=7)])),
+            ),
+            (
+                "blank peer group name",
+                self._payload(self._router_payload(peers=[self._peer_entry(peer_group="")])),
+            ),
+            (
+                "numeric group name",
+                self._scope_with_peer_groups([{**peer_group, "name": 7}]),
+            ),
+            (
+                "blank group name",
+                self._scope_with_peer_groups([{**peer_group, "name": ""}]),
+            ),
+            (
+                "non-string group source",
+                self._scope_with_peer_groups([{**peer_group, "source": ["invalid"]}]),
+            ),
+            (
+                "numeric peer address",
+                self._payload(self._router_payload(peers=[self._peer_entry(peer_address=7)])),
+            ),
+            (
+                "blank peer address",
+                self._payload(self._router_payload(peers=[self._peer_entry(peer_address="")])),
+            ),
+            (
+                "invalid peer address",
+                self._payload(self._router_payload(peers=[self._peer_entry(peer_address="not-an-ip")])),
+            ),
+            (
+                "numeric remote ASN",
+                self._payload(self._router_payload(peers=[self._peer_entry(remote_as=65200)])),
+            ),
+            (
+                "invalid remote ASN",
+                self._payload(self._router_payload(peers=[self._peer_entry(remote_as="invalid")])),
+            ),
+            (
+                "numeric local ASN",
+                self._payload(self._router_payload(peers=[self._peer_entry(local_as=65100)])),
+            ),
+            (
+                "invalid local ASN",
+                self._payload(self._router_payload(peers=[self._peer_entry(local_as="invalid")])),
+            ),
+            (
+                "numeric group remote ASN",
+                self._scope_with_peer_groups([{**peer_group, "remote_as": 65200}]),
+            ),
+            (
+                "invalid group remote ASN",
+                self._scope_with_peer_groups([{**peer_group, "remote_as": "invalid"}]),
+            ),
+            (
+                "numeric scope AF",
+                self._payload(self._router_payload(address_families=[7])),
+            ),
+            (
+                "blank scope AF",
+                self._payload(self._router_payload(address_families=[""])),
+            ),
+            (
+                "numeric peer AF",
+                self._payload(self._router_payload(peers=[self._peer_entry(address_families=[{"af": 7}])])),
+            ),
+            (
+                "blank peer AF",
+                self._payload(self._router_payload(peers=[self._peer_entry(address_families=[{"af": ""}])])),
+            ),
+            (
+                "non-boolean peer AF enabled",
+                self._payload(
+                    self._router_payload(
+                        peers=[self._peer_entry(address_families=[{"af": "ipv4-unicast", "enabled": "invalid"}])]
+                    )
+                ),
+            ),
+            (
+                "numeric group AF",
+                self._scope_with_peer_groups([{**peer_group, "address_families": [{"af": 7}]}]),
+            ),
+            (
+                "blank group AF",
+                self._scope_with_peer_groups([{**peer_group, "address_families": [{"af": ""}]}]),
+            ),
+            (
+                "non-boolean group AF enabled",
+                self._scope_with_peer_groups(
+                    [{**peer_group, "address_families": [{"af": "ipv4-unicast", "enabled": "invalid"}]}]
+                ),
+            ),
+            *malformed_peer_policies,
+            *malformed_group_policies,
+        )
+
+        for label, payload in invalid_payloads:
+            with self.subTest(label=label):
+                with self.assertRaises(AdapterError) as raised:
+                    _reconcile_bgp_config(self.device, payload)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+        state.refresh_from_db()
+        self.assertEqual((state.pk, state.status, state.bgp_peer_id, state.device_base_hash), original)
+
+    def test_asdot_asns_are_canonical_across_reconcile_and_push(self):
+        """Every asdot ASN becomes stable asplain state before downstream consumers run."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer, BGPPeerTemplate, BGPRouter
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        peer = self._peer_entry(remote_as="65535.65534", local_as="65535.65533", peer_group="GROUP")
+        router = self._router_payload(
+            asn="65535.65535",
+            peers=[peer],
+            router_id="198.18.0.1",
+        )
+        router["scopes"][0]["peer_groups"] = [
+            {
+                "name": "GROUP",
+                "remote_as": "65535.65532",
+                "address_families": [{"af": "ipv4-unicast"}],
+            }
+        ]
+        payload = self._payload(router)
+
+        first = _reconcile_bgp_config(self.device, payload)[0]
+        second = _reconcile_bgp_config(self.device, payload)[0]
+
+        self.assertEqual(BGPRouter.objects.get().asn.asn, 4_294_967_295)
+        materialized_peer = BGPPeer.objects.get()
+        self.assertEqual(materialized_peer.remote_as.asn, 4_294_967_294)
+        self.assertEqual(materialized_peer.local_as.asn, 4_294_967_293)
+        self.assertEqual(BGPPeerTemplate.objects.get(name="GROUP").remote_as.asn, 4_294_967_292)
+        state = NSOBGPPeerState.objects.get()
+        self.assertEqual((state.asn_str, state.remote_as_str), ("4294967295", "4294967294"))
+        self.assertEqual(second.pk, first.pk)
+        self.assertEqual(second.bgp_peer_id, first.bgp_peer_id)
+        self.assertEqual(second.device_base_hash, first.device_base_hash)
+
+        content_update(state, status="in_sync")
+        captured = {}
+
+        def capture_push(adapter_device_id, routers):
+            captured["adapter_device_id"] = adapter_device_id
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=capture_push):
+            deliver("bgp", self.device.pk, self.device.nso_management.adapter_device_id)
+
+        pushed_router = captured["routers"][0]
+        self.assertEqual((pushed_router["asn"], pushed_router["router_id"]), ("4294967295", "198.18.0.1"))
+        pushed_peer = pushed_router["scopes"][0]["peers"][0]
+        self.assertEqual((pushed_peer["remote_as"], pushed_peer["local_as"]), ("4294967294", "4294967293"))
+
     def test_single_peer_creates_state_row_in_sync(self):
         """New peer with linked bgp_peer FK → NSOBGPPeerState created with status=in_sync."""
         mgmt = self._make_mgmt()
@@ -325,6 +640,346 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         self.assertEqual(BGPScope.objects.filter(vrf=vrf).count(), 1)
         self.assertEqual(BGPPeer.objects.count(), 1)
+
+    def test_existing_global_peer_ip_converges_to_vrf_without_duplicate_peer(self):
+        """A legacy named-VRF peer keeps its peer and state while its IP becomes scoped."""
+        self._make_mgmt()
+
+        from ipam.models import VRF, IPAddress
+        from netbox_routing.models import BGPPeer, BGPScope
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        address = "2001:db8:0:0:0:0:0:4"
+        global_payload = self._payload(self._router_payload(peers=[self._peer_entry(address)]))
+        _reconcile_bgp_config(self.device, global_payload)
+        vrf = VRF.objects.create(name="LEGACY-VRF")
+        scope = BGPScope.objects.get()
+        scope.vrf = vrf
+        scope.save(update_fields=["vrf"])
+        state = NSOBGPPeerState.objects.get()
+        state.vrf_name = vrf.name
+        state.save(update_fields=["vrf_name"])
+        original_peer_id = state.bgp_peer_id
+        original_ip_id = state.bgp_peer.peer_id
+        self.assertIsNone(IPAddress.objects.get(pk=original_ip_id).vrf_id)
+
+        named_payload = self._payload(self._router_payload(vrf=vrf.name, peers=[self._peer_entry(address)]))
+        _reconcile_bgp_config(self.device, named_payload)
+
+        state.refresh_from_db()
+        peer = BGPPeer.objects.get()
+        self.assertEqual(BGPPeer.objects.count(), 1)
+        self.assertEqual(NSOBGPPeerState.objects.count(), 1)
+        self.assertEqual(peer.pk, original_peer_id)
+        self.assertEqual(state.bgp_peer_id, original_peer_id)
+        self.assertEqual(peer.peer.vrf_id, vrf.pk)
+        self.assertNotEqual(peer.peer_id, original_ip_id)
+
+    def test_duplicate_peer_hosts_are_scoped_and_device_source_is_reused(self):
+        """Peer hosts use each scope while all scopes reuse the device source address."""
+        self._make_mgmt()
+
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        loopback = Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
+        source = IPAddress.objects.create(address="198.18.10.1/32", assigned_object=loopback)
+        vrfs = [VRF.objects.create(name=name) for name in ("BGP-VRF-A", "BGP-VRF-B")]
+        for vrf in vrfs:
+            IPAddress.objects.create(address="198.18.10.2/32", vrf=vrf)
+        scopes = [
+            self._router_payload(
+                vrf=vrf.name,
+                peers=[self._peer_entry("198.18.10.2", source="198.18.10.1")],
+            )["scopes"][0]
+            for vrf in vrfs
+        ]
+        payload = self._payload({"asn": "65100", "router_id": None, "scopes": scopes})
+
+        _reconcile_bgp_config(self.device, payload)
+
+        peers = BGPPeer.objects.select_related("scope__vrf", "peer__vrf", "source__vrf").order_by("scope__vrf__name")
+        self.assertEqual(
+            [(peer.scope.vrf.name, peer.peer.vrf.name, peer.source_id) for peer in peers],
+            [(vrf.name, vrf.name, source.pk) for vrf in vrfs],
+        )
+        for state in NSOBGPPeerState.objects.all():
+            content_update(state, status="accepted")
+
+        _reconcile_bgp_config(self.device, payload)
+
+        self.assertEqual(BGPPeer.objects.count(), 2)
+        self.assertEqual(IPAddress.objects.filter(address__net_host="198.18.10.1").count(), 1)
+        self.assertEqual(set(NSOBGPPeerState.objects.values_list("status", flat=True)), {"in_sync"})
+
+    def test_device_source_prefers_the_scope_vrf_over_global(self):
+        """A source assigned in two VRFs uses the row from the peer scope."""
+        self._make_mgmt()
+
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        source_address = "198.18.10.3"
+        vrf = VRF.objects.create(name="SOURCE-VRF")
+        scoped_loopback = Interface.objects.create(device=self.device, name="Loopback1", type="virtual")
+        scoped_source = IPAddress.objects.create(
+            address=f"{source_address}/32",
+            vrf=vrf,
+            assigned_object=scoped_loopback,
+        )
+        global_loopback = Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
+        IPAddress.objects.create(address=f"{source_address}/32", assigned_object=global_loopback)
+        payload = self._payload(
+            self._router_payload(
+                vrf=vrf.name,
+                peers=[self._peer_entry("198.18.10.4", source=source_address)],
+            )
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+
+        peer = BGPPeer.objects.get()
+        self.assertEqual(peer.source_id, scoped_source.pk)
+        self.assertEqual(peer.source.vrf_id, vrf.pk)
+
+    def test_unique_device_source_in_another_vrf_is_reused(self):
+        """A unique device source is valid even when its VRF differs from the peer scope."""
+        self._make_mgmt()
+
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        loopback = Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
+        source_address = "198.18.10.5"
+        other_vrf = VRF.objects.create(name="OTHER-VRF")
+        source = IPAddress.objects.create(address=f"{source_address}/32", vrf=other_vrf, assigned_object=loopback)
+        scope_vrf = VRF.objects.create(name="SCOPE-VRF")
+        payload = self._payload(
+            self._router_payload(
+                vrf=scope_vrf.name,
+                peers=[self._peer_entry("198.18.10.6", source=source_address)],
+            )
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+
+        peer = BGPPeer.objects.get()
+        self.assertEqual(peer.source_id, source.pk)
+
+    def test_existing_peer_source_row_settles_deploying_state(self):
+        """A matching source already linked to the peer remains its source identity."""
+        self._make_mgmt()
+
+        from ipam.models import VRF, IPAddress
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _content_hash, _peer_object_content, _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        vrf = VRF.objects.create(name="SOURCE-SELECTION-VRF")
+        source_address = "198.18.10.7"
+        selected_source = IPAddress.objects.create(address=f"{source_address}/32")
+        payload = self._payload(
+            self._router_payload(
+                vrf=vrf.name,
+                peers=[self._peer_entry("198.18.10.8")],
+            )
+        )
+        _reconcile_bgp_config(self.device, payload)
+        peer = BGPPeer.objects.get()
+        content_update(peer, source=selected_source)
+        state = NSOBGPPeerState.objects.get()
+        content_update(state, status="deploying")
+        payload["routers"][0]["scopes"][0]["peers"][0]["source"] = source_address
+
+        result = _reconcile_bgp_config(self.device, payload)
+
+        peer.refresh_from_db()
+        self.assertEqual(peer.source_id, selected_source.pk)
+        self.assertEqual(result[0].status, "in_sync")
+        self.assertEqual(result[0].device_base_hash, _content_hash(_peer_object_content(peer)))
+        self.assertEqual(IPAddress.objects.filter(address__net_host=source_address).count(), 1)
+
+    def test_duplicate_peer_does_not_materialize_ignored_asns(self):
+        """Equivalent IPv6 spellings identify one peer before ignored ASNs materialize."""
+        self._make_mgmt()
+
+        from ipam.models import ASN
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        first = self._peer_entry("2001:0db8:0000:0000:0000:0000:0000:0002", remote_as="65200")
+        duplicate = self._peer_entry("2001:db8::2", remote_as="65300", local_as="65400")
+
+        _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[first, duplicate])),
+        )
+
+        self.assertEqual(BGPPeer.objects.count(), 1)
+        self.assertEqual(NSOBGPPeerState.objects.count(), 1)
+        self.assertFalse(ASN.objects.filter(asn__in=(65300, 65400)).exists())
+
+    def test_persisted_expanded_ipv6_state_reuses_canonical_identity(self):
+        """A pre-canonical owned state remains linked and included in the owned snapshot."""
+        mgmt = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        canonical = "2001:db8::2"
+        expanded = "2001:0db8:0000:0000:0000:0000:0000:0002"
+        payload = self._payload(self._router_payload(peers=[self._peer_entry(canonical)]))
+        original = _reconcile_bgp_config(self.device, payload)[0]
+        content_update(original, status="in_sync", peer_address_str=expanded)
+
+        result = _reconcile_bgp_config(self.device, payload)
+
+        state = NSOBGPPeerState.objects.get()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(state.pk, original.pk)
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.peer_address_str, canonical)
+        captured = {}
+
+        def capture_push(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=capture_push):
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
+
+        pushed_peers = captured["routers"][0]["scopes"][0]["peers"]
+        self.assertEqual([peer["peer_address"] for peer in pushed_peers], [canonical])
+
+    def test_persisted_peer_aliases_keep_lower_canonical_pk(self):
+        """The lower canonical row remains the identity when an expanded alias follows it."""
+        mgmt = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        canonical = "2001:db8::2"
+        expanded = "2001:0db8:0000:0000:0000:0000:0000:0002"
+        payload = self._payload(self._router_payload(peers=[self._peer_entry(canonical)]))
+        identity = _reconcile_bgp_config(self.device, payload)[0]
+        content_update(identity, status="in_sync")
+        duplicate = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str=identity.asn_str,
+            vrf_name=identity.vrf_name,
+            peer_address_str=expanded,
+            bgp_peer=identity.bgp_peer,
+            status="accepted",
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+
+        identity.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertLess(identity.pk, duplicate.pk)
+        self.assertEqual(identity.peer_address_str, canonical)
+        self.assertEqual(identity.status, "in_sync")
+        self.assertEqual(duplicate.status, "changed")
+
+    def test_persisted_peer_aliases_keep_lower_expanded_pk_out_of_snapshot(self):
+        """The lower expanded row remains the identity and the canonical alias becomes stale."""
+        mgmt = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        canonical = "2001:db8::2"
+        expanded = "2001:0db8:0000:0000:0000:0000:0000:0002"
+        payload = self._payload(self._router_payload(peers=[self._peer_entry(canonical)]))
+        identity = _reconcile_bgp_config(self.device, payload)[0]
+        content_update(identity, status="in_sync", peer_address_str=expanded)
+        duplicate = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str=identity.asn_str,
+            vrf_name=identity.vrf_name,
+            peer_address_str=canonical,
+            bgp_peer=identity.bgp_peer,
+            status="in_sync",
+        )
+
+        _reconcile_bgp_config(self.device, payload)
+
+        identity.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertLess(identity.pk, duplicate.pk)
+        self.assertEqual(identity.peer_address_str, expanded)
+        self.assertEqual(identity.status, "in_sync")
+        self.assertEqual(duplicate.status, "changed")
+        captured = {}
+
+        def capture_push(adapter_device_id, routers):
+            captured["routers"] = routers
+            return {"device_id": adapter_device_id, "router_count": len(routers)}
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent", side_effect=capture_push):
+            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
+
+        pushed_peers = captured["routers"][0]["scopes"][0]["peers"]
+        self.assertEqual(len(pushed_peers), 1)
+
+    def test_duplicate_router_asn_keeps_first_definition(self):
+        """A repeated router ASN is warned and ignored before it can update a planned router."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPRouter
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        first = self._router_payload(asn="65100")
+        duplicate = self._router_payload(asn="65100", router_id="198.18.0.9")
+
+        with self.assertLogs("netbox_nso_plugin.bgp_reconciler", level="WARNING") as captured:
+            _reconcile_bgp_config(self.device, self._payload(first, duplicate))
+
+        router = BGPRouter.objects.get()
+        self.assertIsNone(router.router_id)
+        self.assertTrue(any("repeated router ASN" in message for message in captured.output))
+
+    def test_duplicate_address_family_is_hash_and_status_stable(self):
+        """Repeated AF identity persists once and remains stable on the next read."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPPeerAddressFamily
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        peer = self._peer_entry()
+        peer["address_families"].append({"af": "ipv4-unicast", "enabled": True})
+        payload = self._payload(self._router_payload(peers=[peer]))
+
+        first = _reconcile_bgp_config(self.device, payload)[0]
+        first_hash = first.device_base_hash
+        second = _reconcile_bgp_config(self.device, payload)[0]
+
+        self.assertEqual(BGPPeer.objects.count(), 1)
+        self.assertEqual(NSOBGPPeerState.objects.count(), 1)
+        self.assertEqual(BGPAddressFamily.objects.count(), 1)
+        self.assertEqual(BGPPeerAddressFamily.objects.count(), 1)
+        self.assertEqual(second.device_base_hash, first_hash)
+        self.assertEqual(second.status, "imported")
 
     def test_push_includes_peer_source_ip(self):
         """BGP delivery must send a peer's source (the local-address IP).
@@ -607,6 +1262,80 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
         self.assertEqual(bp.source, src)
 
+    def test_peer_source_prefix_forms_are_canonical(self):
+        """IPv4 and IPv6 source prefixes resolve to their canonical host addresses."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peers = [
+            self._peer_entry("198.18.20.2", source="198.18.20.1/24"),
+            self._peer_entry("2001:db8::2", source="2001:0db8:0000:0000:0000:0000:0000:0001/64"),
+        ]
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=peers)))
+
+        sources = {
+            str(peer.peer.address.ip): str(peer.source.address.ip)
+            for peer in BGPPeer.objects.select_related("peer", "source")
+        }
+        self.assertEqual(sources, {"198.18.20.2": "198.18.20.1", "2001:db8::2": "2001:db8::1"})
+
+    def test_unparseable_peer_source_prefixes_are_unresolved_interface_names(self):
+        """Unparseable source prefixes use exact interface lookup and remain unresolved."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peers = [
+            self._peer_entry("198.18.20.2", source="198.18.20.1/33"),
+            self._peer_entry("198.18.20.3", source="999.999.999.999/32"),
+            self._peer_entry("198.18.20.4", source="2001:db8::not-hex/64"),
+        ]
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=peers)))
+
+        for peer in BGPPeer.objects.all():
+            self.assertIsNone(peer.source_id)
+            self.assertIsNone(peer.update_source_id)
+
+    def test_scoped_ipv6_peer_source_is_a_typed_adapter_error(self):
+        """A scoped IPv6 source cannot be represented by NetBox."""
+        self._make_mgmt()
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        payload = self._payload(self._router_payload(peers=[self._peer_entry("2001:db8::2", source="fe80::1%eth0/64")]))
+
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(self.device, payload)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_malformed_dotted_peer_sources_are_unresolved_interface_names(self):
+        """Malformed dotted values use exact interface lookup and remain unresolved."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        peers = [
+            self._peer_entry("198.18.20.2", source="1.2.3.4.5/24"),
+            self._peer_entry("198.18.20.3", source="198.18.20.1./32"),
+        ]
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=peers)))
+
+        for peer in BGPPeer.objects.all():
+            self.assertIsNone(peer.source_id)
+            self.assertIsNone(peer.update_source_id)
+
     def test_peer_source_unknown_ip_creates_stub(self):
         """source IP not present in IPAM → a stub IPAddress is auto-created and linked.
 
@@ -641,14 +1370,32 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
-        loopback = Interface.objects.create(device=self.device, name="Loopback0", type="virtual")
+        loopback = Interface.objects.create(device=self.device, name="100GigE0/0/0", type="virtual")
         peer = self._peer_entry()
-        peer["source"] = "Loopback0"
+        peer["source"] = loopback.name
         _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
 
         bp = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
         self.assertEqual(bp.update_source, loopback)
         self.assertIsNone(bp.source_id)
+
+    def test_numeric_slash_peer_source_resolves_as_interface_name(self):
+        """A slash-delimited numeric source resolves by exact interface name."""
+        self._make_mgmt()
+
+        from dcim.models import Interface
+        from netbox_routing.models import BGPPeer
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        interface = Interface.objects.create(device=self.device, name="1/1/1", type="virtual")
+        peer = self._peer_entry(source=interface.name)
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload(peers=[peer])))
+
+        bgp_peer = BGPPeer.objects.get(peer__address__net_host="10.0.0.2")
+        self.assertEqual(bgp_peer.update_source, interface)
+        self.assertIsNone(bgp_peer.source_id)
 
     def test_peer_update_source_unknown_iface_left_null(self):
         """An update-source interface absent from the device → both source and update_source
@@ -784,28 +1531,30 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         template = BGPPeerTemplate.objects.get(name="SHARED-AS")
         self.assertEqual(template.remote_as.asn, 64522)
 
-    def test_invalid_netbox_peer_address_does_not_abort_other_peers(self):
-        """One peer rejected by NetBox validation must not abort the device plan."""
+    def test_scoped_peer_address_rejects_the_complete_document(self):
+        """An IP address NetBox cannot represent rejects the document before any write."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPPeer
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
-        result = _reconcile_bgp_config(
-            self.device,
-            self._payload(
-                self._router_payload(
-                    peers=[
-                        self._peer_entry("198.18.0.23"),
-                        self._peer_entry("fe80::1%eth0"),
-                    ]
-                )
-            ),
-        )
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(
+                self.device,
+                self._payload(
+                    self._router_payload(
+                        peers=[
+                            self._peer_entry("198.18.0.23"),
+                            self._peer_entry("fe80::1%eth0"),
+                        ]
+                    )
+                ),
+            )
 
-        self.assertEqual([state.peer_address_str for state in result], ["198.18.0.23"])
-        self.assertEqual(BGPPeer.objects.filter(scope__router__assigned_object_id=self.device.pk).count(), 1)
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(BGPPeer.objects.filter(scope__router__assigned_object_id=self.device.pk).exists())
 
     def _scope_with_peer_groups(self, peer_groups, asn="65100", address_families=None):
         """Build a payload whose scope carries peer_groups (full-B objects)."""
@@ -814,6 +1563,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             "routers": [
                 {
                     "asn": asn,
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
@@ -954,10 +1704,11 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         ).values_list("address_family__address_family", flat=True)
         self.assertEqual(list(address_families), ["ipv6-unicast"])
 
-    def test_invalid_router_peer_group_does_not_hide_valid_template(self):
-        """A skipped router cannot prevent a valid peer-group reconciliation."""
+    def test_invalid_router_asn_does_not_change_existing_template(self):
+        """An invalid router ASN rejects the document before template changes."""
         self._make_mgmt()
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerTemplateState
 
@@ -966,8 +1717,10 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         _reconcile_bgp_config(self.device, self._payload(valid_router))
 
         invalid_router = self._scope_with_peer_groups([group], asn="not-a-number")["routers"][0]
-        _reconcile_bgp_config(self.device, self._payload(valid_router, invalid_router))
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(self.device, self._payload(valid_router, invalid_router))
 
+        self.assertEqual(raised.exception.code, "invalid_response")
         state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
         self.assertEqual(state.status, "imported")
 
@@ -1006,12 +1759,13 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65200)
 
-    def test_invalid_peer_cannot_override_reported_template_remote_as(self):
-        """The plan ignores a peer that reconciliation skips before its peer-group write."""
+    def test_invalid_peer_rejects_document_before_template_update(self):
+        """An invalid peer rejects the document before it can change a template."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPPeerTemplate
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
         from netbox_nso_plugin.models import NSOBGPPeerState
 
@@ -1031,9 +1785,13 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             )
         )
 
-        self.assertTrue(bgp_reconcile_plan(self.device, changed).changes_content)
-        _reconcile_bgp_config(self.device, changed)
-        self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65100)
+        with self.assertRaises(AdapterError) as raised:
+            bgp_reconcile_plan(self.device, changed)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65200)
+        peer_state.refresh_from_db()
+        self.assertEqual(peer_state.status, "accepted")
 
     def test_peer_group_template_both_moved_is_conflict(self):
         """3-way templates: NetBox edited AND device changed since base → conflict, edit kept."""
@@ -1121,6 +1879,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             "routers": [
                 {
                     "asn": "65100",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
@@ -1462,17 +2221,20 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer.refresh_from_db()
         self.assertEqual(peer.ttl, 99)  # operator edit preserved (never clobbered)
 
-    def test_invalid_asn_skipped(self):
-        """Router with invalid ASN string → silently skipped."""
+    def test_invalid_asn_is_a_typed_adapter_error(self):
+        """A router with an invalid ASN fails at the adapter boundary."""
         self._make_mgmt()
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
-        result = _reconcile_bgp_config(
-            self.device,
-            {"device_id": self.device.pk, "routers": [{"asn": "not-a-number", "scopes": []}]},
-        )
-        self.assertEqual(result, [])
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(
+                self.device,
+                {"device_id": self.device.pk, "routers": [{"asn": "not-a-number", "scopes": []}]},
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_multiple_routers(self):
         """Two routers (different ASNs) → two BGPRouter objects, two state rows each peer."""
