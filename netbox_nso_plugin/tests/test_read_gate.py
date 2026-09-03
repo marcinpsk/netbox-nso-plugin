@@ -1549,7 +1549,8 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInterfaceMtuState
         from netbox_nso_plugin.read_gate import _gate_and_record, mark_publication_error_if_current
         from netbox_nso_plugin.reconcile import _mark_scope_error
-        from netbox_nso_plugin.tests._outbox_case import without_commit_drain
+        from netbox_nso_plugin.tests._outbox_case import wait_until_postgres_blocks, without_commit_drain
+        from netbox_nso_plugin.views import _save_owned_overlay_edit
 
         with without_commit_drain(), transaction.atomic():
             interface = Interface.objects.create(
@@ -1572,8 +1573,10 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
 
         error_holds_level_five = threading.Event()
         release_error = threading.Event()
+        operator_waits_for_level_four = threading.Event()
         operator_holds_level_four = threading.Event()
-        operator_waits_for_level_five = threading.Event()
+        operator_holds_level_five = threading.Event()
+        operator_pid = []
         errors = []
         outcome = {}
         management_table = NSODeviceManagement._meta.db_table
@@ -1605,24 +1608,25 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
                     raise AssertionError("the publication error did not lock its read state")
                 current = NSOInterfaceMtuState.objects.get(pk=state.pk)
                 current.l2_mtu = 1600
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    operator_pid.append(cursor.fetchone()[0])
 
                 def observe_lock_order(execute, sql, params, many, context):
                     statement = str(sql)
                     if "pg_advisory_xact_lock" in statement:
+                        operator_waits_for_level_four.set()
                         result = execute(sql, params, many, context)
                         operator_holds_level_four.set()
                         return result
                     if f'FROM "{management_table}"' in statement and "FOR UPDATE" in statement:
-                        operator_waits_for_level_five.set()
+                        result = execute(sql, params, many, context)
+                        operator_holds_level_five.set()
+                        return result
                     return execute(sql, params, many, context)
 
-                with (
-                    without_commit_drain(),
-                    connection.execute_wrapper(observe_lock_order),
-                    transaction.atomic(),
-                    lock_order_scope(),
-                ):
-                    current.save(update_fields=["l2_mtu"])
+                with without_commit_drain(), connection.execute_wrapper(observe_lock_order):
+                    _save_owned_overlay_edit(current, "interface_mtu", {"l2_mtu": 1500})
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -1635,12 +1639,17 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         try:
             self.assertTrue(error_holds_level_five.wait(10), "the publication error did not reach its callback")
             self.assertTrue(
-                operator_holds_level_four.wait(10),
-                "the operator did not acquire the device-intent lock",
+                operator_waits_for_level_four.wait(10),
+                "the operator did not request the device-intent lock",
             )
-            self.assertTrue(
-                operator_waits_for_level_five.wait(5),
-                "the operator did not reach the management-row lock",
+            wait_until_postgres_blocks(operator_pid[0], "operator device-intent lock")
+            self.assertFalse(
+                operator_holds_level_four.is_set(),
+                "the operator acquired the device-intent lock before the publication error released it",
+            )
+            self.assertFalse(
+                operator_holds_level_five.is_set(),
+                "the operator acquired the management-row lock before the device-intent lock",
             )
         finally:
             release_error.set()
@@ -1652,6 +1661,8 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         if errors:
             raise errors[0]
         self.assertTrue(outcome["marked"])
+        self.assertTrue(operator_holds_level_four.is_set(), "the operator did not acquire the device-intent lock")
+        self.assertTrue(operator_holds_level_five.is_set(), "the operator did not acquire the management-row lock")
         state.refresh_from_db()
         self.assertEqual(state.l2_mtu, 1600)
 
