@@ -293,13 +293,29 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
     def test_direct_management_save_schedules_adapter_work_through_writer(self):
         """A direct save cannot bypass the management writer and adapter sync."""
+        from netbox_nso_plugin import management_lifecycle
+
         mgmt = self._make_mgmt(adapter_device_id=7)
         mgmt.manage_enabled = True
 
-        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+        with (
+            patch.object(
+                management_lifecycle,
+                "save_management",
+                wraps=management_lifecycle.save_management,
+            ) as save_management,
+            self.captureOnCommitCallbacks(execute=False) as callbacks,
+        ):
             mgmt.save(update_fields=["manage_enabled"])
 
+        save_management.assert_called_once_with(
+            mgmt,
+            update_fields=["manage_enabled"],
+            force_insert=False,
+        )
         self.assertEqual(len(callbacks), 1)
+        mgmt.refresh_from_db()
+        self.assertTrue(mgmt.manage_enabled)
 
     def test_management_mirror_ignores_a_row_deleted_before_the_callback(self):
         from netbox_nso_plugin.signals import _update_management_mirror
