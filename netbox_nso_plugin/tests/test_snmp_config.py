@@ -240,6 +240,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             username="nms-user",
             has_auth_secret=True,
             has_priv_secret=True,
+            auth_protocol="sha",
+            priv_protocol="aes-128",
             status="deploying",
         )
         NSOSnmpHostState.objects.create(
