@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import connection
 from django.test import TestCase
 
 from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
