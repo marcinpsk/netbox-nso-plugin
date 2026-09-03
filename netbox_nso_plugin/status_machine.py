@@ -509,8 +509,13 @@ def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
                         raise _StaleOverlayStatusChanged
                     finalise_locked()
                 return
+            except stale._meta.model.DoesNotExist:
+                return
             except _StaleOverlayStatusChanged:
-                stale.refresh_from_db()
+                try:
+                    stale.refresh_from_db()
+                except stale._meta.model.DoesNotExist:
+                    return
         logger.warning(
             "Stale overlay %s changed status twice during finalization. The next reconcile will retry it.",
             stale.pk,

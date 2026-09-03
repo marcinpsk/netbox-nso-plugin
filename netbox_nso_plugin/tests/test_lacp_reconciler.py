@@ -204,6 +204,46 @@ class TestReconcileLagConfig(TestCase):
         self.assertEqual(stale.status, "changed")
         self.assertEqual(revision.revision, before + 1)
 
+    def test_stale_finalization_ignores_deletion_before_first_refresh(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        NSOLACPBundleState.objects.filter(pk=stale.pk).delete()
+
+        sm.finalise_stale_overlay(stale, vestigial=False)
+
+        self.assertFalse(NSOLACPBundleState.objects.filter(pk=stale.pk).exists())
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.assertTrue(NSOLACPBundleState.objects.filter(interface=self.lag).exists())
+
+    def test_stale_finalization_ignores_deletion_before_retry_refresh(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        content_update(NSOLACPBundleState.objects.get(pk=stale.pk), status="in_sync")
+        refreshes = 0
+        deleting = False
+        table = NSOLACPBundleState._meta.db_table
+
+        def delete_before_retry_refresh(execute, sql, params, many, context):
+            nonlocal deleting, refreshes
+            if not deleting and f'FROM "{table}"' in sql and "LIMIT 21" in sql and "FOR UPDATE" not in sql:
+                refreshes += 1
+                if refreshes == 2:
+                    deleting = True
+                    NSOLACPBundleState.objects.filter(pk=stale.pk).delete()
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(delete_before_retry_refresh):
+            sm.finalise_stale_overlay(stale, vestigial=False)
+
+        self.assertEqual(refreshes, 2)
+        self.assertFalse(NSOLACPBundleState.objects.filter(pk=stale.pk).exists())
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.assertTrue(NSOLACPBundleState.objects.filter(interface=self.lag).exists())
+
     def test_stale_member_unbundled_pruned(self):
         # A dropped member whose interface is no longer assigned to any LAG is vestigial.
         reconcile_lag_config(
