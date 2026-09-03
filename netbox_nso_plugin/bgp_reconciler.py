@@ -34,6 +34,7 @@ class _Operations:
         self.deletes = []
         self.operations = []
         self.policy_footprint = None
+        self.source_interface_resolutions = ()
 
     def save(
         self,
@@ -69,7 +70,7 @@ def bgp_reconcile_plan(device, payload):
     """Freeze every shared, native, child, and overlay BGP write."""
     from django.utils import timezone
 
-    from .intent_state import MutationFootprint
+    from .intent_state import MutationFootprint, SourceRow
     from .renderer_writer import RendererMutationPlan
 
     planned_at = timezone.now()
@@ -77,26 +78,62 @@ def bgp_reconcile_plan(device, payload):
         operations = _bgp_reconcile_operations(device, payload, planned_at)
     except ImportError:
         return RendererMutationPlan.build(planned_at=planned_at)
+
+    def validate_after_acquire():
+        _validate_bgp_source_resolutions(device.pk, operations.source_interface_resolutions)
+
     plan = RendererMutationPlan.build(
         saves=operations.saves,
         deletes=operations.deletes,
         planned_at=planned_at,
+        validate_after_acquire=validate_after_acquire,
+    )
+    source_dependencies = MutationFootprint.for_keys(
+        (),
+        source_rows=(
+            SourceRow("dcim.device", device.pk),
+            SourceRow("dcim.interface", None),
+            *(
+                SourceRow("dcim.interface", pk)
+                for _name, pk in operations.source_interface_resolutions
+                if pk is not None
+            ),
+        ),
     )
     policy_footprint = operations.policy_footprint
     if policy_footprint is None:
-        return plan
+        lock_footprint = MutationFootprint.merge(plan.lock_footprint, source_dependencies)
+        lock_footprint = replace(
+            lock_footprint,
+            device_ids=tuple(sorted({device.pk, *lock_footprint.device_ids})),
+        )
+        return replace(plan, lock_footprint=lock_footprint)
     policy_dependencies = MutationFootprint.for_keys(
         (),
         shared_keys=policy_footprint.shared_keys,
         source_rows=policy_footprint.source_rows,
         overlay_rows=policy_footprint.overlay_rows,
     )
-    lock_footprint = MutationFootprint.merge(plan.lock_footprint, policy_dependencies)
+    lock_footprint = MutationFootprint.merge(plan.lock_footprint, source_dependencies, policy_dependencies)
     lock_footprint = replace(
         lock_footprint,
-        device_ids=tuple(sorted({*lock_footprint.device_ids, *policy_footprint.device_ids})),
+        device_ids=tuple(sorted({device.pk, *lock_footprint.device_ids, *policy_footprint.device_ids})),
     )
     return replace(plan, lock_footprint=lock_footprint)
+
+
+def _validate_bgp_source_resolutions(device_id, expected):
+    """Reject a source-interface lookup that changed after discovery."""
+    from dcim.models import Interface
+
+    from .intent_state import RendererTargetsChanged
+
+    expected = tuple(expected)
+    names = {name for name, _pk in expected}
+    rows_by_name = {row.name: row.pk for row in Interface.objects.filter(device_id=device_id, name__in=names)}
+    current = tuple(sorted((name, rows_by_name.get(name)) for name in names))
+    if current != expected:
+        raise RendererTargetsChanged("BGP source-interface resolutions changed during acquisition")
 
 
 def _bgp_fk_identity(obj):
@@ -643,6 +680,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             .order_by("pk")
         )
         self.source_interfaces = {row.name: row for row in interfaces if row.name in source_interfaces}
+        self.operations.source_interface_resolutions = tuple(
+            sorted(
+                (name, self.source_interfaces[name].pk if name in self.source_interfaces else None)
+                for name in source_interfaces
+            )
+        )
         device_interface_ids = {row.pk for row in interfaces}
         self.device_source_ips = {}
         for row in ip_rows:
