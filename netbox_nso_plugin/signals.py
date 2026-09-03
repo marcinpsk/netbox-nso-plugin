@@ -3011,6 +3011,14 @@ def route_policy_intent_item(row):
     obj = row.assigned_object
     if obj is None:
         return None
+    from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
+    from .renderer_audit import RendererAuditRepairFailed
+
+    target_label = obj._meta.label_lower
+    if ROUTE_POLICY_NATIVE_MODEL_LABELS.get(row.family) != target_label:
+        raise RendererAuditRepairFailed(
+            f"route-policy family {row.family!r} cannot render target model {target_label!r}"
+        )
     return {
         "family": row.family,
         "name": row.object_name,

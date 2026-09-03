@@ -1968,6 +1968,20 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     def __str__(self):
         return f"{self.management} / {self.family}:{self.object_name} [{self.status}]"
 
+    def clean(self):
+        """Reject a generic target that does not belong to the selected policy family."""
+        super().clean()
+        if self.content_type_id is None:
+            return
+
+        from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
+
+        target_label = f"{self.content_type.app_label}.{self.content_type.model}"
+        if ROUTE_POLICY_NATIVE_MODEL_LABELS.get(self.family) != target_label:
+            raise ValidationError(
+                {"content_type": (f"Content type {target_label!r} does not match route-policy family {self.family!r}.")}
+            )
+
     @property
     def classification_mode(self) -> str:
         """MASTER (shared, the default) or LOCAL (per-device) classification of this group."""
