@@ -463,7 +463,7 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         candidate = copy.copy(state)
         for field_name, value in fields.items():
             setattr(candidate, field_name, value)
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields, expected_before=state),))
         try:
             with suppress_intent_push(), renderer_writes(plan) as writer:
                 writer.save(candidate, update_fields=fields)
