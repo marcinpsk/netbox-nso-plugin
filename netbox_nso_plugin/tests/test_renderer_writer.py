@@ -26,6 +26,25 @@ from .strict_writer import strict_writer_harness
 
 
 class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
+    def test_expected_preimage_must_be_a_persisted_target(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        _device, management = make_managed("writer-unsaved-preimage", 16271)
+        row = own_vlan(management, 1627, "writer-unsaved-preimage")
+        candidate = NSOVLANState(management=management, vlan=row.vlan, status="accepted")
+        expected = copy.copy(candidate)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "persisted update target"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        candidate,
+                        update_fields={"status"},
+                        expected_before=expected,
+                    ),
+                )
+            )
+
     def test_raced_unregistered_creation_is_consumed_from_its_full_plan(self):
         from ipam.models import VLANGroup
 

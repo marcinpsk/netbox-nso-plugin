@@ -73,6 +73,7 @@ class RendererSave:
     force_insert: bool = False
     natural_key_fields: tuple[str, ...] = ()
     reference_fields: tuple[tuple[str, Any], ...] = ()
+    expected_before: Any = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ def planned_save(
     force_insert=False,
     natural_key=(),
     references=(),
+    expected_before=None,
 ) -> RendererSave:
     """Describe one save for :meth:`RendererMutationPlan.build`."""
     fields = None if update_fields is None else tuple(sorted(set(update_fields)))
@@ -136,6 +138,7 @@ def planned_save(
         force_insert=bool(force_insert),
         natural_key_fields=tuple(natural_key),
         reference_fields=normalized_references,
+        expected_before=expected_before,
     )
 
 
@@ -206,7 +209,7 @@ class RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
         saves = tuple(saves)
-        save_states = tuple((proposed, _stored_instance(proposed.instance)) for proposed in saves)
+        save_states = tuple((proposed, _save_before(proposed)) for proposed in saves)
         creation_refs = _creation_refs(save_states)
         effective_save_states = tuple(
             (proposed, before, _effective_after(proposed.instance, before, proposed.update_fields))
@@ -294,6 +297,21 @@ def _stored_instance(instance):
     if instance.pk is None or instance._state.adding:
         return None
     return type(instance)._default_manager.filter(pk=instance.pk).first()
+
+
+def _save_before(proposed):
+    expected = proposed.expected_before
+    if expected is None:
+        return _stored_instance(proposed.instance)
+    if (
+        proposed.force_insert
+        or expected.pk is None
+        or expected._state.adding
+        or expected._meta.label_lower != proposed.instance._meta.label_lower
+        or expected.pk != proposed.instance.pk
+    ):
+        raise IntentMutationProtocolError("a planned save expected pre-image must identify a persisted update target")
+    return expected
 
 
 def replay_creation_references(instance, references) -> None:
