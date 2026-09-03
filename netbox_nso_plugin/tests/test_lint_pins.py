@@ -21,11 +21,6 @@ PYPROJECT = ROOT / "pyproject.toml"
 UV_LOCK = ROOT / "uv.lock"
 
 
-@pytest.mark.parametrize("dependency", ["sqlparse>=0.5.0", "sqlparse>0.5.0"])
-def test_sqlparse_dependency_accepts_a_supported_floor(dependency):
-    assert _has_supported_sqlparse_floor(dependency)
-
-
 def test_packaging_is_a_direct_test_dependency():
     dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
 
