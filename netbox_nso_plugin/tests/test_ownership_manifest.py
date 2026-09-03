@@ -78,7 +78,6 @@ class TestOwnershipManifestDurability(TestCase):
                 device_id=device.pk,
                 scope=scope,
                 native_model_label="dcim.interface",
-                native_id=device.pk,
                 native_key={"device_id": device.pk, "scope": scope},
             )
 
