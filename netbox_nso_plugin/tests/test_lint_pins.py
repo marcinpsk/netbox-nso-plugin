@@ -33,7 +33,7 @@ def _has_supported_sqlparse_floor(dependency: str) -> bool:
     if requirement.name.casefold() != "sqlparse":
         return False
     for specifier in requirement.specifier:
-        if specifier.operator not in {">=", "~=", "==", "==="}:
+        if specifier.operator not in {">", ">=", "~=", "==", "==="}:
             continue
         try:
             floor = Version(specifier.version)
@@ -48,6 +48,11 @@ def test_sqlparse_is_a_runtime_dependency():
     dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
 
     assert any(_has_supported_sqlparse_floor(dependency) for dependency in dependencies)
+
+
+@pytest.mark.parametrize("dependency", ["sqlparse>=0.5.0", "sqlparse>0.5.0"])
+def test_sqlparse_dependency_accepts_a_supported_floor(dependency):
+    assert _has_supported_sqlparse_floor(dependency)
 
 
 def test_packaging_is_a_direct_test_dependency():
