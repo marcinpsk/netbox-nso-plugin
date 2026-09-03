@@ -429,6 +429,7 @@ class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         snapshot = ([mgmt], {mgmt.adapter_device_id: adapter_device}, {identity: [adapter_device]})
         with patch.object(RendererMutationPlan, "build", side_effect=build_then_stale):
             changed = refresh_sync_cache(mgmt, adapter_device)
+            self.assertEqual(mgmt.last_sync_status, "concurrent-1")
             mgmt.refresh_from_db()
             sweep_result = refresh_sync_caches([mgmt], snapshot=snapshot)
 
