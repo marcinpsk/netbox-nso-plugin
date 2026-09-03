@@ -126,6 +126,32 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         render.assert_not_called()
         reconcile_ownership.assert_not_called()
 
+    def test_delivery_wraps_a_route_policy_family_target_mismatch(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
+
+        route_map = RouteMap.objects.create(name="renderer-audit-wrong-family")
+        state = NSORoutePolicyState(
+            management=self.management,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            family="prefix_list",
+            object_name=route_map.name,
+            status="accepted",
+        )
+        NSORoutePolicyState.objects.bulk_create([state])
+
+        with self.assertRaises(AdapterError) as error:
+            deliver("route_policy", self.device.pk, self.management.adapter_device_id)
+
+        self.assertEqual(error.exception.code, "renderer_audit_failed")
+        self.assertIsInstance(error.exception.__cause__, RendererAuditRepairFailed)
+
     def test_bgp_repair_demotes_the_lifecycle_only_peer_template(self):
         from netbox_nso_plugin.models import NSOBGPPeerTemplateState
         from netbox_nso_plugin.renderer_audit import _repair_plan

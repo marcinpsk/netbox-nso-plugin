@@ -8,8 +8,18 @@ import copy
 import json
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 
 from django.apps import apps
+
+ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
+    {
+        "prefix_list": "netbox_routing.prefixlist",
+        "community_list": "netbox_routing.communitylist",
+        "as_path": "netbox_routing.aspath",
+        "route_map": "netbox_routing.routemap",
+    }
+)
 
 
 class OwnershipAction(str, Enum):
@@ -291,12 +301,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "route_policy": ScopeOwnershipRule(
         scope="route_policy",
-        native_model_labels=(
-            "netbox_routing.prefixlist",
-            "netbox_routing.communitylist",
-            "netbox_routing.aspath",
-            "netbox_routing.routemap",
-        ),
+        native_model_labels=tuple(ROUTE_POLICY_NATIVE_MODEL_LABELS.values()),
         native_key_fields=("name",),
         overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
         overlay_native_fields=(("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),),
@@ -431,6 +436,17 @@ def retire_device_manifests(device_id: int) -> None:
     ).update(ownership_state="retired")
 
 
+def _validated_native_key_fields(native, rule):
+    """Return validated native identity fields for one ownership rule."""
+    native_label = native._meta.label_lower
+    if native_label not in rule.native_model_labels:
+        return None
+    key_fields = dict(rule.native_key_fields_by_model).get(native_label, rule.native_key_fields)
+    for name in key_fields:
+        native._meta.get_field(native._meta.pk.name if name == "pk" else name)
+    return native_label, key_fields
+
+
 def manifest_binding(instance):
     """Return the durable manifest identity for one overlay instance."""
     label = instance._meta.label_lower
@@ -467,7 +483,11 @@ def manifest_binding(instance):
         else:
             native = getattr(instance, native_field, None)
         management = getattr(instance, "management", None)
-        if native is None or management is None:
+        native_fields = None if native is None else _validated_native_key_fields(native, rule)
+        if native_fields is None or management is None:
+            return None
+        native_label, key_fields = native_fields
+        if rule.scope == "route_policy" and ROUTE_POLICY_NATIVE_MODEL_LABELS.get(instance.family) != native_label:
             return None
 
         def json_value(value):
@@ -479,10 +499,9 @@ def manifest_binding(instance):
                 return [json_value(item) for item in value]
             return str(value)
 
-        key_fields = dict(rule.native_key_fields_by_model).get(native._meta.label_lower, rule.native_key_fields)
         native_key = {name: json_value(getattr(native, name)) for name in key_fields}
         scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
-        return rule, scope, management.device_id, native._meta.label_lower, native_key
+        return rule, scope, management.device_id, native_label, native_key
     return None
 
 
