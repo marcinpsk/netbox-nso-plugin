@@ -28,7 +28,7 @@ from django.db.models.signals import (
     pre_migrate,
     pre_save,
 )
-from sqlparse.sql import Comparison, Identifier, IdentifierList
+from sqlparse.sql import Comparison, Function, Identifier, IdentifierList
 from sqlparse.tokens import Comment, Keyword, Literal
 
 logger = logging.getLogger(__name__)
@@ -2765,12 +2765,16 @@ def _parse_dml_target(statement: str) -> tuple[_DMLTarget | None, bool]:
         (token for token in tokens[anchor_index + 1 :] if not (token.ttype in Keyword and token.normalized == "ONLY")),
         None,
     )
-    if not isinstance(target_token, Identifier) or not target_token.get_real_name():
+    if not isinstance(target_token, Identifier | Function) or (
+        isinstance(target_token, Function) and operation_name != "INSERT INTO"
+    ):
+        return None, True
+    if not target_token.get_real_name():
         return None, True
     return _DMLTarget(operation_name, _postgres_identifier_name(target_token)), False
 
 
-def _postgres_identifier_name(identifier: Identifier) -> str:
+def _postgres_identifier_name(identifier: Identifier | Function) -> str:
     """Return one identifier with PostgreSQL's unquoted case folding applied."""
     real_name = identifier.get_real_name()
     for token in identifier.tokens:
