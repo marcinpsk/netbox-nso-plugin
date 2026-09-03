@@ -1454,15 +1454,19 @@ def _drain_once(
     _refuse_in_transaction("drain")
     from .renderer_audit import audit_renderer_scopes
 
+    audit_deadline = None
     if deadline is not None and _deadline_at is None:
         _deadline_at = _send_clock() + deadline
+    if _audit and _deadline_at is not None:
+        audit_started_at = time.monotonic()
+        audit_deadline = audit_started_at + _remaining_send_deadline(_deadline_at)
     if _audit:
         audit_renderer_scopes(
             device_id,
             (scope,),
             trigger="drain._drain_once",
             pre_capture=True,
-            deadline=_deadline_at,
+            deadline=audit_deadline,
         )
     if not delivery.delivery_keys()[scope].in_protocol:
         return _deliver_direct(device_id, scope, mode=mode, force=force, deadline_at=_deadline_at)
