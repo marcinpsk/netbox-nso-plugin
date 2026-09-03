@@ -8,7 +8,7 @@ import copy
 import json
 from dataclasses import dataclass
 from enum import Enum
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 from django.apps import apps
 from django.utils import timezone
@@ -338,12 +338,7 @@ _CONVERTED_SCOPE_RULES = {
     "route_policy": ScopeOwnershipRule(
         scope="route_policy",
         acquisition_strategy="existing_overlay",
-        native_model_labels=(
-            "netbox_routing.prefixlist",
-            "netbox_routing.communitylist",
-            "netbox_routing.aspath",
-            "netbox_routing.routemap",
-        ),
+        native_model_labels=tuple(ROUTE_POLICY_NATIVE_MODEL_LABELS.values()),
         native_key_fields=("name",),
         overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
         overlay_native_fields=(("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),),
@@ -509,9 +504,12 @@ def manifest_binding(instance):
             continue
         native = _manifest_native(instance, native_field)
         management = _manifest_management(instance)
-        if native is None or management is None:
+        native_fields = None if native is None else _validated_native_key_fields(native, rule)
+        if native_fields is None or management is None:
             return None
-        key_fields = dict(rule.native_key_fields_by_model).get(native._meta.label_lower, rule.native_key_fields)
+        native_label, key_fields = native_fields
+        if rule.scope == "route_policy" and ROUTE_POLICY_NATIVE_MODEL_LABELS.get(instance.family) != native_label:
+            return None
         native_key = {name: _json_value(getattr(native, name)) for name in key_fields}
         state_key = _manifest_state_key(instance, native_field)
         scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
@@ -519,7 +517,7 @@ def manifest_binding(instance):
             rule,
             scope,
             management.device_id,
-            native._meta.label_lower,
+            native_label,
             native.pk,
             native_key,
             instance._meta.label_lower,
@@ -647,6 +645,36 @@ def maintain_manifest(instance) -> None:
         if exact is not None:
             NSOOwnershipManifest.objects.filter(pk=exact.pk).exclude(ownership_state="retired").update(**defaults)
             return
+        if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
+            signature = _qualifying_overlay_signature(
+                scope,
+                native_model_label,
+                native_id,
+                state_model_label,
+                state_key,
+            )
+            candidates = NSOOwnershipManifest.objects.filter(
+                device_id=device_id,
+                scope=scope,
+                native_model_label=native_model_label,
+                native_id=native_id,
+                state_model_label=state_model_label,
+            ).order_by("pk")
+            for candidate in candidates:
+                candidate_signature = _qualifying_overlay_signature(
+                    candidate.scope,
+                    candidate.native_model_label,
+                    candidate.native_id,
+                    candidate.state_model_label,
+                    candidate.state_key,
+                )
+                if candidate_signature != signature:
+                    continue
+                if candidate.ownership_state == "retired":
+                    return
+                if adopt_manifest(candidate.pk, native_key=native_key, state_key=state_key):
+                    return
+                break
         previous = (
             NSOOwnershipManifest.objects.filter(
                 **incarnation,
@@ -692,6 +720,30 @@ def _manifest_state_lookup_key(scope, native_model_label, native_key, state_mode
         scope,
         native_model_label,
         json.dumps(native_key, sort_keys=True),
+        state_model_label,
+        json.dumps(state_key, sort_keys=True),
+    )
+
+
+def _qualifying_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key):
+    """Return one canonical native-to-overlay ownership signature."""
+    if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
+        from .bgp_reconciler import canonical_bgp_peer_identity
+
+        asn, vrf, peer_address = canonical_bgp_peer_identity(
+            state_key["asn_str"],
+            state_key["vrf_name"],
+            state_key["peer_address_str"],
+        )
+        state_key = {
+            "asn_str": asn,
+            "vrf_name": vrf,
+            "peer_address_str": peer_address,
+        }
+    return (
+        scope,
+        native_model_label,
+        native_id,
         state_model_label,
         json.dumps(state_key, sort_keys=True),
     )
@@ -747,12 +799,12 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
             native_qualifies=(
                 is_owned(instance.status)
                 if rule.acquisition_strategy == "existing_overlay"
-                else (
+                else _qualifying_overlay_signature(
                     scope,
                     native_model_label,
                     native_id,
                     state_model_label,
-                    json.dumps(state_key, sort_keys=True),
+                    state_key,
                 )
                 in qualifying
             ),
@@ -1494,12 +1546,12 @@ def _qualifying_overlay_signatures(device_id, requested, *, management=None, bin
         return frozenset()
     bindings = _native_bindings(management, requested) if bindings is None else bindings
     return frozenset(
-        (
+        _qualifying_overlay_signature(
             scope,
             native._meta.label_lower,
             native.pk,
             state_model_label,
-            json.dumps(state_key, sort_keys=True),
+            state_key,
         )
         for scope, native, state_model_label, state_key in bindings
     )
@@ -1735,12 +1787,12 @@ def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
             overlay = model.objects.filter(**filters).first()
         native_qualifies = native is not None and (
             rule.acquisition_strategy == "existing_overlay"
-            or (
+            or _qualifying_overlay_signature(
                 manifest.scope,
                 manifest.native_model_label,
                 native.pk,
                 manifest.state_model_label,
-                json.dumps(manifest.state_key, sort_keys=True),
+                manifest.state_key,
             )
             in qualifying
         )

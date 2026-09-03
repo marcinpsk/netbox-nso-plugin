@@ -230,6 +230,11 @@ def _parse_ip_address(value):
     return ipaddress.ip_address(value)
 
 
+def canonical_bgp_peer_identity(asn, vrf, peer_address):
+    """Return the canonical persisted identity for one BGP peer state."""
+    return str(_parse_asn(asn)), vrf, _parse_ip_address(peer_address).compressed
+
+
 def _canonical_source_ip(value):
     """Return a canonical source IP, or None when the value is an interface name."""
     try:
@@ -271,11 +276,7 @@ def _indexed_peer_states(rows):
     duplicates = []
     raw_keys = {}
     for row in rows:
-        canonical_key = (
-            str(_parse_asn(row.asn_str)),
-            row.vrf_name,
-            _parse_ip_address(row.peer_address_str).compressed,
-        )
+        canonical_key = canonical_bgp_peer_identity(row.asn_str, row.vrf_name, row.peer_address_str)
         raw_keys[(row.asn_str, row.vrf_name, row.peer_address_str)] = row
         if canonical_key in identities:
             duplicates.append(row)
