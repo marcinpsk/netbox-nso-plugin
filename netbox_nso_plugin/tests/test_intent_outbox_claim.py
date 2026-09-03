@@ -451,7 +451,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
             deadlines.append(kwargs["deadline"])
             return {"count": 1}
 
-        ticks = iter((100, 102, 105))
+        ticks = iter((100, 100, 102, 105))
         with (
             patch("netbox_nso_plugin.delivery.send", new=answer),
             patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks)),
