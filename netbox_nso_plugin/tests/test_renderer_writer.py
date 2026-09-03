@@ -469,6 +469,178 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert NSOStaticRouteState.objects.filter(pk=state.pk).exists()
         assert type(device).objects.filter(pk=device.pk).exists()
 
+    def test_delete_executes_a_complete_registered_collector_cascade(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        device, management = make_managed("writer-complete-cascade", 16287)
+        route = StaticRoute.objects.create(prefix="198.18.87.0/24", next_hop="198.18.0.87", metric=1)
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="accepted",
+        )
+        manifest = NSOOwnershipManifest.objects.create(
+            device_id=device.pk,
+            scope="static_route",
+            native_model_label=route._meta.label_lower,
+            native_key={
+                "vrf_id": None,
+                "prefix": str(route.prefix),
+                "next_hop": str(route.next_hop),
+                "interface_next_hop": None,
+            },
+        )
+        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+
+        with renderer_writes(plan) as writer:
+            writer.delete(management)
+
+        assert not type(management).objects.filter(pk=management.pk).exists()
+        assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
+        assert type(device).objects.filter(pk=device.pk).exists()
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "detached")
+
+    def test_queryset_management_delete_detaches_manifest_after_renderer_locks(self):
+        from django.db import connection
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.apply_state import _DEVICE_INTENT_LOCK_NAMESPACE
+
+        device, management = make_managed("writer-queryset-delete", 16293)
+        route = StaticRoute.objects.create(prefix="198.18.93.0/24", next_hop="198.18.0.93", metric=1)
+        manifest = NSOOwnershipManifest.objects.create(
+            device_id=device.pk,
+            scope="static_route",
+            native_model_label=route._meta.label_lower,
+            native_key={
+                "vrf_id": None,
+                "prefix": str(route.prefix),
+                "next_hop": str(route.next_hop),
+                "interface_next_hop": None,
+            },
+        )
+        statements = []
+
+        def observe_sql(execute, sql, params, many, context):
+            statements.append((str(sql), tuple(params or ())))
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(observe_sql):
+            type(management).objects.filter(pk=management.pk).delete()
+
+        management_table = management._meta.db_table
+        manifest_table = manifest._meta.db_table
+        device_lock_index = next(
+            index
+            for index, (sql, params) in enumerate(statements)
+            if "pg_advisory_xact_lock" in sql and params == (_DEVICE_INTENT_LOCK_NAMESPACE, device.pk)
+        )
+        management_lock_index = next(
+            index
+            for index, (sql, _params) in enumerate(statements)
+            if f'FROM "{management_table}"' in sql and "FOR UPDATE" in sql
+        )
+        manifest_update_indices = [
+            index
+            for index, (sql, params) in enumerate(statements)
+            if f'UPDATE "{manifest_table}"' in sql and "detached" in params
+        ]
+
+        self.assertEqual(len(manifest_update_indices), 1)
+        manifest_update_index = manifest_update_indices[0]
+        self.assertLess(device_lock_index, manifest_update_index)
+        self.assertLess(management_lock_index, manifest_update_index)
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "detached")
+
+    def _assert_device_delete_retires_manifest_after_renderer_locks(self, *, queryset):
+        from django.db import connection
+        from django.db.models.signals import pre_delete
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.apply_state import _DEVICE_INTENT_LOCK_NAMESPACE
+
+        octet = 95 if queryset else 94
+        device, management = make_managed(f"writer-device-delete-{octet}", 16200 + octet)
+        device_id = device.pk
+        route = StaticRoute.objects.create(
+            prefix=f"198.18.{octet}.0/24",
+            next_hop=f"198.18.0.{octet}",
+            metric=1,
+        )
+        manifest = NSOOwnershipManifest.objects.create(
+            device_id=device_id,
+            scope="static_route",
+            native_model_label=route._meta.label_lower,
+            native_key={
+                "vrf_id": None,
+                "prefix": str(route.prefix),
+                "next_hop": str(route.next_hop),
+                "interface_next_hop": None,
+            },
+        )
+        statements = []
+        management_guard_finished = False
+
+        def mark_management_guard_finished(sender, instance, **kwargs):
+            nonlocal management_guard_finished
+            management_guard_finished = True
+
+        def observe_sql(execute, sql, params, many, context):
+            statements.append((str(sql), tuple(params or ()), management_guard_finished))
+            return execute(sql, params, many, context)
+
+        dispatch_uid = f"test_device_delete_manifest_order_{octet}"
+        pre_delete.connect(
+            mark_management_guard_finished,
+            sender=type(management),
+            dispatch_uid=dispatch_uid,
+            weak=False,
+        )
+        try:
+            with connection.execute_wrapper(observe_sql):
+                if queryset:
+                    type(device).objects.filter(pk=device_id).delete()
+                else:
+                    device.delete()
+        finally:
+            pre_delete.disconnect(sender=type(management), dispatch_uid=dispatch_uid)
+
+        management_table = management._meta.db_table
+        manifest_table = manifest._meta.db_table
+        device_lock_index = next(
+            index
+            for index, (sql, params, _guard_finished) in enumerate(statements)
+            if "pg_advisory_xact_lock" in sql and params == (_DEVICE_INTENT_LOCK_NAMESPACE, device_id)
+        )
+        management_lock_index = next(
+            index
+            for index, (sql, _params, _guard_finished) in enumerate(statements)
+            if f'FROM "{management_table}"' in sql and "FOR UPDATE" in sql
+        )
+        manifest_updates = [
+            (index, guard_finished)
+            for index, (sql, params, guard_finished) in enumerate(statements)
+            if f'UPDATE "{manifest_table}"' in sql and "retired" in params
+        ]
+
+        self.assertEqual(len(manifest_updates), 1)
+        manifest_update_index, guard_finished = manifest_updates[0]
+        self.assertLess(device_lock_index, manifest_update_index)
+        self.assertLess(management_lock_index, manifest_update_index)
+        self.assertFalse(guard_finished)
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+
+    def test_device_delete_retires_manifest_after_renderer_locks(self):
+        self._assert_device_delete_retires_manifest_after_renderer_locks(queryset=False)
+
+    def test_queryset_device_delete_retires_manifest_after_renderer_locks(self):
+        self._assert_device_delete_retires_manifest_after_renderer_locks(queryset=True)
+
     def test_delete_plan_orders_each_collector_model_by_primary_key(self):
         from netbox_routing.models import StaticRoute
 
