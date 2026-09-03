@@ -515,14 +515,16 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             finally:
                 connections.close_all()
 
-        with without_commit_drain(), mirror_transaction(footprint, detect_content_changes=True) as permit:
-            worker = threading.Thread(target=settle)
-            worker.start()
-            self.assertTrue(settlement_started.wait(10), "the settlement worker did not start")
-            wait_until_postgres_blocks(settlement_pid[0], "the settlement worker", timeout=3)
-            _upgrade_detected_reconcile(permit, footprint)
-
-        worker.join(10)
+        worker = threading.Thread(target=settle)
+        try:
+            with without_commit_drain(), mirror_transaction(footprint, detect_content_changes=True) as permit:
+                worker.start()
+                self.assertTrue(settlement_started.wait(10), "the settlement worker did not start")
+                wait_until_postgres_blocks(settlement_pid[0], "the settlement worker", timeout=3)
+                _upgrade_detected_reconcile(permit, footprint)
+        finally:
+            if worker.ident is not None:
+                worker.join(10)
         self.assertFalse(worker.is_alive())
         if failures:
             raise failures[0]
@@ -599,18 +601,19 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 connections.close_all()
 
         settlement_worker = threading.Thread(target=settle)
-        settlement_worker.start()
-        self.assertTrue(settlement_ready.wait(10), "the settlement worker did not acquire the row lock")
         reconcile_worker = threading.Thread(target=reconcile)
-        reconcile_worker.start()
-        self.assertTrue(reconcile_started.wait(10), "the reconcile worker did not start")
         try:
+            settlement_worker.start()
+            self.assertTrue(settlement_ready.wait(10), "the settlement worker did not acquire the row lock")
+            reconcile_worker.start()
+            self.assertTrue(reconcile_started.wait(10), "the reconcile worker did not start")
             wait_until_postgres_blocks(reconcile_pid[0], "the detected reconcile", timeout=3)
         finally:
             release_settlement.set()
+            for worker in (settlement_worker, reconcile_worker):
+                if worker.ident is not None:
+                    worker.join(10)
 
-        settlement_worker.join(10)
-        reconcile_worker.join(10)
         self.assertFalse(settlement_worker.is_alive())
         self.assertFalse(reconcile_worker.is_alive())
         if failures:
