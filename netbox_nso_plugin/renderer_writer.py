@@ -673,18 +673,24 @@ def _plan_delete(proposed: RendererDelete):
     return writes, footprint, changed_keys
 
 
+def _load_frozen_set_rows(model, operation):
+    """Load one set operation only while every selected row matches its frozen pre-image."""
+    selected_rows = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
+    if (
+        tuple(row.pk for row in selected_rows) != operation.selected_pks
+        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_preimages
+    ):
+        raise IntentPlanStaleError(f"{operation.model_label} selected rows changed after planning")
+    return selected_rows
+
+
 def _plan_set_update(proposed: RendererSetUpdate):
     model = apps.get_model(proposed.model_label)
     spec = renderer_input_specs().get(proposed.model_label)
     if spec is None:
         raise IntentMutationProtocolError(f"{proposed.model_label} is not a registered renderer input")
     values = dict(proposed.values)
-    selected_rows = tuple(model._default_manager.filter(pk__in=proposed.selected_pks).order_by("pk"))
-    if (
-        tuple(row.pk for row in selected_rows) != proposed.selected_pks
-        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != proposed.selected_preimages
-    ):
-        raise IntentPlanStaleError(f"{proposed.model_label} selected rows changed after planning")
+    selected_rows = _load_frozen_set_rows(model, proposed)
     footprints = []
     changed_keys = set()
     for before in selected_rows:
@@ -1221,6 +1227,7 @@ class RendererWriter:
             or operation.values != normalized
         ):
             raise IntentMutationProtocolError("set-based update is outside the frozen write set")
+        _load_frozen_set_rows(model, operation)
         updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")
