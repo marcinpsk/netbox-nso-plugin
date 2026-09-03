@@ -6719,6 +6719,113 @@ class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         self.assertEqual(self.member.port_priority, 102)
         self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
 
+    def test_accept_reports_a_refresh_conflict_after_two_interface_retargets(self):
+        import copy
+
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        target_devices = (
+            make_managed("lacp-race-target-first", 16276)[0],
+            make_managed("lacp-race-target-second", 16277)[0],
+        )
+        targets = iter(target_devices)
+        original_build = RendererMutationPlan.build
+
+        def retarget_interface(target):
+            current = Interface.objects.get(pk=self.member.interface_id)
+            candidate = copy.copy(current)
+            candidate.device = target
+            plan = original_build(saves=(planned_save(candidate, update_fields=("device",)),))
+            mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+            with mutation(plan) as writer:
+                writer.save(candidate, update_fields=("device",))
+
+        def build_then_retarget(*args, **kwargs):
+            plan = original_build(*args, **kwargs)
+            target = next(targets, None)
+            if target is not None:
+                in_thread(lambda: retarget_interface(target))
+            return plan
+
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": self.bundle.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_retarget) as build:
+            response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["The LACP bundle changed. Refresh the page and try again."],
+        )
+        self.bundle.refresh_from_db()
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.interface.device_id, target_devices[-1].pk)
+        self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
+
+    def test_accept_reports_a_refresh_conflict_when_selected_members_are_deleted_before_build(self):
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.models import NSOLACPMemberState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        second_interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/21",
+            type="1000base-t",
+        )
+        with transaction.atomic():
+            second_member = NSOLACPMemberState.objects.create(
+                management=self.mgmt,
+                interface=second_interface,
+                lag_bundle=self.lag,
+                mode="active",
+                port_priority=100,
+                status="imported",
+            )
+        selected_members = iter((self.member, second_member))
+        original_build = RendererMutationPlan.build
+
+        def delete_member(member):
+            current = NSOLACPMemberState.objects.get(pk=member.pk)
+            plan = original_build(deletes=(planned_delete(current),))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer, suppress_intent_push():
+                writer.delete(current)
+
+        def delete_then_build(*args, **kwargs):
+            member = next(selected_members)
+            in_thread(lambda: delete_member(member))
+            return original_build(*args, **kwargs)
+
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": self.bundle.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=delete_then_build) as build:
+            response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["The LACP bundle changed. Refresh the page and try again."],
+        )
+        self.bundle.refresh_from_db()
+        self.assertEqual(self.bundle.status, "imported")
+        self.assertFalse(NSOLACPMemberState.objects.filter(pk__in=(self.member.pk, second_member.pk)).exists())
+
 
 class TestRoutePolicyGrid(ViewTestBase):
     """route_policy as a client-side grid: the payload is built from persisted
