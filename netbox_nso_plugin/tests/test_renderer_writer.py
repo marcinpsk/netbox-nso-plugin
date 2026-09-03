@@ -25,6 +25,75 @@ from .mixins import IntentPushResetMixin
 
 
 class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
+    def test_set_update_rejects_a_selected_row_changed_after_plan_build(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_set_update,
+            renderer_writes,
+        )
+
+        _first_device, first_management = make_managed("writer-set-race-first", 16272)
+        second_device, second_management = make_managed("writer-set-race-second", 16273)
+        vlan = VLAN.objects.create(vid=1629, name="writer-set-race")
+        state = NSOVLANState.objects.create(management=first_management, vlan=vlan, status="imported")
+        NSOSVIState.objects.create(
+            management=second_management,
+            interface=Interface.objects.create(device=second_device, name="Vlan1629", type="virtual"),
+            vlan=vlan,
+            svi_type="svi",
+            status="imported",
+        )
+        plan = RendererMutationPlan.build(
+            set_updates=(
+                planned_set_update(
+                    NSOVLANState.objects.filter(management=first_management),
+                    status="accepted",
+                ),
+            )
+        )
+        with transaction.atomic(), offline_mutation():
+            NSOVLANState.objects.filter(pk=state.pk).update(management_id=second_management.pk)
+
+        with self.assertRaises(IntentPlanStaleError), renderer_writes(plan) as writer:
+            writer.set_update(NSOVLANState, plan.write_set[0], status="accepted")
+
+        state.refresh_from_db()
+        self.assertEqual(state.management_id, second_management.pk)
+        self.assertEqual(state.status, "imported")
+
+    def test_set_update_rejects_a_selected_row_changed_before_plan_build(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_set_update,
+        )
+
+        _first_device, first_management = make_managed("writer-set-build-race-first", 16274)
+        _second_device, second_management = make_managed("writer-set-build-race-second", 16275)
+        vlan = VLAN.objects.create(vid=1630, name="writer-set-build-race")
+        state = NSOVLANState.objects.create(management=first_management, vlan=vlan, status="imported")
+        proposed = planned_set_update(
+            NSOVLANState.objects.filter(management=first_management),
+            status="accepted",
+        )
+        with transaction.atomic(), offline_mutation():
+            NSOVLANState.objects.filter(pk=state.pk).update(management_id=second_management.pk)
+
+        with self.assertRaises(IntentPlanStaleError):
+            RendererMutationPlan.build(set_updates=(proposed,))
+
+        state.refresh_from_db()
+        self.assertEqual(state.management_id, second_management.pk)
+        self.assertEqual(state.status, "imported")
+
     def test_set_update_cannot_capture_a_row_created_after_planning(self):
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
