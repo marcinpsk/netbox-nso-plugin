@@ -217,17 +217,23 @@ class TestReconcileLagConfig(TestCase):
         )
         reconcile_lag_config(self.device, payload)
 
+        def is_overlay_probe(sql):
+            where = sql.partition(" WHERE ")[2]
+            return (
+                any(limit in sql for limit in ("LIMIT 1", "LIMIT 21"))
+                and '"management_id" =' in where
+                and '"interface_id" =' in where
+                and (NSOLACPBundleState._meta.db_table in sql or NSOLACPMemberState._meta.db_table in sql)
+            )
+
+        with CaptureQueriesContext(connection) as control_queries:
+            NSOLACPMemberState.objects.get(management=self.mgmt, interface=self.m1)
+        self.assertTrue(any(is_overlay_probe(query["sql"]) for query in control_queries))
+
         with CaptureQueriesContext(connection) as queries:
             reconcile_lag_config(self.device, payload)
 
-        overlay_probes = [
-            query["sql"]
-            for query in queries
-            if "LIMIT 1" in query["sql"]
-            and '"management_id" =' in query["sql"].partition(" WHERE ")[2]
-            and '"interface_id" =' in query["sql"].partition(" WHERE ")[2]
-            and (NSOLACPBundleState._meta.db_table in query["sql"] or NSOLACPMemberState._meta.db_table in query["sql"])
-        ]
+        overlay_probes = [query["sql"] for query in queries if is_overlay_probe(query["sql"])]
         self.assertEqual(overlay_probes, [])
 
     def test_missing_interface_skipped(self):
