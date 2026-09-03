@@ -187,6 +187,7 @@ class RendererMutationPlan:
     lock_footprint: MutationFootprint
     content_keys: tuple[tuple[int, str], ...]
     planned_at: Any
+    validate_after_acquire: Callable[[], None] | None = dataclass_field(default=None, compare=False, repr=False)
     execution: Any = dataclass_field(default=None, compare=False, repr=False)
 
     @property
@@ -204,6 +205,7 @@ class RendererMutationPlan:
         read_dependencies=(),
         planned_at=None,
         additional_footprints=(),
+        validate_after_acquire=None,
         execution=None,
     ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
@@ -274,6 +276,7 @@ class RendererMutationPlan:
             lock_footprint=lock_footprint,
             content_keys=tuple(sorted(content_keys)),
             planned_at=planned_at,
+            validate_after_acquire=validate_after_acquire,
             execution=execution,
         )
 
