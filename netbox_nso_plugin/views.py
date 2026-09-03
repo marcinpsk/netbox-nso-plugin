@@ -5574,9 +5574,9 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         import copy
 
+        from .intent_state import IntentMutationProtocolError
         from .models import NSOLACPBundleState, NSOLACPMemberState
         from .renderer_writer import (
-            IntentPlanStaleError,
             RendererMutationPlan,
             planned_save,
             renderer_mirror_writes,
@@ -5584,43 +5584,45 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
         )
 
         for attempt in range(2):
-            state = get_object_or_404(NSOLACPBundleState, pk=pk)
-            # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
-            # lag-reconciler refuses it zero-write (a retract of an adopted vPC peer-link would
-            # delete it → dual-active split-brain). Refuse Accept so it never becomes owned/writable.
-            if state.vpc_sensitive:
-                messages.error(
-                    request,
-                    f"LACP bundle {state.interface.name} is vPC-protected (a vPC member/peer-link/"
-                    f"orphan port) — NSO refuses to write it, so it cannot be onboarded. Left unmanaged.",
-                )
-                return redirect(_device_nso_tab_url(state.management.device_id))
-            now = timezone.now()
-            candidates = []
-            for member in NSOLACPMemberState.objects.filter(
-                management=state.management,
-                lag_bundle=state.interface,
-            ).order_by("pk"):
-                candidate = copy.copy(member)
-                candidate.status = _status_after_accept(member.status)
-                if candidate.accepted_at is None:
-                    candidate.accepted_at = now
-                candidates.append(candidate)
-            bundle_candidate = copy.copy(state)
-            bundle_candidate.status = _status_after_accept(state.status)
-            if bundle_candidate.accepted_at is None:
-                bundle_candidate.accepted_at = now
-            candidates.append(bundle_candidate)
-            plan = RendererMutationPlan.build(
-                saves=(planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates),
-                planned_at=now,
-            )
-            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             try:
+                state = get_object_or_404(NSOLACPBundleState, pk=pk)
+                # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
+                # lag-reconciler refuses it zero-write (a retract of an adopted vPC peer-link would
+                # delete it → dual-active split-brain). Refuse Accept so it never becomes owned/writable.
+                if state.vpc_sensitive:
+                    messages.error(
+                        request,
+                        f"LACP bundle {state.interface.name} is vPC-protected (a vPC member/peer-link/"
+                        f"orphan port) — NSO refuses to write it, so it cannot be onboarded. Left unmanaged.",
+                    )
+                    return redirect(_device_nso_tab_url(state.management.device_id))
+                now = timezone.now()
+                candidates = []
+                for member in NSOLACPMemberState.objects.filter(
+                    management=state.management,
+                    lag_bundle=state.interface,
+                ).order_by("pk"):
+                    candidate = copy.copy(member)
+                    candidate.status = _status_after_accept(member.status)
+                    if candidate.accepted_at is None:
+                        candidate.accepted_at = now
+                    candidates.append(candidate)
+                bundle_candidate = copy.copy(state)
+                bundle_candidate.status = _status_after_accept(state.status)
+                if bundle_candidate.accepted_at is None:
+                    bundle_candidate.accepted_at = now
+                candidates.append(bundle_candidate)
+                plan = RendererMutationPlan.build(
+                    saves=(
+                        planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates
+                    ),
+                    planned_at=now,
+                )
+                mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
                 with mutation as writer:
                     for candidate in candidates:
                         writer.save(candidate, update_fields=("status", "accepted_at"))
-            except IntentPlanStaleError:
+            except IntentMutationProtocolError:
                 if attempt == 0:
                     continue
                 messages.error(request, "The LACP bundle changed. Refresh the page and try again.")
