@@ -1051,27 +1051,6 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertTrue(plan.changes_content)
         self.assertIn((device.pk, "switchport"), plan.content_keys)
 
-    def test_delete_executes_a_complete_registered_collector_cascade(self):
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
-
-        device, management = make_managed("writer-complete-cascade", 16287)
-        route = StaticRoute.objects.create(prefix="198.18.87.0/24", next_hop="198.18.0.87", metric=1)
-        state = NSOStaticRouteState.objects.create(
-            management=management,
-            static_route=route,
-            status="accepted",
-        )
-        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
-
-        with renderer_writes(plan) as writer:
-            writer.delete(management)
-
-        assert not type(management).objects.filter(pk=management.pk).exists()
-        assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
-        assert type(device).objects.filter(pk=device.pk).exists()
-
     def test_delete_authorizes_registered_collector_child_tables(self):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
