@@ -33,7 +33,7 @@ from netbox_nso_plugin.intent_state import (
 from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
 from netbox_nso_plugin.signals import suppress_intent_push
 
-from ._outbox_case import make_managed, own_vlan, without_commit_drain
+from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -470,7 +470,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
     def test_detected_reconcile_locks_deploying_rows_before_capture(self):
         """Apply settlement waits until a detected reconcile finishes its re-pend decision."""
         import threading
-        import time
 
         from django.db import connections
 
@@ -520,19 +519,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             worker = threading.Thread(target=settle)
             worker.start()
             self.assertTrue(settlement_started.wait(10), "the settlement worker did not start")
-            deadline = time.monotonic() + 3
-            blocked = False
-            while time.monotonic() < deadline:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted)",
-                        [settlement_pid[0]],
-                    )
-                    if cursor.fetchone()[0]:
-                        blocked = True
-                        break
-                time.sleep(0.01)
-            self.assertTrue(blocked, "Apply settlement did not wait for the captured deploying-row lock")
+            wait_until_postgres_blocks(settlement_pid[0], "the settlement worker", timeout=3)
             _upgrade_detected_reconcile(permit, footprint)
 
         worker.join(10)
@@ -545,7 +532,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
     def test_detected_reconcile_does_not_repend_a_row_settled_while_waiting_for_its_lock(self):
         """A reconcile must capture the deploying predicate from the locked row version."""
         import threading
-        import time
 
         from django.db import connections
 
@@ -619,19 +605,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         reconcile_worker.start()
         self.assertTrue(reconcile_started.wait(10), "the reconcile worker did not start")
         try:
-            deadline = time.monotonic() + 3
-            blocked = False
-            while time.monotonic() < deadline:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted)",
-                        [reconcile_pid[0]],
-                    )
-                    if cursor.fetchone()[0]:
-                        blocked = True
-                        break
-                time.sleep(0.01)
-            self.assertTrue(blocked, "the detected reconcile did not wait for the settlement row lock")
+            wait_until_postgres_blocks(reconcile_pid[0], "the detected reconcile", timeout=3)
         finally:
             release_settlement.set()
 
