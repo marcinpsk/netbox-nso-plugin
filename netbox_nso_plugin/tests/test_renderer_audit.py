@@ -454,7 +454,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
 
         def _touch_then_delegate(device_id, scopes):
             # Runs after the plan is frozen and before the repair takes its locks.
-            NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now())
+            in_thread(lambda: NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now()))
             return audit_scope_footprint(device_id, scopes)
 
         with patch(

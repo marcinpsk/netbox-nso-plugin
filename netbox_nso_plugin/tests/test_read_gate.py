@@ -1634,11 +1634,14 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         operator_worker.start()
         try:
             self.assertTrue(error_holds_level_five.wait(10), "the publication error did not reach its callback")
-            if operator_holds_level_four.wait(2):
-                self.assertTrue(
-                    operator_waits_for_level_five.wait(5),
-                    "the operator did not reach the management-row lock",
-                )
+            self.assertTrue(
+                operator_holds_level_four.wait(10),
+                "the operator did not acquire the device-intent lock",
+            )
+            self.assertTrue(
+                operator_waits_for_level_five.wait(5),
+                "the operator did not reach the management-row lock",
+            )
         finally:
             release_error.set()
             error_worker.join(20)
