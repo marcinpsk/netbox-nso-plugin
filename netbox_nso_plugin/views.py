@@ -4472,6 +4472,8 @@ def _route_map_rename_dependents(route_map, old_name):
 
 def _save_route_map_name_edit(state, old_name):
     """Atomically rename a shared route map and refresh every dependent intent scope."""
+    from django.db import IntegrityError
+
     from . import signals
     from . import status_machine as sm
     from .intent_state import (
@@ -4491,63 +4493,101 @@ def _save_route_map_name_edit(state, old_name):
         route_policy_footprint(groups),
         *(footprint_for_instance(row) for row in (*bgp_states, *redistribution_states)),
     )
-    with intent_transaction(footprint):
-        attached = list(
-            NSORoutePolicyState.objects.filter(
-                content_type_id=state.content_type_id,
-                object_id=state.object_id,
-            ).order_by("pk")
-        )
-        classes = list(
-            NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
-        )
-        fallback_redistribution = list(
-            NSORedistributionState.objects.filter(
-                pk__in=[row.pk for row in redistribution_states],
-                redistribution__isnull=True,
-                route_map__iexact=old_name,
-            ).order_by("pk")
-        )
-        now = timezone.now()
-        with suppress_intent_push():
-            for attached_state in attached:
-                attached_state.object_name = new_name
-                update_fields = {"object_name"}
-                if attached_state.pk == state.pk:
-                    if not sm.is_owned(attached_state.status):
-                        attached_state.accepted_at = now
-                    attached_state.status = sm.on_operator_edit(attached_state.status)
-                    attached_state.apply_attempt_id = None
-                    update_fields.update({"status", "accepted_at", "apply_attempt_id"})
-                attached_state.save(update_fields=update_fields)
-            for policy_class in classes:
-                policy_class.object_name = new_name
-                policy_class.save(update_fields=["object_name"])
-            route_map.name = new_name
-            route_map.save(update_fields=["name"])
-            for redistribution_state in fallback_redistribution:
-                redistribution_state.route_map = new_name
-                redistribution_state.save(update_fields=["route_map"])
+    try:
+        with intent_transaction(footprint):
+            attached = list(
+                NSORoutePolicyState.objects.filter(
+                    content_type_id=state.content_type_id,
+                    object_id=state.object_id,
+                ).order_by("pk")
+            )
+            classes = list(
+                NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by(
+                    "pk"
+                )
+            )
+            fallback_redistribution = list(
+                NSORedistributionState.objects.filter(
+                    pk__in=[row.pk for row in redistribution_states],
+                    redistribution__isnull=True,
+                    route_map__iexact=old_name,
+                ).order_by("pk")
+            )
+            now = timezone.now()
+            with suppress_intent_push():
+                for attached_state in attached:
+                    attached_state.object_name = new_name
+                    update_fields = {"object_name"}
+                    if attached_state.pk == state.pk:
+                        if not sm.is_owned(attached_state.status):
+                            attached_state.accepted_at = now
+                        attached_state.status = sm.on_operator_edit(attached_state.status)
+                        attached_state.apply_attempt_id = None
+                        update_fields.update({"status", "accepted_at", "apply_attempt_id"})
+                    attached_state.save(update_fields=update_fields)
+                class_ids = [policy_class.pk for policy_class in classes]
+                try:
+                    with transaction.atomic():
+                        for policy_class in classes:
+                            policy_class.object_name = new_name
+                            policy_class.save(update_fields=["object_name"])
+                        route_map.name = new_name
+                        route_map.save(update_fields=["name"])
+                        classification_collision = (
+                            NSORoutePolicyObjectClass.objects.filter(
+                                family="route_map",
+                                object_name__iexact=new_name,
+                            )
+                            .exclude(pk__in=class_ids)
+                            .exists()
+                        )
+                        if classes and classification_collision:
+                            raise IntegrityError
+                except IntegrityError:
+                    collision = type(route_map).objects.filter(name__iexact=new_name).exclude(pk=route_map.pk)
+                    if collision.exists():
+                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
+                    classification_collision = (
+                        NSORoutePolicyObjectClass.objects.filter(
+                            family="route_map",
+                            object_name__iexact=new_name,
+                        )
+                        .exclude(pk__in=class_ids)
+                        .exists()
+                    )
+                    if classes and classification_collision:
+                        raise _IntentTransactionNoOp(
+                            {"object_name": ["A route-map classification with this name already exists."]}
+                        )
+                    raise
+                for redistribution_state in fallback_redistribution:
+                    redistribution_state.route_map = new_name
+                    redistribution_state.save(update_fields=["route_map"])
 
-        route_policy_targets = {
-            attached_state.management.device_id
-            for attached_state in attached
-            if attached_state.management.adapter_device_id is not None
-        }
-        bgp_targets = {row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None}
-        redistribution_targets = {
-            (row.management.device_id, row.dest_protocol)
-            for row in redistribution_states
-            if row.management.adapter_device_id is not None
-        }
-        # Appended here, not on commit: the entry belongs to the transaction that renamed
-        # the map, and the drain it schedules still runs after that transaction commits.
-        for device_id in route_policy_targets:
-            signals._schedule_intent_push((device_id, "route_policy"))
-        for device_id in bgp_targets:
-            signals._schedule_intent_push((device_id, "bgp"))
-        for device_id, dest_protocol in redistribution_targets:
-            signals._schedule_redistribution_push(device_id, dest_protocol)
+            route_policy_targets = {
+                attached_state.management.device_id
+                for attached_state in attached
+                if attached_state.management.adapter_device_id is not None
+            }
+            bgp_targets = {
+                row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None
+            }
+            redistribution_targets = {
+                (row.management.device_id, row.dest_protocol)
+                for row in redistribution_states
+                if row.management.adapter_device_id is not None
+            }
+            # Appended here, not on commit: the entry belongs to the transaction that renamed
+            # the map, and the drain it schedules still runs after that transaction commits.
+            for device_id in route_policy_targets:
+                signals._schedule_intent_push((device_id, "route_policy"))
+            for device_id in bgp_targets:
+                signals._schedule_intent_push((device_id, "bgp"))
+            for device_id, dest_protocol in redistribution_targets:
+                signals._schedule_redistribution_push(device_id, dest_protocol)
+    except _IntentTransactionNoOp as exc:
+        return exc.result
+    return None
 
 
 def _save_lacp_edit(obj, key, old_values):
@@ -4732,8 +4772,8 @@ def _overlay_family_errors(key, obj, old_values):
 def _save_overlay_edit(obj, key, old_values):
     """Dispatch a validated edit to its family-specific atomic save path."""
     if key == "route_map_name":
-        _save_route_map_name_edit(obj, old_values["object_name"])
-    elif key in ("lacp_bundle", "lacp_member"):
+        return _save_route_map_name_edit(obj, old_values["object_name"])
+    if key in ("lacp_bundle", "lacp_member"):
         _save_lacp_edit(obj, key, old_values)
     elif key == "vlan_name":
         return _save_vlan_name_edit(obj)

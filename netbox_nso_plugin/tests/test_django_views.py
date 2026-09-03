@@ -5256,6 +5256,249 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(r.status_code, 400)
 
 
+class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.superuser = User.objects.create_superuser(
+            username="route-map-race-admin",
+            password=TEST_PASSWORD,
+            email="route-map-race@test.example",
+        )
+        with without_commit_drain(), transaction.atomic():
+            fixtures = _make_fixtures()
+        self.device = fixtures["device"]
+        self.mgmt = fixtures["mgmt"]
+
+    def test_concurrent_case_variant_route_map_insert_returns_a_field_error(self):
+        from threading import Barrier, Thread
+
+        from django.contrib.contenttypes.models import ContentType
+        from django.db import close_old_connections, connections
+        from django.test import Client
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin import views
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyObjectClass, NSORoutePolicyState
+
+        with without_commit_drain(), transaction.atomic():
+            route_map = RouteMap.objects.create(name="RM-RACE-SOURCE")
+            state = NSORoutePolicyState.objects.create(
+                management=self.mgmt,
+                family="route_map",
+                object_name=route_map.name,
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=route_map.pk,
+                status="imported",
+            )
+            policy_class = NSORoutePolicyObjectClass.objects.create(
+                family="route_map",
+                object_name=route_map.name,
+                mode="master",
+            )
+        before_states = list(
+            NSORoutePolicyState.objects.filter(content_type_id=state.content_type_id, object_id=route_map.pk)
+            .order_by("pk")
+            .values_list("object_name", "status", "accepted_at")
+        )
+        before_revisions = list(
+            NSOIntentRevision.objects.order_by("device_id", "scope").values_list("device_id", "scope", "revision")
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:overlay_field_edit",
+            kwargs={"key": "route_map_name", "pk": state.pk},
+        )
+        validation_finished = Barrier(2)
+        collision_committed = Barrier(2)
+        results = {}
+        original_save = views._save_route_map_name_edit
+
+        def save_after_collision(*args, **kwargs):
+            validation_finished.wait(timeout=20)
+            collision_committed.wait(timeout=20)
+            return original_save(*args, **kwargs)
+
+        def request_edit():
+            close_old_connections()
+            try:
+                client = Client()
+                client.force_login(User.objects.get(pk=self.superuser.pk))
+                results["response"] = client.post(url, {"object_name": "RM-RACE-TARGET"})
+            except Exception as exc:  # noqa: BLE001
+                results["request_error"] = exc
+            finally:
+                connections.close_all()
+                results["request_connection_closed"] = connections["default"].connection is None
+
+        def create_collision():
+            close_old_connections()
+            try:
+                validation_finished.wait(timeout=20)
+                with without_commit_drain(), transaction.atomic():
+                    RouteMap.objects.create(name="rm-race-target")
+            except Exception as exc:  # noqa: BLE001
+                results["collision_error"] = exc
+            finally:
+                collision_committed.wait(timeout=20)
+                connections.close_all()
+                results["collision_connection_closed"] = connections["default"].connection is None
+
+        request_thread = Thread(target=request_edit)
+        collision_thread = Thread(target=create_collision)
+        with patch("netbox_nso_plugin.views._save_route_map_name_edit", side_effect=save_after_collision):
+            request_thread.start()
+            collision_thread.start()
+            request_thread.join(timeout=30)
+            collision_thread.join(timeout=30)
+
+        self.assertFalse(request_thread.is_alive(), "the request worker did not finish")
+        self.assertFalse(collision_thread.is_alive(), "the collision worker did not finish")
+        self.assertTrue(results.get("request_connection_closed"), results)
+        self.assertTrue(results.get("collision_connection_closed"), results)
+        self.assertNotIn("collision_error", results, results.get("collision_error"))
+        response = results.get("response")
+        self.assertIsNotNone(response, results.get("request_error"))
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("object_name", response.json()["errors"])
+        route_map.refresh_from_db()
+        policy_class.refresh_from_db()
+        self.assertEqual(route_map.name, "RM-RACE-SOURCE")
+        self.assertEqual(policy_class.object_name, "RM-RACE-SOURCE")
+        self.assertEqual(
+            list(
+                NSORoutePolicyState.objects.filter(content_type_id=state.content_type_id, object_id=route_map.pk)
+                .order_by("pk")
+                .values_list("object_name", "status", "accepted_at")
+            ),
+            before_states,
+        )
+        self.assertEqual(
+            list(
+                NSOIntentRevision.objects.order_by("device_id", "scope").values_list("device_id", "scope", "revision")
+            ),
+            before_revisions,
+        )
+
+    def test_concurrent_case_variant_classification_insert_returns_a_field_error(self):
+        from threading import Barrier, Thread
+
+        from django.contrib.contenttypes.models import ContentType
+        from django.db import close_old_connections, connections
+        from django.test import Client
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin import views
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyObjectClass, NSORoutePolicyState
+
+        with without_commit_drain(), transaction.atomic():
+            route_map = RouteMap.objects.create(name="RM-CLASS-RACE-SOURCE")
+            state = NSORoutePolicyState.objects.create(
+                management=self.mgmt,
+                family="route_map",
+                object_name=route_map.name,
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=route_map.pk,
+                status="imported",
+            )
+            policy_class = NSORoutePolicyObjectClass.objects.create(
+                family="route_map",
+                object_name=route_map.name,
+                mode="master",
+            )
+        before_states = list(
+            NSORoutePolicyState.objects.filter(content_type_id=state.content_type_id, object_id=route_map.pk)
+            .order_by("pk")
+            .values_list("object_name", "status", "accepted_at")
+        )
+        before_revisions = list(
+            NSOIntentRevision.objects.order_by("device_id", "scope").values_list("device_id", "scope", "revision")
+        )
+        url = reverse(
+            "plugins:netbox_nso_plugin:overlay_field_edit",
+            kwargs={"key": "route_map_name", "pk": state.pk},
+        )
+        validation_finished = Barrier(2)
+        collision_committed = Barrier(2)
+        results = {}
+        original_save = views._save_route_map_name_edit
+
+        def save_after_collision(*args, **kwargs):
+            validation_finished.wait(timeout=20)
+            collision_committed.wait(timeout=20)
+            return original_save(*args, **kwargs)
+
+        def request_edit():
+            close_old_connections()
+            try:
+                client = Client()
+                client.force_login(User.objects.get(pk=self.superuser.pk))
+                results["response"] = client.post(url, {"object_name": "RM-CLASS-RACE-TARGET"})
+            except Exception as exc:  # noqa: BLE001
+                results["request_error"] = exc
+            finally:
+                connections.close_all()
+                results["request_connection_closed"] = connections["default"].connection is None
+
+        def create_collision():
+            close_old_connections()
+            try:
+                validation_finished.wait(timeout=20)
+                with without_commit_drain(), transaction.atomic():
+                    NSORoutePolicyObjectClass.objects.create(
+                        family="route_map",
+                        object_name="rm-class-race-target",
+                        mode="local",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                results["collision_error"] = exc
+            finally:
+                collision_committed.wait(timeout=20)
+                connections.close_all()
+                results["collision_connection_closed"] = connections["default"].connection is None
+
+        request_thread = Thread(target=request_edit)
+        collision_thread = Thread(target=create_collision)
+        with patch("netbox_nso_plugin.views._save_route_map_name_edit", side_effect=save_after_collision):
+            request_thread.start()
+            collision_thread.start()
+            request_thread.join(timeout=30)
+            collision_thread.join(timeout=30)
+
+        self.assertFalse(request_thread.is_alive(), "the request worker did not finish")
+        self.assertFalse(collision_thread.is_alive(), "the collision worker did not finish")
+        self.assertTrue(results.get("request_connection_closed"), results)
+        self.assertTrue(results.get("collision_connection_closed"), results)
+        self.assertNotIn("collision_error", results, results.get("collision_error"))
+        response = results.get("response")
+        self.assertIsNotNone(response, results.get("request_error"))
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("object_name", response.json()["errors"])
+        route_map.refresh_from_db()
+        policy_class.refresh_from_db()
+        self.assertEqual(route_map.name, "RM-CLASS-RACE-SOURCE")
+        self.assertEqual(policy_class.object_name, "RM-CLASS-RACE-SOURCE")
+        self.assertEqual(
+            NSORoutePolicyObjectClass.objects.filter(
+                family="route_map",
+                object_name__iexact="RM-CLASS-RACE-TARGET",
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            list(
+                NSORoutePolicyState.objects.filter(content_type_id=state.content_type_id, object_id=route_map.pk)
+                .order_by("pk")
+                .values_list("object_name", "status", "accepted_at")
+            ),
+            before_states,
+        )
+        self.assertEqual(
+            list(
+                NSOIntentRevision.objects.order_by("device_id", "scope").values_list("device_id", "scope", "revision")
+            ),
+            before_revisions,
+        )
+
+
 class TestPagedCategoryQuickSelect(ViewTestBase):
     """Behavioral guard: EVERY paged category in the device NSO tab renders the
     drift/pending/in-sync quick-select. Driven by the view's own paged-category spec,
