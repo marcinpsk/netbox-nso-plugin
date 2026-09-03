@@ -105,6 +105,18 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertEqual(NSOVLANState.objects.filter(pk=self.state.pk).count(), 1)
 
+    def test_registered_insert_with_column_list_on_conflict_do_nothing_does_not_require_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+        columns = ", ".join(field.column for field in NSOVLANState._meta.concrete_fields)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE id = %s ON CONFLICT DO NOTHING",
+                [self.state.pk],
+            )
+
+        self.assertEqual(NSOVLANState.objects.filter(pk=self.state.pk).count(), 1)
+
     def test_registered_raw_dml_with_unknown_columns_fails_closed(self):
         table = NSOVLANState._meta.db_table
 
