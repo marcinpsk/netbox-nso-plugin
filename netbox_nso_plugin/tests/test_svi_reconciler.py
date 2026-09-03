@@ -409,13 +409,13 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
             ownership_state="owned",
         ).exists()
 
-    def test_exhausted_protocol_error_retry_returns_an_operator_error(self):
+    def test_exhausted_save_protocol_error_retry_returns_an_operator_error(self):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
         from django.contrib.messages import get_messages
 
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
 
         state = self._state(name="Vlan301", vid=301, status="conflict")
         user = get_user_model().objects.create_superuser(
@@ -427,13 +427,48 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
 
         with patch(
             "netbox_nso_plugin.renderer_writer.RendererWriter.save",
-            side_effect=RendererTargetsChanged("changed its renderer targets"),
+            side_effect=IntentMutationProtocolError("the stored row disappeared"),
         ) as save:
             response = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(save.call_count, 2)
-        self.assertIn(
-            "Routing state changed. Refresh the page and try again.",
+        self.assertEqual(
             [str(message) for message in get_messages(response.wsgi_request)],
+            ["Routing state changed. Refresh the page and try again."],
         )
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertIsNone(state.accepted_at)
+
+    def test_exhausted_plan_protocol_error_retry_returns_an_operator_error(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+
+        state = self._state(name="Vlan302", vid=302, status="conflict")
+        user = get_user_model().objects.create_superuser(
+            username="svi-plan-stale-admin",
+            password="pw",  # noqa: S106
+            email="stale-svi-plan@example.test",
+        )
+        self.client.force_login(user)
+
+        with patch(
+            "netbox_nso_plugin.renderer_writer.RendererMutationPlan.build",
+            side_effect=IntentMutationProtocolError("the stored row disappeared"),
+        ) as build:
+            response = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["Routing state changed. Refresh the page and try again."],
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertIsNone(state.accepted_at)

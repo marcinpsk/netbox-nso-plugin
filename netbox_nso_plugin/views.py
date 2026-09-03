@@ -6510,9 +6510,8 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         """Accept one converted overlay through its exact renderer plan."""
         import copy
 
-        from .intent_state import RendererTargetsChanged
+        from .intent_state import IntentMutationProtocolError
         from .renderer_writer import (
-            IntentPlanStaleError,
             RendererMutationPlan,
             planned_save,
             renderer_mirror_writes,
@@ -6529,16 +6528,16 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             candidate = copy.copy(current)
             candidate.status = _status_after_accept(current.status)
             candidate.accepted_at = timezone.now()
-            plan = RendererMutationPlan.build(
-                saves=(planned_save(candidate, update_fields=fields),),
-                planned_at=candidate.accepted_at,
-            )
-            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             try:
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(candidate, update_fields=fields),),
+                    planned_at=candidate.accepted_at,
+                )
+                mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
                 with mutation as writer:
                     writer.save(candidate, update_fields=fields)
                 break
-            except (IntentPlanStaleError, RendererTargetsChanged):
+            except IntentMutationProtocolError:
                 if attempt:
                     messages.error(request, "Routing state changed. Refresh the page and try again.")
                     return redirect(_device_nso_tab_url(current.management.device_id))
