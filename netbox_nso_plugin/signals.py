@@ -2921,6 +2921,29 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     from . import adapter_client as client
     from .models import NSOBGPPeerState
 
+    owned_rows = list(
+        NSOBGPPeerState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group")
+    )
+    incomplete = next((row for row in owned_rows if row.bgp_peer_id is None), None)
+    blocked = (
+        {
+            "message": f"BGP snapshot is blocked by peer state {incomplete.pk} without a linked BGP peer.",
+            "detail": {
+                "reason": "missing_bgp_peer",
+                "state_id": incomplete.pk,
+                "asn": incomplete.asn_str,
+                "vrf": incomplete.vrf_name,
+                "peer_address": incomplete.peer_address_str,
+            },
+        }
+        if incomplete is not None
+        else None
+    )
+    renderable_rows = () if blocked is not None else owned_rows
+
     # BGP redistribution: dest_ref = f"{asn}:{vrf}:{af}"
     redist_by_af = _collect_redistribution_by_dest_ref(device_id, "bgp")
 
@@ -2938,12 +2961,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         scope_afs.setdefault((asn_str, vrf_str), {})[af_str] = redist_entries
 
     routers: dict[str, dict] = {}
-    for row in NSOBGPPeerState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group"):
-        if row.bgp_peer is None:
-            continue
+    for row in renderable_rows:
         asn_str = row.asn_str
         vrf_name = row.vrf_name or ""
         if asn_str not in routers:
@@ -2952,25 +2970,39 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         if vrf_name not in scopes:
             scopes[vrf_name] = {"vrf": vrf_name, "address_families": [], "peers": []}
 
-        # Build address-family list from the linked BGPPeer if available.
+        # Build the address-family list from the validated BGPPeer link.
         peer_afs = []
-        if row.bgp_peer is not None:
-            for paf in row.bgp_peer.address_families.select_related(
-                "address_family",
-                "prefixlist_in",
-                "prefixlist_out",
-                "routemap_in",
-                "routemap_out",
-            ):
-                peer_afs.append(bgp_peer_address_family_intent_item(paf))
+        for paf in row.bgp_peer.address_families.select_related(
+            "address_family",
+            "prefixlist_in",
+            "prefixlist_out",
+            "routemap_in",
+            "routemap_out",
+        ):
+            peer_afs.append(bgp_peer_address_family_intent_item(paf))
 
         scopes[vrf_name]["peers"].append(bgp_peer_intent_item(row, peer_afs))
 
-    router_list = _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
+    router_list = (
+        {"blocked": blocked}
+        if blocked is not None
+        else _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
+    )
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            blocker = body["blocked"]
+            raise client.AdapterError(
+                blocker["message"],
+                code="validation_error",
+                detail=blocker["detail"],
+            )
+        return client.put_bgp_intent(adapter_device_id, body)
+
     _push_changed(
         (device_id, "bgp"),
         router_list,
-        lambda body: client.put_bgp_intent(adapter_device_id, body),
+        push,
     )
 
 

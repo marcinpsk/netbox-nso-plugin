@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from ipam.models import ASN, RIR, IPAddress
@@ -20,6 +21,7 @@ from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 
 from netbox_nso_plugin.models import NSOBGPPeerState, NSODeviceManagement, NSOInstance
 
+from ._outbox_case import enqueue, entries, make_managed, state_of, without_commit_drain
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -246,6 +248,7 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
                                     "address_families": [{"af": "ipv4-unicast", "enabled": True}],
                                 }
                             ],
+                            "peer_groups": [],
                         }
                     ],
                 }
@@ -285,7 +288,95 @@ class TestBgpPeerGreenfieldDelete(BgpGreenfieldBase):
         self.assertIsNone(state.bgp_peer_id)
         mock_put.assert_not_called()
 
-    def test_push_omits_owned_overlay_after_foreign_peer_delete(self):
+    def test_single_accept_refuses_an_unlinked_peer_state(self):
+        mgmt = self._mgmt()
+        state = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="198.18.0.4",
+            status="changed",
+        )
+        from users.models import User
+
+        self.client.force_login(User.objects.create_user("bgp-single-accept-admin", is_superuser=True))
+        url = reverse("plugins:netbox_nso_plugin:routing_accept_bgp_peer", kwargs={"pk": state.pk})
+
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertIsNone(state.accepted_at)
+
+    def test_bulk_accept_refuses_an_unlinked_peer_state(self):
+        mgmt = self._mgmt()
+        state = NSOBGPPeerState.objects.create(
+            management=mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="198.18.0.5",
+            status="changed",
+        )
+        from users.models import User
+
+        self.client.force_login(User.objects.create_user("bgp-bulk-accept-admin", is_superuser=True))
+        url = reverse("plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers", kwargs={"device_pk": self.device.pk})
+
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertIsNone(state.accepted_at)
+
+
+class TestBgpIncompleteSnapshotDrain(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.device, self.mgmt = make_managed("bgp-blocked-snapshot", 9911)
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        self.state = NSOBGPPeerState(
+            management=self.mgmt,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="198.18.0.4",
+            status="in_sync",
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    self.state,
+                    force_insert=True,
+                    natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
+                ),
+            )
+        )
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(self.state, force_insert=True)
+        with without_commit_drain(), transaction.atomic():
+            enqueue(self.device, "bgp")
+
+    def test_real_outbox_drain_records_and_dissolves_an_incomplete_snapshot(self):
+        from netbox_nso_plugin import drain
+
+        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
+            drain.drain_intent_outbox()
+
+        mock_put.assert_not_called()
+        self.mgmt.refresh_from_db()
+        error = self.mgmt.intent_push_errors["bgp"]
+        self.assertEqual(error["code"], "validation_error")
+        self.assertEqual(error["detail"]["state_id"], self.state.pk)
+        outbox_state = state_of(self.device, "bgp")
+        self.assertIsNone(outbox_state.push_seq)
+        self.assertEqual(outbox_state.last_error_code, "validation_error")
+        self.assertEqual(len(entries(self.device, "bgp", unconsumed=True)), 1)
+
+
+class TestBgpPeerDeleteAfterOwnership(BgpGreenfieldBase):
+    def test_foreign_delete_leaves_owned_overlay_unlinked_without_sending(self):
         mgmt = self._mgmt()
         scope = self._scope(self._router())
         ip = self._ip("198.18.0.4/32")
@@ -308,14 +399,6 @@ class TestBgpPeerGreenfieldDelete(BgpGreenfieldBase):
         state.refresh_from_db()
         self.assertIsNone(state.bgp_peer_id)
         mock_put.assert_not_called()
-
-        from netbox_nso_plugin.delivery import deliver
-
-        with patch("netbox_nso_plugin.adapter_client.put_bgp_intent") as mock_put:
-            deliver("bgp", self.device.pk, mgmt.adapter_device_id)
-
-        _adapter_id, router_list = mock_put.call_args.args
-        self.assertIsNone(_find_pushed_peer(router_list, "198.18.0.4"))
 
 
 class TestBgpPeerAddView(BgpGreenfieldBase):

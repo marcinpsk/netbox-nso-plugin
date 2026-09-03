@@ -5917,12 +5917,19 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
     def _arm_accept(self, state) -> None:
         """Set family-specific state on *state* before the accepted row is saved."""
 
+    def _accept_blocker(self, state) -> str:
+        """Return why *state* cannot become owned, or an empty string."""
+        return ""
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         state = get_object_or_404(self.model_class, pk=pk)
+        if blocker := self._accept_blocker(state):
+            messages.error(request, f"Cannot accept {state}: {blocker}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         candidate = copy.copy(state)
         # Matching (imported/in_sync) → nothing to apply → in_sync; differing → accepted.
         candidate.status = _status_after_accept(state.status)
@@ -6445,6 +6452,9 @@ class NSOISISInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
 class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
+    def _accept_blocker(self, state):
+        return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
+
 
 class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one BGP peer-group template — take ownership (no device apply path).
@@ -6810,6 +6820,10 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         """Add family-specific accepted fields to one candidate."""
         return ()
 
+    def _accept_blocker(self, state) -> str:
+        """Return why *state* cannot become owned, or an empty string."""
+        return ""
+
     def _build_accept_plan(self, mgmt, accepted, saves):
         """Build the family-specific exact plan and replay operations."""
         from .renderer_writer import RendererMutationPlan
@@ -6839,6 +6853,11 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
                 .select_related("management")
                 .order_by("pk")
             )
+            blocked = next(((row, reason) for row in candidates if (reason := self._accept_blocker(row))), None)
+            if blocked is not None:
+                row, reason = blocked
+                messages.error(request, f"Cannot accept {row}: {reason}")
+                return redirect(_device_nso_tab_url(device_pk))
             accepted = []
             saves = []
             for row in candidates:
@@ -6910,6 +6929,9 @@ class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
+
+    def _accept_blocker(self, state):
+        return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
 
     def _push(self, mgmt):
         _schedule_intent_push((mgmt.device_id, "bgp"))
