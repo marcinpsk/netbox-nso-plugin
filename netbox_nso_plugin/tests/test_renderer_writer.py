@@ -169,7 +169,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from ipam.models import IPAddress
 
         from netbox_nso_plugin.models import NSOInterfaceIPState
-        from netbox_nso_plugin.renderer_writer import _manifest_binding
+        from netbox_nso_plugin.ownership_planner import manifest_binding
 
         device, management = make_managed("writer-missing-vrf", 16297)
         interface = Interface.objects.create(device=device, name="Loopback16297", type="virtual")
@@ -186,7 +186,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         state.management = management
 
-        self.assertIsNone(_manifest_binding(state))
+        self.assertIsNone(manifest_binding(state))
 
     def test_renderer_writer_declares_one_reference_resolver(self):
         import ast

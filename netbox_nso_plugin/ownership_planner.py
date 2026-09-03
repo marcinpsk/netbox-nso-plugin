@@ -452,6 +452,8 @@ def manifest_binding(instance):
                 from ipam.models import VRF
 
                 vrf_id = VRF.objects.filter(name=vrf_name).values_list("pk", flat=True).first()
+                if vrf_id is None:
+                    return None
             native = IPAddress.objects.filter(
                 address=instance.address,
                 vrf_id=vrf_id,
