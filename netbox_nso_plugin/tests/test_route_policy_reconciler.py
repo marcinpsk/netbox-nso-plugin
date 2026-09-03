@@ -2101,6 +2101,111 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(st.is_materialized)
         self.assertEqual(st.status, "imported")
 
+    def test_reconcile_plan_rechecks_owner_after_acquisition(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        payload = self._pl("PL-OWNER-PREDICTION", ["198.18.0.0/24"])
+        reconcile_route_policy(self.d1, payload)
+        owner = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-OWNER-PREDICTION")
+        plan = route_policy_reconcile_plan(self.d2, payload)
+        self.assertFalse(plan.changes_content)
+        content_update(owner, is_materialized=False)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+            with renderer_mirror_writes(plan):
+                reconcile_route_policy(self.d2, payload)
+
+        entries = PrefixListEntry.objects.filter(prefix_list__name="PL-OWNER-PREDICTION")
+        self.assertEqual({str(entry.assigned_prefix) for entry in entries}, {"198.18.0.0/24"})
+
+    def test_reconcile_plan_rechecks_route_map_prefix_list_dependencies_after_acquisition(self):
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        prefix_name = "PL-ROUTE-MAP-PREDICTION"
+        route_map_name = "RM-PREFIX-PREDICTION"
+        prefix_capture = {
+            "name": prefix_name,
+            "entries": [{"sequence": 10, "action": "permit", "prefix": "198.18.0.0/24"}],
+        }
+        route_map_capture = {
+            "name": route_map_name,
+            "entries": [
+                {"sequence": 10, "action": "permit", "match_prefix_lists": [prefix_name]},
+            ],
+        }
+        payload = {"prefix_lists": [prefix_capture], "route_maps": [route_map_capture]}
+        reconcile_route_policy(self.d1, payload)
+        d1_prefix = NSORoutePolicyState.objects.get(
+            management__device=self.d1,
+            family="prefix_list",
+            object_name=prefix_name,
+        )
+        d1_route_map = NSORoutePolicyState.objects.get(
+            management__device=self.d1,
+            family="route_map",
+            object_name=route_map_name,
+        )
+        content_update(d1_prefix, status="accepted")
+        content_update(d1_route_map, status="accepted")
+        reconcile_route_policy(self.d2, payload)
+        d2_prefix = NSORoutePolicyState.objects.get(
+            management__device=self.d2,
+            family="prefix_list",
+            object_name=prefix_name,
+        )
+        d2_route_map = NSORoutePolicyState.objects.get(
+            management__device=self.d2,
+            family="route_map",
+            object_name=route_map_name,
+        )
+        ownership.rematerialize(d2_route_map)
+        d1_prefix.refresh_from_db()
+        d1_route_map.refresh_from_db()
+        d2_prefix.refresh_from_db()
+        d2_route_map.refresh_from_db()
+        self.assertEqual((d1_prefix.status, d1_prefix.is_materialized), ("accepted", True))
+        self.assertEqual((d1_route_map.status, d1_route_map.is_materialized), ("accepted", False))
+        self.assertEqual((d2_prefix.status, d2_prefix.is_materialized), ("imported", False))
+        self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
+
+        plan = route_policy_reconcile_plan(self.d2, payload)
+        self.assertFalse(plan.changes_content)
+        changed_prefix_capture = {
+            "name": prefix_name,
+            "entries": [{"sequence": 10, "action": "permit", "prefix": "198.18.1.0/24"}],
+        }
+        content_update(
+            d1_prefix,
+            captured=changed_prefix_capture,
+            content_hash=ownership.hash_captured("prefix_list", changed_prefix_capture),
+        )
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+            with renderer_mirror_writes(plan):
+                reconcile_route_policy(self.d2, payload)
+
+        d2_prefix.refresh_from_db()
+        d2_route_map.refresh_from_db()
+        self.assertEqual((d2_prefix.status, d2_prefix.is_materialized), ("imported", False))
+        self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
+
     def test_first_prefix_list_capture_replaces_a_populated_unowned_root(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry
