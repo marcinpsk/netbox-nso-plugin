@@ -84,7 +84,7 @@ class TestReconcileRedistribution(TestCase):
         from django.utils import timezone
         from netbox_routing.models import ISISInstance, Redistribution
 
-        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
         from netbox_nso_plugin.signals import suppress_intent_push
@@ -97,7 +97,8 @@ class TestReconcileRedistribution(TestCase):
         state.accepted_at = timezone.now()
         state.save(update_fields=["status", "accepted_at"])
 
-        with transaction.atomic(), offline_mutation(), suppress_intent_push():
+        footprint = deletion_footprint_for_instance(state.redistribution)
+        with transaction.atomic(), intent_transaction(footprint), suppress_intent_push():
             state.redistribution.delete()
         state.refresh_from_db()
         self.assertIsNone(state.redistribution_id)
