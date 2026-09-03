@@ -95,6 +95,64 @@ class TestOwnershipManifestMaintenance(TestCase):
 
         self.device, self.management = make_managed("manifest-maintenance", 1627)
 
+    def test_route_policy_binding_rejects_an_invalid_generic_target(self):
+        from django.contrib.contenttypes.models import ContentType
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOOwnershipManifest, NSORoutePolicyState
+        from netbox_nso_plugin.ownership_planner import maintain_manifest, manifest_binding
+
+        state = NSORoutePolicyState.objects.create(
+            management=self.management,
+            content_type=ContentType.objects.get_for_model(NSODeviceManagement),
+            object_id=self.management.pk,
+            family="route_map",
+            object_name="invalid-manifest-target",
+            status="accepted",
+        )
+
+        self.assertIsNone(manifest_binding(state))
+        maintain_manifest(state)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk).exists())
+
+    def test_route_policy_binding_rejects_a_model_from_another_family(self):
+        from django.contrib.contenttypes.models import ContentType
+        from django.core.exceptions import ValidationError
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.ownership_planner import manifest_binding
+
+        route_map = RouteMap.objects.create(name="manifest-wrong-family")
+        state = NSORoutePolicyState.objects.create(
+            management=self.management,
+            content_type=ContentType.objects.get_for_model(RouteMap),
+            object_id=route_map.pk,
+            family="prefix_list",
+            object_name=route_map.name,
+            status="accepted",
+        )
+
+        self.assertIsNone(manifest_binding(state))
+
+        with self.assertRaises(ValidationError) as error:
+            state.full_clean()
+
+        self.assertIn("content_type", error.exception.message_dict)
+
+    def test_manifest_schema_drift_raises_the_model_field_error(self):
+        from dataclasses import replace
+
+        from django.core.exceptions import FieldDoesNotExist
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.ownership_planner import _validated_native_key_fields, converted_scope_rules
+
+        route_map = RouteMap.objects.create(name="manifest-schema-drift")
+        rule = replace(converted_scope_rules()["route_policy"], native_key_fields=("missing_identity",))
+
+        with self.assertRaises(FieldDoesNotExist):
+            _validated_native_key_fields(route_map, rule)
+
     def test_retired_manifest_is_not_reactivated(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
         from netbox_nso_plugin.ownership_planner import maintain_manifest
