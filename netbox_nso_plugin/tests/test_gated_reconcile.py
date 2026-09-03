@@ -563,7 +563,9 @@ class TestContentionDispositions(TestCase):
 class _ContendedStaleRow:
     """A persisted-shaped row whose status changes before each attempted row lock."""
 
-    _meta = SimpleNamespace(label_lower="netbox_nso_plugin.teststate")
+    class DoesNotExist(Exception):
+        pass
+
     pk = 37
 
     def __init__(self):
@@ -581,6 +583,12 @@ class _ContendedStaleRow:
 
     def save(self, update_fields=None):
         self.saved_fields = list(update_fields) if update_fields else None
+
+
+_ContendedStaleRow._meta = SimpleNamespace(
+    label_lower="netbox_nso_plugin.teststate",
+    model=_ContendedStaleRow,
+)
 
 
 class TestStaleOverlayContention(SimpleTestCase):
