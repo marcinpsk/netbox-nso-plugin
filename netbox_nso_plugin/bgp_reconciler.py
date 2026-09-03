@@ -20,6 +20,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ def _bgp_fk_identity(obj):
     if label == "ipam.asn":
         return ("asn", int(obj.asn))
     if label == "ipam.ipaddress":
-        return ("ip", str(obj.address))
+        return ("ip", str(obj.address), obj.vrf_id)
     if label == "netbox_routing.bgppeertemplate":
         return ("template", obj.name)
     if label in ("netbox_routing.prefixlist", "netbox_routing.routemap"):
@@ -119,6 +120,209 @@ def _bgp_fk_identity(obj):
 def _content_hash(content: dict) -> str:
     """Stable hash of a canonical content dict (for 3-way merge base comparison)."""
     return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode()).hexdigest()
+
+
+_BGP_SCALAR_FIELDS = {
+    "router": {
+        "asn": ((str,), True, "asn"),
+        "router_id": ((str, type(None)), True, "ipv4"),
+    },
+    "scope": {
+        "vrf": ((str,), True, None),
+    },
+    "scope address family": {
+        "af": ((str,), True, "nonempty"),
+    },
+    "peer": {
+        "peer_address": ((str,), True, "ip"),
+        "enabled": ((bool,), True, None),
+        "peer_group": ((str, type(None)), False, "nonempty"),
+        "remote_as": ((str, type(None)), False, "asn"),
+        "local_as": ((str, type(None)), False, "asn"),
+        "ttl": ((int, type(None)), False, None),
+        "password": ((str, type(None)), False, None),
+        "source": ((str, type(None)), False, "source"),
+        "bfd_enabled": ((bool, type(None)), False, None),
+    },
+    "peer address family": {
+        "af": ((str,), True, "nonempty"),
+        "enabled": ((bool,), True, None),
+        "routemap_in": ((str, type(None)), False, None),
+        "routemap_out": ((str, type(None)), False, None),
+        "prefixlist_in": ((str, type(None)), False, None),
+        "prefixlist_out": ((str, type(None)), False, None),
+    },
+    "peer group": {
+        "name": ((str,), True, "nonempty"),
+        "remote_as": ((str, type(None)), False, "asn"),
+        "source": ((str, type(None)), False, "source"),
+    },
+    "peer group address family": {
+        "af": ((str,), True, "nonempty"),
+        "enabled": ((bool,), False, None),
+        "routemap_in": ((str, type(None)), False, None),
+        "routemap_out": ((str, type(None)), False, None),
+        "prefixlist_in": ((str, type(None)), False, None),
+        "prefixlist_out": ((str, type(None)), False, None),
+    },
+}
+
+
+def _parse_asn(value):
+    """Return the uint32 value of a decimal or asdot ASN string."""
+    parts = value.split(".")
+    if len(parts) == 1:
+        number = int(value)
+    elif len(parts) == 2:
+        high, low = (int(part) for part in parts)
+        if not 0 <= high <= 65535 or not 0 <= low <= 65535:
+            raise ValueError
+        number = high * 65536 + low
+    else:
+        raise ValueError
+    if not 1 <= number <= 4294967295:
+        raise ValueError
+    return number
+
+
+def _parse_ip_address(value):
+    """Return the canonical IP address object used by BGP identities."""
+    return ipaddress.ip_address(value)
+
+
+def _canonical_source_ip(value):
+    """Return a canonical source IP, or None when the value is an interface name."""
+    try:
+        interface = ipaddress.ip_interface(value)
+    except ValueError:
+        return None
+    if getattr(interface, "scope_id", None) is not None:
+        raise ipaddress.AddressValueError(value)
+    return interface.ip.compressed
+
+
+def _deduplicated(entries, key, *, keep_last=False):
+    """Return entries with one stable representative for each identity."""
+    unique = {}
+    for entry in entries:
+        identity = key(entry)
+        if identity not in unique or keep_last:
+            unique[identity] = entry
+    return tuple(unique.values())
+
+
+def _first_router_definitions(routers):
+    """Keep the first reported definition for each router ASN."""
+    unique = []
+    seen_asns = set()
+    for router in routers:
+        asn = router["asn"]
+        if asn in seen_asns:
+            logger.warning("BGP: repeated router ASN %s ignored; the first definition wins", asn)
+            continue
+        seen_asns.add(asn)
+        unique.append(router)
+    return tuple(unique)
+
+
+def _indexed_peer_states(rows):
+    """Index the lowest-PK peer state and retain its canonical aliases."""
+    identities = {}
+    duplicates = []
+    raw_keys = {}
+    for row in rows:
+        canonical_key = (row.asn_str, row.vrf_name, _parse_ip_address(row.peer_address_str).compressed)
+        raw_keys[(row.asn_str, row.vrf_name, row.peer_address_str)] = row
+        if canonical_key in identities:
+            duplicates.append(row)
+        else:
+            identities[canonical_key] = row
+    return identities, duplicates, raw_keys
+
+
+def _available_peer_state_address(state, state_key, raw_keys):
+    """Return the canonical address unless another persisted state owns it."""
+    holder = raw_keys.get(state_key)
+    if holder is not None and holder.pk != state.pk:
+        return state.peer_address_str
+    return state_key[2]
+
+
+def _validated_bgp_document(payload):  # noqa: C901
+    """Return a structurally valid BGP adapter document."""
+    from .adapter_client import AdapterError
+
+    def reject(message):
+        raise AdapterError(message, code="invalid_response")
+
+    def validate_scalars(kind, entry):
+        for field, (expected_types, required, rule) in _BGP_SCALAR_FIELDS[kind].items():
+            if field not in entry:
+                if required:
+                    reject(f"Adapter returned a malformed BGP {kind} {field}.")
+                continue
+            value = entry[field]
+            if type(value) not in expected_types:
+                reject(f"Adapter returned a malformed BGP {kind} {field}.")
+            if value is None:
+                continue
+            if rule == "nonempty" and not value:
+                reject(f"Adapter returned a malformed BGP {kind} {field}.")
+            if rule == "asn":
+                try:
+                    number = _parse_asn(value)
+                except ValueError:
+                    reject(f"Adapter returned a malformed BGP {kind} {field}.")
+                entry[field] = str(number)
+            if rule == "source":
+                try:
+                    address = _canonical_source_ip(value)
+                except ValueError:
+                    reject(f"Adapter returned a malformed BGP {kind} {field}.")
+                if address is not None:
+                    entry[field] = address
+            if rule in {"ip", "ipv4"}:
+                try:
+                    address = _parse_ip_address(value)
+                except ValueError:
+                    reject(f"Adapter returned a malformed BGP {kind} {field}.")
+                if getattr(address, "scope_id", None) is not None or (rule == "ipv4" and address.version != 4):
+                    reject(f"Adapter returned a malformed BGP {kind} {field}.")
+                entry[field] = address.compressed
+
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("routers"), list):
+        reject("Adapter returned a malformed BGP document.")
+    payload = copy.deepcopy(payload)
+    for router in payload["routers"]:
+        if not isinstance(router, Mapping) or not isinstance(router.get("scopes"), list):
+            reject("Adapter returned a malformed BGP router.")
+        validate_scalars("router", router)
+        for scope in router["scopes"]:
+            if not isinstance(scope, Mapping):
+                reject("Adapter returned a malformed BGP scope.")
+            validate_scalars("scope", scope)
+            scope_afs = scope.get("address_families")
+            if not isinstance(scope_afs, list):
+                reject("Adapter returned malformed BGP scope address families.")
+            for value in scope_afs:
+                validate_scalars("scope address family", {"af": value})
+            for collection in ("peers", "peer_groups"):
+                entries = scope.get(collection)
+                if not isinstance(entries, list) or not all(isinstance(entry, Mapping) for entry in entries):
+                    reject(f"Adapter returned malformed BGP {collection}.")
+                if any(
+                    not isinstance(entry.get("address_families"), list)
+                    or not all(isinstance(af, Mapping) for af in entry["address_families"])
+                    for entry in entries
+                ):
+                    reject(f"Adapter returned malformed BGP {collection} address families.")
+                for entry in entries:
+                    kind = "peer" if collection == "peers" else "peer group"
+                    validate_scalars(kind, entry)
+                    af_kind = f"{kind} address family"
+                    for address_family in entry["address_families"]:
+                        validate_scalars(af_kind, address_family)
+    return payload
 
 
 _PEER_FIELDS = (
@@ -170,10 +374,8 @@ def _af_device_content(
             return objects_by_name.get(name)
         return resolver(name)
 
-    for paf in af_list or []:
-        af_str = paf.get("af") or ""
-        if not af_str:
-            continue
+    for paf in _deduplicated(af_list, key=lambda entry: entry["af"]):
+        af_str = paf["af"]
         afs.append(
             {
                 "af": af_str,
@@ -341,7 +543,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         from .models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSODeviceManagement
 
         self.device = device
-        self.payload = {"routers": payload} if isinstance(payload, list) else payload
+        self.payload = _validated_bgp_document(payload)
         self.planned_at = planned_at
         self.operations = _Operations()
         self.management = NSODeviceManagement.objects.filter(device=device).first()
@@ -361,69 +563,65 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.peer_content_type = ContentType.objects.get_for_model(BGPPeer)
         self.template_content_type = ContentType.objects.get_for_model(BGPPeerTemplate)
 
-        routers = self.payload.get("routers") or []
-        reported_asns = {
-            str(value)
-            for router in routers
-            for value in (
-                [router.get("asn")]
-                + [
-                    peer.get(key)
-                    for scope in router.get("scopes") or []
-                    for peer in scope.get("peers") or []
-                    for key in ("remote_as", "local_as")
-                ]
-                + [
-                    group.get("remote_as")
-                    for scope in router.get("scopes") or []
-                    for group in scope.get("peer_groups") or []
-                ]
-            )
-            if value not in (None, "")
-        }
-        asn_values = set()
-        for value in reported_asns:
-            try:
-                asn_values.add(int(value))
-            except (TypeError, ValueError):
-                continue
+        self.router_entries = _first_router_definitions(self.payload["routers"])
+        routers = self.router_entries
+        peer_entries = _deduplicated(
+            (
+                (router, scope, peer)
+                for router in sorted(routers, key=lambda row: row["asn"])
+                for scope in sorted(router["scopes"], key=lambda row: row["vrf"])
+                for peer in sorted(scope["peers"], key=lambda row: row["peer_address"])
+            ),
+            key=lambda item: (item[0]["asn"], item[1]["vrf"], _parse_ip_address(item[2]["peer_address"]).compressed),
+        )
+        self.peer_entries_by_scope = {}
+        for _router, scope, peer in peer_entries:
+            self.peer_entries_by_scope.setdefault(id(scope), []).append(peer)
+        group_entries = _deduplicated(
+            (
+                (scope, group)
+                for router in sorted(routers, key=lambda row: row["asn"])
+                for scope in sorted(router["scopes"], key=lambda row: row["vrf"])
+                for group in sorted(scope["peer_groups"], key=lambda row: row["name"].casefold())
+            ),
+            key=lambda item: item[1]["name"],
+            keep_last=True,
+        )
+        self.reported_group_entry_ids = {id(group) for _scope, group in group_entries}
+        reported_asns = {str(router["asn"]) for router in routers}
+        reported_asns.update(
+            str(peer[key])
+            for _router, _scope, peer in peer_entries
+            for key in ("remote_as", "local_as")
+            if peer.get(key) not in (None, "")
+        )
+        reported_asns.update(
+            str(group["remote_as"]) for _scope, group in group_entries if group.get("remote_as") not in (None, "")
+        )
+        asn_values = {int(value) for value in reported_asns}
         self.reported_asns = reported_asns
-        vrf_names = {scope.get("vrf") for router in routers for scope in router.get("scopes") or [] if scope.get("vrf")}
+        vrf_names = {scope["vrf"] for router in routers for scope in router["scopes"] if scope["vrf"]}
         template_names = {
             name
-            for router in routers
-            for scope in router.get("scopes") or []
             for name in (
-                [peer.get("peer_group") for peer in scope.get("peers") or []]
-                + [group.get("name") for group in scope.get("peer_groups") or []]
+                [peer.get("peer_group") for _router, _scope, peer in peer_entries]
+                + [group["name"] for _scope, group in group_entries]
             )
             if name
         }
-        peer_addresses = {
-            peer.get("peer_address")
-            for router in routers
-            for scope in router.get("scopes") or []
-            for peer in scope.get("peers") or []
-            if peer.get("peer_address")
-        }
-        source_values = {
-            peer.get("source")
-            for router in routers
-            for scope in router.get("scopes") or []
-            for peer in scope.get("peers") or []
-            if peer.get("source")
-        }
+        peer_addresses = {peer["peer_address"] for _router, _scope, peer in peer_entries}
+        source_values = {peer.get("source") for _router, _scope, peer in peer_entries if peer.get("source")}
         ip_hosts = set()
         source_interfaces = set()
         for value in peer_addresses | source_values:
             try:
-                address = ipaddress.ip_address(value)
+                address = _parse_ip_address(value)
             except ValueError:
                 if value in source_values:
                     source_interfaces.add(value)
             else:
                 if getattr(address, "scope_id", None) is None:
-                    ip_hosts.add(str(address))
+                    ip_hosts.add(address.compressed)
         ip_filter = Q(pk__in=[])
         for host in ip_hosts:
             ip_filter |= Q(address__net_host=host)
@@ -431,10 +629,25 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             row.asn: row for row in ASN.objects.filter(asn__in=asn_values).select_related("rir").order_by("pk")
         }
         self.rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
-        self.ips = {str(row.address.ip): row for row in IPAddress.objects.filter(ip_filter).order_by("pk")}
-        self.source_interfaces = {
-            row.name: row for row in Interface.objects.filter(device=device, name__in=source_interfaces).order_by("pk")
+        ip_rows = tuple(IPAddress.objects.filter(ip_filter).order_by("pk"))
+        self.ips = {(str(row.address.ip), row.vrf_id): row for row in ip_rows}
+        interface_type = ContentType.objects.get_for_model(Interface)
+        assigned_interface_ids = {
+            row.assigned_object_id
+            for row in ip_rows
+            if row.assigned_object_type_id == interface_type.pk and row.assigned_object_id is not None
         }
+        interfaces = tuple(
+            Interface.objects.filter(device=device)
+            .filter(Q(name__in=source_interfaces) | Q(pk__in=assigned_interface_ids))
+            .order_by("pk")
+        )
+        self.source_interfaces = {row.name: row for row in interfaces if row.name in source_interfaces}
+        device_interface_ids = {row.pk for row in interfaces}
+        self.device_source_ips = {}
+        for row in ip_rows:
+            if row.assigned_object_type_id == interface_type.pk and row.assigned_object_id in device_interface_ids:
+                self.device_source_ips.setdefault(str(row.address.ip), []).append(row)
         self.vrfs = {row.name: row for row in VRF.objects.filter(name__in=vrf_names).order_by("pk")}
         self.routers = {
             int(row.asn.asn): row
@@ -477,7 +690,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             .order_by("pk")
         ):
             scope_key = (row.scope.router_id, row.scope.vrf_id)
-            self.peers[(scope_key, row.peer_id)] = row
+            self.peers[(scope_key, str(row.peer.address.ip))] = row
         self.templates = {
             row.name: row
             for row in BGPPeerTemplate.objects.filter(name__in=template_names)
@@ -501,16 +714,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         ):
             self.peer_address_families.setdefault((row.assigned_object_type_id, row.assigned_object_id), []).append(row)
         self.template_saved = set()
-        self.peer_states = (
-            {
-                (row.asn_str, row.vrf_name, row.peer_address_str): row
-                for row in NSOBGPPeerState.objects.filter(management=self.management)
-                .select_related("bgp_peer")
-                .order_by("pk")
-            }
+        peer_state_rows = (
+            tuple(NSOBGPPeerState.objects.filter(management=self.management).select_related("bgp_peer").order_by("pk"))
             if self.management is not None
-            else {}
+            else ()
         )
+        self.peer_states, self.duplicate_peer_states, self.peer_state_raw_keys = _indexed_peer_states(peer_state_rows)
         self.template_states = (
             {
                 row.template_name: row
@@ -524,17 +733,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.seen_peers = set()
         self.seen_templates = set()
         policy_entries = tuple(
-            address_family
-            for router in self.payload.get("routers", []) or []
-            if isinstance(router, dict)
-            for scope in router.get("scopes", []) or []
-            if isinstance(scope, dict)
-            for owner_key in ("peers", "peer_groups")
-            for owner in scope.get(owner_key, []) or []
-            if isinstance(owner, dict)
-            for address_family in owner.get("address_families", []) or []
-            if isinstance(address_family, dict)
-        )
+            address_family for _router, _scope, peer in peer_entries for address_family in peer["address_families"]
+        ) + tuple(address_family for _scope, group in group_entries for address_family in group["address_families"])
         policy_groups = {
             (family, address_family.get(field))
             for address_family in policy_entries
@@ -563,12 +763,6 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def _scope_key(self, scope):
         return (self._router_key(scope.router), scope.vrf_id)
 
-    @staticmethod
-    def _peer_ip_key(peer_ip):
-        if peer_ip.pk is not None:
-            return peer_ip.pk
-        return ("planned-ip", str(peer_ip.address))
-
     def _ensure_rir(self):
         if self.rir is None:
             self.rir = self.RIR(
@@ -584,11 +778,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         return self.rir
 
     def asn(self, value):
-        try:
-            number = int(value)
-        except (TypeError, ValueError):
-            logger.warning("BGP: invalid ASN value %r, skipping router", value)
-            return None
+        number = int(value)
         current = self.asns.get(number)
         if current is not None:
             return current
@@ -597,22 +787,23 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.save(current, force_insert=True, natural_key=("asn",))
         return current
 
-    def peer_ip(self, value):
+    def peer_ip(self, value, vrf):
         from django.core.exceptions import ValidationError
 
         try:
-            target = ipaddress.ip_address(value)
+            target = _parse_ip_address(value)
         except ValueError:
             logger.warning("BGP: invalid peer IP address %r", value)
             return None
-        address = str(target)
-        if address in self.ips:
-            return self.ips[address]
+        address = target.compressed
+        key = (address, vrf.pk if vrf is not None else None)
+        if key in self.ips:
+            return self.ips[key]
         try:
-            current = self.IPAddress.objects.filter(address__net_host=address).first()
+            current = self.IPAddress.objects.filter(address__net_host=address, vrf=vrf).first()
             if current is None:
                 mask = 32 if target.version == 4 else 128
-                current = self.IPAddress(address=f"{address}/{mask}")
+                current = self.IPAddress(address=f"{address}/{mask}", vrf=vrf)
                 current.full_clean()
                 self.save(
                     current,
@@ -622,19 +813,33 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         except ValidationError as exc:
             logger.warning("BGP: peer IP address %r rejected by NetBox: %s", value, exc)
             return None
-        self.ips[address] = current
+        self.ips[key] = current
         return current
 
-    def source(self, value):
+    def source(self, value, vrf, current_peer):
         if not value:
             return None, None
-        import netaddr
-
         try:
-            netaddr.IPAddress(value)
-        except (netaddr.AddrFormatError, ValueError):
+            address = _parse_ip_address(value).compressed
+        except ValueError:
             return None, self.source_interfaces.get(value)
-        return self.peer_ip(value), None
+        candidates = self.device_source_ips.get(address)
+        if candidates:
+            if len(candidates) == 1:
+                return candidates[0], None
+            vrf_id = vrf.pk if vrf is not None else None
+            scoped = next((candidate for candidate in candidates if candidate.vrf_id == vrf_id), None)
+            if scoped is not None:
+                return scoped, None
+            global_source = next((candidate for candidate in candidates if candidate.vrf_id is None), None)
+            if global_source is not None:
+                return global_source, None
+            logger.warning("BGP: device source IP address %r is unresolvable in the scope VRF", value)
+            return None, None
+        if current_peer is not None and current_peer.source is not None:
+            if str(current_peer.source.address.ip) == address:
+                return current_peer.source, None
+        return self.peer_ip(value, vrf), None
 
     def router(self, asn, router_id):
         number = int(asn.asn)
@@ -737,10 +942,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             else {}
         )
         seen = set()
-        for entry in entries or []:
-            value = entry.get("af") or ""
-            if not value:
-                continue
+        for entry in _deduplicated(entries, key=lambda value: value["af"]):
+            value = entry["af"]
             seen.add(value)
             address_family = self.address_family(scope, value)
             current = existing.get(value)
@@ -773,21 +976,22 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: PLR0915
         from . import status_machine as sm
 
-        address = entry.get("peer_address") or ""
-        if not address:
+        address = entry["peer_address"]
+        state_key = (asn_str, vrf_name, address)
+        if state_key in self.seen_peers:
             return
-        peer_ip = self.peer_ip(address)
+        peer_ip = self.peer_ip(address, scope.vrf)
         if peer_ip is None:
             logger.warning("BGP: could not resolve IP for peer %r; skipping", address)
             return
+        peer_key = (self._scope_key(scope), str(peer_ip.address.ip))
+        current_peer = self.peers.get(peer_key)
         remote_as = self.asn(entry.get("remote_as")) if entry.get("remote_as") not in (None, "") else None
         local_as = self.asn(entry.get("local_as")) if entry.get("local_as") not in (None, "") else None
         peer_group = self.template(entry.get("peer_group") or "", remote_as)
-        source, update_source = self.source(entry.get("source"))
+        source, update_source = self.source(entry.get("source"), scope.vrf, current_peer)
         desired = _peer_desired(entry, remote_as, local_as, peer_group, source, update_source)
-        af_entries = entry.get("address_families") or []
-        peer_key = (self._scope_key(scope), self._peer_ip_key(peer_ip))
-        current_peer = self.peers.get(peer_key)
+        af_entries = entry["address_families"]
         created_peer = current_peer is None
         peer = (
             self.BGPPeer(scope=scope, peer=peer_ip, name=None, **desired) if created_peer else copy.copy(current_peer)
@@ -799,8 +1003,10 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 force_insert=True,
                 natural_key=("scope", "peer", "name"),
             )
+        peer_ip_changed = not created_peer and current_peer.peer_id != peer_ip.pk
+        if peer_ip_changed:
+            peer.peer = peer_ip
 
-        state_key = (asn_str, vrf_name, address)
         current_state = self.peer_states.get(state_key)
         state_created = current_state is None
         state = (
@@ -810,6 +1016,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if state_created
             else copy.copy(current_state)
         )
+        state.peer_address_str = _available_peer_state_address(state, state_key, self.peer_state_raw_keys)
         state.bgp_peer = peer
         state.remote_as_str = str(entry.get("remote_as") or "")
         state.enabled = entry.get("enabled")
@@ -856,6 +1063,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                     setattr(peer, field, value)
                 self.save(peer)
             self.plan_address_family_rows(peer, af_entries, scope)
+        elif peer_ip_changed:
+            self.save(peer, update_fields=("peer",))
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         self.peer_states[state_key] = state
         self.seen_peers.add(state_key)
@@ -868,9 +1077,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def reconcile_template(self, scope, entry):
         from . import status_machine as sm
 
-        name = entry.get("name") or ""
-        if not name:
-            return
+        name = entry["name"]
         remote_as = self.asn(entry.get("remote_as")) if entry.get("remote_as") not in (None, "") else None
         template = self.template(name, remote_as)
         current_state = self.template_states.get(name)
@@ -883,7 +1090,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         state.template = template
         state.remote_as_str = str(entry.get("remote_as") or "")
         state.last_sync_at = self.planned_at
-        af_entries = entry.get("address_families") or []
+        af_entries = entry["address_families"]
         device_hash = _content_hash(
             _template_device_content(
                 remote_as,
@@ -927,55 +1134,58 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def build(self):
         if self.management is None:
             return self.operations
-        routers = sorted(self.payload.get("routers") or [], key=lambda row: str(row.get("asn") or ""))
+        for state in self.duplicate_peer_states:
+            self.plan_stale_peer_state(state, force_changed=True)
+        routers = sorted(self.router_entries, key=lambda row: row["asn"])
         reported_templates = {}
         for value in sorted(self.reported_asns, key=lambda item: (len(item), item)):
             self.asn(value)
         for router_entry in routers:
-            asn_str = str(router_entry.get("asn") or "")
-            asn = self.asn(asn_str) if asn_str else None
-            if asn is None:
-                continue
-            router = self.router(asn, router_entry.get("router_id"))
-            for scope_entry in sorted(router_entry.get("scopes") or [], key=lambda row: row.get("vrf") or ""):
-                vrf_name = scope_entry.get("vrf") or ""
+            asn_str = router_entry["asn"]
+            asn = self.asn(asn_str)
+            router = self.router(asn, router_entry["router_id"])
+            for scope_entry in sorted(router_entry["scopes"], key=lambda row: row["vrf"]):
+                vrf_name = scope_entry["vrf"]
                 scope = self.scope(router, vrf_name)
-                for value in sorted(scope_entry.get("address_families") or []):
-                    if value:
-                        self.address_family(scope, value)
-                for entry in sorted(scope_entry.get("peers") or [], key=lambda row: row.get("peer_address") or ""):
+                for value in sorted(scope_entry["address_families"]):
+                    self.address_family(scope, value)
+                for entry in self.peer_entries_by_scope.get(id(scope_entry), ()):
                     self.reconcile_peer(scope, entry, asn_str, vrf_name)
                 for entry in sorted(
-                    scope_entry.get("peer_groups") or [],
-                    key=lambda row: (row.get("name") or "").casefold(),
+                    scope_entry["peer_groups"],
+                    key=lambda row: row["name"].casefold(),
                 ):
-                    name = entry.get("name") or ""
-                    if name:
-                        reported_templates[name] = (scope, entry)
+                    if id(entry) in self.reported_group_entry_ids:
+                        reported_templates[entry["name"]] = (scope, entry)
         for name in sorted(reported_templates, key=str.casefold):
             self.reconcile_template(*reported_templates[name])
         self.plan_stale_states()
         return self.operations
 
     def plan_stale_states(self):
-        from . import status_machine as sm
-
         for key, current in self.peer_states.items():
             if key in self.seen_peers:
                 continue
-            status = sm.on_reconcile(current.status, present=False)
-            if status != current.status:
-                state = copy.copy(current)
-                state.status = status
-                self.save(state, update_fields=("status",))
+            self.plan_stale_peer_state(current)
         for name, current in self.template_states.items():
             if name in self.seen_templates:
                 continue
+            from . import status_machine as sm
+
             status = sm.on_reconcile(current.status, present=False)
             if status != current.status:
                 state = copy.copy(current)
                 state.status = status
                 self.save(state, update_fields=("status",))
+
+    def plan_stale_peer_state(self, current, *, force_changed=False):
+        from . import status_machine as sm
+
+        status = sm.CHANGED if force_changed else sm.on_reconcile(current.status, present=False)
+        if status != current.status:
+            state = copy.copy(current)
+            state.status = status
+            self.save(state, update_fields=("status",))
 
 
 def _bgp_reconcile_operations(device, payload, planned_at):

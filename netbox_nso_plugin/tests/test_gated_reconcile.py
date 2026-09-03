@@ -418,11 +418,13 @@ class TestRealReconcilerGateFootprints(TestCase):
             "routers": [
                 {
                     "asn": "64512",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
                             "address_families": ["ipv4-unicast"],
                             "peers": [peer],
+                            "peer_groups": [],
                         }
                     ],
                 }
@@ -450,10 +452,20 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             "routers": [
                 {
                     "asn": "64512",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
-                            "peers": [{"peer_address": "198.18.0.1", "remote_as": "64513"}],
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [
+                                {
+                                    "peer_address": "198.18.0.1",
+                                    "remote_as": "64513",
+                                    "enabled": True,
+                                    "address_families": [],
+                                }
+                            ],
+                            "peer_groups": [],
                         }
                     ],
                 }

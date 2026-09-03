@@ -290,6 +290,7 @@ class TestBGPMergeBaseMigration(_CascadeFlushMixin, TransactionTestCase):
             "routers": [
                 {
                     "asn": "64512",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
