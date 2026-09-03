@@ -1025,7 +1025,9 @@ def get_device_apply_state(adapter_device_id: int) -> dict:
             )
     if state["device_id"] != adapter_device_id:
         raise AdapterError("Adapter returned Apply state for another device.", code="invalid_response")
-    head = state.get("head")
+    if "head" not in state:
+        raise AdapterError("Adapter returned a malformed Apply state: head is missing.", code="invalid_response")
+    head = state["head"]
     if head is not None and (
         not isinstance(head, dict)
         or type(head.get("generation_id")) is not int

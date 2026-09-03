@@ -263,6 +263,33 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
         self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
 
+    def test_apply_state_without_head_surfaces_error(self):
+        running = _removal_job(49, "logging", "running")
+        blocked = _blocked_job()
+        residue = _residue_job()
+        jobs = [running, blocked, residue]
+        apply_state = {
+            "device_id": 10,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "last_apply_job": None,
+        }
+
+        data = self._get_jobs(jobs, apply_state=apply_state)
+
+        self.assertIsNone(data["apply_state"])
+        self.assertEqual(
+            data["apply_state_error"],
+            "The NSO adapter returned an invalid response. See the server log.",
+        )
+        self.assertEqual(data["jobs"], jobs)
+        self.assertEqual(data["running"], running)
+        self.assertEqual(data["last"], blocked)
+        self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
+        self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
+
     def test_requested_apply_generations_are_wired_on_the_first_poll(self):
         generations = _device_generations()
         # Job fields come from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
