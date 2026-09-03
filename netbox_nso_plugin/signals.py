@@ -1182,6 +1182,8 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
 
 def _recompute_on_interface_save(sender, instance, created, **kwargs):
     """Consume a preplanned derived description only for an exact interface writer."""
+    from .intent_state import IntentMutationProtocolError
+
     if (
         _is_intent_push_suppressed()
         or _is_adapter_origin_write()
@@ -1191,7 +1193,16 @@ def _recompute_on_interface_save(sender, instance, created, **kwargs):
     templates = _templates()
     if not templates:
         return
-    _recompute_one(instance, templates)
+    try:
+        _recompute_one(instance, templates)
+    except IntentMutationProtocolError:
+        update_fields = kwargs.get("update_fields")
+        if not update_fields or "description" in update_fields:
+            raise
+        logger.warning(
+            "derived_intent.unplanned_write field=description interface_id=%s",
+            instance.pk,
+        )
 
 
 def _stash_interface_old_values(sender, instance, **kwargs):

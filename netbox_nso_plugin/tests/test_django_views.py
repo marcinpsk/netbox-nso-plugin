@@ -1963,6 +1963,49 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         self.assertIsNotNone(self.iface_state.accepted_at)
         mock_put.assert_called()
 
+    def test_derived_description_edit_rejects_an_unplanned_rendered_value(self):
+        from dcim.models import Cable, CableTermination
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+
+        self._make_managed()
+        interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/1",
+            type="1000base-t",
+        )
+        state = NSOInterfaceState.objects.create(
+            interface=interface,
+            attribute="description",
+            status="changed",
+            nso_value="device description",
+        )
+        peer = Device.objects.create(
+            name="view-peer-01",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        peer_interface = Interface.objects.create(
+            device=peer,
+            name="GigabitEthernet0/2",
+            type="1000base-t",
+        )
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=interface)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=peer_interface)
+        NSODerivedIntentTemplate.objects.create(
+            sentinel="[auto]",
+            template="[auto] to {peer_host}:{peer_iface}",
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[state.pk])
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+            self.client.post(url, {"value": "[auto]"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        interface.refresh_from_db()
+        self.assertEqual(interface.description, "")
+
     def test_toggle_enabled_flips_and_owns(self):
         """Inline toggle of enabled flips the interface and owns the 'enabled' attribute."""
         self._make_managed()
@@ -5452,7 +5495,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import intent_transaction, offline_mutation
+        from netbox_nso_plugin.intent_state import _intent_transaction, offline_mutation
         from netbox_nso_plugin.models import NSORedistributionState, NSORoutePolicyState
         from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
         from netbox_nso_plugin.signals import suppress_intent_push
@@ -5475,15 +5518,15 @@ class TestOverlayFieldEditView(ViewTestBase):
             status="accepted",
         )
 
-        def acquire_after_competing_edit(footprint):
+        def acquire_after_competing_edit(footprint, **kwargs):
             with offline_mutation():
                 NSORedistributionState.objects.filter(pk=fallback.pk).update(route_map="RM-RACE-OTHER")
-            return intent_transaction(footprint)
+            return _intent_transaction(footprint, **kwargs)
 
         state.object_name = "RM-RACE-NEW"
         with (
             suppress_intent_push(),
-            patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=acquire_after_competing_edit),
+            patch("netbox_nso_plugin.renderer_writer._intent_transaction", side_effect=acquire_after_competing_edit),
         ):
             with self.assertRaises(IntentPlanStaleError):
                 _save_route_map_name_edit(state, route_map.name)
