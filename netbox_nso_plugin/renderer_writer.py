@@ -694,7 +694,7 @@ def _load_frozen_set_rows(model, operation):
     selected_rows = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
     if (
         tuple(row.pk for row in selected_rows) != operation.selected_pks
-        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_preimages
+        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_before_values
     ):
         raise IntentPlanStaleError(f"{operation.model_label} selected rows changed after planning")
     return selected_rows
@@ -709,13 +709,7 @@ def _plan_set_update(proposed: RendererSetUpdate):
     selected_rows = _load_frozen_set_rows(model, proposed)
     footprints = []
     changed_keys = set()
-    selected = tuple(model._default_manager.filter(pk__in=proposed.selected_pks).order_by("pk"))
-    if tuple(row.pk for row in selected) != proposed.selected_pks:
-        raise IntentPlanStaleError("the frozen set-based update lost a selected row during planning")
-    expected_before = dict(proposed.selected_before_values)
-    for before in selected:
-        if _field_values(before, None) != expected_before[before.pk]:
-            raise IntentPlanStaleError(f"{proposed.model_label} row {before.pk!r} changed during planning")
+    for before in selected_rows:
         after = copy.copy(before)
         for attname, value in values.items():
             setattr(after, attname, value)
@@ -1259,13 +1253,7 @@ class RendererWriter:
             or operation.values != normalized
         ):
             raise IntentMutationProtocolError("set-based update is outside the frozen write set")
-        selected = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
-        if tuple(row.pk for row in selected) != operation.selected_pks:
-            raise IntentPlanStaleError("the frozen set-based update lost a selected row")
-        expected_before = dict(operation.selected_before_values)
-        for row in selected:
-            if _field_values(row, None) != expected_before[row.pk]:
-                raise IntentPlanStaleError(f"{operation.model_label} row {row.pk!r} changed after planning")
+        _load_frozen_set_rows(model, operation)
         updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")
