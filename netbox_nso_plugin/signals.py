@@ -748,35 +748,38 @@ def _sync_source_change(instance, client) -> bool:
         result = {"source_epoch": current.adapter_source_epoch}
     if result.get("source_epoch") is None:
         raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
-    current = management_model.objects.get(pk=instance.pk)
-    if (current.nso_instance_id, current.nso_device_name) != expected_source:
-        return False
-    source_epoch = result["source_epoch"]
-    source_aware = True
-    current.adapter_source_epoch = source_epoch
-    current.source_epoch_aware = source_aware
-    current.source_rekey_pending = False
-    current.reset_pending_source_epoch = source_epoch if invalidated else None
-    from .intent_state import IntentMutationProtocolError
+    from .intent_state import IntentMutationProtocolError, footprint_for_instance, mirror_transaction
     from .management_lifecycle import save_management
 
-    try:
-        save_management(
-            current,
-            update_fields=[
-                "adapter_source_epoch",
-                "source_epoch_aware",
-                "source_rekey_pending",
-                "reset_pending_source_epoch",
-            ],
-        )
-    except IntentMutationProtocolError:
-        latest = (
-            management_model.objects.filter(pk=instance.pk).values_list("nso_instance_id", "nso_device_name").first()
-        )
-        if latest != expected_source:
+    with mirror_transaction(footprint_for_instance(instance)):
+        current = management_model.objects.get(pk=instance.pk)
+        if (current.nso_instance_id, current.nso_device_name) != expected_source:
             return False
-        raise
+        source_epoch = result["source_epoch"]
+        source_aware = True
+        current.adapter_source_epoch = source_epoch
+        current.source_epoch_aware = source_aware
+        current.source_rekey_pending = False
+        current.reset_pending_source_epoch = source_epoch if invalidated else None
+        try:
+            save_management(
+                current,
+                update_fields=[
+                    "adapter_source_epoch",
+                    "source_epoch_aware",
+                    "source_rekey_pending",
+                    "reset_pending_source_epoch",
+                ],
+            )
+        except IntentMutationProtocolError:
+            latest = (
+                management_model.objects.filter(pk=instance.pk)
+                .values_list("nso_instance_id", "nso_device_name")
+                .first()
+            )
+            if latest != expected_source:
+                return False
+            raise
     instance.adapter_source_epoch = source_epoch
     instance.source_epoch_aware = source_aware
     instance.source_rekey_pending = False
@@ -941,7 +944,17 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from django.db import connection
 
         if not connection.needs_rollback:
-            _update_management_mirror(instance, adapter_link_error=message)
+            from .intent_state import RendererTargetsChanged
+            from .renderer_writer import IntentPlanStaleError
+
+            try:
+                _update_management_mirror(instance, adapter_link_error=message)
+            except (IntentPlanStaleError, RendererTargetsChanged) as mirror_exc:
+                logger.warning(
+                    "Skipped adapter error mirror update for management row %s because its renderer plan changed: %s",
+                    instance.pk,
+                    mirror_exc,
+                )
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")

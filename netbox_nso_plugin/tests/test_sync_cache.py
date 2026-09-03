@@ -28,6 +28,7 @@ from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._adapter_http import make_session
+from ._outbox_case import in_thread
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_django_views import ViewTestBase
 
@@ -343,6 +344,100 @@ class TestRefreshSyncCaches(_SyncCacheTestBase):
         self.assertEqual((checked, updated), (5, 5))
 
 
+class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.instance = NSOInstance.objects.create(
+            name="cache-race",
+            adapter_instance_id="cache-race",
+        )
+
+    def _mgmt(self, name, adapter_device_id):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        from .test_onboarding import _device
+
+        row = NSODeviceManagement(
+            device=_device(name),
+            nso_instance=self.instance,
+            nso_device_name=name,
+            adapter_device_id=adapter_device_id,
+        )
+        with intent_transaction(footprint_for_instance(row)):
+            NSODeviceManagement.objects.bulk_create([row])
+        return NSODeviceManagement.objects.get(pk=row.pk)
+
+    def test_stale_error_mirror_does_not_abort_the_cache_sweep(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import refresh_sync_caches
+
+        first = self._mgmt("cache-race-first", 196)
+        second = self._mgmt("cache-race-second", 197)
+        original_build = RendererMutationPlan.build
+        plan_staled = False
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal plan_staled
+            plan = original_build(*args, **kwargs)
+            if not plan_staled:
+                plan_staled = True
+                in_thread(lambda: NSODeviceManagement.objects.filter(pk=first.pk).update(last_sync_status="concurrent"))
+            return plan
+
+        errors = []
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
+            self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as captured,
+        ):
+            try:
+                result = refresh_sync_caches(NSODeviceManagement.objects.all())
+            except Exception as exc:  # noqa: BLE001 (the assertion reports the aborted sweep)
+                errors.append(exc)
+                result = None
+
+        self.assertEqual(errors, [], f"the cache sweep raised {errors!r}")
+        self.assertEqual(result, (2, 0))
+        self.assertTrue(any(f"management row {first.pk}" in message for message in captured.output))
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.last_sync_status, "concurrent")
+        self.assertEqual(first.adapter_link_error, "")
+        self.assertTrue(second.adapter_link_error)
+
+    def test_stale_error_mirror_is_not_reported_as_updated(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import refresh_sync_cache, refresh_sync_caches
+
+        mgmt = self._mgmt("cache-race-skipped", 198)
+        adapter_device = _adapter_row(mgmt)
+        original_build = RendererMutationPlan.build
+        concurrent_updates = 0
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal concurrent_updates
+            plan = original_build(*args, **kwargs)
+            concurrent_updates += 1
+            in_thread(
+                lambda: NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+                    last_sync_status=f"concurrent-{concurrent_updates}"
+                )
+            )
+            return plan
+
+        identity = (mgmt.nso_instance.adapter_instance_id, mgmt.nso_device_name)
+        snapshot = ([mgmt], {mgmt.adapter_device_id: adapter_device}, {identity: [adapter_device]})
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_stale):
+            changed = refresh_sync_cache(mgmt, adapter_device)
+            mgmt.refresh_from_db()
+            sweep_result = refresh_sync_caches([mgmt], snapshot=snapshot)
+
+        self.assertEqual(changed, [])
+        self.assertEqual(sweep_result, (1, 0))
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.last_sync_status, "concurrent-2")
+
+
 class TestReconcileDeviceLinks(_SyncCacheTestBase):
     """Repair rows whose adapter_device_id no longer resolves to their own adapter device.
 
@@ -407,8 +502,8 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         second.refresh_from_db()
         self.assertIsNone(first.adapter_link_attempted_at)
         self.assertIsNotNone(second.adapter_link_attempted_at)
-        self.assertEqual((first.adapter_device_id, second.adapter_device_id), (196, 700))
-        self.assertEqual(onboard.call_count, 1)
+        self.assertEqual((first.adapter_device_id, second.adapter_device_id), (700, 700))
+        self.assertEqual(onboard.call_count, 2)
 
     def test_relink_pushes_scope_against_the_fresh_id(self):
         """The dead id is tried, then the whole link is redone against the new device row.

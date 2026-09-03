@@ -44,19 +44,30 @@ class _LinkReconcileNoOp(Exception):
     """Roll back a repair whose authoritative source identity changed."""
 
 
-def _mirror_management(mgmt, **values) -> None:
+def _mirror_management(mgmt, **values) -> bool:
     """Persist lifecycle-only adapter observations through the exact writer."""
+    from .intent_state import RendererTargetsChanged
     from .management_lifecycle import save_management
+    from .renderer_writer import IntentPlanStaleError
 
     fields = frozenset(values)
     current = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
     if current is None:
-        return
+        return False
     for field_name, value in values.items():
         setattr(current, field_name, value)
-    save_management(current, update_fields=fields)
+    try:
+        save_management(current, update_fields=fields)
+    except (IntentPlanStaleError, RendererTargetsChanged) as exc:
+        logger.warning(
+            "Skipped mirror update for management row %s because its renderer plan changed: %s",
+            mgmt.pk,
+            exc,
+        )
+        return False
     for field_name, value in values.items():
         setattr(mgmt, field_name, value)
+    return True
 
 
 def parse_adapter_timestamp(value, field="timestamp"):
@@ -117,7 +128,9 @@ def refresh_sync_cache(mgmt, adapter_device):
     # the failure would retire a banner whose scope never landed. It is cleared by the successful
     # push (signals.sync_scope_to_adapter) or the banner's own "Retry adapter link" action.
     if update_fields:
-        _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
+        persisted = _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
+        if not persisted:
+            return []
     return update_fields
 
 

@@ -19,7 +19,7 @@ from django.db import connections
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
-from ._outbox_case import content_bulk_update, mirror_update
+from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
@@ -726,6 +726,157 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         _, kw = mock_scope.call_args
         self.assertEqual(kw["primary_ip"], "10.0.0.1")  # /32 stripped → host only
         self.assertEqual(kw["oob_ip"], "192.0.2.5")  # /24 stripped → host only
+
+
+class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        manufacturer = Manufacturer.objects.create(name="Signal race", slug="signal-race")
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model="Signal race",
+            slug="signal-race",
+        )
+        role = DeviceRole.objects.create(name="Signal race", slug="signal-race")
+        site = Site.objects.create(name="Signal race", slug="signal-race")
+        self.device = Device.objects.create(
+            name="signal-race-device",
+            device_type=device_type,
+            role=role,
+            site=site,
+        )
+        self.nso_instance = NSOInstance.objects.create(
+            name="signal-race-instance",
+            adapter_instance_id="signal-race-instance",
+        )
+        row = NSODeviceManagement(
+            device=self.device,
+            nso_instance=self.nso_instance,
+            nso_device_name="signal-race-device",
+            adapter_device_id=7,
+        )
+        _bulk_create_management_without_signals([row])
+        self.mgmt = NSODeviceManagement.objects.get(pk=row.pk)
+
+    def test_adapter_failure_survives_a_stale_error_mirror_plan(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        original_build = RendererMutationPlan.build
+        plan_staled = False
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal plan_staled
+            plan = original_build(*args, **kwargs)
+            if not plan_staled:
+                plan_staled = True
+                in_thread(
+                    lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent")
+                )
+            return plan
+
+        errors = []
+        with (
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
+            patch(
+                f"{_MOD}.set_scope",
+                side_effect=AdapterError("adapter unavailable", code="nso_unreachable"),
+            ),
+            self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
+        ):
+            try:
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+            except Exception as exc:  # noqa: BLE001 (the assertion reports the escaped callback error)
+                errors.append(exc)
+
+        self.assertEqual(errors, [], f"the adapter callback raised {errors!r}")
+        self.assertTrue(any("adapter unavailable" in message for message in captured.output))
+        self.assertTrue(any("Skipped adapter error mirror update" in message for message in captured.output))
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.last_sync_status, "concurrent")
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_new_source_rekey_waits_for_adapter_finalization(self):
+        import select
+        import threading
+
+        from django.db import connection, transaction
+        from psycopg import pq
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.signals import _sync_source_change
+
+        mirror_update(self.mgmt, source_rekey_pending=True)
+        original_build = RendererMutationPlan.build
+        committed = threading.Event()
+        rekey_started = threading.Event()
+        worker_pid = []
+        worker_errors = []
+        workers = []
+
+        def commit_new_source():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    worker_pid.append(cursor.fetchone()[0])
+                with transaction.atomic():
+                    pg_connection = connection.connection.pgconn
+                    table = connection.ops.quote_name(NSODeviceManagement._meta.db_table)
+                    query = (
+                        f"UPDATE {table} SET nso_device_name = $1, source_rekey_pending = TRUE WHERE id = $2"
+                    ).encode()
+                    pg_connection.send_query_params(
+                        query,
+                        [b"newer-source", str(self.mgmt.pk).encode()],
+                    )
+                    while pg_connection.flush() == 1:
+                        select.select([], [pg_connection.socket], [])
+                    rekey_started.set()
+                    while pg_connection.is_busy():
+                        select.select([pg_connection.socket], [], [])
+                        pg_connection.consume_input()
+                    result = pg_connection.get_result()
+                    if result is None or result.status != pq.ExecStatus.COMMAND_OK:
+                        raise AssertionError("the competing source rekey UPDATE failed")
+                    if pg_connection.get_result() is not None:
+                        raise AssertionError("the competing source rekey returned an extra result")
+                committed.set()
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                worker_errors.append(exc)
+            finally:
+                connection.close()
+
+        def build_after_rekey_starts(*args, **kwargs):
+            if not workers:
+                worker = threading.Thread(target=commit_new_source)
+                workers.append(worker)
+                worker.start()
+                self.assertTrue(rekey_started.wait(10), "the competing source rekey did not start")
+                wait_until_postgres_blocks(worker_pid[0], "the competing source rekey", timeout=3)
+            return original_build(*args, **kwargs)
+
+        client = SimpleNamespace(patch_device=lambda **kwargs: {"source_epoch": 2})
+        with patch.object(RendererMutationPlan, "build", side_effect=build_after_rekey_starts):
+            finalized = _sync_source_change(self.mgmt, client)
+
+        for worker in workers:
+            worker.join(10)
+            self.assertFalse(worker.is_alive(), "the competing source rekey did not finish")
+        if worker_errors:
+            raise worker_errors[0]
+
+        self.assertTrue(finalized)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.nso_device_name, "newer-source")
+        self.assertTrue(self.mgmt.source_rekey_pending, "adapter finalization cleared the newer source fence")
+        self.assertTrue(committed.is_set())
 
 
 class TestOffboardDeviceFromAdapter(unittest.TestCase):
