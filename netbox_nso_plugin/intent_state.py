@@ -2417,12 +2417,54 @@ def _validate_explicit_write(sender, instance, update_fields=None, **kwargs):
         require_planned_signal_write(instance, update_fields=update_fields)
 
 
-def _validate_explicit_delete(sender, instance, **kwargs):
-    """Validate a registered delete only while an explicit writer is active."""
+def _delete_origin_label(origin) -> str | None:
+    """Return the model label for one instance or queryset deletion origin."""
+    origin_model = getattr(origin, "model", type(origin))
+    return getattr(getattr(origin_model, "_meta", None), "label_lower", None)
+
+
+def _deletion_roots(origin):
+    """Return the complete registered root set for one Collector deletion."""
+    origin_label = _delete_origin_label(origin)
+    if origin_label not in {"dcim.device", "netbox_nso_plugin.nsodevicemanagement"}:
+        raise IntentMutationProtocolError(f"unsupported management deletion origin {origin_label!r}")
+    if hasattr(origin, "model"):
+        return tuple(origin.order_by("pk"))
+    return (origin,)
+
+
+def _lock_management_delete(instance, origin) -> None:
+    """Hold one complete deletion footprint before management teardown evidence changes."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsodevicemanagement":
+        return
+    roots = _deletion_roots(origin)
+    footprint = MutationFootprint.merge(*(deletion_footprint_for_instance(root) for root in roots))
+    active = _ACTIVE_PERMIT.get()
+    if active is None:
+        connection = transaction.get_connection()
+        atomic_block = connection.atomic_blocks[-1]
+        if getattr(origin, "_nso_renderer_delete_lock", None) is not atomic_block:
+            from .apply_state import lock_order_scope
+
+            with lock_order_scope():
+                _acquire(footprint, bump=False)
+            setattr(origin, "_nso_renderer_delete_lock", atomic_block)
+    elif not active.footprint.covers(footprint):
+        raise IntentMutationProtocolError("the active mutation footprint does not cover the management deletion")
+
+    from .ownership_planner import detach_device_manifests, retire_device_manifests
+
+    transition = retire_device_manifests if _delete_origin_label(origin) == "dcim.device" else detach_device_manifests
+    transition(instance.device_id)
+
+
+def _validate_explicit_delete(sender, instance, origin=None, **kwargs):
+    """Validate explicit deletes and lock management teardown evidence."""
     from .renderer_writer import active_renderer_writer, require_planned_signal_write
 
     if active_renderer_writer() is not None:
         require_planned_signal_write(instance, deleting=True)
+    _lock_management_delete(instance, origin)
     permit = _ACTIVE_PERMIT.get()
     # The repend runs after the block's writes: this is what tells it which of the rows it
     # captured as deploying were consumed by a delete rather than lost.

@@ -78,6 +78,19 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.device, self.management = make_managed("intent-permit", 1623)
         self.state = own_vlan(self.management, 1623, "intent-permit")
 
+    def test_management_delete_guard_rejects_an_unknown_origin(self):
+        from netbox_nso_plugin.intent_state import _validate_explicit_delete
+
+        with transaction.atomic(), self.assertRaisesRegex(IntentMutationProtocolError, "deletion origin"):
+            _validate_explicit_delete(type(self.management), self.management, origin=object())
+
+    def test_management_delete_guard_rejects_an_uncovered_active_permit(self):
+        with self.assertRaisesRegex(IntentMutationProtocolError, "does not cover the management deletion"):
+            with mirror_transaction(MutationFootprint()):
+                type(self.management).objects.filter(pk=self.management.pk).delete()
+
+        self.assertTrue(type(self.management).objects.filter(pk=self.management.pk).exists())
+
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():
             locked = NSOVLANState.objects.select_for_update(of=("self",)).get(pk=self.state.pk)
