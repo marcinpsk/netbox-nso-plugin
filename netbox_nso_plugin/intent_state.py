@@ -2621,35 +2621,48 @@ def _begin_implicit(
     _IMPLICIT_PERMITS.set(permits)
 
 
+def _transition_management_manifests(instance, origin) -> None:
+    """Transition management manifests after the renderer acquires its locks."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsodevicemanagement":
+        return
+    origin_model = getattr(origin, "model", type(origin))
+    origin_label = getattr(getattr(origin_model, "_meta", None), "label_lower", None)
+    from .ownership_planner import detach_device_manifests, retire_device_manifests
+
+    transition = retire_device_manifests if origin_label == "dcim.device" else detach_device_manifests
+    transition(instance.device_id)
+
+
 def _begin_delete_implicit(sender, instance, origin=None, **kwargs):
     """Keep a cascade permit alive until the registered root's post-delete."""
     from .renderer_writer import active_renderer_writer
 
     if active_renderer_writer() is not None:
         _begin_implicit(sender, instance, deleting=True, origin=origin, **kwargs)
-        return
-    origin_label = getattr(getattr(origin, "_meta", None), "label_lower", None)
-    if origin_label in _REGISTRY:
-        target = origin
-        footprint = deletion_footprint_for_instance(target) if _ACTIVE_PERMIT.get() is None else None
     else:
-        origin_model = getattr(origin, "model", None)
-        origin_label = getattr(getattr(origin_model, "_meta", None), "label_lower", None)
-        roots = list(origin.order_by("pk")) if origin_label in _REGISTRY and _ACTIVE_PERMIT.get() is None else []
-        target = roots[0] if roots else instance
-        footprint = (
-            MutationFootprint.merge(*(deletion_footprint_for_instance(root) for root in roots)) if roots else None
+        origin_label = getattr(getattr(origin, "_meta", None), "label_lower", None)
+        if origin_label in _REGISTRY:
+            target = origin
+            footprint = deletion_footprint_for_instance(target) if _ACTIVE_PERMIT.get() is None else None
+        else:
+            origin_model = getattr(origin, "model", None)
+            origin_label = getattr(getattr(origin_model, "_meta", None), "label_lower", None)
+            roots = list(origin.order_by("pk")) if origin_label in _REGISTRY and _ACTIVE_PERMIT.get() is None else []
+            target = roots[0] if roots else instance
+            footprint = (
+                MutationFootprint.merge(*(deletion_footprint_for_instance(root) for root in roots)) if roots else None
+            )
+        if footprint is None and _ACTIVE_PERMIT.get() is None:
+            footprint = deletion_footprint_for_instance(target)
+        _begin_implicit(
+            type(target),
+            target,
+            deleting=True,
+            origin=origin,
+            footprint_override=footprint,
+            **kwargs,
         )
-    if footprint is None and _ACTIVE_PERMIT.get() is None:
-        footprint = deletion_footprint_for_instance(target)
-    _begin_implicit(
-        type(target),
-        target,
-        deleting=True,
-        origin=origin,
-        footprint_override=footprint,
-        **kwargs,
-    )
+    _transition_management_manifests(instance, origin)
 
 
 def _end_implicit(sender, instance, **kwargs):

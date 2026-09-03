@@ -281,9 +281,7 @@ def _device_is_managed(device_id) -> bool:
 @receiver(pre_delete, sender="dcim.Device")
 def _mark_device_teardown(sender, instance, **kwargs):
     from . import outbox
-    from .ownership_planner import retire_device_manifests
 
-    retire_device_manifests(instance.pk)
     outbox.mark_device_teardown(instance.pk, outbox.current_txid())
 
 
