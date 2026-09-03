@@ -32,6 +32,7 @@ from ._adapter_http import make_response, make_session
 from ._outbox_case import (
     ReceiptAdapter,
     content_bulk_update,
+    in_thread,
     make_managed,
     mirror_update,
     without_commit_drain,
@@ -6612,6 +6613,111 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         self.assertNotIn("adapter is down", body)
         self.assertNotIn("No remote syslog servers configured", body)
         self.assertIn("192.0.2.99", body)  # persisted rows still render
+
+
+class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        manufacturer = Manufacturer.objects.create(name="LACP race", slug="lacp-race")
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model="LACP race",
+            slug="lacp-race",
+        )
+        role = DeviceRole.objects.create(name="LACP race", slug="lacp-race")
+        site = Site.objects.create(name="LACP race", slug="lacp-race")
+        self.device = Device.objects.create(
+            name="lacp-race-device",
+            device_type=device_type,
+            role=role,
+            site=site,
+        )
+        nso_instance = NSOInstance.objects.create(
+            name="lacp-race-instance",
+            adapter_instance_id="lacp-race-instance",
+        )
+        self.mgmt = NSODeviceManagement(
+            device=self.device,
+            nso_instance=nso_instance,
+            nso_device_name="lacp-race-device",
+        )
+        with intent_transaction(footprint_for_instance(self.mgmt)):
+            NSODeviceManagement.objects.bulk_create([self.mgmt])
+        self.user = User.objects.create_superuser(
+            username="lacp-race-admin",
+            password=TEST_PASSWORD,
+            email="lacp-race-admin@test.example",
+        )
+        self.client.force_login(self.user)
+
+        self.lag = Interface.objects.create(device=self.device, name="Port-channel20", type="lag")
+        member = Interface.objects.create(device=self.device, name="GigabitEthernet0/20", type="1000base-t")
+        with transaction.atomic():
+            self.bundle = NSOLACPBundleState.objects.create(
+                management=self.mgmt,
+                interface=self.lag,
+                lag_id=20,
+                status="imported",
+            )
+            self.member = NSOLACPMemberState.objects.create(
+                management=self.mgmt,
+                interface=member,
+                lag_bundle=self.lag,
+                mode="active",
+                port_priority=100,
+                status="imported",
+            )
+
+    def _post_with_member_changes(self, priorities):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOLACPMemberState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        original_build = RendererMutationPlan.build
+        pending_priorities = iter(priorities)
+
+        def change_priority(priority):
+            current = NSOLACPMemberState.objects.get(pk=self.member.pk)
+            with intent_transaction(footprint_for_instance(current)):
+                NSOLACPMemberState.objects.filter(pk=current.pk).update(port_priority=priority)
+
+        def build_then_change(*args, **kwargs):
+            plan = original_build(*args, **kwargs)
+            priority = next(pending_priorities, None)
+            if priority is not None:
+                in_thread(lambda: change_priority(priority))
+            return plan
+
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": self.bundle.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_change):
+            return self.client.post(url)
+
+    def test_accept_rebuilds_the_plan_after_one_concurrent_member_change(self):
+        response = self._post_with_member_changes([101])
+
+        self.assertEqual(response.status_code, 302)
+        self.bundle.refresh_from_db()
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.port_priority, 101)
+        self.assertEqual((self.bundle.status, self.member.status), ("in_sync", "in_sync"))
+
+    def test_accept_reports_a_refresh_conflict_after_two_member_changes(self):
+        from django.contrib.messages import get_messages
+
+        response = self._post_with_member_changes([101, 102])
+
+        self.assertEqual(response.status_code, 302)
+        message_text = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertTrue(any("Refresh the page and try again." in message for message in message_text))
+        self.assertFalse(any(message.startswith("Accepted LACP bundle") for message in message_text))
+        self.bundle.refresh_from_db()
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.port_priority, 102)
+        self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
 
 
 class TestRoutePolicyGrid(ViewTestBase):
