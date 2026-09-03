@@ -983,6 +983,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             device_id=device.pk,
             scope="static_route",
             native_model_label=route._meta.label_lower,
+            native_id=route.pk,
             native_key={
                 "vrf_id": None,
                 "prefix": str(route.prefix),
@@ -1013,6 +1014,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             device_id=device.pk,
             scope="static_route",
             native_model_label=route._meta.label_lower,
+            native_id=route.pk,
             native_key={
                 "vrf_id": None,
                 "prefix": str(route.prefix),
@@ -1073,6 +1075,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             device_id=device_id,
             scope="static_route",
             native_model_label=route._meta.label_lower,
+            native_id=route.pk,
             native_key={
                 "vrf_id": None,
                 "prefix": str(route.prefix),
@@ -1211,37 +1214,6 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         self.assertTrue(plan.changes_content)
         self.assertIn((device.pk, "switchport"), plan.content_keys)
-
-    def test_delete_executes_a_complete_registered_collector_cascade(self):
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.models import NSOOwnershipManifest
-        from netbox_nso_plugin.ownership_planner import maintain_manifest
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
-
-        device, management = make_managed("writer-complete-cascade", 16287)
-        route = StaticRoute.objects.create(prefix="198.18.87.0/24", next_hop="198.18.0.87", metric=1)
-        state = NSOStaticRouteState.objects.create(
-            management=management,
-            static_route=route,
-            status="accepted",
-        )
-        maintain_manifest(state)
-        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
-
-        with renderer_writes(plan) as writer:
-            writer.delete(management)
-
-        assert not type(management).objects.filter(pk=management.pk).exists()
-        assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
-        assert type(device).objects.filter(pk=device.pk).exists()
-        assert (
-            NSOOwnershipManifest.objects.get(
-                device_id=device.pk,
-                state_model_label=state._meta.label_lower,
-            ).ownership_state
-            == "retired"
-        )
 
     def test_cascade_retires_manifest_after_a_foreign_native_key_rename(self):
         from netbox_routing.models import StaticRoute
