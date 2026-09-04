@@ -252,7 +252,8 @@ class TestLinkReconcileCannotRestoreSourceState(_SyncCacheTestBase):
     """A link sweep that read before a rekey cannot restore the stale source."""
 
     def test_a_stale_snapshot_cannot_overwrite_a_rekey(self):
-        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.intent_state import footprint_for_instance
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision
         from netbox_nso_plugin.sync_cache import reconcile_device_links
 
         mgmt = self._mgmt("cache-stale-source", 196)
@@ -262,6 +263,10 @@ class TestLinkReconcileCannotRestoreSourceState(_SyncCacheTestBase):
             nso_device_name="cache-rekeyed",
             source_rekey_pending=True,
         )
+        revision_keys = footprint_for_instance(mgmt).revision_keys
+        revisions_before = {
+            key: NSOIntentRevision.objects.get(device_id=key[0], scope=key[1]).revision for key in revision_keys
+        }
 
         with (
             patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
@@ -279,3 +284,7 @@ class TestLinkReconcileCannotRestoreSourceState(_SyncCacheTestBase):
         self.assertEqual(mgmt.nso_device_name, "cache-rekeyed")
         self.assertTrue(mgmt.source_rekey_pending)
         self.assertEqual(mgmt.adapter_device_id, 196)
+        revisions_after = {
+            key: NSOIntentRevision.objects.get(device_id=key[0], scope=key[1]).revision for key in revision_keys
+        }
+        self.assertEqual(revisions_after, revisions_before)

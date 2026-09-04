@@ -38,6 +38,10 @@ _MISSING = "missing"  # our device is not in the adapter at all — re-link it
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
 
 
+class _LinkReconcileNoOp(Exception):
+    """Roll back a repair whose authoritative source identity changed."""
+
+
 def _mirror_management(mgmt, **values) -> None:
     """Persist lifecycle-only adapter observations with one locked instance save."""
     from .intent_state import update_mirror_fields
@@ -267,7 +271,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                     current.source_rekey_pending
                     or (current.nso_instance_id, current.nso_device_name) != expected_source
                 ):
-                    continue
+                    raise _LinkReconcileNoOp
                 # Stamp for being TRIED, not for succeeding, and before the try: whether the
                 # re-onboard worked is not observable here (it happens in an on_commit callback
                 # that logs and returns), so a stamp conditional on success would never move a
@@ -290,6 +294,8 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                     )
                     _mirror_management(current, adapter_device_id=None)
                 current.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+        except _LinkReconcileNoOp:
+            continue
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue
