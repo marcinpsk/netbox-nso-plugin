@@ -137,7 +137,8 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
             desired_micro = bool(entry.get("micro_bfd", False))
             desired_enabled = bool(entry.get("enabled", True))
             if (
-                current_native.bfd_profile_id != (profile.pk if profile is not None else None)
+                (profile is not None and profile.pk is None)
+                or current_native.bfd_profile_id != (profile.pk if profile is not None else None)
                 or current_native.micro_bfd != desired_micro
                 or current_native.enabled != desired_enabled
             ):
