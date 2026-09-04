@@ -20,6 +20,7 @@ from ._outbox_case import (
     make_managed,
     mirror_update,
     own_vlan,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -1406,6 +1407,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         attach_holds_vlan = threading.Event()
         release_attach = threading.Event()
         rename_acquired_vlan = threading.Event()
+        renamer_ready = threading.Event()
+        renamer_pid: list[int] = []
         errors = []
         original_shared_lock = apply_state.lock_shared_dependencies
         attacher = None
@@ -1443,6 +1446,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 with without_commit_drain(), transaction.atomic():
                     current = VLAN.objects.get(pk=vlan.pk)
                     current.name = "rename-after-attach-started"
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute("SELECT pg_backend_pid()")
+                        renamer_pid.append(cursor.fetchone()[0])
+                    renamer_ready.set()
                     current.save(update_fields=["name"])
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
@@ -1458,7 +1465,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             self.assertTrue(attach_holds_vlan.wait(10), "the attachment did not acquire the shared VLAN lock")
             renamer.start()
             try:
-                self.assertFalse(rename_acquired_vlan.wait(0.2), "the rename bypassed the attachment's VLAN lock")
+                self.assertTrue(renamer_ready.wait(10), "the rename did not reach its database write")
+                wait_until_postgres_blocks(renamer_pid[0], "the rename")
+                self.assertFalse(rename_acquired_vlan.is_set(), "the rename bypassed the attachment's VLAN lock")
             finally:
                 release_attach.set()
                 attacher.join(10)
