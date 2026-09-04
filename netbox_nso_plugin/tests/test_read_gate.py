@@ -215,9 +215,14 @@ class TestGateTransitions(TestCase):
         )
         before = revision.revision
 
-        self._run(_rs(attempt_id=71))
+        self._run(
+            _rs(attempt_id=71),
+            body=lambda: mirror_update(self.mgmt, last_sync_status="success"),
+        )
 
+        self.mgmt.refresh_from_db()
         revision.refresh_from_db()
+        self.assertEqual(self.mgmt.last_sync_status, "success")
         self.assertEqual(revision.revision, before)
 
     def test_absent_authoritative_cleared_admits(self):
