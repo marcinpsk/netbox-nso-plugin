@@ -149,17 +149,19 @@ def reconcile_lag_config(device, payload: dict) -> list:
     """
     from .renderer_writer import (
         active_renderer_writer,
-        renderer_mirror_writes,
-        renderer_writes,
+        renderer_writes_replanning_once,
     )
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    plan = active.plan if active is not None else lacp_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    if active is not None:
+        with contextlib.nullcontext(active) as writer, suppress_intent_push():
+            return _reconcile_lag_config(device, payload, writer, active.plan.planned_at)
+
+    def plan_fn():
+        return lacp_reconcile_plan(device, payload)
+
+    with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
         return _reconcile_lag_config(device, payload, writer, plan.planned_at)
 
 

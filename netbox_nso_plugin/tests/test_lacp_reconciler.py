@@ -273,6 +273,151 @@ class TestReconcileLagConfig(TestCase):
         state = NSOLACPBundleState.objects.get(interface=self.lag)
         assert state.status == "changed"
 
+    def test_stale_imported_bundle_replans_after_status_flip(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import lacp_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.m1.lag = self.lag
+        self.m1.save(update_fields=["lag"])
+        real_plan = lacp_reconciler.lacp_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, payload):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, payload)
+            if plan_calls == 1:
+                fresh = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+                content_update(fresh, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+            return plan
+
+        with patch.object(lacp_reconciler, "lacp_reconcile_plan", side_effect=plan_then_flip):
+            reconcile_lag_config(self.device, _payload([]))
+
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
+
+    def test_stale_accepted_bundle_replans_after_status_flip(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import lacp_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.m1.lag = self.lag
+        self.m1.save(update_fields=["lag"])
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        content_update(state, status="accepted")
+        real_plan = lacp_reconciler.lacp_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, payload):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, payload)
+            if plan_calls == 1:
+                fresh = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+                content_update(fresh, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+            return plan
+
+        with patch.object(lacp_reconciler, "lacp_reconcile_plan", side_effect=plan_then_flip):
+            reconcile_lag_config(self.device, _payload([]))
+
+        state.refresh_from_db()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
+
+    def test_bundle_preimage_change_reacquires_fresh_plan(self):
+        from datetime import UTC, datetime
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import lacp_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        control_device = Device.objects.create(
+            name="lag-rtr-control",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        control_management = NSODeviceManagement.objects.create(
+            device=control_device,
+            nso_instance=self.inst,
+            nso_device_name="lag-rtr-control",
+        )
+        control_lag = Interface.objects.create(device=control_device, name=self.lag.name, type="lag")
+        control_member = Interface.objects.create(device=control_device, name=self.m1.name, type="1000base-t")
+        payload = _payload([self._bundle(min_links=2)])
+        planned_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+        with patch("django.utils.timezone.now", return_value=planned_at):
+            reconcile_lag_config(self.device, payload)
+            reconcile_lag_config(control_device, payload)
+            self.m1.lag = self.lag
+            self.m1.save(update_fields=["lag"])
+            control_member.lag = control_lag
+            control_member.save(update_fields=["lag"])
+
+            control_state = NSOLACPBundleState.objects.get(
+                management=control_management,
+                interface=control_lag,
+            )
+            content_update(control_state, min_links=5, status="accepted")
+            reconcile_lag_config(control_device, payload)
+            control_state.refresh_from_db()
+
+            real_plan = lacp_reconciler.lacp_reconcile_plan
+            plan_calls = 0
+            revision_after_edit = None
+
+            def plan_then_edit(device, candidate_payload):
+                nonlocal plan_calls, revision_after_edit
+                plan_calls += 1
+                plan = real_plan(device, candidate_payload)
+                if plan_calls == 1:
+                    fresh = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+                    content_update(fresh, min_links=5, status="accepted")
+                    revision_after_edit = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+                return plan
+
+            with patch.object(lacp_reconciler, "lacp_reconcile_plan", side_effect=plan_then_edit):
+                reconcile_lag_config(self.device, payload)
+
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        compared_fields = (
+            "lag_id",
+            "min_links",
+            "system_priority",
+            "system_id",
+            "timer",
+            "admin_key",
+            "vpc_sensitive",
+            "status",
+            "last_sync_at",
+            "accepted_at",
+            "last_apply_at",
+            "last_apply_error",
+        )
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(
+            tuple(getattr(state, field) for field in compared_fields),
+            tuple(getattr(control_state, field) for field in compared_fields),
+        )
+        self.assertEqual(revision.revision, revision_after_edit + 1)
+
     def test_stale_owned_bundle_husk_preserved(self):
         # An owned (accepted) row is never pruned, even as a husk.
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))

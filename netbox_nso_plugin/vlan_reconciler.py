@@ -823,15 +823,18 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
 
 def reconcile_vlan_database(device, payload: dict) -> list:
     """Apply one frozen VLAN reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    plan = active.plan if active is not None else vlan_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    if active is not None:
+        with contextlib.nullcontext(active) as writer, suppress_intent_push():
+            return _reconcile_vlan_database(device, payload, writer, active.plan.planned_at)
+
+    def plan_fn():
+        return vlan_reconcile_plan(device, payload)
+
+    with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
         return _reconcile_vlan_database(device, payload, writer, plan.planned_at)
 
 
@@ -954,18 +957,29 @@ def _switchport_is_pristine(interface) -> bool:
 
 def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAttempt | None = None) -> list:
     """Apply one frozen switchport reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     if attempt is None:
         attempt = prepare_switchport_reconcile(device, payload)
     active = active_renderer_writer()
-    plan = active.plan if active is not None else attempt.plan
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
-        return _reconcile_switchport(device, payload, writer, plan.planned_at, attempt.interface_pks)
+    if active is not None:
+        with contextlib.nullcontext(active) as writer, suppress_intent_push():
+            return _reconcile_switchport(device, payload, writer, active.plan.planned_at, attempt.interface_pks)
+
+    attempts = [attempt]
+    acquisitions = 0
+
+    def plan_fn():
+        nonlocal acquisitions
+        acquisitions += 1
+        if acquisitions > 1:  # a replan re-freezes its own resolutions before re-acquiring
+            attempts.append(prepare_switchport_reconcile(device, payload))
+        return attempts[-1].plan
+
+    with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
+        frozen = next(candidate for candidate in attempts if candidate.plan is plan)
+        return _reconcile_switchport(device, payload, writer, plan.planned_at, frozen.interface_pks)
 
 
 def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_pks: dict) -> list:

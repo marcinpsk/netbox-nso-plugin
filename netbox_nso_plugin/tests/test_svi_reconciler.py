@@ -195,6 +195,36 @@ class TestSviReconciler(TestCase):
         names = set(NSOSVIState.objects.filter(management=self.management).values_list("interface__name", flat=True))
         self.assertEqual(names, {"Vlan301"})
 
+    def test_stale_imported_svi_replans_after_status_flip(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import svi_reconciler
+
+        payload = {"interfaces": [{"interface_name": "Vlan302", "vlan_id": 302, "type": "svi"}]}
+        reconcile_svi = svi_reconciler.reconcile_svi
+        reconcile_svi(self.device, payload)
+        state = NSOSVIState.objects.get(management=self.management, interface__name="Vlan302")
+        real_plan = svi_reconciler.svi_reconcile_plan
+        plan_calls = 0
+
+        def plan_then_flip(device, candidate_payload):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan = real_plan(device, candidate_payload)
+            if plan_calls == 1:
+                from ._outbox_case import content_update
+
+                fresh = NSOSVIState.objects.get(pk=state.pk)
+                content_update(fresh, status="in_sync")
+            return plan
+
+        with patch.object(svi_reconciler, "svi_reconcile_plan", side_effect=plan_then_flip):
+            reconcile_svi(self.device, {"interfaces": []})
+
+        state.refresh_from_db()
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+
 
 class TestSviWritePath(IntentPushResetMixin, TestCase):
     @classmethod
