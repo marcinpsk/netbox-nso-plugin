@@ -3593,8 +3593,8 @@ def _on_routing_policy_entry_delete(sender, instance, **kwargs):
 def redistribution_intent_item(row):
     """Return one redistribution row in the adapter's exact nested wire shape."""
     entry = {"source_protocol": row.source_protocol, "source_ref": row.source_ref}
-    if row.redistribution_id is not None:
-        fork = row.redistribution
+    fork = row.redistribution
+    if fork is not None:
         if fork.route_map:
             entry["route_map"] = fork.route_map.name
         if fork.metric is not None:
