@@ -2775,9 +2775,22 @@ def _accept_isis_flex_algo(flex_algo) -> None:
     state.save()  # → _on_isis_flex_algo_state_save schedules the push
 
 
+def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
+    """Capture linked overlays before Django clears their native foreign key."""
+    from .models import NSOISISFlexAlgoState
+
+    instance._nso_linked_flex_algo_state_pks = tuple(
+        NSOISISFlexAlgoState.objects.filter(isis_flex_algo=instance).values_list("pk", flat=True)
+    )
+
+
 def _remove_isis_flex_algo(flex_algo) -> None:
     """Drop the overlay for this flex-algo and push the removal (full-replace)."""
-    from .intent_state import MutationFootprint, SourceRow, intent_transaction
+    from django.db import transaction
+
+    from .apply_state import lock_device_intent_transaction, lock_order_scope
+    from .deployment import lock_mutation
+    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
     from .models import NSODeviceManagement, NSOISISFlexAlgoState
 
     inst = flex_algo.instance
@@ -2790,23 +2803,31 @@ def _remove_isis_flex_algo(flex_algo) -> None:
         return
     if mgmt.adapter_device_id is None:
         return
-    states = list(
-        NSOISISFlexAlgoState.objects.filter(
-            management=mgmt, process_tag=inst.process_tag or "", algo_id=int(flex_algo.algo_id)
-        )
-    )
     device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
     key = (device_id, "isis_flex_algo")
     footprint = MutationFootprint.for_keys(
         {key},
-        overlay_rows=(
-            SourceRow("netbox_nso_plugin.nsoisisflexalgostate", None),
-            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
-        ),
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", None),),
     )
-    with intent_transaction(footprint):
-        NSOISISFlexAlgoState.objects.filter(pk__in=[state.pk for state in states]).delete()
-        _schedule_intent_push(key)
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(device_id)
+        try:
+            with intent_transaction(footprint):
+                state_pks = set(getattr(flex_algo, "_nso_linked_flex_algo_state_pks", ()))
+                state_pks.update(
+                    NSOISISFlexAlgoState.objects.filter(
+                        management=mgmt,
+                        process_tag=inst.process_tag or "",
+                        algo_id=int(flex_algo.algo_id),
+                    ).values_list("pk", flat=True)
+                )
+                if not state_pks:
+                    raise IntentTransactionNoOp
+                NSOISISFlexAlgoState.objects.filter(pk__in=state_pks).delete()
+                _schedule_intent_push(key)
+        except IntentTransactionNoOp:
+            return
 
 
 @_skip_on_render
@@ -2816,8 +2837,8 @@ def _on_routing_isis_flex_algo_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
-def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
-    """Flex-algo deleted in NetBox → drop overlay + push removal before the cascade."""
+def _on_routing_isis_flex_algo_post_delete(sender, instance, **kwargs):
+    """Flex-algo deleted in NetBox → drop its overlay and push the removal."""
     _remove_isis_flex_algo(instance)
 
 
@@ -4374,15 +4395,28 @@ def _on_routing_isis_interface_save(sender, instance, **kwargs):
     _accept_isis_interface(instance)
 
 
-@_skip_on_render
 def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
+    """Capture linked overlays before Django clears their native foreign key."""
+    from .models import NSOISISInterfaceState
+
+    instance._nso_linked_isis_interface_state_pks = tuple(
+        NSOISISInterfaceState.objects.filter(isis_interface=instance).values_list("pk", flat=True)
+    )
+
+
+@_skip_on_render
+def _on_routing_isis_interface_post_delete(sender, instance, **kwargs):
     """Operator deletes an IS-IS interface → drop its overlay + push the removal (parity with OSPF).
 
     Without this, deleting an ISISInterface only SET_NULLs NSOISISInterfaceState.isis_interface;
     the overlay row lingers with its owned status and no reduced IS-IS intent is pushed, so the
     device keeps the IS-IS config NetBox just removed.
     """
-    from .intent_state import MutationFootprint, SourceRow, intent_transaction
+    from django.db import transaction
+
+    from .apply_state import lock_device_intent_transaction, lock_order_scope
+    from .deployment import lock_mutation
+    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
     from .models import NSODeviceManagement, NSOISISInterfaceState
 
     iface = instance.interface
@@ -4396,19 +4430,25 @@ def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
     qs = NSOISISInterfaceState.objects.filter(management=mgmt, interface=iface)
     if af:
         qs = qs.filter(af=af)  # scope to this ISISInterface's address-family; leave a sibling AF alone
-    states = list(qs)
     device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
     key = (device_id, "isis")
     footprint = MutationFootprint.for_keys(
         {key},
-        overlay_rows=(
-            SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None),
-            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
-        ),
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None),),
     )
-    with intent_transaction(footprint):
-        NSOISISInterfaceState.objects.filter(pk__in=[state.pk for state in states]).delete()
-        _schedule_intent_push(key)
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(device_id)
+        try:
+            with intent_transaction(footprint):
+                state_pks = set(getattr(instance, "_nso_linked_isis_interface_state_pks", ()))
+                state_pks.update(qs.values_list("pk", flat=True))
+                if not state_pks:
+                    raise IntentTransactionNoOp
+                NSOISISInterfaceState.objects.filter(pk__in=state_pks).delete()
+                _schedule_intent_push(key)
+        except IntentTransactionNoOp:
+            return
 
 
 @_skip_on_render
@@ -5016,9 +5056,14 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_flex_algo_post_save",
         )
         pre_delete.connect(
-            _as_delete_origin(_on_routing_isis_flex_algo_pre_delete),
+            _on_routing_isis_flex_algo_pre_delete,
             sender=ISISFlexAlgo,
-            dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete",
+            dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete_capture",
+        )
+        post_delete.connect(
+            _as_delete_origin(_on_routing_isis_flex_algo_post_delete),
+            sender=ISISFlexAlgo,
+            dispatch_uid="nso_plugin_routing_isis_flex_algo_post_delete",
             weak=False,
         )
     except ImportError:
@@ -5053,9 +5098,14 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_interface_post_save",
         )
         pre_delete.connect(
-            _as_delete_origin(_on_routing_isis_interface_pre_delete),
+            _on_routing_isis_interface_pre_delete,
             sender=ISISInterface,
-            dispatch_uid="nso_plugin_routing_isis_interface_pre_delete",
+            dispatch_uid="nso_plugin_routing_isis_interface_pre_delete_capture",
+        )
+        post_delete.connect(
+            _as_delete_origin(_on_routing_isis_interface_post_delete),
+            sender=ISISInterface,
+            dispatch_uid="nso_plugin_routing_isis_interface_post_delete",
             weak=False,
         )
     except ImportError:

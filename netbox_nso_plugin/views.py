@@ -51,6 +51,7 @@ from .forms import (
     NSOSnmpV3UserStateForm,
     NSOVaultSettingsForm,
 )
+from .intent_state import IntentTransactionNoOp as _IntentTransactionNoOp
 from .models import (
     AdapterConnection,
     NSOBFDInterfaceState,
@@ -3783,14 +3784,6 @@ def _status_after_accept(source_status: str) -> str:
     real intent that the device doesn't have yet → ``accepted`` ("pending apply").
     """
     return "in_sync" if source_status in _MATCHING_SOURCE_STATUSES else "accepted"
-
-
-class _IntentTransactionNoOp(Exception):
-    """Unwind an intent transaction when a locked precondition rejects the request."""
-
-    def __init__(self, result=None):
-        super().__init__()
-        self.result = result
 
 
 class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
