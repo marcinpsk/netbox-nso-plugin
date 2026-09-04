@@ -384,7 +384,8 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
                             "Adapter device id %s belongs to another NetBox device. Dropping the stale pointer.",
                             current.adapter_device_id,
                         )
-                        _mirror_management(current, adapter_device_id=None)
+                        if not _mirror_management(current, adapter_device_id=None):
+                            continue
                     invalidate_delivery_baselines(current.device_id)
                 elif state is _UNMAPPED:
                     # The pointer is already null and this branch does not change it. The repair
