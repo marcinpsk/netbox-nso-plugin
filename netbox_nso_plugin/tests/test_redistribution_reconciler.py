@@ -320,18 +320,22 @@ class TestReconcileRedistribution(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        OSPFInstance.objects.create(
+        destination = OSPFInstance.objects.create(
             name="process-1",
             router_id="198.18.0.1",
             process_id="1",
             device=self.device,
         )
-        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.intent_state import SourceRow, reconcile_transaction
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
 
         entry = self._entry(dest_protocol="ospf", dest_ref="1", metric_type="1")
         reconcile_redistribution(self.device, {"entries": [entry]})
         plan = redistribution_reconcile_plan(self.device, {"entries": [entry]})
+        self.assertIn(
+            SourceRow(destination._meta.label_lower, destination.pk),
+            plan.footprint.source_rows,
+        )
 
         with reconcile_transaction(plan):
             pass
