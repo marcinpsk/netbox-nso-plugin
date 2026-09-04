@@ -314,12 +314,11 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     overlay correlatable" is one concern — splitting it across two commands invites an
     operator to run one and not the other.
 
-    A row already ``deploying`` is **demoted to accepted**. Its new generation makes any
-    in-flight result uncorrelatable, so leaving it ``deploying`` would strand it until the
-    backstop fires; a new generation means unsettled intent, and ``accepted`` is what
-    unsettled intent reads as. ``in_sync``, ``accepted`` and ``apply_failed`` rows keep
-    their status and only change generation, so the *next* result correlates and no badge
-    flickers. ``accepted_at`` is untouched — it dates first ownership.
+    :func:`intent_transaction` demotes a row already ``deploying`` while it acquires the
+    selected overlay. Its new generation makes any in-flight result uncorrelatable, so the
+    row must be ``accepted`` before it is armed. ``in_sync``, ``accepted`` and
+    ``apply_failed`` rows keep their status and only change generation, so the *next* result
+    correlates and no badge flickers. ``accepted_at`` is untouched: it dates first ownership.
 
     The candidate set is the pusher's own (``signals.PUSHED_STATIC_ROUTE_FILTER``), not a
     broader "owned" one: a route with an interface-only next hop is owned but has no place
@@ -338,7 +337,6 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     from .intent_generation import UNALLOCATED
     from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
     from .models import NSOStaticRouteState
-    from .status_machine import DEPLOYING
 
     candidates = list(
         NSOStaticRouteState.objects.filter(
@@ -369,11 +367,7 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
             with signals.suppress_intent_push():
                 for row in rows:
                     signals._arm_static_route_generation(row)
-                    update_fields = list(armed_fields)
-                    if row.status == DEPLOYING:
-                        row.status = "accepted"
-                        update_fields.append("status")
-                    row.save(update_fields=update_fields)
+                    row.save(update_fields=armed_fields)
             for snapshot, row in zip(before, rows, strict=True):
                 # Restore only while both lifecycle coordinates remain as this pass left them.
                 snapshot["armed_generation"] = row.intent_generation
