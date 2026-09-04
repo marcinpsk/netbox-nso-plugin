@@ -186,6 +186,50 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(len(res["instances"]), 1)
         self.assertEqual(res["instances"][0].status, "imported")  # unowned, materialized → imported (unified)
 
+    def test_owned_instance_overlay_retains_operator_values(self):
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.signals import ospf_instance_intent_item
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        operator_areas = [{"area-id": "0.0.0.1", "area-type": "stub"}]
+        state = NSOOSPFInstanceState.objects.create(
+            management=self._make_mgmt(),
+            process_id="10",
+            router_id="198.18.0.1",
+            vrf="operator-vrf",
+            areas=operator_areas,
+            enabled=True,
+            status="accepted",
+        )
+
+        _reconcile_ospf(
+            self.device,
+            self._payload(
+                [
+                    self._instance(
+                        router_id="198.18.0.2",
+                        vrf="device-vrf",
+                        areas=[{"area-id": "0.0.0.2", "area-type": "standard"}],
+                    )
+                ]
+            ),
+        )
+
+        state.refresh_from_db()
+        self.assertEqual(state.router_id, "198.18.0.1")
+        self.assertEqual(state.vrf, "operator-vrf")
+        self.assertEqual(state.areas, operator_areas)
+        self.assertEqual(
+            ospf_instance_intent_item(state),
+            {
+                "process_id": "10",
+                "vrf": "operator-vrf",
+                "areas": operator_areas,
+                "router_id": "198.18.0.1",
+                "enabled": True,
+            },
+        )
+
     def test_stale_instance_with_linked_object_marked_changed(self):
         # Device drops the process but its netbox-routing OSPFInstance still exists → drift.
         self._make_mgmt()
@@ -333,6 +377,34 @@ class TestReconcileOspfFill(TestCase):
         self.assertEqual(x.area.area_id, "0.0.0.0")
         self.assertEqual(x.cost, 750)
         self.assertEqual(x.network_type, "point-to-point")
+
+    def test_duplicate_interface_entries_use_the_first_observation(self):
+        self._make_mgmt()
+        from netbox_routing.models import OSPFArea, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+        from netbox_nso_plugin.template_content import _reconcile_ospf
+
+        _reconcile_ospf(
+            self.device,
+            self._payload(
+                [self._instance()],
+                [
+                    self._iface(name="Tunnel10", cost=100, passive=True),
+                    self._iface(name="Tunnel10", area_id="0.0.0.1", cost=200, passive=False),
+                ],
+            ),
+        )
+
+        self.assertEqual(set(OSPFArea.objects.values_list("area_id", flat=True)), {"0.0.0.0"})
+        self.assertEqual(OSPFInterface.objects.filter(interface=self.tun).count(), 1)
+        self.assertEqual(NSOOSPFInterfaceState.objects.filter(interface=self.tun).count(), 1)
+        native = OSPFInterface.objects.get(interface=self.tun)
+        state = NSOOSPFInterfaceState.objects.get(interface=self.tun)
+        self.assertEqual(native.cost, 100)
+        self.assertIs(native.passive, True)
+        self.assertEqual(state.cost, 100)
+        self.assertIs(state.passive, True)
 
     def test_device_dotted_area_reuses_operator_bare_area(self):
         # Regression for the LAG99:99 'pending apply' bug: device reports area 0.0.0.0,
