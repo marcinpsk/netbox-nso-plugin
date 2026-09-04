@@ -593,6 +593,50 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 900)
 
+    def test_failed_reused_id_clear_skips_the_full_save(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-reused-stale", 619)
+        stranger = _adapter_row(mgmt, nso_device_name="somebody-else", netbox_device_id=mgmt.device_id + 999)
+        original_build = RendererMutationPlan.build
+        full_save_ids = []
+        pointer_plan_staled = False
+
+        def build_then_stale_pointer_clear(*args, **kwargs):
+            nonlocal pointer_plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
+            if proposed_save is not None and proposed_save.update_fields is None:
+                full_save_ids.append(proposed_save.instance.adapter_device_id)
+            plan = original_build(*args, **kwargs)
+            if proposed_save is not None and proposed_save.update_fields == ("adapter_device_id",):
+                pointer_plan_staled = True
+                concurrent = NSODeviceManagement.objects.get(pk=mgmt.pk)
+                concurrent.last_sync_status = "concurrent"
+                save_management(concurrent, update_fields={"last_sync_status"})
+            return plan
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[stranger]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify") as sync_notify,
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale_pointer_clear),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        self.assertTrue(pointer_plan_staled)
+        self.assertEqual(full_save_ids, [])
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        sync_notify.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 619)
+        self.assertEqual(mgmt.last_sync_status, "concurrent")
+
     def test_leaves_healthy_rows_alone(self):
         """Every mapping resolving to its own device → nothing to reconcile, no onboard call."""
         from netbox_nso_plugin.sync_cache import reconcile_device_links

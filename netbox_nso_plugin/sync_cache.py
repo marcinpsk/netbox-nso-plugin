@@ -320,7 +320,8 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                         current.adapter_device_id,
                         current.nso_device_name,
                     )
-                    _mirror_management(current, adapter_device_id=None)
+                    if not _mirror_management(current, adapter_device_id=None):
+                        continue
                 save_management(current)
         except _LinkReconcileNoOp:
             continue
