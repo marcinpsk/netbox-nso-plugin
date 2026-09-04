@@ -301,6 +301,10 @@ class _StaticRouteBackfillNoOp(Exception):
     """The authoritative read found no static-route generation to arm."""
 
 
+class _RestoreNoOp(Exception):
+    """Roll back a restore whose authoritative row no longer matches."""
+
+
 def _backfill_static_route_generations(mgmt) -> list[dict]:
     """Arm every owned overlay of *mgmt* still on the unallocated sentinel.
 
@@ -432,15 +436,18 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         ).first()
         if state is None:
             continue
-        with intent_transaction(footprint_for_instance(state)):
-            state.refresh_from_db()
-            if state.intent_generation != armed_generation or state.status != armed_status:
-                continue
-            for field_name, value in fields.items():
-                setattr(state, field_name, value)
-            with suppress_intent_push():
-                state.save(update_fields=fields)
-            restored += 1
+        try:
+            with intent_transaction(footprint_for_instance(state)):
+                state.refresh_from_db()
+                if state.intent_generation != armed_generation or state.status != armed_status:
+                    raise _RestoreNoOp
+                for field_name, value in fields.items():
+                    setattr(state, field_name, value)
+                with suppress_intent_push():
+                    state.save(update_fields=fields)
+                restored += 1
+        except _RestoreNoOp:
+            continue
     return restored
 
 

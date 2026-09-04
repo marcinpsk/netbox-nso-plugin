@@ -19,13 +19,14 @@ test transaction would make every device report the refusal as a rejection.
 from __future__ import annotations
 
 import contextlib
+import threading
 from io import StringIO
 from unittest.mock import patch
 from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.core.management import CommandError, call_command
-from django.db import transaction
+from django.db import connection, transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import without_commit_drain
@@ -643,6 +644,65 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             assert row.intent_generation > UNALLOCATED
         assert results[0]["ok"] is False
         assert results[0]["armed_rolled_back"] == 0
+
+    def test_a_concurrent_status_change_before_restore_does_not_advance_revision(self):
+        """A restore skipped after acquisition leaves the intent revision unchanged."""
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_drift import (
+            _backfill_static_route_generations,
+            _restore_static_route_generations,
+        )
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
+
+        _, mgmt = self._managed_device("restore-race", 8111)
+        row = self._own_route(mgmt, "198.18.33.0/24", "198.18.33.1")
+        snapshots = _backfill_static_route_generations(mgmt)
+        revision_keys = intent_state.footprint_for_instance(row).revision_keys
+        self.assertEqual(revision_keys, ((mgmt.device_id, "static_route"),))
+        revision_key = revision_keys[0]
+        revision = NSOIntentRevision.objects.get(device_id=revision_key[0], scope=revision_key[1])
+        before = revision.revision
+        candidate_loaded = threading.Barrier(2, timeout=30)
+        row_changed = threading.Barrier(2, timeout=30)
+        errors: list[BaseException] = []
+        candidate_query_seen = False
+
+        def wait_after_candidate_query(execute, sql, params, many, context):
+            nonlocal candidate_query_seen
+            result = execute(sql, params, many, context)
+            if not candidate_query_seen and NSOStaticRouteState._meta.db_table in sql:
+                candidate_query_seen = True
+                candidate_loaded.wait()
+                row_changed.wait()
+            return result
+
+        def settle_row():
+            try:
+                candidate_loaded.wait()
+                current = NSOStaticRouteState.objects.get(pk=row.pk)
+                intent_state.update_mirror_fields(current, status="in_sync")
+                row_changed.wait()
+            except BaseException as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+                row_changed.abort()
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=settle_row)
+        worker.start()
+        with connection.execute_wrapper(wait_after_candidate_query):
+            restored = _restore_static_route_generations(snapshots)
+        worker.join(timeout=60)
+
+        assert not worker.is_alive(), "concurrent status writer did not finish"
+        assert errors == []
+        assert candidate_query_seen
+        assert restored == 0
+        row.refresh_from_db()
+        revision.refresh_from_db()
+        assert row.status == "in_sync"
+        assert row.intent_generation == snapshots[0]["armed_generation"]
+        assert revision.revision == before, "a skipped restore committed an intent revision"
 
     def test_partial_restore_reports_the_row_left_armed(self):
         """A compare-and-set miss stays in the failed result's armed subset."""
