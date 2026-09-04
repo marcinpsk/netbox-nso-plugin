@@ -23,7 +23,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
-from ._outbox_case import content_bulk_update, without_commit_drain
+from ._outbox_case import content_bulk_update, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_sync_cache import _SyncCacheTestBase
 
@@ -152,18 +152,20 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
     def _run_barrier(self, *, settles_deploying: bool) -> int:
         thread, release, failure = self._start_paused_reconcile(settles_deploying=settles_deploying)
         backfill_started = threading.Event()
-        backfill_done = threading.Event()
+        backfill_pid: list[int] = []
         backfill_result: list[int] = []
         backfill_failure: list[BaseException] = []
 
         def _run_backfill():
+            with connections["default"].cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                backfill_pid.append(cursor.fetchone()[0])
             backfill_started.set()
             try:
                 backfill_result.append(self._backfill())
             except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread
                 backfill_failure.append(exc)
             finally:
-                backfill_done.set()
                 connections.close_all()
 
         backfill = threading.Thread(target=_run_backfill)
@@ -171,12 +173,19 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         self.addCleanup(backfill.join, 30)
         self.addCleanup(release.set)
         assert backfill_started.wait(timeout=30)
-        assert not backfill_done.wait(timeout=0.2), "the backfill bypassed the reconciler's footprint lock"
-        release.set()
+        blocked_failure = None
+        try:
+            wait_until_postgres_blocks(backfill_pid[0], "the backfill")
+        except BaseException as exc:  # noqa: BLE001 (re-raised after both threads finish)
+            blocked_failure = exc
+        finally:
+            release.set()
         thread.join(timeout=30)
         backfill.join(timeout=30)
         assert not thread.is_alive(), "the reconciler never returned, so its writes are still in flight"
         assert not backfill.is_alive(), "the backfill did not resume after the reconcile committed"
+        if blocked_failure is not None:
+            raise blocked_failure
         assert not failure, failure
         assert not backfill_failure, backfill_failure
         armed = backfill_result[0]
