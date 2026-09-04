@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""The commit hook and CI must run the SAME ruff.
-
-An unpinned ruff in CI resolves to whatever is newest at job time, so a new lint or
-formatting rule turns CI red on a commit the hook had just passed.
-"""
+"""The dev group pins ruff and zizmor; CI and hooks derive them from uv.lock."""
 
 from __future__ import annotations
 
 import re
+import shlex
+import sys
 import tomllib
 from pathlib import Path
 
@@ -66,20 +64,43 @@ def test_sqlparse_dependency_rejects_an_unsupported_floor(dependency):
     assert not _has_supported_sqlparse_floor(dependency)
 
 
-def _workflow_version() -> str:
-    found = re.findall(r"ruff==([0-9][^\s\"']*)", WORKFLOW.read_text(encoding="utf-8"))
-    assert found, "the lint workflow installs an unpinned ruff"
-    assert len(set(found)) == 1, f"the lint workflow installs different ruff versions: {found}"
-    return found[0]
+def _workflow_tool_commands(tool: str) -> list[list[str]]:
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert not re.search(rf"(?<![\w-]){tool}==", workflow_text), f"the lint workflow hardcodes a {tool} version"
+
+    workflow = yaml.safe_load(workflow_text)
+    commands = []
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if isinstance(run, str) and re.search(rf"(?<![\w-]){tool}(?![\w-])", run):
+                command = shlex.split(run)
+                assert command[:4] == ["uv", "run", "--frozen", tool], (
+                    f"the lint workflow must run {tool} via uv run --frozen: {run!r}"
+                )
+                commands.append(command[4:])
+
+    assert commands, f"the lint workflow does not run {tool} via uv run --frozen"
+    return commands
 
 
-def _pre_commit_version() -> str:
-    found = re.search(
-        r"repo: https://github\.com/astral-sh/ruff-pre-commit\s*\n\s*rev: v(\S+)",
-        PRE_COMMIT.read_text(encoding="utf-8"),
+def _local_hook(hook_id: str, tool: str) -> dict[str, object]:
+    config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
+    hooks = [
+        hook
+        for repository in config["repos"]
+        if repository["repo"] == "local"
+        for hook in repository["hooks"]
+        if hook["id"] == hook_id
+    ]
+    assert len(hooks) == 1, f"pre-commit must define one local {hook_id} hook"
+    hook = hooks[0]
+    command = shlex.split(hook["entry"])
+    assert command[:4] == ["uv", "run", "--native-tls", tool], (
+        f"the local {hook_id} hook must run {tool} via uv run --native-tls"
     )
-    assert found, "the ruff pre-commit hook has no rev"
-    return found.group(1)
+    assert hook["language"] == "system"
+    return hook
 
 
 def _declared_version() -> str:
@@ -97,65 +118,41 @@ def _locked_version() -> str:
     raise AssertionError("ruff is absent from the lock file")
 
 
-def test_every_ruff_pin_names_one_version():
-    versions = {
-        "lint-format.yaml": _workflow_version(),
-        ".pre-commit-config.yaml": _pre_commit_version(),
-        "pyproject.toml": _declared_version(),
-        "uv.lock": _locked_version(),
-    }
-
-    assert len(set(versions.values())) == 1, f"ruff versions have drifted apart: {versions}"
-
-
-def _workflow_zizmor_version() -> str:
-    # Executed references must pin literally; interpolated or indirect forms fail loudly by design.
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    references = []
-    for job in workflow["jobs"].values():
-        for step in job.get("steps", []):
-            executed_values = [step.get("run"), step.get("uses"), *step.get("with", {}).values()]
-            references.extend(
-                match
-                for value in executed_values
-                if isinstance(value, str)
-                for match in re.finditer(r"(?<![\w-])zizmor(?:==([0-9][^\s\"']*))?(?![\w-])", value)
-            )
-
-    assert references, "the lint workflow does not install or run zizmor"
-    unpinned = [match.string for match in references if match.group(1) is None]
-    assert not unpinned, f"the lint workflow has an unpinned zizmor reference: {unpinned}"
-    versions = [match.group(1) for match in references]
-    assert len(set(versions)) == 1, f"the lint workflow installs different zizmor versions: {versions}"
-    return versions[0]
+def test_ruff_version_has_one_source():
+    assert _workflow_tool_commands("ruff") == [["check", "."], ["format", "--check", "."]]
+    config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
+    assert all(repository["repo"] != "https://github.com/astral-sh/ruff-pre-commit" for repository in config["repos"])
+    check_hook = _local_hook("ruff-check", "ruff")
+    format_hook = _local_hook("ruff-format", "ruff")
+    assert shlex.split(check_hook["entry"])[4:] == [
+        "check",
+        "--force-exclude",
+        "--fix",
+        "--exit-non-zero-on-fix",
+    ]
+    assert shlex.split(format_hook["entry"])[4:] == ["format", "--force-exclude"]
+    assert check_hook["types_or"] == format_hook["types_or"] == ["python", "pyi"]
+    assert check_hook["require_serial"] is format_hook["require_serial"] is True
+    assert _declared_version() == _locked_version()
 
 
-def test_workflow_zizmor_pin_must_be_executed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_workflow_zizmor_must_be_executed_via_uv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workflow = tmp_path / "lint-format.yaml"
     workflow.write_text(
         """
 jobs:
   lint:
     env:
-      UNUSED_PIN: zizmor==1.29.0
+      UNUSED_COMMAND: uv run --frozen zizmor
     steps:
-      - run: uv pip install zizmor
+      - run: echo audit
 """,
         encoding="utf-8",
     )
-    monkeypatch.setattr("netbox_nso_plugin.tests.test_lint_pins.WORKFLOW", workflow)
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOW", workflow)
 
-    with pytest.raises(AssertionError, match="unpinned zizmor"):
-        _workflow_zizmor_version()
-
-
-def _pre_commit_zizmor_version() -> str:
-    found = re.search(
-        r"repo: https://github\.com/zizmorcore/zizmor-pre-commit\s*\n\s*rev: v(\S+)",
-        PRE_COMMIT.read_text(encoding="utf-8"),
-    )
-    assert found, "the zizmor pre-commit hook has no rev"
-    return found.group(1)
+    with pytest.raises(AssertionError, match="does not run zizmor via uv run --frozen"):
+        _workflow_tool_commands("zizmor")
 
 
 def _declared_zizmor_version() -> str:
@@ -173,12 +170,13 @@ def _locked_zizmor_version() -> str:
     raise AssertionError("zizmor is absent from the lock file")
 
 
-def test_every_zizmor_pin_names_one_version():
-    versions = {
-        "lint-format.yaml": _workflow_zizmor_version(),
-        ".pre-commit-config.yaml": _pre_commit_zizmor_version(),
-        "pyproject.toml": _declared_zizmor_version(),
-        "uv.lock": _locked_zizmor_version(),
-    }
-
-    assert len(set(versions.values())) == 1, f"zizmor versions have drifted apart: {versions}"
+def test_zizmor_version_has_one_source():
+    assert _workflow_tool_commands("zizmor") == [[".github/workflows"]]
+    config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
+    assert all(
+        repository["repo"] != "https://github.com/zizmorcore/zizmor-pre-commit" for repository in config["repos"]
+    )
+    hook = _local_hook("zizmor", "zizmor")
+    assert hook["files"] == r"^\.github/workflows/"
+    assert hook["pass_filenames"] is True
+    assert _declared_zizmor_version() == _locked_zizmor_version()
