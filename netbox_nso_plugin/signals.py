@@ -4342,12 +4342,6 @@ def _connect_g_activated():  # pragma: no cover
             sender=ISISFlexAlgo,
             dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete_capture",
         )
-        post_delete.connect(
-            _as_delete_origin(_on_routing_isis_flex_algo_post_delete),
-            sender=ISISFlexAlgo,
-            dispatch_uid="nso_plugin_routing_isis_flex_algo_post_delete",
-            weak=False,
-        )
     except ImportError:
         logger.debug("netbox_routing not installed — flex-algo greenfield signals not registered")
 
@@ -4383,12 +4377,6 @@ def _connect_g_activated():  # pragma: no cover
             _on_routing_isis_interface_pre_delete,
             sender=ISISInterface,
             dispatch_uid="nso_plugin_routing_isis_interface_pre_delete_capture",
-        )
-        post_delete.connect(
-            _as_delete_origin(_on_routing_isis_interface_post_delete),
-            sender=ISISInterface,
-            dispatch_uid="nso_plugin_routing_isis_interface_post_delete",
-            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — IS-IS interface greenfield signals not registered")
