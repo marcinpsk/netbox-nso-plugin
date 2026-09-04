@@ -4,7 +4,7 @@
 
 import os
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
@@ -86,14 +86,45 @@ class TestRunDeviceReconcile(APITestCase):
             manage_redistribution=False,
         )
 
-        client = SimpleNamespace(get_route_policy=lambda _device_id: {})
+        route_policy = {}
+        requested_device_ids = []
+
+        def get_route_policy(device_id):
+            requested_device_ids.append(device_id)
+            return route_policy
+
+        client = SimpleNamespace(get_route_policy=get_route_policy)
+        ctx = {}
+        attempt_ids = (object(),)
+
+        def run_body(_ctx, _mgmt, _family, _payload, body, **_kwargs):
+            return body()
+
         with (
             patch("netbox_nso_plugin.apply_settlement.load_deployment_evidence") as load_evidence,
-            patch("netbox_nso_plugin.reconcile._gated"),
+            patch(
+                "netbox_nso_plugin.apply_settlement.route_policy_deploying_attempt_ids",
+                return_value=attempt_ids,
+            ) as deploying_attempt_ids,
+            patch("netbox_nso_plugin.reconcile._safe_reconcile", return_value=[]) as safe_reconcile,
+            patch("netbox_nso_plugin.reconcile._gated", side_effect=run_body),
         ):
-            _reconcile_routing(device, mgmt, client, {})
+            _reconcile_routing(device, mgmt, client, ctx)
 
         load_evidence.assert_not_called()
+        self.assertEqual(requested_device_ids, [mgmt.adapter_device_id])
+        deploying_attempt_ids.assert_called_once_with(mgmt)
+        safe_reconcile.assert_called_once_with(
+            ctx,
+            "route_policy_states",
+            mgmt,
+            ("NSORoutePolicyState",),
+            ANY,
+            device,
+            route_policy,
+        )
+        self.assertEqual(ctx["_route_policy_attempt_ids"], attempt_ids)
+        self.assertEqual(ctx["_route_policy_adapter_device_id"], mgmt.adapter_device_id)
 
     def test_route_policy_evidence_programming_error_stops_reconcile(self):
         from uuid import uuid4
