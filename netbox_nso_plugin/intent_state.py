@@ -516,6 +516,7 @@ class _Permit:
     deferred_update: dict[str, Any] = field(default_factory=dict)
     atomic_block_id: int | None = None
     detect_reconcile_content: bool = False
+    settles_deploying: bool = True
     initial_deploying_rows: tuple[SourceRow, ...] = ()
     deferred_repend_rows: tuple[SourceRow, ...] = ()
 
@@ -1912,25 +1913,47 @@ def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -
     permit.detect_reconcile_content = False
 
 
+def _join_active_permit(
+    footprint: MutationFootprint,
+    *,
+    settles_deploying: bool,
+) -> _Permit | None:
+    """Join a covering permit and retain the strictest reconcile settlement rule."""
+    active = _ACTIVE_PERMIT.get()
+    if active is None:
+        return None
+    if not active.footprint.covers(footprint):
+        raise IntentMutationProtocolError("an active mutation footprint cannot expand")
+    active.settles_deploying = active.settles_deploying and settles_deploying
+    return active
+
+
 @contextlib.contextmanager
-def _intent_transaction(footprint: MutationFootprint, *, defer_repend: bool = False):
+def _intent_transaction(
+    footprint: MutationFootprint,
+    *,
+    defer_repend: bool = False,
+    settles_deploying: bool = True,
+):
     """Acquire one content permit, optionally forcing its re-pend at body exit."""
     _discard_rolled_back_implicit_permit()
-    active = _ACTIVE_PERMIT.get()
+    active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
-        if not active.footprint.covers(footprint):
-            raise IntentMutationProtocolError("an active mutation footprint cannot expand")
         yield active
         return
     from .apply_state import lock_order_scope
 
     with transaction.atomic(), lock_order_scope():
-        permit = _Permit(footprint=footprint, dml_kind="content")
+        permit = _Permit(
+            footprint=footprint,
+            dml_kind="content",
+            settles_deploying=settles_deploying,
+        )
         token = _ACTIVE_PERMIT.set(permit)
         try:
             deploying_rows = _acquire(footprint, defer_repend=defer_repend)
             yield permit
-            if defer_repend and deploying_rows:
+            if defer_repend and permit.settles_deploying and deploying_rows:
                 _repend_locked_rows(deploying_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
@@ -1944,13 +1967,16 @@ def intent_transaction(footprint: MutationFootprint):
 
 
 @contextlib.contextmanager
-def mirror_transaction(footprint: MutationFootprint, *, detect_content_changes: bool = False):
+def mirror_transaction(
+    footprint: MutationFootprint,
+    *,
+    detect_content_changes: bool = False,
+    settles_deploying: bool = True,
+):
     """Acquire a complete read-side footprint without advancing intent identity."""
     _discard_rolled_back_implicit_permit()
-    active = _ACTIVE_PERMIT.get()
+    active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
-        if not active.footprint.covers(footprint):
-            raise IntentMutationProtocolError("an active mutation footprint cannot expand")
         yield active
         return
     from .apply_state import lock_order_scope
@@ -1960,6 +1986,7 @@ def mirror_transaction(footprint: MutationFootprint, *, detect_content_changes: 
             footprint=footprint,
             dml_kind="reconcile",
             detect_reconcile_content=detect_content_changes,
+            settles_deploying=settles_deploying,
         )
         token = _ACTIVE_PERMIT.set(permit)
         try:
@@ -1969,7 +1996,7 @@ def mirror_transaction(footprint: MutationFootprint, *, detect_content_changes: 
                 capture_deploying=detect_content_changes,
             )
             yield permit
-            if permit.deferred_repend_rows:
+            if permit.settles_deploying and permit.deferred_repend_rows:
                 _repend_locked_rows(permit.deferred_repend_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
@@ -1979,11 +2006,16 @@ def mirror_transaction(footprint: MutationFootprint, *, detect_content_changes: 
 def reconcile_transaction(plan: ReconcileMutationPlan):
     """Acquire a read plan with the permit required by its canonical fragment delta."""
     if plan.changes_content:
-        mutation = _intent_transaction(plan.footprint, defer_repend=True)
+        mutation = _intent_transaction(
+            plan.footprint,
+            defer_repend=True,
+            settles_deploying=plan.settles_deploying,
+        )
     else:
         mutation = mirror_transaction(
             plan.footprint,
             detect_content_changes=plan.detect_content_changes,
+            settles_deploying=plan.settles_deploying,
         )
     with mutation as permit:
         if plan.validate_after_acquire is not None:
