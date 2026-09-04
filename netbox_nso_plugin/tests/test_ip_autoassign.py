@@ -12,11 +12,16 @@ Covers:
 - reconciler in_sync → active IPAddress activation (single-ended and P2P both-ends)
 """
 
+import threading
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from dcim.models import Cable, CableTermination, Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.db import connections
+from django.test import TestCase, TransactionTestCase
 from ipam.models import IPAddress, Prefix, Role
+
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestClassifyInterface(TestCase):
@@ -284,7 +289,7 @@ class TestAutoAssignIP(TestCase):
         before = revision.revision
         result = {"allocated": [], "errors": [], "skipped": []}
 
-        with patch.object(pool, "get_first_available_ip", return_value=None):
+        with patch.object(Prefix, "get_first_available_ip", return_value=None):
             _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
 
         assert result["errors"]
@@ -381,6 +386,304 @@ class TestAutoAssignIP(TestCase):
         self.assertIn("no cable peer found", result["errors"][0]["reason"])
 
         mgmt.delete()
+
+
+class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from ._outbox_case import make_managed, without_commit_drain
+
+        with without_commit_drain():
+            self.device_a, self.management_a = make_managed("single-pool", 4301, index=1)
+            self.device_b, self.management_b = make_managed("single-pool", 4302, index=2)
+            self.interface_a = Interface.objects.create(device=self.device_a, name="Loopback1", type="virtual")
+            self.interface_b = Interface.objects.create(device=self.device_b, name="Loopback1", type="virtual")
+        pool = Prefix.objects.create(prefix="198.18.0.0/29")
+        self.pool = Prefix.objects.get(pk=pool.pk)
+
+    def test_concurrent_draws_from_one_pool_lock_the_prefix(self):
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._outbox_case import wait_until_postgres_blocks
+
+        first_queried = threading.Event()
+        release_first = threading.Event()
+        second_connected = threading.Event()
+        second_pid: list[int] = []
+        failures: list[BaseException] = []
+        first_result = {"allocated": [], "errors": [], "skipped": []}
+        second_result = {"allocated": [], "errors": [], "skipped": []}
+        real_first_available = Prefix.get_first_available_ip
+
+        def pause_first_draw(pool):
+            available = real_first_available(pool)
+            if threading.current_thread().name == "first-allocation":
+                first_queried.set()
+                assert release_first.wait(timeout=30), "the first allocation barrier was not released"
+            return available
+
+        def allocate(interface, management, result, *, record_pid=False):
+            try:
+                if record_pid:
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute("SELECT pg_backend_pid()")
+                        second_pid.append(cursor.fetchone()[0])
+                    second_connected.set()
+                _reserve_single(interface, management, "ipv4", self.pool, result, push=False)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        with patch.object(Prefix, "get_first_available_ip", pause_first_draw):
+            first = threading.Thread(
+                target=allocate,
+                args=(self.interface_a, self.management_a, first_result),
+                name="first-allocation",
+            )
+            second = threading.Thread(
+                target=allocate,
+                args=(self.interface_b, self.management_b, second_result),
+                kwargs={"record_pid": True},
+                name="second-allocation",
+            )
+            first.start()
+            self.addCleanup(release_first.set)
+            self.addCleanup(first.join, 30)
+            assert first_queried.wait(timeout=30), (failures, first_result)
+            second.start()
+            self.addCleanup(second.join, 30)
+            assert second_connected.wait(timeout=30), "the second allocation never opened its connection"
+            blocked_failure = None
+            try:
+                wait_until_postgres_blocks(second_pid[0], "the second allocation")
+            except BaseException as exc:  # noqa: BLE001
+                blocked_failure = exc
+            finally:
+                release_first.set()
+            first.join(timeout=30)
+            second.join(timeout=30)
+
+        assert not first.is_alive(), "the first allocation did not finish"
+        assert not second.is_alive(), "the second allocation did not finish"
+        if blocked_failure is not None:
+            raise blocked_failure
+        assert not failures, failures
+        self.assertEqual(first_result["errors"], [])
+        self.assertEqual(second_result["errors"], [])
+        addresses = {
+            first_result["allocated"][0]["address"],
+            second_result["allocated"][0]["address"],
+        }
+        self.assertEqual(len(addresses), 2)
+        states = NSOInterfaceIPState.objects.filter(source_pool=self.pool)
+        self.assertEqual(states.count(), 2)
+        self.assertEqual(set(states.values_list("address", flat=True)), addresses)
+        self.assertEqual(
+            IPAddress.objects.filter(assigned_object_id__in=[self.interface_a.pk, self.interface_b.pk]).count(),
+            2,
+        )
+
+    def test_single_and_p2p_draws_use_one_lock_order(self):
+        from netbox_nso_plugin import intent_state, ip_autoassign
+
+        from ._outbox_case import wait_until_postgres_blocks
+
+        single_interface = self.interface_a
+        p2p_interface = Interface.objects.create(device=self.device_a, name="Ethernet1", type="1000base-t")
+        peer_interface = Interface.objects.create(device=self.device_b, name="Ethernet1", type="1000base-t")
+        p2p_ready = threading.Event()
+        request_p2p_pool = threading.Event()
+        single_has_pool = threading.Event()
+        release_single = threading.Event()
+        p2p_connected = threading.Event()
+        p2p_pid: list[int] = []
+        failures: list[BaseException] = []
+        single_result = {"allocated": [], "errors": [], "skipped": []}
+        p2p_result = {"allocated": [], "errors": [], "skipped": []}
+        real_intent_transaction = intent_state.intent_transaction
+
+        def pool_finder(_family, _site):
+            p2p_ready.set()
+            assert request_p2p_pool.wait(timeout=30), "the P2P pool request was not released"
+            return self.pool
+
+        @contextmanager
+        def observe_single_intent(footprint):
+            with real_intent_transaction(footprint) as mutation:
+                if threading.current_thread().name == "single-allocation":
+                    single_has_pool.set()
+                    assert release_single.wait(timeout=30), "the single allocation was not released"
+                yield mutation
+
+        def allocate_single():
+            try:
+                ip_autoassign._reserve_single(
+                    single_interface,
+                    self.management_a,
+                    "ipv4",
+                    self.pool,
+                    single_result,
+                    push=False,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        def allocate_p2p():
+            try:
+                with connections["default"].cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    p2p_pid.append(cursor.fetchone()[0])
+                p2p_connected.set()
+                ip_autoassign._assign_one_p2p_family(
+                    p2p_interface,
+                    peer_interface,
+                    self.management_a,
+                    self.management_b,
+                    "ipv4",
+                    self.device_a.site,
+                    p2p_result,
+                    pool_finder=pool_finder,
+                    no_pool_reason=lambda _family: "no pool",
+                    push=False,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        with patch.object(intent_state, "intent_transaction", side_effect=observe_single_intent):
+            p2p = threading.Thread(target=allocate_p2p, name="p2p-allocation")
+            single = threading.Thread(target=allocate_single, name="single-allocation")
+            p2p.start()
+            self.addCleanup(request_p2p_pool.set)
+            self.addCleanup(p2p.join, 30)
+            assert p2p_connected.wait(timeout=30), "the P2P allocation never opened its database connection"
+            assert p2p_ready.wait(timeout=30), (failures, p2p_result)
+            single.start()
+            self.addCleanup(release_single.set)
+            self.addCleanup(single.join, 30)
+            assert single_has_pool.wait(timeout=30), (failures, single_result)
+            request_p2p_pool.set()
+            try:
+                wait_until_postgres_blocks(p2p_pid[0], "the P2P allocation")
+            finally:
+                release_single.set()
+            p2p.join(timeout=30)
+            single.join(timeout=30)
+
+        assert not p2p.is_alive(), "the P2P allocation did not finish"
+        assert not single.is_alive(), "the single allocation did not finish"
+        assert not failures, failures
+        self.assertNotIn("deadlock", str(p2p_result["errors"]).lower())
+        self.assertEqual(single_result["errors"], [])
+
+    def test_link_role_wrapper_locks_the_pool_before_intent(self):
+        from netbox_nso_plugin import intent_state, ip_autoassign
+        from netbox_nso_plugin.link_role import provision_link_role
+        from netbox_nso_plugin.models import NSOLinkRole, NSOLinkRoleAssignment
+
+        from ._outbox_case import wait_until_postgres_blocks
+
+        wrapper_interface = Interface.objects.create(device=self.device_a, name="Loopback2", type="virtual")
+        pool_role = Role.objects.create(name="Single wrapper pool", slug="single-wrapper-pool")
+        self.pool.role = pool_role
+        self.pool.save(update_fields=["role"])
+        role = NSOLinkRole.objects.create(
+            name="single-wrapper-lock",
+            slug="single-wrapper-lock",
+            link_type="single",
+            assign_ipv4=True,
+            assign_ipv6=False,
+            ipv4_pool_role=pool_role.slug,
+        )
+        NSOLinkRoleAssignment.objects.create(role=role, interface=wrapper_interface)
+        single_has_pool = threading.Event()
+        release_single = threading.Event()
+        wrapper_connected = threading.Event()
+        wrapper_at_assignment = threading.Event()
+        release_wrapper = threading.Event()
+        wrapper_pid: list[int] = []
+        failures: list[BaseException] = []
+        single_result = {"allocated": [], "errors": [], "skipped": []}
+        wrapper_result: list[dict] = []
+        real_intent_transaction = intent_state.intent_transaction
+        real_assign_ips_for_role = ip_autoassign.assign_ips_for_role
+
+        def observe_single_intent(footprint):
+            if threading.current_thread().name == "direct-single-allocation":
+                single_has_pool.set()
+                assert release_single.wait(timeout=30), "the direct allocation was not released"
+            return real_intent_transaction(footprint)
+
+        def pause_wrapper_assignment(*args, **kwargs):
+            wrapper_at_assignment.set()
+            assert release_wrapper.wait(timeout=30), "the link-role assignment was not released"
+            return real_assign_ips_for_role(*args, **kwargs)
+
+        def allocate_single():
+            try:
+                ip_autoassign._reserve_single(
+                    self.interface_a,
+                    self.management_a,
+                    "ipv4",
+                    self.pool,
+                    single_result,
+                    push=False,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        def provision_wrapper():
+            try:
+                with connections["default"].cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    wrapper_pid.append(cursor.fetchone()[0])
+                wrapper_connected.set()
+                wrapper_result.append(provision_link_role(wrapper_interface))
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        with (
+            patch.object(intent_state, "intent_transaction", side_effect=observe_single_intent),
+            patch.object(ip_autoassign, "assign_ips_for_role", side_effect=pause_wrapper_assignment),
+        ):
+            single = threading.Thread(target=allocate_single, name="direct-single-allocation")
+            wrapper = threading.Thread(target=provision_wrapper, name="link-role-provision")
+            single.start()
+            self.addCleanup(release_single.set)
+            self.addCleanup(single.join, 30)
+            assert single_has_pool.wait(timeout=30), (failures, single_result)
+            wrapper.start()
+            self.addCleanup(release_wrapper.set)
+            self.addCleanup(wrapper.join, 30)
+            assert wrapper_connected.wait(timeout=30), "link-role provisioning never opened its connection"
+            blocked_failure = None
+            try:
+                wait_until_postgres_blocks(wrapper_pid[0], "link-role provisioning")
+            except BaseException as exc:  # noqa: BLE001
+                blocked_failure = exc
+            finally:
+                release_single.set()
+                release_wrapper.set()
+            single.join(timeout=30)
+            wrapper.join(timeout=30)
+
+        assert not single.is_alive(), "the direct allocation did not finish"
+        assert not wrapper.is_alive(), "link-role provisioning did not finish"
+        if blocked_failure is not None:
+            raise blocked_failure
+        assert wrapper_at_assignment.is_set(), "link-role provisioning never reached IP assignment"
+        assert not failures, failures
+        self.assertEqual(single_result["errors"], [])
+        self.assertEqual(wrapper_result[0]["errors"], [])
 
 
 class TestRollbackAutoAssigned(TestCase):

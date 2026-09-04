@@ -351,9 +351,10 @@ def provision_link_role(interface) -> dict:
     partial-failure **rollback**.
     """
     from django.db import transaction
+    from ipam.models import Prefix
 
     from .intent_state import intent_transaction
-    from .ip_autoassign import assign_ips_for_role
+    from .ip_autoassign import _resolve_role_pool, assign_ips_for_role
     from .signals import suppress_intent_push
 
     role, other_end = resolve_role(interface)
@@ -403,6 +404,12 @@ def provision_link_role(interface) -> dict:
             return summary
         mgmt_by_device[end.device_id] = end_mgmt
 
+    site = getattr(interface.device, "site", None)
+    resolved_pool_ids = {}
+    for spec in intent_bundle(role).pools:
+        pool = _resolve_role_pool(spec, None, site)
+        resolved_pool_ids[spec.family] = pool.pk if pool is not None else None
+
     def _collect(res, kind):
         if isinstance(res.get("errors"), list):
             summary["errors"].extend({"kind": kind, **e} for e in res["errors"])
@@ -410,29 +417,38 @@ def provision_link_role(interface) -> dict:
             summary["errors"].append({"kind": kind, "reason": res["error"], "interface": res.get("interface")})
 
     try:
-        with intent_transaction(_provision_link_footprint(role, pairs, device_ids)):
-            with suppress_intent_push():
-                ip_res = assign_ips_for_role(
-                    interface,
-                    role,
-                    other_end,
-                    push=False,
-                    mgmt=mgmt_by_device[interface.device_id],
-                    peer_mgmt=(mgmt_by_device.get(other_end.device_id) if other_end is not None else None),
-                )
-                summary["ip"] = ip_res
-                _collect(ip_res, "ip")
-                for end, peer in pairs:
-                    end_mgmt = mgmt_by_device[end.device_id]
-                    d = apply_description_for_role(end, role, peer, push=False, mgmt=end_mgmt)
-                    summary["descriptions"].append(d)
-                    _collect(d, "description")
-                    g = enable_igp_for_role(end, role, push=False, mgmt=end_mgmt)
-                    summary["igp"].append(g)
-                    _collect(g, "igp")
-            if summary["errors"]:
-                raise _ProvisionRollback()
-            _enqueue_provisioned(role, device_ids)
+        with transaction.atomic():
+            locked_pools = {
+                pool.pk: pool
+                for pool in Prefix.objects.select_for_update(of=("self",))
+                .filter(pk__in={pk for pk in resolved_pool_ids.values() if pk is not None})
+                .order_by("pk")
+            }
+            resolved_pools = {family: locked_pools.get(pool_id) for family, pool_id in resolved_pool_ids.items()}
+            with intent_transaction(_provision_link_footprint(role, pairs, device_ids)):
+                with suppress_intent_push():
+                    ip_res = assign_ips_for_role(
+                        interface,
+                        role,
+                        other_end,
+                        push=False,
+                        mgmt=mgmt_by_device[interface.device_id],
+                        peer_mgmt=(mgmt_by_device.get(other_end.device_id) if other_end is not None else None),
+                        resolved_pools=resolved_pools,
+                    )
+                    summary["ip"] = ip_res
+                    _collect(ip_res, "ip")
+                    for end, peer in pairs:
+                        end_mgmt = mgmt_by_device[end.device_id]
+                        d = apply_description_for_role(end, role, peer, push=False, mgmt=end_mgmt)
+                        summary["descriptions"].append(d)
+                        _collect(d, "description")
+                        g = enable_igp_for_role(end, role, push=False, mgmt=end_mgmt)
+                        summary["igp"].append(g)
+                        _collect(g, "igp")
+                if summary["errors"]:
+                    raise _ProvisionRollback()
+                _enqueue_provisioned(role, device_ids)
     except _ProvisionRollback:
         summary["rolled_back"] = True
         return summary
