@@ -457,7 +457,7 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
             assert second_connected.wait(timeout=30), "the second allocation never opened its connection"
             blocked_failure = None
             try:
-                wait_until_postgres_blocks(second_pid[0], "the second allocation")
+                wait_until_postgres_blocks(second_pid[0], "the second allocation", locktype="transactionid")
             except BaseException as exc:  # noqa: BLE001
                 blocked_failure = exc
             finally:
@@ -569,7 +569,7 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
             assert single_has_pool.wait(timeout=30), (failures, single_result)
             request_p2p_pool.set()
             try:
-                wait_until_postgres_blocks(p2p_pid[0], "the P2P allocation")
+                wait_until_postgres_blocks(p2p_pid[0], "the P2P allocation", locktype="transactionid")
             finally:
                 release_single.set()
             p2p.join(timeout=30)
@@ -667,7 +667,7 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
             assert wrapper_connected.wait(timeout=30), "link-role provisioning never opened its connection"
             blocked_failure = None
             try:
-                wait_until_postgres_blocks(wrapper_pid[0], "link-role provisioning")
+                wait_until_postgres_blocks(wrapper_pid[0], "link-role provisioning", locktype="transactionid")
             except BaseException as exc:  # noqa: BLE001
                 blocked_failure = exc
             finally:

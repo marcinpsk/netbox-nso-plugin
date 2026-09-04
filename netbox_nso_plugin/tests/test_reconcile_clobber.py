@@ -175,7 +175,7 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         assert backfill_started.wait(timeout=30)
         blocked_failure = None
         try:
-            wait_until_postgres_blocks(backfill_pid[0], "the backfill")
+            wait_until_postgres_blocks(backfill_pid[0], "the backfill", locktype="advisory")
         except BaseException as exc:  # noqa: BLE001 (re-raised after both threads finish)
             blocked_failure = exc
         finally:

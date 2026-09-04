@@ -192,17 +192,26 @@ def in_thread(work, timeout=30):
         raise errors[0]
 
 
-def wait_until_postgres_blocks(pid: int, description: str, timeout: float = 5.0) -> None:
+def wait_until_postgres_blocks(
+    pid: int,
+    description: str,
+    timeout: float = 5.0,
+    *,
+    locktype: str | None = None,
+) -> None:
     """Wait until PostgreSQL reports that one test connection is waiting for a lock."""
     from django.db import connection
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted)",
-                [pid],
-            )
+            query = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted"
+            params: list = [pid]
+            if locktype is not None:
+                query += " AND locktype = %s"
+                params.append(locktype)
+            query += ")"
+            cursor.execute(query, params)
             if cursor.fetchone()[0]:
                 return
         time.sleep(0.01)

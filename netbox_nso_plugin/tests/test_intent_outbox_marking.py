@@ -296,7 +296,7 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
             workers.append(worker)
             self.addCleanup(worker.join, 30)
             assert started.wait(timeout=30)
-            wait_until_postgres_blocks(writer_pid[0], "the writer")
+            wait_until_postgres_blocks(writer_pid[0], "the writer", locktype="transactionid")
             return rendered
 
         with patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit):

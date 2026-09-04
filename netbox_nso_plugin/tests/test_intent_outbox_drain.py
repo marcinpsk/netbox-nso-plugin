@@ -532,7 +532,7 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         self.addCleanup(claimant.join, 30)
         self.addCleanup(release.set)
         assert claim_started.wait(timeout=30), "the claimant never opened its database connection"
-        wait_until_postgres_blocks(claimant_pid[0], "the claim")
+        wait_until_postgres_blocks(claimant_pid[0], "the claim", locktype="transactionid")
 
         release.set()
         writer.join(timeout=30)

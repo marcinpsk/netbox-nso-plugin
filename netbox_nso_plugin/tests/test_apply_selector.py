@@ -1466,7 +1466,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             renamer.start()
             try:
                 self.assertTrue(renamer_ready.wait(10), "the rename did not reach its database write")
-                wait_until_postgres_blocks(renamer_pid[0], "the rename")
+                wait_until_postgres_blocks(renamer_pid[0], "the rename", locktype="advisory")
                 self.assertFalse(rename_acquired_vlan.is_set(), "the rename bypassed the attachment's VLAN lock")
             finally:
                 release_attach.set()

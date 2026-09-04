@@ -66,6 +66,58 @@ class _ConcurrencyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTest
         NSOIntentOutboxEntry.objects.all().delete()
 
 
+class TestTheLockProbeReadsTheLockClassItIsGiven(_CascadeFlushMixin, TransactionTestCase):
+    """``wait_until_postgres_blocks`` must answer for the lock class it is named, not for any block.
+
+    Every contention probe in this module names a ``locktype``. If the helper took the
+    argument and ignored it, a block of an unrelated class would satisfy the probe and
+    every caller would stay green while the window it means to open never opened.
+    """
+
+    #: Test-only single-argument advisory key; the deployment gate's own key is 1_503_003_006.
+    LOCK_KEY = 1_503_003_937
+
+    def test_a_backend_blocked_on_an_advisory_lock_answers_only_the_advisory_probe(self):
+        from django.db import connections
+
+        connected = threading.Event()
+        contender_pid: list[int] = []
+        failures: list[BaseException] = []
+
+        def contend():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    contender_pid.append(cursor.fetchone()[0])
+                connected.set()
+                with transaction.atomic(), connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_xact_lock(%s)", [self.LOCK_KEY])
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                connections.close_all()
+
+        contender = threading.Thread(target=contend)
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", [self.LOCK_KEY])
+            contender.start()
+            # Registered before this transaction ends, which is the release that unblocks it.
+            self.addCleanup(contender.join, 30)
+            assert connected.wait(timeout=30), "the contender never opened its connection"
+
+            # The contender waits for an advisory lock and for nothing else.
+            wait_until_postgres_blocks(contender_pid[0], "the contender", locktype="advisory")
+            wait_until_postgres_blocks(contender_pid[0], "the contender")
+            with self.assertRaises(AssertionError) as refused:
+                wait_until_postgres_blocks(contender_pid[0], "the contender", timeout=0.5, locktype="transactionid")
+            assert "the contender never blocked" in str(refused.exception)
+
+        contender.join(timeout=30)
+        assert not contender.is_alive(), "the contender never took the released lock"
+        assert failures == []
+
+
 class TestTheLeaseIsReadOnTheDatabaseClock(_ConcurrencyCase):
     """O1.21(a): an application clock running ahead may not expire a live claim."""
 
@@ -193,7 +245,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
             self.addCleanup(remover.join, 30)
             self.addCleanup(release_render.set)
             assert remover_started.wait(timeout=30), "the remover never opened its database connection"
-            wait_until_postgres_blocks(remover_pid[0], "the deletion")
+            wait_until_postgres_blocks(remover_pid[0], "the deletion", locktype="transactionid")
 
             release_render.set()
             claimant.join(timeout=30)
@@ -294,7 +346,7 @@ class TestUntrackedNativeDeletesSerializeWithSaves(_ConcurrencyCase):
             self.addCleanup(saving.join, 30)
             assert save_connected.wait(timeout=30), "the concurrent save never opened its database connection"
             try:
-                wait_until_postgres_blocks(save_pid[0], "the concurrent native save")
+                wait_until_postgres_blocks(save_pid[0], "the concurrent native save", locktype="transactionid")
                 with connection.cursor() as cursor:
                     cursor.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", [save_pid[0]])
                     self.assertEqual(cursor.fetchone()[0], "Lock")
@@ -569,7 +621,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             try:
                 assert held.wait(timeout=30), "the removal never reached its hold point"
                 assert reown_connected.wait(timeout=30), "the re-ownership never opened its connection"
-                wait_until_postgres_blocks(reown_pid[0], "the re-ownership")
+                wait_until_postgres_blocks(reown_pid[0], "the re-ownership", locktype="advisory")
             except BaseException as exc:  # noqa: BLE001 (reported on the caller's thread)
                 probe_failures.append(exc)
             finally:
