@@ -704,6 +704,61 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert row.intent_generation == snapshots[0]["armed_generation"]
         assert revision.revision == before, "a skipped restore committed an intent revision"
 
+    def test_a_concurrent_delete_does_not_stop_later_snapshot_restores(self):
+        """A deleted candidate is a no-op, so later snapshots still restore."""
+        from netbox_nso_plugin.intent_drift import _backfill_static_route_generations, _safe_restore
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        _, mgmt = self._managed_device("restore-delete-race", 8112)
+        self._own_route(mgmt, "198.18.34.0/24", "198.18.34.1")
+        self._own_route(mgmt, "198.18.35.0/24", "198.18.35.1")
+        snapshots = _backfill_static_route_generations(mgmt)
+        first_pk = snapshots[0]["pk"]
+        second_pk = snapshots[1]["pk"]
+        candidate_loaded = threading.Barrier(2, timeout=30)
+        row_deleted = threading.Barrier(2, timeout=30)
+        errors: list[BaseException] = []
+        candidate_query_seen = False
+
+        def wait_after_first_candidate_query(execute, sql, params, many, context):
+            nonlocal candidate_query_seen
+            result = execute(sql, params, many, context)
+            if not candidate_query_seen and NSOStaticRouteState._meta.db_table in sql:
+                candidate_query_seen = True
+                candidate_loaded.wait()
+                row_deleted.wait()
+            return result
+
+        def delete_first_row():
+            try:
+                candidate_loaded.wait()
+                current = NSOStaticRouteState.objects.get(pk=first_pk)
+                with without_commit_drain(), intent_transaction(footprint_for_instance(current)):
+                    current.delete()
+                row_deleted.wait()
+            except BaseException as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+                row_deleted.abort()
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=delete_first_row)
+        worker.start()
+        with connection.execute_wrapper(wait_after_first_candidate_query):
+            restored, unrestored = _safe_restore(snapshots, mgmt.device_id)
+        worker.join(timeout=60)
+
+        assert not worker.is_alive(), "concurrent row deletion did not finish"
+        assert errors == []
+        assert candidate_query_seen
+        assert restored == 1
+        assert [snapshot["pk"] for snapshot in unrestored] == [first_pk]
+        assert not NSOStaticRouteState.objects.filter(pk=first_pk).exists()
+        second = NSOStaticRouteState.objects.get(pk=second_pk)
+        assert second.intent_generation == UNALLOCATED
+
     def test_partial_restore_reports_the_row_left_armed(self):
         """A compare-and-set miss stays in the failed result's armed subset."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet

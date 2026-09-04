@@ -446,7 +446,7 @@ def _restore_static_route_generations(before: list[dict]) -> int:
                 with suppress_intent_push():
                     state.save(update_fields=fields)
                 restored += 1
-        except _RestoreNoOp:
+        except (_RestoreNoOp, NSOStaticRouteState.DoesNotExist):
             continue
     return restored
 
