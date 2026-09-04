@@ -743,6 +743,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertTrue(required <= declared, required - declared)
 
     def test_registry_has_frozen_ranks_and_trace_fixtures(self):
+        self.assertEqual(len(SOURCE_MODEL_RANKS), len(set(SOURCE_MODEL_RANKS)))
         declared = set(renderer_input_specs())
         classified = set(SOURCE_MODEL_RANKS) | set(OVERLAY_MODEL_RANKS) | {"netbox_nso_plugin.nsodevicemanagement"}
         self.assertEqual(declared - classified, set())

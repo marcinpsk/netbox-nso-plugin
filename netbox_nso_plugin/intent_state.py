@@ -76,7 +76,6 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.isisinterfacelevel",
     "netbox_routing.isisprefixsid",
     "netbox_routing.ospfarea",
-    "netbox_routing.ospfinstance",
     "netbox_routing.ospfinterface",
     "netbox_routing.bgprouter",
     "netbox_routing.bgpscope",
