@@ -193,7 +193,8 @@ def promote_current_intent(
     """CAS stored receipt revisions, create the attempt, and stamp its rows."""
     from . import status_machine as sm
     from .intent_state import OVERLAY_MODEL_RANKS, mirror_refresh
-    from .models import NSOApplyAttempt, NSODeviceManagement, NSOStaticRouteState
+    from .models import NSOApplyAttempt, NSODeviceManagement, NSORoutePolicyState, NSOStaticRouteState
+    from .route_policy_reconciler import _group_mode
     from .signals import suppress_intent_push
 
     expected_scopes = {entry.key for entry in registry.values() if entry.in_protocol}
@@ -219,11 +220,19 @@ def promote_current_intent(
             if model is NSOStaticRouteState and not static_route_stored:
                 continue
             _enter_level(8, (model_ranks[model._meta.label_lower], 0))
-            locked_statuses = list(
-                model.objects.select_for_update(of=("self",))
-                .filter(management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED))
-                .order_by("pk")
-            )
+            locked_statuses = [
+                row
+                for row in (
+                    model.objects.select_for_update(of=("self",))
+                    .filter(management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED))
+                    .order_by("pk")
+                )
+                if not (
+                    model is NSORoutePolicyState
+                    and _group_mode(row.family, row.object_name) == "local"
+                    and row.assigned_object is None
+                )
+            ]
             locked_rows.append((scope, model, locked_statuses))
 
         selected = {

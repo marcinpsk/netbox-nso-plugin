@@ -187,7 +187,7 @@ class TestAttemptSettlement(TestCase):
         identified = self._vlan_row(1637, attempt_id)
         unidentified = self._vlan_row(1638, unidentified_attempt_id)
         self._local_attempt(attempt_id, 74, {"vlan": 504})
-        result = {"vlan_count_by_outcome": {"apply_failed": 1}}
+        result = {"vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 1}}
         evidence = _attempt(
             attempt_id,
             self.adapter_device_id,
@@ -399,6 +399,75 @@ class TestAttemptSettlement(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
+    def test_settled_generation_rejects_a_failed_carrier_snapshot(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+
+        attempt_id = uuid4()
+        row = self._vlan_row(1639, attempt_id)
+        self._local_attempt(attempt_id, 53, {"vlan": 303})
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            53,
+            {"vlan": 303},
+            "settled",
+            result={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        )
+        evidence["generations"][0]["carrier_job_status"] = "failed"
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "settled generation has an invalid carrier snapshot"):
+            settle_apply_attempts(
+                self.management,
+                _payload(self.adapter_device_id, [evidence]),
+                static_route_feed_drained=True,
+            )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_settled_generation_rejects_a_missing_carrier_result(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+
+        attempt_id = uuid4()
+        row = self._vlan_row(1641, attempt_id)
+        self._local_attempt(attempt_id, 55, {"vlan": 305})
+        evidence = _attempt(attempt_id, self.adapter_device_id, 55, {"vlan": 305}, "settled")
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "settled generation has an invalid carrier snapshot"):
+            settle_apply_attempts(
+                self.management,
+                _payload(self.adapter_device_id, [evidence]),
+                static_route_feed_drained=True,
+            )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_settled_generation_rejects_an_unknown_scope_outcome(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+
+        attempt_id = uuid4()
+        row = self._vlan_row(1640, attempt_id)
+        self._local_attempt(attempt_id, 54, {"vlan": 304})
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            54,
+            {"vlan": 304},
+            "settled",
+            result={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0, "unknown": 1}},
+        )
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid vlan outcome counts"):
+            settle_apply_attempts(
+                self.management,
+                _payload(self.adapter_device_id, [evidence]),
+                static_route_feed_drained=True,
+            )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
     def test_a_non_list_generation_collection_is_a_contract_error(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
 
@@ -424,7 +493,14 @@ class TestAttemptSettlement(TestCase):
         attempt_id = uuid4()
         row = self._vlan_row(1631, attempt_id)
         self._local_attempt(attempt_id, 71, {"vlan": 501})
-        evidence = _attempt(attempt_id, self.adapter_device_id, 71, {"vlan": 501}, "settled")
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            71,
+            {"vlan": 501},
+            "settled",
+            result={"vlan_count_by_outcome": {"in_sync": 0, "apply_failed": 0}},
+        )
 
         settle_apply_attempts(
             self.management,

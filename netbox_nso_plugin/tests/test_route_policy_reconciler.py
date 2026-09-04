@@ -134,27 +134,126 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertNotEqual(st.status, "error")
         self.assertEqual(st.object_id, existing.pk)
 
-    def test_deploying_row_settles_in_sync_when_present(self):
-        """A route-policy row marked 'deploying' at Apply settles to in_sync once the
-        device re-reports the object — the accepted→deploying→in_sync apply lifecycle."""
+    def test_deploying_row_waits_for_correlated_apply_evidence(self):
+        """An ordinary device read cannot identify the Apply attempt that it reflects."""
         from uuid import uuid4
 
         self._make_mgmt(self.device)
+        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
-        reconcile_route_policy(self.device, self._payload())  # first read → imported rows
+        payload = {"community_lists": [{"name": "CL-EMPTY", "entries": []}]}
+        reconcile_route_policy(self.device, payload)
         st = NSORoutePolicyState.objects.get(
-            management__device=self.device, family="community_list", object_name="CL-LOCAL"
+            management__device=self.device, family="community_list", object_name="CL-EMPTY"
         )
-        st.status = "deploying"  # Apply marked it deploying
-        st.apply_attempt_id = uuid4()
+        attempt_id = uuid4()
+        st.status = "deploying"
+        st.apply_attempt_id = attempt_id
         st.save(update_fields=["status", "apply_attempt_id"])
 
-        reconcile_route_policy(self.device, self._payload())  # object still present → settle
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, payload)):
+            reconcile_route_policy(self.device, payload)
         st.refresh_from_db()
-        self.assertEqual(st.status, "in_sync")
-        self.assertIsNone(st.apply_attempt_id)
+        self.assertEqual(st.status, "deploying")
+        self.assertEqual(st.apply_attempt_id, attempt_id)
+
+    def test_local_deploying_row_waits_for_correlated_apply_evidence(self):
+        """A LOCAL row is not rendered, so a device read cannot settle its Apply attempt."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-LOCAL",
+            mode="local",
+        )
+        payload = {"community_lists": [{"name": "CL-LOCAL", "entries": []}]}
+        reconcile_route_policy(self.device, payload)
+        state = NSORoutePolicyState.objects.get(
+            management__device=self.device,
+            family="community_list",
+            object_name="CL-LOCAL",
+        )
+        attempt_id = uuid4()
+        state.status = "deploying"
+        state.apply_attempt_id = attempt_id
+        state.save(update_fields=["status", "apply_attempt_id"])
+
+        reconcile_route_policy(self.device, payload)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
+
+    def test_apply_promotes_only_rows_in_the_rendered_route_policy_snapshot(self):
+        """Apply must not bind an omitted LOCAL row to the MASTER carrier evidence."""
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-LOCAL",
+            mode="local",
+        )
+        payload = {
+            "community_lists": [
+                {"name": "CL-MASTER", "entries": []},
+                {"name": "cl-local", "entries": []},
+                {"name": "CL-ATTACHED", "entries": []},
+            ]
+        }
+        reconcile_route_policy(self.device, payload)
+        master = NSORoutePolicyState.objects.get(management=management, object_name="CL-MASTER")
+        local = NSORoutePolicyState.objects.get(management=management, object_name="cl-local")
+        attached_local = NSORoutePolicyState.objects.get(management=management, object_name="CL-ATTACHED")
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-ATTACHED",
+            mode="local",
+        )
+        for row in (master, local, attached_local):
+            with intent_transaction(footprint_for_instance(row)):
+                row.status = "accepted"
+                row.save(update_fields=["status"])
+
+        registry = delivery.delivery_keys()
+        pushed = {}
+        for push_seq, entry in enumerate(
+            (candidate for candidate in registry.values() if candidate.in_protocol),
+            start=1,
+        ):
+            revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope=entry.key)
+            pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
+        attempt_id = uuid4()
+
+        apply_state.promote_current_intent(
+            management,
+            registry,
+            pushed,
+            apply_attempt_id=attempt_id,
+            static_route_stored=False,
+        )
+
+        master.refresh_from_db()
+        local.refresh_from_db()
+        attached_local.refresh_from_db()
+        self.assertEqual(master.status, "deploying")
+        self.assertEqual(master.apply_attempt_id, attempt_id)
+        self.assertEqual(attached_local.status, "deploying")
+        self.assertEqual(attached_local.apply_attempt_id, attempt_id)
+        self.assertEqual(local.status, "accepted")
+        self.assertIsNone(local.apply_attempt_id)
 
     def test_reconciles_all_families(self):
         """One object per family → created in netbox_routing + a state row each."""

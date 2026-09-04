@@ -586,11 +586,12 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 manage_logging=True,
             )
             self.row = NSOLoggingLevelState.objects.create(
-                management=self.mgmt, console_severity="CRITICAL", status="accepted", accepted_at=timezone.now()
+                management=self.mgmt, status="accepted", accepted_at=timezone.now()
             )
 
-    def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
+    def test_apply_sends_an_owned_logging_retraction_and_the_read_keeps_it_deploying(self):
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
         from netbox_nso_plugin.views import _prepare_apply
 
         # The acknowledged baseline an accept-time push leaves behind, which the Apply overrides.
@@ -607,11 +608,23 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
             prepared, selected = _prepare_apply(self.mgmt)
 
         mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
+        self.assertIsNone(mock_put.call_args.args[2])
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
+        attempt_id = self.row.apply_attempt_id
+        self.assertIsNotNone(attempt_id)
         moved_pks = [pk for stream, _model, pks, _previous in prepared.moved for pk in pks if stream == "logging"]
         self.assertIn(self.row.pk, moved_pks)
         self.assertIn("logging", selected)
         with self.assertRaises(TypeError):
             selected["logging"] = 0
+
+        # Removal-generation settlement is tracked by board card #1656.
+        _reconcile_logging_config(
+            self.device,
+            {"hosts": [], "last_refreshed_at": None, "refresh_source": "test"},
+        )
+
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "deploying")
+        self.assertEqual(self.row.apply_attempt_id, attempt_id)

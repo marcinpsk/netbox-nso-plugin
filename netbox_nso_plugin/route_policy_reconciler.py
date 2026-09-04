@@ -683,7 +683,8 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
 
     # #93 — device-caught-up settle for OWNED rows: the operator's intent IS the current
     # NetBox object; when THIS device's capture equals it, the device has caught up —
-    # genuine confirmation, so it may settle accepted/deploying/apply_failed → in_sync.
+    # genuine confirmation, so it may settle accepted/apply_failed to in_sync. A deploying
+    # row needs correlated Apply evidence.
     # (The materialized-content 'matches' below can never see this: settles_owned=False
     # kept staged intent pending forever — example-comm sat 26 days already satisfied.)
     # route_map has no extractor yet (push shape ≠ capture shape) → None → no settle.
@@ -693,7 +694,12 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
         obj,
         exclude_members=(list(state.unsupported_members or []) or None) if family == "community_list" else None,
     ):
-        state.status = sm.on_reconcile(state.status, matches=True, settles_owned=True)
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=True,
+            settles_owned=True,
+            settles_deploying=False,
+        )
 
     # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
     # device confirmation, so it must not settle an owned row (settles_owned=False).
@@ -704,7 +710,13 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     if diverged and _owner_can_refresh(state):
         _refresh_owner(state, family, obj, ct, captured, entries_hash, now)
         return state, False
-    state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)
+    state.status = sm.on_reconcile(
+        state.status,
+        matches=not diverged,
+        conflict=diverged,
+        settles_owned=False,
+        settles_deploying=False,
+    )
     should_fill = state.status != sm.CONFLICT
     if should_fill:
         state.content_hash = entries_hash
@@ -932,7 +944,13 @@ def _upsert_local_state(mgmt, family, name, captured, now):
         )
     if not new_row:
         changed = state.content_hash != entries_hash
-        state.status = sm.on_reconcile(state.status, matches=not changed, conflict=False, settles_owned=False)
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=not changed,
+            conflict=False,
+            settles_owned=False,
+            settles_deploying=False,
+        )
         state.content_hash = entries_hash
     # LOCAL is never materialized; drop any object link left from a prior MASTER classification.
     state.captured = captured
@@ -1172,7 +1190,7 @@ def route_policy_reconcile_plan(device, payload: dict):
         )
     except ImportError:
         return ReconcileMutationPlan(MutationFootprint())
-    return ReconcileMutationPlan(footprint, changes_content=changes_content)
+    return ReconcileMutationPlan(footprint, changes_content=changes_content, settles_deploying=False)
 
 
 def _reconcile_route_policy(device, payload: dict) -> list:

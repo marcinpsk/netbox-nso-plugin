@@ -56,6 +56,7 @@ def svi_reconcile_plan(device, payload: dict):
             ),
         ),
         changes_content=changes_content,
+        settles_deploying=False,
     )
 
 
@@ -115,7 +116,7 @@ def _reconcile_svi(device, payload: dict) -> list:
             # restores the old device VRF and the pending change is lost.
             desired_vid = state.vlan.vid if state.vlan else None
             matches = desired_vid == vid and state.svi_type == device_type and state.vrf == device_vrf
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             # Unowned rows are device mirrors and continue tracking every reported value.
             state.vlan = vlan

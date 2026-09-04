@@ -188,39 +188,46 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.vrf, "CUSTOMER")
         self.assertEqual(state.status, "in_sync")
 
-    def test_deploying_waits_for_matching_device_values_before_settling(self):
-        """Reappearance alone must not confirm an Apply while the device still has old values."""
+    def test_deploying_waits_for_correlated_apply_evidence(self):
+        """An ordinary device read cannot identify the Apply attempt that it reflects."""
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
-        self._state(name="Vlan100", vid=100, status="deploying")
+        state = self._state(name="Vlan100", vid=100, status="deploying")
+        self._state(name="Vlan200", vid=200, status="in_sync")
+        attempt_id = state.apply_attempt_id
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"}]})
-        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "deploying")
+        state = NSOSVIState.objects.get(interface__name="Vlan100")
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
 
         reconcile_svi(
             self.device,
             {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]},
         )
-        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "in_sync")
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
 
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned SVI overlay must NOT be hard-deleted when the device stops reporting it.
 
         NSOSVIState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows destroys
-        ownership. A confirmed row that vanishes surfaces as ``changed``. That content
-        change advances the scope revision and re-pends another deploying row.
+        ownership. A deploying row retains its correlated Apply attempt. A confirmed row
+        that vanishes surfaces as ``changed`` and advances the scope revision.
         """
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
         deploying = self._state(name="Vlan100", vid=100, status="deploying")
+        attempt_id = deploying.apply_attempt_id
         confirmed = self._state(name="Vlan200", vid=200, status="in_sync")
         reconcile_svi(self.device, {"interfaces": []})  # device stops reporting all SVIs
         assert NSOSVIState.objects.filter(pk=deploying.pk).exists(), "deploying (apply-in-flight) overlay deleted"
         assert NSOSVIState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         deploying.refresh_from_db()
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt_id
         assert NSOSVIState.objects.get(pk=confirmed.pk).status == "changed"
 
     def test_push_builds_owned_snapshot(self):

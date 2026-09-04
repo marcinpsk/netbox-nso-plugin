@@ -372,6 +372,14 @@ class IntentMutationProtocolError(RuntimeError):
     """A renderer input write did not hold its complete mutation footprint."""
 
 
+class IntentTransactionNoOp(Exception):
+    """Unwind an intent transaction when a locked precondition rejects the mutation."""
+
+    def __init__(self, result=None):
+        super().__init__()
+        self.result = result
+
+
 class RendererTargetsChanged(IntentMutationProtocolError):
     """A source row changed the devices that render it during acquisition."""
 
@@ -448,6 +456,7 @@ class ReconcileMutationPlan:
 
     footprint: MutationFootprint
     changes_content: bool = False
+    settles_deploying: bool = True
     validate_after_acquire: Callable[[], None] | None = field(default=None, compare=False, repr=False)
 
 
@@ -1677,6 +1686,7 @@ def _acquire(
     *,
     bump: bool = True,
     join_deployment_gate: bool = True,
+    settles_deploying: bool = True,
 ) -> None:
     from .apply_state import (
         _enter_level,
@@ -1737,7 +1747,7 @@ def _acquire(
             if row_ref.pk is None:
                 continue
             row = apps.get_model(row_ref.model_label).objects.get(pk=row_ref.pk)
-            if row.status == "deploying":
+            if row.status == "deploying" and settles_deploying:
                 row.status = "accepted"
                 update_fields = ["status"]
                 if hasattr(row, "apply_attempt_id"):
@@ -1747,7 +1757,7 @@ def _acquire(
 
 
 @contextlib.contextmanager
-def intent_transaction(footprint: MutationFootprint):
+def intent_transaction(footprint: MutationFootprint, *, settles_deploying: bool = True):
     """Acquire L2-L8, bump at L7, then grant the immutable L9 write permit."""
     _discard_rolled_back_implicit_permit()
     active = _ACTIVE_PERMIT.get()
@@ -1762,7 +1772,7 @@ def intent_transaction(footprint: MutationFootprint):
         permit = _Permit(footprint=footprint, dml_kind="content")
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint)
+            _acquire(footprint, settles_deploying=settles_deploying)
             yield permit
         finally:
             _ACTIVE_PERMIT.reset(token)
@@ -1793,8 +1803,11 @@ def mirror_transaction(footprint: MutationFootprint):
 @contextlib.contextmanager
 def reconcile_transaction(plan: ReconcileMutationPlan):
     """Acquire a read plan with the permit required by its canonical fragment delta."""
-    mutation = intent_transaction if plan.changes_content else mirror_transaction
-    with mutation(plan.footprint) as permit:
+    if plan.changes_content:
+        mutation = intent_transaction(plan.footprint, settles_deploying=plan.settles_deploying)
+    else:
+        mutation = mirror_transaction(plan.footprint)
+    with mutation as permit:
         if plan.validate_after_acquire is not None:
             plan.validate_after_acquire()
         yield permit

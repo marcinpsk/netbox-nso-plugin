@@ -77,6 +77,10 @@ def _validate_generation(raw) -> dict:
         or any(value is not None and not _positive_int(value) for value in raw["source_push_seq"].values())
     ):
         raise EvidenceInvariantError("deployment evidence generation has invalid stream provenance")
+    if raw["status"] == "settled" and (
+        raw["carrier_job_status"] != "succeeded" or not isinstance(raw["carrier_job_result"], dict)
+    ):
+        raise EvidenceInvariantError("settled generation has an invalid carrier snapshot")
     _parse_time(raw["updated_at"])
     return raw
 
@@ -195,6 +199,19 @@ def _failure_message(disposition, attempt_id, generation, scope):
     )
 
 
+def _scope_result_is_success(generation, scope: str) -> bool:
+    """Return whether the correlated carrier reports a successful scope snapshot."""
+    result = generation.get("carrier_job_result")
+    counts = result.get(f"{scope}_count_by_outcome") if isinstance(result, dict) else None
+    if (
+        not isinstance(counts, dict)
+        or set(counts) != {"in_sync", "apply_failed"}
+        or any(type(count) is not int or count < 0 for count in counts.values())
+    ):
+        raise EvidenceInvariantError(f"deployment evidence has invalid {scope} outcome counts")
+    return counts["in_sync"] > 0 and counts["apply_failed"] == 0
+
+
 def _load_attempts(management, deployment_evidence, rows_by_scope, required_attempt_ids=()):
     from .models import NSOApplyAttempt
 
@@ -254,6 +271,9 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
                 continue
             if disposition == "settled":
                 if scope == "static_route" and not static_route_feed_drained:
+                    continue
+                if scope != "static_route" and _scope_result_is_success(generation, scope):
+                    decisions.append((scope, row, "in_sync", "", False))
                     continue
                 if now - _parse_time(generation["updated_at"]) < grace:
                     continue
