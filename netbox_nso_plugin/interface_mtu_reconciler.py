@@ -86,6 +86,7 @@ def interface_mtu_reconcile_plan(device, payload: dict):
         saves=saves,
         deletes=deletes,
         planned_at=planned_at,
+        settles_deploying=False,
         execution=_ReconcileExecution(tuple(operations), tuple(rows)),
     )
 
