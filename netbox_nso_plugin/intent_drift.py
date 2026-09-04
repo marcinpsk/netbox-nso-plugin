@@ -297,6 +297,10 @@ class _PushNotAcknowledged(Exception):
     """The adapter did not answer this device's push with a stored count."""
 
 
+class _StaticRouteBackfillNoOp(Exception):
+    """The authoritative read found no static-route generation to arm."""
+
+
 def _backfill_static_route_generations(mgmt) -> list[dict]:
     """Arm every owned overlay of *mgmt* still on the unallocated sentinel.
 
@@ -346,31 +350,36 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     if not candidates:
         return []
     footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
-    with intent_transaction(footprint):
-        rows = list(
-            NSOStaticRouteState.objects.filter(
-                signals.PUSHED_STATIC_ROUTE_FILTER,
-                pk__in=[row.pk for row in candidates],
-                intent_generation=UNALLOCATED,
-            ).order_by("management_id", "pk")
-        )
-        armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
-        before = [
-            {"pk": row.pk, "status": row.status, **{field: getattr(row, field) for field in armed_fields}}
-            for row in rows
-        ]
-        with signals.suppress_intent_push():
-            for row in rows:
-                signals._arm_static_route_generation(row)
-                update_fields = list(armed_fields)
-                if row.status == DEPLOYING:
-                    row.status = "accepted"
-                    update_fields.append("status")
-                row.save(update_fields=update_fields)
-        for snapshot, row in zip(before, rows, strict=True):
-            # Restore only while both lifecycle coordinates remain as this pass left them.
-            snapshot["armed_generation"] = row.intent_generation
-            snapshot["armed_status"] = row.status
+    try:
+        with intent_transaction(footprint):
+            rows = list(
+                NSOStaticRouteState.objects.filter(
+                    signals.PUSHED_STATIC_ROUTE_FILTER,
+                    pk__in=[row.pk for row in candidates],
+                    intent_generation=UNALLOCATED,
+                ).order_by("management_id", "pk")
+            )
+            if not rows:
+                raise _StaticRouteBackfillNoOp
+            armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
+            before = [
+                {"pk": row.pk, "status": row.status, **{field: getattr(row, field) for field in armed_fields}}
+                for row in rows
+            ]
+            with signals.suppress_intent_push():
+                for row in rows:
+                    signals._arm_static_route_generation(row)
+                    update_fields = list(armed_fields)
+                    if row.status == DEPLOYING:
+                        row.status = "accepted"
+                        update_fields.append("status")
+                    row.save(update_fields=update_fields)
+            for snapshot, row in zip(before, rows, strict=True):
+                # Restore only while both lifecycle coordinates remain as this pass left them.
+                snapshot["armed_generation"] = row.intent_generation
+                snapshot["armed_status"] = row.status
+    except _StaticRouteBackfillNoOp:
+        return []
     logger.info("Armed %s static-route overlay(s) of device %s from the generation sentinel", len(rows), mgmt.device_id)
     return before
 

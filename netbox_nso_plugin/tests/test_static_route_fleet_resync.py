@@ -454,9 +454,13 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
         from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOIntentRevision
 
         _, mgmt = self._managed_device("arming-race", 8106)
         row = self._own_route(mgmt, "198.18.32.0/24", "198.18.32.1")
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="static_route")
+        initial_revision = revision.revision
+        revision_before_arming: list[int] = []
         real_intent_transaction = intent_state.intent_transaction
 
         @contextlib.contextmanager
@@ -469,6 +473,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 route.next_hop = None
                 route.interface_next_hop = "Ethernet1/1"
                 route.save(update_fields=["next_hop", "interface_next_hop"])
+            revision.refresh_from_db()
+            revision_before_arming.append(revision.revision)
             with real_intent_transaction(footprint):
                 yield
 
@@ -479,6 +485,10 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(armed, [])
         self.assertEqual(row.intent_generation, UNALLOCATED)
         self.assertIsNone(row.generation_started_at)
+        self.assertEqual(len(revision_before_arming), 1)
+        self.assertGreater(revision_before_arming[0], initial_revision)
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, revision_before_arming[0])
 
     def test_a_rejected_push_keeps_its_reason_on_the_device(self):
         """Codex S6 P2 — the rollback undoes the arming, and must not undo the diagnosis.
