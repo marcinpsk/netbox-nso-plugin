@@ -1594,8 +1594,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory' "
-                "AND classid = ANY(%s) AND objid = %s",
-                [namespaces, lock_id],
+                "AND classid = ANY(%s)",
+                [namespaces],
             )
             self.assertEqual(cursor.fetchone()[0], 0)
 
