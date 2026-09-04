@@ -261,7 +261,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         if attempted >= MAX_RELINKS_PER_RUN:
             _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
-        expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name)
+        expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
         try:
             from .intent_state import footprint_for_instance, intent_transaction
 
@@ -269,7 +269,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 current = type(mgmt).objects.get(pk=mgmt.pk)
                 if (
                     current.source_rekey_pending
-                    or (current.nso_instance_id, current.nso_device_name) != expected_source
+                    or (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
                 ):
                     raise _LinkReconcileNoOp
                 # Stamp for being TRIED, not for succeeding, and before the try: whether the

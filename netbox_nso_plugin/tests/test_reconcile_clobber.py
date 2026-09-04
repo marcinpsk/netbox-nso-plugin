@@ -23,7 +23,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
-from ._outbox_case import content_bulk_update, wait_until_postgres_blocks, without_commit_drain
+from ._outbox_case import content_bulk_update, mirror_update, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_sync_cache import _SyncCacheTestBase
 
@@ -284,6 +284,54 @@ class TestLinkReconcileCannotRestoreSourceState(_SyncCacheTestBase):
         self.assertEqual(mgmt.nso_device_name, "cache-rekeyed")
         self.assertTrue(mgmt.source_rekey_pending)
         self.assertEqual(mgmt.adapter_device_id, 196)
+        revisions_after = {
+            key: NSOIntentRevision.objects.get(device_id=key[0], scope=key[1]).revision for key in revision_keys
+        }
+        self.assertEqual(revisions_after, revisions_before)
+
+    def test_a_stale_snapshot_cannot_overwrite_a_remapped_adapter_id(self):
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-stale-adapter-id", 196)
+        snapshot = (
+            [mgmt],
+            {
+                196: {
+                    "id": 196,
+                    "nso_instance": "other-instance",
+                    "nso_device_name": "other-device",
+                    "netbox_device_id": None,
+                }
+            },
+            {},
+        )
+        revision_keys = intent_state.footprint_for_instance(mgmt).revision_keys
+        revisions_before = {
+            key: NSOIntentRevision.objects.get(device_id=key[0], scope=key[1]).revision for key in revision_keys
+        }
+        real_footprint_for_instance = intent_state.footprint_for_instance
+
+        def remap_before_acquisition(instance):
+            mirror_update(NSODeviceManagement.objects.get(pk=mgmt.pk), adapter_device_id=197)
+            return real_footprint_for_instance(instance)
+
+        with (
+            patch("netbox_nso_plugin.intent_state.footprint_for_instance", side_effect=remap_before_acquisition),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 198}) as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify") as notify,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 197)
+        self.assertEqual((broken, attempted), (1, 0))
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        notify.assert_not_called()
         revisions_after = {
             key: NSOIntentRevision.objects.get(device_id=key[0], scope=key[1]).revision for key in revision_keys
         }
