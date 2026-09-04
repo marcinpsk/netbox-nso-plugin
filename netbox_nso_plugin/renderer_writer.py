@@ -7,7 +7,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from django.apps import apps
@@ -662,6 +662,29 @@ class RendererWriter:
     def _fields_match(self, expected_values, instance):
         return all(self._value_matches(instance, attname, expected) for attname, expected in expected_values)
 
+    def assert_preimages_current(self):
+        """Reject a frozen plan whose persisted inputs changed before execution."""
+        for write in self.plan.write_set:
+            model = apps.get_model(write.model_label)
+            if write.operation in {"save", "delete"} and write.pk is not None:
+                current = model._default_manager.filter(pk=write.pk).first()
+                if current is None or not self._fields_match(write.before_values, current):
+                    raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
+            elif write.operation == "set_update" and write.selected_preimages:
+                selected = tuple(model._default_manager.filter(pk__in=write.selected_pks).order_by("pk"))
+                preimages = tuple((row.pk, _field_values(row, None)) for row in selected)
+                if tuple(row.pk for row in selected) != write.selected_pks or preimages != write.selected_preimages:
+                    raise IntentPlanStaleError(f"{write.model_label} selected rows changed after planning")
+            elif write.operation == "m2m_set" and not isinstance(write.pk, RendererCreationRef):
+                current = model._default_manager.filter(pk=write.pk).first()
+                field_name = dict(write.natural_key)["field_name"]
+                before_pks = dict(write.values)["before_pks"]
+                if (
+                    current is None
+                    or tuple(sorted(getattr(current, field_name).values_list("pk", flat=True))) != before_pks
+                ):
+                    raise IntentPlanStaleError("the M2M edge set changed after planning")
+
     def _identity_matches(self, write, instance):
         if write.pk is not None:
             return instance.pk == write.pk
@@ -1119,3 +1142,49 @@ def renderer_mirror_writes(plan: RendererMutationPlan):
             writer.assert_complete()
         finally:
             _ACTIVE_WRITER.reset(token)
+
+
+@contextlib.contextmanager
+def renderer_writes_replanning_once(plan_fn):
+    """Acquire an exact renderer plan and retry one stale acquisition."""
+
+    def mutation_for(plan):
+        return renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+
+    def signature(plan):
+        planned_at = _normal(plan.planned_at)
+        writes = tuple(
+            replace(
+                write,
+                values=tuple(
+                    (name, planned_at_marker if value == planned_at else value) for name, value in write.values
+                ),
+            )
+            for write in plan.write_set
+        )
+        return writes, plan.lock_footprint, plan.content_keys
+
+    planned_at_marker = object()
+    plan = plan_fn()
+    stack = contextlib.ExitStack()
+    retry_plan = None
+    try:
+        writer = stack.enter_context(mutation_for(plan))
+        current_plan = plan_fn()
+        if signature(current_plan) != signature(plan):
+            retry_plan = current_plan
+            raise IntentPlanStaleError("renderer plan changed during acquisition")
+    except IntentPlanStaleError as exc:
+        stack.__exit__(type(exc), exc, exc.__traceback__)
+        plan = retry_plan if retry_plan is not None else plan_fn()
+    except BaseException as exc:
+        stack.__exit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        with stack:
+            yield writer, plan
+        return
+
+    with mutation_for(plan) as writer:
+        writer.assert_preimages_current()
+        yield writer, plan

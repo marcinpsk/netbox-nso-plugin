@@ -408,6 +408,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
     def test_switchport_body_writes_only_the_interfaces_resolved_at_plan_time(self):
         """An interface that arrives after the plan is deferred: writing it escapes the footprint."""
         from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
         from netbox_nso_plugin.vlan_reconciler import (
             prepare_switchport_reconcile,
             reconcile_switchport,
@@ -424,7 +425,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         attempt = prepare_switchport_reconcile(self.device, payload)
         late = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
 
-        reconcile_switchport(self.device, payload, attempt)
+        plan = attempt.plan  # the read gate opens the writer for the frozen plan, then runs the body
+        with renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan):
+            reconcile_switchport(self.device, payload, attempt)
 
         late.refresh_from_db()
         self.assertFalse(late.mode)

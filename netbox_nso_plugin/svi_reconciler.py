@@ -131,15 +131,18 @@ def _svi_reconcile_operations(device, payload, planned_at):
 
 def reconcile_svi(device, payload: dict) -> list:
     """Apply one frozen SVI reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    plan = active.plan if active is not None else svi_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    if active is not None:
+        with contextlib.nullcontext(active) as writer, suppress_intent_push():
+            return _reconcile_svi(device, payload, writer, active.plan.planned_at)
+
+    def plan_fn():
+        return svi_reconcile_plan(device, payload)
+
+    with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
         return _reconcile_svi(device, payload, writer, plan.planned_at)
 
 
