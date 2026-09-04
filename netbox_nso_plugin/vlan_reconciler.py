@@ -931,6 +931,8 @@ def _save_reconcile_instance(writer, instance, update_fields, force_insert):
             instance._state.db = existing._state.db
             return
     _sync_cached_foreign_keys(instance)
+    if not force_insert and writer.consume_applied_save(instance):
+        return
     writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
@@ -1087,8 +1089,6 @@ def _reconcile_switchport(device, payload: dict, writer, plan) -> list:
     operations = execution.operations
     for operation, instance, update_fields, force_insert, field_name, related in operations:
         if operation == "save":
-            if not force_insert and writer.consume_applied_save(instance):
-                continue
             _save_reconcile_instance(writer, instance, update_fields, force_insert)
         elif operation == "delete":
             writer.delete(instance)

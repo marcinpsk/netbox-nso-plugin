@@ -305,6 +305,50 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             ],
         )
 
+    def test_switchport_reconcile_reads_a_pristine_interface_twice(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
+        from netbox_nso_plugin.vlan_reconciler import _reconcile_switchport, switchport_reconcile_plan
+
+        group = VLANGroup.objects.create(name=f"NSO {self.device.name}", slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=1648, name="EXISTING")
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "access",
+                    "untagged_vlan": vlan.vid,
+                    "tagged_vlans": [],
+                }
+            ]
+        }
+        plan = switchport_reconcile_plan(self.device, payload)
+        mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+        table = connection.ops.quote_name(Interface._meta.db_table)
+        pk_column = connection.ops.quote_name(Interface._meta.pk.column)
+
+        with mutation(plan) as writer:
+            with CaptureQueriesContext(connection) as queries:
+                rows = _reconcile_switchport(self.device, payload, writer, plan)
+
+        interface_reads = [
+            query["sql"]
+            for query in queries
+            if query["sql"].lstrip().upper().startswith("SELECT")
+            and f"FROM {table}" in query["sql"]
+            and f"{table}.{pk_column} = {self.interface.pk}" in query["sql"]
+        ]
+        self.assertEqual(len(interface_reads), 2, interface_reads)
+        self.interface.refresh_from_db()
+        state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual(self.interface.mode, "access")
+        self.assertEqual(self.interface.untagged_vlan_id, vlan.pk)
+        self.assertEqual(state.mode, "access")
+        self.assertEqual(state.untagged_vlan_id, vlan.pk)
+        self.assertEqual([row.pk for row in rows], [state.pk])
+
     def test_switchport_reconcile_adopts_a_completed_creation_plan(self):
         from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
         from netbox_nso_plugin.vlan_reconciler import (
