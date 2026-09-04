@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+from ._outbox_case import mirror_update
 from ._settlement_case import (
     _CarrierCase,
     _make_device,
@@ -177,14 +178,13 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
         self._settle_after_repair("reonboard", 3, 300, 1, seed=seed)
 
     def test_a_drained_result_for_the_old_adapter_id_does_not_settle_attempts(self):
-        from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.settlement import ConsumeResult, sweep_static_route_settlements
 
         device = _make_device("remapped-after-drain")
         mgmt = _make_mgmt(device, "remapped-after-drain", 70)
         route = _route("198.18.70.0/24", "198.18.0.70", devices=[device])
         _own(route, mgmt, generation=270)
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=71)
+        mirror_update(mgmt, adapter_device_id=71)
         old_epoch = ConsumeResult(70, 1, False, False, False, 1, drained=True)
 
         with (
