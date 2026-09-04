@@ -449,11 +449,12 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 name="second-allocation",
             )
             first.start()
-            self.addCleanup(release_first.set)
             self.addCleanup(first.join, 30)
+            self.addCleanup(release_first.set)
             assert first_queried.wait(timeout=30), (failures, first_result)
             second.start()
             self.addCleanup(second.join, 30)
+            self.addCleanup(release_first.set)
             assert second_connected.wait(timeout=30), "the second allocation never opened its connection"
             blocked_failure = None
             try:
@@ -559,13 +560,13 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
             p2p = threading.Thread(target=allocate_p2p, name="p2p-allocation")
             single = threading.Thread(target=allocate_single, name="single-allocation")
             p2p.start()
-            self.addCleanup(request_p2p_pool.set)
             self.addCleanup(p2p.join, 30)
+            self.addCleanup(request_p2p_pool.set)
             assert p2p_connected.wait(timeout=30), "the P2P allocation never opened its database connection"
             assert p2p_ready.wait(timeout=30), (failures, p2p_result)
             single.start()
-            self.addCleanup(release_single.set)
             self.addCleanup(single.join, 30)
+            self.addCleanup(release_single.set)
             assert single_has_pool.wait(timeout=30), (failures, single_result)
             request_p2p_pool.set()
             try:
@@ -658,12 +659,13 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
             single = threading.Thread(target=allocate_single, name="direct-single-allocation")
             wrapper = threading.Thread(target=provision_wrapper, name="link-role-provision")
             single.start()
-            self.addCleanup(release_single.set)
             self.addCleanup(single.join, 30)
+            self.addCleanup(release_single.set)
             assert single_has_pool.wait(timeout=30), (failures, single_result)
             wrapper.start()
-            self.addCleanup(release_wrapper.set)
             self.addCleanup(wrapper.join, 30)
+            self.addCleanup(release_wrapper.set)
+            self.addCleanup(release_single.set)
             assert wrapper_connected.wait(timeout=30), "link-role provisioning never opened its connection"
             blocked_failure = None
             try:
