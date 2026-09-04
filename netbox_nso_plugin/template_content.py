@@ -840,6 +840,7 @@ def logging_reconcile_plan(device, payload):
             ),
         ),
         changes_content=changes_content,
+        settles_deploying=False,
     )
 
 

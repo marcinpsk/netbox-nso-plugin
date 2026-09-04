@@ -689,7 +689,6 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
 
     from . import status_machine as sm
 
-    was_deploying = state.status == sm.DEPLOYING
     # #93 — device-caught-up settle for OWNED rows: the operator's intent IS the current
     # NetBox object; when THIS device's capture equals it, the device has caught up —
     # genuine confirmation, so it may settle accepted/apply_failed to in_sync. A deploying
@@ -719,9 +718,13 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     if diverged and _owner_can_refresh(state):
         _refresh_owner(state, family, obj, ct, captured, entries_hash, now)
         return state, False
-    state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)
-    if was_deploying and state.status == sm.IN_SYNC:
-        state.apply_attempt_id = None
+    state.status = sm.on_reconcile(
+        state.status,
+        matches=not diverged,
+        conflict=diverged,
+        settles_owned=False,
+        settles_deploying=False,
+    )
     should_fill = state.status != sm.CONFLICT
     if should_fill:
         state.content_hash = entries_hash
@@ -733,7 +736,6 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     state.save(
         update_fields=[
             "status",
-            "apply_attempt_id",
             "content_hash",
             "captured",
             "last_sync_at",
