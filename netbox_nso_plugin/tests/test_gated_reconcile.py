@@ -526,6 +526,26 @@ class TestOptionalRoutingDependencyPlans(TestCase):
 
         self.assertEqual(result, [])
 
+    def test_bgp_plan_propagates_unrelated_import_failures(self):
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+
+        device, _management = _make("bgp-import-failure")
+        failures = (
+            ImportError("planner import failed"),
+            ModuleNotFoundError("No module named 'planner_dependency'", name="planner_dependency"),
+        )
+
+        for failure in failures:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                patch(
+                    "netbox_nso_plugin.bgp_reconciler._bgp_reconcile_operations",
+                    side_effect=failure,
+                ),
+                self.assertRaises(type(failure)),
+            ):
+                bgp_reconcile_plan(device, {"routers": []})
+
     def test_missing_netbox_routing_skips_reconcile_entry_points(self):
         from netbox_nso_plugin.isis_reconciler import reconcile_isis
         from netbox_nso_plugin.ospf_reconciler import reconcile_ospf
