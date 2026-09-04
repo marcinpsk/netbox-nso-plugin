@@ -82,7 +82,7 @@ class TestReconcileBfd(TestCase):
         self.assertIsNone(native.bfd_profile_id)
         self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
 
-        reconcile_bfd(self.device, [self._entry("ae1", tx=333, rx=444, mult=5)])
+        reconcile_bfd(self.device, [self._entry("ae1", micro=False, tx=333, rx=444, mult=5)])
 
         native = BFDInterface.objects.get(interface=self.ae1)
         self.assertIsNotNone(native.bfd_profile_id)
