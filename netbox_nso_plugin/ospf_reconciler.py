@@ -137,10 +137,15 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
         instance_entries[process_id] = entry
 
     interface_entries = []
+    seen_interface_names = set()
     for raw_entry in payload.get("interfaces") or []:
         if not isinstance(raw_entry, dict):
             continue
         entry = dict(raw_entry)
+        interface_name = entry.get("interface_name") or ""
+        if interface_name in seen_interface_names:
+            continue
+        seen_interface_names.add(interface_name)
         raw_process_id = entry.get("process_id")
         entry["process_id"] = str(raw_process_id) if raw_process_id is not None else None
         interface_entries.append(entry)
@@ -184,10 +189,10 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             else NSOOSPFInstanceState(management=management, process_id=process_id)
         )
         owned = sm.is_owned(state.status)
-        state.router_id = _clean_router_id(entry.get("router_id"))
-        state.vrf = entry.get("vrf") or ""
-        state.areas = entry.get("areas") or []
         if not owned:
+            state.router_id = _clean_router_id(entry.get("router_id"))
+            state.vrf = entry.get("vrf") or ""
+            state.areas = entry.get("areas") or []
             state.enabled = entry.get("enabled")
         state.last_sync_at = planned_at
 
