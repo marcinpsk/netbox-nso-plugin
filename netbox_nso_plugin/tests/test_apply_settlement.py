@@ -285,7 +285,20 @@ class TestAttemptSettlement(TestCase):
             "attempts": [
                 None,
                 {"generations": None},
-                {"generations": [None, {"seq": True, "carrier_job_id": 91, "carrier_job_result": result}]},
+                {
+                    "apply_attempt_id": str(attempt_id),
+                    "generations": [
+                        None,
+                        {
+                            "seq": 99.5,
+                            "carrier_job_id": 91,
+                            "carrier_job_status": "succeeded",
+                            "carrier_job_result": result,
+                            "carrier_job_error": None,
+                            "updated_at": "2026-08-01T10:02:00Z",
+                        },
+                    ],
+                },
                 {
                     "apply_attempt_id": str(attempt_id),
                     "generations": [
