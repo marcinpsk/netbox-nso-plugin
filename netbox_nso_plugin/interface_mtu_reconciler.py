@@ -47,7 +47,7 @@ def interface_mtu_reconcile_plan(device, payload: dict):
         candidate = copy.copy(state)
         item = reported.get(state.interface_id)
         if item is None:
-            candidate.status = sm.on_reconcile(state.status, present=False)
+            candidate.status = sm.on_reconcile(state.status, present=False, settles_deploying=False)
         elif sm.is_owned(state.status):
             matches = all(
                 item.get(source) == getattr(state, target)
@@ -59,7 +59,7 @@ def interface_mtu_reconcile_plan(device, payload: dict):
             candidate.ip_mtu = item.get("ip_mtu")
             candidate.mpls_mtu = item.get("mpls_mtu")
             candidate.bound_port = item.get("bound_port") or ""
-            candidate.status = sm.on_reconcile(state.status, matches=None)
+            candidate.status = sm.on_reconcile(state.status, matches=None, settles_deploying=False)
         if canonical_fragment(state) != canonical_fragment(candidate):
             changes_content = True
             break
@@ -124,7 +124,7 @@ def reconcile_interface_mtu(device, payload: dict) -> list:
         else:
             # Unowned mirror: track the device values for display.
             state.l2_mtu, state.ip_mtu, state.mpls_mtu = dev_mtu, dev_ip, dev_mpls
-            state.status = sm.on_reconcile(state.status, matches=None)
+            state.status = sm.on_reconcile(state.status, matches=None, settles_deploying=False)
         state.last_sync_at = now
         state.save()
         rows.append(state)
@@ -134,7 +134,7 @@ def reconcile_interface_mtu(device, payload: dict) -> list:
     # (keeps accepted/deploying, else → changed); unowned vestigial rows are pruned.
     for stale in NSOInterfaceMtuState.objects.filter(management=management).exclude(interface__name__in=matched_names):
         if sm.is_owned(stale.status):
-            stale.status = sm.on_reconcile(stale.status, present=False)
+            stale.status = sm.on_reconcile(stale.status, present=False, settles_deploying=False)
             stale.last_sync_at = now
             stale.save(update_fields=["status", "last_sync_at"])
         else:

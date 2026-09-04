@@ -556,57 +556,27 @@ class TestRealBodyGateSweep(TestCase):
 class TestDefaultPlanContentMutation(TestCase):
     """Exercise an owned-fragment change through a real default-plan body."""
 
-    def test_direct_stale_mtu_transition_repends_the_complete_scope(self):
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
+    def test_late_stale_bfd_transition_repends_a_row_settled_earlier_in_the_body(self):
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.reconcile import reconcile_category
 
-        device, mgmt = _make(f"gm{uuid.uuid4().hex[:6]}", manage_interfaces=True)
-        confirmed_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
-        deploying_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
-        confirmed = NSOInterfaceMtuState.objects.create(
-            management=mgmt,
-            interface=confirmed_interface,
-            l2_mtu=9100,
-            status="in_sync",
-        )
-        deploying = NSOInterfaceMtuState.objects.create(
-            management=mgmt,
-            interface=deploying_interface,
-            l2_mtu=9100,
-            status="deploying",
-            apply_attempt_id=uuid.uuid4(),
-        )
-        document = {"interfaces": [], "read_state": _rs()}
-
-        with patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=document):
-            context = reconcile_category(device, mgmt, "interface_mtu")
-
-        confirmed.refresh_from_db()
-        deploying.refresh_from_db()
-        self.assertEqual(context["_gate"]["interface_mtu"], "ran")
-        self.assertEqual(confirmed.status, "changed")
-        self.assertEqual(deploying.status, "accepted")
-        self.assertIsNone(deploying.apply_attempt_id)
-
-    def test_late_stale_mtu_transition_repends_a_row_settled_earlier_in_the_body(self):
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-        from netbox_nso_plugin.reconcile import reconcile_category
-
-        device, mgmt = _make(f"gl{uuid.uuid4().hex[:6]}", manage_interfaces=True)
+        device, mgmt = _make(f"gl{uuid.uuid4().hex[:6]}", manage_routing=True, manage_bgp=True)
         deploying_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
         confirmed_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
-        deploying = NSOInterfaceMtuState.objects.create(
+        deploying = NSOBFDInterfaceState.objects.create(
             management=mgmt,
             interface=deploying_interface,
-            l2_mtu=9100,
-            ip_mtu=9000,
-            mpls_mtu=9088,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
             status="accepted",
         )
-        confirmed = NSOInterfaceMtuState.objects.create(
+        confirmed = NSOBFDInterfaceState.objects.create(
             management=mgmt,
             interface=confirmed_interface,
-            l2_mtu=9100,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
             status="in_sync",
         )
         mirror_update(deploying, status="deploying", apply_attempt_id=uuid.uuid4())
@@ -614,20 +584,20 @@ class TestDefaultPlanContentMutation(TestCase):
             "interfaces": [
                 {
                     "interface_name": deploying_interface.name,
-                    "mtu": 9100,
-                    "ip_mtu": 9000,
-                    "mpls_mtu": 9088,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
                 }
             ],
             "read_state": _rs(),
         }
 
-        with patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=document):
-            context = reconcile_category(device, mgmt, "interface_mtu")
+        with patch("netbox_nso_plugin.adapter_client.get_bfd", return_value=document):
+            context = reconcile_category(device, mgmt, "bfd")
 
         deploying.refresh_from_db()
         confirmed.refresh_from_db()
-        self.assertEqual(context["_gate"]["interface_mtu"], "ran")
+        self.assertEqual(context["_gate"]["bfd"], "ran")
         self.assertEqual(confirmed.status, "changed")
         self.assertEqual(deploying.status, "accepted")
         self.assertIsNone(deploying.apply_attempt_id)
