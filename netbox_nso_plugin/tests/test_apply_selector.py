@@ -20,7 +20,6 @@ from ._outbox_case import (
     make_managed,
     mirror_update,
     own_vlan,
-    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
