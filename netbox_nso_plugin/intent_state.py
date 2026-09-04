@@ -2085,6 +2085,7 @@ def _intent_transaction(
     *,
     defer_repend: bool = False,
     repend_after: bool = False,
+    settles_deploying: bool = True,
     bump_keys=None,
 ):
     """Acquire one content permit and apply the requested re-pend timing."""
@@ -2109,7 +2110,7 @@ def _intent_transaction(
                 bump_keys=bump_keys,
             )
             yield permit
-            if (defer_repend or repend_after) and deploying_rows:
+            if (defer_repend or repend_after) and permit.settles_deploying and deploying_rows:
                 _repend_locked_rows(deploying_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)

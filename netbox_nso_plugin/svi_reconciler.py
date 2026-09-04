@@ -19,7 +19,12 @@ def svi_reconcile_plan(device, payload: dict):
 
     planned_at = timezone.now()
     saves, deletes, _operations, _rows = _svi_reconcile_operations(device, payload, planned_at)
-    return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    return RendererMutationPlan.build(
+        saves=saves,
+        deletes=deletes,
+        planned_at=planned_at,
+        settles_deploying=False,
+    )
 
 
 def svi_reconcile_footprint(device, payload: dict):

@@ -344,8 +344,9 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         payload = {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]}
         plan = svi_reconcile_plan(self.device, payload)
         self.assertTrue(plan.changes_content)
+        self.assertFalse(plan.settles_deploying)
 
-        outer_plan = ReconcileMutationPlan(plan.footprint, detect_content_changes=True)
+        outer_plan = ReconcileMutationPlan(plan.lock_footprint, changes_content=True)
         with reconcile_transaction(outer_plan):
             reconcile_svi(self.device, payload)
 

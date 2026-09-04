@@ -160,13 +160,23 @@ class RendererMutationPlan:
     lock_footprint: MutationFootprint
     content_keys: tuple[tuple[int, str], ...]
     planned_at: Any
+    settles_deploying: bool = True
 
     @property
     def changes_content(self) -> bool:
         return bool(self.content_keys)
 
     @classmethod
-    def build(cls, *, saves=(), deletes=(), set_updates=(), m2m_writes=(), planned_at=None) -> RendererMutationPlan:
+    def build(
+        cls,
+        *,
+        saves=(),
+        deletes=(),
+        set_updates=(),
+        m2m_writes=(),
+        planned_at=None,
+        settles_deploying=True,
+    ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
         saves = tuple(saves)
@@ -208,6 +218,7 @@ class RendererMutationPlan:
             lock_footprint=lock_footprint,
             content_keys=tuple(sorted(content_keys)),
             planned_at=planned_at,
+            settles_deploying=settles_deploying,
         )
 
 
@@ -1116,6 +1127,7 @@ def renderer_writes(plan: RendererMutationPlan):
         plan.lock_footprint,
         bump_keys=plan.content_keys,
         repend_after=True,
+        settles_deploying=plan.settles_deploying,
     ) as permit:
         writer = RendererWriter(plan, content=True, permit=permit)
         token = _ACTIVE_WRITER.set(writer)
@@ -1134,7 +1146,7 @@ def renderer_mirror_writes(plan: RendererMutationPlan):
         raise IntentMutationProtocolError("renderer_mirror_writes cannot execute a content-changing plan")
     if active_renderer_writer() is not None:
         raise IntentMutationProtocolError("renderer writer contexts cannot nest")
-    with mirror_transaction(plan.lock_footprint) as permit:
+    with mirror_transaction(plan.lock_footprint, settles_deploying=plan.settles_deploying) as permit:
         writer = RendererWriter(plan, content=False, permit=permit)
         token = _ACTIVE_WRITER.set(writer)
         try:
@@ -1162,7 +1174,7 @@ def renderer_writes_replanning_once(plan_fn):
             )
             for write in plan.write_set
         )
-        return writes, plan.lock_footprint, plan.content_keys
+        return writes, plan.lock_footprint, plan.content_keys, plan.settles_deploying
 
     planned_at_marker = object()
     plan = plan_fn()
