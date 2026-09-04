@@ -85,17 +85,18 @@ class TestReconcileRedistribution(TestCase):
         from netbox_routing.models import ISISInstance, Redistribution
 
         from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
-        from netbox_nso_plugin.models import NSORedistributionState
-        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
-        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+        from netbox_nso_plugin.signals import redistribution_intent_item, suppress_intent_push
 
         self._make_mgmt()
         ISISInstance.objects.create(device=self.device, process_tag="")
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         state = NSORedistributionState.objects.get()
+        state.metric = 20
         state.status = "accepted"
         state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        state.save(update_fields=["metric", "status", "accepted_at"])
 
         footprint = deletion_footprint_for_instance(state.redistribution)
         with transaction.atomic(), intent_transaction(footprint), suppress_intent_push():
@@ -103,10 +104,21 @@ class TestReconcileRedistribution(TestCase):
         state.refresh_from_db()
         self.assertIsNone(state.redistribution_id)
 
-        reconciled = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})[0]
+        payload = {"entries": [self._entry(metric=10)]}
+        plan = redistribution_reconcile_plan(self.device, payload)
+        self.assertEqual(plan.content_keys, ((self.device.pk, "isis"),))
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
+        before = revision.revision
 
+        reconciled = reconcile_redistribution(self.device, payload)[0]
+
+        revision.refresh_from_db()
         self.assertIsNotNone(reconciled.redistribution_id)
+        self.assertEqual(reconciled.metric, 20)
+        self.assertEqual(reconciled.redistribution.metric, 10)
+        self.assertEqual(redistribution_intent_item(reconciled)["metric"], 10)
         self.assertEqual(Redistribution.objects.count(), 1)
+        self.assertEqual(revision.revision, before + 1)
 
     def test_category_reconcile_declares_its_native_and_overlay_writes(self):
         management = self._make_mgmt()
