@@ -31,7 +31,12 @@ def _interface_mtu_plan_and_operations(device, payload, planned_at):
     from .renderer_writer import RendererMutationPlan
 
     saves, deletes, operations, rows = _interface_mtu_reconcile_operations(device, payload, planned_at)
-    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    plan = RendererMutationPlan.build(
+        saves=saves,
+        deletes=deletes,
+        planned_at=planned_at,
+        settles_deploying=False,
+    )
     return plan, operations, rows
 
 
@@ -75,10 +80,14 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
         candidate.bound_port = item.get("bound_port") or ""
         if sm.is_owned(candidate.status):
             expected_values = (candidate.l2_mtu, candidate.ip_mtu, candidate.mpls_mtu)
-            candidate.status = sm.on_reconcile(candidate.status, matches=device_values == expected_values)
+            candidate.status = sm.on_reconcile(
+                candidate.status,
+                matches=device_values == expected_values,
+                settles_deploying=False,
+            )
         else:
             candidate.l2_mtu, candidate.ip_mtu, candidate.mpls_mtu = device_values
-            candidate.status = sm.on_reconcile(candidate.status, matches=None)
+            candidate.status = sm.on_reconcile(candidate.status, matches=None, settles_deploying=False)
         candidate.last_sync_at = planned_at
         created = current is None
         saves.append(planned_save(candidate, force_insert=created, natural_key=("management", "interface")))
@@ -90,7 +99,7 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
             continue
         if sm.is_owned(stale.status):
             candidate = copy.copy(stale)
-            candidate.status = sm.on_reconcile(stale.status, present=False)
+            candidate.status = sm.on_reconcile(stale.status, present=False, settles_deploying=False)
             candidate.last_sync_at = planned_at
             fields = ("status", "last_sync_at")
             saves.append(planned_save(candidate, update_fields=fields))
