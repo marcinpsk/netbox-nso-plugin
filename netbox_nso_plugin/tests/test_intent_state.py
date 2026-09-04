@@ -643,7 +643,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "netbox_routing.isissetting",
                 "netbox_routing.isissrv6locator",
                 "netbox_routing.ospfarea",
-                "netbox_routing.ospfinstance",
                 "netbox_routing.ospfinterface",
                 "netbox_routing.staticroute_devices",
                 "vpn.l2vpn",

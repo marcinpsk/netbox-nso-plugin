@@ -892,7 +892,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
 
 def reconcile_vlan_database(device, payload: dict) -> list:
     """Apply one frozen VLAN reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
+    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()

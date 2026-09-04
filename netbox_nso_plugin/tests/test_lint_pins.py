@@ -27,11 +27,24 @@ def test_packaging_is_a_direct_test_dependency():
     assert any(Requirement(dependency).name == "packaging" for dependency in dependencies)
 
 
-def _workflow_version() -> str:
-    found = re.findall(r"ruff==([0-9][^\s\"']*)", WORKFLOW.read_text(encoding="utf-8"))
-    assert found, "the lint workflow installs an unpinned ruff"
-    assert len(set(found)) == 1, f"the lint workflow installs different ruff versions: {found}"
-    return found[0]
+def _workflow_tool_commands(tool: str) -> list[list[str]]:
+    workflow_text = WORKFLOW.read_text(encoding="utf-8")
+    assert not re.search(rf"(?<![\w-]){tool}==", workflow_text), f"the lint workflow hardcodes a {tool} version"
+
+    workflow = yaml.safe_load(workflow_text)
+    commands = []
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if isinstance(run, str) and re.search(rf"(?<![\w-]){tool}(?![\w-])", run):
+                command = shlex.split(run)
+                assert command[:4] == ["uv", "run", "--frozen", tool], (
+                    f"the lint workflow must run {tool} via uv run --frozen: {run!r}"
+                )
+                commands.append(command[4:])
+
+    assert commands, f"the lint workflow does not run {tool} via uv run --frozen"
+    return commands
 
 
 def _local_hook(hook_id: str, tool: str) -> dict[str, object]:

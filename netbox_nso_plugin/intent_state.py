@@ -52,6 +52,7 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.routemapentry_match_prefix_list",
     "netbox_routing.staticroute",
     "netbox_routing.staticroute_devices",
+    "netbox_routing.ospfinstance",
     "netbox_routing.isisinstance",
     "netbox_routing.isissetting",
     "netbox_routing.isislevel",
@@ -376,6 +377,14 @@ _GLOBAL_LIFECYCLE_FIELDS = frozenset(
 
 class IntentMutationProtocolError(RuntimeError):
     """A renderer input write did not hold its complete mutation footprint."""
+
+
+class IntentTransactionNoOp(Exception):
+    """Unwind an intent transaction when a locked precondition rejects the mutation."""
+
+    def __init__(self, result=None):
+        super().__init__()
+        self.result = result
 
 
 class RendererTargetsChanged(IntentMutationProtocolError):
@@ -2198,7 +2207,7 @@ def _intent_transaction(
     bump_keys=None,
 ):
     """Acquire one content permit and apply the requested re-pend timing."""
-    active = _ACTIVE_PERMIT.get()
+    active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
         yield active
         return
@@ -2237,9 +2246,10 @@ def mirror_transaction(
     *,
     detect_content_changes: bool = False,
     repeatable_read: bool = False,
+    settles_deploying: bool = True,
 ):
     """Acquire a complete read-side footprint without advancing intent identity."""
-    active = _ACTIVE_PERMIT.get()
+    active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
         yield active
         return
