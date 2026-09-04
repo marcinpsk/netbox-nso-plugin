@@ -50,6 +50,7 @@ class TestInterfaceMtuReconciler(TestCase):
         )
 
         self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertFalse(plan.settles_deploying)
         self.assertEqual(
             [(write.operation, write.model_label) for write in plan.write_set],
             [("save", "netbox_nso_plugin.nsointerfacemtustate")],
@@ -210,13 +211,15 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
 
         schedule.assert_not_called()
 
-    def test_deploying_settles_in_sync_when_device_matches(self):
-        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+    def test_deploying_waits_for_correlated_apply_evidence(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
 
         from ._outbox_case import mirror_update
 
-        state = self._state(l2_mtu=9000, status="deploying")
-        attempt_id = state.apply_attempt_id
+        state = self._state(l2_mtu=9000)
         other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
         confirmed = NSOInterfaceMtuState.objects.create(
             management=self.management,
@@ -225,6 +228,8 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
             status="in_sync",
         )
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="interface_mtu")
+        attempt_id = uuid4()
+        state = mirror_update(state, status="deploying", apply_attempt_id=attempt_id)
         matching = {
             "interfaces": [
                 {"interface_name": "Port-channel1", "mtu": 9000},
@@ -232,9 +237,6 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
             ]
         }
         non_matching_with_content_delta = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]}
-        mirror_update(state, status="deploying", apply_attempt_id=attempt_id)
-        state.refresh_from_db()
-        self.assertEqual(state.status, "deploying")
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
