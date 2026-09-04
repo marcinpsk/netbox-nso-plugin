@@ -669,8 +669,9 @@ class TestReconcileDeviceLinksConcurrency(_CascadeFlushMixin, IntentPushResetMix
         worker = threading.Thread(target=start_rekey)
         worker.start()
         snapshot = ([self.mgmt], {}, {})
-        with connection.execute_wrapper(wait_after_candidate_query):
-            result = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
+        with self.assertNoLogs("netbox_nso_plugin.sync_cache", level="ERROR"):
+            with connection.execute_wrapper(wait_after_candidate_query):
+                result = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
         worker.join(timeout=60)
 
         assert not worker.is_alive(), "concurrent rekey writer did not finish"
