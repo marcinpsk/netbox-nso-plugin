@@ -53,7 +53,7 @@ def interface_mtu_reconcile_plan(device, payload: dict):
                 item.get(source) == getattr(state, target)
                 for source, target in (("mtu", "l2_mtu"), ("ip_mtu", "ip_mtu"), ("mpls_mtu", "mpls_mtu"))
             )
-            candidate.status = sm.on_reconcile(state.status, matches=matches)
+            candidate.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             candidate.l2_mtu = item.get("mtu")
             candidate.ip_mtu = item.get("ip_mtu")
@@ -77,6 +77,7 @@ def interface_mtu_reconcile_plan(device, payload: dict):
             ),
         ),
         changes_content=changes_content,
+        settles_deploying=False,
     )
 
 
@@ -116,11 +117,10 @@ def reconcile_interface_mtu(device, payload: dict) -> list:
         state.bound_port = item.get("bound_port") or ""
 
         if sm.is_owned(state.status):
-            # Owned: the operator's MTU values are the intent — never clobber them with
-            # the device read. Settle by device-vs-intent (deploying → in_sync once the
-            # device reflects the pushed values; accepted holds until then).
+            # Owned MTU values are operator intent and must not be replaced with device values.
+            # Only correlated Apply evidence can settle a deploying row.
             matches = dev_mtu == state.l2_mtu and dev_ip == state.ip_mtu and dev_mpls == state.mpls_mtu
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             # Unowned mirror: track the device values for display.
             state.l2_mtu, state.ip_mtu, state.mpls_mtu = dev_mtu, dev_ip, dev_mpls

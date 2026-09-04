@@ -148,12 +148,51 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.l2_mtu, 9216)  # operator intent preserved, not overwritten
         self.assertEqual(state.status, "accepted")  # device mismatch → holds accepted
 
-    def test_deploying_settles_in_sync_when_device_matches(self):
-        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+    def test_deploying_waits_for_correlated_apply_evidence(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
 
-        self._state(l2_mtu=9000, status="deploying")
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9000}]})
-        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).status, "in_sync")
+        state = self._state(l2_mtu=9000, status="deploying")
+        attempt_id = state.apply_attempt_id
+        other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        confirmed = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=other,
+            l2_mtu=1500,
+            status="in_sync",
+        )
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="interface_mtu")
+        matching = {
+            "interfaces": [
+                {"interface_name": "Port-channel1", "mtu": 9000},
+                {"interface_name": "Port-channel2", "mtu": 1500},
+            ]
+        }
+        non_matching_with_content_delta = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]}
+
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_interface_mtu",
+                side_effect=(matching, non_matching_with_content_delta),
+            ),
+        ):
+            reconcile_category(self.device, self.management, "interface_mtu")
+            state.refresh_from_db()
+            self.assertEqual(state.status, "deploying")
+            self.assertEqual(state.apply_attempt_id, attempt_id)
+
+            revision.refresh_from_db()
+            revision_before_content_delta = revision.revision
+            reconcile_category(self.device, self.management, "interface_mtu")
+
+        state.refresh_from_db()
+        confirmed.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
+        self.assertEqual(confirmed.status, "changed")
+        self.assertGreater(revision.revision, revision_before_content_delta)
 
     def test_owned_row_unreported_not_pruned(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu

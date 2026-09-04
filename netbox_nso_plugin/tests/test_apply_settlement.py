@@ -150,6 +150,54 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(row.status, "deploying")
         self.assertEqual(row.apply_attempt_id, current_id)
 
+    def test_correlated_interface_mtu_success_settles_its_deploying_row(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOInterfaceMtuState
+
+        attempt_id = uuid4()
+        last_apply_at = timezone.now()
+        interface = Interface.objects.create(device=self.device, name="Port-channel1626", type="lag")
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=interface,
+            l2_mtu=9000,
+            status="deploying",
+            last_apply_at=last_apply_at,
+            apply_attempt_id=attempt_id,
+        )
+        selected = {"interface_mtu": 501}
+        response = _response(self.adapter_device_id, 72, selected)
+        NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            management=self.management,
+            adapter_device_id=self.adapter_device_id,
+            selected=selected,
+            scope_revisions={"interface_mtu": 1},
+            http_status=202,
+            response=response,
+        )
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            72,
+            selected,
+            "settled",
+            result={"interface_mtu_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        )
+
+        settle_apply_attempts(
+            self.management,
+            _payload(self.adapter_device_id, [evidence]),
+            static_route_feed_drained=True,
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+        self.assertEqual(row.last_apply_at, last_apply_at)
+        self.assertEqual(row.apply_attempt_id, attempt_id)
+
     def test_an_aggregate_scope_failure_does_not_fail_unidentified_rows(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
