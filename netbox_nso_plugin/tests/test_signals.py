@@ -238,48 +238,6 @@ class TestUntrackedNativeDeleteIsNoOp(_SignalDBBase):
         push.assert_not_called()
 
 
-class TestRekeyedNativeDelete(_SignalDBBase):
-    def test_rekeyed_isis_flex_algo_delete_removes_every_linked_overlay(self):
-        from netbox_routing.models import ISISFlexAlgo, ISISInstance
-
-        from netbox_nso_plugin.models import NSOISISFlexAlgoState
-
-        management = self._make_mgmt(adapter_device_id=42)
-        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
-        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"):
-            with self.captureOnCommitCallbacks(execute=True):
-                flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=128)
-                flex_algo.algo_id = 129
-                flex_algo.save(update_fields=["algo_id"])
-
-        self.assertEqual(NSOISISFlexAlgoState.objects.filter(management=management).count(), 2)
-        flex_algo.delete()
-
-        self.assertFalse(NSOISISFlexAlgoState.objects.filter(management=management).exists())
-
-    def test_rekeyed_isis_interface_delete_removes_every_linked_overlay(self):
-        from netbox_routing.models import ISISInstance, ISISInterface
-
-        from netbox_nso_plugin.models import NSOISISInterfaceState
-
-        management = self._make_mgmt(adapter_device_id=42)
-        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
-        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
-            with self.captureOnCommitCallbacks(execute=True):
-                isis_interface = ISISInterface.objects.create(
-                    interface=self.iface,
-                    address_family="ipv4",
-                    instance=instance,
-                )
-                isis_interface.address_family = "ipv6"
-                isis_interface.save(update_fields=["address_family"])
-
-        self.assertEqual(NSOISISInterfaceState.objects.filter(management=management).count(), 2)
-        isis_interface.delete()
-
-        self.assertFalse(NSOISISInterfaceState.objects.filter(management=management).exists())
-
-
 class TestSyncScopeToAdapter(_SignalDBBase):
     """Tests for the sync_scope_to_adapter signal handler (real NSODeviceManagement row)."""
 

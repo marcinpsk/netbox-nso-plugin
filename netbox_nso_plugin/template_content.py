@@ -1127,7 +1127,12 @@ def _logging_plan_and_operations(device, payload):
 
     planned_at = timezone.now()
     saves, deletes, operations, level_result = _logging_reconcile_operations(device, payload, planned_at)
-    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    plan = RendererMutationPlan.build(
+        saves=saves,
+        deletes=deletes,
+        planned_at=planned_at,
+        settles_deploying=False,
+    )
     return plan, operations, level_result
 
 
@@ -1213,6 +1218,7 @@ def _static_route_plan_and_operations(device, payload, planned_at, *, resolve_st
         deletes=deletes,
         m2m_writes=m2m_writes,
         planned_at=planned_at,
+        settles_deploying=False,
     )
     if confirmed_drift:
         content_footprint = MutationFootprint.for_keys(((device.pk, "static_route"),))

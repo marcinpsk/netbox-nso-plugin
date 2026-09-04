@@ -365,6 +365,7 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
         return cleaned
 
     def save(self, commit=True):
+        import contextlib
         import copy
 
         if self._secret_result:
@@ -379,33 +380,52 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
         if not commit:
             return obj
 
+        from .intent_state import MutationFootprint, SourceRow, footprint_for_instance, intent_transaction
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         created = obj.pk is None or obj._state.adding
-        saves = [
-            planned_save(
-                obj,
-                force_insert=created,
-                natural_key=("management", "community_hash"),
+        rekeys_hosts = bool(self._old_hash and self._old_hash != obj.community_hash)
+        lock_context = contextlib.nullcontext()
+        if rekeys_hosts:
+            footprint = MutationFootprint.merge(
+                footprint_for_instance(obj),
+                MutationFootprint.for_keys(
+                    (),
+                    overlay_rows=(SourceRow(NSOSnmpHostState._meta.label_lower, None),),
+                ),
             )
-        ]
-        host_candidates = []
-        if self._old_hash and self._old_hash != obj.community_hash:
-            for host in NSOSnmpHostState.objects.filter(
-                management=obj.management,
-                community_hash=self._old_hash,
-            ).order_by("pk"):
-                candidate = copy.copy(host)
-                candidate.community_hash = obj.community_hash
-                host_candidates.append(candidate)
-                saves.append(planned_save(candidate, update_fields=("community_hash",)))
-        plan = RendererMutationPlan.build(saves=saves)
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
-            writer.save(obj, force_insert=created)
-            for candidate in host_candidates:
-                writer.save(candidate, update_fields=("community_hash",))
-            self.save_m2m()
+            lock_context = intent_transaction(footprint)
+
+        with lock_context:
+            saves = [
+                planned_save(
+                    obj,
+                    force_insert=created,
+                    natural_key=("management", "community_hash"),
+                )
+            ]
+            host_candidates = []
+            if rekeys_hosts:
+                hosts = NSOSnmpHostState.objects.select_for_update(of=("self",)).filter(
+                    management=obj.management,
+                    community_hash=self._old_hash,
+                )
+                for host in hosts.order_by("pk"):
+                    candidate = copy.copy(host)
+                    candidate.community_hash = obj.community_hash
+                    update_fields = ["community_hash"]
+                    if candidate.status == "deploying":
+                        candidate.status = "accepted"
+                        update_fields.append("status")
+                    host_candidates.append((candidate, tuple(update_fields)))
+                    saves.append(planned_save(candidate, update_fields=update_fields))
+            plan = RendererMutationPlan.build(saves=saves)
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                writer.save(obj, force_insert=created)
+                for candidate, update_fields in host_candidates:
+                    writer.save(candidate, update_fields=update_fields)
+                self.save_m2m()
         return obj
 
 

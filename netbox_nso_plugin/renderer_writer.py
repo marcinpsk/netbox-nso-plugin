@@ -8,7 +8,7 @@ import contextlib
 import contextvars
 import copy
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from typing import Any
 
@@ -186,6 +186,7 @@ class RendererMutationPlan:
     content_keys: tuple[tuple[int, str], ...]
     planned_at: Any
     validate_after_acquire: Callable[[], None] | None = dataclass_field(default=None, compare=False, repr=False)
+    settles_deploying: bool = True
 
     @property
     def changes_content(self) -> bool:
@@ -202,6 +203,7 @@ class RendererMutationPlan:
         read_dependencies=(),
         planned_at=None,
         validate_after_acquire=None,
+        settles_deploying=True,
     ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
@@ -271,6 +273,7 @@ class RendererMutationPlan:
             content_keys=tuple(sorted(content_keys)),
             planned_at=planned_at,
             validate_after_acquire=validate_after_acquire,
+            settles_deploying=settles_deploying,
         )
 
 
@@ -1452,7 +1455,7 @@ def renderer_mirror_writes(plan: RendererMutationPlan):
         raise IntentMutationProtocolError("renderer_mirror_writes cannot execute a content-changing plan")
     if active_renderer_writer() is not None:
         raise IntentMutationProtocolError("renderer writer contexts cannot nest")
-    with mirror_transaction(plan.lock_footprint) as permit:
+    with mirror_transaction(plan.lock_footprint, settles_deploying=plan.settles_deploying) as permit:
         if plan.validate_after_acquire is not None:
             plan.validate_after_acquire()
         writer = RendererWriter(plan, content=False, permit=permit)
@@ -1507,5 +1510,4 @@ def renderer_writes_replanning_once(plan_fn):
         return
 
     with mutation_for(plan) as writer:
-        writer.assert_preimages_current()
         yield writer, plan

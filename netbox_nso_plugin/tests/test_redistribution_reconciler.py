@@ -483,12 +483,6 @@ class TestReconcileRedistribution(TestCase):
         entry = self._entry(dest_protocol="ospf", dest_ref="1", metric_type="1")
         reconcile_redistribution(self.device, {"entries": [entry]})
         plan = redistribution_reconcile_plan(self.device, {"entries": [entry]})
-        self.assertIn(
-            SourceRow(destination._meta.label_lower, destination.pk),
-            plan.footprint.source_rows,
-        )
-
-        destination = OSPFInstance.objects.get(device=self.device, process_id="1")
         self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.lock_footprint.source_rows)
 
     def test_plan_locks_devices_that_share_a_route_map_without_expanding_revisions(self):

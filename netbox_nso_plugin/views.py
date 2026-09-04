@@ -5045,6 +5045,8 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
         NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
     )
     class_ids = tuple(policy_class.pk for policy_class in classes)
+    attached_ids = tuple(attached_state.pk for attached_state in attached)
+    attached_management_ids = tuple(attached_state.management_id for attached_state in attached)
     fallback_redistribution = [
         row
         for row in redistribution_states
@@ -5075,7 +5077,18 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
         operations.append((candidate, ("route_map",)))
 
     def validate_after_acquire():
-        if errors := _route_map_name_collision_errors(type(route_map), route_map.pk, new_name, class_ids):
+        errors = _route_map_name_collision_errors(type(route_map), route_map.pk, new_name, class_ids)
+        if not errors and (
+            NSORoutePolicyState.objects.filter(
+                management_id__in=attached_management_ids,
+                family="route_map",
+                object_name__iexact=new_name,
+            )
+            .exclude(pk__in=attached_ids)
+            .exists()
+        ):
+            errors = {"object_name": ["A route map with this name already exists."]}
+        if errors:
             raise _IntentTransactionNoOp(errors)
 
     plan = RendererMutationPlan.build(

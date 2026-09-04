@@ -433,7 +433,12 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             root,
             exclude_members=(list(candidate.unsupported_members or []) or None) if family == "community_list" else None,
         ):
-            candidate.status = sm.on_reconcile(candidate.status, matches=True, settles_owned=True)
+            candidate.status = sm.on_reconcile(
+                candidate.status,
+                matches=True,
+                settles_owned=True,
+                settles_deploying=False,
+            )
         if candidate.is_materialized:
             diverged = bool(candidate.content_hash) and candidate.content_hash != entries_hash
         else:
@@ -452,6 +457,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 matches=not diverged,
                 conflict=diverged,
                 settles_owned=False,
+                settles_deploying=False,
             )
             if candidate.status != sm.CONFLICT:
                 candidate.content_hash = entries_hash
@@ -592,7 +598,13 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             return
         state = copy.copy(current)
         changed = state.content_hash != entries_hash
-        state.status = sm.on_reconcile(state.status, matches=not changed, conflict=False, settles_owned=False)
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=not changed,
+            conflict=False,
+            settles_owned=False,
+            settles_deploying=False,
+        )
         state.content_hash = entries_hash
         state.captured = captured
         state.last_sync_at = self.planned_at
@@ -993,6 +1005,7 @@ def _mutation_plan(operations, planned_at):
         deletes=operations.deletes,
         m2m_writes=operations.m2m_writes,
         planned_at=planned_at,
+        settles_deploying=False,
     )
     if not operations.content_groups:
         return plan

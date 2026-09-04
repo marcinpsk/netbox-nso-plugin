@@ -169,9 +169,8 @@ class TestReconcileRoutePolicy(TestCase):
         from uuid import uuid4
 
         self._make_mgmt(self.device)
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         payload = {"community_lists": [{"name": "CL-EMPTY", "entries": []}]}
         reconcile_route_policy(self.device, payload)
@@ -183,8 +182,7 @@ class TestReconcileRoutePolicy(TestCase):
         st.apply_attempt_id = attempt_id
         st.save(update_fields=["status", "apply_attempt_id"])
 
-        with reconcile_transaction(route_policy_reconcile_plan(self.device, payload)):
-            reconcile_route_policy(self.device, payload)
+        reconcile_route_policy(self.device, payload)
         st.refresh_from_db()
         self.assertEqual(st.status, "deploying")
         self.assertEqual(st.apply_attempt_id, attempt_id)
