@@ -4508,19 +4508,19 @@ def _save_route_map_name_edit(state, old_name):
             )
             now = timezone.now()
             with suppress_intent_push():
-                for attached_state in attached:
-                    attached_state.object_name = new_name
-                    update_fields = {"object_name"}
-                    if attached_state.pk == state.pk:
-                        if not sm.is_owned(attached_state.status):
-                            attached_state.accepted_at = now
-                        attached_state.status = sm.on_operator_edit(attached_state.status)
-                        attached_state.apply_attempt_id = None
-                        update_fields.update({"status", "accepted_at", "apply_attempt_id"})
-                    attached_state.save(update_fields=update_fields)
                 class_ids = [policy_class.pk for policy_class in classes]
                 try:
                     with transaction.atomic():
+                        for attached_state in attached:
+                            attached_state.object_name = new_name
+                            update_fields = {"object_name"}
+                            if attached_state.pk == state.pk:
+                                if not sm.is_owned(attached_state.status):
+                                    attached_state.accepted_at = now
+                                attached_state.status = sm.on_operator_edit(attached_state.status)
+                                attached_state.apply_attempt_id = None
+                                update_fields.update({"status", "accepted_at", "apply_attempt_id"})
+                            attached_state.save(update_fields=update_fields)
                         for policy_class in classes:
                             policy_class.object_name = new_name
                             policy_class.save(update_fields=["object_name"])
@@ -4537,6 +4537,17 @@ def _save_route_map_name_edit(state, old_name):
                         if classes and classification_collision:
                             raise IntegrityError
                 except IntegrityError:
+                    attached_collision = (
+                        NSORoutePolicyState.objects.filter(
+                            management_id__in=[row.management_id for row in attached],
+                            family="route_map",
+                            object_name=new_name,
+                        )
+                        .exclude(pk__in=[row.pk for row in attached])
+                        .exists()
+                    )
+                    if attached_collision:
+                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
                     collision = type(route_map).objects.filter(name__iexact=new_name).exclude(pk=route_map.pk)
                     if collision.exists():
                         raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
