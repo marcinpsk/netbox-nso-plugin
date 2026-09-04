@@ -469,10 +469,14 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
         from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         _, mgmt = self._managed_device("arming-race", 8106)
         row = self._own_route(mgmt, "198.18.32.0/24", "198.18.32.1")
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="static_route")
+        initial_revision = revision.revision
+        revision_before_arming: list[int] = []
         real_renderer_writes = renderer_writes
         raced = False
 
@@ -489,6 +493,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 route_plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
                 with without_commit_drain(), real_renderer_writes(route_plan) as writer:
                     writer.save(candidate, update_fields=fields)
+                revision.refresh_from_db()
+                revision_before_arming.append(revision.revision)
             with real_renderer_writes(plan) as writer:
                 yield writer
 
