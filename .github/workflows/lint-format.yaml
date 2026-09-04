@@ -27,15 +27,11 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        # Keep ruff in step with [dependency-groups].dev and .pre-commit-config.yaml.
-        run: uv pip install --system ruff==0.15.4
-
       - name: Run Ruff linting
-        run: ruff check .
+        run: uv run --frozen ruff check .
 
       - name: Run Ruff formatting check
-        run: ruff format --check .
+        run: uv run --frozen ruff format --check .
 
       - name: Audit the GitHub Actions workflows
-        run: uvx zizmor==1.29.0 .github/workflows
+        run: uv run --frozen zizmor .github/workflows
