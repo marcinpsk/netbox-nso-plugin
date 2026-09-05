@@ -7644,7 +7644,8 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         self.client.force_login(self.user)
         self.device, self.mgmt = make_managed("apambig", 7791)
         with without_commit_drain(), transaction.atomic():
-            interface = Interface.objects.create(device=self.device, name="Port-channel7791", type="lag")
+            # The native MTU is the ownership anchor; Accept adopts it (_write_owned_interface_mtu).
+            interface = Interface.objects.create(device=self.device, name="Port-channel7791", type="lag", mtu=9000)
             self.mtu_state = NSOInterfaceMtuState.objects.create(
                 management=self.mgmt, interface=interface, l2_mtu=9000, status="accepted"
             )
