@@ -336,6 +336,43 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert NSOBFDInterfaceState.objects.get(pk=deploying.pk).status == "deploying"
         assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
 
+    def test_matching_timers_keep_a_deploying_row_in_flight(self):
+        """Re-reading the intended timers is not apply evidence for an in-flight BFD row."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        attempt = uuid4()
+        deploying = NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            micro_bfd=True,
+            status="deploying",
+            apply_attempt_id=attempt,
+        )
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        deploying.refresh_from_db()
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt
+
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
 

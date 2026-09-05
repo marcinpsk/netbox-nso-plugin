@@ -413,6 +413,23 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "deploying")
 
+    def test_matching_read_keeps_a_deploying_vlan_in_flight(self):
+        """A matching device name is not apply evidence: the correlated result settles it."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        from ._outbox_case import content_update
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=33)
+        attempt = uuid4()
+        content_update(state, status="deploying", apply_attempt_id=attempt)
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt)
+
     def test_rescope_move_to_empty_group(self):
         """Re-scoping into a group with no collision just moves the VLAN (stays synced)."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan

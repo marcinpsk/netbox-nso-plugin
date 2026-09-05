@@ -166,6 +166,7 @@ def vlan_reconcile_plan(device, payload: dict):
             candidate.status = sm.on_reconcile(
                 state.status,
                 matches=vlan_name_matches(candidate),
+                settles_deploying=False,
             )
         else:
             candidate.status = sm.on_reconcile(state.status, present=False)
@@ -538,7 +539,7 @@ def _reconcile_vlan_database(device, payload: dict) -> list:
         # Value overlay: the editable value is the VLAN name. A nameless device VLAN
         # matches only its untouched placeholder. An operator rename remains pending.
         matches = vlan_name_matches(state)
-        state.status = sm.on_reconcile(state.status, matches=matches)
+        state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         state.save()
         rows.append(state)
 

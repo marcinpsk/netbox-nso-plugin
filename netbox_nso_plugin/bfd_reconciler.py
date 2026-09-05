@@ -57,7 +57,7 @@ def bfd_reconcile_plan(device, interfaces: list):
         elif sm.is_owned(state.status):
             matches = all(entry.get(field) == getattr(state, field) for field in ("min_tx", "min_rx", "multiplier"))
             matches = matches and bool(entry.get("micro_bfd", False)) == state.micro_bfd
-            candidate.status = sm.on_reconcile(state.status, matches=matches)
+            candidate.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             for field in ("min_tx", "min_rx", "multiplier"):
                 setattr(candidate, field, entry.get(field))
@@ -109,8 +109,8 @@ def _get_or_create_bfd_profile(entry: dict, BFDProfile, cache: dict):
 def _upsert_bfd_state(mgmt, iface, entry: dict, now) -> None:
     """Mirror one interface's device-observed BFD timers + lifecycle status into the overlay.
 
-    Fresh import lands 'imported'; owned statuses are preserved, except 'deploying'
-    (Apply in flight) → 'in_sync' once the device re-reports BFD here (apply landed).
+    Fresh import lands 'imported' and owned statuses are preserved. A 'deploying' row
+    stays in flight: only the correlated apply result settles it, never a device read.
     """
     from . import status_machine as sm
     from .models import NSOBFDInterfaceState
@@ -132,7 +132,7 @@ def _upsert_bfd_state(mgmt, iface, entry: dict, now) -> None:
     else:
         state.micro_bfd = reported_micro
     # Mirror overlay: imported on import; owned preserved; deploying→in_sync on apply.
-    state.status = sm.on_reconcile(state.status, matches=matches if owned else None)
+    state.status = sm.on_reconcile(state.status, matches=matches if owned else None, settles_deploying=False)
     state.last_sync_at = now
     state.save()
 
