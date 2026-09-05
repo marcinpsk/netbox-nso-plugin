@@ -1943,8 +1943,9 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     @property
     def classification_mode(self) -> str:
         """MASTER (shared, the default) or LOCAL (per-device) classification of this group."""
-        row = NSORoutePolicyObjectClass.objects.filter(family=self.family, object_name=self.object_name).first()
-        return row.mode if row else "master"
+        from .route_policy_reconciler import _group_mode
+
+        return _group_mode(self.family, self.object_name)
 
 
 _ROUTE_POLICY_OBJECT_MODE_CHOICES = [

@@ -417,6 +417,19 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNone(row.apply_attempt_id)
 
+    def test_classification_mode_agrees_with_apply_on_a_mixed_case_name(self):
+        """The NSO tab badge and Apply must read one classification, case-insensitively."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-LOCAL", mode="local")
+        reconcile_route_policy(self.device, {"community_lists": [{"name": "cl-local", "entries": []}]})
+        state = NSORoutePolicyState.objects.get(management=management, object_name="cl-local")
+
+        self.assertEqual(_group_mode(state.family, state.object_name), "local")
+        self.assertEqual(state.classification_mode, "local")
+
     def test_promotion_excludes_a_local_row_that_only_postgres_case_folds_onto_its_class(self):
         """UPPER() folds the greek final sigma onto sigma; python str.lower()/upper() does not."""
         from types import SimpleNamespace
