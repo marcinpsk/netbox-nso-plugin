@@ -2410,8 +2410,8 @@ def _live_pool_markers(connection) -> frozenset[tuple]:
     return live
 
 
-def _consume_pool_delete_cascade(statement, params, connection) -> bool:
-    """Consume the delete marker when this is the collector's SET_NULL update for a pool."""
+def _is_pool_delete_cascade(statement, params, connection) -> bool:
+    """Report whether this is the collector's SET_NULL update for a pool being deleted."""
     entries = _live_pool_markers(connection)
     match = _SOURCE_POOL_CASCADE.search(statement)
     if not entries or match is None:
@@ -2426,11 +2426,9 @@ def _consume_pool_delete_cascade(statement, params, connection) -> bool:
         targets = {int(value) for value in values}
     except (TypeError, ValueError):
         return False
-    consumed = {entry for entry in entries if entry[0] == connection.alias and entry[2] in targets}
-    if not targets or {entry[2] for entry in consumed} != targets:
-        return False
-    _DELETING_POOLS.set(entries - consumed)
-    return True
+    # The marker stays until post_delete, so a same-shape peer update cannot starve the collector.
+    marked = {entry[2] for entry in entries if entry[0] == connection.alias}
+    return bool(targets) and targets <= marked
 
 
 def _dml_guard(execute, sql, params, many, context):
@@ -2470,7 +2468,7 @@ def _dml_guard(execute, sql, params, many, context):
     source_pool_cascade = (
         spec.model_label == "netbox_nso_plugin.nsointerfaceipstate"
         and touched_columns == frozenset({"source_pool_id"})
-        and _consume_pool_delete_cascade(statement, params, context["connection"])
+        and _is_pool_delete_cascade(statement, params, context["connection"])
     )
     if interface_assignment_cascade or source_pool_cascade:
         return execute(sql, params, many, context)

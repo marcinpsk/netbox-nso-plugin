@@ -278,6 +278,38 @@ class TestAutoAssignIP(TestCase):
         with self.assertRaises(IntentMutationProtocolError):
             NSOInterfaceIPState.objects.filter(source_pool_id__in=[pool.pk]).update(source_pool_id=None)
 
+    def test_a_peer_pre_delete_receiver_does_not_starve_the_cascade(self):
+        """Another app's pre_delete receiver may clear the same column for the pool being deleted.
+        That must not spend the authorization the collector's own SET_NULL update still needs."""
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        self._make_mgmt()
+        pool = Prefix.objects.create(prefix="10.204.0.0/24", role=self.lb_role)
+        iface = Interface.objects.create(device=self.device, name="Loopback204", type="virtual")
+        state = NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="10.204.0.1/24",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+            source_pool=pool,
+        )
+
+        def clear_the_pointer(sender, instance, **kwargs):
+            NSOInterfaceIPState.objects.filter(source_pool_id__in=[instance.pk]).update(source_pool_id=None)
+
+        # Connected after ours, so it runs after the marker is set and before the collector updates.
+        pre_delete.connect(clear_the_pointer, sender=Prefix, dispatch_uid="test_pool_delete_peer", weak=False)
+        self.addCleanup(pre_delete.disconnect, clear_the_pointer, sender=Prefix, dispatch_uid="test_pool_delete_peer")
+
+        pool.delete()
+
+        self.assertFalse(Prefix.objects.filter(pk=pool.pk).exists())
+        state.refresh_from_db()
+        self.assertIsNone(state.source_pool_id)
+
     def test_reserve_single_carries_pool_vrf(self):
         """A VRF-scoped pool (as a link-role resolves) must land the reserved IPAddress in that
         VRF — otherwise it goes into the global table (wrong IPAM accounting) and rollback, which
