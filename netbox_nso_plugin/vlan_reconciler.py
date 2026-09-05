@@ -19,6 +19,7 @@ source of truth.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,42 @@ def vlan_reconcile_plan(device, payload: dict):
     return ReconcileMutationPlan(footprint, changes_content=changes_content)
 
 
-def switchport_reconcile_footprint(device, payload: dict):
+def _switchport_items(payload) -> list:
+    """Return the payload's interface entries as a list of dicts."""
+    items = payload.get("interfaces") or [] if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _switchport_interface_pks(device, payload: dict) -> dict:
+    """Resolve the payload's interface names to pks, ONCE, before any lock is taken."""
+    from dcim.models import Interface
+
+    names = {item.get("interface_name") for item in _switchport_items(payload)}
+    names = {name for name in names if isinstance(name, str)}
+    return dict(Interface.objects.filter(device=device, name__in=names).values_list("name", "pk"))
+
+
+@dataclass(frozen=True)
+class SwitchportReconcileAttempt:
+    """One switchport read: its plan, and the exact interface pks its body may write.
+
+    The names are resolved before acquisition, so an interface that appears between the
+    plan and the body is deferred to the next read instead of escaping the footprint.
+    Only pks are frozen: the body reloads the rows under the lock, so a field the
+    operator committed after the plan is never compared or saved from a stale copy.
+    """
+
+    plan: object
+    interface_pks: dict
+
+
+def prepare_switchport_reconcile(device, payload: dict) -> SwitchportReconcileAttempt:
+    """Freeze the payload's interface resolutions, then plan against exactly those."""
+    interface_pks = _switchport_interface_pks(device, payload)
+    return SwitchportReconcileAttempt(switchport_reconcile_plan(device, payload, interface_pks), interface_pks)
+
+
+def switchport_reconcile_footprint(device, payload: dict, interface_pks: dict | None = None):
     """Declare native VLAN rows read or written by one switchport reconciliation."""
     from dcim.models import Interface
     from ipam.models import VLAN
@@ -188,16 +224,10 @@ def switchport_reconcile_footprint(device, payload: dict):
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return MutationFootprint()
-    items = payload.get("interfaces", []) or [] if isinstance(payload, dict) else []
-    if not isinstance(items, list):
-        items = []
+    items = _switchport_items(payload)
     vids = vlan_ids_for_dependency_lock(items, "untagged_vlan", "tagged_vlans")
-    interface_names = {
-        item.get("interface_name")
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get("interface_name"), str)
-    }
-    interfaces = list(Interface.objects.filter(device=device, name__in=interface_names))
+    if interface_pks is None:
+        interface_pks = _switchport_interface_pks(device, payload)
     group = _device_vlan_group(device, create=False)
 
     states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
@@ -217,7 +247,7 @@ def switchport_reconcile_footprint(device, payload: dict):
         source_rows=(
             *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
             SourceRow("ipam.vlan", None),
-            *(SourceRow(interface._meta.label_lower, interface.pk) for interface in interfaces),
+            *(SourceRow(Interface._meta.label_lower, interface_pk) for interface_pk in interface_pks.values()),
             SourceRow(Interface._meta.get_field("tagged_vlans").remote_field.through._meta.label_lower, None),
             SourceRow(
                 NSOSwitchportState._meta.get_field("tagged_vlans").remote_field.through._meta.label_lower,
@@ -231,7 +261,7 @@ def switchport_reconcile_footprint(device, payload: dict):
     )
 
 
-def switchport_reconcile_plan(device, payload: dict):
+def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None = None):
     """Classify a switchport refresh from its predicted rendered membership."""
     import copy
 
@@ -241,15 +271,11 @@ def switchport_reconcile_plan(device, payload: dict):
     from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
     from .status_machine import is_owned
 
-    footprint = switchport_reconcile_footprint(device, payload)
+    footprint = switchport_reconcile_footprint(device, payload, interface_pks)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return ReconcileMutationPlan(footprint)
-    reported = {
-        item.get("interface_name"): item
-        for item in payload.get("interfaces", []) or []
-        if isinstance(item, dict) and item.get("interface_name")
-    }
+    reported = {item.get("interface_name"): item for item in _switchport_items(payload) if item.get("interface_name")}
     states = tuple(
         NSOSwitchportState.objects.filter(management=management)
         .select_related("interface", "untagged_vlan")
@@ -589,16 +615,18 @@ def _write_switchport(management, interface, group, mode: str, untagged, tagged:
     interface.tagged_vlans.set(tagged_objs)
 
 
-def reconcile_switchport(device, payload: dict) -> list:
+def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAttempt | None = None) -> list:
     """Run switchport reconciliation behind its complete mutation footprint."""
     from .intent_state import reconcile_transaction
     from .signals import suppress_intent_push
 
-    with reconcile_transaction(switchport_reconcile_plan(device, payload)), suppress_intent_push():
-        return _reconcile_switchport(device, payload)
+    if attempt is None:
+        attempt = prepare_switchport_reconcile(device, payload)
+    with reconcile_transaction(attempt.plan), suppress_intent_push():
+        return _reconcile_switchport(device, payload, attempt.interface_pks)
 
 
-def _reconcile_switchport(device, payload: dict) -> list:
+def _reconcile_switchport(device, payload: dict, interface_pks: dict) -> list:
     """Reconcile L2 switchports: seed a pristine NetBox interface from the device, else 3-way.
 
     Brings switchport in line with every other overlay: when the NetBox interface has no
@@ -609,7 +637,12 @@ def _reconcile_switchport(device, payload: dict) -> list:
     touched it, an operator edit is frozen (``changed``) and survives, both-moved →
     ``conflict``. Owned (accepted) rows keep the value-aware settle and are never
     auto-clobbered. IOS's implicit default native VLAN 1 is normalised to "no native".
+
+    *interface_pks* is the frozen name→pk map of :class:`SwitchportReconcileAttempt`; a
+    payload name missing from it is deferred to the next read. The rows are reloaded here,
+    under the acquired lock, so the compare and the write see committed operator edits.
     """
+    from dcim.models import Interface
     from django.utils import timezone
 
     from . import merge_util
@@ -625,11 +658,14 @@ def _reconcile_switchport(device, payload: dict) -> list:
     now = timezone.now()
     rows: list = []
     seen: set[int] = set()
-    for item in payload.get("interfaces", []) or []:
-        try:
-            interface = device.interfaces.get(name=item["interface_name"])
-        except Exception:
-            continue
+    interfaces = {
+        interface.pk: interface
+        for interface in Interface.objects.filter(pk__in=set(interface_pks.values())).select_related("untagged_vlan")
+    }
+    for item in _switchport_items(payload):
+        interface = interfaces.get(interface_pks.get(item.get("interface_name")))
+        if interface is None:
+            continue  # not resolved before acquisition, or gone since; the next read picks it up
 
         nso_mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
         nso_untagged = item.get("untagged_vlan")

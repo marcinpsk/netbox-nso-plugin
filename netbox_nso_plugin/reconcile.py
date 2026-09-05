@@ -207,16 +207,26 @@ def _gated(
     return result
 
 
+def _switchport_attempt_slot(device, payload):
+    """Share ONE frozen switchport resolution between the gate's plan and its body."""
+    from .vlan_reconciler import prepare_switchport_reconcile
+
+    slot = []
+
+    def plan():
+        slot.clear()
+        slot.append(prepare_switchport_reconcile(device, payload))
+        return slot[0].plan
+
+    return slot, plan
+
+
 def _native_vlan_footprint(device, payload, family: str):
     """Resolve the complete native VLAN footprint before taking its first lock."""
     if family == "vlan":
         from .vlan_reconciler import vlan_reconcile_plan
 
         return vlan_reconcile_plan(device, payload)
-    if family == "switchport":
-        from .vlan_reconciler import switchport_reconcile_plan
-
-        return switchport_reconcile_plan(device, payload)
     if family == "svi":
         from .svi_reconciler import svi_reconcile_plan
 
@@ -640,16 +650,24 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
+            sw_slot, sw_plan = _switchport_attempt_slot(device, sw_doc)
             _gated(
                 ctx,
                 mgmt,
                 "switchport",
                 sw_doc,
                 lambda: _safe_reconcile(
-                    ctx, "switchport_states", mgmt, ("NSOSwitchportState",), reconcile_switchport, device, sw_doc
+                    ctx,
+                    "switchport_states",
+                    mgmt,
+                    ("NSOSwitchportState",),
+                    reconcile_switchport,
+                    device,
+                    sw_doc,
+                    sw_slot[0],
                 ),
                 epoch=dev_id,
-                pre_body=lambda: _native_vlan_footprint(device, sw_doc, "switchport"),
+                pre_body=sw_plan,
             )
         if mgmt.manage_snmp:
             snmp_doc = client.get_snmp_config(dev_id)
@@ -842,15 +860,16 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
+            sw_slot, sw_plan = _switchport_attempt_slot(device, sw_doc)
             _gated(
                 ctx,
                 mgmt,
                 "switchport",
                 sw_doc,
-                lambda: reconcile_switchport(device, sw_doc),
+                lambda: reconcile_switchport(device, sw_doc, sw_slot[0]),
                 epoch=dev_id,
                 ctx_key="switchport_states",
-                pre_body=lambda: _native_vlan_footprint(device, sw_doc, "switchport"),
+                pre_body=sw_plan,
             )
         elif key == "interfaces":
             from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
@@ -982,15 +1001,16 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
+            sw_slot, sw_plan = _switchport_attempt_slot(device, sw_doc)
             _gated(
                 ctx,
                 mgmt,
                 "switchport",
                 sw_doc,
-                lambda: reconcile_switchport(device, sw_doc),
+                lambda: reconcile_switchport(device, sw_doc, sw_slot[0]),
                 epoch=dev_id,
                 ctx_key="switchport_states",
-                pre_body=lambda: _native_vlan_footprint(device, sw_doc, "switchport"),
+                pre_body=sw_plan,
             )
         elif key == "svi":
             from .svi_reconciler import reconcile_svi

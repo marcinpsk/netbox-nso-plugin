@@ -199,6 +199,79 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertFalse(plan.changes_content)
 
+    def test_switchport_body_writes_only_the_interfaces_resolved_at_plan_time(self):
+        """An interface that arrives after the plan is deferred: writing it escapes the footprint."""
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.vlan_reconciler import (
+            _reconcile_switchport,
+            prepare_switchport_reconcile,
+            reconcile_switchport,
+            reconcile_vlan_database,
+        )
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "TEN"}]})
+        payload = {
+            "interfaces": [
+                {"interface_name": self.interface.name, "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+                {"interface_name": "GigabitEthernet0/2", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+            ]
+        }
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        late = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
+
+        with reconcile_transaction(attempt.plan), suppress_intent_push():
+            _reconcile_switchport(self.device, payload, attempt.interface_pks)
+
+        late.refresh_from_db()
+        self.assertFalse(late.mode)
+        self.assertIsNone(late.untagged_vlan_id)
+        self.assertFalse(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+        seeded = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual(seeded.status, "imported")
+        self.assertEqual(seeded.mode, "access")
+        self.assertEqual(seeded.untagged_vlan.vid, 10)
+
+        reconcile_switchport(self.device, payload)  # the next read resolves it and seeds it
+        self.assertTrue(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+
+    def test_switchport_body_reloads_the_frozen_interfaces_after_acquisition(self):
+        """An operator edit committed after the plan must not be clobbered from a stale copy."""
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.vlan_reconciler import (
+            _reconcile_switchport,
+            prepare_switchport_reconcile,
+            reconcile_vlan_database,
+        )
+
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        payload = {
+            "interfaces": [
+                {"interface_name": self.interface.name, "mode": "access", "untagged_vlan": 10, "tagged_vlans": []}
+            ]
+        }
+        attempt = prepare_switchport_reconcile(self.device, payload)
+
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        edited = Interface.objects.get(pk=self.interface.pk)
+        edited.mode = "access"
+        edited.untagged_vlan = VLAN.objects.get(group=group, vid=20)
+        edited.save()
+
+        with reconcile_transaction(attempt.plan), suppress_intent_push():
+            _reconcile_switchport(self.device, payload, attempt.interface_pks)
+
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.untagged_vlan.vid, 20)  # operator value NOT clobbered
+        state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual(state.status, "changed")  # existing-value branch, device differs
+        self.assertTrue(state.device_base_hash)  # the device version is adopted as the merge base
+
     def test_two_nameless_vlans_get_unique_placeholder_names(self):
         """Live arcos shape (vlans 5/6, no names): NetBox's (group, name) unique
         constraint rejects a SECOND name='' VLAN in the per-device group, which
