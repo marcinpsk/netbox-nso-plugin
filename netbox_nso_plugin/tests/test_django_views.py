@@ -6829,3 +6829,79 @@ class TestReviewRegressionPins(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.status, "accepted")
         self.assertIsNotNone(row.accepted_at)
+
+
+class TestNSOVLANRescopeView(ViewTestBase):
+    """POST-level cover for the rescope refusals the acquisition can raise."""
+
+    def test_rescope_refuses_when_a_device_attaches_before_acquisition(self):
+        """A late renderer target must return the refusal redirect, not an unhandled exception."""
+        from django.contrib.messages import get_messages
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.mgmt, vlan__vid=44)
+        source_vlan = state.vlan
+        target_group = VLANGroup.objects.create(name="Rescope Target", slug="rescope-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=44, name="MGMT")
+        late_device = Device.objects.create(
+            name="late-rescope-router",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        late_mgmt = NSODeviceManagement.objects.create(
+            device=late_device,
+            nso_instance=self.nso_instance,
+            nso_device_name="late-rescope-router",
+        )
+        original_footprint = intent_state.vlan_footprint
+        attached = False
+        revisions_after_attach = {}
+        late_state_pk = None
+
+        def attach_before_transaction(vlan_id, scopes, **kwargs):
+            nonlocal attached, late_state_pk
+            footprint = original_footprint(vlan_id, scopes, **kwargs)
+            if not attached and vlan_id == source_vlan.pk:
+                attached = True
+                late_state = NSOVLANState(
+                    management=late_mgmt,
+                    vlan=source_vlan,
+                    device_name="MGMT",
+                    status="imported",
+                )
+                with intent_state.intent_transaction(intent_state.footprint_for_instance(late_state)):
+                    late_state.save()
+                late_state_pk = late_state.pk
+                revisions_after_attach.update(
+                    dict(NSOIntentRevision.objects.values_list("id", "revision")),
+                )
+            # The stale footprint is what makes acquisition find the extra renderer target.
+            return footprint
+
+        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=attach_before_transaction):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
+                {"group": target_group.pk},
+            )
+
+        self.assertTrue(attached)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["The VLAN attachment changed. Refresh the page and try again."],
+        )
+        source_vlan.refresh_from_db()
+        target_vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertNotEqual(source_vlan.group_id, target_group.pk)
+        self.assertEqual(target_vlan.group_id, target_group.pk)
+        self.assertEqual(state.vlan_id, source_vlan.pk)
+        self.assertEqual(NSOVLANState.objects.get(pk=late_state_pk).vlan_id, source_vlan.pk)
+        self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), revisions_after_attach)
