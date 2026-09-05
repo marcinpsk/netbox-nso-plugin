@@ -11,7 +11,7 @@ import threading
 from collections import namedtuple
 
 from django.db.models import Q
-from django.db.models.signals import m2m_changed, post_delete, post_init, post_save, pre_delete, pre_save
+from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
@@ -48,7 +48,12 @@ def _ned_id_for_device(device_id: int) -> str:
     )
     if platform_id is None:
         return ""
-    ned_id = NSOPlatformNedMapping.objects.filter(platform_id=platform_id).values_list("ned_id", flat=True).first()
+    ned_id = (
+        NSOPlatformNedMapping.objects.filter(platform_id=platform_id)
+        .order_by()
+        .values_list("ned_id", flat=True)
+        .first()
+    )
     return str(ned_id or "")
 
 
@@ -129,12 +134,41 @@ def _skip_on_render(handler):
 
     @functools.wraps(handler)
     def _wrapped(*args, **kwargs):
-        # suppress_intent_push() (the reconcile/import path) is the authoritative
-        # guard; the GET-render check is a belt-and-suspenders for the legacy
-        # render-time reconcile and becomes redundant once render is read-only.
-        if _is_intent_push_suppressed() or _is_render_request():
-            return None
-        return handler(*args, **kwargs)
+        try:
+            # suppress_intent_push() (the reconcile/import path) is the authoritative
+            # guard; the GET-render check is a belt-and-suspenders for the legacy
+            # render-time reconcile and becomes redundant once render is read-only.
+            if _is_intent_push_suppressed() or _is_render_request():
+                return None
+            return handler(*args, **kwargs)
+        except BaseException:
+            from .intent_state import _abort_m2m_implicit, _end_implicit
+
+            sender = kwargs.get("sender", args[0] if len(args) > 0 else None)
+            instance = kwargs.get("instance", args[1] if len(args) > 1 else None)
+            action = kwargs.get("action", args[2] if len(args) > 2 else None)
+            details = {key: value for key, value in kwargs.items() if key not in {"sender", "instance", "action"}}
+            if action is not None:
+                _abort_m2m_implicit(sender, instance)
+            else:
+                _end_implicit(sender, instance, **details)
+            raise
+
+    return _wrapped
+
+
+def _close_renderer_m2m_permit(handler):
+    """Close an implicit M2M permit even when a behavior handler raises."""
+
+    @functools.wraps(handler)
+    def _wrapped(sender, instance, action, **kwargs):
+        try:
+            return handler(sender, instance, action, **kwargs)
+        finally:
+            if action.startswith("post_"):
+                from .intent_state import _end_m2m_implicit
+
+                _end_m2m_implicit(sender, instance, action, **kwargs)
 
     return _wrapped
 
@@ -265,31 +299,6 @@ def _clear_management_teardown(sender, instance, **kwargs):
     outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
 
 
-def _capture_intent_field_change(sender, instance, *, scope, **kwargs):
-    """Compare wire-visible fields before a save so its post-save hook can re-pend safely."""
-    from .apply_state import capture_intent_field_change
-
-    instance._nso_intent_previous_status = None
-    instance._nso_intent_forced_status = None
-    if _is_intent_push_suppressed() or _is_render_request():
-        return
-    capture_intent_field_change(instance, scope, update_fields=kwargs.get("update_fields"))
-
-
-def _remember_intent_status(sender, instance, **kwargs):
-    """Track the status this instance loaded or most recently persisted."""
-    from .apply_state import remember_loaded_status
-
-    remember_loaded_status(instance)
-
-
-def _finalise_intent_field_change(sender, instance, *, scope, **kwargs):
-    """Persist lifecycle changes even when the caller excluded status from its save."""
-    from .apply_state import repend_changed_row
-
-    repend_changed_row(instance, scope)
-
-
 def _schedule_intent_push(key, transitions=()) -> None:
     """Append this transaction's contribution to *key* and arrange for the key to drain.
 
@@ -309,8 +318,9 @@ def _schedule_intent_push(key, transitions=()) -> None:
     from django.db import transaction
 
     from . import outbox
+    from .intent_state import mirror_refresh_is_active
 
-    if _is_intent_push_suppressed() or _is_render_request():
+    if _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active():
         return  # a reconcile or render write mirrors the adapter; it is not operator intent
     outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
     _pending_intent_keys().add(tuple(key))
@@ -356,9 +366,7 @@ def _allocate_push_attempt(device_id, scope):
             attempts = dict(mgmt.intent_push_attempts or {})
             attempt = int(attempts.get(scope) or 0) + 1
             attempts[scope] = attempt
-            # Queryset update, not save(): the mark is bookkeeping and must not re-date
-            # last_updated or wake a management post_save.
-            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_attempts=attempts)
+            _update_management_mirror(mgmt, intent_push_attempts=attempts)
             return attempt
     except Exception as exc:  # noqa: BLE001 — bookkeeping must never block the push itself
         logger.warning("Could not allocate an intent-push attempt for device %s/%s: %s", device_id, scope, exc)
@@ -471,7 +479,7 @@ def _record_push_outcome(device_id, scope, attempt, exc):
                 if attribute is not None:
                     entry["route_ids"] = attribute(device_id, entry["detail"])
                 errors[scope] = entry
-            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(intent_push_errors=errors)
+            _update_management_mirror(mgmt, intent_push_errors=errors)
     except Exception as exc2:  # noqa: BLE001 — surfacing must never turn a swallowed push into a raise
         logger.warning("Could not record the intent-push outcome for device %s/%s: %s", device_id, scope, exc2)
 
@@ -542,6 +550,23 @@ def _send_rendered(rendered, body):
     return result
 
 
+def interface_intent_item(state):
+    """Return one interface attribute in the adapter's exact wire shape."""
+    iface = state.interface
+    if state.attribute == "description":
+        intent_value = iface.description or ""
+    elif state.attribute == "enabled":
+        intent_value = str(iface.enabled).lower()
+    else:
+        return None
+    return {
+        "interface": iface.name,
+        "attribute": state.attribute,
+        "intent_value": intent_value,
+        "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
+    }
+
+
 def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
     """Build and capture the full OWNED interface intent snapshot.
 
@@ -566,21 +591,8 @@ def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
 
     attributes = []
     for state in states:
-        iface = state.interface
-        if state.attribute == "description":
-            intent_value = iface.description or ""
-        elif state.attribute == "enabled":
-            intent_value = str(iface.enabled).lower()
-        else:
-            continue
-        attributes.append(
-            {
-                "interface": iface.name,
-                "attribute": state.attribute,
-                "intent_value": intent_value,
-                "accepted_at": state.accepted_at.isoformat() if state.accepted_at else None,
-            }
-        )
+        if item := interface_intent_item(state):
+            attributes.append(item)
 
     _push_changed(
         (device_id, "interface"),
@@ -592,6 +604,40 @@ def _push_interface_intent_for_device(device_id, adapter_device_id) -> None:
 #: The destination protocols a redistribution change can be scheduled against. It is the
 #: delivery key itself, so an unknown value names no renderer and must be refused, not sent.
 _REDISTRIBUTION_PROTOCOLS = ("ospf", "isis", "bgp")
+_MANAGEMENT_MIRROR_FIELDS = frozenset(
+    {
+        "adapter_device_id",
+        "adapter_incarnation_born",
+        "adapter_source_epoch",
+        "source_epoch_aware",
+        "source_rekey_pending",
+        "reset_pending_source_epoch",
+        "reset_pending_incarnation",
+        "reset_pending_born",
+        "reset_conflict_born",
+        "adapter_incarnation",
+        "adapter_link_error",
+        "adapter_link_attempted_at",
+        "settle_cursor_seq",
+        "settle_cursor_incarnation",
+        "settle_cursor_device_id",
+        "settle_stall_seq",
+        "settle_stall_attempts",
+        "settle_stall_first_seen_at",
+        "onboard_status",
+        "onboard_error",
+        "onboarded_at",
+        "onboard_steps",
+        "onboard_job_id",
+        "last_sync_at",
+        "last_sync_status",
+        "degraded_surfaces",
+        "last_journaled_apply_job",
+        "state_snapshot",
+        "intent_push_attempts",
+        "intent_push_errors",
+    }
+)
 
 
 def redistribution_destinations() -> tuple[str, ...]:
@@ -623,6 +669,10 @@ def remember_adapter_source(sender, instance, **kwargs):
     if not instance.pk:
         instance._nso_source_changed = True
         return
+    update_fields = kwargs.get("update_fields")
+    if update_fields and set(update_fields) <= _MANAGEMENT_MIRROR_FIELDS:
+        instance._nso_source_changed = False
+        return
     previous = (
         sender.objects.filter(pk=instance.pk)
         .values_list("nso_instance_id", "nso_device_name", "source_rekey_pending")
@@ -652,77 +702,82 @@ def _invalidate_source_admissions(instance) -> int:
     )
 
 
-@contextlib.contextmanager
-def _source_rekey_lock(management_id):
-    """Serialize remote rekeys across transactions on this management row."""
-    from django.db import connection
-
-    namespace = 0x4E534F  # "NSO"; two-int PostgreSQL advisory-lock namespace
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT pg_advisory_lock(%s, %s)", [namespace, management_id])
-    try:
-        yield
-    finally:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [namespace, management_id])
-
-
 def _sync_source_change(instance, client) -> bool:
-    """Serialize a source rekey and adopt its epoch only for the persisted tuple."""
+    """Fence, call, then finalize a source rekey in two durable transactions."""
     from django.db import transaction
+
+    from .apply_state import lock_device_intent_transaction, lock_order_scope
+    from .deployment import lock_mutation
 
     management_model = type(instance)
     expected_source = (instance.nso_instance_id, instance.nso_device_name)
-    with _source_rekey_lock(instance.pk):
-        with transaction.atomic():
-            current = management_model.objects.select_for_update().select_related("nso_instance").get(pk=instance.pk)
-            if (current.nso_instance_id, current.nso_device_name) != expected_source:
-                return False
-            invalidated = _invalidate_source_admissions(current)
-            management_model.objects.filter(pk=current.pk).update(source_rekey_pending=True)
-            current.source_rekey_pending = True
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(instance.device_id)
+        # of=("self",): without it the joined instance row is locked too, and every device shares it.
+        current = (
+            management_model.objects.select_for_update(of=("self",)).select_related("nso_instance").get(pk=instance.pk)
+        )
+        if (current.nso_instance_id, current.nso_device_name) != expected_source:
+            return False
+        invalidated = _invalidate_source_admissions(current)
 
-        from .adapter_client import AdapterError
+    from .adapter_client import AdapterError
 
-        try:
-            result = client.patch_device(
-                adapter_device_id=current.adapter_device_id,
-                nso_instance=current.nso_instance.adapter_instance_id,
-                nso_device_name=current.nso_device_name,
-            )
-        except AdapterError as exc:
-            # The mapping this rekey retargets is gone, so the PATCH can never land and both the
-            # periodic repair and the Retry button would re-enter here forever. Re-onboard under
-            # the NEW identity — which is what the rekey was expressing — then fall through to
-            # the same completion below, so the epoch fence and the reset-pending marker are
-            # recorded exactly as on the normal path. Handling it HERE rather than at the caller
-            # is what keeps ``invalidated`` in scope: admissions were already blanked above, and
-            # dropping that marker would leave every family fenced while the UI read all-clear.
-            if exc.code != "not_found":
-                raise
-            logger.warning(
-                "Rekey target %s is gone for NetBox device %s — re-onboarding under the new source",
-                current.adapter_device_id,
-                current.device_id,
-            )
-            _onboard_into_adapter(current, client)
-            # ``current`` is a separate instance from the caller's ``instance``; without this
-            # the scope push below would still target the dead id.
-            instance.adapter_device_id = current.adapter_device_id
-            result = {"source_epoch": current.adapter_source_epoch}
-        if result.get("source_epoch") is None:
-            raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
-        with transaction.atomic():
-            current = management_model.objects.select_for_update().get(pk=instance.pk)
-            if (current.nso_instance_id, current.nso_device_name) != expected_source:
-                return False
-            source_epoch = result["source_epoch"]
-            source_aware = True
-            management_model.objects.filter(pk=current.pk).update(
-                adapter_source_epoch=source_epoch,
-                source_epoch_aware=source_aware,
-                source_rekey_pending=False,
-                reset_pending_source_epoch=source_epoch if invalidated else None,
+    try:
+        result = client.patch_device(
+            adapter_device_id=current.adapter_device_id,
+            nso_instance=current.nso_instance.adapter_instance_id,
+            nso_device_name=current.nso_device_name,
+        )
+    except AdapterError as exc:
+        # The old adapter mapping can disappear before the rekey runs. Onboard the new
+        # durable source identity and finalize it through the same fenced second phase.
+        if exc.code != "not_found":
+            raise
+        logger.warning(
+            "Rekey target %s is gone for NetBox device %s. Re-onboarding the new source.",
+            current.adapter_device_id,
+            current.device_id,
+        )
+        _onboard_into_adapter(current, client)
+        instance.adapter_device_id = current.adapter_device_id
+        result = {"source_epoch": current.adapter_source_epoch}
+    if result.get("source_epoch") is None:
+        raise RuntimeError("adapter rekey response omitted source_epoch; publication remains fenced")
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(instance.device_id)
+        current = management_model.objects.select_for_update().get(pk=instance.pk)
+        if (current.nso_instance_id, current.nso_device_name) != expected_source:
+            return False
+        source_epoch = result["source_epoch"]
+        source_aware = True
+        current.adapter_source_epoch = source_epoch
+        current.source_epoch_aware = source_aware
+        current.source_rekey_pending = False
+        current.reset_pending_source_epoch = source_epoch if invalidated else None
+        from .intent_state import mirror_refresh
+
+        with (
+            suppress_intent_push(),
+            mirror_refresh(
+                current,
+                {
+                    "adapter_source_epoch",
+                    "source_epoch_aware",
+                    "source_rekey_pending",
+                    "reset_pending_source_epoch",
+                },
+            ),
+        ):
+            current.save(
+                update_fields=[
+                    "adapter_source_epoch",
+                    "source_epoch_aware",
+                    "source_rekey_pending",
+                    "reset_pending_source_epoch",
+                ]
             )
     instance.adapter_source_epoch = source_epoch
     instance.source_epoch_aware = source_aware
@@ -733,31 +788,56 @@ def _sync_source_change(instance, client) -> bool:
 def _onboard_into_adapter(instance, client):
     """Register the device with the adapter and store the returned mapping on the row.
 
-    ``.update()`` (not ``.save()``) so storing the mapping doesn't re-enter this handler.
+    The adapter identity fields are admission metadata, not renderer content.
     """
     result = client.onboard_device(
         nso_instance=instance.nso_instance.adapter_instance_id,
         nso_device_name=instance.nso_device_name,
         netbox_device_id=instance.device_id,
     )
-    type(instance).objects.filter(pk=instance.pk).update(
-        adapter_device_id=result["id"],
-        adapter_source_epoch=result.get("source_epoch"),
-        source_epoch_aware=result.get("source_epoch") is not None,
-    )
-    instance.adapter_device_id = result["id"]
-    instance.adapter_source_epoch = result.get("source_epoch")
-    instance.source_epoch_aware = result.get("source_epoch") is not None
+    from django.db import transaction
+
+    from .apply_state import lock_device_intent_transaction, lock_order_scope
+    from .deployment import lock_mutation
+    from .intent_state import mirror_refresh
+
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(instance.device_id)
+        current = type(instance).objects.select_for_update().get(pk=instance.pk)
+        current.adapter_device_id = result["id"]
+        current.adapter_source_epoch = result.get("source_epoch")
+        current.source_epoch_aware = result.get("source_epoch") is not None
+        with (
+            suppress_intent_push(),
+            mirror_refresh(
+                current,
+                {"adapter_device_id", "adapter_source_epoch", "source_epoch_aware"},
+            ),
+        ):
+            current.save(update_fields=["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"])
+    instance.adapter_device_id = current.adapter_device_id
+    instance.adapter_source_epoch = current.adapter_source_epoch
+    instance.source_epoch_aware = current.source_epoch_aware
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
-def sync_scope_to_adapter(sender, instance, created, **kwargs):
+def sync_scope_to_adapter(sender, instance, created, update_fields=None, **kwargs):
     """Run adapter side effects only after the management-row transaction commits."""
     from django.db import transaction
 
+    if update_fields and set(update_fields) <= _MANAGEMENT_MIRROR_FIELDS:
+        return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
     transaction.on_commit(lambda: _sync_committed_scope_to_adapter(sender, instance.pk, created))
+
+
+def _update_management_mirror(instance, **values):
+    """Persist management lifecycle fields through a per-instance mirror permit."""
+    from .intent_state import update_mirror_fields
+
+    update_mirror_fields(instance, **values)
 
 
 def _sync_committed_scope_to_adapter(sender, instance_pk, created):
@@ -834,15 +914,14 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
                 notify_result["job_id"],
             )
         # Linking succeeded — clear any error left by a prior failed attempt so the tab banner
-        # goes away. .update() (not .save()) so this doesn't re-fire this post_save handler.
+        # goes away.
         if instance.adapter_link_error:
-            type(instance).objects.filter(pk=instance.pk).update(adapter_link_error="")
-            instance.adapter_link_error = ""
+            _update_management_mirror(instance, adapter_link_error="")
     except Exception as exc:
         logger.warning("Failed to sync scope to adapter for device %s: %s", instance.device_id, exc)
         # Surface the failure on the row instead of only logging it: otherwise the device looks
         # managed in NetBox while silently unlinked from the adapter (adapter_device_id stays None),
-        # with nothing mirrored/applied and no operator-visible signal. .update() avoids recursion.
+        # with nothing mirrored/applied and no operator-visible signal.
         from .adapter_client import public_error_message
 
         message = (
@@ -858,7 +937,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
         from django.db import connection
 
         if not connection.needs_rollback:
-            type(instance).objects.filter(pk=instance.pk).update(adapter_link_error=message)
+            _update_management_mirror(instance, adapter_link_error=message)
 
 
 @receiver(post_delete, sender="netbox_nso_plugin.NSODeviceManagement")
@@ -1042,7 +1121,7 @@ def _recompute_on_interface_save(sender, instance, created, **kwargs):
 
 
 def _stash_interface_old_values(sender, instance, **kwargs):
-    """Capture and lock native interface fields rendered by intent.
+    """Capture native interface fields rendered by intent.
 
     Lets :func:`_push_intent_on_interface_edit` tell which attribute the operator
     actually changed. Without it, every save would promote *every* managed attribute
@@ -1051,13 +1130,11 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     """
     if not instance.pk:
         instance._nso_old_values = None
-        instance._nso_name_intent_rows = {}
-        instance._nso_name_intent_management = None
+        instance._intent_rename_targets = set()
         return
     fields = ("name", "description", "enabled")
     instance._nso_old_values = sender.objects.filter(pk=instance.pk).values(*fields).first()
-    instance._nso_name_intent_rows = {}
-    instance._nso_name_intent_management = None
+    instance._intent_rename_targets = set()
     update_fields = kwargs.get("update_fields")
     if (
         _is_intent_push_suppressed()
@@ -1067,70 +1144,51 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     ):
         return
 
-    from .apply_state import DeferredIntentFieldStale, lock_interface_intent_rows
+    current = instance._nso_old_values
+    if current is None or instance.name == current["name"]:
+        return
+    from .apply_state import interface_intent_targets
 
-    locked, management, rows = lock_interface_intent_rows(instance.pk)
-    if locked is None or management is None or not any(rows.values()):
-        return
-    current = {field: getattr(locked, field) for field in fields}
-    instance._nso_old_values = current
-    loaded_name = getattr(instance, "_nso_loaded_interface_name", None)
-    if loaded_name is None:
-        deferred_name = instance.__dict__.get("name", current["name"])
-        if deferred_name != current["name"]:
-            raise DeferredIntentFieldStale("deferred interface name changed before save")
-        loaded_name = current["name"]
-        if "name" not in instance.__dict__:
-            instance.name = current["name"]
-    if loaded_name != current["name"] and instance.name == loaded_name:
-        instance.name = current["name"]
-        return
-    if instance.name != current["name"]:
-        instance._nso_name_intent_rows = rows
-        instance._nso_name_intent_management = management
+    device_ids, scopes = interface_intent_targets(instance.pk)
+    instance._intent_rename_targets = {(device_id, scope) for device_id in device_ids for scope in scopes}
 
 
 @_skip_on_render
 def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
-    """Re-pend each Apply scope whose payload contains a renamed interface."""
+    """Queue each scope whose payload contains a renamed interface."""
     if created:
         return
-    rows = getattr(instance, "_nso_name_intent_rows", {})
-    management = getattr(instance, "_nso_name_intent_management", None)
-    if management is None or not any(rows.values()):
-        return
-
     from . import delivery
     from . import status_machine as sm
+    from .intent_state import interface_name_intent_rows
+    from .models import NSODeviceManagement
 
-    targets = set()
+    targets = getattr(instance, "_intent_rename_targets", set())
+    if not targets:
+        return
     with suppress_intent_push():
-        for scope, states in rows.items():
-            for state in states:
-                was_owned = sm.is_owned(state.status)
-                new_status = (
-                    "accepted"
-                    if state.status == "deploying"
-                    else sm.on_reconcile(
-                        state.status,
-                        matches=False,
-                    )
-                )
-                if new_status != state.status:
-                    state.status = new_status
-                    state.save(update_fields=["status"])
-                entry = delivery.delivery_keys()[scope]
-                may_deliver = entry.in_protocol or management.auto_apply
-                if was_owned and management.adapter_device_id is not None and may_deliver:
-                    targets.add((management.device_id, scope))
+        for state in interface_name_intent_rows(instance.pk):
+            if not sm.is_owned(state.status):
+                continue
+            new_status = "accepted" if state.status == "deploying" else sm.on_reconcile(state.status, matches=False)
+            if new_status == state.status:
+                continue
+            state.status = new_status
+            update_fields = ["status"]
+            if state.status != "deploying" and getattr(state, "apply_attempt_id", None) is not None:
+                state.apply_attempt_id = None
+                update_fields.append("apply_attempt_id")
+            state.save(update_fields=update_fields)
+    auto_apply = dict(
+        NSODeviceManagement.objects.filter(device_id__in={device_id for device_id, _scope in targets}).values_list(
+            "device_id", "auto_apply"
+        )
+    )
     for key in sorted(targets):
+        device_id, scope = key
+        if not delivery.delivery_keys()[scope].in_protocol and not auto_apply.get(device_id, False):
+            continue
         _schedule_intent_push(key)
-
-
-def _remember_interface_name(sender, instance, **kwargs):
-    """Record the native name represented by this interface instance."""
-    if "name" in instance.__dict__:
-        instance._nso_loaded_interface_name = instance.__dict__["name"]
 
 
 @_skip_on_render
@@ -1247,6 +1305,20 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
     )
 
 
+def interface_ip_intent_item(row):
+    """Return one interface address in the adapter's exact wire shape."""
+    entry = {
+        "interface": row.interface.name,
+        "address": row.address,
+        "family": row.family,
+        "secondary": bool(row.secondary),
+        "vrf": row.vrf,
+        "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None,
+    }
+    entry.update(_nokia_routed_binding(row.interface))
+    return entry
+
+
 def _push_ip_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IP intent snapshot for a device."""
     from . import adapter_client as client
@@ -1257,18 +1329,7 @@ def _push_ip_intent_for_device(device_id, adapter_device_id):
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface", "interface__parent")
 
-    addresses = []
-    for ip_state in ip_states:
-        entry = {
-            "interface": ip_state.interface.name,
-            "address": ip_state.address,
-            "family": ip_state.family,
-            "secondary": bool(ip_state.secondary),
-            "vrf": ip_state.vrf,
-            "accepted_at": ip_state.accepted_at.isoformat() if ip_state.accepted_at else None,
-        }
-        entry.update(_nokia_routed_binding(ip_state.interface))
-        addresses.append(entry)
+    addresses = [interface_ip_intent_item(ip_state) for ip_state in ip_states]
 
     _push_changed((device_id, "ip"), addresses, lambda body: client.put_ip_intent(adapter_device_id, body))
 
@@ -1292,6 +1353,13 @@ def _nokia_routed_binding(interface) -> dict:
     if not tag.isdigit():
         return {}
     return {"routed": True, "parent_binding": parent.name, "encap_tag": tag}
+
+
+def snmp_vault_ref_push_blocker(row) -> str:
+    """Why *row* cannot be faithfully pushed, or "" when it can."""
+    if not row.vault_ref:
+        return "this owned SNMP row has no Vault reference"
+    return ""
 
 
 def snmp_v3_user_push_blocker(row) -> str:
@@ -1354,12 +1422,16 @@ def snmp_host_push_blocker(row) -> str:
     return ""
 
 
-def _drop_unpushable_snmp_rows(model, rows, blocker):
+def _drop_unpushable_snmp_rows(rows, blocker):
     """Split *rows* into (pushable, blocked) and surface each blocked row as an error.
 
-    ``.update()`` (not ``.save()``) — a save would re-enter the post_save receiver and
-    schedule another push of the snapshot we are building right now.
+    The renderer already omits each blocked row. Its canonical fragment is therefore
+    ABSENT both before and after the error badge update.
     """
+    from django.db import transaction
+
+    from .intent_state import mirror_refresh
+
     pushable, blocked = [], []
     for row in rows:
         reason = blocker(row)
@@ -1369,8 +1441,70 @@ def _drop_unpushable_snmp_rows(model, rows, blocker):
         else:
             pushable.append(row)
     if blocked:
-        model.objects.filter(pk__in=[r.pk for r in blocked]).exclude(status="error").update(status="error")
+        with transaction.atomic(), suppress_intent_push():
+            for row in blocked:
+                if row.status == "error":
+                    continue
+                with mirror_refresh(row, {"status"}) as locked:
+                    if locked is None:
+                        continue
+                    locked.status = "error"
+                    locked.save(update_fields=["status"])
     return pushable
+
+
+def _snmp_push_blockers(rows, blocker):
+    """Return the reasons that prevent a complete SNMP snapshot."""
+    blocked = []
+    for row in rows:
+        reason = blocker(row)
+        if reason:
+            logger.warning("SNMP intent: %s blocks the full snapshot: %s", row, reason)
+            blocked.append(f"{row}: {reason}")
+    return blocked
+
+
+def snmp_community_intent_item(row):
+    """Return one SNMP community in the adapter's exact wire shape."""
+    return {
+        "label": row.community_hash,
+        "vault_ref": row.vault_ref,
+        "access": row.access,
+        "acl": row.acl or None,
+    }
+
+
+def snmp_v3_user_intent_item(row):
+    """Return one SNMPv3 user in the adapter's exact wire shape."""
+    return {
+        "username": row.username,
+        "group": row.group_name or None,
+        "auth_protocol": row.auth_protocol or None,
+        "priv_protocol": row.priv_protocol or None,
+        "auth_vault_ref": f"{row.vault_ref}#auth" if row.auth_protocol else None,
+        "priv_vault_ref": f"{row.vault_ref}#priv" if row.priv_protocol else None,
+    }
+
+
+def snmp_host_intent_item(row, ned_id):
+    """Return one SNMP notification host in the adapter's exact wire shape."""
+    host = {
+        "address": row.address,
+        "version": row.version,
+        "notify_type": row.notify_type,
+        "community_or_user": (row.username if _host_is_v3(row.version) else row.community_hash) or "",
+    }
+    suppress_default_port = row.port == 162 and ned_id.startswith(
+        ("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli")
+    )
+    if row.port is not None and not suppress_default_port:
+        host["port"] = row.port
+    return host
+
+
+def snmp_system_info_intent_item(row):
+    """Return the SNMP system-information singleton in its exact wire shape."""
+    return {"location": row.location or None, "contact": row.contact or None}
 
 
 def _push_snmp_intent_for_device(device_id, adapter_device_id):
@@ -1378,48 +1512,35 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
     from . import adapter_client as client
     from .models import NSOSnmpCommunityState, NSOSnmpHostState, NSOSnmpSystemInfoState, NSOSnmpV3UserState
 
+    owned_communities = list(
+        NSOSnmpCommunityState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management")
+    )
+    blocked = _snmp_push_blockers(owned_communities, snmp_vault_ref_push_blocker)
     communities = []
-    for row in NSOSnmpCommunityState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management"):
+    for row in owned_communities:
         if not row.vault_ref:
             continue
-        communities.append(
-            {
-                "label": row.community_hash,  # use hash as stable label
-                "vault_ref": row.vault_ref,
-                "access": row.access,
-                "acl": row.acl or None,
-            }
-        )
+        communities.append(snmp_community_intent_item(row))
 
     v3_users = []
-    owned_v3 = [
-        row
-        for row in NSOSnmpV3UserState.objects.filter(
+    owned_v3 = list(
+        NSOSnmpV3UserState.objects.filter(
             management__device_id=device_id,
             status__in=_OWNED_PUSH_STATUSES,
         )
-        if row.vault_ref
-    ]
-    for row in _drop_unpushable_snmp_rows(NSOSnmpV3UserState, owned_v3, snmp_v3_user_push_blocker):
+    )
+    blocked.extend(_snmp_push_blockers(owned_v3, snmp_vault_ref_push_blocker))
+    for row in _drop_unpushable_snmp_rows(owned_v3, snmp_v3_user_push_blocker):
         # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at
         # "#auth"/"#priv" by convention. A leg without its protocol is not
         # derivable on-device, so its ref is withheld (the reconciler would
         # otherwise resolve a secret it cannot apply). snmp_v3_user_push_blocker
         # has already rejected the case where the DEVICE holds a secret whose
         # protocol was never declared — withholding there would downgrade the user.
-        v3_users.append(
-            {
-                "username": row.username,
-                "group": row.group_name or None,
-                "auth_protocol": row.auth_protocol or None,
-                "priv_protocol": row.priv_protocol or None,
-                "auth_vault_ref": f"{row.vault_ref}#auth" if row.auth_protocol else None,
-                "priv_vault_ref": f"{row.vault_ref}#priv" if row.priv_protocol else None,
-            }
-        )
+        v3_users.append(snmp_v3_user_intent_item(row))
 
     ned_id = _ned_id_for_device(device_id)
     hosts = []
@@ -1429,22 +1550,8 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
             status__in=_OWNED_PUSH_STATUSES,
         )
     )
-    for row in _drop_unpushable_snmp_rows(NSOSnmpHostState, owned_hosts, snmp_host_push_blocker):
-        host = {
-            "address": row.address,
-            "version": row.version,
-            "notify_type": row.notify_type,
-            # ONE NED field, two meanings — which is the whole reason v3 hosts were unpushable
-            # (CR-P16). On v1/v2c it is the community (referenced by its label); on v3 it is the
-            # security user name, which both host writers key the receiver on.
-            "community_or_user": (row.username if _host_is_v3(row.version) else row.community_hash) or "",
-        }
-        suppress_default_port = row.port == 162 and ned_id.startswith(
-            ("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli")
-        )
-        if row.port is not None and not suppress_default_port:
-            host["port"] = row.port
-        hosts.append(host)
+    for row in _drop_unpushable_snmp_rows(owned_hosts, snmp_host_push_blocker):
+        hosts.append(snmp_host_intent_item(row, ned_id))
 
     system_info = None
     try:
@@ -1452,18 +1559,24 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
             management__device_id=device_id,
         )
         if sysinfo.status in _OWNED_PUSH_STATUSES:
-            system_info = {
-                "location": sysinfo.location or None,
-                "contact": sysinfo.contact or None,
-            }
+            system_info = snmp_system_info_intent_item(sysinfo)
     except NSOSnmpSystemInfoState.DoesNotExist:
         pass
 
-    _push_changed(
-        (device_id, "snmp"),
-        [communities, v3_users, hosts, system_info],
-        lambda body: client.put_snmp_intent(adapter_device_id, *body),
-    )
+    payload = {"blocked": blocked} if blocked else [communities, v3_users, hosts, system_info]
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            from .adapter_client import AdapterError
+
+            raise AdapterError(
+                f"SNMP snapshot is blocked: {'; '.join(body['blocked'])}",
+                code="validation_error",
+                detail={"reason": "blocked_owned_row"},
+            )
+        return client.put_snmp_intent(adapter_device_id, *body)
+
+    _push_changed((device_id, "snmp"), payload, push)
 
 
 @_skip_on_render
@@ -1483,6 +1596,29 @@ def _on_snmp_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "snmp"))
 
 
+def logging_host_intent_item(row, ned_id):
+    """Return one remote logging host in the adapter's exact wire shape."""
+    from .template_content import _canonical_logging_intent_field
+
+    host = {
+        "address": row.address,
+        "severity": _canonical_logging_intent_field(ned_id, "severity", row.severity or ""),
+        "facility": _canonical_logging_intent_field(ned_id, "facility", row.facility or ""),
+        "transport": row.transport or "",
+        "vrf": row.vrf or "",
+        "source": row.source or "",
+    }
+    suppress_default_port = row.port == 514 and ned_id.startswith(("timos", "arcos-"))
+    if row.port is not None and not suppress_default_port:
+        host["port"] = row.port
+    return host
+
+
+def logging_levels_intent_item(row):
+    """Return the local logging singleton, including its explicit null shape."""
+    return row.set_severities() or None
+
+
 def _push_logging_intent_for_device(device_id, adapter_device_id):
     """Build and push the full logging intent snapshot (hosts + local levels) for a device.
 
@@ -1495,7 +1631,6 @@ def _push_logging_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOLoggingHostState, NSOLoggingLevelState
-    from .template_content import _canonical_logging_intent_field
 
     ned_id = _ned_id_for_device(device_id)
     hosts = []
@@ -1503,25 +1638,14 @@ def _push_logging_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ):
-        host = {
-            "address": row.address,
-            "severity": _canonical_logging_intent_field(ned_id, "severity", row.severity or ""),
-            "facility": _canonical_logging_intent_field(ned_id, "facility", row.facility or ""),
-            "transport": row.transport or "",
-            "vrf": row.vrf or "",
-            "source": row.source or "",
-        }
-        suppress_default_port = row.port == 514 and ned_id.startswith(("timos", "arcos-"))
-        if row.port is not None and not suppress_default_port:
-            host["port"] = row.port
-        hosts.append(host)
+        hosts.append(logging_host_intent_item(row, ned_id))
 
     local_levels = None
     levels_row = NSOLoggingLevelState.objects.filter(management__device_id=device_id).first()
     if levels_row is not None and levels_row.status in _OWNED_PUSH_STATUSES:
         # An owned row with every severity blank manages nothing → null (un-manage);
         # the #83 cleared-owned-scalar shape, same as deleting the row.
-        local_levels = levels_row.set_severities() or None
+        local_levels = logging_levels_intent_item(levels_row)
 
     _push_changed(
         (device_id, "logging"),
@@ -1547,6 +1671,19 @@ def _on_logging_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "logging"))
 
 
+def svi_intent_item(row):
+    """Return one SVI in the adapter's exact wire shape, or None when unkeyed."""
+    vid = row.vlan.vid if row.vlan else None
+    if vid is None:
+        return None
+    return {
+        "interface_name": row.interface.name,
+        "vlan_id": vid,
+        "type": row.svi_type or "svi",
+        "vrf": row.vrf or "",
+    }
+
+
 def _push_svi_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned SVI/IRB intent snapshot for a device.
 
@@ -1561,17 +1698,8 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface", "vlan"):
-        vid = row.vlan.vid if row.vlan else None
-        if vid is None:
-            continue  # the svi-reconciler keys on a VLAN id
-        interfaces.append(
-            {
-                "interface_name": row.interface.name,
-                "vlan_id": vid,
-                "type": row.svi_type or "svi",
-                "vrf": row.vrf or "",
-            }
-        )
+        if item := svi_intent_item(row):
+            interfaces.append(item)
 
     _push_changed(
         (device_id, "svi"),
@@ -1597,6 +1725,19 @@ def _on_svi_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "svi"))
 
 
+def subinterface_intent_item(row):
+    """Return one dot1q subinterface in its exact wire shape, or None when unkeyed."""
+    if row.dot1q_vlan is None or row.parent_interface is None:
+        return None
+    return {
+        "interface_name": row.interface.name,
+        "parent_interface": row.parent_interface.name,
+        "dot1q_vlan": row.dot1q_vlan,
+        "type": "subinterface",
+        "vrf": row.vrf or "",
+    }
+
+
 def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned dot1q subinterface intent snapshot.
 
@@ -1611,19 +1752,8 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface", "parent_interface"):
-        # The subinterface-reconciler keys on the dot1q tag and (for Junos) the
-        # parent interface — skip rows missing either rather than emit a bad payload.
-        if row.dot1q_vlan is None or row.parent_interface is None:
-            continue
-        interfaces.append(
-            {
-                "interface_name": row.interface.name,
-                "parent_interface": row.parent_interface.name,
-                "dot1q_vlan": row.dot1q_vlan,
-                "type": "subinterface",
-                "vrf": row.vrf or "",
-            }
-        )
+        if item := subinterface_intent_item(row):
+            interfaces.append(item)
 
     _push_changed(
         (device_id, "subinterface"),
@@ -1649,6 +1779,18 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "subinterface"))
 
 
+def interface_mtu_intent_item(row):
+    """Return one MTU intent item, or None when it manages no MTU leaf."""
+    if row.l2_mtu is None and row.ip_mtu is None and row.mpls_mtu is None:
+        return None
+    return {
+        "interface_name": row.interface.name,
+        "mtu": row.l2_mtu,
+        "ip_mtu": row.ip_mtu,
+        "mpls_mtu": row.mpls_mtu,
+    }
+
+
 def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface MTU intent snapshot (Phase 2b).
 
@@ -1663,17 +1805,8 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface"):
-        # At least one MTU value must be set or the reconciler has nothing to write.
-        if row.l2_mtu is None and row.ip_mtu is None and row.mpls_mtu is None:
-            continue
-        interfaces.append(
-            {
-                "interface_name": row.interface.name,
-                "mtu": row.l2_mtu,
-                "ip_mtu": row.ip_mtu,
-                "mpls_mtu": row.mpls_mtu,
-            }
-        )
+        if item := interface_mtu_intent_item(row):
+            interfaces.append(item)
 
     _push_changed(
         (device_id, "interface_mtu"),
@@ -1699,6 +1832,15 @@ def _on_mtu_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "interface_mtu"))
 
 
+def vlan_intent_item(row):
+    """Return one VLAN row in the adapter's exact wire shape."""
+    from .vlan_reconciler import rendered_vlan_name
+
+    if row.vlan is None:
+        return None
+    return {"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row)}
+
+
 def _push_vlan_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned VLAN-database intent snapshot for a device (write).
 
@@ -1708,16 +1850,14 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOVLANState
-    from .vlan_reconciler import rendered_vlan_name
 
     vlans = []
     for row in NSOVLANState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("vlan"):
-        if row.vlan is None:
-            continue
-        vlans.append({"vlan_id": row.vlan.vid, "name": rendered_vlan_name(row)})
+        if item := vlan_intent_item(row):
+            vlans.append(item)
 
     _push_changed(
         (device_id, "vlan"),
@@ -1745,7 +1885,7 @@ def _on_vlan_state_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_vlan_pre_save(sender, instance, **kwargs):
-    """Lock and record changes to fields rendered by VLAN or SVI intent.
+    """Record changes to fields rendered by VLAN or SVI intent.
 
     A VID-only save can require a new fabricated display name while ``update_fields``
     excludes ``name``. The direct update keeps that derived placeholder consistent without
@@ -1756,37 +1896,39 @@ def _on_vlan_pre_save(sender, instance, **kwargs):
     candidate_fields = {"name", "vid"}
     if update_fields is not None:
         candidate_fields.intersection_update(update_fields)
-    instance._nso_vlan_changed_fields = frozenset()
-    instance._nso_vlan_intent_rows = {}
+    instance._intent_vlan_changed_fields = frozenset()
+    instance._intent_vlan_rows = {}
+    instance._intent_vlan_update_name = False
     if instance._state.adding or not candidate_fields:
         return
 
-    from .apply_state import lock_vlan_intent_rows
+    from .apply_state import vlan_intent_targets
 
     scopes = ("vlan", "svi", "switchport") if "vid" in candidate_fields else ("vlan",)
-    locked_vlan, rows = lock_vlan_intent_rows(instance.pk, scopes)
-    if locked_vlan is None:
+    current_vlan = sender.objects.filter(pk=instance.pk).first()
+    if current_vlan is None:
         return
-    changed_fields = {field for field in candidate_fields if getattr(locked_vlan, field) != getattr(instance, field)}
+    _device_ids, rows = vlan_intent_targets(instance.pk, scopes)
+    changed_fields = {field for field in candidate_fields if getattr(current_vlan, field) != getattr(instance, field)}
     if "vid" in changed_fields and "name" not in changed_fields and rows.get("vlan"):
         from .vlan_reconciler import placeholder_vlan_name
 
-        display_placeholder = locked_vlan.name == placeholder_vlan_name(locked_vlan.vid) and all(
+        display_placeholder = current_vlan.name == placeholder_vlan_name(current_vlan.vid) and all(
             not state.device_name for state in rows["vlan"]
         )
         derived_name = placeholder_vlan_name(instance.vid)
         name_taken = (
-            locked_vlan.group_id is not None
+            current_vlan.group_id is not None
             and sender.objects.filter(
-                group_id=locked_vlan.group_id,
+                group_id=current_vlan.group_id,
                 name=derived_name,
             )
             .exclude(pk=instance.pk)
             .exists()
         ) or (
-            locked_vlan.qinq_svlan_id is not None
+            current_vlan.qinq_svlan_id is not None
             and sender.objects.filter(
-                qinq_svlan_id=locked_vlan.qinq_svlan_id,
+                qinq_svlan_id=current_vlan.qinq_svlan_id,
                 name=derived_name,
             )
             .exclude(pk=instance.pk)
@@ -1795,10 +1937,10 @@ def _on_vlan_pre_save(sender, instance, **kwargs):
         if display_placeholder and not name_taken:
             instance.name = derived_name
             if update_fields is not None and "name" not in update_fields:
-                sender.objects.filter(pk=instance.pk).update(name=instance.name)
+                instance._intent_vlan_update_name = True
             changed_fields.add("name")
-    instance._nso_vlan_changed_fields = frozenset(changed_fields)
-    instance._nso_vlan_intent_rows = rows
+    instance._intent_vlan_changed_fields = frozenset(changed_fields)
+    instance._intent_vlan_rows = rows
 
 
 @_skip_on_render
@@ -1810,15 +1952,17 @@ def _on_vlan_change(sender, instance, **kwargs):
     A name change affects VLAN intent. A VID change affects VLAN, SVI, and switchport intent.
     The pre-save locks serialize these shared native fields with Apply promotion.
     """
-    changed_fields = getattr(instance, "_nso_vlan_changed_fields", frozenset())
+    changed_fields = getattr(instance, "_intent_vlan_changed_fields", frozenset())
     if not changed_fields:
         return
+    if getattr(instance, "_intent_vlan_update_name", False):
+        sender.objects.filter(pk=instance.pk).update(name=instance.name)
 
     from . import delivery
     from . import status_machine as sm
     from .vlan_reconciler import is_placeholder_vlan_name
 
-    rows = getattr(instance, "_nso_vlan_intent_rows", {})
+    rows = getattr(instance, "_intent_vlan_rows", {})
     vid_changed = "vid" in changed_fields
     targets = set()
     with suppress_intent_push():
@@ -1826,6 +1970,7 @@ def _on_vlan_change(sender, instance, **kwargs):
             if scope in ("svi", "switchport") and not vid_changed:
                 continue
             for state in states:
+                state.refresh_from_db()
                 was_owned = sm.is_owned(state.status)
                 matches = False
                 if scope == "vlan" and not vid_changed:
@@ -1865,6 +2010,17 @@ def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
         _schedule_intent_push((device_id, "vlan"))
 
 
+def bfd_intent_item(row):
+    """Return one BFD interface in the adapter's exact wire shape."""
+    return {
+        "interface_name": row.interface.name,
+        "min_tx": row.min_tx,
+        "min_rx": row.min_rx,
+        "multiplier": row.multiplier,
+        "micro_bfd": bool(row.micro_bfd),
+    }
+
+
 def _push_bfd_intent_for_device(device_id, adapter_device_id):
     """Build and push the full owned per-interface BFD intent snapshot for a device.
 
@@ -1879,15 +2035,7 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface"):
-        interfaces.append(
-            {
-                "interface_name": row.interface.name,
-                "min_tx": row.min_tx,
-                "min_rx": row.min_rx,
-                "multiplier": row.multiplier,
-                "micro_bfd": bool(row.micro_bfd),
-            }
-        )
+        interfaces.append(bfd_intent_item(row))
 
     _push_changed(
         (device_id, "bfd"),
@@ -2099,6 +2247,23 @@ def stored_static_route_count(response):
     return count
 
 
+def static_route_intent_item(row):
+    """Return one owned static-route overlay in the adapter's exact wire shape."""
+    route = row.static_route
+    item = {
+        "route_id": route.pk,
+        "generation": row.intent_generation or None,
+        "vrf": route.vrf.name if route.vrf else "",
+        "prefix": str(route.prefix),
+        "next_hop": str(route.next_hop),
+        "permanent": route.permanent or False,
+        "tag": route.tag,
+    }
+    if route.metric is not None:
+        item["metric"] = route.metric
+    return item
+
+
 def _push_static_route_intent_for_device(device_id, adapter_device_id):
     """Build and capture the full static route intent snapshot for a device.
 
@@ -2120,27 +2285,10 @@ def _push_static_route_intent_for_device(device_id, adapter_device_id):
     for row in NSOStaticRouteState.objects.filter(
         PUSHED_STATIC_ROUTE_FILTER, management__device_id=device_id
     ).select_related("static_route", "static_route__vrf"):
-        sr = row.static_route
-        vrf_name = sr.vrf.name if sr.vrf else ""
         generation = row.intent_generation or None
-        route = {
-            "route_id": sr.pk,
-            "generation": generation,
-            "vrf": vrf_name,
-            "prefix": str(sr.prefix),
-            "next_hop": str(sr.next_hop),
-            "permanent": sr.permanent or False,
-            "tag": sr.tag,
-        }
-        # Always sent: an omitted optional field is a CLEAR to the adapter, NED-agnostically.
-        # Nokia's default preference 5 used to be suppressed here, which turned an edit
-        # 3 → 5 into a clear plus a networked retract job for a value the SR OS writer
-        # treats identically to None and the exporter suppresses on the way back.
-        if sr.metric is not None:
-            route["metric"] = sr.metric
-        routes.append(route)
+        routes.append(static_route_intent_item(row))
         if generation is not None:
-            generations[sr.pk] = generation
+            generations[row.static_route_id] = generation
 
     _push_changed(
         (device_id, "static_route"),
@@ -2158,6 +2306,9 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
     generation while the response is in flight; recording the stale echo would then let the
     next apply result settle content that has already been superseded.
     """
+    from django.db import transaction
+
+    from .intent_state import mirror_refresh
     from .models import NSOStaticRouteState
 
     for echo in echoes:
@@ -2168,11 +2319,20 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
             continue
         if generation is None or generations.get(route_id) != generation:
             continue  # never pushed by us at this generation — not an expectation we may record
-        NSOStaticRouteState.objects.filter(
-            management__device_id=device_id,
-            static_route_id=route_id,
-            intent_generation=generation,
-        ).update(expected_generation=generation, expected_fingerprint=fingerprint)
+        with transaction.atomic(), suppress_intent_push():
+            rows = NSOStaticRouteState.objects.select_for_update(of=("self",)).filter(
+                management__device_id=device_id,
+                static_route_id=route_id,
+                intent_generation=generation,
+            )
+            for row in rows:
+                fields = {"expected_generation", "expected_fingerprint"}
+                with mirror_refresh(row, fields) as locked:
+                    if locked is None:
+                        continue
+                    locked.expected_generation = generation
+                    locked.expected_fingerprint = fingerprint
+                    locked.save(update_fields=fields)
 
 
 @_skip_on_render
@@ -2391,9 +2551,6 @@ def _accept_static_route_for_device(static_route, device) -> None:
     state.nso_prefix = str(static_route.prefix or "")
     state.nso_next_hop = str(static_route.next_hop or "")
     state.last_sync_at = timezone.now()
-    from .apply_state import mark_explicit_accept
-
-    mark_explicit_accept(state)
     state.save()  # → _on_static_route_state_save schedules the push
     if not was_owned:
         from . import outbox
@@ -2480,6 +2637,7 @@ def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
     _transition_static_route_content(instance, previous=previous)
 
 
+@_close_renderer_m2m_permit
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
     """Device assigned to / removed from a route → own / remove + push (greenfield).
@@ -2529,6 +2687,19 @@ def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
 # ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────
 
 
+def isis_flex_algo_intent_item(row):
+    """Return one IS-IS Flex-Algo in the adapter's exact wire shape."""
+    return {
+        "process_tag": row.process_tag or "",
+        "algo_id": int(row.algo_id),
+        "metric_type": row.metric_type or None,
+        "priority": row.priority,
+        "admin_group_exclude": row.admin_group_exclude or None,
+        "admin_group_include_any": row.admin_group_include_any or None,
+        "admin_group_include_all": row.admin_group_include_all or None,
+    }
+
+
 def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
     """Build and push the full IS-IS Flex-Algo intent snapshot for a device."""
     from . import adapter_client as client
@@ -2539,17 +2710,7 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ):
-        flex_algos.append(
-            {
-                "process_tag": row.process_tag or "",
-                "algo_id": int(row.algo_id),
-                "metric_type": row.metric_type or None,
-                "priority": row.priority,
-                "admin_group_exclude": row.admin_group_exclude or None,
-                "admin_group_include_any": row.admin_group_include_any or None,
-                "admin_group_include_all": row.admin_group_include_all or None,
-            }
-        )
+        flex_algos.append(isis_flex_algo_intent_item(row))
 
     _push_changed(
         (device_id, "isis_flex_algo"),
@@ -2617,8 +2778,22 @@ def _accept_isis_flex_algo(flex_algo) -> None:
     state.save()  # → _on_isis_flex_algo_state_save schedules the push
 
 
+def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
+    """Capture linked overlays before Django clears their native foreign key."""
+    from .models import NSOISISFlexAlgoState
+
+    instance._nso_linked_flex_algo_state_pks = tuple(
+        NSOISISFlexAlgoState.objects.filter(isis_flex_algo=instance).values_list("pk", flat=True)
+    )
+
+
 def _remove_isis_flex_algo(flex_algo) -> None:
     """Drop the overlay for this flex-algo and push the removal (full-replace)."""
+    from django.db import transaction
+
+    from .apply_state import lock_device_intent_transaction, lock_order_scope
+    from .deployment import lock_mutation
+    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
     from .models import NSODeviceManagement, NSOISISFlexAlgoState
 
     inst = flex_algo.instance
@@ -2631,11 +2806,31 @@ def _remove_isis_flex_algo(flex_algo) -> None:
         return
     if mgmt.adapter_device_id is None:
         return
-    NSOISISFlexAlgoState.objects.filter(
-        management=mgmt, process_tag=inst.process_tag or "", algo_id=int(flex_algo.algo_id)
-    ).delete()
     device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "isis_flex_algo"))
+    key = (device_id, "isis_flex_algo")
+    footprint = MutationFootprint.for_keys(
+        {key},
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", None),),
+    )
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(device_id)
+        try:
+            with intent_transaction(footprint):
+                state_pks = set(getattr(flex_algo, "_nso_linked_flex_algo_state_pks", ()))
+                state_pks.update(
+                    NSOISISFlexAlgoState.objects.filter(
+                        management=mgmt,
+                        process_tag=inst.process_tag or "",
+                        algo_id=int(flex_algo.algo_id),
+                    ).values_list("pk", flat=True)
+                )
+                if not state_pks:
+                    raise IntentTransactionNoOp
+                NSOISISFlexAlgoState.objects.filter(pk__in=state_pks).delete()
+                _schedule_intent_push(key)
+        except IntentTransactionNoOp:
+            return
 
 
 @_skip_on_render
@@ -2645,9 +2840,21 @@ def _on_routing_isis_flex_algo_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
-def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
-    """Flex-algo deleted in NetBox → drop overlay + push removal before the cascade."""
+def _on_routing_isis_flex_algo_post_delete(sender, instance, **kwargs):
+    """Flex-algo deleted in NetBox → drop its overlay and push the removal."""
     _remove_isis_flex_algo(instance)
+
+
+def l2_sap_intent_item(row):
+    """Return one L2 SAP in the adapter's exact wire shape."""
+    return {
+        "service_name": row.service_name,
+        "service_type": row.service_type,
+        "sap_id": row.sap_id,
+        "port": row.port,
+        "outer_tag": row.outer_tag,
+        "inner_tag": row.inner_tag,
+    }
 
 
 def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
@@ -2660,16 +2867,7 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ):
-        saps.append(
-            {
-                "service_name": row.service_name,
-                "service_type": row.service_type,
-                "sap_id": row.sap_id,
-                "port": row.port,
-                "outer_tag": row.outer_tag,
-                "inner_tag": row.inner_tag,
-            }
-        )
+        saps.append(l2_sap_intent_item(row))
 
     _push_changed(
         (device_id, "l2_sap"),
@@ -2695,6 +2893,29 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "l2_sap"))
 
 
+def lacp_member_intent_item(row):
+    """Return one LACP member in the adapter's exact nested wire shape."""
+    return {
+        "interface_name": row.interface.name,
+        "mode": row.mode,
+        "port_priority": row.port_priority,
+    }
+
+
+def lacp_bundle_intent_item(row, members):
+    """Return one LACP bundle in the adapter's exact wire shape."""
+    return {
+        "name": row.interface.name,
+        "lag_id": row.lag_id,
+        "min_links": row.min_links,
+        "system_priority": row.system_priority,
+        "system_id": row.system_id,
+        "timer": row.timer,
+        "admin_key": row.admin_key,
+        "members": list(members),
+    }
+
+
 def _push_lacp_intent_for_device(device_id, adapter_device_id):
     """Build and push (apply) the full LACP bundle intent snapshot for a device.
 
@@ -2715,23 +2936,15 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
         .exclude(vpc_sensitive=True)
         .select_related("interface")
     ):
-        members = []
-        for m in NSOLACPMemberState.objects.filter(
-            management__device_id=device_id, lag_bundle=b.interface, status__in=_owned
-        ).select_related("interface"):
-            members.append({"interface_name": m.interface.name, "mode": m.mode, "port_priority": m.port_priority})
-        bundles.append(
-            {
-                "name": b.interface.name,
-                "lag_id": b.lag_id,
-                "min_links": b.min_links,
-                "system_priority": b.system_priority,
-                "system_id": b.system_id,
-                "timer": b.timer,
-                "admin_key": b.admin_key,
-                "members": members,
-            }
+        members = (
+            lacp_member_intent_item(member)
+            for member in NSOLACPMemberState.objects.filter(
+                management__device_id=device_id,
+                lag_bundle=b.interface,
+                status__in=_owned,
+            ).select_related("interface")
         )
+        bundles.append(lacp_bundle_intent_item(b, members))
 
     _push_changed(
         (device_id, "lacp"),
@@ -2765,6 +2978,16 @@ def _on_lacp_state_save(sender, instance, **kwargs):
 _NETBOX_TO_NSO_MODE = {"access": "access", "tagged": "trunk", "tagged-all": "trunk-all"}
 
 
+def switchport_intent_item(row, tagged_vlan_ids):
+    """Return one switchport row in the adapter's exact wire shape."""
+    return {
+        "interface_name": row.interface.name,
+        "mode": _NETBOX_TO_NSO_MODE.get(row.mode or "", row.mode or ""),
+        "untagged_vlan": row.untagged_vlan.vid if row.untagged_vlan else None,
+        "tagged_vlans": sorted(tagged_vlan_ids),
+    }
+
+
 def _push_switchport_intent_for_device(device_id, adapter_device_id):
     """Build and push (apply) the device's owned L2 switchport snapshot.
 
@@ -2778,14 +3001,7 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
     for st in NSOSwitchportState.objects.filter(
         management__device_id=device_id, status__in=("accepted", "deploying", "in_sync")
     ).select_related("interface", "untagged_vlan"):
-        interfaces.append(
-            {
-                "interface_name": st.interface.name,
-                "mode": _NETBOX_TO_NSO_MODE.get(st.mode or "", st.mode or ""),
-                "untagged_vlan": st.untagged_vlan.vid if st.untagged_vlan else None,
-                "tagged_vlans": sorted(v.vid for v in st.tagged_vlans.all()),
-            }
-        )
+        interfaces.append(switchport_intent_item(st, (v.vid for v in st.tagged_vlans.all())))
 
     _push_changed(
         (device_id, "switchport"),
@@ -2813,6 +3029,18 @@ def _on_switchport_state_save(sender, instance, **kwargs):
     _schedule_intent_push((device_id, "switchport"))
 
 
+def isis_level_intent_item(row):
+    """Return one IS-IS level contribution, or None for a knobless row."""
+    entry = {"level": int(row.level)}
+    if row.wide_metrics_only is not None:
+        entry["wide_metrics_only"] = row.wide_metrics_only
+    if getattr(row, "labeled_preference", None) is not None:
+        entry["labeled_preference"] = row.labeled_preference
+    if row.disabled is not None:
+        entry["disabled"] = row.disabled
+    return entry if len(entry) > 1 else None
+
+
 def _isis_levels_for_state(state):
     """Per-level tuning rows of the state's linked netbox_routing instance.
 
@@ -2829,16 +3057,47 @@ def _isis_levels_for_state(state):
         return []
     out = []
     for lv in ISISLevel.objects.filter(instance=inst).order_by("level"):
-        entry = {"level": int(lv.level)}
-        if lv.wide_metrics_only is not None:
-            entry["wide_metrics_only"] = lv.wide_metrics_only
-        if getattr(lv, "labeled_preference", None) is not None:
-            entry["labeled_preference"] = lv.labeled_preference
-        if lv.disabled is not None:
-            entry["disabled"] = lv.disabled
-        if len(entry) > 1:
+        if entry := isis_level_intent_item(lv):
             out.append(entry)
     return out
+
+
+def isis_interface_intent_item(row):
+    """Return one IS-IS interface in the adapter's exact wire shape."""
+    return {
+        "interface_name": row.interface.name,
+        "af": row.af,
+        "process_tag": row.process_tag or "",
+        "circuit_type": row.circuit_type,
+        "network_type": row.network_type,
+        "metric": row.metric,
+        "passive": row.passive or False,
+        "bfd_enabled": row.bfd_enabled,
+        "frr_enabled": row.frr_enabled,
+        "frr_protection": row.frr_protection or None,
+    }
+
+
+def isis_instance_intent_item(row, *, redistribution=(), levels=()):
+    """Return one IS-IS process in the adapter's exact wire shape."""
+    entry = {
+        "process_tag": row.process_tag or "",
+        "net": row.net,
+        "is_type": row.is_type,
+        "metric_style": row.metric_style,
+        "overload_bit": row.overload_bit,
+        "area_auth_type": row.area_auth_type,
+        "area_auth_key": row.area_auth_key or None,
+        "domain_auth_type": row.domain_auth_type,
+        "domain_auth_key": row.domain_auth_key or None,
+        "fast_reroute": row.fast_reroute or None,
+        "microloop_avoidance": row.microloop_avoidance,
+    }
+    if redistribution:
+        entry["redistribution"] = list(redistribution)
+    if levels:
+        entry["levels"] = list(levels)
+    return entry
 
 
 def _push_isis_intent_for_device(device_id, adapter_device_id):
@@ -2853,52 +3112,16 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("interface"):
-        interfaces.append(
-            {
-                "interface_name": row.interface.name,
-                "af": row.af,
-                "process_tag": row.process_tag or "",
-                "circuit_type": row.circuit_type,
-                "network_type": row.network_type,
-                "metric": row.metric,
-                "passive": row.passive or False,
-                # tri-state: None passes through the adapter's optional bfd_enabled
-                # (no wire leaf emitted → reconcile leaves brownfield BFD untouched).
-                "bfd_enabled": row.bfd_enabled,
-                # FRR (#83), same tri-state contract; protection '' → None (enum leaf).
-                "frr_enabled": row.frr_enabled,
-                "frr_protection": row.frr_protection or None,
-            }
-        )
+        interfaces.append(isis_interface_intent_item(row))
 
     processes = []
     for row in NSOISISInstanceState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ):
-        proc_entry = {
-            "process_tag": row.process_tag or "",
-            "net": row.net,
-            "is_type": row.is_type,
-            "metric_style": row.metric_style,
-            "overload_bit": row.overload_bit,
-            "area_auth_type": row.area_auth_type,
-            # Routing-protocol auth keys: pushed when held (empty string → None so the
-            # adapter intent treats "no key" as absent rather than a literal empty key).
-            "area_auth_key": row.area_auth_key or None,
-            "domain_auth_type": row.domain_auth_type,
-            "domain_auth_key": row.domain_auth_key or None,
-            # FRR (#83): flavor '' → None (enum leaf); microloop tri-state verbatim.
-            "fast_reroute": row.fast_reroute or None,
-            "microloop_avoidance": row.microloop_avoidance,
-        }
         proc_redist = redist_by_proc.get(row.process_tag or "", [])
-        if proc_redist:
-            proc_entry["redistribution"] = proc_redist
         levels = _isis_levels_for_state(row)
-        if levels:
-            proc_entry["levels"] = levels
-        processes.append(proc_entry)
+        processes.append(isis_instance_intent_item(row, redistribution=proc_redist, levels=levels))
 
     _push_changed(
         (device_id, "isis"),
@@ -3049,6 +3272,33 @@ def _bgp_peer_model_fields(bgp_peer) -> dict:
     return fields
 
 
+def bgp_peer_address_family_intent_item(row):
+    """Return one BGP peer address family in the adapter's exact nested wire shape."""
+    entry = {
+        "af": row.address_family.address_family,
+        "enabled": row.enabled if row.enabled is not None else True,
+    }
+    for field_name in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
+        if value := getattr(row, field_name):
+            entry[field_name] = value.name
+    return entry
+
+
+def bgp_peer_intent_item(row, address_families):
+    """Return one BGP peer in the adapter's exact nested wire shape."""
+    entry = {
+        "peer_address": row.peer_address_str,
+        "enabled": row.enabled if row.enabled is not None else True,
+        "remote_as": row.remote_as_str or None,
+        "address_families": list(address_families),
+    }
+    source_value = _bgp_peer_source_value(row.bgp_peer)
+    if source_value is not None:
+        entry["source"] = source_value
+    entry.update(_bgp_peer_model_fields(row.bgp_peer))
+    return entry
+
+
 def _bgp_router_id_map(device_id) -> dict:
     """Map asn_str → owned global router-id for every BGPRouter on this device.
 
@@ -3115,31 +3365,9 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
                 "routemap_in",
                 "routemap_out",
             ):
-                af_entry = {
-                    "af": paf.address_family.address_family,
-                    "enabled": paf.enabled if paf.enabled is not None else True,
-                }
-                if paf.routemap_in:
-                    af_entry["routemap_in"] = paf.routemap_in.name
-                if paf.routemap_out:
-                    af_entry["routemap_out"] = paf.routemap_out.name
-                if paf.prefixlist_in:
-                    af_entry["prefixlist_in"] = paf.prefixlist_in.name
-                if paf.prefixlist_out:
-                    af_entry["prefixlist_out"] = paf.prefixlist_out.name
-                peer_afs.append(af_entry)
+                peer_afs.append(bgp_peer_address_family_intent_item(paf))
 
-        peer_dict = {
-            "peer_address": row.peer_address_str,
-            "enabled": row.enabled if row.enabled is not None else True,
-            "remote_as": row.remote_as_str or None,
-            "address_families": peer_afs,
-        }
-        source_value = _bgp_peer_source_value(row.bgp_peer)
-        if source_value is not None:
-            peer_dict["source"] = source_value
-        peer_dict.update(_bgp_peer_model_fields(row.bgp_peer))
-        scopes[vrf_name]["peers"].append(peer_dict)
+        scopes[vrf_name]["peers"].append(bgp_peer_intent_item(row, peer_afs))
 
     router_list = _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
     _push_changed(
@@ -3295,6 +3523,20 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
     _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
 
 
+def route_policy_intent_item(row):
+    """Return one owned route-policy object in the adapter's exact wire shape."""
+    obj = row.assigned_object
+    if obj is None:
+        return None
+    return {
+        "family": row.family,
+        "name": row.object_name,
+        "entries": _build_route_policy_entries(row.family, obj),
+        "accepted": True,
+        **({"invert_match": bool(getattr(obj, "invert_match", False))} if row.family == "community_list" else {}),
+    }
+
+
 def _push_route_policy_intent_for_device(device_id, adapter_device_id):
     """Build and push the full route-policy intent snapshot for a device."""
     from . import adapter_client as client
@@ -3309,30 +3551,8 @@ def _push_route_policy_intent_for_device(device_id, adapter_device_id):
 
     objects = []
     for row in owned_rows:
-        # Build the entries payload from the associated NetBox object via the GFK.
-        obj = row.assigned_object
-        if obj is None:
-            continue
-        entries = _build_route_policy_entries(row.family, obj)
-        objects.append(
-            {
-                "family": row.family,
-                "name": row.object_name,
-                # Every row here is OWNED (query filters to _OWNED_PUSH_STATUSES), i.e. operator
-                # intent that must stay eligible for Apply. Keying this off status=='accepted'
-                # dropped the flag once a row advanced to deploying/in_sync/apply_failed, so the
-                # adapter stamped no accepted_at and treated the object as ineligible → Apply
-                # applied 0 route-policy items and the row stuck in 'deploying' forever (rg03).
-                "entries": entries,
-                "accepted": True,
-                # community-list only: Junos invert-match / Nokia expression NOT(…).
-                **(
-                    {"invert_match": bool(getattr(obj, "invert_match", False))}
-                    if row.family == "community_list"
-                    else {}
-                ),
-            }
-        )
+        if item := route_policy_intent_item(row):
+            objects.append(item)
 
     _push_changed(
         (device_id, "route_policy"),
@@ -3355,13 +3575,20 @@ def _store_unsupported_members(owned_rows, resp) -> None:
     """
     if resp is None:
         return  # push skipped-unchanged or failed — keep whatever we last recorded
+    from django.db import transaction
+
+    from .intent_state import mirror_refresh
+
     unsupported = resp.get("unsupported_members") or {}
-    with suppress_intent_push():
+    with transaction.atomic(), suppress_intent_push():
         for row in owned_rows:
             members = unsupported.get(row.object_name, []) if row.family == "community_list" else []
             if list(row.unsupported_members or []) != list(members):
-                row.unsupported_members = members
-                row.save(update_fields=["unsupported_members"])
+                with mirror_refresh(row, {"unsupported_members"}) as locked:
+                    if locked is None:
+                        continue
+                    locked.unsupported_members = members
+                    locked.save(update_fields=["unsupported_members"])
 
 
 def _build_community_list_entries(obj):
@@ -3799,9 +4026,6 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
         # imported / unknown — device matches NetBox (no drift) → safe to adopt.
         state.content_type, state.object_id = ct, obj.pk
         state.status, state.accepted_at = "accepted", now
-        from .apply_state import mark_explicit_accept
-
-        mark_explicit_accept(state)
         state.save()
     return CascadeResult(drifted=drifted, cross_device=cross_device)
 
@@ -3828,10 +4052,7 @@ def _accept_route_policy_object(obj) -> None:
             if state.status != "accepted":
                 state.status = "accepted"
             state.last_sync_at = timezone.now()
-            from .apply_state import mark_explicit_accept
-
-            mark_explicit_accept(state)
-            state.save()  # → _on_route_policy_state_save schedules the intent push
+            state.save(update_fields=["status", "last_sync_at"])
             if is_route_map:
                 # Owning a route-map owns its contributors (else dangling device references).
                 _own_route_map_contributors(mgmt, obj)
@@ -3862,6 +4083,27 @@ def _on_routing_policy_entry_delete(sender, instance, **kwargs):
     _on_routing_policy_entry_save(sender, instance, **kwargs)
 
 
+def redistribution_intent_item(row):
+    """Return one redistribution row in the adapter's exact nested wire shape."""
+    entry = {"source_protocol": row.source_protocol, "source_ref": row.source_ref}
+    if row.redistribution_id is not None:
+        fork = row.redistribution
+        if fork.route_map:
+            entry["route_map"] = fork.route_map.name
+        if fork.metric is not None:
+            entry["metric"] = fork.metric
+        if fork.metric_type:
+            entry["metric_type"] = fork.metric_type
+    else:
+        if row.route_map:
+            entry["route_map"] = row.route_map
+        if row.metric is not None:
+            entry["metric"] = row.metric
+        if row.metric_type:
+            entry["metric_type"] = row.metric_type
+    return entry
+
+
 def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> dict[str, list[dict]]:
     """Return redistribution entries grouped by dest_ref for the given protocol and device.
 
@@ -3876,24 +4118,34 @@ def _collect_redistribution_by_dest_ref(device_id: int, dest_protocol: str) -> d
         dest_protocol=dest_protocol,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("redistribution", "redistribution__route_map"):
-        entry: dict = {"source_protocol": row.source_protocol, "source_ref": row.source_ref}
-        if row.redistribution_id is not None:
-            fork = row.redistribution
-            if fork.route_map:
-                entry["route_map"] = fork.route_map.name
-            if fork.metric is not None:
-                entry["metric"] = fork.metric
-            if fork.metric_type:
-                entry["metric_type"] = fork.metric_type
-        else:
-            if row.route_map:
-                entry["route_map"] = row.route_map
-            if row.metric is not None:
-                entry["metric"] = row.metric
-            if row.metric_type:
-                entry["metric_type"] = row.metric_type
-        by_ref.setdefault(row.dest_ref, []).append(entry)
+        by_ref.setdefault(row.dest_ref, []).append(redistribution_intent_item(row))
     return by_ref
+
+
+def ospf_instance_intent_item(row, redistribution=()):
+    """Return one OSPF process in the adapter's exact wire shape."""
+    entry = {"process_id": row.process_id, "vrf": row.vrf or "", "areas": row.areas or []}
+    if row.router_id:
+        entry["router_id"] = row.router_id
+    if row.enabled is not None:
+        entry["enabled"] = row.enabled
+    if redistribution:
+        entry["redistribution"] = list(redistribution)
+    return entry
+
+
+def ospf_interface_intent_item(row):
+    """Return one OSPF interface in the adapter's exact wire shape."""
+    entry = {
+        "interface_name": row.interface.name,
+        "passive": row.passive if row.passive is not None else False,
+        "auth_present": row.auth_present if row.auth_present is not None else False,
+    }
+    for field_name in ("process_id", "area_id", "priority", "cost", "network_type", "auth_type"):
+        value = getattr(row, field_name)
+        if value is not None:
+            entry[field_name] = value
+    return entry
 
 
 def _push_ospf_intent_for_device(device_id, adapter_device_id):
@@ -3908,43 +4160,15 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management"):
-        entry = {
-            "process_id": row.process_id,
-            "vrf": row.vrf or "",
-            "areas": row.areas or [],
-        }
-        if row.router_id:
-            entry["router_id"] = row.router_id
-        if row.enabled is not None:
-            entry["enabled"] = row.enabled
         proc_redist = redist_by_proc.get(str(row.process_id), [])
-        if proc_redist:
-            entry["redistribution"] = proc_redist
-        instances.append(entry)
+        instances.append(ospf_instance_intent_item(row, proc_redist))
 
     interfaces = []
     for row in NSOOSPFInterfaceState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
     ).select_related("management"):
-        entry = {
-            "interface_name": row.interface.name,
-            "passive": row.passive if row.passive is not None else False,
-            "auth_present": row.auth_present if row.auth_present is not None else False,
-        }
-        if row.process_id is not None:
-            entry["process_id"] = row.process_id
-        if row.area_id is not None:
-            entry["area_id"] = row.area_id
-        if row.priority is not None:
-            entry["priority"] = row.priority
-        if row.cost is not None:
-            entry["cost"] = row.cost
-        if row.network_type is not None:
-            entry["network_type"] = row.network_type
-        if row.auth_type is not None:
-            entry["auth_type"] = row.auth_type
-        interfaces.append(entry)
+        interfaces.append(ospf_interface_intent_item(row))
 
     payload = {"instances": instances, "interfaces": interfaces}
     _push_changed((device_id, "ospf"), payload, lambda body: client.put_ospf_intent(adapter_device_id, body))
@@ -4174,14 +4398,28 @@ def _on_routing_isis_interface_save(sender, instance, **kwargs):
     _accept_isis_interface(instance)
 
 
-@_skip_on_render
 def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
+    """Capture linked overlays before Django clears their native foreign key."""
+    from .models import NSOISISInterfaceState
+
+    instance._nso_linked_isis_interface_state_pks = tuple(
+        NSOISISInterfaceState.objects.filter(isis_interface=instance).values_list("pk", flat=True)
+    )
+
+
+@_skip_on_render
+def _on_routing_isis_interface_post_delete(sender, instance, **kwargs):
     """Operator deletes an IS-IS interface → drop its overlay + push the removal (parity with OSPF).
 
     Without this, deleting an ISISInterface only SET_NULLs NSOISISInterfaceState.isis_interface;
     the overlay row lingers with its owned status and no reduced IS-IS intent is pushed, so the
     device keeps the IS-IS config NetBox just removed.
     """
+    from django.db import transaction
+
+    from .apply_state import lock_device_intent_transaction, lock_order_scope
+    from .deployment import lock_mutation
+    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
     from .models import NSODeviceManagement, NSOISISInterfaceState
 
     iface = instance.interface
@@ -4195,9 +4433,25 @@ def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
     qs = NSOISISInterfaceState.objects.filter(management=mgmt, interface=iface)
     if af:
         qs = qs.filter(af=af)  # scope to this ISISInterface's address-family; leave a sibling AF alone
-    qs.delete()
     device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "isis"))
+    key = (device_id, "isis")
+    footprint = MutationFootprint.for_keys(
+        {key},
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None),),
+    )
+    with transaction.atomic(), lock_order_scope():
+        lock_mutation()
+        lock_device_intent_transaction(device_id)
+        try:
+            with intent_transaction(footprint):
+                state_pks = set(getattr(instance, "_nso_linked_isis_interface_state_pks", ()))
+                state_pks.update(qs.values_list("pk", flat=True))
+                if not state_pks:
+                    raise IntentTransactionNoOp
+                NSOISISInterfaceState.objects.filter(pk__in=state_pks).delete()
+                _schedule_intent_push(key)
+        except IntentTransactionNoOp:
+            return
 
 
 @_skip_on_render
@@ -4299,18 +4553,6 @@ def _connect_g_activated():  # pragma: no cover
         _create_greenfield_subif_state,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_greenfield_subif",
-    )
-    post_init.connect(
-        _remember_interface_name,
-        sender=Interface,
-        dispatch_uid="nso_plugin_iface_name_post_init",
-        weak=False,
-    )
-    post_save.connect(
-        _remember_interface_name,
-        sender=Interface,
-        dispatch_uid="nso_plugin_iface_name_post_save",
-        weak=False,
     )
     pre_save.connect(
         _on_ip_address_pre_save,
@@ -4632,45 +4874,6 @@ def _connect_g_activated():  # pragma: no cover
         weak=False,
     )
 
-    # Capture only wire-visible field changes before the post-save hooks run. Reconcile
-    # functions often call save() for status and timestamps; those writes must not detach a
-    # deploying row from its Apply. A real overlay edit still re-pends that exact row.
-    for scope, model in (
-        ("logging", NSOLoggingLevelState),
-        ("svi", NSOSVIState),
-        ("subinterface", NSOSubinterfaceState),
-        ("interface_mtu", NSOInterfaceMtuState),
-        ("vlan", NSOVLANState),
-        ("bfd", NSOBFDInterfaceState),
-        ("static_route", NSOStaticRouteState),
-        ("l2_sap", NSOL2SapState),
-        ("route_policy", NSORoutePolicyState),
-    ):
-        pre_save.connect(
-            functools.partial(_capture_intent_field_change, scope=scope),
-            sender=model,
-            dispatch_uid=f"nso_plugin_{scope}_intent_change_pre_save",
-            weak=False,
-        )
-        post_init.connect(
-            _remember_intent_status,
-            sender=model,
-            dispatch_uid=f"nso_plugin_{scope}_intent_status_post_init",
-            weak=False,
-        )
-        post_save.connect(
-            functools.partial(_finalise_intent_field_change, scope=scope),
-            sender=model,
-            dispatch_uid=f"nso_plugin_{scope}_intent_change_post_save",
-            weak=False,
-        )
-        post_save.connect(
-            _remember_intent_status,
-            sender=model,
-            dispatch_uid=f"nso_plugin_{scope}_intent_status_post_save",
-            weak=False,
-        )
-
     # netbox_routing policy object deletion → drop overlays + push removal (full-replace)
     try:
         from netbox_routing.models import (
@@ -4856,9 +5059,14 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_flex_algo_post_save",
         )
         pre_delete.connect(
-            _as_delete_origin(_on_routing_isis_flex_algo_pre_delete),
+            _on_routing_isis_flex_algo_pre_delete,
             sender=ISISFlexAlgo,
-            dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete",
+            dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete_capture",
+        )
+        post_delete.connect(
+            _as_delete_origin(_on_routing_isis_flex_algo_post_delete),
+            sender=ISISFlexAlgo,
+            dispatch_uid="nso_plugin_routing_isis_flex_algo_post_delete",
             weak=False,
         )
     except ImportError:
@@ -4893,9 +5101,14 @@ def _connect_g_activated():  # pragma: no cover
             dispatch_uid="nso_plugin_routing_isis_interface_post_save",
         )
         pre_delete.connect(
-            _as_delete_origin(_on_routing_isis_interface_pre_delete),
+            _on_routing_isis_interface_pre_delete,
             sender=ISISInterface,
-            dispatch_uid="nso_plugin_routing_isis_interface_pre_delete",
+            dispatch_uid="nso_plugin_routing_isis_interface_pre_delete_capture",
+        )
+        post_delete.connect(
+            _as_delete_origin(_on_routing_isis_interface_post_delete),
+            sender=ISISInterface,
+            dispatch_uid="nso_plugin_routing_isis_interface_post_delete",
             weak=False,
         )
     except ImportError:

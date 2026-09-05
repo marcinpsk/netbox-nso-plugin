@@ -122,26 +122,29 @@ class TestCoalescedRoutePolicyClaimPreservesSuccessHook(_ClaimCase):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         name = "claim-community"
         unsupported = "color:0:12."
-        community_list = CommunityList.objects.create(name=name)
-        CommunityListEntry.objects.create(
-            community_list=community_list,
-            action="permit",
-            community=Community.objects.create(community=unsupported),
-        )
-        with suppress_intent_push():
-            state = NSORoutePolicyState.objects.create(
-                management=self.mgmt,
-                family="community_list",
-                object_name=name,
-                content_type=ContentType.objects.get_for_model(CommunityList),
-                object_id=community_list.pk,
-                status="accepted",
+        with transaction.atomic():
+            community_list = CommunityList.objects.create(name=name)
+            CommunityListEntry.objects.create(
+                community_list=community_list,
+                action="permit",
+                community=Community.objects.create(community=unsupported),
             )
+        state = NSORoutePolicyState(
+            management=self.mgmt,
+            family="community_list",
+            object_name=name,
+            content_type=ContentType.objects.get_for_model(CommunityList),
+            object_id=community_list.pk,
+            status="accepted",
+        )
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
 
         enqueue(self.device, "route_policy")
         enqueue(self.device, "route_policy")
@@ -270,6 +273,22 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
         assert self.adapter.sequences == [claimed.push_seq]
         assert self.adapter.replays == 0
         assert entries(self.device, "vlan") == []
+
+    def test_a_claim_without_a_revision_is_rejected_as_corrupt(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        own_vlan(self.mgmt, 863, self.tag)
+        claimed = drain.claim(self.device.pk, "vlan")
+        NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").update(
+            claim_revision=None,
+            claimed_at=None,
+        )
+
+        with self.assertRaisesRegex(drain.ProtocolViolation, "durable intent revision"):
+            drain.claim(self.device.pk, "vlan")
+
+        self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
 
     def test_a_crash_after_the_send_replays_into_the_receipt_and_clears_the_authority(self):
         from netbox_nso_plugin import drain

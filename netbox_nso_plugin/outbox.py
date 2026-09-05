@@ -321,7 +321,7 @@ def current_txid() -> int:
 
     outer = connection.atomic_blocks[0] if connection.atomic_blocks else None
     hooks = connection.run_on_commit
-    cached = getattr(connection, "_nso_intent_txid", None)
+    cached = getattr(connection, "_nso_outbox_txid", None)
     # Django 6.1 rollback paths replace this private hook list. Its identity rejects
     # transaction IDs cached by a transaction or savepoint that rolled back.
     if outer is not None and cached is not None and cached[0] is outer and cached[1] is hooks:
@@ -331,12 +331,12 @@ def current_txid() -> int:
         cursor.execute("SELECT txid_current()")
         txid = int(cursor.fetchone()[0])
     if outer is not None:
-        connection._nso_intent_txid = (outer, hooks, txid)
+        connection._nso_outbox_txid = (outer, hooks, txid)
 
         def clear_cache():
-            cached = getattr(connection, "_nso_intent_txid", None)
+            cached = getattr(connection, "_nso_outbox_txid", None)
             if cached is not None and cached[0] is outer and cached[1] is hooks:
-                del connection._nso_intent_txid
+                del connection._nso_outbox_txid
 
         transaction.on_commit(clear_cache)
     return txid
@@ -355,6 +355,27 @@ def _refuse_outside_a_transaction() -> None:
 
     if not connection.in_atomic_block:
         raise RuntimeError("an intent outbox entry must be appended inside the writer's own transaction")
+
+
+def bump_intent_revision(device_id: int, scope: str) -> int:
+    """Advance one delivery scope's durable content revision."""
+    from django.db import connection
+
+    from .models import NSOIntentRevision
+
+    if not connection.in_atomic_block:
+        raise RuntimeError("an intent revision must be bumped inside the writer's own transaction")
+    table = connection.ops.quote_name(NSOIntentRevision._meta.db_table)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {table} "  # noqa: S608 (quoted model metadata, not input)
+            "(device_id, scope, revision, updated_at) VALUES (%s, %s, 1, NOW()) "
+            "ON CONFLICT (device_id, scope) DO UPDATE SET "
+            f"revision = {table}.revision + 1, updated_at = NOW() "
+            "RETURNING revision",
+            [device_id, scope],
+        )
+        return int(cursor.fetchone()[0])
 
 
 def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = False) -> None:
@@ -382,6 +403,14 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return
+    from .intent_state import revision_was_acquired
+
+    if not revision_was_acquired(device_id, scope):
+        from .intent_state import IntentMutationProtocolError
+
+        raise IntentMutationProtocolError(
+            f"intent outbox key {(device_id, scope)!r} was not acquired before the source write"
+        )
     NSOIntentOutboxEntry.objects.create(
         device_id=device_id,
         scope=scope,

@@ -60,6 +60,22 @@ class IntentPushResetMixin:
 
         reset_intent_push_state()
 
+    def tearDown(self):
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS
+
+        permit = _ACTIVE_PERMIT.get()
+        implicit_permits = _IMPLICIT_PERMITS.get()
+        try:
+            self.assertIsNone(permit, f"implicit renderer permit leaked after the test: {permit!r}")
+            self.assertFalse(
+                implicit_permits,
+                f"implicit renderer permit entries leaked after the test: {implicit_permits!r}",
+            )
+        finally:
+            _ACTIVE_PERMIT.set(None)
+            _IMPLICIT_PERMITS.set({})
+            super().tearDown()
+
 
 def _deliver_scheduled_keys():
     """Deliver what the transaction scheduled, when a ``TestCase`` makes the drain impossible.
@@ -138,6 +154,8 @@ class IntentPushDeliveryMixin(IntentPushResetMixin):
         real_drain = signals._drain_intent_pushes
 
         def deliver_or_drain():
+            if connection.needs_rollback:
+                return None
             if connection.in_atomic_block:
                 return _deliver_scheduled_keys()
             return real_drain()
@@ -170,15 +188,30 @@ def isolate_other_scopes(*under_test: str):
     unknown = set(under_test) - set(keys)
     assert not unknown, f"not delivery scopes: {sorted(unknown)}"
     real_push_now, real_drain_key = drain.push_now, drain.drain_key
+    synthetic_push_seq = iter(range(1_000_000, 1_001_000))
+
+    def record(device_id, scope):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        captured = drain._SUCCESSFUL_PUSHES.get()
+        if captured is not None:
+            revision, _created = NSOIntentRevision.objects.get_or_create(device_id=device_id, scope=scope)
+            captured[scope] = drain.SuccessfulPush(
+                next(synthetic_push_seq),
+                f"isolated-{scope}",
+                int(revision.revision),
+            )
 
     def push_now(device_id, scope, **kwargs):
         if scope in under_test:
             return real_push_now(device_id, scope, **kwargs)
+        record(device_id, scope)
         return {"status": "deployed", "count": 0}
 
     def drain_key(device_id, scope, **kwargs):
         if scope in under_test:
             return real_drain_key(device_id, scope, **kwargs)
+        record(device_id, scope)
         return drain.SUCCEEDED
 
     with contextlib.ExitStack() as stack:

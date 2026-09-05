@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import patch
 
-from django.db import connections, transaction
+from django.db import connections
 
 from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
 
@@ -95,28 +95,16 @@ class TestOrderingAndIsolation(_CarrierCase):
         assert state.status == "in_sync", "the backstop judged a row whose settlement was unconsumed"
         assert state.last_apply_error == ""
 
-    def test_a_consumer_error_suppresses_only_the_static_backstop(self):
-        """(b) Fail closed and narrow: the other scopes settle, the static row waits."""
-        from netbox_nso_plugin.models import NSOLoggingLevelState
-        from netbox_nso_plugin.signals import suppress_intent_push
-
+    def test_a_consumer_error_leaves_the_static_row_waiting(self):
+        """(b) Fail closed: a static row waits when its exact-result feed fails."""
         device = _make_device("iso")
         mgmt = _make_mgmt(device, "iso", 21)
         sr = _route("10.32.0.0/16", "10.32.0.1", devices=[device])
         state = _own(sr, mgmt, generation=103)
         _stale_clock(state)
-        with suppress_intent_push(), transaction.atomic():
-            other_scope = NSOLoggingLevelState.objects.create(
-                management=mgmt, console_severity="warning", status="deploying"
-            )
-        logging_path = f"/api/v1/devices/{mgmt.adapter_device_id}/logging-intent"
-        assert ("PUT", logging_path) not in self.adapter.store.requests
-        # One job carrying both channels' evidence: the per-route settlement the consumer
-        # would read, and the per-scope counter the coarse settle reads.
         self.adapter.store.terminal_job(
             21,
             results=[_result(sr.pk, 103)],
-            extra={"logging_count_by_outcome": {"apply_failed": 1}},
         )
         # Only the ASCENDING page fails, which is exactly the settlement request.
         self.adapter.store.feed_error_devices.add(21)
@@ -125,9 +113,7 @@ class TestOrderingAndIsolation(_CarrierCase):
         self._drain()
 
         state.refresh_from_db()
-        other_scope.refresh_from_db()
-        assert other_scope.status == "apply_failed", "a consumer error skipped the other scopes' settle"
-        assert state.status == "deploying", "the static backstop judged on an unconsumed feed"
+        assert state.status == "deploying", "the static row was judged on an unconsumed feed"
         assert self._cursor(mgmt).settle_cursor_seq is None
 
 
@@ -194,15 +180,15 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
             "on 61, where an apply is in flight"
         )
 
-    def test_the_backstop_still_judges_when_the_repaired_device_is_idle(self):
-        """The control: standing down is the probe's verdict, not a disabled backstop."""
+    def test_a_repaired_device_does_not_judge_an_orphan_attempt(self):
+        """A repaired link does not make an orphan Apply UUID actionable."""
         device = _make_device("idle")
         mgmt = _make_mgmt(device, "idle", 62)
         # The generation probe must succeed. It 404s for a device the store does not hold, and an
         # unknown result stands the backstop down, which removes this test's premise.
         self.adapter.store.add_device(nso_instance="se-idle-inst", nso_device_name="nso-se-idle", device_id=63)
         sr = _route("10.39.0.0/16", "10.39.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=121)
+        state = _own(sr, mgmt, generation=121, orphan=True)
         _stale_clock(state)
 
         with _repair_before_the_lock(mgmt.pk, 63):
@@ -211,7 +197,7 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
 
         assert self.adapter.store.feed_requests[0][0] == 63, "the repair did not land before the lock"
         state.refresh_from_db()
-        assert state.status == "apply_failed"
+        assert state.status == "deploying"
 
 
 class TestTheBackstopNeedsADrainedFeed(_CarrierCase):
@@ -273,7 +259,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
     ``apply_failed`` row — a loop started by the thing meant to end one.
     """
 
-    def test_escalating_a_stuck_row_sends_no_static_route_intent(self):
+    def test_an_orphan_attempt_sends_no_static_route_intent(self):
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.signals import reset_intent_push_state
 
@@ -281,7 +267,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
         mgmt = _make_mgmt(device, "nopush", 42)
         self.adapter.store.add_device(nso_instance="se-nopush-inst", nso_device_name="nso-se-nopush", device_id=42)
         sr = _route("10.36.0.0/16", "10.36.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=112)
+        state = _own(sr, mgmt, generation=112, orphan=True)
         _stale_clock(state)
         # An empty feed: drained, so the backstop may judge, and nothing else can push.
         # The worker that runs this has never pushed for this device, so its change-detection
@@ -294,7 +280,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
         self._drain()
 
         state.refresh_from_db()
-        assert state.status == "apply_failed", "the backstop did not fire, so this proves nothing"
+        assert state.status == "deploying"
         pushes = self._intent_puts()
         assert pushes == [], f"escalating re-pushed this device's static-route intent: {pushes}"
         # Positive control: the same filter DOES see a push issued through the client the

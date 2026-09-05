@@ -80,19 +80,20 @@ class _ActivationCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestC
             route.devices.remove(self.device)
 
     def reown(self, route, *, callbacks=False):
-        from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+        from ._static_route_case import _assign_and_accept
 
         guard = transaction.atomic() if callbacks else without_commit_drain()
         with guard:
             with transaction.atomic():
-                with suppress_intent_push():
-                    route.devices.add(self.device)
-                _accept_static_route_for_device(route, self.device)
+                _assign_and_accept(route, self.device)
 
     def bypass_unown(self, route):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOStaticRouteState
 
-        NSOStaticRouteState.objects.filter(management=self.mgmt, static_route=route).update(status="imported")
+        state = NSOStaticRouteState.objects.get(management=self.mgmt, static_route=route)
+        with intent_transaction(footprint_for_instance(state)):
+            NSOStaticRouteState.objects.filter(pk=state.pk).update(status="imported")
 
     def sent(self):
         return [
@@ -245,14 +246,12 @@ class TestNetZeroMembershipChangeWritesNoTombstone(_ActivationCase):
 
     def test_remove_then_readd_is_present_and_unlisted(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
 
         route = own_route(self.mgmt, "198.18.0.128/28", "198.18.0.129")
         self.land(route)
         with without_commit_drain(), transaction.atomic():
             route.devices.remove(self.device)
             route.devices.add(self.device)
-            _accept_static_route_for_device(route, self.device)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
         [request] = self.sent()
@@ -269,14 +268,14 @@ class TestOutrightDeletionFansOutAuthority(_ActivationCase):
 
     def test_route_delete_lists_the_id_for_each_device(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+
+        from ._static_route_case import _assign_and_accept
 
         other_device, other_mgmt = make_managed("fanout-other", 7967, index=2)
         route = own_route(self.mgmt, "198.18.0.144/28", "198.18.0.145")
+
         with without_commit_drain(), transaction.atomic():
-            with suppress_intent_push():
-                route.devices.add(other_device)
-            _accept_static_route_for_device(route, other_device)
+            _assign_and_accept(route, other_device)
         assert self.drain() == drain.SUCCEEDED
         config, session = self.adapter.patches()
         with config, session:

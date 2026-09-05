@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -63,6 +64,40 @@ def make_managed(tag: str, adapter_device_id: int, index: int = 1):
         return device, make_mgmt(device, tag, adapter_device_id)
 
 
+def mirror_update(instance, **values):
+    """Persist lifecycle-only fixture fields through the production mirror permit."""
+    from netbox_nso_plugin.intent_state import update_mirror_fields
+
+    return update_mirror_fields(instance, **values)
+
+
+def content_update(instance, **values):
+    """Persist a fixture's rendered change through its exact content footprint."""
+    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+    current = type(instance).objects.get(pk=instance.pk)
+    footprint = footprint_for_instance(current)
+    with without_commit_drain(), intent_transaction(footprint):
+        for field_name, value in values.items():
+            setattr(current, field_name, value)
+        current.save(update_fields=set(values))
+    for field_name, value in values.items():
+        setattr(instance, field_name, value)
+    return current
+
+
+def content_bulk_update(instance, **values):
+    """Persist exact rendered fixture DML without firing model signals."""
+    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+    current = type(instance).objects.get(pk=instance.pk)
+    with without_commit_drain(), intent_transaction(footprint_for_instance(current)):
+        type(current).objects.filter(pk=current.pk).update(**values)
+    for field_name, value in values.items():
+        setattr(instance, field_name, value)
+    return type(instance).objects.get(pk=instance.pk)
+
+
 def own_vlan(mgmt, vid: int, tag: str):
     """One owned VLAN overlay, which is what a VLAN render puts on the wire."""
     from ipam.models import VLAN
@@ -78,13 +113,11 @@ def own_route(mgmt, prefix: str, next_hop: str, *, device=None):
     """A route assigned to the device and owned by it, as the accept path leaves it."""
     from netbox_routing.models import StaticRoute
 
-    from netbox_nso_plugin.signals import _accept_static_route_for_device, suppress_intent_push
+    from ._static_route_case import _assign_and_accept
 
     with without_commit_drain(), transaction.atomic():
         route = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-        with suppress_intent_push():
-            route.devices.add(device or mgmt.device)
-        _accept_static_route_for_device(route, device or mgmt.device)
+        _assign_and_accept(route, device or mgmt.device)
     return route
 
 
@@ -125,8 +158,9 @@ def expire_claim(device, scope) -> bool:
 def enqueue(device, scope, *, transitions=(), delete_origin=False):
     """Append one entry the way an operator transaction does, without a render."""
     from netbox_nso_plugin import outbox
+    from netbox_nso_plugin.intent_state import content_mutation
 
-    with transaction.atomic():
+    with content_mutation({(device.pk, scope)}):
         outbox.enqueue(device.pk, scope, transitions=transitions, delete_origin=delete_origin)
 
 
@@ -156,6 +190,32 @@ def in_thread(work, timeout=30):
     assert not worker.is_alive(), "the worker transaction never finished"
     if errors:
         raise errors[0]
+
+
+def wait_until_postgres_blocks(
+    pid: int,
+    description: str,
+    timeout: float = 5.0,
+    *,
+    locktype: str | None = None,
+) -> None:
+    """Wait until PostgreSQL reports that one test connection is waiting for a lock."""
+    from django.db import connection
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with connection.cursor() as cursor:
+            query = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND NOT granted"
+            params: list = [pid]
+            if locktype is not None:
+                query += " AND locktype = %s"
+                params.append(locktype)
+            query += ")"
+            cursor.execute(query, params)
+            if cursor.fetchone()[0]:
+                return
+        time.sleep(0.01)
+    raise AssertionError(f"{description} never blocked on the footprint lock")
 
 
 _commit_drain_patch_lock = threading.Lock()

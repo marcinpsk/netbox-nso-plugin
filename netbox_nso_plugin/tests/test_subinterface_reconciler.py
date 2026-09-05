@@ -10,6 +10,7 @@ from ipam.models import VLAN
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSubinterfaceState
 
+from ._outbox_case import content_update, mirror_update
 from .mixins import IntentPushResetMixin
 
 
@@ -65,6 +66,33 @@ class TestSubinterfaceReconciler(TestCase):
         self.assertEqual(rows[0].status, "imported")
         # A dot1q tag must NOT create a device VLAN object.
         self.assertEqual(VLAN.objects.count(), 0)
+
+    def test_direct_reconcile_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        revision, _ = NSOIntentRevision.objects.get_or_create(
+            device=self.device,
+            scope="subinterface",
+        )
+        before = revision.revision
+
+        reconcile_subinterface(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1.1623",
+                        "parent_interface": "GigabitEthernet0/1",
+                        "dot1q_vlan": 1623,
+                        "type": "subinterface",
+                    }
+                ]
+            },
+        )
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
 
     def test_missing_parent_creates_subif_without_parent_flagged_changed(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
@@ -127,6 +155,49 @@ class TestSubinterfaceReconciler(TestCase):
         )
         self.assertEqual(Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.200").count(), 1)
 
+    def test_a_concurrently_created_subinterface_is_reused(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.subinterface_reconciler import (
+            _reconcile_subinterface,
+            subinterface_reconcile_plan,
+        )
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": "GigabitEthernet0/1.201",
+                    "parent_interface": self.parent.name,
+                    "dot1q_vlan": 201,
+                }
+            ]
+        }
+        plan = subinterface_reconcile_plan(self.device, payload)
+        inserted = None
+
+        def insert_after_interface_read(execute, sql, params, many, context):
+            nonlocal inserted
+            result = execute(sql, params, many, context)
+            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                inserted = Interface.objects.create(
+                    device=self.device,
+                    name="GigabitEthernet0/1.201",
+                    type="virtual",
+                    parent=self.parent,
+                )
+            return result
+
+        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
+            rows = _reconcile_subinterface(self.device, payload)
+
+        self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
+        self.assertEqual(rows[0].interface_id, inserted.pk)
+        self.assertEqual(
+            Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.201").count(),
+            1,
+        )
+
     def test_stale_state_pruned(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -171,6 +242,8 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         cls.parent = Interface.objects.create(device=cls.device, name="ge-0/0/0", type="1000base-t")
 
     def _state(self, name="ge-0/0/0.100", dot1q=100, status="imported"):
+        from uuid import uuid4
+
         iface = Interface.objects.create(device=self.device, name=name, type="virtual", parent=self.parent)
         # Creating a NEW parent+dot1q interface on a managed device (adapter_device_id set)
         # fires the greenfield post_save signal (_create_greenfield_subif_state), which
@@ -185,11 +258,11 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
                 "dot1q_vlan": dot1q,
                 "vrf": "MTI",
                 "status": status,
+                "apply_attempt_id": uuid4() if status == "deploying" else None,
             },
         )
         if state.status != status:
-            NSOSubinterfaceState.objects.filter(pk=state.pk).update(status=status)
-            state.status = status
+            state = content_update(state, status=status)
         return state
 
     def test_reconcile_preserves_owned_status(self):
@@ -216,7 +289,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
         state = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
-        NSOSubinterfaceState.objects.filter(pk=state.pk).update(dot1q_vlan=200, vrf="CUSTOMER")
+        state = content_update(state, dot1q_vlan=200, vrf="CUSTOMER")
         old_device = {
             "interfaces": [
                 {
@@ -255,21 +328,121 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         """An owned subinterface overlay must NOT be hard-deleted when the device stops reporting it.
 
         NSOSubinterfaceState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows
-        destroys the in-flight Apply marker + ownership. Intent-pending rows (deploying) are
-        kept; a confirmed row (in_sync) that vanishes surfaces as drift (``changed``).
+        destroys ownership. A confirmed row that vanishes surfaces as ``changed``. That
+        rendered-membership change advances the scope revision, so another deploying row is
+        re-pended to ``accepted`` and loses its superseded attempt identity.
         """
-        from netbox_nso_plugin.models import NSOSubinterfaceState
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
-        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
+        attempt = uuid4()
+        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
+        before = revision.revision
+        deploying.refresh_from_db()
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
+
         reconcile_subinterface(self.device, {"interfaces": []})  # device stops reporting all subifs
+
         assert NSOSubinterfaceState.objects.filter(pk=deploying.pk).exists(), (
             "deploying (apply-in-flight) overlay deleted"
         )
         assert NSOSubinterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
-        assert NSOSubinterfaceState.objects.get(pk=deploying.pk).status == "deploying"
+        deploying.refresh_from_db()
+        revision.refresh_from_db()
+        assert deploying.status == "accepted"
+        assert deploying.apply_attempt_id is None
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+        assert revision.revision == before + 1  # the vanished confirmed subinterface is a content change
+
+    def _payload(self, name, dot1q):
+        """The device read that exactly matches a fixture row's parent, dot1q and VRF."""
+        return {
+            "interfaces": [
+                {
+                    "interface_name": name,
+                    "parent_interface": "ge-0/0/0",
+                    "dot1q_vlan": dot1q,
+                    "type": "subinterface",
+                    "vrf": "MTI",
+                }
+            ]
+        }
+
+    def test_matching_read_keeps_a_deploying_row_in_flight(self):
+        """A matching read is not apply evidence: only a correlated apply result settles it."""
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
+        attempt = deploying.apply_attempt_id
+        assert attempt is not None
+
+        reconcile_subinterface(self.device, self._payload("ge-0/0/0.100", 100))
+
+        deploying.refresh_from_db()
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt
+
+    def test_a_vanished_confirmed_sibling_repends_a_deploying_row(self):
+        """A vanished confirmed sibling bears content, so every deploying row in the scope is stale.
+
+        The in-flight row is still reported, carrying the pre-apply dot1q the device still
+        holds, so only the acquisition re-pend can move it off ``deploying``.
+        """
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+        confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
+        attempt = uuid4()
+        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
+        before = revision.revision
+        deploying.refresh_from_db()
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
+
+        reconcile_subinterface(self.device, self._payload("ge-0/0/0.100", 999))  # ge-0/0/0.200 vanishes
+
+        deploying.refresh_from_db()
+        revision.refresh_from_db()
+        assert deploying.status == "accepted"
+        assert deploying.apply_attempt_id is None
+        assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+        assert revision.revision == before + 1
+
+    def test_a_vanished_confirmed_sibling_repends_then_settles_a_matching_deploying_row(self):
+        """The re-pend discards the stale attempt, and a matching device entry settles the accepted row."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+        confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
+        attempt = uuid4()
+        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
+        before = revision.revision
+        deploying.refresh_from_db()
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
+
+        reconcile_subinterface(self.device, self._payload("ge-0/0/0.100", 100))  # ge-0/0/0.200 vanishes
+
+        deploying.refresh_from_db()
+        revision.refresh_from_db()
+        assert deploying.status == "in_sync"
+        assert deploying.apply_attempt_id is None
+        assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+        assert revision.revision == before + 1
 
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch

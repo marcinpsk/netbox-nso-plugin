@@ -11,13 +11,15 @@ from __future__ import annotations
 
 from datetime import timedelta
 from unittest.mock import patch
+from urllib.parse import urlparse
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
-from ._settlement_adapter import FakeAdapter, LoopbackOnlySession
+from ._settlement_adapter import FakeAdapter, LoopbackOnlySession, _Handler
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
@@ -50,24 +52,43 @@ def _make_mgmt(device, tag: str, adapter_device_id: int | None):
 def _route(prefix, next_hop, *, devices=()):
     from netbox_routing.models import StaticRoute
 
-    from netbox_nso_plugin.signals import suppress_intent_push
+    from ._static_route_case import _assign_without_push
 
     sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
     if devices:
-        with suppress_intent_push():
-            sr.devices.add(*devices)
+        _assign_without_push(sr, *devices)
     return sr
 
 
-def _own(sr, mgmt, *, generation, expected=True, status="deploying"):
-    """An owned overlay at *generation*, with or without a recorded expectation."""
-    from netbox_nso_plugin.models import NSOStaticRouteState
+def _own(sr, mgmt, *, generation, expected=True, status="deploying", orphan=False):
+    """An owned overlay at *generation*, optionally without its Apply-attempt record."""
+    from netbox_nso_plugin.models import NSOApplyAttempt, NSOStaticRouteState
+
+    attempt_id = uuid4() if status == "deploying" else None
+    if attempt_id is not None and not orphan:
+        selected = {"static_route": generation}
+        NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            management=mgmt,
+            adapter_device_id=mgmt.adapter_device_id,
+            scope_revisions=selected,
+            selected=selected,
+            http_status=202,
+            response={
+                "device_id": mgmt.adapter_device_id,
+                "outcome": "promoted",
+                "selected": selected,
+                "skipped": {},
+                "generations": [{"generation_id": generation}],
+            },
+        )
 
     with patch(PUT), transaction.atomic():
         return NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
             status=status,
+            apply_attempt_id=attempt_id,
             nso_prefix=str(sr.prefix or ""),
             nso_next_hop=str(sr.next_hop or ""),
             accepted_at=timezone.now(),
@@ -100,6 +121,54 @@ def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT,
     }
 
 
+def _pending_attempt_evidence(adapter_device_id, requested_ids):
+    """Build the adapter's pending evidence shape for real local attempt records."""
+    from netbox_nso_plugin.models import NSOApplyAttempt
+
+    local_attempts = NSOApplyAttempt.objects.in_bulk(requested_ids)
+    attempts = []
+    unknown = []
+    for attempt_id in requested_ids:
+        attempt = local_attempts.get(attempt_id)
+        if attempt is None or attempt.adapter_device_id != adapter_device_id:
+            unknown.append(str(attempt_id))
+            continue
+        response = attempt.response
+        generation_id = response["generations"][0]["generation_id"]
+        attempts.append(
+            {
+                "apply_attempt_id": str(attempt.pk),
+                "admission_state": "admitted",
+                "http_status": attempt.http_status,
+                "response": response,
+                "generations": [
+                    {
+                        "generation_id": generation_id,
+                        "seq": generation_id,
+                        "status": "running",
+                        "sections": sorted(attempt.selected),
+                        "source_push_seq": attempt.selected,
+                        "carrier_job_id": generation_id,
+                        "carrier_job_status": "running",
+                        "carrier_job_result": None,
+                        "carrier_job_error": None,
+                        "updated_at": timezone.now().isoformat(),
+                    }
+                ],
+            }
+        )
+    return {
+        "device_id": adapter_device_id,
+        "head": None,
+        "blocked": False,
+        "write_work_pending": bool(attempts),
+        "held_jobs": [],
+        "pending_generations": len(attempts),
+        "attempts": attempts,
+        "unknown_apply_attempt_ids": unknown,
+    }
+
+
 class _AdapterDoubleMixin:
     """Point the plugin at a live adapter double for the duration of one test.
 
@@ -114,6 +183,24 @@ class _AdapterDoubleMixin:
     def setUp(self):
         super().setUp()
         from netbox_nso_plugin import adapter_client
+
+        real_do_post = _Handler.do_POST
+
+        def do_post(handler):
+            parsed = urlparse(handler.path)
+            if parsed.path.endswith("/deployment-evidence"):
+                from uuid import UUID
+
+                body = handler._body()
+                requested_ids = [UUID(str(value)) for value in body.get("apply_attempt_ids", [])]
+                device_id = handler._device_id_from_path(parsed)
+                handler._send(200, _pending_attempt_evidence(device_id, requested_ids))
+                return
+            real_do_post(handler)
+
+        evidence_endpoint = patch.object(_Handler, "do_POST", do_post)
+        evidence_endpoint.start()
+        self.addCleanup(evidence_endpoint.stop)
 
         blocked = patch("netbox_nso_plugin.adapter_client.requests.Session", LoopbackOnlySession)
         blocked.start()

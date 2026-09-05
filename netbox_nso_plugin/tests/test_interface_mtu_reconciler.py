@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 from django.utils import timezone
@@ -98,6 +100,22 @@ class TestInterfaceMtuReconciler(TestCase):
         reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]})
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).l2_mtu, 1500)
 
+    def test_category_reconcile_declares_interface_mtu_rows(self):
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+
+        from ._outbox_case import mirror_update
+
+        payload = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]}
+        mirror_update(self.management, adapter_device_id=76)
+        self.addCleanup(mirror_update, self.management, adapter_device_id=None)
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=payload),
+        ):
+            result = reconcile_category(self.device, self.management, "interface_mtu")
+
+        self.assertEqual(result["interface_mtu_states"][0].l2_mtu, 9216)
+
 
 class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
     @classmethod
@@ -110,8 +128,14 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
 
     def _state(self, l2_mtu=9216, status="accepted"):
+        from uuid import uuid4
+
         return NSOInterfaceMtuState.objects.create(
-            management=self.management, interface=self.po1, l2_mtu=l2_mtu, status=status
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=l2_mtu,
+            status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
         )
 
     def test_owned_values_not_clobbered_by_device_read(self):
@@ -124,12 +148,51 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.l2_mtu, 9216)  # operator intent preserved, not overwritten
         self.assertEqual(state.status, "accepted")  # device mismatch → holds accepted
 
-    def test_deploying_settles_in_sync_when_device_matches(self):
-        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+    def test_deploying_waits_for_correlated_apply_evidence(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
 
-        self._state(l2_mtu=9000, status="deploying")
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9000}]})
-        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).status, "in_sync")
+        state = self._state(l2_mtu=9000, status="deploying")
+        attempt_id = state.apply_attempt_id
+        other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        confirmed = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=other,
+            l2_mtu=1500,
+            status="in_sync",
+        )
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="interface_mtu")
+        matching = {
+            "interfaces": [
+                {"interface_name": "Port-channel1", "mtu": 9000},
+                {"interface_name": "Port-channel2", "mtu": 1500},
+            ]
+        }
+        non_matching_with_content_delta = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]}
+
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_interface_mtu",
+                side_effect=(matching, non_matching_with_content_delta),
+            ),
+        ):
+            reconcile_category(self.device, self.management, "interface_mtu")
+            state.refresh_from_db()
+            self.assertEqual(state.status, "deploying")
+            self.assertEqual(state.apply_attempt_id, attempt_id)
+
+            revision.refresh_from_db()
+            revision_before_content_delta = revision.revision
+            reconcile_category(self.device, self.management, "interface_mtu")
+
+        state.refresh_from_db()
+        confirmed.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
+        self.assertEqual(confirmed.status, "changed")
+        self.assertGreater(revision.revision, revision_before_content_delta)
 
     def test_owned_row_unreported_not_pruned(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
@@ -161,8 +224,22 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
+        from django.db.models.signals import pre_save
+
+        from netbox_nso_plugin.intent_state import revision_was_acquired
+        from netbox_nso_plugin.models import NSOIntentRevision
 
         state = self._state(l2_mtu=9216, status="imported")
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="interface_mtu")
+        revision_before = revision.revision
+        interface_scope_acquired = []
+
+        def _record_footprint(sender, instance, **kwargs):
+            if instance.pk == state.pk:
+                interface_scope_acquired.append(revision_was_acquired(self.device.pk, "interface"))
+
+        pre_save.connect(_record_footprint, sender=type(state), weak=False)
+        self.addCleanup(pre_save.disconnect, _record_footprint, sender=type(state))
         User = get_user_model()
         admin = User.objects.create_superuser(username="mtu-admin", password="pw", email="m@x.y")  # noqa: S106
         self.client.force_login(admin)
@@ -175,6 +252,10 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "in_sync")
         self.assertIsNotNone(state.accepted_at)
         self.assertEqual(self.po1.mtu, 9216)  # native L2 mtu written onto dcim.Interface
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, revision_before + 1)
+        self.assertTrue(interface_scope_acquired)
+        self.assertTrue(all(interface_scope_acquired))
 
     def test_accept_differing_value_marks_accepted_pending_apply(self):
         from unittest.mock import patch

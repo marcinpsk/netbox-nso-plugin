@@ -326,15 +326,34 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
             self.instance.vault_secret_version = self._secret_result["version"]
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
-        obj = super().save(*args, **kwargs)
-        if self._secret_result and self._old_hash and self._old_hash != obj.community_hash:
-            # Trap hosts reference the community by hash-as-label; re-point them
-            # so the push doesn't reference the rotated-away hash (which the
-            # reconciler now rejects instead of configuring it as a community).
-            NSOSnmpHostState.objects.filter(management=obj.management, community_hash=self._old_hash).update(
-                community_hash=obj.community_hash
+            from .intent_state import MutationFootprint, SourceRow, footprint_for_instance, intent_transaction
+
+            # The trap hosts are discovered under the lock, so the footprint carries their
+            # table sentinel: a host the SNMP reconciler commits before acquisition is covered.
+            footprint = MutationFootprint.merge(
+                footprint_for_instance(self.instance),
+                MutationFootprint.for_keys(
+                    (),
+                    overlay_rows=(SourceRow(NSOSnmpHostState._meta.label_lower, None),),
+                ),
             )
-        return obj
+            with intent_transaction(footprint):
+                obj = super().save(*args, **kwargs)
+                if self._old_hash and self._old_hash != obj.community_hash:
+                    # Trap hosts reference the community by hash-as-label; re-point them
+                    # so the push does not reference the rotated-away hash.
+                    host_pks = list(
+                        NSOSnmpHostState.objects.select_for_update(of=("self",))
+                        .filter(management=obj.management, community_hash=self._old_hash)
+                        .order_by("pk")
+                        .values_list("pk", flat=True)
+                    )
+                    NSOSnmpHostState.objects.filter(pk__in=host_pks).update(community_hash=obj.community_hash)
+                    # _acquire settles only pk-named rows, never the sentinel, so the rekey settles
+                    # the hosts it re-points (this model carries no apply_attempt_id to clear).
+                    NSOSnmpHostState.objects.filter(pk__in=host_pks, status="deploying").update(status="accepted")
+                return obj
+        return super().save(*args, **kwargs)
 
 
 class NSOSnmpV3UserStateForm(NetBoxModelForm):
@@ -423,6 +442,10 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
                 self.instance.vault_has_priv = True
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
+            from .intent_state import footprint_for_instance, intent_transaction
+
+            with intent_transaction(footprint_for_instance(self.instance)):
+                return super().save(*args, **kwargs)
         return super().save(*args, **kwargs)
 
 

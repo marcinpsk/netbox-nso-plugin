@@ -9,8 +9,153 @@ NSORedistributionState overlay row to it.
 """
 
 import logging
+from typing import NamedTuple
+
+from .intent_state import mirror_reconciler
 
 logger = logging.getLogger(__name__)
+
+_DESTINATION_PROTOCOLS = ("bgp", "isis", "ospf")
+
+
+class _MirrorPrediction(NamedTuple):
+    """Describe one reported state's predicted native mirror action."""
+
+    action: str
+    destination_label: str | None
+    destination_id: object | None
+    current_redistribution_id: int | None
+    target_redistribution_id: int | None
+    route_map_id: int | None
+    before: object
+    after: object
+
+
+def redistribution_reconcile_plan(device, payload: dict):
+    """Declare every native and overlay row one redistribution refresh can write."""
+    import copy
+    from collections import Counter
+
+    from . import status_machine as sm
+    from .intent_state import (
+        MutationFootprint,
+        ReconcileMutationPlan,
+        SourceRow,
+        canonical_fragment,
+        route_policy_footprint,
+    )
+    from .models import NSODeviceManagement, NSORedistributionState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    states = tuple(
+        NSORedistributionState.objects.filter(management=management).select_related("redistribution").order_by("pk")
+    )
+    reported = {
+        (
+            entry.get("dest_protocol") or "",
+            entry.get("dest_ref") or "",
+            entry.get("source_protocol") or "",
+            entry.get("source_ref") or "",
+        ): entry
+        for entry in payload.get("entries", []) or []
+        if isinstance(entry, dict) and entry.get("dest_protocol") and entry.get("source_protocol")
+    }
+    mirror_predictions = _redistribution_mirror_predictions(states, reported, device)
+    protocols = {
+        protocol
+        for protocol in (
+            *(state.dest_protocol for state in states),
+            *(key[0] for key in reported),
+        )
+        if protocol in _DESTINATION_PROTOCOLS
+    }
+    redistribution_ids = {
+        redistribution_id
+        for _state_pk, _key, prediction in mirror_predictions
+        for redistribution_id in (prediction.current_redistribution_id, prediction.target_redistribution_id)
+        if redistribution_id is not None
+    }
+    redistribution_ids.update(state.redistribution_id for state in states if state.redistribution_id is not None)
+    dependent_states = tuple(
+        NSORedistributionState.objects.filter(redistribution_id__in=redistribution_ids)
+        .select_related("management", "redistribution", "redistribution__route_map")
+        .order_by("pk")
+    )
+    dependent_snapshot = _redistribution_dependency_snapshot(redistribution_ids)
+    reference_counts = Counter(state.redistribution_id for state in dependent_states)
+    stale_unowned_counts = Counter(
+        state.redistribution_id
+        for state in states
+        if state.redistribution_id is not None
+        and not sm.is_owned(state.status)
+        and (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref) not in reported
+    )
+    changes_content = False
+    for state in states:
+        key = (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref)
+        if key not in reported:
+            candidate = copy.copy(state)
+            candidate.status = sm.on_reconcile(state.status, present=False)
+            if canonical_fragment(state) != canonical_fragment(candidate):
+                changes_content = True
+                break
+            if state.redistribution_id is not None and stale_unowned_counts[
+                state.redistribution_id
+            ] == reference_counts.get(state.redistribution_id, 0):
+                changes_content = True
+                break
+        elif sm.is_owned(state.status) and state.redistribution_id is None:
+            if _resolve_redist_destination(device, state.dest_protocol, state.dest_ref) is not None:
+                changes_content = True
+                break
+    if not changes_content and any(_mirror_prediction_changes_content(item[-1]) for item in mirror_predictions):
+        changes_content = True
+    route_map_groups = {("route_map", entry.get("route_map")) for entry in reported.values() if entry.get("route_map")}
+    policy_footprint = route_policy_footprint(route_map_groups)
+    revision_keys = {(device.pk, protocol) for protocol in protocols}
+    revision_keys.update(
+        (state.management.device_id, state.dest_protocol)
+        for state in dependent_states
+        if sm.is_owned(state.status) and state.dest_protocol in _DESTINATION_PROTOCOLS
+    )
+    footprint = MutationFootprint.for_keys(
+        revision_keys,
+        shared_keys=(("redistribution", str(pk)) for pk in redistribution_ids),
+        source_rows=(
+            SourceRow("netbox_routing.redistribution", None),
+            *(SourceRow("netbox_routing.redistribution", pk) for pk in redistribution_ids),
+            *(
+                SourceRow(prediction.destination_label, prediction.destination_id)
+                for _state_pk, _key, prediction in mirror_predictions
+                if prediction.destination_label is not None and prediction.destination_id is not None
+            ),
+        ),
+        overlay_rows=(
+            SourceRow("netbox_nso_plugin.nsoredistributionstate", None),
+            *(SourceRow(state._meta.label_lower, state.pk) for state in (*states, *dependent_states)),
+        ),
+    )
+    policy_dependencies = MutationFootprint.for_keys(
+        (),
+        shared_keys=policy_footprint.shared_keys,
+        source_rows=policy_footprint.source_rows,
+        overlay_rows=policy_footprint.overlay_rows,
+    )
+    footprint = MutationFootprint.merge(footprint, policy_dependencies)
+    return ReconcileMutationPlan(
+        footprint,
+        changes_content=changes_content,
+        validate_after_acquire=lambda: _validate_redistribution_mirror_predictions(
+            device,
+            management.pk,
+            reported,
+            mirror_predictions,
+            redistribution_ids,
+            dependent_snapshot,
+        ),
+    )
 
 
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
@@ -91,6 +236,162 @@ def _redist_object_content(redist) -> dict:
         "metric": redist.metric,
         "metric_type": redist.metric_type or "",
     }
+
+
+def _resolve_reported_redistribution(state, device):
+    """Resolve the exact destination and native row used by the reconcile body."""
+    try:
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import Redistribution
+    except ImportError:
+        return None, None
+
+    destination = _resolve_redist_destination(device, state.dest_protocol, state.dest_ref)
+    if destination is None:
+        return None, None
+    destination_type = ContentType.objects.get_for_model(type(destination))
+    redistribution = Redistribution.objects.filter(
+        destination_type=destination_type,
+        destination_id=destination.pk,
+        source_protocol=state.source_protocol,
+        source_ref=state.source_ref,
+    ).first()
+    return destination, redistribution
+
+
+def _reported_redist_mirror_prediction(state, entry: dict, device):
+    """Return exact target identities, merge action, and rendered fragments."""
+    import copy
+
+    from .intent_state import ABSENT, canonical_fragment
+    from .status_machine import is_owned
+
+    try:
+        from netbox_routing.models import Redistribution, RouteMap
+    except ImportError:
+        return _MirrorPrediction("unavailable", None, None, state.redistribution_id, None, None, ABSENT, ABSENT)
+
+    from . import merge_util
+
+    destination, redistribution = _resolve_reported_redistribution(state, device)
+    destination_label = getattr(getattr(destination, "_meta", None), "label_lower", None)
+    destination_id = getattr(destination, "pk", None)
+    target_id = getattr(redistribution, "pk", None)
+    if destination is None:
+        return _MirrorPrediction("no_destination", None, None, state.redistribution_id, None, None, ABSENT, ABSENT)
+    route_map = RouteMap.objects.filter(name=entry.get("route_map") or "").first() if entry.get("route_map") else None
+    route_map_id = getattr(route_map, "pk", None)
+    if is_owned(state.status):
+        before = canonical_fragment(state)
+        candidate_state = copy.copy(state)
+        if redistribution is None:
+            redistribution = Redistribution(
+                destination_type_id=None,
+                destination_id=destination.pk,
+                source_protocol=state.source_protocol,
+                source_ref=state.source_ref,
+                route_map=route_map,
+                metric=entry.get("metric"),
+                metric_type=_redist_metric_type(entry),
+            )
+        candidate_state.redistribution = redistribution
+        return _MirrorPrediction(
+            "owned",
+            destination_label,
+            destination_id,
+            state.redistribution_id,
+            target_id,
+            route_map_id,
+            before,
+            canonical_fragment(candidate_state),
+        )
+    if redistribution is None:
+        return _MirrorPrediction(
+            "create",
+            destination_label,
+            destination_id,
+            state.redistribution_id,
+            None,
+            route_map_id,
+            ABSENT,
+            ABSENT,
+        )
+    dev_hash = merge_util.content_hash(_redist_device_content(entry, route_map, device))
+    obj_hash = merge_util.content_hash(_redist_object_content(redistribution))
+    action = merge_util.three_way(
+        created=False,
+        base=state.device_base_hash,
+        obj_hash=obj_hash,
+        dev_hash=dev_hash,
+    )
+    before = canonical_fragment(redistribution)
+    candidate = copy.copy(redistribution)
+    candidate.route_map = route_map
+    candidate.metric = entry.get("metric")
+    candidate.metric_type = _redist_metric_type(entry)
+    return _MirrorPrediction(
+        action,
+        destination_label,
+        destination_id,
+        state.redistribution_id,
+        target_id,
+        route_map_id,
+        before,
+        canonical_fragment(candidate),
+    )
+
+
+def _redistribution_mirror_predictions(states, reported, device):
+    """Snapshot every reported state's mirror classification and dependencies."""
+    predictions = []
+    for state in states:
+        key = (state.dest_protocol, state.dest_ref, state.source_protocol, state.source_ref)
+        entry = reported.get(key)
+        if entry is None:
+            continue
+        prediction = _reported_redist_mirror_prediction(state, entry, device)
+        predictions.append((state.pk, key, prediction))
+    return tuple(predictions)
+
+
+def _mirror_prediction_changes_content(prediction: _MirrorPrediction) -> bool:
+    """Return whether one mirror prediction changes its exact rendered fragment."""
+    return prediction.action in {"mirror", "owned"} and prediction.before != prediction.after
+
+
+def _redistribution_dependency_snapshot(redistribution_ids):
+    """Snapshot overlays whose ownership can make one native row render."""
+    from .models import NSORedistributionState
+
+    return tuple(
+        NSORedistributionState.objects.filter(redistribution_id__in=redistribution_ids)
+        .order_by("pk")
+        .values_list("pk", "redistribution_id", "management__device_id", "dest_protocol", "status")
+    )
+
+
+def _validate_redistribution_mirror_predictions(
+    device,
+    management_id,
+    reported,
+    expected,
+    redistribution_ids,
+    expected_dependents,
+) -> None:
+    """Reject mirror classifications whose native or policy dependencies changed."""
+    from .intent_state import RendererTargetsChanged
+    from .models import NSORedistributionState
+
+    current = tuple(
+        NSORedistributionState.objects.filter(management_id=management_id)
+        .select_related("redistribution", "redistribution__route_map")
+        .order_by("pk")
+    )
+    if (
+        _redistribution_mirror_predictions(current, reported, device) != expected
+        or _redistribution_dependency_snapshot(redistribution_ids) != expected_dependents
+    ):
+        raise RendererTargetsChanged("redistribution mirror dependencies changed during acquisition")
 
 
 def _redist_overlay_matches_device(state, entry: dict) -> bool:
@@ -176,6 +477,7 @@ def _create_or_link_redistribution(state, device, entry: dict) -> tuple[bool | N
         return None, False
 
 
+@mirror_reconciler
 def reconcile_redistribution(device, payload: dict) -> list:
     """Reconcile redistribution data from the adapter into NSORedistributionState rows.
 

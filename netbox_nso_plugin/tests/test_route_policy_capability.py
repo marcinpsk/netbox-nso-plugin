@@ -286,16 +286,19 @@ class TestAttachBlockOverride(_CapBase):
         other_mgmt = NSODeviceManagement.objects.create(
             device=other_dev, nso_instance=inst, nso_device_name="cap-dev-x", adapter_device_id=298
         )
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
-                management=other_mgmt,
-                family="prefix_list",
-                object_name=pl.name,
-                content_type=ContentType.objects.get_for_model(PrefixList),
-                object_id=pl.pk,
-                status="in_sync",
-                is_materialized=True,
-            )
+        state = NSORoutePolicyState(
+            management=other_mgmt,
+            family="prefix_list",
+            object_name=pl.name,
+            content_type=ContentType.objects.get_for_model(PrefixList),
+            object_id=pl.pk,
+            status="in_sync",
+            is_materialized=True,
+        )
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
 
         verdict = {"known": True, "fully_supported": True, "unsupported": []}
         with patch("netbox_nso_plugin.adapter_client._request", side_effect=_request_returning(verdict)):
@@ -325,15 +328,19 @@ class TestPanelCapabilityBadge(_CapBase):
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.signals import suppress_intent_push
 
-        with suppress_intent_push():
-            return NSORoutePolicyState.objects.create(
-                management=mgmt,
-                family=family,
-                object_name=obj.name,
-                content_type=ContentType.objects.get_for_model(obj),
-                object_id=obj.pk,
-                status="accepted",
-            )
+        state = NSORoutePolicyState(
+            management=mgmt,
+            family=family,
+            object_name=obj.name,
+            content_type=ContentType.objects.get_for_model(obj),
+            object_id=obj.pk,
+            status="accepted",
+        )
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+        return state
 
     def _annotated_states(self, obj):
         from netbox_nso_plugin.template_content import RoutePolicyNSODevices
@@ -451,15 +458,18 @@ class TestPanelCapabilityBadge(_CapBase):
         other_mgmt = NSODeviceManagement.objects.create(
             device=other_dev, nso_instance=inst, nso_device_name="cap-dev-2", adapter_device_id=295
         )
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
-                management=other_mgmt,
-                family="prefix_list",
-                object_name=pl.name,
-                content_type=ContentType.objects.get_for_model(PrefixList),
-                object_id=pl.pk,
-                status="imported",
-            )
+        state = NSORoutePolicyState(
+            management=other_mgmt,
+            family="prefix_list",
+            object_name=pl.name,
+            content_type=ContentType.objects.get_for_model(PrefixList),
+            object_id=pl.pk,
+            status="imported",
+        )
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
 
         ext = object.__new__(RoutePolicyNSODevices)
         ext.context = {"object": pl}

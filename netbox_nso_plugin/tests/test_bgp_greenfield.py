@@ -140,6 +140,7 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         it is never auto-promoted to accepted or pushed. Guards the greenfield-only rule in
         _accept_bgp_peer_for_device (without it, this edit would promote imported→accepted
         and push)."""
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
@@ -147,8 +148,9 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         ip = self._ip("10.0.0.5/32")
         # Simulate brownfield adoption: peer + imported overlay materialized under suppression
         # (exactly how the reconciler creates them), so no greenfield ownership is taken.
-        with suppress_intent_push():
-            peer = BGPPeer.objects.create(scope=scope, peer=ip, name=None, remote_as=self.remote_asn, enabled=True)
+        peer = BGPPeer(scope=scope, peer=ip, name=None, remote_as=self.remote_asn, enabled=True)
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(peer)):
+            peer.save(force_insert=True)
             NSOBGPPeerState.objects.create(
                 management=mgmt,
                 asn_str="65100",

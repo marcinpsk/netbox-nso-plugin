@@ -302,7 +302,11 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
     def setUp(self):
         super().setUp()
-        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), without_commit_drain():
+        with (
+            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"),
+            without_commit_drain(),
+            transaction.atomic(),
+        ):
             _make_fixtures(self)
             self.mgmt = NSODeviceManagement.objects.create(
                 device=self.dev_a,
@@ -321,6 +325,7 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
     def test_reprovision_pushes_despite_the_acknowledged_baseline(self):
         from netbox_nso_plugin import drain, outbox
+        from netbox_nso_plugin.intent_state import content_mutation
         from netbox_nso_plugin.link_role import _push_provisioned
 
         role = NSOLinkRole.objects.create(
@@ -332,13 +337,11 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             igp="none",
         )
         with patch("netbox_nso_plugin.adapter_client.put_intent", return_value={"count": 1}) as mock_put:
-            with transaction.atomic():
+            with content_mutation({(self.dev_a.pk, "interface")}):
                 outbox.enqueue(self.dev_a.pk, "interface")
             drain.drain_key(self.dev_a.pk, "interface")  # the baseline the claim dedupes against
             self.assertEqual(mock_put.call_count, 1)
-            with transaction.atomic():
-                outbox.enqueue(self.dev_a.pk, "interface")
-            drain.drain_key(self.dev_a.pk, "interface")  # the control: unchanged, so dropped
+            drain.push_now(self.dev_a.pk, "interface")  # the control: no queued revision, so nothing to send
             self.assertEqual(mock_put.call_count, 1)
             _push_provisioned(role, [self.dev_a.pk])  # re-provision must send AGAIN (forced)
             self.assertEqual(mock_put.call_count, 2)

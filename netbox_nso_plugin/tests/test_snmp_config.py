@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, 
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from ._outbox_case import content_bulk_update
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -210,14 +211,61 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         mgmt = self._create_mgmt()
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
-            status="accepted"
-        )
+        state = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234")
+        content_bulk_update(state, status="accepted")
 
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
+
+    def test_matching_read_does_not_settle_generation_correlated_deploying_rows(self):
+        from netbox_nso_plugin.models import (
+            NSOSnmpCommunityState,
+            NSOSnmpHostState,
+            NSOSnmpSystemInfoState,
+            NSOSnmpV3UserState,
+        )
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        NSOSnmpCommunityState.objects.create(
+            management=mgmt,
+            community_hash="abcd1234abcd1234",
+            vault_secret_hash="abcd1234abcd1234",
+            status="deploying",
+        )
+        NSOSnmpV3UserState.objects.create(
+            management=mgmt,
+            username="nms-user",
+            has_auth_secret=True,
+            has_priv_secret=True,
+            status="deploying",
+        )
+        NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="10.0.0.100",
+            version="v2c",
+            notify_type="trap",
+            community_hash="abcd1234abcd1234",
+            status="deploying",
+        )
+        NSOSnmpSystemInfoState.objects.create(
+            management=mgmt,
+            location="DC-01 Rack A",
+            contact="noc@example.com",
+            status="deploying",
+        )
+
+        _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
+
+        self.assertEqual(
+            NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234").status,
+            "deploying",
+        )
+        self.assertEqual(NSOSnmpV3UserState.objects.get(management=mgmt, username="nms-user").status, "deploying")
+        self.assertEqual(NSOSnmpHostState.objects.get(management=mgmt, address="10.0.0.100").status, "deploying")
+        self.assertEqual(NSOSnmpSystemInfoState.objects.get(management=mgmt).status, "deploying")
 
     def test_system_info_deleted_after_load_returns_none(self):
         """A concurrent singleton deletion must not crash the read reconciliation."""
@@ -256,6 +304,46 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self.assertEqual(deleted, [True])
         self.assertIsNone(result["system_info"])
+
+    def test_system_info_concurrent_edit_returns_the_persisted_row(self):
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOSnmpSystemInfoState
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._create_mgmt()
+        row = NSOSnmpSystemInfoState.objects.create(
+            management=mgmt,
+            location="Test rack",
+            contact="noc@example.invalid",
+            status="accepted",
+        )
+        edited = []
+
+        def edit_after_load(sender, instance, **kwargs):
+            if edited or instance.pk != row.pk:
+                return
+            edited.append(True)
+            content_bulk_update(instance, location="Operator rack")
+            instance.location = "Test rack"
+
+        post_init.connect(edit_after_load, sender=NSOSnmpSystemInfoState, weak=False)
+        self.addCleanup(post_init.disconnect, edit_after_load, sender=NSOSnmpSystemInfoState)
+
+        result = _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [],
+                "system_info": {"location": "Test rack", "contact": "noc@example.invalid"},
+            },
+        )
+
+        self.assertEqual(edited, [True])
+        self.assertIsNotNone(result["system_info"])
+        self.assertEqual(result["system_info"].location, "Operator rack")
+        self.assertEqual(result["system_info"].status, "accepted")
 
     def test_omitted_default_trap_port_matches_owned_intent(self):
         from netbox_nso_plugin.models import NSOSnmpHostState
@@ -356,7 +444,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOSnmpHostState.objects.filter(pk=instance.pk).update(notify_type="inform")
+            content_bulk_update(instance, notify_type="inform")
+            instance.notify_type = "trap"
 
         post_init.connect(_concurrent_editor, sender=NSOSnmpHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOSnmpHostState)
@@ -408,7 +497,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOSnmpHostState.objects.filter(pk=instance.pk).update(address="198.18.0.99")
+            content_bulk_update(instance, address="198.18.0.99")
+            instance.address = "198.18.0.35"
 
         post_init.connect(_concurrent_renamer, sender=NSOSnmpHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOSnmpHostState)
@@ -592,14 +682,20 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         mgmt = self._create_mgmt()
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="ef012345ef012345").update(
+        community = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="ef012345ef012345")
+        content_bulk_update(
+            community,
             status="accepted",
             vault_ref="network/netbox/snmp/community/ef012345ef012345#community",
         )
-        NSOSnmpV3UserState.objects.filter(management=mgmt, username="nms-user").update(
-            status="deploying", vault_ref="network/netbox/snmp/v3/nms-user"
+        user = NSOSnmpV3UserState.objects.get(management=mgmt, username="nms-user")
+        content_bulk_update(
+            user,
+            status="deploying",
+            vault_ref="network/netbox/snmp/v3/nms-user",
         )
-        NSOSnmpHostState.objects.filter(management=mgmt, address="10.0.0.100").update(status="in_sync")
+        host = NSOSnmpHostState.objects.get(management=mgmt, address="10.0.0.100")
+        content_bulk_update(host, status="in_sync")
 
         empty = dict(_SAMPLE_PAYLOAD)
         empty["communities"], empty["v3_users"], empty["hosts"] = [], [], []
@@ -632,13 +728,11 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
         # confirmed: fingerprint equals the device hash → settles
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
-            status="accepted", vault_secret_hash="abcd1234abcd1234"
-        )
+        confirmed = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234")
+        content_bulk_update(confirmed, status="accepted", vault_secret_hash="abcd1234abcd1234")
         # unconfirmed: no fingerprint recorded → preserved
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="ef012345ef012345").update(
-            status="accepted", vault_secret_hash=""
-        )
+        unconfirmed = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="ef012345ef012345")
+        content_bulk_update(unconfirmed, status="accepted", vault_secret_hash="")
 
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
 
@@ -652,8 +746,10 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         mgmt = self._create_mgmt()
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)
-        NSOSnmpCommunityState.objects.filter(management=mgmt, community_hash="abcd1234abcd1234").update(
-            vault_ref="network/netbox/snmp/community/abcd1234abcd1234#community"
+        state = NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234")
+        content_bulk_update(
+            state,
+            vault_ref="network/netbox/snmp/community/abcd1234abcd1234#community",
         )
 
         _reconcile_snmp_config(self.device, _SAMPLE_PAYLOAD)

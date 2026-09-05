@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from ._outbox_case import content_bulk_update
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -366,8 +367,13 @@ class TestReconcileInterfaceIps(TestCase):
         with self._auto_create_ctx(False):
             _reconcile_interface_ips(self.device, empty_vrf)
             # Operator had accepted the (no-VRF) row before the VRF was captured.
-            NSOInterfaceIPState.objects.filter(interface=self.iface, address="172.30.150.202/24", vrf="").update(
-                status="accepted"
+            content_bulk_update(
+                NSOInterfaceIPState.objects.get(
+                    interface=self.iface,
+                    address="172.30.150.202/24",
+                    vrf="",
+                ),
+                status="accepted",
             )
             _reconcile_interface_ips(self.device, mgmt_vrf)
 

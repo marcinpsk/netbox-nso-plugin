@@ -100,6 +100,7 @@ class SuccessfulPush:
 
     push_seq: int
     identity: str
+    revision: int
 
 
 _SUCCESSFUL_PUSHES: ContextVar[dict[str, SuccessfulPush] | None] = ContextVar("nso_successful_pushes", default=None)
@@ -205,6 +206,8 @@ class Claim:
     payload: object
     #: Plugin-side, mode-bearing: the acknowledged baseline an unchanged claim drops against.
     identity: str
+    #: Durable content revision read in the same snapshot as ``payload``.
+    revision: int
     deletions: list
     mark: bool | None
     mark_any: bool
@@ -215,6 +218,8 @@ class Claim:
 
     def __post_init__(self):
         ClaimFlags(self.mode, self.marking_mode, self.mark_any, False)
+        if type(self.revision) is not int or self.revision < 0:
+            raise ValueError("claim revision must be a non-negative integer")
 
 
 @dataclasses.dataclass
@@ -299,6 +304,23 @@ def _unconsumed(device_id, scope):
     from .models import NSOIntentOutboxEntry
 
     return NSOIntentOutboxEntry.objects.filter(device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True)
+
+
+def _intent_revision(device_id, scope) -> int:
+    """Lock and return the revision that brackets this claim's rendered snapshot.
+
+    A renderer mutation that committed after the repeatable-read snapshot began updated
+    this row. PostgreSQL then raises a serialization failure at ``FOR UPDATE`` and the
+    outer claim retry starts with a fresh snapshot. A mutation that starts after this lock
+    waits until the claim has folded and rendered.
+    """
+    from .models import NSOIntentRevision
+
+    NSOIntentRevision.objects.get_or_create(device_id=device_id, scope=scope)
+    revision = (
+        NSOIntentRevision.objects.select_for_update(of=("self",)).order_by().get(device_id=device_id, scope=scope)
+    )
+    return int(revision.revision)
 
 
 def _work_pending(state) -> bool:
@@ -444,6 +466,10 @@ def _takeover(state, mgmt, now) -> Claim | None:
         )
         _abandon_locked(state)
         return None
+    if state.claim_revision is None:
+        raise ProtocolViolation(
+            f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
+        )
     state.claimed_at = now
     state.save()
     logger.info("taking over push_seq %s for %s/%s", state.push_seq, state.device_id, state.scope)
@@ -454,6 +480,7 @@ def _takeover(state, mgmt, now) -> Claim | None:
         push_seq=state.push_seq,
         payload=state.claim_payload,
         identity=state.claim_identity,
+        revision=state.claim_revision,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
         mark_any=flags.mark_any,
@@ -485,6 +512,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         untracked = mark_any and not any(row.transitions for row in rows)
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
+    revision = _intent_revision(device_id, scope)
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     identity = request_identity(
         rendered.payload,
@@ -517,6 +545,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     state.claim_mark = mark
     flags = ClaimFlags(mode, marking_mode, mark_any, bool(force))
     state.claim_flags = flags.as_json()
+    state.claim_revision = revision
     state.queued_deletions = []
     state.save()
     return Claim(
@@ -526,6 +555,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
         push_seq=push_seq,
         payload=rendered.payload,
         identity=identity,
+        revision=revision,
         deletions=deletions,
         mark=mark,
         mark_any=flags.mark_any,
@@ -558,6 +588,7 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     marking_mode = delivery.delivery_keys()[scope].marking_mode
     if deletions or untracked_mark:
         raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
+    revision = _intent_revision(device_id, scope)
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     push_seq = allocate_push_seq()
     state.push_seq = push_seq
@@ -575,6 +606,7 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     state.claim_mark = None
     flags = ClaimFlags(delivery.MODE_STORE_ONLY, marking_mode, False, bool(force))
     state.claim_flags = flags.as_json()
+    state.claim_revision = revision
     state.save()
     return Claim(
         device_id=device_id,
@@ -583,6 +615,7 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
         push_seq=push_seq,
         payload=rendered.payload,
         identity=state.claim_identity,
+        revision=revision,
         deletions=[],
         mark=None,
         mark_any=flags.mark_any,
@@ -600,6 +633,7 @@ def _form_backfill(state, mgmt, now) -> Claim:
     ``claim_deletions`` and then take the adapter's 422 for carrying authority the mode
     forbids. It consumes no entry, so the real work is still owed after it succeeds.
     """
+    revision = _intent_revision(state.device_id, state.scope)
     rendered = delivery.render(state.scope, state.device_id, mgmt.adapter_device_id)
     marking_mode = delivery.delivery_keys()[state.scope].marking_mode
     push_seq = allocate_push_seq()
@@ -618,6 +652,7 @@ def _form_backfill(state, mgmt, now) -> Claim:
     state.claim_mark = None
     flags = ClaimFlags(delivery.MODE_BACKFILL_ONLY, marking_mode, False, True)
     state.claim_flags = flags.as_json()
+    state.claim_revision = revision
     state.save()
     return Claim(
         device_id=state.device_id,
@@ -626,6 +661,7 @@ def _form_backfill(state, mgmt, now) -> Claim:
         push_seq=push_seq,
         payload=rendered.payload,
         identity=state.claim_identity,
+        revision=revision,
         deletions=[],
         mark=None,
         mark_any=flags.mark_any,
@@ -1430,7 +1466,7 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
         if pushed is not None:
             # Latest wins: one capture spans several caller calls, and a scope that settles
             # again there has genuinely moved on to a later sequence.
-            pushed[scope] = SuccessfulPush(claimed.push_seq, claimed.identity)
+            pushed[scope] = SuccessfulPush(claimed.push_seq, claimed.identity, claimed.revision)
     if answered_other_work:
         if chain <= 0:
             logger.info(
@@ -1799,6 +1835,23 @@ def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
     )
 
 
+def _restored_claim_validation(state, receipt, flags) -> str | None:
+    """Return a restore outcome when persisted claim evidence cannot settle."""
+    if state.claim_revision is None:
+        raise ProtocolViolation(
+            f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
+        )
+    if receipt.get("request_digest") != _sent_wire_digest(state, flags):
+        logger.error(
+            "%s/%s holds push_seq %s at a digest the receipt does not name",
+            state.device_id,
+            state.scope,
+            state.push_seq,
+        )
+        return RESTORE_FAILED_CLOSED
+    return None
+
+
 def resolve_restored_claim(device_id, scope, receipt) -> str:
     """Resolve one restored claim against the adapter's receipt for its key (§4.6).
 
@@ -1863,14 +1916,9 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
                 _clear_claim(state)
                 state.save()
                 return RESTORE_REBASED
-            if receipt.get("request_digest") != _sent_wire_digest(state, flags):
-                logger.error(
-                    "%s/%s holds push_seq %s at a digest the receipt does not name",
-                    device_id,
-                    scope,
-                    state.push_seq,
-                )
-                return RESTORE_FAILED_CLOSED
+            validation = _restored_claim_validation(state, receipt, flags)
+            if validation is not None:
+                return validation
             break
 
     # Rebuilt from the row alone: nothing is sent, so the claim needs no adapter id.
@@ -1881,6 +1929,7 @@ def resolve_restored_claim(device_id, scope, receipt) -> str:
         push_seq=state.push_seq,
         payload=state.claim_payload,
         identity=state.claim_identity,
+        revision=state.claim_revision,
         deletions=list(state.claim_deletions or []),
         mark=state.claim_mark,
         mark_any=flags.mark_any,
@@ -1931,6 +1980,7 @@ def _clear_claim(state) -> None:
     state.claim_payload = None
     state.claim_identity = ""
     state.claim_flags = {}
+    state.claim_revision = None
     state.claim_mark = None
 
 

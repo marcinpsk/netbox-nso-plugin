@@ -25,9 +25,11 @@ from ._outbox_case import (
     ReceiptAdapter,
     entries,
     make_managed,
+    mirror_update,
     own_route,
     own_vlan,
     state_of,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -396,8 +398,8 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
         def repair(rows, snapshot=None):
             """The two branches that leave the caller holding something untrue."""
-            NSODeviceManagement.objects.filter(pk=reused_mgmt.pk).update(adapter_device_id=7710)
-            NSODeviceManagement.objects.filter(pk=missing_mgmt.pk).update(adapter_device_id=7711)
+            mirror_update(NSODeviceManagement.objects.get(pk=reused_mgmt.pk), adapter_device_id=7710)
+            mirror_update(NSODeviceManagement.objects.get(pk=missing_mgmt.pk), adapter_device_id=7711)
             for row in rows:
                 if row.pk == reused_mgmt.pk:
                     row.adapter_device_id = None  # _REUSED drops the pointer on the object
@@ -471,11 +473,11 @@ class TestTheTickDrainsTheTail(_DrainCase):
 
 
 class TestOutOfOrderCommitVisibility(_DrainCase):
-    """O1.24: an entry allocated first and committed last is simply unconsumed."""
+    """A-21/A-23: claims cannot pass an open mutation of their device and scope."""
 
-    def test_the_late_commit_is_seen_by_the_next_claim_the_scan_and_the_tick(self):
+    def test_a_claim_waits_for_an_open_revocation_and_folds_it(self):
         from netbox_nso_plugin import drain, outbox
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+        from netbox_nso_plugin.intent_state import content_mutation
 
         device, mgmt = make_managed("late", 7640)
         keeper = own_route(mgmt, "198.51.100.48/28", "198.51.100.4")
@@ -491,9 +493,9 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         errors: list[BaseException] = []
 
         def late_writer():
-            """One transaction that allocates its entry first and commits last."""
+            """Hold the scope revision lock after recording a revocation."""
             try:
-                with transaction.atomic():
+                with without_commit_drain(), content_mutation({(device.pk, "static_route")}):
                     outbox.enqueue(device.pk, "static_route", transitions=[outbox.revoke_transition(leaving.pk)])
                     inserted.set()
                     assert release.wait(timeout=30)
@@ -509,34 +511,41 @@ class TestOutOfOrderCommitVisibility(_DrainCase):
         self.addCleanup(release.set)
         assert inserted.wait(timeout=30)
 
-        # Two transactions that start later commit first, so their entries take higher ids
-        # and are the only ones the claim's snapshot can see.
-        for _ in range(2):
-            with without_commit_drain(), transaction.atomic():
-                mgmt.static_route_states.get(static_route=keeper).save()
-        later_ids = [row.pk for row in entries(device, "static_route") if row.pk not in removal_ids]
-        assert len(later_ids) == 2
+        claims: list = []
+        claim_started = threading.Event()
+        claimant_pid: list[int] = []
 
-        claimed = drain.claim(device.pk, "static_route")
-        assert claimed is not None and [d["route_id"] for d in claimed.deletions] == [leaving.pk]
+        def claim():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    claimant_pid.append(cursor.fetchone()[0])
+                claim_started.set()
+                claims.append(drain.claim(device.pk, "static_route"))
+            except BaseException as exc:  # noqa: BLE001 (reported, not swallowed)
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        claimant = threading.Thread(target=claim)
+        claimant.start()
+        self.addCleanup(claimant.join, 30)
+        self.addCleanup(release.set)
+        assert claim_started.wait(timeout=30), "the claimant never opened its database connection"
+        wait_until_postgres_blocks(claimant_pid[0], "the claim", locktype="transactionid")
 
         release.set()
         writer.join(timeout=30)
+        claimant.join(timeout=30)
         assert errors == []
+        assert not writer.is_alive()
+        assert not claimant.is_alive()
 
-        unconsumed = list(
-            NSOIntentOutboxEntry.objects.filter(device=device, scope="static_route", consumed_by_push_seq=None)
-        )
-        assert len(unconsumed) == 1, "the entry the claim could not see is simply unconsumed"
-        assert unconsumed[0].pk < min(later_ids), "it was allocated before the entries that were consumed"
-
-        assert drain.revocation_hit(claimed) is True, "the pre-send scan reads the unconsumed transitions"
-        assert drain.abandon(claimed) == drain.ABANDONED
-        assert (device.pk, "static_route") in drain.drain_candidates()
-
-        refolded = drain.claim(device.pk, "static_route")
+        [claimed] = claims
+        assert claimed is not None
         assert entries(device, "static_route", unconsumed=True) == []
-        assert refolded.deletions == [], "the revocation withdrew the authority the earlier fold carried"
+        assert claimed.deletions == [], "the committed revocation withdrew the removal authority"
+        assert [row["route_id"] for row in claimed.payload] == [keeper.pk]
 
     def test_a_null_route_id_in_a_revoke_record_does_not_poison_the_key(self):
         from netbox_nso_plugin import drain, outbox

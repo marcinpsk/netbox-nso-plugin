@@ -20,9 +20,88 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler
+
 logger = logging.getLogger(__name__)
 
 
+def lag_config_reconcile_plan(device, payload: dict):
+    """Declare LACP overlay rows and predict changes to owned wire fragments."""
+    import copy
+
+    from dcim.models import Interface
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
+    from .models import NSODeviceManagement, NSOLACPBundleState, NSOLACPMemberState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    interface_by_name = {interface.name: interface for interface in interfaces}
+    bundles = tuple(NSOLACPBundleState.objects.filter(management=management).select_related("interface").order_by("pk"))
+    members = tuple(NSOLACPMemberState.objects.filter(management=management).select_related("interface").order_by("pk"))
+    reported_bundles = {
+        item.get("name"): item
+        for item in payload.get("bundles", []) or []
+        if isinstance(item, dict) and item.get("name") in interface_by_name
+    }
+    reported_members = {
+        member.get("interface_name"): (item, member)
+        for item in reported_bundles.values()
+        for member in item.get("members", []) or []
+        if isinstance(member, dict) and member.get("interface_name") in interface_by_name
+    }
+    changes_content = False
+    for state in bundles:
+        candidate = copy.copy(state)
+        item = reported_bundles.get(state.interface.name)
+        if item is None:
+            candidate.status = sm.on_reconcile(state.status, present=False)
+        else:
+            candidate.lag_id = item.get("lag_id")
+            candidate.min_links = item.get("min_links")
+            candidate.system_priority = item.get("system_priority")
+            candidate.system_id = item.get("system_id") or ""
+            candidate.timer = item.get("timer") or ""
+            candidate.admin_key = item.get("admin_key")
+            candidate.vpc_sensitive = bool(item.get("vpc_sensitive"))
+            candidate.status = sm.on_reconcile(state.status, matches=None)
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            changes_content = True
+            break
+    if not changes_content:
+        for state in members:
+            candidate = copy.copy(state)
+            observed = reported_members.get(state.interface.name)
+            if observed is None:
+                candidate.status = sm.on_reconcile(state.status, present=False)
+            else:
+                item, member = observed
+                candidate.lag_bundle = interface_by_name[item["name"]]
+                candidate.mode = member.get("mode") or ""
+                candidate.port_priority = member.get("port_priority")
+                candidate.status = sm.on_reconcile(state.status, matches=None)
+            if canonical_fragment(state) != canonical_fragment(candidate):
+                changes_content = True
+                break
+    states = (*bundles, *members)
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "lacp")},
+            source_rows=(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsolacpbundlestate", None),
+                SourceRow("netbox_nso_plugin.nsolacpmemberstate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
+    )
+
+
+@mirror_reconciler
 def reconcile_lag_config(device, payload: dict) -> list:
     """Upsert NSOLACPBundleState + NSOLACPMemberState from the adapter lag-config payload.
 

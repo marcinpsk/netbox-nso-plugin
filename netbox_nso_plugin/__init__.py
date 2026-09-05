@@ -29,13 +29,13 @@ class NSOPluginConfig(PluginConfig):
     def ready(self):  # pragma: no cover
         """Connect signal handlers after all apps are loaded."""
         super().ready()
+        from django.conf import settings
+
         from . import (
             jobs,  # noqa: F401 — registers the @system_job hourly onboarding sweep
+            route_policy_reconciler,  # noqa: F401
             signals,  # noqa: F401
         )
-        from .signals import _connect_g_activated
-
-        _connect_g_activated()
 
         # Register the shared-object materialization specs (route-policy families) at startup.
         # They live in route_policy_reconciler (run via its module-level _register_specs()), but
@@ -43,13 +43,22 @@ class NSOPluginConfig(PluginConfig):
         # rendering the versions page before any reconcile had an EMPTY registry, making
         # hash_captured() return "" and every device version falsely read as "matches". Importing
         # it here guarantees the specs exist in every process (web + worker).
-        from django.conf import settings
-
-        from . import route_policy_reconciler  # noqa: F401
         from .derived_intent import _register_description_from_cable
+        from .intent_state import (
+            connect_renderer_input_end_handlers,
+            ensure_delete_signal_origin,
+            register_builtin_renderer_inputs,
+        )
+        from .signals import _connect_g_activated
 
         # The field is always available; enabled templates are read live from NetBox.
         _register_description_from_cable()
+        ensure_delete_signal_origin()
+        # Register the begin hooks before behavior signals. Register the matching end hooks
+        # afterwards so one implicit permit encloses the complete save or delete sequence.
+        register_builtin_renderer_inputs(connect_ends=False)
+        _connect_g_activated()
+        connect_renderer_input_end_handlers()
 
         cfg = settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
         self._interface_ip_auto_create = cfg.get("interface_ip_auto_create", False)

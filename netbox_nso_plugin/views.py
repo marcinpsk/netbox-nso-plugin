@@ -2,7 +2,9 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
 import re
+from dataclasses import dataclass
 from types import MappingProxyType
+from uuid import uuid4
 
 from dcim.models import Device
 from django.contrib import messages
@@ -49,6 +51,7 @@ from .forms import (
     NSOSnmpV3UserStateForm,
     NSOVaultSettingsForm,
 )
+from .intent_state import IntentTransactionNoOp as _IntentTransactionNoOp
 from .models import (
     AdapterConnection,
     NSOBFDInterfaceState,
@@ -2576,6 +2579,14 @@ class ApplyIntentChanged(ApplyRefused):
     """Intent changed after one selected receipt was stored, so Apply must be retried."""
 
 
+@dataclass(frozen=True)
+class PreparedApply:
+    """The durable attempt and the exact local rows that it promoted."""
+
+    attempt_id: object
+    moved: tuple
+
+
 #: What a preparation step did, in the operator's words. A closed vocabulary: with the
 #: delivery-registry labels it is everything a refusal may say.
 _PREPARE_FAILED = "failed"
@@ -2789,7 +2800,9 @@ def _prepare_apply(mgmt):
         if outcome != drain.SUCCEEDED:
             raise ApplyPreparationRefused("snmp", _PREPARE_NOT_SETTLED)
 
-        _push_direct_snapshots(mgmt, registry, remaining_budget)
+    # Direct snapshots do not participate in the adapter selector. Keep them outside
+    # the receipt capture so only in-protocol store-only claims reach promotion.
+    _push_direct_snapshots(mgmt, registry, remaining_budget)
 
     selected = MappingProxyType({registry[scope].section: successful.push_seq for scope, successful in pushed.items()})
 
@@ -2802,13 +2815,19 @@ def _prepare_apply(mgmt):
     try:
         from .apply_state import IntentChangedDuringPreparation, promote_current_intent
 
-        moved = promote_current_intent(mgmt, registry, pushed, static_route_stored=static_route_stored)
+        attempt, moved = promote_current_intent(
+            mgmt,
+            registry,
+            pushed,
+            apply_attempt_id=uuid4(),
+            static_route_stored=static_route_stored,
+        )
     except IntentChangedDuringPreparation as exc:
         raise ApplyIntentChanged from exc
     except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
         raise ApplyPromotionFailed from exc
-    return moved, selected
+    return PreparedApply(attempt.pk, tuple(moved)), selected
 
 
 def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
@@ -2820,13 +2839,49 @@ def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
     job would strand it as 'applying' forever because nothing can settle it.
     """
     keep_streams = set(keep_streams)
-    for section, model, pks, previous_status in moved or []:
+    if not isinstance(moved, PreparedApply):
+        raise TypeError("Apply rollback requires a durable prepared attempt")
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    for section, model, pks, previous_status in moved.moved:
         if section in keep_streams:
             continue
         try:
-            model.objects.filter(pk__in=pks, status="deploying").update(status=previous_status)
+            with transaction.atomic():
+                rows = list(
+                    model.objects.select_for_update(of=("self",)).filter(
+                        pk__in=pks,
+                        status="deploying",
+                        apply_attempt_id=moved.attempt_id,
+                    )
+                )
+                for row in rows:
+                    with suppress_intent_push(), mirror_refresh(row, {"status", "apply_attempt_id"}) as locked:
+                        if locked is None:
+                            continue
+                        locked.status = previous_status
+                        locked.apply_attempt_id = None
+                        locked.save(update_fields=["status", "apply_attempt_id"])
         except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
             logger.warning("Apply rollback failed: %s", exc)
+
+
+def _record_apply_response(prepared, *, http_status, response) -> None:
+    """Persist the exact replayable adapter answer for one local attempt."""
+    from .models import NSOApplyAttempt
+
+    if not isinstance(prepared, PreparedApply):
+        raise TypeError("Apply response recording requires a durable prepared attempt")
+    with transaction.atomic():
+        updated = NSOApplyAttempt.objects.filter(pk=prepared.attempt_id, response__isnull=True).update(
+            http_status=http_status,
+            response=response,
+        )
+        if updated != 1:
+            stored = NSOApplyAttempt.objects.get(pk=prepared.attempt_id)
+            if stored.http_status != http_status or stored.response != response:
+                raise RuntimeError("an Apply attempt received two different responses")
 
 
 def _stream_reason_message(prefix, reasons) -> str:
@@ -2990,6 +3045,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 request, mgmt, "Adapter returned an invalid Apply response.", is_ajax=is_ajax
             )
         outcome = result.get("outcome")
+        _record_apply_response(prepared, http_status=200 if outcome == "no_op" else 202, response=result)
         expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
         if partition_error:
             if outcome == "no_op" and result.get("generations") == []:
@@ -3063,9 +3119,16 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
     def _adapter_error(self, request, mgmt, exc, prepared, *, action, label, is_ajax):
         """Roll back a definitely rejected Apply and surface the adapter's failure."""
-        definitely_not_enqueued = exc.code == "configuration_error" or (
-            type(exc.status_code) is int and 400 <= exc.status_code < 500
-        )
+        definitely_not_enqueued = exc.definitely_not_enqueued
+        # An ambiguous failure may still have enqueued the Apply, and the stored response is the
+        # attempt's immutable answer, so only a deterministic rejection may become it.
+        if (
+            prepared is not None
+            and definitely_not_enqueued
+            and type(exc.status_code) is int
+            and isinstance(exc.response, dict)
+        ):
+            _record_apply_response(prepared, http_status=exc.status_code, response=exc.response)
         if prepared is not None and definitely_not_enqueued:
             _rollback_prepare_apply(prepared)
         if exc.code == "conflict":
@@ -3138,7 +3201,9 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
         try:
             result = (
-                action_fn(mgmt.adapter_device_id, selected) if action == "apply" else action_fn(mgmt.adapter_device_id)
+                action_fn(mgmt.adapter_device_id, prepared.attempt_id, selected)
+                if action == "apply"
+                else action_fn(mgmt.adapter_device_id)
             )
             if action == "apply":
                 return self._apply_result(request, mgmt, result, prepared, selected, label=label, is_ajax=is_ajax)
@@ -3621,13 +3686,18 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
                 # legitimately EMPTY list — keep the last-known interfaces (codex B5-F5)
                 interfaces = (mgmt.state_snapshot or {}).get("interfaces", [])
                 messages.warning(request, "Interface read unavailable — kept last-known interface data.")
-            NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
-                state_snapshot={
+            from .intent_state import mirror_refresh
+            from .signals import suppress_intent_push
+
+            with transaction.atomic(), suppress_intent_push():
+                mgmt = NSODeviceManagement.objects.select_for_update(of=("self",)).get(pk=mgmt.pk)
+                mgmt.state_snapshot = {
                     "compliance": compliance,
                     "interfaces": interfaces,
                     "refreshed_at": timezone.now().isoformat(),
                 }
-            )
+                with mirror_refresh(mgmt, {"state_snapshot"}):
+                    mgmt.save(update_fields={"state_snapshot"})
             messages.success(request, "Compliance data refreshed.")
         except AdapterError as exc:
             messages.error(request, f"Could not reach adapter: {public_error_message(exc)}")
@@ -3705,26 +3775,6 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 # ── Accept workflow ───────────────────────────────────────────────────────────
 
 
-def _push_intent_for_device(device_id: int) -> None:
-    """Record the device's interface intent in the outbox, which drains it once.
-
-    Appends rather than pushes (#1503 Appendix O): every in-protocol send is a claimed,
-    sequenced logical operation, so the view-level bulk accept goes through the same outbox
-    as the accept signal and the Decision-G edit signal rather than calling the builder
-    around it. The caller must hold a writer transaction, as ``NSOBulkAcceptView.post`` does.
-    """
-    try:
-        mgmt = NSODeviceManagement.objects.select_related("nso_instance").get(device_id=device_id)
-    except NSODeviceManagement.DoesNotExist:
-        logger.warning("No NSODeviceManagement for device %s, skipping intent push", device_id)
-        return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    _schedule_intent_push((device_id, "interface"))
-
-
 # Statuses where the NetBox value already matches the device — accepting them
 # leaves nothing to apply.
 _MATCHING_SOURCE_STATUSES = ("imported", "in_sync")
@@ -3774,12 +3824,13 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):
         """Copy the device value onto the interface and mark the state in_sync."""
+        from .intent_state import footprint_for_instance, intent_transaction
         from .signals import suppress_intent_push
 
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         iface = state.interface
         dev_val = state.nso_value
-        with suppress_intent_push():
+        with intent_transaction(footprint_for_instance(iface)), suppress_intent_push():
             if state.attribute == "description":
                 iface.description = dev_val or ""
                 iface.save(update_fields=["description"])
@@ -4256,14 +4307,44 @@ def _sync_native_redistribution(obj):
         native.save(update_fields=["route_map", "metric", "metric_type"])
 
 
-def _save_owned_overlay_edit(obj, key):
+def _owned_overlay_edit_footprint(obj, key):
+    """Resolve the overlay and native rows changed by one inline edit."""
+    from .intent_state import MutationFootprint, footprint_for_instance, renderer_input_specs
+
+    native = {
+        "interface_mtu": getattr(obj, "interface", None),
+        "ospf_instance": getattr(obj, "ospf_instance", None),
+        "ospf_interface": getattr(obj, "ospf_interface", None),
+        "isis_instance": getattr(obj, "isis_instance", None),
+        "isis_interface": getattr(obj, "isis_interface", None),
+        "bgp_peer": getattr(obj, "bgp_peer", None),
+        "redistribution": getattr(obj, "redistribution", None),
+        "static_route": getattr(obj, "static_route", None),
+    }.get(key)
+    footprints = [footprint_for_instance(obj)]
+    if native is not None and native._meta.label_lower in renderer_input_specs():
+        footprints.append(footprint_for_instance(native))
+    return MutationFootprint.merge(*footprints)
+
+
+def _clear_apply_attempt(obj, update_fields) -> None:
+    """Clear a stale deployment fence when this overlay supports one."""
+    from django.core.exceptions import FieldDoesNotExist
+
+    try:
+        obj._meta.get_field("apply_attempt_id")
+    except FieldDoesNotExist:
+        return
+    obj.apply_attempt_id = None
+    update_fields.add("apply_attempt_id")
+
+
+def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
-    from django.db import transaction
-
     from . import status_machine as sm
-    from .apply_state import mark_explicit_accept
+    from .intent_state import intent_transaction
 
-    with transaction.atomic():
+    with intent_transaction(_owned_overlay_edit_footprint(obj, key)):
         if not sm.is_owned(obj.status):
             obj.accepted_at = timezone.now()
         obj.status = sm.on_operator_edit(obj.status)
@@ -4292,8 +4373,16 @@ def _save_owned_overlay_edit(obj, key):
 
             with suppress_intent_push():
                 obj.static_route.save(update_fields=["metric", "permanent", "tag"])
-        mark_explicit_accept(obj)
-        obj.save()
+        update_fields = {
+            field_name
+            for field_name, old_value in old_values.items()
+            if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
+        }
+        update_fields.add("status")
+        _clear_apply_attempt(obj, update_fields)
+        if obj.accepted_at is not None:
+            update_fields.add("accepted_at")
+        obj.save(update_fields=update_fields)
         if key == "static_route":
             from .signals import _transition_static_route_content
 
@@ -4348,97 +4437,207 @@ def _route_map_name_errors(state, old_name):
     return errors
 
 
-def _route_map_dependent_pushes(route_map, old_name):
-    """Return dependent BGP/redistribution intent targets for a route-map rename."""
+def _route_map_rename_dependents(route_map, old_name):
+    """Discover every overlay and policy group that consumes a route-map name."""
     from django.db.models import Q
+    from netbox_routing.models import RouteMapEntry
 
     from . import signals
     from .models import NSOBGPPeerState, NSORedistributionState
 
     owned = signals._OWNED_PUSH_STATUSES
-    bgp_targets = set(
+    bgp_states = list(
         NSOBGPPeerState.objects.filter(
             Q(bgp_peer__address_families__routemap_in=route_map)
             | Q(bgp_peer__address_families__routemap_out=route_map),
             status__in=owned,
-            management__adapter_device_id__isnull=False,
-        ).values_list("management__device_id", flat=True)
+        ).select_related("management")
     )
-
-    redistribution = NSORedistributionState.objects.filter(
-        Q(redistribution__route_map=route_map) | Q(redistribution__isnull=True, route_map__iexact=old_name),
-        status__in=owned,
+    redistribution_states = list(
+        NSORedistributionState.objects.filter(
+            Q(redistribution__route_map=route_map) | Q(redistribution__isnull=True, route_map__iexact=old_name),
+            status__in=owned,
+        ).select_related("management")
     )
-    redistribution_targets = set(
-        redistribution.filter(management__adapter_device_id__isnull=False).values_list(
-            "management__device_id", "dest_protocol"
-        )
-    )
-    redistribution.filter(redistribution__isnull=True, route_map__iexact=old_name).update(route_map=route_map.name)
-    return bgp_targets, redistribution_targets
+    dependent_groups = {
+        ("route_map", name)
+        for name in RouteMapEntry.objects.filter(Q(call_policy=route_map) | Q(apply_policy=route_map))
+        .exclude(route_map=route_map)
+        .values_list("route_map__name", flat=True)
+    }
+    return bgp_states, redistribution_states, dependent_groups
 
 
 def _save_route_map_name_edit(state, old_name):
     """Atomically rename a shared route map and refresh every dependent intent scope."""
-    from django.db import transaction
+    from django.db import IntegrityError
 
     from . import signals
     from . import status_machine as sm
-    from .apply_state import mark_explicit_accept
-    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .intent_state import (
+        MutationFootprint,
+        footprint_for_instance,
+        intent_transaction,
+        route_policy_footprint,
+    )
+    from .models import NSORedistributionState, NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .signals import suppress_intent_push
 
     route_map = state.assigned_object
     new_name = state.object_name
-    with transaction.atomic():
-        attached = NSORoutePolicyState.objects.select_for_update().filter(
-            content_type_id=state.content_type_id,
-            object_id=state.object_id,
-        )
-        attached.exclude(pk=state.pk).update(object_name=new_name)
-        NSORoutePolicyObjectClass.objects.select_for_update().filter(
-            family="route_map", object_name__iexact=old_name
-        ).update(object_name=new_name)
+    bgp_states, redistribution_states, dependent_groups = _route_map_rename_dependents(route_map, old_name)
+    groups = {("route_map", old_name), ("route_map", new_name), *dependent_groups}
+    footprint = MutationFootprint.merge(
+        route_policy_footprint(groups),
+        *(footprint_for_instance(row) for row in (*bgp_states, *redistribution_states)),
+    )
+    try:
+        with intent_transaction(footprint):
+            attached = list(
+                NSORoutePolicyState.objects.filter(
+                    content_type_id=state.content_type_id,
+                    object_id=state.object_id,
+                ).order_by("pk")
+            )
+            classes = list(
+                NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by(
+                    "pk"
+                )
+            )
+            fallback_redistribution = list(
+                NSORedistributionState.objects.filter(
+                    pk__in=[row.pk for row in redistribution_states],
+                    redistribution__isnull=True,
+                    route_map__iexact=old_name,
+                ).order_by("pk")
+            )
+            now = timezone.now()
+            with suppress_intent_push():
+                class_ids = [policy_class.pk for policy_class in classes]
+                try:
+                    with transaction.atomic():
+                        for attached_state in attached:
+                            attached_state.object_name = new_name
+                            update_fields = {"object_name"}
+                            if attached_state.pk == state.pk:
+                                if not sm.is_owned(attached_state.status):
+                                    attached_state.accepted_at = now
+                                attached_state.status = sm.on_operator_edit(attached_state.status)
+                                attached_state.apply_attempt_id = None
+                                update_fields.update({"status", "accepted_at", "apply_attempt_id"})
+                            attached_state.save(update_fields=update_fields)
+                        for policy_class in classes:
+                            policy_class.object_name = new_name
+                            policy_class.save(update_fields=["object_name"])
+                        route_map.name = new_name
+                        route_map.save(update_fields=["name"])
+                        classification_collision = (
+                            NSORoutePolicyObjectClass.objects.filter(
+                                family="route_map",
+                                object_name__iexact=new_name,
+                            )
+                            .exclude(pk__in=class_ids)
+                            .exists()
+                        )
+                        if classes and classification_collision:
+                            raise IntegrityError
+                except IntegrityError:
+                    attached_collision = (
+                        NSORoutePolicyState.objects.filter(
+                            management_id__in=[row.management_id for row in attached],
+                            family="route_map",
+                            object_name=new_name,
+                        )
+                        .exclude(pk__in=[row.pk for row in attached])
+                        .exists()
+                    )
+                    if attached_collision:
+                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
+                    collision = type(route_map).objects.filter(name__iexact=new_name).exclude(pk=route_map.pk)
+                    if collision.exists():
+                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
+                    classification_collision = (
+                        NSORoutePolicyObjectClass.objects.filter(
+                            family="route_map",
+                            object_name__iexact=new_name,
+                        )
+                        .exclude(pk__in=class_ids)
+                        .exists()
+                    )
+                    if classes and classification_collision:
+                        raise _IntentTransactionNoOp(
+                            {"object_name": ["A route-map classification with this name already exists."]}
+                        )
+                    raise
+                for redistribution_state in fallback_redistribution:
+                    redistribution_state.route_map = new_name
+                    redistribution_state.save(update_fields=["route_map"])
 
-        if not sm.is_owned(state.status):
-            state.accepted_at = timezone.now()
-        state.status = sm.on_operator_edit(state.status)
-        mark_explicit_accept(state)
-        state.save()
+            route_policy_targets = {
+                attached_state.management.device_id
+                for attached_state in attached
+                if attached_state.management.adapter_device_id is not None
+            }
+            bgp_targets = {
+                row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None
+            }
+            redistribution_targets = {
+                (row.management.device_id, row.dest_protocol)
+                for row in redistribution_states
+                if row.management.adapter_device_id is not None
+            }
+            # Appended here, not on commit: the entry belongs to the transaction that renamed
+            # the map, and the drain it schedules still runs after that transaction commits.
+            for device_id in route_policy_targets:
+                signals._schedule_intent_push((device_id, "route_policy"))
+            for device_id in bgp_targets:
+                signals._schedule_intent_push((device_id, "bgp"))
+            for device_id, dest_protocol in redistribution_targets:
+                signals._schedule_redistribution_push(device_id, dest_protocol)
+    except _IntentTransactionNoOp as exc:
+        return exc.result
+    return None
 
-        route_map.name = new_name
-        route_map.save(update_fields=["name"])
-        bgp_targets, redistribution_targets = _route_map_dependent_pushes(route_map, old_name)
-        # Appended here, not on commit: the entry belongs to the transaction that renamed
-        # the map, and the drain it schedules still runs after that transaction commits.
-        for device_id in bgp_targets:
-            signals._schedule_intent_push((device_id, "bgp"))
-        for device_id, dest_protocol in redistribution_targets:
-            signals._schedule_redistribution_push(device_id, dest_protocol)
 
-
-def _save_lacp_edit(obj, key):
+def _save_lacp_edit(obj, key, old_values):
     """Own a complete LACP bundle while preserving which member actually changed."""
-    from django.db import transaction
-
     from . import status_machine as sm
+    from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
     from .models import NSOLACPBundleState, NSOLACPMemberState
 
-    with transaction.atomic():
-        if key == "lacp_bundle":
-            bundle = obj
-        else:
-            bundle = NSOLACPBundleState.objects.select_for_update().get(
-                management=obj.management, interface=obj.lag_bundle
-            )
+    bundle = (
+        obj
+        if key == "lacp_bundle"
+        else NSOLACPBundleState.objects.get(management=obj.management, interface=obj.lag_bundle)
+    )
+    members = list(
+        NSOLACPMemberState.objects.filter(
+            management=bundle.management,
+            lag_bundle=bundle.interface,
+        )
+    )
+    footprint = MutationFootprint.merge(
+        footprint_for_instance(bundle),
+        *(footprint_for_instance(member) for member in members),
+    )
+    changed_values = {
+        field_name: getattr(obj, field_name)
+        for field_name, old_value in old_values.items()
+        if getattr(obj, field_name) != old_value
+    }
+    with intent_transaction(footprint):
+        bundle = NSOLACPBundleState.objects.get(pk=bundle.pk)
         members = list(
-            NSOLACPMemberState.objects.select_for_update().filter(
-                management=bundle.management, lag_bundle=bundle.interface
-            )
+            NSOLACPMemberState.objects.filter(
+                management=bundle.management,
+                lag_bundle=bundle.interface,
+            ).order_by("pk")
         )
         now = timezone.now()
         for member in members:
             if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
-                member = obj
+                for field_name, value in changed_values.items():
+                    setattr(member, field_name, value)
                 target_status = sm.on_operator_edit(member.status)
             elif member.status == "deploying":
                 target_status = sm.on_operator_edit(member.status)
@@ -4447,12 +4646,21 @@ def _save_lacp_edit(obj, key):
             if not sm.is_owned(member.status):
                 member.accepted_at = now
             member.status = target_status
-            member.save()
+            update_fields = {"status", "accepted_at"}
+            if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
+                update_fields.update(changed_values)
+            member.save(update_fields=update_fields)
 
+        if key == "lacp_bundle":
+            for field_name, value in changed_values.items():
+                setattr(bundle, field_name, value)
         if not sm.is_owned(bundle.status):
             bundle.accepted_at = now
         bundle.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
-        bundle.save()
+        bundle_update_fields = {"status", "accepted_at"}
+        if key == "lacp_bundle":
+            bundle_update_fields.update(changed_values)
+        bundle.save(update_fields=bundle_update_fields)
 
 
 def _save_vlan_name_edit(obj):
@@ -4460,44 +4668,55 @@ def _save_vlan_name_edit(obj):
     from django.db import IntegrityError, transaction
 
     from . import status_machine as sm
-    from .apply_state import lock_vlan_intent_rows, mark_explicit_accept
+    from .intent_state import intent_transaction, vlan_footprint
+    from .models import NSOVLANState
     from .signals import suppress_intent_push
-    from .vlan_reconciler import is_placeholder_vlan_name
+    from .vlan_reconciler import vlan_name_matches
 
+    vlan_model = type(obj.vlan)
     desired_name = obj.vlan.name
-    with transaction.atomic():
-        vlan, rows = lock_vlan_intent_rows(obj.vlan_id, ("vlan",))
-        if vlan is None:
-            return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
-        vlan.name = desired_name
-        states = rows["vlan"]
-        try:
-            with transaction.atomic(), suppress_intent_push():
-                vlan.save(update_fields=["name"])
-        except IntegrityError:
-            from django.db.models import Q
+    missing_error = {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
+    if not vlan_model.objects.filter(pk=obj.vlan_id).exists():
+        return missing_error
+    footprint = vlan_footprint(obj.vlan_id, ("vlan",))
+    try:
+        with intent_transaction(footprint):
+            vlan = vlan_model.objects.filter(pk=obj.vlan_id).first()
+            if vlan is None:
+                raise _IntentTransactionNoOp(missing_error)
+            vlan.name = desired_name
+            states = list(NSOVLANState.objects.filter(vlan=vlan).order_by("pk"))
+            try:
+                with transaction.atomic(), suppress_intent_push():
+                    vlan.save(update_fields=["name"])
+            except IntegrityError:
+                from django.db.models import Q
 
-            collision_scope = Q(group_id=vlan.group_id)
-            if vlan.qinq_svlan_id is not None:
-                collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
-            collision = type(vlan).objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
-            if collision.exists():
-                return {"name": ["A VLAN with this name already exists in this VLAN scope."]}
-            raise
+                collision_scope = Q(group_id=vlan.group_id)
+                if vlan.qinq_svlan_id is not None:
+                    collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
+                collision = vlan_model.objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
+                if collision.exists():
+                    raise _IntentTransactionNoOp({"name": ["A VLAN with this name already exists in this VLAN scope."]})
+                raise
 
-        now = timezone.now()
-        for state in states:
-            state.vlan = vlan
-            if not sm.is_owned(state.status):
-                state.accepted_at = now
-            matches = state.device_name == vlan.name if state.device_name else is_placeholder_vlan_name(state)
-            state.status = (
-                sm.on_operator_edit(state.status)
-                if state.status == "deploying"
-                else ("in_sync" if matches else "accepted")
-            )
-            mark_explicit_accept(state)
-            state.save()
+            now = timezone.now()
+            for state in states:
+                state.vlan = vlan
+                was_deploying = state.status == "deploying"
+                if not sm.is_owned(state.status):
+                    state.accepted_at = now
+                matches = vlan_name_matches(state)
+                state.status = (
+                    sm.on_operator_edit(state.status)
+                    if state.status == "deploying"
+                    else ("in_sync" if matches else "accepted")
+                )
+                if was_deploying:
+                    state.apply_attempt_id = None
+                state.save()
+    except _IntentTransactionNoOp as exc:
+        return exc.result
     return None
 
 
@@ -4562,13 +4781,13 @@ def _overlay_family_errors(key, obj, old_values):
 def _save_overlay_edit(obj, key, old_values):
     """Dispatch a validated edit to its family-specific atomic save path."""
     if key == "route_map_name":
-        _save_route_map_name_edit(obj, old_values["object_name"])
-    elif key in ("lacp_bundle", "lacp_member"):
-        _save_lacp_edit(obj, key)
+        return _save_route_map_name_edit(obj, old_values["object_name"])
+    if key in ("lacp_bundle", "lacp_member"):
+        _save_lacp_edit(obj, key, old_values)
     elif key == "vlan_name":
         return _save_vlan_name_edit(obj)
     else:
-        _save_owned_overlay_edit(obj, key)
+        _save_owned_overlay_edit(obj, key, old_values)
     return None
 
 
@@ -4728,18 +4947,25 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
         now = timezone.now()
         base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
+        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+        candidates = list(base.filter(status__in=("imported", "changed")).order_by("pk"))
+        footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
         # One transaction for the ownership and the entry that records it: appended after
         # the commit, the entry could be lost while the rows read as owned.
-        with transaction.atomic():
-            settled = base.filter(status="imported").update(status="in_sync", accepted_at=now)
-            pending = base.filter(status="changed").update(status="accepted", accepted_at=now)
-            updated = settled + pending
+        with intent_transaction(footprint):
+            updated = 0
+            for row in base.filter(pk__in=[candidate.pk for candidate in candidates]).order_by("pk"):
+                if row.status not in {"imported", "changed"}:
+                    continue
+                row.status = "in_sync" if row.status == "imported" else "accepted"
+                update_fields = {"status"}
+                if row.accepted_at is None:
+                    row.accepted_at = now
+                    update_fields.add("accepted_at")
+                row.save(update_fields=update_fields)
+                updated += 1
 
-            # Push whenever anything became owned — the snapshot is by status (OWNED_STATES),
-            # and matching rows settle to in_sync (an owned status), so even owned-but-matching
-            # rows are recorded in the adapter to persist ownership.
-            if updated:
-                _push_intent_for_device(device_pk)
         if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
         else:
@@ -5257,40 +5483,34 @@ def _switchport_vlan_ids(state) -> set[int]:
     return vlan_ids
 
 
-def _lock_switchport_accept_state(state):
-    """Lock and reload one switchport in VLAN-before-device order."""
-    from ipam.models import VLAN
-
-    from .apply_state import (
-        InterfaceIntentLockStale,
-        lock_device_vlan_membership_transaction,
-        lock_interface_intent_rows,
-        lock_vlan_intent_transaction,
-        lock_vlan_membership_transaction,
-    )
+def _switchport_accept_footprint(state):
+    """Declare the interface, VLAN, and overlay rows changed by switchport accept."""
+    from .intent_state import MutationFootprint, SourceRow
 
     vlan_ids = _switchport_vlan_ids(state)
-    lock_device_vlan_membership_transaction(state.management.device_id)
-    for vlan_id in sorted(vlan_ids):
-        lock_vlan_membership_transaction(vlan_id)
-    for vlan_id in sorted(vlan_ids):
-        lock_vlan_intent_transaction(vlan_id)
-    locked_vlan_ids = set(
-        VLAN.objects.select_for_update(of=("self",)).filter(pk__in=vlan_ids).values_list("pk", flat=True)
+    return MutationFootprint.for_keys(
+        {(state.management.device_id, "switchport")},
+        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+        source_rows=(
+            SourceRow("dcim.interface", state.interface_id),
+            *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+        ),
+        overlay_rows=(SourceRow(state._meta.label_lower, state.pk),),
     )
-    if locked_vlan_ids != vlan_ids:
-        raise _SwitchportAcceptRetry
 
-    try:
-        interface, _management, rows = lock_interface_intent_rows(state.interface_id)
-    except InterfaceIntentLockStale as exc:
-        raise _SwitchportAcceptRetry from exc
-    locked_state = next((candidate for candidate in rows["switchport"] if candidate.pk == state.pk), None)
+
+def _reload_switchport_accept_state(state, vlan_ids):
+    """Revalidate the dependencies after the immutable footprint is locked."""
+    from dcim.models import Interface
+
+    from .models import NSOSwitchportState
+
+    interface = Interface.objects.filter(pk=state.interface_id).first()
+    locked_state = NSOSwitchportState.objects.select_related("management").filter(pk=state.pk).first()
     if (
         interface is None
-        or _management is None
         or locked_state is None
-        or locked_state.management_id != _management.pk
+        or locked_state.management.device_id != interface.device_id
         or locked_state.interface_id != interface.pk
         or _switchport_vlan_ids(locked_state) != vlan_ids
     ):
@@ -5308,25 +5528,26 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
-
         from .models import NSOSwitchportState
 
         for _attempt in range(2):
             state = get_object_or_404(NSOSwitchportState, pk=pk)
-            with transaction.atomic():
-                try:
-                    state, iface = _lock_switchport_accept_state(state)
-                except _SwitchportAcceptRetry:
-                    continue
-                # native-write-on-accept: make the NetBox interface match what NSO observed.
-                iface.mode = state.mode or ""
-                iface.untagged_vlan = state.untagged_vlan
-                iface.save()
-                iface.tagged_vlans.set(state.tagged_vlans.all())
-                state.status = _status_after_accept(state.status)
-                state.accepted_at = timezone.now()
-                state.save(update_fields=["status", "accepted_at"])
+            vlan_ids = _switchport_vlan_ids(state)
+            from .intent_state import RendererTargetsChanged, intent_transaction
+
+            try:
+                with intent_transaction(_switchport_accept_footprint(state)):
+                    state, iface = _reload_switchport_accept_state(state, vlan_ids)
+                    # native-write-on-accept: make the NetBox interface match what NSO observed.
+                    iface.mode = state.mode or ""
+                    iface.untagged_vlan = state.untagged_vlan
+                    iface.save()
+                    iface.tagged_vlans.set(state.tagged_vlans.all())
+                    state.status = _status_after_accept(state.status)
+                    state.accepted_at = timezone.now()
+                    state.save(update_fields=["status", "accepted_at"])
+            except (RendererTargetsChanged, _SwitchportAcceptRetry):
+                continue
             break
         else:
             messages.error(request, "The switchport changed. Refresh the page and try again.")
@@ -5474,6 +5695,24 @@ def _apply_ip_update(update, now):
     ip_obj.save()
 
 
+def _ip_edit_footprint(updates):
+    """Freeze every native and overlay row that one paired-address edit can write."""
+    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance
+
+    states = [update["state"] for update in updates]
+    inverse_ids = {state.peer_state_id for state in states if state.auto_assigned and state.peer_state_id is not None}
+    source_rows = [SourceRow("ipam.ipaddress", None)]
+    source_rows.extend(
+        SourceRow("ipam.ipaddress", update["native"].pk) for update in updates if update["native"] is not None
+    )
+    overlay_rows = [SourceRow(states[0]._meta.label_lower, pk) for pk in inverse_ids]
+    keys = {(state.interface.device_id, "ip") for state in states}
+    return MutationFootprint.merge(
+        *(footprint_for_instance(state) for state in states),
+        MutationFootprint.for_keys(keys, source_rows=source_rows, overlay_rows=overlay_rows),
+    )
+
+
 class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
     """Edit/materialize an interface IP from the merged grid, optionally with its peer.
 
@@ -5485,8 +5724,9 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
     def post(self, request, pk):
         """Validate, atomically write native IPAM + overlays, then push owned intent."""
         from django.core.exceptions import ValidationError
-        from django.db import IntegrityError, transaction
+        from django.db import IntegrityError
 
+        from .intent_state import intent_transaction
         from .models import NSODeviceManagement, NSOInterfaceIPState
         from .signals import _schedule_intent_push, suppress_intent_push
 
@@ -5526,7 +5766,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                 raise PermissionDenied
 
         try:
-            with transaction.atomic():
+            with intent_transaction(_ip_edit_footprint(updates)):
                 now = timezone.now()
                 with suppress_intent_push():
                     for update in updates:
@@ -5930,13 +6170,7 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     model_class = None
 
     def _push(self, mgmt):
-        """Record the accepted rows in the outbox; override in subclasses.
-
-        The bulk update writes with ``QuerySet.update()``, which fires no signal, so the
-        subclass names the key its rows belong to. Appending is what makes the send a
-        claimed, sequenced operation (#1503 Appendix O, §4.2) rather than a bare PUT whose
-        failure the view would swallow with nothing left to retry.
-        """
+        """Record the accepted rows in the outbox; override in subclasses."""
 
     def _after_accept(self, mgmt, accepted_pks):
         """Run after the bulk ownership update, before the push (override in subclasses).
@@ -5946,7 +6180,8 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         """
 
     def post(self, request, device_pk):  # noqa: D102
-        from django.db import transaction
+        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+        from .signals import suppress_intent_push
 
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
@@ -5958,19 +6193,29 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # and for drift. Already-owned rows (in_sync/accepted) are skipped (accepting
         # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
-        base = self.model_class.objects.filter(management=mgmt)
+        candidates = list(
+            self.model_class.objects.filter(management=mgmt, status__in=["imported", "changed", "conflict"])
+            .select_related("management")
+            .order_by("pk")
+        )
+        footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
         # One transaction: a request is not wrapped in one, so committing the status ahead
         # of _after_accept() would publish rows that read as owned while still carrying the
         # state the previous apply named — which a concurrent Apply would then act on.
-        with transaction.atomic():
-            # Captured before the UPDATE: afterwards the two groups are indistinguishable,
-            # and only the drift group is entering ownership.
-            drift_pks = list(base.filter(status__in=["changed", "conflict"]).values_list("pk", flat=True))
-            n_owned = base.filter(status="imported").update(status="in_sync")
-            # The pks narrow the update, they do not replace its predicate: a reconcile that
-            # re-classified one of them meanwhile owns that row's status, not this request.
-            n_drift = base.filter(pk__in=drift_pks, status__in=["changed", "conflict"]).update(status="accepted")
-            count = n_owned + n_drift
+        with intent_transaction(footprint):
+            current = list(self.model_class.objects.filter(pk__in=[row.pk for row in candidates]).order_by("pk"))
+            drift_pks = [row.pk for row in current if row.status in {"changed", "conflict"}]
+            accepted = [row for row in current if row.status in {"imported", "changed", "conflict"}]
+            now = timezone.now()
+            with suppress_intent_push():
+                for row in accepted:
+                    row.status = "in_sync" if row.status == "imported" else "accepted"
+                    update_fields = ["status"]
+                    if row.accepted_at is None:
+                        row.accepted_at = now
+                        update_fields.append("accepted_at")
+                    row.save(update_fields=update_fields)
+            count = len(accepted)
             if count and mgmt.adapter_device_id is not None:
                 self._after_accept(mgmt, drift_pks)
                 # Inside the same transaction as the ownership it records: appended after
@@ -6098,25 +6343,27 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         """
         return ""
 
-    def lock_state_for_accept(self, state):
-        """Return the state that this accept operation must update."""
-        return get_object_or_404(
-            self.model_class.objects.select_for_update(of=("self",)),
-            pk=state.pk,
-        )
-
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        # One transaction, so the row and the outbox entry it schedules commit together.
-        with transaction.atomic():
-            state = self.lock_state_for_accept(state)
-            blocker = self.push_blocker(state)
-            if blocker:
-                messages.error(request, f"Cannot accept {state}: {blocker}")
-                return redirect(_device_nso_tab_url(state.management.device_id))
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        from .intent_state import footprint_for_instance, intent_transaction
+
+        blocker = self.push_blocker(state)
+        if blocker:
+            messages.error(request, f"Cannot accept {state}: {blocker}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
+        footprint = footprint_for_instance(state)
+        try:
+            with intent_transaction(footprint):
+                state = get_object_or_404(self.model_class, pk=state.pk)
+                blocker = self.push_blocker(state)
+                if blocker:
+                    raise _IntentTransactionNoOp(blocker)
+                state.status = _status_after_accept(state.status)
+                state.accepted_at = timezone.now()
+                state.save(update_fields=["status", "accepted_at"])
+        except _IntentTransactionNoOp as exc:
+            messages.error(request, f"Cannot accept {state}: {exc.result}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -6346,11 +6593,18 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
+        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+        footprint = MutationFootprint.merge(
+            footprint_for_instance(state),
+            footprint_for_instance(state.interface),
+        )
         # One transaction, so the native adoption, the row and the outbox entry it
         # schedules commit together.
-        with transaction.atomic():
+        with intent_transaction(footprint):
+            state = get_object_or_404(self.model_class, pk=state.pk)
+            state.status = _status_after_accept(state.status)
+            state.accepted_at = timezone.now()
             if state.l2_mtu is not None:
                 iface = state.interface
                 clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
@@ -6393,6 +6647,7 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         from ipam.models import VLANGroup
 
+        from .intent_state import RendererTargetsChanged
         from .vlan_reconciler import VLANRescopeConflict, rescope_vlan
 
         state = get_object_or_404(NSOVLANState, pk=pk)
@@ -6400,7 +6655,8 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
         device_id = state.management.device_id
         try:
             action, vlan = rescope_vlan(state, group)
-        except VLANRescopeConflict:
+        # A device that starts rendering the source VLAN during acquisition is the same refusal.
+        except (VLANRescopeConflict, RendererTargetsChanged):
             messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
             return redirect(_device_nso_tab_url(device_id))
         if action == "noop":
@@ -6488,8 +6744,6 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             )
 
         with transaction.atomic():
-            from .apply_state import mark_explicit_accept
-
             state, created = NSORoutePolicyState.objects.get_or_create(
                 management=mgmt,
                 family=family,
@@ -6507,7 +6761,6 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             state.content_type = ct
             state.object_id = obj.pk
             state.last_sync_at = timezone.now()
-            mark_explicit_accept(state)
             state.save()  # → _on_route_policy_state_save schedules the push
             cascade = None
             if family == "route_map":
@@ -6769,35 +7022,31 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         except (TypeError, ValueError):
             messages.error(request, "Select a valid VLAN.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
-        with transaction.atomic():
-            from .apply_state import (
-                lock_device_intent_transaction,
-                lock_device_vlan_membership_transaction,
-                lock_vlan_intent_transaction,
-                lock_vlan_membership_transaction,
-                mark_explicit_accept,
-            )
+        if not VLAN.objects.filter(pk=vlan_id).exists():
+            messages.error(request, "The selected VLAN is no longer available.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
+        from .intent_state import intent_transaction, vlan_footprint
 
-            lock_device_vlan_membership_transaction(mgmt.device_id)
-            lock_vlan_membership_transaction(vlan_id)
-            lock_vlan_intent_transaction(vlan_id)
-            vlan = VLAN.objects.select_for_update(of=("self",)).filter(pk=vlan_id).first()
-            if vlan is None:
-                messages.error(request, "The selected VLAN is no longer available.")
-                return redirect(_device_nso_tab_url(mgmt.device_id))
-            lock_device_intent_transaction(mgmt.device_id)
+        footprint = vlan_footprint(vlan_id, ("vlan",), extra_device_ids=(mgmt.device_id,))
+        try:
+            with intent_transaction(footprint):
+                vlan = VLAN.objects.filter(pk=vlan_id).first()
+                if vlan is None:
+                    raise _IntentTransactionNoOp
 
-            state, created = NSOVLANState.objects.get_or_create(
-                management=mgmt,
-                vlan=vlan,
-                defaults={"status": "accepted", "accepted_at": timezone.now()},
-            )
-            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-                state.status = "accepted"
-                state.accepted_at = timezone.now()
-            state.last_sync_at = timezone.now()
-            mark_explicit_accept(state)
-            state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+                state, created = NSOVLANState.objects.get_or_create(
+                    management=mgmt,
+                    vlan=vlan,
+                    defaults={"status": "accepted", "accepted_at": timezone.now()},
+                )
+                if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+                    state.status = "accepted"
+                    state.accepted_at = timezone.now()
+                state.last_sync_at = timezone.now()
+                state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
+        except _IntentTransactionNoOp:
+            messages.error(request, "The selected VLAN is no longer available.")
+            return redirect(_device_nso_tab_url(mgmt.device_id))
         messages.success(
             request, f"Attached VLAN {vlan.vid} ({vlan.name or '—'}) to {mgmt.device.name} — Apply to write it."
         )

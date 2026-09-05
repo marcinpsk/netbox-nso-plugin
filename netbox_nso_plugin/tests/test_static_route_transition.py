@@ -14,7 +14,7 @@ import threading
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.db import connection, transaction
+from django.db import connection, connections, transaction
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
@@ -125,8 +125,9 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         put.assert_called_once()
         self.assertEqual(put.call_args.args[1][0]["metric"], 7)
 
-    def test_a_suppressed_save_and_a_no_delta_save_do_nothing(self):
-        """P2.5 — reconcile writes are not intent, and neither is an edit the wire never carries."""
+    def test_a_suppressed_content_save_is_refused_and_a_no_delta_save_does_nothing(self):
+        """Suppression cannot hide rendered changes, and labels do not reach the wire."""
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.signals import suppress_intent_push
 
         with _fixtures():
@@ -135,14 +136,16 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         before = state.intent_generation
 
         with patch(PUT) as put, self.captureOnCommitCallbacks(execute=True):
-            with suppress_intent_push():
-                sr.next_hop = "10.0.0.9"
-                sr.save()
+            with self.assertRaisesRegex(IntentMutationProtocolError, "changes rendered content"):
+                with suppress_intent_push():
+                    sr.next_hop = "10.0.0.9"
+                    sr.save()
         state.refresh_from_db()
         self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.intent_generation, before)
         put.assert_not_called()
 
+        sr.refresh_from_db()
         with patch(PUT) as put, self.captureOnCommitCallbacks(execute=True):
             sr.name = "renamed"  # never reaches the wire
             sr.save()
@@ -360,37 +363,36 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         """Committing the status ahead of the generation leaves a window in which a concurrent
         Apply force-pushes the freshly accepted row on the generation the *last* apply named,
         and moves it to deploying — after which the arming pass no longer matches it."""
-        from django.db import connections
-        from django.db.models import QuerySet
-
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         state = self._drifted(1)[0]
         stale_generation = state.intent_generation
-        original, observed = QuerySet.update, []
+        observed = []
 
-        def _observe(pk):
+        def _observe_committed_push(_adapter_device_id, _routes):
+            alias = "static_route_observer"
+            connections[alias] = connection.copy(alias=alias)
+            observer = connections[alias]
             try:
-                row = NSOStaticRouteState.objects.get(pk=pk)
-                observed.append((row.status, row.intent_generation))
+                table = observer.ops.quote_name(NSOStaticRouteState._meta.db_table)
+                with observer.cursor() as cursor:
+                    cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
+                        f"SELECT status, intent_generation FROM {table} WHERE id = %s",
+                        [state.pk],
+                    )
+                    observed.append(cursor.fetchone())
             finally:
-                connections.close_all()
+                observer.close()
+                del connections[alias]
+            return {}
 
-        def _update_then_observe(self, **kwargs):
-            result = original(self, **kwargs)
-            if kwargs.get("status") == "accepted":
-                # A second connection: it sees only what has been COMMITTED so far.
-                watcher = threading.Thread(target=_observe, args=(state.pk,))
-                watcher.start()
-                watcher.join(timeout=30)
-            return result
-
-        with patch(PUT), patch.object(QuerySet, "update", _update_then_observe):
+        with patch(PUT, side_effect=_observe_committed_push):
             response = self._post()
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(len(observed), 1)
-        self.assertNotEqual(observed[0], ("accepted", stale_generation))
+        self.assertEqual(observed[0][0], "accepted")
+        self.assertGreater(observed[0][1], stale_generation)
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
         self.assertGreater(state.intent_generation, stale_generation)
@@ -398,22 +400,23 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
     def test_a_row_a_reconcile_moved_on_is_not_clobbered_by_the_captured_pks(self):
         """Selecting by pk alone drops the status predicate the original UPDATE carried, so a
         row a background reconcile has already re-classified is overwritten with `accepted`."""
-        from django.db.models import QuerySet
+        import contextlib
 
-        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.tests._outbox_case import mirror_update
 
         state = self._drifted(1)[0]
-        original, injected = QuerySet.update, []
+        original, injected = intent_state.intent_transaction, []
 
-        def _reclassify_then_update(self, **kwargs):
-            # The accept UPDATE only: the imported -> in_sync pass runs first, and injecting
-            # there lands outside the window this pin is about.
-            if not injected and kwargs.get("status") == "accepted":
+        @contextlib.contextmanager
+        def _reclassify_then_lock(footprint):
+            if not injected:
                 injected.append(True)
-                original(NSOStaticRouteState.objects.filter(pk=state.pk), status="imported")
-            return original(self, **kwargs)
+                mirror_update(state, status="imported")
+            with original(footprint) as permit:
+                yield permit
 
-        with patch(PUT), patch.object(QuerySet, "update", _reclassify_then_update):
+        with patch(PUT), patch("netbox_nso_plugin.intent_state.intent_transaction", _reclassify_then_lock):
             response = self._post()
 
         self.assertEqual(response.status_code, 302)
@@ -607,9 +610,10 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
                 with transaction.atomic():
                     row = StaticRoute.objects.get(pk=sr.pk)
                     row.next_hop = next_hop
+                    row.save(update_fields=["next_hop"])
+                    # Release the main thread only now: the row lock pre_save took is held.
                     if before is not None:
                         before.set()
-                    row.save(update_fields=["next_hop"])
                     if after is not None:
                         after.wait(timeout=30)
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed

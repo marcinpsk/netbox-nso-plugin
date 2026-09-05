@@ -19,12 +19,14 @@ test transaction would make every device report the refusal as a rejection.
 from __future__ import annotations
 
 import contextlib
+import threading
 from io import StringIO
 from unittest.mock import patch
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.core.management import CommandError, call_command
-from django.db import transaction
+from django.db import connection, transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import without_commit_drain
@@ -70,16 +72,17 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
+
+        from ._static_route_case import _assign_without_push
 
         with _quiet_fixture(), transaction.atomic():
             sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
-            with suppress_intent_push():
-                sr.devices.add(mgmt.device)
+            _assign_without_push(sr, mgmt.device)
             return NSOStaticRouteState.objects.create(
                 management=mgmt,
                 static_route=sr,
                 status=status,
+                apply_attempt_id=uuid4() if status == "deploying" else None,
                 nso_prefix=prefix,
                 nso_next_hop=next_hop,
                 accepted_at=timezone.now(),
@@ -409,7 +412,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
         from netbox_nso_plugin.intent_generation import UNALLOCATED
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.signals import suppress_intent_push
+
+        from ._static_route_case import _assign_without_push
 
         _, mgmt = self._managed_device("ifacenh", 8105)
         carried = self._own_route(mgmt, "10.77.0.0/16", "10.0.0.78")
@@ -417,8 +421,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             iface_route = StaticRoute.objects.create(
                 prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
             )
-            with suppress_intent_push():
-                iface_route.devices.add(mgmt.device)
+            _assign_without_push(iface_route, mgmt.device)
             skipped = NSOStaticRouteState.objects.create(
                 management=mgmt,
                 static_route=iface_route,
@@ -444,6 +447,49 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
         assert skipped.generation_started_at is None
         assert results[0]["armed"] == 1
+
+    def test_a_route_that_becomes_unpushable_before_arming_stays_unallocated(self):
+        """Recheck push eligibility after the content footprint is acquired."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        _, mgmt = self._managed_device("arming-race", 8106)
+        row = self._own_route(mgmt, "198.18.32.0/24", "198.18.32.1")
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="static_route")
+        initial_revision = revision.revision
+        revision_before_arming: list[int] = []
+        real_intent_transaction = intent_state.intent_transaction
+
+        @contextlib.contextmanager
+        def make_route_unpushable(footprint):
+            from netbox_nso_plugin.signals import suppress_intent_push
+
+            route = StaticRoute.objects.get(pk=row.static_route_id)
+            route_footprint = intent_state.footprint_for_instance(route)
+            with without_commit_drain(), suppress_intent_push(), real_intent_transaction(route_footprint):
+                route.next_hop = None
+                route.interface_next_hop = "Ethernet1/1"
+                route.save(update_fields=["next_hop", "interface_next_hop"])
+            revision.refresh_from_db()
+            revision_before_arming.append(revision.revision)
+            with real_intent_transaction(footprint):
+                yield
+
+        with patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=make_route_unpushable):
+            armed = _backfill_static_route_generations(mgmt)
+
+        row.refresh_from_db()
+        self.assertEqual(armed, [])
+        self.assertEqual(row.intent_generation, UNALLOCATED)
+        self.assertIsNone(row.generation_started_at)
+        self.assertEqual(len(revision_before_arming), 1)
+        self.assertGreater(revision_before_arming[0], initial_revision)
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, revision_before_arming[0])
 
     def test_a_rejected_push_keeps_its_reason_on_the_device(self):
         """Codex S6 P2 — the rollback undoes the arming, and must not undo the diagnosis.
@@ -532,6 +578,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         def _edit_then_refuse(adapter_device_id, routes):
             """Re-accept the row on the sender's own connection, then answer unacknowledged."""
+            from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
             from netbox_nso_plugin.signals import (
                 _STATIC_ROUTE_ARMED_FIELDS,
                 _arm_static_route_generation,
@@ -539,7 +586,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             )
 
             live = NSOStaticRouteState.objects.get(pk=row.pk)
-            with suppress_intent_push():
+            with suppress_intent_push(), intent_transaction(footprint_for_instance(live)):
                 _arm_static_route_generation(live)
                 live.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
             edited["generation"] = live.intent_generation
@@ -565,13 +612,24 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         armed_generations: dict[int, int] = {}
 
         def _change_statuses_then_refuse(adapter_device_id, routes):
+            from netbox_nso_plugin.intent_state import mirror_refresh
+            from netbox_nso_plugin.signals import suppress_intent_push
+
             armed_generations.update(
                 NSOStaticRouteState.objects.filter(pk__in=(deploying.pk, in_sync.pk)).values_list(
                     "pk", "intent_generation"
                 )
             )
-            NSOStaticRouteState.objects.filter(pk=deploying.pk).update(status="deploying")
-            NSOStaticRouteState.objects.filter(pk=in_sync.pk).update(status="in_sync")
+            for row, status in ((deploying, "deploying"), (in_sync, "in_sync")):
+                current = NSOStaticRouteState.objects.get(pk=row.pk)
+                fields = {"status"}
+                if status == "deploying":
+                    fields.add("apply_attempt_id")
+                with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
+                    locked.status = status
+                    if status == "deploying":
+                        locked.apply_attempt_id = uuid4()
+                    locked.save(update_fields=fields)
 
         with patch(
             "netbox_nso_plugin.adapter_client.put_static_route_intent",
@@ -587,6 +645,120 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert results[0]["ok"] is False
         assert results[0]["armed_rolled_back"] == 0
 
+    def test_a_concurrent_status_change_before_restore_does_not_advance_revision(self):
+        """A restore skipped after acquisition leaves the intent revision unchanged."""
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_drift import (
+            _backfill_static_route_generations,
+            _restore_static_route_generations,
+        )
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
+
+        _, mgmt = self._managed_device("restore-race", 8111)
+        row = self._own_route(mgmt, "198.18.33.0/24", "198.18.33.1")
+        snapshots = _backfill_static_route_generations(mgmt)
+        revision_keys = intent_state.footprint_for_instance(row).revision_keys
+        self.assertEqual(revision_keys, ((mgmt.device_id, "static_route"),))
+        revision_key = revision_keys[0]
+        revision = NSOIntentRevision.objects.get(device_id=revision_key[0], scope=revision_key[1])
+        before = revision.revision
+        candidate_loaded = threading.Barrier(2, timeout=30)
+        row_changed = threading.Barrier(2, timeout=30)
+        errors: list[BaseException] = []
+        candidate_query_seen = False
+
+        def wait_after_candidate_query(execute, sql, params, many, context):
+            nonlocal candidate_query_seen
+            result = execute(sql, params, many, context)
+            if not candidate_query_seen and NSOStaticRouteState._meta.db_table in sql:
+                candidate_query_seen = True
+                candidate_loaded.wait()
+                row_changed.wait()
+            return result
+
+        def settle_row():
+            try:
+                candidate_loaded.wait()
+                current = NSOStaticRouteState.objects.get(pk=row.pk)
+                intent_state.update_mirror_fields(current, status="in_sync")
+                row_changed.wait()
+            except BaseException as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+                row_changed.abort()
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=settle_row)
+        worker.start()
+        with connection.execute_wrapper(wait_after_candidate_query):
+            restored = _restore_static_route_generations(snapshots)
+        worker.join(timeout=60)
+
+        assert not worker.is_alive(), "concurrent status writer did not finish"
+        assert errors == []
+        assert candidate_query_seen
+        assert restored == 0
+        row.refresh_from_db()
+        revision.refresh_from_db()
+        assert row.status == "in_sync"
+        assert row.intent_generation == snapshots[0]["armed_generation"]
+        assert revision.revision == before, "a skipped restore committed an intent revision"
+
+    def test_a_concurrent_delete_does_not_stop_later_snapshot_restores(self):
+        """A deleted candidate is a no-op, so later snapshots still restore."""
+        from netbox_nso_plugin.intent_drift import _backfill_static_route_generations, _safe_restore
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        _, mgmt = self._managed_device("restore-delete-race", 8112)
+        self._own_route(mgmt, "198.18.34.0/24", "198.18.34.1")
+        self._own_route(mgmt, "198.18.35.0/24", "198.18.35.1")
+        snapshots = _backfill_static_route_generations(mgmt)
+        first_pk = snapshots[0]["pk"]
+        second_pk = snapshots[1]["pk"]
+        candidate_loaded = threading.Barrier(2, timeout=30)
+        row_deleted = threading.Barrier(2, timeout=30)
+        errors: list[BaseException] = []
+        candidate_query_seen = False
+
+        def wait_after_first_candidate_query(execute, sql, params, many, context):
+            nonlocal candidate_query_seen
+            result = execute(sql, params, many, context)
+            if not candidate_query_seen and NSOStaticRouteState._meta.db_table in sql:
+                candidate_query_seen = True
+                candidate_loaded.wait()
+                row_deleted.wait()
+            return result
+
+        def delete_first_row():
+            try:
+                candidate_loaded.wait()
+                current = NSOStaticRouteState.objects.get(pk=first_pk)
+                with without_commit_drain(), intent_transaction(footprint_for_instance(current)):
+                    current.delete()
+                row_deleted.wait()
+            except BaseException as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+                row_deleted.abort()
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=delete_first_row)
+        worker.start()
+        with connection.execute_wrapper(wait_after_first_candidate_query):
+            restored, unrestored = _safe_restore(snapshots, mgmt.device_id)
+        worker.join(timeout=60)
+
+        assert not worker.is_alive(), "concurrent row deletion did not finish"
+        assert errors == []
+        assert candidate_query_seen
+        assert restored == 1
+        assert [snapshot["pk"] for snapshot in unrestored] == [first_pk]
+        assert not NSOStaticRouteState.objects.filter(pk=first_pk).exists()
+        second = NSOStaticRouteState.objects.get(pk=second_pk)
+        assert second.intent_generation == UNALLOCATED
+
     def test_partial_restore_reports_the_row_left_armed(self):
         """A compare-and-set miss stays in the failed result's armed subset."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
@@ -599,10 +771,16 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         armed_generation: dict[str, int] = {}
 
         def _move_one_then_refuse(adapter_device_id, routes):
+            from netbox_nso_plugin.intent_state import mirror_refresh
+            from netbox_nso_plugin.signals import suppress_intent_push
+
             armed_generation["moved"] = NSOStaticRouteState.objects.values_list("intent_generation", flat=True).get(
                 pk=moved.pk
             )
-            NSOStaticRouteState.objects.filter(pk=moved.pk).update(status="in_sync")
+            current = NSOStaticRouteState.objects.get(pk=moved.pk)
+            with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, {"status"}) as locked:
+                locked.status = "in_sync"
+                locked.save(update_fields=["status"])
 
         with patch(
             "netbox_nso_plugin.adapter_client.put_static_route_intent",

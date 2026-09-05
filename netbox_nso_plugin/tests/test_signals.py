@@ -10,16 +10,73 @@ instances plus a sys.modules-injected fake `models` module, which bypassed exact
 queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.test import RequestFactory, TestCase
+from django.db import connections
+from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
-from .mixins import IntentPushDeliveryMixin
+from ._outbox_case import content_bulk_update, mirror_update
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
+
+
+class TestM2MPermitCleanup(IntentPushResetMixin, TestCase):
+    def test_a_failing_pre_action_handler_closes_its_implicit_permit(self):
+        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS, _begin_m2m_implicit
+        from netbox_nso_plugin.signals import _skip_on_render
+
+        manufacturer = Manufacturer.objects.create(name="M2M permit", slug="m2m-permit")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="M2M permit", slug="m2m-permit")
+        role = DeviceRole.objects.create(name="M2M permit", slug="m2m-permit")
+        site = Site.objects.create(name="M2M permit", slug="m2m-permit")
+        device = Device.objects.create(name="m2m-permit", device_type=device_type, role=role, site=site)
+        route = StaticRoute.objects.create(prefix="198.18.27.0/24", next_hop="198.18.0.27")
+        sender = StaticRoute.devices.through
+        details = {"pk_set": {device.pk}, "reverse": False, "model": Device}
+        _begin_m2m_implicit(sender, route, "pre_add", **details)
+
+        @_skip_on_render
+        def fail_pre_add(sender, instance, action, **kwargs):
+            raise RuntimeError("pre-add failure")
+
+        with self.assertRaisesRegex(RuntimeError, "pre-add failure"):
+            fail_pre_add(sender, route, "pre_add", **details)
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+        self.assertEqual(_IMPLICIT_PERMITS.get(), {})
+
+
+def _bulk_create_management_without_signals(rows):
+    from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+    rows = tuple(rows)
+    footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in rows))
+    with intent_transaction(footprint):
+        type(rows[0]).objects.bulk_create(rows)
+
+
+def _invoke_push_intent_on_accept(state):
+    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    from netbox_nso_plugin.signals import push_intent_on_accept
+
+    with intent_transaction(footprint_for_instance(state)):
+        push_intent_on_accept(sender=type(state), instance=state)
+
+
+def _invoke_interface_edit(interface):
+    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    from netbox_nso_plugin.signals import _push_intent_on_interface_edit
+
+    with intent_transaction(footprint_for_instance(interface)):
+        _push_intent_on_interface_edit(None, interface, created=False)
 
 
 class _SignalDBBase(IntentPushDeliveryMixin, TestCase):
@@ -67,7 +124,7 @@ class _SignalDBBase(IntentPushDeliveryMixin, TestCase):
         """
         from netbox_nso_plugin.models import NSODeviceManagement
 
-        NSODeviceManagement.objects.bulk_create(
+        _bulk_create_management_without_signals(
             [
                 NSODeviceManagement(
                     device=self.device,
@@ -97,87 +154,118 @@ class _SignalDBBase(IntentPushDeliveryMixin, TestCase):
         state = NSOInterfaceState.objects.create(
             interface=interface, attribute=attribute, status="imported", nso_value=nso_value
         )
-        NSOInterfaceState.objects.filter(pk=state.pk).update(status="accepted", accepted_at=now)
+        content_bulk_update(state, status="accepted", accepted_at=now)
         state.status = "accepted"
         state.accepted_at = now
         return state
 
 
-class TestDeferredSignalMarkers(_SignalDBBase):
-    def test_interface_post_init_does_not_load_a_deferred_name(self):
-        from dcim.models import Interface
+class TestUntrackedNativeDeleteIsNoOp(_SignalDBBase):
+    def test_untracked_isis_flex_algo_delete_changes_nothing(self):
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
 
-        with self.assertNumQueries(1):
-            interface = Interface.objects.only("pk").get(pk=self.iface.pk)
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
 
-        self.assertNotIn("_nso_loaded_interface_name", interface.__dict__)
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        self._make_mgmt(adapter_device_id=42)
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis_flex_algo")
+        before_revision = revision.revision
+        before_outbox = list(
+            NSOIntentOutboxEntry.objects.filter(device=self.device, scope="isis_flex_algo").values_list("pk", flat=True)
+        )
 
-    def test_overlay_post_init_does_not_load_a_deferred_status(self):
-        from ipam.models import VLAN
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            flex_algo.delete()
 
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.signals import suppress_intent_push
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before_revision)
+        self.assertEqual(
+            list(
+                NSOIntentOutboxEntry.objects.filter(device=self.device, scope="isis_flex_algo").values_list(
+                    "pk", flat=True
+                )
+            ),
+            before_outbox,
+        )
+        push.assert_not_called()
 
-        management = self._make_mgmt()
-        vlan = VLAN.objects.create(vid=409, name="deferred-status")
-        with suppress_intent_push():
-            state = NSOVLANState.objects.create(
-                management=management,
-                vlan=vlan,
-                device_name=vlan.name,
-                status="imported",
-            )
+    def test_untracked_isis_interface_delete_changes_nothing(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
 
-        with self.assertNumQueries(1):
-            deferred = NSOVLANState.objects.only("pk").get(pk=state.pk)
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
 
-        self.assertNotIn("_nso_loaded_status", deferred.__dict__)
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        isis_interface = ISISInterface.objects.create(
+            interface=self.iface,
+            address_family="ipv4",
+            instance=instance,
+        )
+        self._make_mgmt(adapter_device_id=42)
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
+        before_revision = revision.revision
+        before_outbox = list(
+            NSOIntentOutboxEntry.objects.filter(device=self.device, scope="isis").values_list("pk", flat=True)
+        )
 
-    def test_a_lazy_deferred_interface_name_cannot_overwrite_a_concurrent_rename(self):
-        from dcim.models import Interface
-        from django.db import transaction
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            isis_interface.delete()
 
-        from netbox_nso_plugin.apply_state import DeferredIntentFieldStale
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before_revision)
+        self.assertEqual(
+            list(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="isis").values_list("pk", flat=True)),
+            before_outbox,
+        )
+        push.assert_not_called()
 
-        self._make_mgmt()
-        self._accepted_state(self.iface, "description", nso_value=self.iface.description)
-        interface = Interface.objects.only("pk").get(pk=self.iface.pk)
-        self.assertEqual(interface.name, "GigabitEthernet0/0")
-        Interface.objects.filter(pk=self.iface.pk).update(name="GigabitEthernet0/1")
 
-        interface.description = "changed description"
-        with self.assertRaises(DeferredIntentFieldStale), transaction.atomic():
-            interface.save()
+class TestRekeyedNativeDelete(_SignalDBBase):
+    def test_rekeyed_isis_flex_algo_delete_removes_every_linked_overlay(self):
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
 
-        self.assertEqual(Interface.objects.get(pk=self.iface.pk).name, "GigabitEthernet0/1")
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
 
-    def test_a_lazy_deferred_overlay_status_cannot_overwrite_a_concurrent_transition(self):
-        from django.db import transaction
-        from ipam.models import VLAN
+        management = self._make_mgmt(adapter_device_id=42)
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=128)
+                flex_algo.algo_id = 129
+                flex_algo.save(update_fields=["algo_id"])
 
-        from netbox_nso_plugin.apply_state import DeferredIntentFieldStale
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.signals import suppress_intent_push
+        self.assertEqual(NSOISISFlexAlgoState.objects.filter(management=management).count(), 2)
+        flex_algo.delete()
 
-        management = self._make_mgmt()
-        vlan = VLAN.objects.create(vid=410, name="deferred-stale-status")
-        with suppress_intent_push():
-            state = NSOVLANState.objects.create(
-                management=management,
-                vlan=vlan,
-                device_name=vlan.name,
-                status="imported",
-            )
-        deferred = NSOVLANState.objects.only("pk").get(pk=state.pk)
-        self.assertEqual(deferred.status, "imported")
-        self.assertNotIn("_nso_loaded_status", deferred.__dict__)
-        NSOVLANState.objects.filter(pk=state.pk).update(status="accepted")
+        self.assertFalse(NSOISISFlexAlgoState.objects.filter(management=management).exists())
 
-        deferred.device_name = "changed device name"
-        with self.assertRaises(DeferredIntentFieldStale), transaction.atomic():
-            deferred.save()
+    def test_rekeyed_isis_interface_delete_removes_every_linked_overlay(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
 
-        self.assertEqual(NSOVLANState.objects.get(pk=state.pk).status, "accepted")
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        management = self._make_mgmt(adapter_device_id=42)
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                isis_interface = ISISInterface.objects.create(
+                    interface=self.iface,
+                    address_family="ipv4",
+                    instance=instance,
+                )
+                isis_interface.address_family = "ipv6"
+                isis_interface.save(update_fields=["address_family"])
+
+        self.assertEqual(NSOISISInterfaceState.objects.filter(management=management).count(), 2)
+        isis_interface.delete()
+
+        self.assertFalse(NSOISISInterfaceState.objects.filter(management=management).exists())
 
 
 class TestSyncScopeToAdapter(_SignalDBBase):
@@ -188,6 +276,20 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
         with self.captureOnCommitCallbacks(execute=True):
             sync_scope_to_adapter(sender=type(instance), instance=instance, created=created)
+
+    def test_intent_delivery_bookkeeping_does_not_resync_the_adapter_link(self):
+        from netbox_nso_plugin.signals import sync_scope_to_adapter
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        for field_name in ("intent_push_attempts", "intent_push_errors"):
+            with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                sync_scope_to_adapter(
+                    sender=type(mgmt),
+                    instance=mgmt,
+                    created=False,
+                    update_fields={field_name},
+                )
+            self.assertEqual(callbacks, [], field_name)
 
     def test_created_onboards_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=None)
@@ -218,8 +320,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
     def test_source_update_patches_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=7)
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, source_rekey_pending=True)
 
         with (
             patch(f"{_MOD}.patch_device", return_value={"source_epoch": 2}) as mock_patch,
@@ -254,8 +355,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
         mgmt = self._make_mgmt(adapter_device_id=7)
         NSOFamilyReadState.objects.create(management=mgmt, family="bfd", observed_outcome="ok")
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, source_rekey_pending=True)
 
         with (
             patch(f"{_MOD}.patch_device", side_effect=AdapterError("Device not found", code="not_found")),
@@ -280,8 +380,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         from netbox_nso_plugin.adapter_client import AdapterError
 
         mgmt = self._make_mgmt(adapter_device_id=7)
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, source_rekey_pending=True)
 
         with (
             patch(f"{_MOD}.patch_device", side_effect=AdapterError("adapter down", code="nso_unreachable")),
@@ -342,10 +441,8 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
     def test_source_update_without_epoch_preserves_floor_and_stays_fenced(self):
         mgmt = self._make_mgmt(adapter_device_id=7)
-        type(mgmt).objects.filter(pk=mgmt.pk).update(adapter_source_epoch=4, source_epoch_aware=True)
-        mgmt.refresh_from_db()
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, adapter_source_epoch=4, source_epoch_aware=True)
+        mirror_update(mgmt, source_rekey_pending=True)
 
         with (
             patch(f"{_MOD}.patch_device", return_value={}),
@@ -364,8 +461,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
 
         mgmt = self._make_mgmt(adapter_device_id=7)
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, source_rekey_pending=True)
         with patch(f"{_MOD}.patch_device", return_value={}):
             self._sync_scope(mgmt, created=False)
 
@@ -399,8 +495,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             publication_sequence=4,
             applied_publication_sequence=4,
         )
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, source_rekey_pending=True)
 
         with (
             patch(f"{_MOD}.patch_device", return_value={"source_epoch": 2}),
@@ -418,7 +513,8 @@ class TestSyncScopeToAdapter(_SignalDBBase):
     def test_committed_callback_rekeys_the_latest_source_tuple(self):
         mgmt = self._make_mgmt(adapter_device_id=7)
         stale = type(mgmt).objects.get(pk=mgmt.pk)
-        type(mgmt).objects.filter(pk=mgmt.pk).update(
+        content_bulk_update(
+            mgmt,
             nso_device_name="newer-source",
             source_rekey_pending=True,
         )
@@ -453,8 +549,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             publication_sequence=4,
             applied_publication_sequence=4,
         )
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
-        mgmt.source_rekey_pending = True
+        mirror_update(mgmt, source_rekey_pending=True)
 
         with patch(
             f"{_MOD}.patch_device",
@@ -472,7 +567,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
 
     def test_pending_source_rekey_is_retried_on_an_ordinary_save(self):
         mgmt = self._make_mgmt(adapter_device_id=7)
-        type(mgmt).objects.filter(pk=mgmt.pk).update(source_rekey_pending=True)
+        mirror_update(mgmt, source_rekey_pending=True)
         mgmt.refresh_from_db()
         mgmt._nso_source_changed = False
 
@@ -520,8 +615,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         so the tab's failure banner disappears."""
         mgmt = self._make_mgmt(adapter_device_id=None)
         # Simulate a leftover error from an earlier failed link attempt.
-        type(mgmt).objects.filter(pk=mgmt.pk).update(adapter_link_error="earlier failure")
-        mgmt.refresh_from_db()
+        mirror_update(mgmt, adapter_link_error="earlier failure")
 
         with (
             patch(f"{_MOD}.onboard_device", return_value={"id": 88}),
@@ -655,7 +749,6 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
     def test_skips_when_not_owned(self):
         from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
 
         self._make_mgmt(adapter_device_id=7)
         # status not in OWNED_STATES → not owned.
@@ -664,7 +757,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
         )
 
         with patch(f"{_MOD}.put_intent") as mock_put:
-            push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+            _invoke_push_intent_on_accept(state)
 
         mock_put.assert_not_called()
 
@@ -675,7 +768,6 @@ class TestPushIntentOnAccept(_SignalDBBase):
         from django.utils import timezone
 
         from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
 
         self._make_mgmt(adapter_device_id=7)
         state = NSOInterfaceState.objects.create(
@@ -688,20 +780,17 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
         mock_put.assert_not_called()
 
     def test_pushes_intent_on_accepted(self):
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
         mock_put.assert_called_once()
         adapter_id, attrs = mock_put.call_args[0]
@@ -714,16 +803,13 @@ class TestPushIntentOnAccept(_SignalDBBase):
     def test_pushes_enabled_attribute(self):
         from dcim.models import Interface
 
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
         self._make_mgmt(adapter_device_id=3)
         iface = Interface.objects.create(device=self.device, name="Loopback0", type="virtual", enabled=False)
         state = self._accepted_state(iface, "enabled", nso_value="true")
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
         attrs = mock_put.call_args[0][1]
         self.assertEqual(attrs[0]["intent_value"], "false")  # str(Interface.enabled).lower()
@@ -762,43 +848,34 @@ class TestPushIntentOnAccept(_SignalDBBase):
         self.assertEqual(attrs[0]["intent_value"], "uplink to spine")
 
     def test_skips_when_mgmt_does_not_exist(self):
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
         # No NSODeviceManagement for this device → NSODeviceManagement.objects.get raises.
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
         mock_put.assert_not_called()
 
     def test_skips_when_adapter_id_none(self):
         """A management row without an adapter_device_id yet → nothing to push to."""
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
         self._make_mgmt(adapter_device_id=None)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
         mock_put.assert_not_called()
 
     def test_skips_unknown_attribute(self):
         """An owned state with an attribute outside (description, enabled) is dropped."""
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "mtu", nso_value="1500")
 
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
         # put_intent is still called, but the unknown attribute was filtered out.
         attrs = mock_put.call_args[0][1]
@@ -807,8 +884,6 @@ class TestPushIntentOnAccept(_SignalDBBase):
     def test_put_intent_error_is_swallowed(self):
         """put_intent raising AdapterError is caught and logged, not propagated."""
         from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
 
         self._make_mgmt(adapter_device_id=3)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
@@ -816,7 +891,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
         with patch(f"{_MOD}.put_intent", side_effect=AdapterError("down", code="nso_unreachable")):
             with self.captureOnCommitCallbacks(execute=True):
                 # Should not raise — a warning is logged instead.
-                push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                _invoke_push_intent_on_accept(state)
 
 
 class TestSkipOnRenderGuard(_SignalDBBase):
@@ -832,9 +907,6 @@ class TestSkipOnRenderGuard(_SignalDBBase):
         """Drive push_intent_on_accept with current_request set to a real GET/POST/None."""
         from netbox.context import current_request
 
-        from netbox_nso_plugin.models import NSOInterfaceState
-        from netbox_nso_plugin.signals import push_intent_on_accept
-
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
@@ -843,7 +915,7 @@ class TestSkipOnRenderGuard(_SignalDBBase):
         try:
             with patch(f"{_MOD}.put_intent") as mock_put:
                 with self.captureOnCommitCallbacks(execute=True):
-                    push_intent_on_accept(sender=NSOInterfaceState, instance=state)
+                    _invoke_push_intent_on_accept(state)
                 return mock_put
         finally:
             current_request.reset(token)
@@ -894,7 +966,7 @@ try:
             nso_instance = NSOInstance.objects.create(name="IpSigNSO", adapter_instance_id="nso-ipsig")
 
             # Bypass sync_scope_to_adapter signal
-            NSODeviceManagement.objects.bulk_create(
+            _bulk_create_management_without_signals(
                 [
                     NSODeviceManagement(
                         device=cls.device,
@@ -1011,10 +1083,17 @@ try:
                 interface=self.iface, address="10.2.0.1/24", vrf="", status="imported", family="ipv4"
             )
 
-            with self.captureOnCommitCallbacks(execute=True), suppress_intent_push():
-                IPAddress.objects.create(
-                    address="10.2.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
-                )
+            address = IPAddress(
+                address="10.2.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
+            )
+            from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+            with (
+                self.captureOnCommitCallbacks(execute=True),
+                suppress_intent_push(),
+                intent_transaction(footprint_for_instance(address)),
+            ):
+                address.save()
 
             state = NSOInterfaceIPState.objects.get(interface=self.iface, address="10.2.0.1/24", vrf="")
             self.assertEqual(state.status, "imported", "suppressed IP save must not force-promote to accepted")
@@ -1091,7 +1170,7 @@ try:
             cls.device = Device.objects.create(name="gsig-router", device_type=dt, role=role, site=site)
             cls.iface = Interface.objects.create(device=cls.device, name="GigabitEthernet0/0", type="1000base-t")
             inst = NSOInstance.objects.create(name="GsigNSO", adapter_instance_id="nso-gsig")
-            NSODeviceManagement.objects.bulk_create(
+            _bulk_create_management_without_signals(
                 [
                     NSODeviceManagement(
                         device=cls.device,
@@ -1118,8 +1197,6 @@ try:
             """
             from netbox.context import current_request
 
-            from netbox_nso_plugin.signals import _push_intent_on_interface_edit
-
             req = RequestFactory().post("/", headers=header) if header is not None else None
             # Simulate the pre_save snapshot: operator changed the description,
             # left enabled untouched.
@@ -1128,7 +1205,7 @@ try:
             try:
                 with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
                     with self.captureOnCommitCallbacks(execute=True):
-                        _push_intent_on_interface_edit(None, self.iface, created=False)
+                        _invoke_interface_edit(self.iface)
                     return mock_put
             finally:
                 current_request.reset(token)
@@ -1163,7 +1240,6 @@ try:
             from netbox.context import current_request
 
             from netbox_nso_plugin.models import NSOInterfaceState
-            from netbox_nso_plugin.signals import _push_intent_on_interface_edit
 
             enabled_state = NSOInterfaceState.objects.create(
                 interface=self.iface, attribute="enabled", status="imported", nso_value="True"
@@ -1174,7 +1250,7 @@ try:
             try:
                 with patch("netbox_nso_plugin.adapter_client.put_intent"):
                     with self.captureOnCommitCallbacks(execute=True):
-                        _push_intent_on_interface_edit(None, self.iface, created=False)
+                        _invoke_interface_edit(self.iface)
             finally:
                 current_request.reset(token)
 
@@ -1200,7 +1276,7 @@ try:
             cls.device = Device.objects.create(name="ospf-gf-rtr", device_type=dt, role=role, site=site)
             cls.iface = Interface.objects.create(device=cls.device, name="LAG99:99", type="virtual")
             nso_inst = NSOInstance.objects.create(name="OspfGfNSO", adapter_instance_id="nso-ospfgf")
-            NSODeviceManagement.objects.bulk_create(
+            _bulk_create_management_without_signals(
                 [
                     NSODeviceManagement(
                         device=cls.device,
@@ -1823,10 +1899,19 @@ class TestDeleteOriginMarking(_SignalDBBase):
         from netbox_nso_plugin.models import NSOSVIState
 
         vlan = VLAN.objects.create(vid=444, name="do-v444")
-        with self._arranged():
-            return NSOSVIState.objects.create(
-                management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
-            )
+        state = NSOSVIState(management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted")
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with self._arranged(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+        return state
+
+    @staticmethod
+    def _static_route_assignment_footprint(route, device_id):
+        """The production M2M footprint for assigning *device_id* to *route*."""
+        from netbox_nso_plugin.intent_state import _static_route_devices_footprint
+
+        return _static_route_devices_footprint(route, "pre_add", {device_id}, False)
 
     def test_overlay_delete_push_is_marked_delete_origin(self):
         mgmt = self._mgmt()
@@ -1862,7 +1947,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
-        with self._arranged():
+        from netbox_nso_plugin.intent_state import intent_transaction
+
+        with self._arranged(), intent_transaction(self._static_route_assignment_footprint(route, mgmt.device_id)):
             route.devices.add(mgmt.device)
             NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
@@ -1892,7 +1979,13 @@ class TestDeleteOriginMarking(_SignalDBBase):
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-add", metric=1)
 
-        params = self._recorded_params(lambda: route.devices.add(mgmt.device))
+        from django.db import transaction
+
+        def assign():
+            with transaction.atomic():
+                route.devices.add(mgmt.device)
+
+        params = self._recorded_params(assign)
         self.assertTrue(params, "assigning the device must push the (grown) snapshot")
         self.assertFalse(
             any("delete_origin" in p for p in params),
@@ -1907,7 +2000,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-rm", metric=1)
-        with self._arranged():
+        from netbox_nso_plugin.intent_state import intent_transaction
+
+        with self._arranged(), intent_transaction(self._static_route_assignment_footprint(route, mgmt.device_id)):
             # The assignment handler is suppressed too, so the overlay is owned explicitly.
             route.devices.add(mgmt.device)
             _accept_static_route_for_device(route, mgmt.device)
@@ -1954,6 +2049,106 @@ class TestDeleteOriginMarking(_SignalDBBase):
         self._assert_teardown_touched_only_the_offboard(self._recorded_calls(mgmt.delete))
 
     def test_deleting_a_device_pushes_no_intent(self):
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin.models import NSOSVIState
+
         mgmt = self._mgmt()
         self._owned_svi(mgmt)
-        self._assert_teardown_touched_only_the_offboard(self._recorded_calls(self.device.delete))
+        origins = []
+
+        def capture_origin(sender, origin, **kwargs):
+            origins.append(origin)
+
+        pre_delete.connect(capture_origin, sender=NSOSVIState, weak=False)
+        try:
+            calls = self._recorded_calls(self.device.delete)
+        finally:
+            pre_delete.disconnect(capture_origin, sender=NSOSVIState)
+
+        self.assertEqual(origins, [self.device])
+        self._assert_teardown_touched_only_the_offboard(calls)
+
+
+class TestSourceRekeyLocksOnlyItsManagementRow(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The rekey's first locking read joins NSOInstance, and a bare FOR UPDATE locks every
+    joined table, so it also held the instance row that every managed device shares.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from ._outbox_case import make_managed, mirror_update
+
+        self.device, self.mgmt = make_managed("rekeylock", 8801)
+        mirror_update(self.mgmt, source_rekey_pending=True)
+        self.mgmt.refresh_from_db()
+
+    def _can_lock(self, table, pk):
+        """Whether a second connection can take that row now, without waiting for the rekey."""
+        from django.db import connection
+        from django.db.utils import OperationalError
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT 1 FROM {table} WHERE id = %s FOR UPDATE NOWAIT", [pk])
+                cursor.fetchone()
+        except OperationalError:
+            return False
+        return True
+
+    def test_the_rekey_leaves_the_shared_nso_instance_row_lockable(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        held = threading.Event()
+        release = threading.Event()
+        failures: list[BaseException] = []
+        probes: dict[str, bool] = {}
+
+        def hold_the_first_locking_read(execute, sql, params, many, context):
+            # Only the rekey's first query joins the instance table into a locking read.
+            if held.is_set() or "FOR UPDATE" not in sql or NSOInstance._meta.db_table not in sql:
+                return execute(sql, params, many, context)
+            rows = execute(sql, params, many, context)
+            held.set()
+            assert release.wait(timeout=30), "the rekey hold was never released"
+            return rows
+
+        def rekey():
+            try:
+                # No test transaction here, so the handler's on_commit callback runs at once.
+                with connections["default"].execute_wrapper(hold_the_first_locking_read):
+                    signals.sync_scope_to_adapter(sender=NSODeviceManagement, instance=self.mgmt, created=False)
+            except BaseException as exc:  # noqa: BLE001 (re-raised on the caller's thread)
+                failures.append(exc)
+            finally:
+                held.set()
+                connections.close_all()
+
+        with (
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 9}) as mock_patch,
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+            patch(f"{_MOD}.onboard_device") as mock_onboard,
+        ):
+            worker = threading.Thread(target=rekey, name="source-rekey")
+            worker.start()
+            self.addCleanup(worker.join, 30)
+            self.addCleanup(release.set)
+            assert held.wait(timeout=30), failures
+            try:
+                probes["instance"] = self._can_lock(NSOInstance._meta.db_table, self.mgmt.nso_instance_id)
+                probes["management"] = self._can_lock(NSODeviceManagement._meta.db_table, self.mgmt.pk)
+            finally:
+                release.set()
+            worker.join(timeout=30)
+
+        assert not worker.is_alive(), "the rekey never finished"
+        assert not failures, failures
+        self.assertTrue(probes["instance"], "the rekey locked the NSOInstance row every device shares")
+        self.assertFalse(probes["management"], "the rekey did not hold its own management row")
+        mock_patch.assert_called_once()
+        mock_onboard.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_source_epoch, 9)
+        self.assertFalse(self.mgmt.source_rekey_pending)

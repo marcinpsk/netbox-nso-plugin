@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+import uuid
+
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
@@ -329,20 +331,38 @@ class NSOInstance(NetBoxModel):
         """
         from django.db import transaction
 
+        from .intent_state import MutationFootprint, SourceRow, intent_transaction
+
         with transaction.atomic():
-            # Lock the other default rows so concurrent saves serialize on the default check:
-            # without this, two concurrent non-default creates both see "no default", both force
-            # themselves default, then each clears the other → zero defaults (get_default()→None).
-            # (Re-query fresh in each spot: on a create self.pk is None until super().save(), so a
-            # single captured queryset would exclude the wrong row and clear its own flag.)
-            other_defaults = NSOInstance.objects.select_for_update().filter(is_default=True).exclude(pk=self.pk)
-            # If no other default exists (e.g. this is the first instance), force this one to be
-            # the default so onboarding always has something to pre-select.
-            if not other_defaults.exists():
-                self.is_default = True
-            super().save(*args, **kwargs)
-            if self.is_default:
-                NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
+            default_ids = frozenset(
+                NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
+            )
+            footprint = MutationFootprint.for_keys(
+                (),
+                shared_keys=(("nso-instance-default", "singleton"),),
+                source_rows=(
+                    SourceRow(self._meta.label_lower, self.pk),
+                    *(SourceRow(self._meta.label_lower, pk) for pk in default_ids),
+                ),
+            )
+            with intent_transaction(footprint):
+                current_default_ids = frozenset(
+                    NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
+                )
+                if current_default_ids != default_ids:
+                    from .intent_state import IntentMutationProtocolError
+
+                    raise IntentMutationProtocolError("the NSO instance default set changed during acquisition")
+                # The shared key serializes the default check. The source rows lock the
+                # existing default instances before the write.
+                other_defaults = NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk)
+                # If no other default exists (e.g. this is the first instance), force this one to be
+                # the default so onboarding always has something to pre-select.
+                if not other_defaults.exists():
+                    self.is_default = True
+                super().save(*args, **kwargs)
+                if self.is_default:
+                    NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
 
 
 class NSOPlatformNedMapping(NetBoxModel):
@@ -462,8 +482,8 @@ class NSODeviceManagement(NetBoxModel):
     auto_apply = models.BooleanField(
         default=False,
         help_text=(
-            "When True, every accept of a value on this device enqueues an apply job "
-            "on the adapter. Disabled by default so brownfield devices are brought into "
+            "When True, every accepted value on this device starts Apply automatically. "
+            "Disabled by default so brownfield devices are brought into "
             "management one cautious push at a time."
         ),
     )
@@ -653,7 +673,8 @@ class NSODeviceManagement(NetBoxModel):
         them deliberately, holding this same row lock.
         """
         if kwargs.get("update_fields") is not None or not self.pk:
-            return super().save(*args, **kwargs)
+            with transaction.atomic():
+                return super().save(*args, **kwargs)
         protected = self._STALE_SAVE_PROTECTED_FIELDS
         with transaction.atomic():
             current = type(self).objects.select_for_update().filter(pk=self.pk).values(*protected).first()
@@ -862,6 +883,14 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
         ("error", "Error"),
         ("conflict", "Conflict"),  # address already assigned elsewhere in NetBox
     ]
+    ALLOCATION_KIND_MANUAL = "manual"
+    ALLOCATION_KIND_SINGLE = "single"
+    ALLOCATION_KIND_P2P = "p2p"
+    ALLOCATION_KIND_CHOICES = [
+        (ALLOCATION_KIND_MANUAL, "Manual"),
+        (ALLOCATION_KIND_SINGLE, "Auto-assigned single address"),
+        (ALLOCATION_KIND_P2P, "Auto-assigned P2P pair"),
+    ]
 
     interface = models.ForeignKey(
         to="dcim.Interface",
@@ -909,6 +938,12 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
     auto_assigned = models.BooleanField(
         default=False,
         help_text="True when this address was minted by the IP auto-assignment engine.",
+    )
+    allocation_kind = models.CharField(
+        max_length=16,
+        choices=ALLOCATION_KIND_CHOICES,
+        default=ALLOCATION_KIND_MANUAL,
+        help_text="The allocation shape that owns cleanup of the source pool.",
     )
     source_pool = models.ForeignKey(
         to="ipam.Prefix",
@@ -1286,8 +1321,21 @@ class NSOLoggingLevelState(NetBoxModel):
     )
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_loglvl_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_loglvl_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO Logging Level State"
         verbose_name_plural = "NSO Logging Level States"
 
@@ -1348,6 +1396,7 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
     # ── #1396 R3: intent generation + the settlement expectation ────────────────
     # ``intent_generation`` is allocated from a database-global sequence
     # (:func:`~netbox_nso_plugin.intent_generation.allocate_intent_generation`) on every
@@ -1374,6 +1423,18 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
     class Meta:
         ordering = ["management", "static_route"]
         unique_together = [("management", "static_route")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_static_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_static_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO Static Route State"
         verbose_name_plural = "NSO Static Route States"
 
@@ -1435,10 +1496,23 @@ class NSOL2SapState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "service_name", "sap_id"]
         unique_together = [("management", "service_name", "sap_id")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_l2sap_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_l2sap_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO L2 SAP State"
         verbose_name_plural = "NSO L2 SAP States"
 
@@ -1837,6 +1911,7 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
     # community-list members this device's NED cannot hold (e.g. a wildcard color on
     # Nokia). The adapter reports them on intent push; they are surfaced as "unsupported
     # on <ned>" so an operator understands why an owned object may sit at "pending apply"
@@ -1847,6 +1922,18 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     class Meta:
         ordering = ["management", "family", "object_name"]
         unique_together = [("management", "family", "object_name")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_routepol_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_routepol_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO Route Policy State"
         verbose_name_plural = "NSO Route Policy States"
 
@@ -1856,8 +1943,9 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     @property
     def classification_mode(self) -> str:
         """MASTER (shared, the default) or LOCAL (per-device) classification of this group."""
-        row = NSORoutePolicyObjectClass.objects.filter(family=self.family, object_name=self.object_name).first()
-        return row.mode if row else "master"
+        from .route_policy_reconciler import _group_mode
+
+        return _group_mode(self.family, self.object_name)
 
 
 _ROUTE_POLICY_OBJECT_MODE_CHOICES = [
@@ -2223,10 +2311,23 @@ class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "vlan"]
         unique_together = [("management", "vlan")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_vlan_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_vlan_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO VLAN State"
         verbose_name_plural = "NSO VLAN States"
 
@@ -2306,10 +2407,23 @@ class NSOSVIState(NetBoxModel):
     )
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_svi_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_svi_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO SVI State"
         verbose_name_plural = "NSO SVI States"
 
@@ -2357,10 +2471,23 @@ class NSOSubinterfaceState(NetBoxModel):
     )
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_subif_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_subif_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO Subinterface State"
         verbose_name_plural = "NSO Subinterface States"
 
@@ -2408,10 +2535,23 @@ class NSOInterfaceMtuState(NetBoxModel):
     )
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_mtu_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_mtu_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO Interface MTU State"
         verbose_name_plural = "NSO Interface MTU States"
 
@@ -2447,10 +2587,23 @@ class NSOBFDInterfaceState(NetBoxModel):
     )
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
+        indexes = [
+            models.Index(
+                fields=["management", "status", "apply_attempt_id"],
+                name="nso_bfd_apply_lookup",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(status="deploying") | models.Q(apply_attempt_id__isnull=False),
+                name="nso_bfd_deploy_attempt",
+            )
+        ]
         verbose_name = "NSO BFD State"
         verbose_name_plural = "NSO BFD States"
 
@@ -2735,6 +2888,55 @@ class NSOLinkRoleAssignment(NetBoxModel):
 # fields would multiply the write cost of a bulk edit for records no operator browses.
 
 
+class NSOIntentRevision(models.Model):
+    """The durable content revision of one device delivery scope."""
+
+    device = models.ForeignKey(to="dcim.Device", on_delete=models.CASCADE, related_name="nso_intent_revisions")
+    scope = models.CharField(max_length=32)
+    revision = models.BigIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device", "scope"],
+                name="nso_intent_revision_key",
+            )
+        ]
+        ordering = ["device", "scope"]
+        verbose_name = "NSO Intent Revision"
+        verbose_name_plural = "NSO Intent Revisions"
+
+    def __str__(self):
+        return f"{self.device_id}/{self.scope} r{self.revision}"
+
+
+class NSOApplyAttempt(models.Model):
+    """One manual Apply identity and the exact request available for replay."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    management = models.ForeignKey(
+        to="NSODeviceManagement",
+        on_delete=models.CASCADE,
+        related_name="apply_attempts",
+    )
+    created_at = models.DateTimeField(db_default=Now())
+    adapter_device_id = models.BigIntegerField(null=True, blank=True)
+    scope_revisions = models.JSONField(default=dict, blank=True)
+    selected = models.JSONField(default=dict, blank=True)
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    response = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["management", "-created_at"], name="nso_apply_attempt_device")]
+        ordering = ["-created_at"]
+        verbose_name = "NSO Apply Attempt"
+        verbose_name_plural = "NSO Apply Attempts"
+
+    def __str__(self):
+        return str(self.pk)
+
+
 class NSOIntentOutboxEntry(models.Model):
     """One operator transaction's contribution to a delivery key.
 
@@ -2795,6 +2997,7 @@ class NSOIntentOutboxState(models.Model):
     claim_payload = models.JSONField(null=True, blank=True)
     claim_deletions = models.JSONField(default=list, blank=True)
     claim_flags = models.JSONField(default=dict, blank=True)
+    claim_revision = models.BigIntegerField(null=True, blank=True)
     # Not the receipt's digest: that one is over the wire body, and is derived from
     # ``claim_payload`` when a restore needs it. This also carries the mode, the authority
     # and the legacy flag, which no body carries, and is what an unchanged claim drops against.

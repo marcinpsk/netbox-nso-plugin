@@ -21,6 +21,7 @@ import datetime
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from django.db import OperationalError, connection, transaction
@@ -31,10 +32,13 @@ from ._outbox_case import (
     ReceiptAdapter,
     entries,
     expire_claim,
+    make_device,
     make_managed,
+    make_mgmt,
     own_route,
     own_vlan,
     state_of,
+    wait_until_postgres_blocks,
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -60,6 +64,58 @@ class _ConcurrencyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTest
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         NSOIntentOutboxEntry.objects.all().delete()
+
+
+class TestTheLockProbeReadsTheLockClassItIsGiven(_CascadeFlushMixin, TransactionTestCase):
+    """``wait_until_postgres_blocks`` must answer for the lock class it is named, not for any block.
+
+    Every contention probe in this module names a ``locktype``. If the helper took the
+    argument and ignored it, a block of an unrelated class would satisfy the probe and
+    every caller would stay green while the window it means to open never opened.
+    """
+
+    #: Test-only single-argument advisory key; the deployment gate's own key is 1_503_003_006.
+    LOCK_KEY = 1_503_003_937
+
+    def test_a_backend_blocked_on_an_advisory_lock_answers_only_the_advisory_probe(self):
+        from django.db import connections
+
+        connected = threading.Event()
+        contender_pid: list[int] = []
+        failures: list[BaseException] = []
+
+        def contend():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    contender_pid.append(cursor.fetchone()[0])
+                connected.set()
+                with transaction.atomic(), connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_xact_lock(%s)", [self.LOCK_KEY])
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                connections.close_all()
+
+        contender = threading.Thread(target=contend)
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", [self.LOCK_KEY])
+            contender.start()
+            # Registered before this transaction ends, which is the release that unblocks it.
+            self.addCleanup(contender.join, 30)
+            assert connected.wait(timeout=30), "the contender never opened its connection"
+
+            # The contender waits for an advisory lock and for nothing else.
+            wait_until_postgres_blocks(contender_pid[0], "the contender", locktype="advisory")
+            wait_until_postgres_blocks(contender_pid[0], "the contender")
+            with self.assertRaises(AssertionError) as refused:
+                wait_until_postgres_blocks(contender_pid[0], "the contender", timeout=0.5, locktype="transactionid")
+            assert "the contender never blocked" in str(refused.exception)
+
+        contender.join(timeout=30)
+        assert not contender.is_alive(), "the contender never took the released lock"
+        assert failures == []
 
 
 class TestTheLeaseIsReadOnTheDatabaseClock(_ConcurrencyCase):
@@ -128,39 +184,88 @@ class TestOnlyOneScavengerReplaysAnExpiredClaim(_ConcurrencyCase):
 
 
 class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
-    """O1.25 (R5-B2): a deletion committing between them must be invisible to both."""
+    """O1.25 (R5-B2): a deletion cannot split the fold from its rendered snapshot."""
 
     tag = "snap"
     adapter_device_id = 7804
 
     def test_a_deletion_committing_before_the_render_leaves_body_and_authority_together(self):
+        from django.db import connections
+
         from netbox_nso_plugin import delivery, drain
 
         route = own_route(self.mgmt, "198.51.100.112/28", "198.51.100.8")
         keeper = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
         real_render = delivery.render
-        removed = threading.Event()
+        render_started = threading.Event()
+        release_render = threading.Event()
+        remover_started = threading.Event()
+        remover_pid: list[int] = []
+        claimed: list = []
+        failures: list[BaseException] = []
 
-        def remove_between_the_fold_and_the_render(*args, **kwargs):
-            """The operator's removal commits after the fold read its entries."""
-            if not removed.is_set():
-                self._remove_in_another_connection(route)
-                removed.set()
+        def pause_between_the_fold_and_the_render(*args, **kwargs):
+            render_started.set()
+            assert release_render.wait(timeout=30), "the barrier never released the render"
             return real_render(*args, **kwargs)
 
-        with patch("netbox_nso_plugin.delivery.render", side_effect=remove_between_the_fold_and_the_render):
-            claimed = drain.claim(self.device.pk, "static_route")
+        def claim():
+            try:
+                claimed.append(drain.claim(self.device.pk, "static_route"))
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                connections.close_all()
 
-        assert claimed is not None
-        sent_ids = {entry["route_id"] for entry in claimed.payload}
+        def remove():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    remover_pid.append(cursor.fetchone()[0])
+                remover_started.set()
+                with transaction.atomic():
+                    route.devices.remove(self.device)
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                connections.close_all()
+
+        with (
+            without_commit_drain(),
+            patch("netbox_nso_plugin.delivery.render", side_effect=pause_between_the_fold_and_the_render),
+        ):
+            claimant = threading.Thread(target=claim)
+            claimant.start()
+            self.addCleanup(claimant.join, 30)
+            self.addCleanup(release_render.set)
+            assert render_started.wait(timeout=30), "the claim never reached the render"
+
+            remover = threading.Thread(target=remove)
+            remover.start()
+            self.addCleanup(remover.join, 30)
+            self.addCleanup(release_render.set)
+            assert remover_started.wait(timeout=30), "the remover never opened its database connection"
+            wait_until_postgres_blocks(remover_pid[0], "the deletion", locktype="transactionid")
+
+            release_render.set()
+            claimant.join(timeout=30)
+            remover.join(timeout=30)
+
+        assert not claimant.is_alive(), "the claim did not finish"
+        assert not remover.is_alive(), "the deletion did not resume after the claim committed"
+        assert failures == []
+
+        [first_claim] = claimed
+        assert first_claim is not None
+        sent_ids = {entry["route_id"] for entry in first_claim.payload}
         assert sent_ids == {route.pk, keeper.pk}, "the body is rendered on the fold's own snapshot"
-        assert claimed.deletions == []
+        assert first_claim.deletions == []
         assert entries(self.device, "static_route", unconsumed=True), "the deletion entry is untouched"
 
         config, session = self.adapter.patches()
         with config, session:
-            answer = drain.send_claim(claimed)
-        assert drain.settle(claimed, answer) == drain.SUCCEEDED
+            answer = drain.send_claim(first_claim)
+        assert drain.settle(first_claim, answer) == drain.SUCCEEDED
 
         later = drain.claim(self.device.pk, "static_route")
         assert {entry["route_id"] for entry in later.payload} == {keeper.pk}
@@ -168,16 +273,138 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
             "the next claim ships the omission WITH its authority"
         )
 
-    def _remove_in_another_connection(self, route):
-        """Commit the operator's removal on its own connection, patching only from here."""
-        from ._outbox_case import in_thread, without_commit_drain
 
-        def remove():
-            with transaction.atomic():
-                route.devices.remove(self.device)
+class TestUntrackedNativeDeletesSerializeWithSaves(_ConcurrencyCase):
+    """A native delete locks its source row before it takes the device-scope lock."""
 
-        with without_commit_drain():
-            in_thread(remove)
+    tag = "native-delete"
+    adapter_device_id = 7807
+
+    def _assert_delete_blocks_save(self, device, native, field_name, field_value, overlay_model, scope, orphan_filter):
+        from django.db import connections
+
+        from netbox_nso_plugin import intent_state
+
+        held = threading.Event()
+        release = threading.Event()
+        save_connected = threading.Event()
+        save_finished = threading.Event()
+        save_pid: list[int] = []
+        delete_errors: list[BaseException] = []
+        save_errors: list[BaseException] = []
+        real_intent_transaction = intent_state.intent_transaction
+        deleting = None
+
+        @contextmanager
+        def pause_after_delete_lock(*args, **kwargs):
+            with real_intent_transaction(*args, **kwargs) as mutation:
+                if threading.current_thread() is deleting and not held.is_set():
+                    held.set()
+                    assert release.wait(timeout=30), "the delete lock was never released"
+                yield mutation
+
+        def delete_native():
+            try:
+                with transaction.atomic():
+                    type(native).objects.get(pk=native.pk).delete()
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                delete_errors.append(exc)
+            finally:
+                connections.close_all()
+
+        def save_native():
+            try:
+                current = type(native).objects.get(pk=native.pk)
+                setattr(current, field_name, field_value)
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    save_pid.append(cursor.fetchone()[0])
+                save_connected.set()
+                with transaction.atomic():
+                    current.save(update_fields=[field_name])
+            except BaseException as exc:  # noqa: BLE001 (a deleted native row rejects the save)
+                save_errors.append(exc)
+            finally:
+                save_finished.set()
+                connections.close_all()
+
+        with (
+            without_commit_drain(),
+            patch(
+                "netbox_nso_plugin.intent_state.intent_transaction",
+                side_effect=pause_after_delete_lock,
+            ),
+        ):
+            deleting = threading.Thread(target=delete_native)
+            deleting.start()
+            self.addCleanup(deleting.join, 30)
+            self.addCleanup(release.set)
+            assert held.wait(timeout=5), "the untracked delete never acquired its device-scope lock"
+
+            saving = threading.Thread(target=save_native)
+            saving.start()
+            self.addCleanup(saving.join, 30)
+            assert save_connected.wait(timeout=30), "the concurrent save never opened its database connection"
+            try:
+                wait_until_postgres_blocks(save_pid[0], "the concurrent native save", locktype="transactionid")
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", [save_pid[0]])
+                    self.assertEqual(cursor.fetchone()[0], "Lock")
+                self.assertFalse(save_finished.is_set(), "the save finished before the delete released its lock")
+            finally:
+                release.set()
+            deleting.join(timeout=30)
+            saving.join(timeout=30)
+
+        assert not deleting.is_alive(), "the native delete did not finish"
+        assert not saving.is_alive(), "the concurrent native save did not finish"
+        assert save_finished.is_set(), "the concurrent save did not finish after the delete released its lock"
+        assert delete_errors == []
+        assert not type(native).objects.filter(pk=native.pk).exists()
+        assert not overlay_model.objects.filter(status="accepted", **orphan_filter).exists()
+        assert not entries(device, scope)
+        self.assertEqual(len(save_errors), 1)
+        self.assertIs(type(save_errors[0]), type(native).NotUpdated)
+        self.assertIn("did not affect any rows", str(save_errors[0]))
+        self.assertNotIn("deadlock", str(save_errors[0]).lower())
+
+    def test_untracked_deletes_block_concurrent_native_saves(self):
+        from dcim.models import Interface
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState, NSOISISInterfaceState
+
+        device = make_device(self.tag, 2)
+        instance = ISISInstance.objects.create(device=device, process_tag="CORE")
+        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        interface = Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
+        isis_interface = ISISInterface.objects.create(
+            interface=interface,
+            address_family="ipv4",
+            instance=instance,
+        )
+        with without_commit_drain(), transaction.atomic():
+            mgmt = make_mgmt(device, self.tag, self.adapter_device_id + 1)
+        self.clear_entries()
+
+        self._assert_delete_blocks_save(
+            device,
+            flex_algo,
+            "priority",
+            111,
+            NSOISISFlexAlgoState,
+            "isis_flex_algo",
+            {"management": mgmt, "isis_flex_algo__isnull": True},
+        )
+        self._assert_delete_blocks_save(
+            device,
+            isis_interface,
+            "metric",
+            111,
+            NSOISISInterfaceState,
+            "isis",
+            {"management": mgmt, "isis_interface__isnull": True},
+        )
 
 
 class _SerializationCause(Exception):
@@ -283,11 +510,8 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return self._transaction(lambda: route.devices.remove(self.device), **barriers)
 
     def _reown(self, route, **barriers):
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         def own():
             route.devices.add(self.device)
-            _accept_static_route_for_device(route, self.device)
 
         return self._transaction(own, **barriers)
 
@@ -379,7 +603,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         found, op_delete, op_revoke = self._transitions_for(route.pk)
         assert [op for _pk, op in found] == [op_revoke, op_delete], f"id order is not commit order: {found}"
 
-    def test_two_different_routes_commute_and_never_wait_on_each_other(self):
+    def test_two_different_routes_share_the_scope_revision_lock(self):
         from netbox_nso_plugin import outbox
 
         leaving = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
@@ -388,22 +612,43 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
             returning.devices.remove(self.device)
         self.clear_entries()
         held = threading.Event()
-        owned = threading.Event()
         release = threading.Event()
+        reown_connected = threading.Event()
+        reown_pid: list[int] = []
+        probe_failures: list[BaseException] = []
 
-        def release_once_the_other_finished():
-            assert owned.wait(timeout=30), "the re-ownership waited on the removal's rows"
-            release.set()
+        def release_after_contention_window():
+            try:
+                assert held.wait(timeout=30), "the removal never reached its hold point"
+                assert reown_connected.wait(timeout=30), "the re-ownership never opened its connection"
+                wait_until_postgres_blocks(reown_pid[0], "the re-ownership", locktype="advisory")
+            except BaseException as exc:  # noqa: BLE001 (reported on the caller's thread)
+                probe_failures.append(exc)
+            finally:
+                release.set()
 
-        watcher = threading.Thread(target=release_once_the_other_finished)
+        reown = self._reown(returning, before=held)
+
+        def measured_reown():
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                reown_pid.append(cursor.fetchone()[0])
+            reown_connected.set()
+            reown()
+
+        watcher = threading.Thread(target=release_after_contention_window, daemon=True)
         watcher.start()
-        # The removal holds its transaction open across the whole of the other one: two
-        # routes touch disjoint rows, so the re-ownership commits without waiting for it.
+        self.addCleanup(release.set)
+        # The route rows are disjoint, but both changes bump the same device and scope
+        # revision. The device advisory gate serializes the two renderer mutations before
+        # either reaches that shared revision row.
         self._run(
             self._remove(leaving, after=held, hold=release),
-            self._reown(returning, before=held, committed=owned),
+            measured_reown,
         )
         watcher.join(timeout=30)
+        assert not watcher.is_alive(), "the lock watcher never finished"
+        assert not probe_failures, probe_failures
 
         folded = outbox.fold_transitions(
             [record for row in entries(self.device, "static_route") for record in row.transitions]

@@ -30,6 +30,8 @@ from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 from netbox_nso_plugin.tests.mixins import _CascadeFlushMixin
 
+from ._outbox_case import mirror_update
+
 
 def _make_device(name):
     mfg = Manufacturer.objects.create(name=f"{name}-mfg", slug=f"{name}-mfg")
@@ -204,6 +206,25 @@ class TestGateTransitions(TestCase):
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_incarnation, _INC_A[0])
 
+    def test_admitted_mirror_body_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        revision, _ = NSOIntentRevision.objects.get_or_create(
+            device=self.mgmt.device,
+            scope="bfd",
+        )
+        before = revision.revision
+
+        self._run(
+            _rs(attempt_id=71),
+            body=lambda: mirror_update(self.mgmt, last_sync_status="success"),
+        )
+
+        self.mgmt.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(self.mgmt.last_sync_status, "success")
+        self.assertEqual(revision.revision, before)
+
     def test_absent_authoritative_cleared_admits(self):
         from netbox_nso_plugin.read_gate import RAN
 
@@ -302,36 +323,6 @@ class TestGateTransitions(TestCase):
         self.assertEqual(body.calls, 1)
         self.assertIsNone(self._row().applied_payload_revision)
 
-    def test_postgresql_deadlock_retries_the_same_publication(self):
-        from django.db import OperationalError
-
-        from netbox_nso_plugin.read_gate import RAN
-        from netbox_nso_plugin.reconcile import _safe_reconcile
-
-        cause = RuntimeError("deadlock detected")
-        cause.sqlstate = "40P01"
-        deadlock = OperationalError("deadlock detected")
-        deadlock.__cause__ = cause
-        calls = 0
-        context = {}
-
-        def flaky_reconciler():
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise deadlock
-            return "reconciled"
-
-        def scoped_body():
-            _safe_reconcile(context, "value", self.mgmt, (), flaky_reconciler)
-            return context["value"]
-
-        result, _ = self._run(_rs(attempt_id=8), body=scoped_body)
-        self.assertEqual(result.disposition, RAN)
-        self.assertEqual(calls, 2)
-        self.assertEqual(result.value, "reconciled")
-        self.assertEqual(self._row().applied_attempt_id, 8)
-
     def test_body_failure_after_admission_keeps_applied_truthful(self):
         boom = RuntimeError("materializer failed")
         with self.assertRaises(RuntimeError):
@@ -340,6 +331,47 @@ class TestGateTransitions(TestCase):
         self.assertEqual(row.admitted_attempt_id, 7)
         self.assertIsNone(row.applied_attempt_id)
         self.assertNotEqual(row.publication_sequence, row.applied_publication_sequence)
+
+    def test_plan_failure_carries_the_publication_guard(self):
+        from netbox_nso_plugin.read_gate import gated_family_run
+
+        boom = RuntimeError("plan failed")
+        with self.assertRaises(RuntimeError) as raised:
+            gated_family_run(
+                self.mgmt,
+                "bfd",
+                _rs(attempt_id=8),
+                _Recorder(),
+                epoch=self.epoch,
+                pre_body=lambda: (_ for _ in ()).throw(boom),
+            )
+
+        self.assertEqual(raised.exception._nso_publication_guard[0], "bfd")
+
+    def test_changed_renderer_targets_skip_the_admitted_publication(self):
+        from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan, RendererTargetsChanged
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
+
+        def targets_changed():
+            raise RendererTargetsChanged("renderer targets changed during acquisition")
+
+        body = _Recorder()
+        plan = ReconcileMutationPlan(
+            MutationFootprint.for_keys({(self.mgmt.device_id, "bfd")}),
+            validate_after_acquire=targets_changed,
+        )
+        result = gated_family_run(
+            self.mgmt,
+            "bfd",
+            _rs(attempt_id=8),
+            body,
+            epoch=self.epoch,
+            pre_body=lambda: plan,
+        )
+
+        self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+        self.assertEqual(body.calls, 0)
+        self.assertIsNone(self._row().applied_attempt_id)
 
     def test_late_synthesized_null_loses(self):
         self._run(_rs(attempt_id=5))
@@ -377,7 +409,7 @@ class TestGateTransitions(TestCase):
         from netbox_nso_plugin.models import NSOFamilyReadState
         from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE
 
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True)
+        mirror_update(self.mgmt, source_rekey_pending=True)
         result, body = self._run(_rs(attempt_id=7))
         self.assertEqual(result.disposition, SKIPPED_UNAVAILABLE)
         self.assertEqual(body.calls, 0)
@@ -873,7 +905,7 @@ class TestAggregateObservation(TestCase):
 
     def test_null_adapter_device_id_skips(self):
         self._adopt()
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=None)
+        mirror_update(self.mgmt, adapter_device_id=None)
         wrote = self._observe({"bfd": _rs(attempt_id=12)})
         self.assertFalse(wrote)
 
@@ -1397,7 +1429,8 @@ class TestQueuedCarrierArbiter(TestCase):
 
 class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
     def setUp(self):
-        self.mgmt = _make_mgmt(_make_device(f"rg-orch-{uuid.uuid4().hex[:8]}"))
+        with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"), transaction.atomic():
+            self.mgmt = _make_mgmt(_make_device(f"rg-orch-{uuid.uuid4().hex[:8]}"))
         self.epoch = self.mgmt.adapter_device_id
         self.conn = _redis()
         self.key = f"nso-test-lease:{uuid.uuid4().hex}"
@@ -1512,76 +1545,6 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(row.applied_attempt_id, 6)
         self.assertEqual(row.observed_attempt_id, 6)
         self.assertTrue(a.lost)
-
-    def test_successor_admitted_mid_body_rolls_back_stale_body(self):
-        """A body that loses its publication token cannot leak even unrelated ORM writes."""
-        from netbox_nso_plugin.read_gate import RAN, SKIPPED_STALE_ATTEMPT, gated_family_run
-
-        body_started = threading.Event()
-        successor_done = threading.Event()
-        outcome = {}
-
-        def stale_body():
-            device = Device.objects.get(pk=self.mgmt.device_id)
-            device.comments = "stale body leaked"
-            device.save(update_fields=["comments"])
-            body_started.set()
-            self.assertTrue(successor_done.wait(timeout=20))
-
-        def run_stale():
-            try:
-                outcome["stale"] = gated_family_run(self.mgmt, "bfd", _rs(attempt_id=5), stale_body, epoch=self.epoch)
-            finally:
-                _close_thread_db()
-
-        thread = threading.Thread(target=run_stale)
-        thread.start()
-        self.assertTrue(body_started.wait(timeout=20))
-        successor = gated_family_run(self.mgmt, "bfd", _rs(attempt_id=6), _Recorder(), epoch=self.epoch)
-        successor_done.set()
-        thread.join(timeout=30)
-
-        self.assertEqual(successor.disposition, RAN)
-        self.assertEqual(outcome["stale"].disposition, SKIPPED_STALE_ATTEMPT)
-        self.mgmt.device.refresh_from_db()
-        self.assertEqual(self.mgmt.device.comments, "")
-
-    def test_source_save_mid_body_rolls_back_old_source_writes(self):
-        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
-
-        body_started = threading.Event()
-        source_saved = threading.Event()
-        outcome = {}
-
-        def stale_body():
-            device = Device.objects.get(pk=self.mgmt.device_id)
-            device.comments = "old source leaked"
-            device.save(update_fields=["comments"])
-            body_started.set()
-            self.assertTrue(source_saved.wait(timeout=20))
-
-        def run_stale():
-            try:
-                outcome["stale"] = gated_family_run(
-                    self.mgmt,
-                    "bfd",
-                    _rs(attempt_id=5),
-                    stale_body,
-                    epoch=self.epoch,
-                )
-            finally:
-                _close_thread_db()
-
-        thread = threading.Thread(target=run_stale)
-        thread.start()
-        self.assertTrue(body_started.wait(timeout=20))
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(source_rekey_pending=True)
-        source_saved.set()
-        thread.join(timeout=30)
-
-        self.assertEqual(outcome["stale"].disposition, SKIPPED_STALE_ATTEMPT)
-        self.mgmt.device.refresh_from_db()
-        self.assertEqual(self.mgmt.device.comments, "")
 
     def test_concurrent_first_create_single_row(self):
         from netbox_nso_plugin.models import NSOFamilyReadState

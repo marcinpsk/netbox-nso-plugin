@@ -10,6 +10,11 @@ writes (no mocks of our own code).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import call, patch
+from uuid import uuid4
+
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.contenttypes.models import ContentType
 from django.template.loader import render_to_string
@@ -54,17 +59,19 @@ class _RoutePolicyFixture(TestCase):
             defaults={"nso_instance": inst, "nso_device_name": "rpj-dev", "adapter_device_id": 777},
         )[0]
 
-    def _reconcile(self):
-        """Create real netbox_routing objects + GFK-linked state rows via the reconciler."""
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
-
-        payload = {
+    def _payload(self):
+        return {
             "prefix_lists": [{"name": "PLJ", "entries": [{"seq": 5, "action": "permit"}]}],
             "community_lists": [{"name": "CLJ", "entries": [{"community": "65000:1"}]}],
             "as_paths": [{"name": "APJ", "entries": [{"regex": "^65000_"}]}],
             "route_maps": [{"name": "RMJ", "entries": [{"seq": 10, "action": "permit"}]}],
         }
-        reconcile_route_policy(self.device, payload)
+
+    def _reconcile(self):
+        """Create real netbox_routing objects + GFK-linked state rows via the reconciler."""
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        reconcile_route_policy(self.device, self._payload())
 
 
 class TestAppliedToDevicesPanel(_RoutePolicyFixture):
@@ -106,7 +113,12 @@ class TestAppliedToDevicesPanel(_RoutePolicyFixture):
         cl = CommunityList.objects.get(name="CLJ")
         ct = ContentType.objects.get_for_model(cl)
         # Operator owns it → status accepted (so the panel shows a non-import badge).
-        NSORoutePolicyState.objects.filter(content_type=ct, object_id=cl.pk).update(status="accepted")
+        state = NSORoutePolicyState.objects.get(content_type=ct, object_id=cl.pk)
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(state)):
+            state.status = "accepted"
+            state.save(update_fields=["status"])
         states = list(NSORoutePolicyState.objects.filter(content_type=ct, object_id=cl.pk).select_related("management"))
 
         html = render_to_string("netbox_nso_plugin/route_policy_nso_devices.html", {"nso_states": states})
@@ -126,7 +138,14 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         from netbox_nso_plugin.models import NSORoutePolicyState
 
         self._reconcile()
-        NSORoutePolicyState.objects.filter(management__device=self.device).update(status="accepted")
+        states = list(NSORoutePolicyState.objects.filter(management__device=self.device))
+        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+
+        footprint = MutationFootprint.merge(*(footprint_for_instance(state) for state in states))
+        with intent_transaction(footprint):
+            for state in states:
+                state.status = "accepted"
+                state.save(update_fields=["status"])
 
     def _entries_for(self, name, model):
         ct = ContentType.objects.get_for_model(model)
@@ -160,6 +179,197 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         # last_apply_at stamped on the rows for the panel's "Last apply" column.
         self.assertTrue(all(r.last_apply_at for r in NSORoutePolicyState.objects.filter(management=mgmt)))
 
+    def test_reconcile_preserves_the_final_route_policy_attempt_for_journaling(self):
+        from dcim.models import Interface
+        from django.utils import timezone
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision, NSORoutePolicyState, NSOSVIState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, run_device_reconcile
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        from ._outbox_case import content_update, mirror_update
+        from .test_apply_settlement import _attempt, _payload, _response
+
+        mgmt = content_update(self._make_mgmt(), manage_routing=True, manage_route_policy=True)
+        route_policy_payload = {
+            "prefix_lists": [
+                {
+                    "name": "PL-STABLE",
+                    "family": 4,
+                    "entries": [{"action": "permit", "prefix": "198.18.0.0/15"}],
+                },
+                {
+                    "name": "PL-EXISTING",
+                    "family": 4,
+                    "entries": [{"action": "permit", "prefix": "192.0.2.0/24"}],
+                },
+            ],
+            "community_lists": [],
+            "as_paths": [],
+            "route_maps": [],
+        }
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        reconcile_route_policy(self.device, route_policy_payload)
+        row = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name="PL-STABLE")
+        existing_row = NSORoutePolicyState.objects.get(
+            management=mgmt,
+            family="prefix_list",
+            object_name="PL-EXISTING",
+        )
+        with intent_transaction(footprint_for_instance(existing_row)):
+            existing_row.status = "in_sync"
+            existing_row.save(update_fields=["status"])
+        with intent_transaction(footprint_for_instance(row)):
+            row.status = "accepted"
+            row.save(update_fields=["status"])
+        attempt_id = uuid4()
+        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertFalse(route_policy_reconcile_plan(self.device, route_policy_payload).changes_content)
+        selected = {"route_policy": 41, "svi": 42}
+        response = _response(mgmt.adapter_device_id, 81, selected)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="route_policy").revision
+        NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            management=mgmt,
+            adapter_device_id=mgmt.adapter_device_id,
+            selected=selected,
+            scope_revisions={"route_policy": revision},
+            http_status=202,
+            response=response,
+        )
+        group = _device_vlan_group(self.device)
+
+        def make_svi(name, vid, *, status, svi_attempt_id=None):
+            interface = Interface.objects.create(device=self.device, name=name, type="virtual")
+            vlan = VLAN.objects.create(group=group, vid=vid, name=name)
+            state = NSOSVIState.objects.create(
+                management=mgmt,
+                interface=interface,
+                vlan=vlan,
+                svi_type="svi",
+                status="accepted",
+            )
+            return mirror_update(state, status=status, apply_attempt_id=svi_attempt_id)
+
+        make_svi("Vlan1641", 1641, status="in_sync")
+        successful_svi = make_svi("Vlan1642", 1642, status="deploying", svi_attempt_id=attempt_id)
+        waiting_attempt_id = uuid4()
+        waiting_svi = make_svi("Vlan1643", 1643, status="deploying", svi_attempt_id=waiting_attempt_id)
+        failed_attempt_id = uuid4()
+        failed_svi = make_svi("Vlan1644", 1644, status="deploying", svi_attempt_id=failed_attempt_id)
+        waiting_selected = {"svi": 43}
+        NSOApplyAttempt.objects.create(
+            id=waiting_attempt_id,
+            management=mgmt,
+            adapter_device_id=mgmt.adapter_device_id,
+            selected=waiting_selected,
+            scope_revisions={"svi": 1},
+            http_status=202,
+            response=_response(mgmt.adapter_device_id, 82, waiting_selected),
+        )
+        failed_selected = {"svi": 44}
+        NSOApplyAttempt.objects.create(
+            id=failed_attempt_id,
+            management=mgmt,
+            adapter_device_id=mgmt.adapter_device_id,
+            selected=failed_selected,
+            scope_revisions={"svi": 1},
+            http_status=202,
+            response=_response(mgmt.adapter_device_id, 83, failed_selected),
+        )
+        carrier_result = {
+            "route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
+            "svi_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
+        }
+        successful_evidence = _attempt(
+            attempt_id,
+            mgmt.adapter_device_id,
+            81,
+            selected,
+            "settled",
+            result=carrier_result,
+        )
+        successful_evidence["generations"][0]["updated_at"] = timezone.now().isoformat()
+        evidence_by_id = {
+            attempt_id: successful_evidence,
+            waiting_attempt_id: _attempt(
+                waiting_attempt_id,
+                mgmt.adapter_device_id,
+                82,
+                waiting_selected,
+                "pending",
+            ),
+            failed_attempt_id: _attempt(
+                failed_attempt_id,
+                mgmt.adapter_device_id,
+                83,
+                failed_selected,
+                "failed",
+            ),
+        }
+        lease_held = False
+
+        @contextmanager
+        def read_lease():
+            nonlocal lease_held
+            lease_held = True
+            try:
+                yield
+            finally:
+                lease_held = False
+
+        def fetch_evidence_outside_read_lease(_adapter_device_id, requested_attempt_ids):
+            self.assertFalse(lease_held)
+            return _payload(
+                mgmt.adapter_device_id,
+                [evidence_by_id[requested] for requested in requested_attempt_ids],
+            )
+
+        with (
+            patch(
+                "netbox_nso_plugin.reconcile._acquire_reconcile_lease",
+                side_effect=lambda *_args, **_kwargs: _LeaseOutcome(lease=read_lease()),
+            ),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_deployment_evidence",
+                side_effect=fetch_evidence_outside_read_lease,
+            ) as fetch_evidence,
+            patch("netbox_nso_plugin.adapter_client.get_route_policy", return_value=route_policy_payload),
+            patch(
+                "netbox_nso_plugin.settlement.settle_static_routes",
+                return_value=SimpleNamespace(drained=True),
+            ),
+        ):
+            run_device_reconcile(self.device.pk)
+            run_device_reconcile(self.device.pk)
+
+        row.refresh_from_db()
+        successful_svi.refresh_from_db()
+        waiting_svi.refresh_from_db()
+        failed_svi.refresh_from_db()
+        mgmt.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+        self.assertEqual(successful_svi.status, "in_sync")
+        self.assertEqual(waiting_svi.status, "deploying")
+        self.assertEqual(waiting_svi.apply_attempt_id, waiting_attempt_id)
+        self.assertEqual(failed_svi.status, "apply_failed")
+        self.assertEqual(mgmt.last_journaled_apply_job, "981")
+        self.assertEqual(
+            fetch_evidence.call_args_list,
+            [
+                call(
+                    mgmt.adapter_device_id,
+                    tuple(sorted((attempt_id, waiting_attempt_id, failed_attempt_id), key=str)),
+                ),
+                call(mgmt.adapter_device_id, (waiting_attempt_id,)),
+            ],
+        )
+
     def test_idempotent_same_job_does_not_duplicate(self):
         from netbox_routing.models import CommunityList
 
@@ -172,6 +382,37 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         _journal_route_policy_apply(mgmt, _job(8527, in_sync=2))  # same job id → no-op
 
         self.assertEqual(self._entries_for("CLJ", CommunityList).count(), 1)
+
+    def test_newer_route_policy_revision_rejects_a_stale_carrier(self):
+        from extras.models import JournalEntry
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        from ._outbox_case import content_update
+
+        mgmt = self._make_mgmt()
+        self._owned_reconcile()
+        attempt_id = uuid4()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="route_policy").revision
+        NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            management=mgmt,
+            adapter_device_id=mgmt.adapter_device_id,
+            selected={"route_policy": 41},
+            scope_revisions={"route_policy": revision},
+        )
+        community_list = CommunityList.objects.get(name="CLJ")
+        content_update(community_list, name="CLJ-NEW")
+        carrier = _job(8528, in_sync=1)
+        carrier["apply_attempt_id"] = str(attempt_id)
+
+        _journal_route_policy_apply(mgmt, carrier)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.last_journaled_apply_job, "")
+        self.assertFalse(JournalEntry.objects.exists())
 
     def test_failure_marks_entry_danger(self):
         from netbox_routing.models import CommunityList
