@@ -499,6 +499,33 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         self.assertEqual(row.status, "deploying")
         self.assertEqual(row.apply_attempt_id, attempt_id)
 
+    def test_a_vanished_confirmed_host_does_not_reset_a_deploying_levels_row(self):
+        """A content-bearing read must not re-pend an in-flight sibling in the same scope."""
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOLoggingHostState
+        from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
+
+        attempt_id = uuid4()
+        row = self._row(
+            console_severity="CRITICAL",
+            status="deploying",
+            accepted_at=timezone.now(),
+            apply_attempt_id=attempt_id,
+        )
+        host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.9", status="in_sync")
+        payload = {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
+
+        plan = logging_reconcile_plan(self.device, payload)
+        self.assertTrue(plan.changes_content)  # the vanished confirmed host bears the content
+        with reconcile_transaction(plan):
+            _reconcile_logging_config(self.device, payload)
+
+        row.refresh_from_db()
+        host.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
+        self.assertEqual(host.status, "changed")
+
 
 class TestLoggingLevelsInlineClearGuard(LevelsTestBase):
     """codex P4b triage: clearing the LAST severity inline must not silently retract.

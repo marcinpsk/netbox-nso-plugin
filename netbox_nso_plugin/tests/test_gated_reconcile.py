@@ -167,6 +167,25 @@ class TestGatedReconcileBehavior(_L2Base):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
+    def test_a_vanished_confirmed_sap_does_not_reset_a_deploying_sibling(self):
+        """A content-bearing read must not re-pend an in-flight sibling in the same scope."""
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        self._reconcile(_l2_payload(("TL", "TL2"), read_state=_rs(attempt_id=1)))
+        deploying = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
+        confirmed = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL2")
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
+        content_update(deploying, status="deploying", apply_attempt_id=attempt.pk)
+        content_update(confirmed, status="in_sync")
+
+        self._reconcile(_l2_payload(("TL",), read_state=_rs(attempt_id=2)))  # TL2 vanishes
+
+        deploying.refresh_from_db()
+        confirmed.refresh_from_db()
+        self.assertEqual(deploying.status, "deploying")
+        self.assertEqual(deploying.apply_attempt_id, attempt.pk)
+        self.assertEqual(confirmed.status, "changed")
+
     def test_missing_read_state_key_is_legacy_and_runs(self):
         self._prime()
         ctx = self._reconcile(_l2_payload(("NEW",)))  # pre-S4 adapter: no read_state

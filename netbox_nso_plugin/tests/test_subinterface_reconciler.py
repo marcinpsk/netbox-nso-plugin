@@ -328,13 +328,14 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
         NSOSubinterfaceState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows
         destroys ownership. A confirmed row that vanishes surfaces as ``changed``. That
-        rendered-membership change advances the scope revision, so another deploying row is
-        re-pended to ``accepted`` and loses its superseded attempt identity.
+        rendered-membership change advances the scope revision, but the read is not apply
+        evidence, so the in-flight sibling keeps ``deploying`` and its attempt identity.
         """
         from netbox_nso_plugin.models import NSOSubinterfaceState
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
         deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
+        attempt = deploying.apply_attempt_id
         confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
         reconcile_subinterface(self.device, {"interfaces": []})  # device stops reporting all subifs
         assert NSOSubinterfaceState.objects.filter(pk=deploying.pk).exists(), (
@@ -342,8 +343,52 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         )
         assert NSOSubinterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         deploying.refresh_from_db()
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt
+        assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+
+    def _payload(self, name, dot1q):
+        """The device read that exactly matches a fixture row's parent, dot1q and VRF."""
+        return {
+            "interfaces": [
+                {
+                    "interface_name": name,
+                    "parent_interface": "ge-0/0/0",
+                    "dot1q_vlan": dot1q,
+                    "type": "subinterface",
+                    "vrf": "MTI",
+                }
+            ]
+        }
+
+    def test_matching_read_keeps_a_deploying_row_in_flight(self):
+        """A matching read is not apply evidence: only a correlated apply result settles it."""
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
+        attempt = deploying.apply_attempt_id
+        assert attempt is not None
+
+        reconcile_subinterface(self.device, self._payload("ge-0/0/0.100", 100))
+
+        deploying.refresh_from_db()
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt
+
+    def test_matching_read_keeps_a_deploying_row_in_flight_under_a_content_change(self):
+        """A vanished confirmed sibling makes the plan content-bearing; acquisition must not reset."""
+        from netbox_nso_plugin.models import NSOSubinterfaceState
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
+        attempt = deploying.apply_attempt_id
+        confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
+
+        reconcile_subinterface(self.device, self._payload("ge-0/0/0.100", 100))
+
+        deploying.refresh_from_db()
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
 
     def test_push_builds_owned_snapshot(self):
