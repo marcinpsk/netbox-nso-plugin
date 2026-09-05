@@ -392,7 +392,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         """A vanished confirmed sibling bears content, so every deploying row in the scope is stale.
 
         The in-flight row is still reported, carrying the pre-apply dot1q the device still
-        holds, so only the acquisition re-pend can move it off ``deploying``.
+        holds, so only the deferred re-pend can move it off ``deploying``.
         """
         from uuid import uuid4
 
@@ -418,8 +418,12 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
         assert revision.revision == before + 1
 
-    def test_a_vanished_confirmed_sibling_repends_then_settles_a_matching_deploying_row(self):
-        """The re-pend discards the stale attempt, and a matching device entry settles the accepted row."""
+    def test_a_vanished_confirmed_sibling_repends_a_matching_deploying_row_after_the_read(self):
+        """The deferred re-pend runs after the read's transitions, so a matching entry never settles here.
+
+        The transition fence leaves the in-flight row ``deploying``, then the deferred re-pend
+        at the end of the reconcile transaction moves it to ``accepted`` with no attempt.
+        """
         from uuid import uuid4
 
         from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
@@ -439,7 +443,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
         deploying.refresh_from_db()
         revision.refresh_from_db()
-        assert deploying.status == "in_sync"
+        assert deploying.status == "accepted"
         assert deploying.apply_attempt_id is None
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
         assert revision.revision == before + 1

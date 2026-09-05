@@ -521,12 +521,14 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "requests" },
+    { name = "sqlparse" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "build" },
     { name = "django" },
+    { name = "packaging" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -543,12 +545,16 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "requests", specifier = ">=2.34.2" }]
+requires-dist = [
+    { name = "requests", specifier = ">=2.34.2" },
+    { name = "sqlparse", specifier = ">=0.5.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "build" },
     { name = "django", specifier = ">=6.1,<7.0" },
+    { name = "packaging" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov", specifier = ">=7.1.0" },

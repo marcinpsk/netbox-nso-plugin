@@ -8,12 +8,14 @@ import contextlib
 import contextvars
 import copy
 import functools
+import logging
 import operator
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import sqlparse
 from django.apps import apps
 from django.db import connections, transaction
 from django.db.backends.signals import connection_created
@@ -26,6 +28,10 @@ from django.db.models.signals import (
     pre_migrate,
     pre_save,
 )
+from sqlparse.sql import Comparison, Function, Identifier, IdentifierList
+from sqlparse.tokens import Comment, Keyword, Literal
+
+logger = logging.getLogger(__name__)
 
 ABSENT = ("ABSENT",)
 
@@ -324,10 +330,6 @@ _FRAGMENT_GATE_FIELDS = {
     "netbox_nso_plugin.nsovlanstate": {"status", "device_name"},
 }
 
-_DML_TABLE = re.compile(
-    r'^\s*(?P<operation>INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?(?P<table>[A-Za-z0-9_]+)"?',
-    re.IGNORECASE,
-)
 # Django's collector clears this FK with one lazy SET_NULL update on every ipam.Prefix delete.
 # The new value is a literal or a bound parameter, depending on the Django version.
 _SOURCE_POOL_CASCADE = re.compile(
@@ -389,6 +391,12 @@ class IntentTransactionNoOp(Exception):
 
 class RendererTargetsChanged(IntentMutationProtocolError):
     """A source row changed the devices that render it during acquisition."""
+
+
+@dataclass(frozen=True)
+class _DMLTarget:
+    operation: str
+    table: str
 
 
 @dataclass(frozen=True, order=True)
@@ -466,6 +474,7 @@ class ReconcileMutationPlan:
     # A content-bearing read re-pends the deploying rows in its scope; families opt out per plan.
     settles_deploying: bool = True
     validate_after_acquire: Callable[[], None] | None = field(default=None, compare=False, repr=False)
+    detect_content_changes: bool = False
 
 
 @dataclass(frozen=True)
@@ -506,6 +515,10 @@ class _Permit:
     implicit: bool = False
     deferred_update: dict[str, Any] = field(default_factory=dict)
     atomic_block_id: int | None = None
+    detect_reconcile_content: bool = False
+    settles_deploying: bool = True
+    initial_deploying_rows: tuple[SourceRow, ...] = ()
+    deferred_repend_rows: tuple[SourceRow, ...] = ()
 
 
 _REGISTRY: dict[str, RendererInputSpec] = {}
@@ -523,6 +536,19 @@ _DELETING_POOLS: contextvars.ContextVar[frozenset[tuple]] = contextvars.ContextV
     "nso_intent_deleting_pools", default=frozenset()
 )
 _RECONCILER_ACTIVE: contextvars.ContextVar[int] = contextvars.ContextVar("nso_intent_reconciler_active", default=0)
+_DML_PARSE_SKIP_KEYWORDS = frozenset(
+    {"SELECT", "SET", "SAVEPOINT", "RELEASE", "SHOW", "BEGIN", "COMMIT", "ROLLBACK", "DECLARE", "FETCH", "CLOSE"}
+)
+_FIRST_SQL_KEYWORD = re.compile(
+    r"\A(?:\s+|--[^\r\n]*(?:\r\n?|\n|\Z)|/\*.*?\*/)*([A-Za-z]+)",
+    re.DOTALL,
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _registered_table_names() -> tuple[str, ...]:
+    """Return lower-case table names for the guard's raw SQL prescan."""
+    return tuple(table.lower() for table in _TABLE_REGISTRY)
 
 
 def _discard_rolled_back_implicit_permit() -> None:
@@ -540,6 +566,47 @@ def _discard_rolled_back_implicit_permit() -> None:
 def renderer_input_specs() -> dict[str, RendererInputSpec]:
     """Return the declared registry keyed by lower-case Django model label."""
     return _REGISTRY
+
+
+def reconcile_family_footprint(device_id: int, scopes) -> MutationFootprint:
+    """Cover every registered model that a family reconciler may refresh."""
+    requested = frozenset(str(scope) for scope in scopes)
+    source_labels = set()
+    overlay_labels = set()
+    overlay_rows = set()
+
+    def add_model(model) -> None:
+        label = model._meta.label_lower
+        if label in OVERLAY_MODEL_RANKS:
+            field_names = {field.name for field in model._meta.concrete_fields}
+            if "management" in field_names:
+                device_lookup = "management__device_id"
+            elif "interface" in field_names:
+                device_lookup = "interface__device_id"
+            else:
+                raise IntentMutationProtocolError(f"overlay model {label} has no device ownership path")
+            overlay_labels.add(label)
+            overlay_rows.update(
+                SourceRow(label, pk)
+                for pk in model.objects.filter(**{device_lookup: device_id}).values_list("pk", flat=True)
+            )
+        elif label in SOURCE_MODEL_RANKS:
+            source_labels.add(label)
+        elif label in _REGISTRY and label != "netbox_nso_plugin.nsodevicemanagement":
+            raise IntentMutationProtocolError(f"renderer-input model {label} has no declared lock rank")
+
+    for spec in _REGISTRY.values():
+        if requested.isdisjoint(spec.scopes):
+            continue
+        add_model(spec.model)
+        for model_field in spec.model._meta.many_to_many:
+            add_model(model_field.remote_field.through)
+
+    return MutationFootprint.for_keys(
+        {(int(device_id), scope) for scope in requested},
+        source_rows=(SourceRow(label, None) for label in source_labels),
+        overlay_rows=(*overlay_rows, *(SourceRow(label, None) for label in overlay_labels)),
+    )
 
 
 @contextlib.contextmanager
@@ -1670,6 +1737,8 @@ def _lock_rows(rows: tuple[SourceRow, ...], *, level: int, ranks: tuple[str, ...
         )
 
     for row in sorted(rows, key=sort_key):
+        if row.pk is None:
+            continue
         _enter_level(level, sort_key(row))
         model = apps.get_model(row.model_label)
         list(model.objects.select_for_update(of=("self",)).filter(pk=row.pk).order_by("pk"))
@@ -1694,13 +1763,82 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
             )
 
 
+def _deploying_scope_rows(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
+    """Discover candidate Apply-in-flight rows after their revision locks are held."""
+    from .apply_state import deploying_models
+
+    models_by_scope = deploying_models()
+    rows = []
+    for device_id, scope in footprint.revision_keys:
+        model = models_by_scope.get(scope)
+        if model is None:
+            continue
+        rows.extend(
+            SourceRow(model._meta.label_lower, pk)
+            for pk in model.objects.filter(
+                management__device_id=device_id,
+                status="deploying",
+            )
+            .order_by("pk")
+            .values_list("pk", flat=True)
+        )
+    return tuple(rows)
+
+
+def _still_deploying_rows(rows: tuple[SourceRow, ...]) -> tuple[SourceRow, ...]:
+    """Keep candidates whose locked row version is still deploying."""
+    current = set()
+    labels = {row.model_label for row in rows}
+    for label in OVERLAY_MODEL_RANKS:
+        if label not in labels:
+            continue
+        pks = {row.pk for row in rows if row.model_label == label and row.pk is not None}
+        current.update(
+            SourceRow(label, pk)
+            for pk in apps.get_model(label).objects.filter(pk__in=pks, status="deploying").values_list("pk", flat=True)
+        )
+    return tuple(row for row in rows if row in current)
+
+
+def _bump_and_lock_deploying(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
+    """Advance locked revisions and lock the complete promoted scope."""
+    from .outbox import bump_intent_revision
+
+    for device_id, scope in footprint.revision_keys:
+        bump_intent_revision(device_id, scope)
+    deploying_rows = _deploying_scope_rows(footprint)
+    locked_overlay_rows = tuple(set(footprint.overlay_rows) | set(deploying_rows))
+    _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
+    return _still_deploying_rows(deploying_rows)
+
+
+def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
+    """Force rows captured as deploying back to pending Apply state."""
+    from .signals import suppress_intent_push
+
+    with suppress_intent_push():
+        for row_ref in rows:
+            if row_ref.pk is None:
+                continue
+            row = apps.get_model(row_ref.model_label).objects.filter(pk=row_ref.pk).first()
+            if row is None:
+                continue
+            row.status = "accepted"
+            update_fields = ["status"]
+            if hasattr(row, "apply_attempt_id"):
+                row.apply_attempt_id = None
+                update_fields.append("apply_attempt_id")
+            row.save(update_fields=update_fields)
+
+
 def _acquire(
     footprint: MutationFootprint,
     *,
     bump: bool = True,
     join_deployment_gate: bool = True,
-    settles_deploying: bool = True,
-) -> None:
+    defer_repend: bool = False,
+    capture_deploying: bool = False,
+) -> tuple[SourceRow, ...]:
     from .apply_state import (
         _enter_level,
         lock_device_intent_transaction,
@@ -1709,8 +1847,6 @@ def _acquire(
     )
     from .deployment import lock_mutation
     from .models import NSODeviceManagement, NSOFamilyReadState
-    from .outbox import bump_intent_revision
-    from .signals import suppress_intent_push
 
     if not transaction.get_connection().in_atomic_block:
         raise IntentMutationProtocolError("intent_transaction requires transaction.atomic()")
@@ -1749,66 +1885,119 @@ def _acquire(
     for device_id, scopes in sorted(scopes_by_device.items()):
         lock_intent_revisions(device_id, scopes)
     if bump:
-        for device_id, scope in footprint.revision_keys:
-            bump_intent_revision(device_id, scope)
-    locked_overlay_rows = tuple(set(footprint.overlay_rows))
-    _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
-    if not bump:
-        return
-    with suppress_intent_push():
-        for row_ref in locked_overlay_rows:
-            if row_ref.pk is None:
-                continue
-            row = apps.get_model(row_ref.model_label).objects.get(pk=row_ref.pk)
-            if row.status == "deploying" and settles_deploying:
-                row.status = "accepted"
-                update_fields = ["status"]
-                if hasattr(row, "apply_attempt_id"):
-                    row.apply_attempt_id = None
-                    update_fields.append("apply_attempt_id")
-                row.save(update_fields=update_fields)
+        deploying_rows = _bump_and_lock_deploying(footprint)
+        if not defer_repend:
+            _repend_locked_rows(deploying_rows)
+        return deploying_rows
+    deploying_rows = _deploying_scope_rows(footprint) if capture_deploying else ()
+    _lock_rows(tuple(set(footprint.overlay_rows) | set(deploying_rows)), level=8, ranks=OVERLAY_MODEL_RANKS)
+    return _still_deploying_rows(deploying_rows)
+
+
+def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -> None:
+    """Upgrade a locked read transaction when its body proves a content delta."""
+    if not permit.detect_reconcile_content:
+        raise IntentMutationProtocolError("read-side content mutation requires a predicted reconcile plan")
+    prelocked_rows = set(permit.footprint.overlay_rows)
+    missing_rows = {row for row in requested.overlay_rows if row.pk is not None and row not in prelocked_rows}
+    if missing_rows:
+        details = sorted((row.model_label, repr(row.pk)) for row in missing_rows)
+        raise IntentMutationProtocolError(f"detected reconcile content rows were not prelocked: {details!r}")
+    from .outbox import bump_intent_revision
+
+    for device_id, scope in permit.footprint.revision_keys:
+        bump_intent_revision(device_id, scope)
+    permit.deferred_repend_rows = permit.initial_deploying_rows
+    permit.dml_kind = "content"
+    permit.bump_revisions = True
+    permit.detect_reconcile_content = False
+
+
+def _join_active_permit(
+    footprint: MutationFootprint,
+    *,
+    settles_deploying: bool,
+) -> _Permit | None:
+    """Join a covering permit and retain the strictest reconcile settlement rule."""
+    active = _ACTIVE_PERMIT.get()
+    if active is None:
+        return None
+    if not active.footprint.covers(footprint):
+        raise IntentMutationProtocolError("an active mutation footprint cannot expand")
+    active.settles_deploying = active.settles_deploying and settles_deploying
+    return active
 
 
 @contextlib.contextmanager
-def intent_transaction(footprint: MutationFootprint, *, settles_deploying: bool = True):
-    """Acquire L2-L8, bump at L7, then grant the immutable L9 write permit."""
+def _intent_transaction(
+    footprint: MutationFootprint,
+    *,
+    defer_repend: bool = False,
+    settles_deploying: bool = True,
+):
+    """Acquire one content permit, optionally forcing its re-pend at body exit."""
     _discard_rolled_back_implicit_permit()
-    active = _ACTIVE_PERMIT.get()
+    active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
-        if not active.footprint.covers(footprint):
-            raise IntentMutationProtocolError("an active mutation footprint cannot expand")
         yield active
         return
     from .apply_state import lock_order_scope
 
     with transaction.atomic(), lock_order_scope():
-        permit = _Permit(footprint=footprint, dml_kind="content")
+        permit = _Permit(
+            footprint=footprint,
+            dml_kind="content",
+            settles_deploying=settles_deploying,
+        )
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint, settles_deploying=settles_deploying)
+            deploying_rows = _acquire(footprint, defer_repend=defer_repend)
             yield permit
+            if defer_repend and permit.settles_deploying and deploying_rows:
+                _repend_locked_rows(deploying_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
 
 
 @contextlib.contextmanager
-def mirror_transaction(footprint: MutationFootprint):
+def intent_transaction(footprint: MutationFootprint):
+    """Acquire L2-L8, bump at L7, then grant the immutable L9 write permit."""
+    with _intent_transaction(footprint) as permit:
+        yield permit
+
+
+@contextlib.contextmanager
+def mirror_transaction(
+    footprint: MutationFootprint,
+    *,
+    detect_content_changes: bool = False,
+    settles_deploying: bool = True,
+):
     """Acquire a complete read-side footprint without advancing intent identity."""
     _discard_rolled_back_implicit_permit()
-    active = _ACTIVE_PERMIT.get()
+    active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
-        if not active.footprint.covers(footprint):
-            raise IntentMutationProtocolError("an active mutation footprint cannot expand")
         yield active
         return
     from .apply_state import lock_order_scope
 
     with transaction.atomic(), lock_order_scope():
-        permit = _Permit(footprint=footprint, dml_kind="reconcile")
+        permit = _Permit(
+            footprint=footprint,
+            dml_kind="reconcile",
+            detect_reconcile_content=detect_content_changes,
+            settles_deploying=settles_deploying,
+        )
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint, bump=False)
+            permit.initial_deploying_rows = _acquire(
+                footprint,
+                bump=False,
+                capture_deploying=detect_content_changes,
+            )
             yield permit
+            if permit.settles_deploying and permit.deferred_repend_rows:
+                _repend_locked_rows(permit.deferred_repend_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
 
@@ -1817,9 +2006,17 @@ def mirror_transaction(footprint: MutationFootprint):
 def reconcile_transaction(plan: ReconcileMutationPlan):
     """Acquire a read plan with the permit required by its canonical fragment delta."""
     if plan.changes_content:
-        mutation = intent_transaction(plan.footprint, settles_deploying=plan.settles_deploying)
+        mutation = _intent_transaction(
+            plan.footprint,
+            defer_repend=True,
+            settles_deploying=plan.settles_deploying,
+        )
     else:
-        mutation = mirror_transaction(plan.footprint)
+        mutation = mirror_transaction(
+            plan.footprint,
+            detect_content_changes=plan.detect_content_changes,
+            settles_deploying=plan.settles_deploying,
+        )
     with mutation as permit:
         if plan.validate_after_acquire is not None:
             plan.validate_after_acquire()
@@ -1941,6 +2138,29 @@ def _authorize_dml(permit: _Permit, table: str) -> None:
     permit.authorized_dml[table] = permit.authorized_dml.get(table, 0) + 1
 
 
+@contextlib.contextmanager
+def reconcile_cascade_dml(model):
+    """Authorize one framework cascade statement inside a covered read transaction."""
+    permit = _ACTIVE_PERMIT.get()
+    if permit is None or permit.dml_kind != "reconcile":
+        yield
+        return
+    label = model._meta.label_lower
+    footprint_rows = (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
+    if not any(row.model_label == label for row in footprint_rows):
+        raise IntentMutationProtocolError(f"reconcile cascade table {label!r} is outside the active footprint")
+    table = model._meta.db_table
+    previous = permit.authorized_dml.get(table, 0)
+    _authorize_dml(permit, table)
+    try:
+        yield
+    finally:
+        if previous:
+            permit.authorized_dml[table] = previous
+        else:
+            permit.authorized_dml.pop(table, None)
+
+
 def _content_permit_covers(instance, spec: RendererInputSpec, permit: _Permit) -> bool:
     row = SourceRow(instance._meta.label_lower, instance.pk)
     future = SourceRow(instance._meta.label_lower, None)
@@ -2056,10 +2276,17 @@ def _suppressed_permit(instance, spec, before, after, update_fields, footprint_o
             raise IntentMutationProtocolError(
                 f"suppressed {instance._meta.label_lower} write requires content_mutation or mirror_refresh"
             )
-    if before != after or not declared_mirror:
+    if before != after:
         return _Permit(
             footprint=footprint_override or footprint_for_instance(instance, spec),
             dml_kind="content",
+            implicit=True,
+        )
+    if not declared_mirror:
+        return _Permit(
+            footprint=footprint_override or footprint_for_instance(instance, spec),
+            dml_kind="content",
+            bump_revisions=False,
             implicit=True,
         )
     if footprint := _secondary_dml_footprint(instance, spec):
@@ -2100,7 +2327,16 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
         before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
         after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
         if before != after:
-            raise IntentMutationProtocolError(f"read-side {sender._meta.label_lower} write changes rendered content")
+            if active.detect_reconcile_content and sender._meta.label_lower in OVERLAY_MODEL_RANKS:
+                requested = MutationFootprint.for_keys(
+                    active.footprint.revision_keys,
+                    overlay_rows=(SourceRow(sender._meta.label_lower, instance.pk),),
+                )
+                _upgrade_detected_reconcile(active, requested)
+            else:
+                raise IntentMutationProtocolError(
+                    f"read-side {sender._meta.label_lower} write changes rendered content"
+                )
     elif not _content_permit_covers(instance, spec, active):
         before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
         after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
@@ -2156,7 +2392,7 @@ def _begin_implicit(
             footprint_override,
         )
     else:
-        proposed_footprint = footprint_for_instance(instance, spec)
+        proposed_footprint = footprint_override or footprint_for_instance(instance, spec)
         benign_insert = _benign_unrendered_insert(instance, before, after)
     if (
         not _is_intent_push_suppressed()
@@ -2164,7 +2400,9 @@ def _begin_implicit(
         and not (instance._state.adding and proposed_footprint.overlay_rows and not benign_insert)
     ):
         benign_footprint = MutationFootprint() if benign_insert else proposed_footprint
-        secondary_footprint = None if benign_insert else _secondary_dml_footprint(instance, spec)
+        secondary_footprint = (
+            None if benign_insert or footprint_override is not None else _secondary_dml_footprint(instance, spec)
+        )
         if secondary_footprint is not None or benign_footprint.shared_keys or benign_footprint.overlay_rows:
             permit = _Permit(
                 footprint=secondary_footprint or benign_footprint,
@@ -2191,8 +2429,7 @@ def _begin_implicit(
                 implicit=True,
             )
     elif not _is_intent_push_suppressed():
-        footprint = footprint_override or footprint_for_instance(instance, spec)
-        permit = _Permit(footprint=footprint, dml_kind="content", implicit=True)
+        permit = _Permit(footprint=proposed_footprint, dml_kind="content", implicit=True)
     token = _ACTIVE_PERMIT.set(permit)
     if transaction.get_connection().atomic_blocks:
         permit.atomic_block_id = id(transaction.get_connection().atomic_blocks[-1])
@@ -2410,8 +2647,12 @@ def _live_pool_markers(connection) -> frozenset[tuple]:
     return live
 
 
-def _is_pool_delete_cascade(statement, params, connection) -> bool:
+def _is_pool_delete_cascade(spec, touched_columns, statement, params, connection) -> bool:
     """Report whether this is the collector's SET_NULL update for a pool being deleted."""
+    if spec.model_label != "netbox_nso_plugin.nsointerfaceipstate":
+        return False
+    if touched_columns != frozenset({"source_pool_id"}):
+        return False
     entries = _live_pool_markers(connection)
     match = _SOURCE_POOL_CASCADE.search(statement)
     if not entries or match is None:
@@ -2431,61 +2672,78 @@ def _is_pool_delete_cascade(statement, params, connection) -> bool:
     return bool(targets) and targets <= marked
 
 
-def _dml_guard(execute, sql, params, many, context):
-    statement = str(sql)
-    match = _DML_TABLE.match(statement)
-    if match is None or match.group("table") not in _TABLE_REGISTRY:
-        return execute(sql, params, many, context)
-    if _MIGRATIONS_ACTIVE.get():
-        return execute(sql, params, many, context)
-    permit = _ACTIVE_PERMIT.get()
-    table = match.group("table")
-    spec = _TABLE_REGISTRY[table]
-    touched_columns = _dml_columns(statement, match)
-    guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
-    content_columns = {spec.model._meta.get_field(field_name).column for field_name in guarded_fields}
-    if touched_columns is not None and touched_columns.isdisjoint(content_columns):
-        return execute(sql, params, many, context)
-    if permit is not None and permit.dml_kind == "offline":
-        return execute(sql, params, many, context)
-    remaining = 0 if permit is None else permit.authorized_dml.get(table, 0)
-    footprint_tables = set()
-    if permit is not None and permit.dml_kind == "content":
-        footprint_tables = {
-            apps.get_model(row.model_label)._meta.db_table
-            for row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
-        }
-        if permit.footprint.device_ids:
-            footprint_tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
-    interface_assignment_cascade = (
-        spec.model_label == "ipam.ipaddress"
-        and (touched_columns is None or touched_columns <= {"assigned_object_type_id", "assigned_object_id"})
-        and permit is not None
-        and permit.dml_kind == "content"
-        and any(row.model_label == "dcim.interface" for row in permit.footprint.source_rows)
-    )
-    # The pool pointer is an audit trail, not part of the pushed IP intent.
-    source_pool_cascade = (
-        spec.model_label == "netbox_nso_plugin.nsointerfaceipstate"
-        and touched_columns == frozenset({"source_pool_id"})
-        and _is_pool_delete_cascade(statement, params, context["connection"])
-    )
-    if interface_assignment_cascade or source_pool_cascade:
-        return execute(sql, params, many, context)
-    if remaining < 1 and table not in footprint_tables:
-        _clear_failed_implicit_permit(permit)
-        raise IntentMutationProtocolError(
-            f"bulk/raw DML on renderer input {table} requires an exact content_mutation permit; "
-            f"active={getattr(permit, 'dml_kind', None)!r}, columns={sorted(touched_columns or ())!r}, "
-            f"tables={sorted(footprint_tables)!r}"
-        )
-    if remaining:
-        permit.authorized_dml[table] = remaining - 1
+def _execute_with_permit_cleanup(execute, sql, params, many, context, permit):
+    """Execute SQL and retire an implicit permit when the database rejects it."""
     try:
         return execute(sql, params, many, context)
     except Exception:
         _clear_failed_implicit_permit(permit)
         raise
+
+
+def _permit_footprint_tables(permit) -> set[str]:
+    """Tables a content permit already authorizes through its footprint."""
+    if permit is None or permit.dml_kind != "content":
+        return set()
+    tables = {
+        apps.get_model(row.model_label)._meta.db_table
+        for row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
+    }
+    if permit.footprint.device_ids:
+        tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
+    return tables
+
+
+def _dml_guard(execute, sql, params, many, context):
+    statement = str(sql)
+    if _MIGRATIONS_ACTIVE.get():
+        return execute(sql, params, many, context)
+    lowered_statement = statement.lower()
+    if not any(table in lowered_statement for table in _registered_table_names()):
+        return execute(sql, params, many, context)
+    first_keyword = _FIRST_SQL_KEYWORD.match(statement)
+    if first_keyword is not None and first_keyword.group(1).upper() in _DML_PARSE_SKIP_KEYWORDS:
+        return execute(sql, params, many, context)
+    target, unparseable = _parse_dml_target(statement)
+    if target is None:
+        mentioned = _mentioned_registered_tables(statement)
+        if unparseable and mentioned:
+            raise IntentMutationProtocolError(f"unparseable SQL mentions renderer input tables {sorted(mentioned)!r}")
+        return execute(sql, params, many, context)
+    if target.table not in _TABLE_REGISTRY:
+        return execute(sql, params, many, context)
+    touched_columns = _dml_columns(statement, target.operation)
+    permit = _ACTIVE_PERMIT.get()
+    if target.operation == "INSERT INTO" and touched_columns == frozenset():
+        if permit is None:
+            # drift signal: this creation skips the pre_save bookkeeping (revision bump, re-pend)
+            logger.warning("unpermitted creation on renderer input %s proceeded without bookkeeping", target.table)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
+    table = target.table
+    spec = _TABLE_REGISTRY[table]
+    guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
+    content_columns = {spec.model._meta.get_field(field_name).column for field_name in guarded_fields}
+    if touched_columns and touched_columns.isdisjoint(content_columns):
+        return execute(sql, params, many, context)
+    if permit is not None and permit.dml_kind == "offline":
+        return execute(sql, params, many, context)
+    # source_pool is a declared content field, so the column-aware admission cannot reach the
+    # collector's SET_NULL update: the pool pointer is an audit trail, not pushed IP intent.
+    if _is_pool_delete_cascade(spec, touched_columns, statement, params, context["connection"]):
+        return execute(sql, params, many, context)
+    remaining = 0 if permit is None else permit.authorized_dml.get(table, 0)
+    footprint_tables = _permit_footprint_tables(permit)
+    if remaining < 1 and table not in footprint_tables:
+        column_detail = "unknown" if touched_columns is None else sorted(touched_columns)
+        _clear_failed_implicit_permit(permit)
+        raise IntentMutationProtocolError(
+            f"bulk/raw DML on renderer input {table} requires an exact content_mutation permit; "
+            f"active={getattr(permit, 'dml_kind', None)!r}, columns={column_detail!r}, "
+            f"tables={sorted(footprint_tables)!r}"
+        )
+    if remaining:
+        permit.authorized_dml[table] = remaining - 1
+    return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
 
 
 def _clear_failed_implicit_permit(permit) -> None:
@@ -2498,18 +2756,206 @@ def _clear_failed_implicit_permit(permit) -> None:
     _ACTIVE_PERMIT.reset(token)
 
 
-def _dml_columns(statement: str, match) -> frozenset[str] | None:
-    """Return columns written by generated UPDATE/INSERT SQL, or None for DELETE/unknown."""
-    operation = re.sub(r"\s+", " ", match.group("operation").upper())
-    tail = statement[match.end() :]
+@functools.lru_cache(maxsize=512)
+def _parse_dml_target(statement: str) -> tuple[_DMLTarget | None, bool]:
+    """Return one parsed mutation target and whether classification failed."""
+    parsed = sqlparse.parse(statement)
+    if len(parsed) != 1:
+        classified = [_parse_dml_target(str(candidate)) for candidate in parsed]
+        return None, any(target is not None or unparseable for target, unparseable in classified)
+    parsed_statement = parsed[0]
+    statement_type = parsed_statement.get_type().upper()
+    operations = {
+        "UPDATE": ("UPDATE", "UPDATE"),
+        "INSERT": ("INSERT INTO", "INTO"),
+        "DELETE": ("DELETE FROM", "FROM"),
+    }
+    operation = operations.get(statement_type)
+    if operation is None:
+        flattened = tuple(
+            token for token in parsed_statement.flatten() if not token.is_whitespace and token.ttype not in Comment
+        )
+        mutation_tokens = tuple(
+            (index, token)
+            for index, token in enumerate(flattened)
+            if token.ttype in sqlparse.tokens.DML and token.normalized in {"UPDATE", "INSERT", "DELETE", "MERGE"}
+        )
+        if statement_type == "SELECT":
+            lock_prefixes = (("FOR",), ("FOR", "NO", "KEY"))
+
+            def is_locking_update(index, token) -> bool:
+                if token.normalized != "UPDATE":
+                    return False
+                return any(
+                    tuple(candidate.normalized for candidate in flattened[index - len(prefix) : index]) == prefix
+                    for prefix in lock_prefixes
+                    if index >= len(prefix)
+                )
+
+            return None, any(not is_locking_update(index, token) for index, token in mutation_tokens)
+        return None, bool(mutation_tokens)
+    operation_name, anchor = operation
+    tokens = _sql_tokens(parsed_statement)
+    anchor_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if (anchor == "UPDATE" and token.ttype in sqlparse.tokens.DML and token.normalized == anchor)
+            or (anchor != "UPDATE" and token.ttype in Keyword and token.normalized == anchor)
+        ),
+        None,
+    )
+    if anchor_index is None:
+        return None, True
+    target_token = next(
+        (token for token in tokens[anchor_index + 1 :] if not (token.ttype in Keyword and token.normalized == "ONLY")),
+        None,
+    )
+    if not isinstance(target_token, Identifier | Function) or (
+        isinstance(target_token, Function) and operation_name != "INSERT INTO"
+    ):
+        return None, True
+    if not target_token.get_real_name():
+        return None, True
+    return _DMLTarget(operation_name, _postgres_identifier_name(target_token)), False
+
+
+def _postgres_identifier_name(identifier: Identifier | Function) -> str:
+    """Return one identifier with PostgreSQL's unquoted case folding applied."""
+    real_name = identifier.get_real_name()
+    for token in identifier.tokens:
+        if token.ttype == Literal.String.Symbol:
+            quoted = token.value[1:-1].replace('""', '"')
+            if quoted == real_name:
+                return quoted
+    return real_name.lower()
+
+
+def _mentioned_registered_tables(statement: str) -> set[str]:
+    """Return registered table names present in otherwise unclassified SQL."""
+    return {
+        table
+        for table in _TABLE_REGISTRY
+        if re.search(rf'(?<![A-Za-z0-9_])"?{re.escape(table)}"?(?![A-Za-z0-9_])', statement, re.IGNORECASE)
+    }
+
+
+@functools.lru_cache(maxsize=512)
+def _dml_columns(statement: str, operation: str) -> frozenset[str] | None:
+    """Return columns that can mutate existing rows, or None when they are unknown."""
+    if operation == "DELETE FROM":
+        return None
+    parsed = sqlparse.parse(statement)
+    if len(parsed) != 1:
+        return None
+    tokens = _sql_tokens(parsed[0])
     if operation == "UPDATE":
-        set_clause = re.split(r"\s+WHERE\s+", tail, maxsplit=1, flags=re.IGNORECASE)[0]
-        return frozenset(re.findall(r'"(?P<column>[A-Za-z0-9_]+)"\s*=', set_clause))
+        set_index = next(
+            (index for index, token in enumerate(tokens) if token.ttype in Keyword and token.normalized == "SET"),
+            None,
+        )
+        if set_index is None or set_index + 1 >= len(tokens):
+            return None
+        assignments = tokens[set_index + 1]
+        if isinstance(assignments, Comparison):
+            comparisons = (assignments,)
+        elif isinstance(assignments, IdentifierList):
+            comparisons = tuple(assignments.get_identifiers())
+        else:
+            return None
+        columns = tuple(_comparison_column(comparison) for comparison in comparisons)
+        return None if not columns or any(column is None for column in columns) else frozenset(columns)
     if operation == "INSERT INTO":
-        columns = re.match(r"\s*\((?P<columns>[^)]*)\)\s*VALUES\b", tail, re.IGNORECASE)
-        if columns is not None:
-            return frozenset(re.findall(r'"(?P<column>[A-Za-z0-9_]+)"', columns.group("columns")))
+        return _insert_update_columns(parsed[0])
     return None
+
+
+def _insert_update_columns(statement) -> frozenset[str] | None:
+    """Return ON CONFLICT DO UPDATE columns, with an empty set for creation."""
+    tokens = tuple(token for token in statement.flatten() if not token.is_whitespace and token.ttype not in Comment)
+    conflict_index = next(
+        (
+            index
+            for index in range(len(tokens) - 1)
+            if tokens[index].normalized == "ON" and tokens[index + 1].normalized == "CONFLICT"
+        ),
+        None,
+    )
+    if conflict_index is None:
+        return frozenset()
+    do_index = next(
+        (index for index in range(conflict_index + 2, len(tokens)) if tokens[index].normalized == "DO"),
+        None,
+    )
+    if do_index is None or do_index + 1 >= len(tokens):
+        return None
+    if tokens[do_index + 1].normalized == "NOTHING":
+        return frozenset()
+    if (
+        tokens[do_index + 1].normalized != "UPDATE"
+        or do_index + 2 >= len(tokens)
+        or tokens[do_index + 2].normalized != "SET"
+    ):
+        return None
+    return _flattened_assignment_columns(tokens[do_index + 3 :])
+
+
+def _flattened_assignment_columns(tokens) -> frozenset[str] | None:
+    """Return columns from a flattened PostgreSQL assignment list."""
+    columns = []
+    index = 0
+    while index < len(tokens):
+        column = _postgres_column_token_name(tokens[index])
+        if column is None or index + 1 >= len(tokens) or tokens[index + 1].value != "=":
+            return None
+        columns.append(column)
+        index += 2
+        expression_started = False
+        depth = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if depth == 0 and token.ttype in Keyword and token.normalized in {"WHERE", "RETURNING"}:
+                return frozenset(columns) if expression_started else None
+            if depth == 0 and token.value == ",":
+                if not expression_started:
+                    return None
+                index += 1
+                break
+            if token.value in {"(", "[", "{"}:
+                depth += 1
+            elif token.value in {")", "]", "}"}:
+                depth -= 1
+                if depth < 0:
+                    return None
+            expression_started = True
+            index += 1
+        else:
+            return frozenset(columns) if expression_started and depth == 0 else None
+    return None
+
+
+def _postgres_column_token_name(token) -> str | None:
+    """Return one PostgreSQL assignment column with case folding applied."""
+    if token.ttype == Literal.String.Symbol:
+        return token.value[1:-1].replace('""', '"')
+    if token.ttype in sqlparse.tokens.Name:
+        return token.value.lower()
+    return None
+
+
+def _comparison_column(comparison) -> str | None:
+    """Return the column assigned by one parsed UPDATE comparison."""
+    if not isinstance(comparison, Comparison):
+        return None
+    tokens = _sql_tokens(comparison)
+    if len(tokens) < 3 or tokens[1].value != "=" or not isinstance(tokens[0], Identifier):
+        return None
+    return _postgres_identifier_name(tokens[0])
+
+
+def _sql_tokens(group) -> tuple:
+    """Return significant direct children from one parsed SQL token group."""
+    return tuple(token for token in group.tokens if not token.is_whitespace and token.ttype not in Comment)
 
 
 def _install_guard(connection, **kwargs):
@@ -2563,6 +3009,7 @@ def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = Tru
     )
     _REGISTRY[label] = normalized
     _TABLE_REGISTRY[model._meta.db_table] = normalized
+    _registered_table_names.cache_clear()
     uid = f"nso_intent_guard_{label}"
     pre_save.connect(_begin_implicit, sender=model, dispatch_uid=f"{uid}_pre_save", weak=False)
     pre_delete.connect(_begin_delete_implicit, sender=model, dispatch_uid=f"{uid}_pre_delete", weak=False)

@@ -152,6 +152,8 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
 
+        from ._outbox_case import mirror_update
+
         state = self._state(l2_mtu=9000, status="deploying")
         attempt_id = state.apply_attempt_id
         other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
@@ -169,6 +171,9 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
             ]
         }
         non_matching_with_content_delta = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]}
+        mirror_update(state, status="deploying", apply_attempt_id=attempt_id)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),

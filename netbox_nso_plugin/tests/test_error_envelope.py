@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
+from django.conf import settings
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from ipam.models import IPAddress
@@ -26,6 +27,7 @@ from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOPlatformNedMapping
 
 from ._adapter_http import make_response
+from ._outbox_case import mirror_update
 from .test_django_views import ViewTestBase
 
 # Shaped like something that must never be echoed to a client: a requests transport error
@@ -42,7 +44,8 @@ _AJAX = {"HTTP_X_REQUESTED_WITH": "XMLHttpRequest"}
 _PUBLIC_ADAPTER_ERROR = "The NSO adapter request failed. See the server log."
 _PUBLIC_INVALID_RESPONSE = "The NSO adapter returned an invalid response. See the server log."
 _PLUGINS_CONFIG = {
-    "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"}
+    **settings.PLUGINS_CONFIG,
+    "netbox_nso_plugin": {"adapter_url": "http://adapter.invalid", "adapter_token": "envelope-test-token"},
 }
 
 
@@ -148,8 +151,8 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
-        # A queryset write, so the post_save adapter push does not fire during fixture setup.
-        NSODeviceManagement.objects.filter(pk=cls.mgmt.pk).update(adapter_device_id=4242)
+        # A suppressed mirror write, so the post_save adapter push does not fire during fixture setup.
+        mirror_update(cls.mgmt, adapter_device_id=4242)
         cls.mgmt.refresh_from_db()
 
     def _url(self, name, **kwargs):
@@ -196,9 +199,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
 
     def test_onboard_status_poll_reports_a_fixed_public_error(self):
         """A transient adapter outage while polling keeps the row provisioning, with no leak."""
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-            onboard_status="provisioning", onboard_job_id="job-42"
-        )
+        mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
 
         with self.assertLogs(_ADAPTER_LOG, level="WARNING"):
             resp = self.client.post(self._url("onboard_status", pk=self.mgmt.pk), **_AJAX)
@@ -391,7 +392,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
-        NSODeviceManagement.objects.filter(pk=cls.mgmt.pk).update(adapter_device_id=4242)
+        mirror_update(cls.mgmt, adapter_device_id=4242)
         cls.mgmt.refresh_from_db()
 
     def setUp(self):
@@ -426,9 +427,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
         """
         from netbox_nso_plugin.onboarding import advance_provisioning
 
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-            onboard_status="provisioning", onboard_job_id="job-42"
-        )
+        mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
         self.mgmt.refresh_from_db()
 
         result = advance_provisioning(self.mgmt)

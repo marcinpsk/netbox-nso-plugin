@@ -5,14 +5,23 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-GENERATION_STATUSES = frozenset({"pending", "running", "settled", "failed", "outcome_unknown", "abandoned"})
+LOST_RESPONSE_REPLAY_WINDOW = timedelta(days=1)
+
+GENERATION_DISPOSITIONS = {
+    "pending": "waiting",
+    "running": "waiting",
+    "settled": "settled",
+    "failed": "blocked",
+    "outcome_unknown": "blocked",
+    "abandoned": "abandoned",
+}
 _ATTEMPT_FIELDS = frozenset({"apply_attempt_id", "admission_state", "http_status", "response", "generations"})
 _GENERATION_FIELDS = frozenset(
     {
@@ -36,17 +45,12 @@ class EvidenceInvariantError(RuntimeError):
 
 def _generation_disposition(status: str) -> str:
     """Classify every status in the adapter's exhaustive OpenAPI enum."""
-    match status:
-        case "pending" | "running":
-            return "waiting"
-        case "settled":
-            return "settled"
-        case "failed" | "outcome_unknown":
-            return "blocked"
-        case "abandoned":
-            return "abandoned"
-        case _:
-            raise EvidenceInvariantError(f"unknown generation status {status!r}")
+    if type(status) is not str:
+        raise EvidenceInvariantError(f"unknown generation status {status!r}")
+    try:
+        return GENERATION_DISPOSITIONS[status]
+    except KeyError:
+        raise EvidenceInvariantError(f"unknown generation status {status!r}") from None
 
 
 def _positive_int(value) -> bool:
@@ -68,6 +72,8 @@ def _validate_generation(raw) -> dict:
         raise EvidenceInvariantError("deployment evidence generation has an invalid shape")
     if not _positive_int(raw["generation_id"]) or not _positive_int(raw["seq"]):
         raise EvidenceInvariantError("deployment evidence generation has an invalid identity")
+    if type(raw["status"]) is not str:
+        raise EvidenceInvariantError("deployment evidence generation has an invalid status")
     _generation_disposition(raw["status"])
     if (
         not isinstance(raw["sections"], list)
@@ -218,15 +224,31 @@ def _load_attempts(management, deployment_evidence, rows_by_scope, required_atte
     raw_attempts = deployment_evidence["attempts"]
     if not isinstance(raw_attempts, list) or not isinstance(deployment_evidence["unknown_apply_attempt_ids"], list):
         raise EvidenceInvariantError("deployment evidence attempt collections are invalid")
-    attempt_ids = {row.apply_attempt_id for rows in rows_by_scope.values() for row in rows}
-    attempt_ids.update(required_attempt_ids)
-    local_attempts = NSOApplyAttempt.objects.in_bulk(attempt_ids)
-    validated = {}
+    raw_ids = []
     for raw in raw_attempts:
         try:
             raw_id = UUID(str(raw.get("apply_attempt_id")))
         except (TypeError, ValueError, AttributeError):
             raise EvidenceInvariantError("deployment evidence has an invalid attempt UUID") from None
+        raw_ids.append(raw_id)
+
+    unknown_ids = set()
+    for value in deployment_evidence["unknown_apply_attempt_ids"]:
+        try:
+            unknown_ids.add(UUID(str(value)))
+        except (TypeError, ValueError, AttributeError):
+            raise EvidenceInvariantError("deployment evidence has an invalid unknown attempt UUID") from None
+
+    attempt_ids = {row.apply_attempt_id for rows in rows_by_scope.values() for row in rows}
+    attempt_ids.update(required_attempt_ids)
+    attempt_ids.update(raw_ids)
+    attempt_ids.update(unknown_ids)
+    local_attempts = NSOApplyAttempt.objects.filter(
+        management=management,
+        pk__in=attempt_ids,
+    ).in_bulk()
+    validated = {}
+    for raw, raw_id in zip(raw_attempts, raw_ids, strict=True):
         local = local_attempts.get(raw_id)
         if local is None:
             continue
@@ -236,12 +258,6 @@ def _load_attempts(management, deployment_evidence, rows_by_scope, required_atte
             continue
         validated[raw_id] = _validate_attempt(raw, local)
 
-    unknown_ids = set()
-    for value in deployment_evidence["unknown_apply_attempt_ids"]:
-        try:
-            unknown_ids.add(UUID(str(value)))
-        except (TypeError, ValueError, AttributeError):
-            raise EvidenceInvariantError("deployment evidence has an invalid unknown attempt UUID") from None
     if unknown_ids & set(validated):
         raise EvidenceInvariantError("an Apply attempt is both known and unknown")
     return local_attempts, validated, unknown_ids
@@ -402,6 +418,22 @@ def route_policy_deploying_attempt_ids(management) -> tuple[UUID, ...]:
     return tuple(sorted(attempt_ids, key=str))
 
 
+def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
+    """Return referenced attempts plus local attempts whose response was lost."""
+    from .models import NSOApplyAttempt
+
+    attempt_ids = set(deploying_attempt_ids(management))
+    attempt_ids.update(
+        NSOApplyAttempt.objects.filter(
+            management=management,
+            adapter_device_id=management.adapter_device_id,
+            response__isnull=True,
+            created_at__gte=timezone.now() - LOST_RESPONSE_REPLAY_WINDOW,
+        ).values_list("pk", flat=True)
+    )
+    return tuple(sorted(attempt_ids, key=str))
+
+
 def _record_replay_answer(attempt, result=None, error=None) -> None:
     from .models import NSOApplyAttempt
 
@@ -430,7 +462,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     from .models import NSOApplyAttempt
 
     if attempt_ids is None:
-        attempt_ids = deploying_attempt_ids(management)
+        attempt_ids = deployment_evidence_attempt_ids(management)
     if not attempt_ids:
         return None
     evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
@@ -447,6 +479,8 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             "Adapter returned an invalid unknown attempt UUID.",
             code="invalid_response",
         ) from exc
+    if unknown - set(attempt_ids):
+        raise EvidenceInvariantError("deployment evidence names an unrequested unknown Apply attempt")
     replayed = False
     for attempt in NSOApplyAttempt.objects.filter(
         pk__in=unknown,
@@ -459,7 +493,8 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             if exc.status_code == 409 and exc.code == "conflict":
                 job_id = exc.detail.get("job_id") if isinstance(exc.detail, dict) else None
                 logger.info(
-                    "Apply replay for attempt %s is waiting for adapter job %s",
+                    "Apply replay for adapter device %s attempt %s is waiting for adapter job %s",
+                    management.adapter_device_id,
                     attempt.pk,
                     job_id,
                 )

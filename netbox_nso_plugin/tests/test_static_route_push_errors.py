@@ -374,8 +374,9 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
         from django.db.models.signals import pre_save
 
         from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.tests._outbox_case import mirror_update
 
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(intent_push_attempts={"static_route": 1})
+        mirror_update(self.mgmt, intent_push_attempts={"static_route": 1})
         stale = NSODeviceManagement.objects.get(pk=self.mgmt.pk)  # carries attempt 1
         stale.nso_device_name = "renamed-mid-race"
 
@@ -417,7 +418,7 @@ class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixi
                     cursor.execute("SELECT pg_backend_pid()")
                     writer_pid.append(cursor.fetchone()[0])
                 writer_running.set()
-                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(intent_push_attempts={"static_route": 9})
+                mirror_update(self.mgmt, intent_push_attempts={"static_route": 9})
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
                 errors.append(exc)
             finally:

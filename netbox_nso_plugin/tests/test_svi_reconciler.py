@@ -143,9 +143,15 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
+        in_flight_rows = tuple(
+            NSOSVIState.objects.filter(management=self.management, status="deploying").values_list(
+                "pk",
+                "apply_attempt_id",
+            )
+        )
         iface = Interface.objects.create(device=self.device, name=name, type="virtual")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
-        return NSOSVIState.objects.create(
+        state = NSOSVIState.objects.create(
             management=self.management,
             interface=iface,
             vlan=vlan,
@@ -154,6 +160,15 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
             status=status,
             apply_attempt_id=uuid4() if status == "deploying" else None,
         )
+        from ._outbox_case import mirror_update
+
+        for pk, apply_attempt_id in in_flight_rows:
+            mirror_update(
+                NSOSVIState.objects.get(pk=pk),
+                status="deploying",
+                apply_attempt_id=apply_attempt_id,
+            )
+        return state
 
     def test_reconcile_preserves_owned_status(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
@@ -209,6 +224,37 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "deploying")
         self.assertEqual(state.apply_attempt_id, attempt_id)
+
+    def test_predicted_scope_change_keeps_deploying_and_advances_revision(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin.intent_state import ReconcileMutationPlan, reconcile_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi, svi_reconcile_plan
+
+        from ._outbox_case import mirror_update
+
+        deploying = self._state(name="Vlan100", vid=100, status="accepted")
+        confirmed = self._state(name="Vlan200", vid=200, status="in_sync")
+        mirror_update(deploying, status="deploying", apply_attempt_id=uuid4())
+        attempt_id = deploying.apply_attempt_id
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="svi")
+        before = revision.revision
+        payload = {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]}
+        plan = svi_reconcile_plan(self.device, payload)
+        self.assertTrue(plan.changes_content)
+
+        outer_plan = ReconcileMutationPlan(plan.footprint, detect_content_changes=True)
+        with reconcile_transaction(outer_plan):
+            reconcile_svi(self.device, payload)
+
+        deploying.refresh_from_db()
+        confirmed.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(deploying.status, "deploying")
+        self.assertEqual(deploying.apply_attempt_id, attempt_id)
+        self.assertEqual(revision.revision, before + 1)
 
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned SVI overlay must NOT be hard-deleted when the device stops reporting it.

@@ -1508,6 +1508,117 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(outcome["result"].disposition, RAN)
         self.assertTrue(body_started.is_set())
 
+    def test_publication_error_and_operator_edit_follow_canonical_lock_order(self):
+        from dcim.models import Interface
+        from django.db import connection
+
+        from netbox_nso_plugin.apply_state import lock_order_scope
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInterfaceMtuState
+        from netbox_nso_plugin.read_gate import _gate_and_record, mark_publication_error_if_current
+        from netbox_nso_plugin.reconcile import _mark_scope_error
+        from netbox_nso_plugin.tests._outbox_case import without_commit_drain
+
+        with without_commit_drain(), transaction.atomic():
+            interface = Interface.objects.create(
+                device=self.mgmt.device,
+                name="Ethernet-publication-error",
+                type="1000base-t",
+            )
+            state = NSOInterfaceMtuState.objects.create(
+                management=self.mgmt,
+                interface=interface,
+                l2_mtu=1500,
+                status="imported",
+            )
+        decision = _gate_and_record(
+            self.mgmt,
+            "interface_mtu",
+            _rs(attempt_id=5),
+            epoch=self.epoch,
+        )
+
+        error_holds_level_five = threading.Event()
+        release_error = threading.Event()
+        operator_holds_level_four = threading.Event()
+        operator_waits_for_level_five = threading.Event()
+        errors = []
+        outcome = {}
+        management_table = NSODeviceManagement._meta.db_table
+
+        def mark_error():
+            error_holds_level_five.set()
+            if not release_error.wait(10):
+                raise AssertionError("the operator interleaving did not release the publication error")
+            _mark_scope_error(self.mgmt, ("NSOInterfaceMtuState",))
+
+        def publication_error():
+            try:
+                with lock_order_scope():
+                    outcome["marked"] = mark_publication_error_if_current(
+                        self.mgmt,
+                        "interface_mtu",
+                        decision,
+                        self.epoch,
+                        mark_error,
+                    )
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                _close_thread_db()
+
+        def operator_edit():
+            try:
+                if not error_holds_level_five.wait(10):
+                    raise AssertionError("the publication error did not lock its read state")
+                current = NSOInterfaceMtuState.objects.get(pk=state.pk)
+                current.l2_mtu = 1600
+
+                def observe_lock_order(execute, sql, params, many, context):
+                    statement = str(sql)
+                    if "pg_advisory_xact_lock" in statement:
+                        result = execute(sql, params, many, context)
+                        operator_holds_level_four.set()
+                        return result
+                    if f'FROM "{management_table}"' in statement and "FOR UPDATE" in statement:
+                        operator_waits_for_level_five.set()
+                    return execute(sql, params, many, context)
+
+                with (
+                    without_commit_drain(),
+                    connection.execute_wrapper(observe_lock_order),
+                    transaction.atomic(),
+                    lock_order_scope(),
+                ):
+                    current.save(update_fields=["l2_mtu"])
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                _close_thread_db()
+
+        error_worker = threading.Thread(target=publication_error)
+        operator_worker = threading.Thread(target=operator_edit)
+        error_worker.start()
+        operator_worker.start()
+        try:
+            self.assertTrue(error_holds_level_five.wait(10), "the publication error did not reach its callback")
+            if operator_holds_level_four.wait(2):
+                self.assertTrue(
+                    operator_waits_for_level_five.wait(5),
+                    "the operator did not reach the management-row lock",
+                )
+        finally:
+            release_error.set()
+            error_worker.join(20)
+            operator_worker.join(20)
+
+        self.assertFalse(error_worker.is_alive())
+        self.assertFalse(operator_worker.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertTrue(outcome["marked"])
+        state.refresh_from_db()
+        self.assertEqual(state.l2_mtu, 1600)
+
     def test_old_starts_new_finishes_old_resumes_cannot_overwrite(self):
         """A stalls with the lease past expiry; B (successor) applies attempt 6;
         A resumes with its stale attempt 5 → the gate refuses, applied stays 6,

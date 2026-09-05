@@ -274,7 +274,8 @@ class TestLinkReconcileCannotRestoreSourceState(_SyncCacheTestBase):
             patch("netbox_nso_plugin.adapter_client.sync_notify") as notify,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
+            with self.assertNoLogs("netbox_nso_plugin.sync_cache", level="ERROR"):
+                broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
 
         self.assertEqual((broken, attempted), (1, 0))
         onboard.assert_not_called()

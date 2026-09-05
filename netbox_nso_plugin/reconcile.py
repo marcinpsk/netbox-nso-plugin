@@ -1425,7 +1425,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     route_policy_adapter_device_id = ctx.pop(_ROUTE_POLICY_ADAPTER_DEVICE_ID, None)
     route_policy_evidence = None
     if route_policy_adapter_device_id is not None and route_policy_attempt_ids:
-        from .apply_settlement import deploying_attempt_ids, load_deployment_evidence
+        from .apply_settlement import deployment_evidence_attempt_ids, load_deployment_evidence
 
         evidence_management = NSODeviceManagement.objects.filter(
             device=device,
@@ -1434,7 +1434,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         if evidence_management is not None:
             requested_attempt_ids = tuple(
                 sorted(
-                    set(route_policy_attempt_ids) | set(deploying_attempt_ids(evidence_management)),
+                    set(route_policy_attempt_ids) | set(deployment_evidence_attempt_ids(evidence_management)),
                     key=str,
                 )
             )

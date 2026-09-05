@@ -570,8 +570,12 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(revision.revision, before + 1)
         self.assertTrue(sr.devices.filter(pk=self.device.pk).exists())  # association kept
 
-    def test_a_vanished_confirmed_route_repends_a_deploying_sibling(self):
-        """A vanished confirmed route bears content, so every deploying row in the scope is stale."""
+    def test_a_vanished_confirmed_route_keeps_a_deploying_sibling(self):
+        """The static-route plan opts out of the drift re-pend, so a deploying row keeps its attempt.
+
+        The vanished confirmed route still bears content, so the scope revision advances, but
+        ``settles_deploying=False`` on the static-route plan keeps the in-flight row untouched.
+        """
         from uuid import uuid4
 
         from netbox_routing.models import StaticRoute
@@ -600,7 +604,7 @@ class TestReconcileStaticRoutes(TestCase):
         confirmed.status = "in_sync"
         confirmed.save(update_fields=["status"])
         attempt_id = uuid4()
-        # Marked LAST, and lifecycle-only: a sibling content write re-pends a deploying row.
+        # Marked LAST, and lifecycle-only: only the read under test can move the row.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt_id)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
         before = revision.revision
@@ -614,8 +618,8 @@ class TestReconcileStaticRoutes(TestCase):
         deploying.refresh_from_db()
         confirmed.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(deploying.status, "accepted")
-        self.assertIsNone(deploying.apply_attempt_id)
+        self.assertEqual(deploying.status, "deploying")
+        self.assertEqual(deploying.apply_attempt_id, attempt_id)
         self.assertEqual(confirmed.status, "changed")
         self.assertEqual(revision.revision, before + 1)
 

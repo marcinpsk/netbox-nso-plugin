@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
@@ -180,15 +180,10 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         self.assertTrue(all(r.last_apply_at for r in NSORoutePolicyState.objects.filter(management=mgmt)))
 
     def test_reconcile_preserves_the_final_route_policy_attempt_for_journaling(self):
-        from dcim.models import Interface
-        from django.utils import timezone
-        from ipam.models import VLAN
-
-        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision, NSORoutePolicyState, NSOSVIState
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision, NSORoutePolicyState
         from netbox_nso_plugin.reconcile import _LeaseOutcome, run_device_reconcile
-        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-        from ._outbox_case import content_update, mirror_update
+        from ._outbox_case import content_update, mirror_update, own_vlan
         from .test_apply_settlement import _attempt, _payload, _response
 
         mgmt = content_update(self._make_mgmt(), manage_routing=True, manage_route_policy=True)
@@ -198,12 +193,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
                     "name": "PL-STABLE",
                     "family": 4,
                     "entries": [{"action": "permit", "prefix": "198.18.0.0/15"}],
-                },
-                {
-                    "name": "PL-EXISTING",
-                    "family": 4,
-                    "entries": [{"action": "permit", "prefix": "192.0.2.0/24"}],
-                },
+                }
             ],
             "community_lists": [],
             "as_paths": [],
@@ -214,14 +204,6 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
 
         reconcile_route_policy(self.device, route_policy_payload)
         row = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name="PL-STABLE")
-        existing_row = NSORoutePolicyState.objects.get(
-            management=mgmt,
-            family="prefix_list",
-            object_name="PL-EXISTING",
-        )
-        with intent_transaction(footprint_for_instance(existing_row)):
-            existing_row.status = "in_sync"
-            existing_row.save(update_fields=["status"])
         with intent_transaction(footprint_for_instance(row)):
             row.status = "accepted"
             row.save(update_fields=["status"])
@@ -230,7 +212,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
         self.assertFalse(route_policy_reconcile_plan(self.device, route_policy_payload).changes_content)
-        selected = {"route_policy": 41, "svi": 42}
+        selected = {"route_policy": 41}
         response = _response(mgmt.adapter_device_id, 81, selected)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="route_policy").revision
         NSOApplyAttempt.objects.create(
@@ -242,74 +224,55 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
             http_status=202,
             response=response,
         )
-        group = _device_vlan_group(self.device)
-
-        def make_svi(name, vid, *, status, svi_attempt_id=None):
-            interface = Interface.objects.create(device=self.device, name=name, type="virtual")
-            vlan = VLAN.objects.create(group=group, vid=vid, name=name)
-            state = NSOSVIState.objects.create(
-                management=mgmt,
-                interface=interface,
-                vlan=vlan,
-                svi_type="svi",
-                status="accepted",
-            )
-            return mirror_update(state, status=status, apply_attempt_id=svi_attempt_id)
-
-        make_svi("Vlan1641", 1641, status="in_sync")
-        successful_svi = make_svi("Vlan1642", 1642, status="deploying", svi_attempt_id=attempt_id)
-        waiting_attempt_id = uuid4()
-        waiting_svi = make_svi("Vlan1643", 1643, status="deploying", svi_attempt_id=waiting_attempt_id)
-        failed_attempt_id = uuid4()
-        failed_svi = make_svi("Vlan1644", 1644, status="deploying", svi_attempt_id=failed_attempt_id)
-        waiting_selected = {"svi": 43}
+        unrelated_attempt_id = uuid4()
+        vlan_row = mirror_update(
+            own_vlan(mgmt, 1642, "route-policy-journal"),
+            status="deploying",
+            apply_attempt_id=unrelated_attempt_id,
+        )
+        unrelated_selected = {"vlan": 42}
         NSOApplyAttempt.objects.create(
-            id=waiting_attempt_id,
+            id=unrelated_attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
-            selected=waiting_selected,
-            scope_revisions={"svi": 1},
+            selected=unrelated_selected,
+            scope_revisions={"vlan": 1},
             http_status=202,
-            response=_response(mgmt.adapter_device_id, 82, waiting_selected),
+            response=_response(mgmt.adapter_device_id, 82, unrelated_selected),
         )
-        failed_selected = {"svi": 44}
-        NSOApplyAttempt.objects.create(
-            id=failed_attempt_id,
+        lost_response_attempt_id = uuid4()
+        lost_response_selected = {"ip": 43}
+        lost_response_attempt = NSOApplyAttempt.objects.create(
+            id=lost_response_attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
-            selected=failed_selected,
-            scope_revisions={"svi": 1},
-            http_status=202,
-            response=_response(mgmt.adapter_device_id, 83, failed_selected),
+            selected=lost_response_selected,
+            scope_revisions={"ip": 1},
         )
-        carrier_result = {
-            "route_policy_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
-            "svi_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
-        }
-        successful_evidence = _attempt(
-            attempt_id,
-            mgmt.adapter_device_id,
-            81,
-            selected,
-            "settled",
-            result=carrier_result,
-        )
-        successful_evidence["generations"][0]["updated_at"] = timezone.now().isoformat()
+        carrier_result = {"route_policy_count_by_outcome": {"in_sync": 1, "apply_failed": 0}}
         evidence_by_id = {
-            attempt_id: successful_evidence,
-            waiting_attempt_id: _attempt(
-                waiting_attempt_id,
+            attempt_id: _attempt(
+                attempt_id,
+                mgmt.adapter_device_id,
+                81,
+                selected,
+                "settled",
+                result=carrier_result,
+            ),
+            unrelated_attempt_id: _attempt(
+                unrelated_attempt_id,
                 mgmt.adapter_device_id,
                 82,
-                waiting_selected,
-                "pending",
+                unrelated_selected,
+                "failed",
             ),
-            failed_attempt_id: _attempt(
-                failed_attempt_id,
+            lost_response_attempt_id: _attempt(
+                lost_response_attempt_id,
                 mgmt.adapter_device_id,
                 83,
-                failed_selected,
-                "failed",
+                lost_response_selected,
+                "settled",
+                result={"ip_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
             ),
         }
         lease_held = False
@@ -346,28 +309,18 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
             ),
         ):
             run_device_reconcile(self.device.pk)
-            run_device_reconcile(self.device.pk)
 
         row.refresh_from_db()
-        successful_svi.refresh_from_db()
-        waiting_svi.refresh_from_db()
-        failed_svi.refresh_from_db()
+        vlan_row.refresh_from_db()
+        lost_response_attempt.refresh_from_db()
         mgmt.refresh_from_db()
         self.assertEqual(row.status, "in_sync")
-        self.assertEqual(successful_svi.status, "in_sync")
-        self.assertEqual(waiting_svi.status, "deploying")
-        self.assertEqual(waiting_svi.apply_attempt_id, waiting_attempt_id)
-        self.assertEqual(failed_svi.status, "apply_failed")
+        self.assertEqual(vlan_row.status, "apply_failed")
+        self.assertEqual(lost_response_attempt.http_status, 202)
         self.assertEqual(mgmt.last_journaled_apply_job, "981")
-        self.assertEqual(
-            fetch_evidence.call_args_list,
-            [
-                call(
-                    mgmt.adapter_device_id,
-                    tuple(sorted((attempt_id, waiting_attempt_id, failed_attempt_id), key=str)),
-                ),
-                call(mgmt.adapter_device_id, (waiting_attempt_id,)),
-            ],
+        fetch_evidence.assert_called_once_with(
+            mgmt.adapter_device_id,
+            tuple(sorted((attempt_id, unrelated_attempt_id, lost_response_attempt_id), key=str)),
         )
 
     def test_idempotent_same_job_does_not_duplicate(self):

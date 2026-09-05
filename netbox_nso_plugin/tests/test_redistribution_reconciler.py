@@ -150,7 +150,10 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         redist = Redistribution.objects.get(source_protocol="static")
         redist.metric = 99  # operator edit; device still reports 10
-        redist.save()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(redist)):
+            redist.save()
 
         states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         self.assertEqual(states[0].status, "changed")  # edit surfaced as drift
@@ -250,6 +253,25 @@ class TestReconcileRedistribution(TestCase):
         )
         plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
 
+        with transaction.atomic(), offline_mutation():
+            destination.delete()
+
+        with self.assertRaises(RendererTargetsChanged):
+            plan.validate_after_acquire()
+
+    def test_new_reported_entry_locks_and_revalidates_its_destination(self):
+        """A reported entry without an overlay still protects its destination."""
+        self._make_mgmt()
+        from django.db import transaction
+        from netbox_routing.models import ISISInstance
+
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged, SourceRow, offline_mutation
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
+
+        self.assertIn(SourceRow(destination._meta.label_lower, destination.pk), plan.footprint.source_rows)
         with transaction.atomic(), offline_mutation():
             destination.delete()
 
@@ -400,7 +422,10 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry()]})
         state = NSORedistributionState.objects.get()
         state.redistribution.metric_type = "internal"
-        state.redistribution.save(update_fields=["metric_type"])
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(state.redistribution)):
+            state.redistribution.save(update_fields=["metric_type"])
         state.metric_type = "internal"
         state.status = "accepted"
         state.save(update_fields=["metric_type", "status"])
@@ -438,7 +463,10 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
         redist = Redistribution.objects.get(source_protocol="static")
         redist.metric = 99  # operator edit
-        redist.save()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(redist)):
+            redist.save()
         states = reconcile_redistribution(self.device, {"entries": [self._entry(metric=20)]})  # device also moved
         self.assertEqual(states[0].status, "conflict")
         redist.refresh_from_db()
@@ -462,8 +490,12 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(NSORedistributionState.objects.count(), 0)  # overlay gone
         self.assertEqual(Redistribution.objects.count(), 0)  # object gone
 
-    def test_category_reconcile_deletes_the_last_unowned_native_row(self):
-        management = self._make_mgmt()
+    def test_gated_removal_locks_and_deletes_the_native_redistribution(self):
+        mgmt = self._make_mgmt()
+        mgmt.manage_routing = True
+        mgmt.manage_redistribution = True
+        mgmt.save(update_fields=["manage_routing", "manage_redistribution"])
+        from django.db import connection
         from netbox_routing.models import ISISInstance, Redistribution
 
         ISISInstance.objects.create(device=self.device, process_tag="")
@@ -472,12 +504,28 @@ class TestReconcileRedistribution(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
         reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        native = Redistribution.objects.get()
+        statements = []
+
+        def observe_sql(execute, sql, params, many, context):
+            statements.append((str(sql), tuple(params or ())))
+            return execute(sql, params, many, context)
+
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
             patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value={"entries": []}),
+            connection.execute_wrapper(observe_sql),
         ):
-            reconcile_category(self.device, management, "redistribution")
+            context = reconcile_category(self.device, mgmt, "redistribution")
 
+        self.assertEqual(context["_gate"]["redistribution"], "legacy")
+        self.assertTrue(
+            any(
+                f'FROM "{native._meta.db_table}"' in sql and "FOR UPDATE" in sql and native.pk in params
+                for sql, params in statements
+            ),
+            "the gated footprint did not lock the exact native redistribution row",
+        )
         self.assertFalse(NSORedistributionState.objects.exists())
         self.assertFalse(Redistribution.objects.exists())
 
