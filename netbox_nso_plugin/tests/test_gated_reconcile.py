@@ -258,10 +258,11 @@ class TestRealReconcilerGateFootprints(TestCase):
         )
 
     def test_lacp_gate_covers_bundle_and_member_rows(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
         from netbox_nso_plugin.reconcile import reconcile_category
 
-        Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
-        Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+        lag = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
+        member_iface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
         payload = {
             "bundles": [
                 {
@@ -277,8 +278,17 @@ class TestRealReconcilerGateFootprints(TestCase):
             ctx = reconcile_category(self.device, self.mgmt, "lacp")
 
         self.assertEqual(ctx["_gate"]["lag_config"], "ran")
+        bundle = NSOLACPBundleState.objects.get(management=self.mgmt, interface=lag)
+        self.assertEqual(bundle.lag_id, 1)
+        member = NSOLACPMemberState.objects.get(management=self.mgmt, interface=member_iface)
+        self.assertEqual(member.lag_bundle_id, lag.pk)  # the LAG Interface, not the bundle overlay
+        self.assertEqual(member.mode, "active")
 
     def test_bgp_gate_covers_the_materialized_graph_and_overlay(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
         from netbox_nso_plugin.reconcile import reconcile_category
 
         payload = self._bgp_payload()
@@ -287,6 +297,19 @@ class TestRealReconcilerGateFootprints(TestCase):
             ctx = reconcile_category(self.device, self.mgmt, "bgp")
 
         self.assertEqual(ctx["_gate"]["bgp"], "ran")
+        router = BGPRouter.objects.get(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=self.device.pk,
+        )
+        self.assertEqual(router.assigned_object, self.device)  # both halves of the generic FK
+        self.assertEqual(router.asn.asn, 64512)
+        scope = BGPScope.objects.get(router=router)
+        self.assertIsNone(scope.vrf_id)  # the default VRF
+        peer = BGPPeer.objects.get(scope=scope)
+        self.assertEqual(str(peer.peer.address.ip), "198.18.0.1")
+        self.assertEqual(peer.remote_as.asn, 64513)
+        state = NSOBGPPeerState.objects.get(management=self.mgmt)
+        self.assertEqual(state.bgp_peer_id, peer.pk)
 
     def test_bfd_gate_covers_native_and_overlay_creations(self):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
