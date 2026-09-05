@@ -1073,6 +1073,127 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertIn(st.status, ("accepted", "deploying", "in_sync", "apply_failed"))
         self.assertTrue(RouteMap.objects.filter(name="RM-KEEP").exists())  # kept (operator owns)
 
+    def _rp_revision(self, device=None):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        row = NSOIntentRevision.objects.filter(device=device or self.device, scope="route_policy").first()
+        return row.revision if row else 0
+
+    def test_omitted_unowned_group_removal_runs_under_the_gate(self):
+        """The plan must predict the stale-row cascade: the gate refuses it under a mirror permit."""
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        seeded = {"route_maps": [{"name": "RM-OMIT", "entries": [{"sequence": 10, "action": "permit"}]}]}
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        before = self._rp_revision()
+
+        empty = {"route_maps": []}
+        plan = route_policy_reconcile_plan(self.device, empty)
+        self.assertTrue(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, empty)
+
+        self.assertFalse(NSORoutePolicyState.objects.filter(family="route_map", object_name="RM-OMIT").exists())
+        self.assertFalse(RouteMap.objects.filter(name="RM-OMIT").exists())
+        self.assertGreater(self._rp_revision(), before)
+
+    def test_omitted_in_sync_owner_flag_runs_under_the_gate(self):
+        """in_sync -> changed drops the owned group from the wire, so the plan must bump."""
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        seeded = {"route_maps": [{"name": "RM-SYNCED", "entries": [{"sequence": 10, "action": "permit"}]}]}
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-SYNCED")
+        with intent_transaction(footprint_for_instance(state)):
+            state.status = "in_sync"
+            state.save(update_fields=["status"])
+        before = self._rp_revision()
+
+        empty = {"route_maps": []}
+        plan = route_policy_reconcile_plan(self.device, empty)
+        self.assertTrue(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, empty)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertFalse(state.device_present)
+        self.assertTrue(RouteMap.objects.filter(name="RM-SYNCED").exists())
+        self.assertGreater(self._rp_revision(), before)
+
+    def test_omitted_accepted_owner_is_a_lifecycle_only_read(self):
+        """An accepted row keeps its status on absence: flags only, no bump."""
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        seeded = {"route_maps": [{"name": "RM-ACCEPTED", "entries": [{"sequence": 10, "action": "permit"}]}]}
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-ACCEPTED")
+        with intent_transaction(footprint_for_instance(state)):
+            state.status = "accepted"
+            state.save(update_fields=["status"])
+        before = self._rp_revision()
+
+        empty = {"route_maps": []}
+        plan = route_policy_reconcile_plan(self.device, empty)
+        self.assertFalse(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, empty)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertFalse(state.device_present)
+        self.assertTrue(RouteMap.objects.filter(name="RM-ACCEPTED").exists())
+        self.assertEqual(self._rp_revision(), before)
+
+    def test_omitted_referenced_unowned_group_is_a_lifecycle_only_read(self):
+        """A still-referenced object is kept and flagged, so absence writes no content."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        rmaps = [
+            {"name": "RM-REF", "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": ["PL-KEPT"]}]}
+        ]
+        seeded = {
+            "prefix_lists": [{"name": "PL-KEPT", "entries": [{"sequence": 10, "prefix": "10.0.0.0/8"}]}],
+            "route_maps": rmaps,
+        }
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        before = self._rp_revision()
+
+        dropped = {"route_maps": rmaps}
+        plan = route_policy_reconcile_plan(self.device, dropped)
+        self.assertFalse(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, dropped)
+
+        state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-KEPT")
+        self.assertFalse(state.device_present)
+        self.assertTrue(PrefixList.objects.filter(name="PL-KEPT").exists())
+        self.assertEqual(self._rp_revision(), before)
+
     def test_route_map_expands_matched_community_list_into_match_community(self):
         """A route-map matching a community-list also links that list's member
         Communities into match_community (devices never match communities directly)."""
@@ -1576,6 +1697,68 @@ class TestSharedObjectOwnership(TestCase):
         pl_state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-REF")
         self.assertFalse(pl_state.device_present)  # flagged removed
         self.assertTrue(PrefixList.objects.filter(name="PL-REF").exists())  # kept — still referenced
+
+    def _rp_revision(self, device):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        row = NSOIntentRevision.objects.filter(device=device, scope="route_policy").first()
+        return row.revision if row else 0
+
+    def test_non_owner_drop_of_a_shared_object_is_a_lifecycle_only_read(self):
+        """Dropping a non-materialized row leaves the shared object untouched: no bump."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        for device in (self.d1, self.d2):
+            payload = self._pl("PL-DROP", ["10.0.0.0/8"])
+            with reconcile_transaction(route_policy_reconcile_plan(device, payload)):
+                reconcile_route_policy(device, payload)
+        before = (self._rp_revision(self.d1), self._rp_revision(self.d2))
+
+        empty = {"prefix_lists": []}
+        plan = route_policy_reconcile_plan(self.d2, empty)
+        self.assertFalse(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.d2, empty)
+
+        self.assertFalse(NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-DROP").exists())
+        self.assertTrue(PrefixList.objects.filter(name="PL-DROP").exists())
+        self.assertEqual((self._rp_revision(self.d1), self._rp_revision(self.d2)), before)
+
+    def test_owner_drop_of_a_shared_object_rematerializes_under_the_gate(self):
+        """Re-pointing refills the shared object from the sibling, so the plan must bump."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        for device in (self.d1, self.d2):
+            payload = self._pl("PL-HANDOVER", ["10.0.0.0/8"])
+            with reconcile_transaction(route_policy_reconcile_plan(device, payload)):
+                reconcile_route_policy(device, payload)
+        before = self._rp_revision(self.d1)
+
+        empty = {"prefix_lists": []}
+        plan = route_policy_reconcile_plan(self.d1, empty)
+        self.assertTrue(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.d1, empty)
+
+        self.assertFalse(
+            NSORoutePolicyState.objects.filter(management__device=self.d1, object_name="PL-HANDOVER").exists()
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-HANDOVER")
+        self.assertTrue(s2.is_materialized)
+        self.assertTrue(PrefixList.objects.filter(name="PL-HANDOVER").exists())
+        self.assertGreater(self._rp_revision(self.d1), before)
 
     def test_rematerialize_repoints_ownership(self):
         """Operator picks the second device's version → the shared object is refilled from

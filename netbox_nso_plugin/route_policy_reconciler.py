@@ -28,6 +28,14 @@ from .route_policy_structure import canonical_route_map, prefix_list_entry_unit
 
 logger = logging.getLogger(__name__)
 
+# One route-policy family → the document key that carries it.
+_FAMILY_PAYLOAD_KEYS = {
+    "prefix_list": "prefix_lists",
+    "community_list": "community_lists",
+    "as_path": "as_paths",
+    "route_map": "route_maps",
+}
+
 # name → tuple of prefix-list units, memoized for one reconcile pass (cleared at its start).
 # Lets canonical_route_map expand prefix-list refs to content without re-querying per call.
 _PL_UNIT_CACHE: ContextVar[dict[str, tuple] | None] = ContextVar("route_policy_prefix_units", default=None)
@@ -1107,15 +1115,9 @@ def route_policy_reconcile_footprint(device, payload: dict):
     from .intent_state import route_policy_footprint
     from .models import NSORoutePolicyState
 
-    family_payload_keys = {
-        "prefix_list": "prefix_lists",
-        "community_list": "community_lists",
-        "as_path": "as_paths",
-        "route_map": "route_maps",
-    }
     groups = {
         (family, row.get("name", ""))
-        for family, key in family_payload_keys.items()
+        for family, key in _FAMILY_PAYLOAD_KEYS.items()
         for row in payload.get(key) or []
         if row.get("name")
     }
@@ -1166,6 +1168,46 @@ def _route_policy_group_changes_content(management, family: str, name: str, capt
     return False
 
 
+def _route_policy_omitted_group_changes_content(state) -> bool:
+    """Predict whether removing one group the payload OMITS writes materialized content.
+
+    Mirrors the decision order of the stale-row loop in :func:`_reconcile_route_policy`
+    (``_flag_removed`` / :func:`_track_unowned_removal`). The reported-group predictor
+    above never sees these groups: the payload does not carry them.
+    """
+    from . import status_machine as sm
+
+    if sm.is_owned(state.status):
+        # in_sync → changed drops the row from the wire; the other owned states are kept as is.
+        return state.status == sm.IN_SYNC
+    group = list(ownership.group_rows(state))
+    if any(sm.is_owned(s.status) for s in group):
+        return False
+    if any(s.pk != state.pk and s.device_present and s.captured for s in group):
+        return bool(state.is_materialized)  # re-pointing refills the shared object
+    obj = state.assigned_object
+    if obj is None:
+        return False
+    return not _object_referenced(obj, state.family)  # unreferenced → object + entries deleted
+
+
+def _route_policy_omitted_group_predictions(management, payload: dict) -> list[tuple[str, str, bool]]:
+    """``(family, name, changes_content)`` for every persisted group the payload omits."""
+    from .models import NSORoutePolicyState
+
+    reported = {
+        (family, (row.get("name") or "").casefold())
+        for family, key in _FAMILY_PAYLOAD_KEYS.items()
+        for row in payload.get(key) or []
+        if isinstance(row, dict) and row.get("name")
+    }
+    return [
+        (state.family, state.object_name, _route_policy_omitted_group_changes_content(state))
+        for state in NSORoutePolicyState.objects.filter(management=management)
+        if (state.family, state.object_name.casefold()) not in reported
+    ]
+
+
 def route_policy_reconcile_plan(device, payload: dict):
     """Declare the route-policy footprint and any materialized-content write."""
     from .intent_state import MutationFootprint, ReconcileMutationPlan
@@ -1175,18 +1217,14 @@ def route_policy_reconcile_plan(device, payload: dict):
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return ReconcileMutationPlan(footprint)
-    family_payload_keys = {
-        "prefix_list": "prefix_lists",
-        "community_list": "community_lists",
-        "as_path": "as_paths",
-        "route_map": "route_maps",
-    }
     try:
         changes_content = any(
             _route_policy_group_changes_content(management, family, row["name"], row)
-            for family, key in family_payload_keys.items()
+            for family, key in _FAMILY_PAYLOAD_KEYS.items()
             for row in payload.get(key) or []
             if isinstance(row, dict) and row.get("name")
+        ) or any(
+            prediction for _family, _name, prediction in _route_policy_omitted_group_predictions(management, payload)
         )
     except ImportError:
         return ReconcileMutationPlan(MutationFootprint())
@@ -1210,19 +1248,6 @@ def _reconcile_route_policy(device, payload: dict) -> list:
     except NSODeviceManagement.DoesNotExist:
         return []
 
-    family_payload_keys = {
-        "prefix_list": "prefix_lists",
-        "community_list": "community_lists",
-        "as_path": "as_paths",
-        "route_map": "route_maps",
-    }
-    touched_groups = {
-        (family, row.get("name", ""))
-        for family, key in family_payload_keys.items()
-        for row in payload.get(key) or []
-        if row.get("name")
-    }
-    touched_groups.update(NSORoutePolicyState.objects.filter(management=mgmt).values_list("family", "object_name"))
     now = timezone.now()
     _PL_UNIT_CACHE.set({})  # context-local: concurrent device reconciles cannot cross-contaminate
     seen_keys: set[tuple] = set()
