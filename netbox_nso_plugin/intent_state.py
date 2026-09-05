@@ -2647,8 +2647,12 @@ def _live_pool_markers(connection) -> frozenset[tuple]:
     return live
 
 
-def _is_pool_delete_cascade(statement, params, connection) -> bool:
+def _is_pool_delete_cascade(spec, touched_columns, statement, params, connection) -> bool:
     """Report whether this is the collector's SET_NULL update for a pool being deleted."""
+    if spec.model_label != "netbox_nso_plugin.nsointerfaceipstate":
+        return False
+    if touched_columns != frozenset({"source_pool_id"}):
+        return False
     entries = _live_pool_markers(connection)
     match = _SOURCE_POOL_CASCADE.search(statement)
     if not entries or match is None:
@@ -2675,6 +2679,19 @@ def _execute_with_permit_cleanup(execute, sql, params, many, context, permit):
     except Exception:
         _clear_failed_implicit_permit(permit)
         raise
+
+
+def _permit_footprint_tables(permit) -> set[str]:
+    """Tables a content permit already authorizes through its footprint."""
+    if permit is None or permit.dml_kind != "content":
+        return set()
+    tables = {
+        apps.get_model(row.model_label)._meta.db_table
+        for row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
+    }
+    if permit.footprint.device_ids:
+        tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
+    return tables
 
 
 def _dml_guard(execute, sql, params, many, context):
@@ -2710,15 +2727,12 @@ def _dml_guard(execute, sql, params, many, context):
         return execute(sql, params, many, context)
     if permit is not None and permit.dml_kind == "offline":
         return execute(sql, params, many, context)
+    # source_pool is a declared content field, so the column-aware admission cannot reach the
+    # collector's SET_NULL update: the pool pointer is an audit trail, not pushed IP intent.
+    if _is_pool_delete_cascade(spec, touched_columns, statement, params, context["connection"]):
+        return execute(sql, params, many, context)
     remaining = 0 if permit is None else permit.authorized_dml.get(table, 0)
-    footprint_tables = set()
-    if permit is not None and permit.dml_kind == "content":
-        footprint_tables = {
-            apps.get_model(row.model_label)._meta.db_table
-            for row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
-        }
-        if permit.footprint.device_ids:
-            footprint_tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
+    footprint_tables = _permit_footprint_tables(permit)
     if remaining < 1 and table not in footprint_tables:
         column_detail = "unknown" if touched_columns is None else sorted(touched_columns)
         _clear_failed_implicit_permit(permit)
