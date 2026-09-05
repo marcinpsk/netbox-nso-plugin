@@ -216,19 +216,23 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         ownership. A deploying row retains its correlated Apply attempt. A confirmed row
         that vanishes surfaces as ``changed`` and advances the scope revision.
         """
-        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
         deploying = self._state(name="Vlan100", vid=100, status="deploying")
         attempt_id = deploying.apply_attempt_id
         confirmed = self._state(name="Vlan200", vid=200, status="in_sync")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="svi")
+        before = revision.revision
         reconcile_svi(self.device, {"interfaces": []})  # device stops reporting all SVIs
         assert NSOSVIState.objects.filter(pk=deploying.pk).exists(), "deploying (apply-in-flight) overlay deleted"
         assert NSOSVIState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         deploying.refresh_from_db()
+        revision.refresh_from_db()
         assert deploying.status == "deploying"
         assert deploying.apply_attempt_id == attempt_id
         assert NSOSVIState.objects.get(pk=confirmed.pk).status == "changed"
+        assert revision.revision == before + 1  # the vanished confirmed SVI is a content change
 
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch
