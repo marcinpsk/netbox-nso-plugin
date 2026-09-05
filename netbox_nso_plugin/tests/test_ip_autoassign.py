@@ -1356,6 +1356,7 @@ class TestAutoAssignIPP2P(TestCase):
                 "device_id"
             )
         )
+        self.assertEqual(len(revisions), 2, "both device ip revisions must exist for this pin to mean anything")
         before = [(revision.pk, revision.revision) for revision in revisions]
 
         with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
