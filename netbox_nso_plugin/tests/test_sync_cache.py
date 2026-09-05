@@ -832,6 +832,73 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual(mgmt.adapter_device_id, 196)
         self.assertFalse(mgmt.source_rekey_pending)
 
+    def test_failed_rekey_fence_skips_the_full_save(self):
+        """A rejected fence write must not let the re-save push under the old source identity."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-fence-stale", 196)
+        _stamp_verified_baselines(mgmt)
+        second = self._mgmt("cache-fence-next", 197)
+        renamed = _adapter_row(mgmt, nso_device_name="old-device-name")
+        original_build = RendererMutationPlan.build
+        full_save_pks = []
+        scope_calls = []
+        fence_plan_staled = False
+
+        def build_then_stale_fence(*args, **kwargs):
+            nonlocal fence_plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
+            if proposed_save is not None and proposed_save.update_fields is None:
+                full_save_pks.append(proposed_save.instance.pk)
+            plan = original_build(*args, **kwargs)
+            if (
+                proposed_save is not None
+                and proposed_save.update_fields == ("source_rekey_pending",)
+                and proposed_save.instance.pk == mgmt.pk
+            ):
+                fence_plan_staled = True
+                concurrent = NSODeviceManagement.objects.get(pk=mgmt.pk)
+                concurrent.last_sync_status = "concurrent"
+                save_management(concurrent, update_fields={"last_sync_status"})
+            return plan
+
+        def fake_set_scope(adapter_device_id, *args, **kwargs):
+            scope_calls.append(adapter_device_id)
+            if adapter_device_id == 197:
+                raise AdapterError("Device not found", code="not_found")
+            return {}
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[renamed]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 700}),
+            patch("netbox_nso_plugin.adapter_client.patch_device") as rekey,
+            patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=fake_set_scope),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale_fence),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (2, 2))
+        self.assertTrue(fence_plan_staled)
+        self.assertNotIn(mgmt.pk, full_save_pks)  # the rejected row never reached the full save
+        self.assertEqual(scope_calls, [197, 700])  # nothing pushed under the old source identity
+        rekey.assert_not_called()
+        self.assertEqual(
+            NSOIntentRevision.objects.filter(device=mgmt.device, verified_revision=4).count(),
+            len(delivery.delivery_keys()),
+        )
+        mgmt.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 196)
+        self.assertFalse(mgmt.source_rekey_pending)  # still unfenced, for a later sweep to retry
+        self.assertEqual(mgmt.last_sync_status, "concurrent")
+        self.assertEqual(second.adapter_device_id, 700)  # the next row still repaired
+
     def test_drops_a_reused_id_before_pushing_anything(self):
         """An id owned by another device is dropped FIRST, so no scope reaches that device.
 

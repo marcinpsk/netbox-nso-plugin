@@ -378,7 +378,8 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
                             "Adapter source identity changed for device id %s. Routing through the rekey fence.",
                             current.adapter_device_id,
                         )
-                        _mirror_management(current, source_rekey_pending=True)
+                        if not _mirror_management(current, source_rekey_pending=True):
+                            continue
                     else:
                         logger.warning(
                             "Adapter device id %s belongs to another NetBox device. Dropping the stale pointer.",
