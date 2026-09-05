@@ -445,8 +445,45 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(late.mode, "access")
         self.assertEqual(late.untagged_vlan.vid, 10)
 
+    def test_standalone_switchport_replan_keeps_the_frozen_interface_set(self):
+        """A replan re-reads the frozen pks; it must never re-resolve names mid-acquisition."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import (
+            prepare_switchport_reconcile,
+            reconcile_switchport,
+            reconcile_vlan_database,
+        )
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "TEN"}]})
+        payload = {
+            "interfaces": [
+                {"interface_name": self.interface.name, "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+                {"interface_name": "GigabitEthernet0/3", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+            ]
+        }
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        late = Interface.objects.create(device=self.device, name="GigabitEthernet0/3", type="1000base-t")
+
+        reconcile_switchport(self.device, payload, attempt)
+
+        late.refresh_from_db()
+        self.assertFalse(late.mode)
+        self.assertIsNone(late.untagged_vlan_id)
+        self.assertFalse(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+        seeded = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual(seeded.status, "imported")
+
+        reconcile_switchport(self.device, payload)  # a fresh attempt resolves it and seeds it
+        self.assertTrue(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+
     def test_switchport_body_reloads_the_frozen_interfaces_after_acquisition(self):
-        """An operator edit committed after the plan must not be clobbered from a stale copy."""
+        """An operator edit committed after the plan must not be clobbered from a stale copy.
+
+        Only the standalone entry replans a stale pre-image, once. The gated read refuses it
+        (IntentPlanStaleError), and on the whole-device path that refusal becomes the
+        family's scope error: unowned rows go to ``error`` until the next read re-plans.
+        SVI behaves the same. Card #1659 tracks the gate-path race.
+        """
         from netbox_nso_plugin.models import NSOSwitchportState
         from netbox_nso_plugin.vlan_reconciler import (
             prepare_switchport_reconcile,
