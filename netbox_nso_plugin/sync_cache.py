@@ -321,7 +321,8 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                         current.adapter_device_id,
                         adapter_device["id"],
                     )
-                    _mirror_management(current, adapter_device_id=adapter_device["id"])
+                    if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
+                        continue
                 elif state is _REUSED:
                     logger.warning(
                         "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
