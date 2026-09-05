@@ -103,10 +103,62 @@ def own_vlan(mgmt, vid: int, tag: str):
     from ipam.models import VLAN
 
     from netbox_nso_plugin.models import NSOVLANState
+    from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
     with without_commit_drain(), transaction.atomic():
         vlan = VLAN.objects.create(vid=vid, name=f"cl-{tag}-v{vid}")
-        return NSOVLANState.objects.create(management=mgmt, vlan=vlan, status="accepted")
+        state = NSOVLANState(management=mgmt, vlan=vlan, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),)
+        )
+        with renderer_writes(plan) as writer:
+            writer.save(state, force_insert=True)
+        return state
+
+
+def write_vlan_state(state, **values):
+    """Persist one owned VLAN-overlay mutation through the converted writer seam."""
+    import copy
+
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
+
+    candidate = copy.copy(type(state).objects.get(pk=state.pk))
+    for field_name, value in values.items():
+        setattr(candidate, field_name, value)
+    fields = tuple(sorted(values))
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, update_fields=fields)
+    for field_name, value in values.items():
+        setattr(state, field_name, value)
+    return candidate
+
+
+def delete_vlan_state(state):
+    """Delete one VLAN overlay through the converted writer seam."""
+    from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+    current = type(state).objects.get(pk=state.pk)
+    plan = RendererMutationPlan.build(deletes=(planned_delete(current),))
+    with renderer_writes(plan) as writer:
+        return writer.delete(current)
+
+
+def rename_vlan(state, name):
+    """Persist one native VLAN-name edit through the converted family workflow."""
+    from netbox_nso_plugin.vlan_reconciler import save_vlan_content
+
+    vlan = type(state.vlan).objects.get(pk=state.vlan_id)
+    vlan.name = name
+    saved = save_vlan_content(vlan, update_fields=("name",))
+    state.vlan.name = saved.name
+    return saved
 
 
 def own_route(mgmt, prefix: str, next_hop: str, *, device=None):

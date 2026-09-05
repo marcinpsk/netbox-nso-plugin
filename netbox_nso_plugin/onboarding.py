@@ -284,13 +284,17 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     from django.utils import timezone
 
     try:
-        NSODeviceManagement.objects.create(
-            device=device,
-            nso_instance=instance,
-            nso_device_name=nso_name,
-            onboarded_at=timezone.now(),
-            onboard_status="provisioning",
-            onboard_job_id=job_id,
+        from .management_lifecycle import save_management
+
+        save_management(
+            NSODeviceManagement(
+                device=device,
+                nso_instance=instance,
+                nso_device_name=nso_name,
+                onboarded_at=timezone.now(),
+                onboard_status="provisioning",
+                onboard_job_id=job_id,
+            )
         )
     except Exception as exc:  # noqa: BLE001 — the adapter job is already running; surface it for recovery
         # provision_device() already enqueued job_id, so NSO is building the node. Without a
@@ -352,7 +356,9 @@ def advance_provisioning(mgmt) -> dict:
     if not mgmt.onboard_job_id:
         mgmt.onboard_status = "provision_failed"
         mgmt.onboard_error = "No provision job id recorded."
-        mgmt.save(update_fields=["onboard_status", "onboard_error"])
+        from .management_lifecycle import save_management
+
+        save_management(mgmt, update_fields=["onboard_status", "onboard_error"])
         return {"status": "provision_failed", "error": mgmt.onboard_error}
 
     try:
@@ -376,7 +382,9 @@ def advance_provisioning(mgmt) -> dict:
             mgmt.onboard_status = ""
             mgmt.onboard_steps = steps
             mgmt.onboard_error = ""
-            mgmt.save()
+            from .management_lifecycle import save_management
+
+            save_management(mgmt)
             return {"status": "ready"}
         mgmt.onboard_status = "provision_failed"
         mgmt.onboard_steps = steps
@@ -387,7 +395,9 @@ def advance_provisioning(mgmt) -> dict:
             mgmt.pk,
             result,
         )
-        mgmt.save(update_fields=["onboard_status", "onboard_steps", "onboard_error"])
+        from .management_lifecycle import save_management
+
+        save_management(mgmt, update_fields=["onboard_status", "onboard_steps", "onboard_error"])
         return {"status": "provision_failed", "error": mgmt.onboard_error}
 
     # failed / timeout / unknown-terminal
@@ -401,7 +411,9 @@ def advance_provisioning(mgmt) -> dict:
         mgmt.pk,
         err,
     )
-    mgmt.save(update_fields=["onboard_status", "onboard_error"])
+    from .management_lifecycle import save_management
+
+    save_management(mgmt, update_fields=["onboard_status", "onboard_error"])
     return {"status": "provision_failed", "error": mgmt.onboard_error}
 
 
@@ -461,10 +473,14 @@ def manage_existing(device, instance, nso_device_name) -> dict:
         return result
 
     try:
-        NSODeviceManagement.objects.create(
-            device=device,
-            nso_instance=instance,
-            nso_device_name=name,
+        from .management_lifecycle import save_management
+
+        save_management(
+            NSODeviceManagement(
+                device=device,
+                nso_instance=instance,
+                nso_device_name=name,
+            )
         )
     except Exception as exc:
         logger.exception("manage_existing: creating the management row for %s failed", name)

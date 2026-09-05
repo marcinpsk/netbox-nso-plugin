@@ -19,7 +19,7 @@ from django.db import connections
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
-from ._outbox_case import content_bulk_update, mirror_update
+from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
@@ -272,10 +272,10 @@ class TestSyncScopeToAdapter(_SignalDBBase):
     """Tests for the sync_scope_to_adapter signal handler (real NSODeviceManagement row)."""
 
     def _sync_scope(self, instance, *, created):
-        from netbox_nso_plugin.signals import sync_scope_to_adapter
+        from netbox_nso_plugin.signals import _queue_scope_sync
 
         with self.captureOnCommitCallbacks(execute=True):
-            sync_scope_to_adapter(sender=type(instance), instance=instance, created=created)
+            _queue_scope_sync(type(instance), instance, created)
 
     def test_intent_delivery_bookkeeping_does_not_resync_the_adapter_link(self):
         from netbox_nso_plugin.signals import sync_scope_to_adapter
@@ -290,6 +290,42 @@ class TestSyncScopeToAdapter(_SignalDBBase):
                     update_fields={field_name},
                 )
             self.assertEqual(callbacks, [], field_name)
+
+    def test_direct_management_save_schedules_adapter_work_through_writer(self):
+        """A direct save cannot bypass the management writer and adapter sync."""
+        from netbox_nso_plugin import management_lifecycle
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        mgmt.manage_enabled = True
+
+        with (
+            patch.object(
+                management_lifecycle,
+                "save_management",
+                wraps=management_lifecycle.save_management,
+            ) as save_management,
+            self.captureOnCommitCallbacks(execute=False) as callbacks,
+        ):
+            mgmt.save(update_fields=["manage_enabled"])
+
+        save_management.assert_called_once_with(
+            mgmt,
+            update_fields=["manage_enabled"],
+            force_insert=False,
+        )
+        self.assertEqual(len(callbacks), 1)
+        mgmt.refresh_from_db()
+        self.assertTrue(mgmt.manage_enabled)
+
+    def test_management_mirror_ignores_a_row_deleted_before_the_callback(self):
+        from netbox_nso_plugin.signals import _update_management_mirror
+
+        mgmt = self._make_mgmt(adapter_device_id=7)
+        type(mgmt).objects.filter(pk=mgmt.pk).delete()
+
+        _update_management_mirror(mgmt, adapter_link_error="adapter unavailable")
+
+        self.assertFalse(type(mgmt).objects.filter(pk=mgmt.pk).exists())
 
     def test_created_onboards_device_and_sets_scope(self):
         mgmt = self._make_mgmt(adapter_device_id=None)
@@ -399,6 +435,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         self.assertTrue(mgmt.source_rekey_pending)  # still pending, retried next save
 
     def test_source_save_is_fail_closed_before_its_on_commit_callback(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
         from netbox_nso_plugin.read_gate import SKIPPED_UNAVAILABLE, gated_family_run
 
         mgmt = self._make_mgmt(adapter_device_id=7)
@@ -407,7 +444,7 @@ class TestSyncScopeToAdapter(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=False) as callbacks,
             patch(f"{_MOD}.patch_device") as mock_patch,
         ):
-            mgmt.save()
+            save_management(mgmt)
 
         self.assertEqual(len(callbacks), 1)
         mock_patch.assert_not_called()
@@ -583,6 +620,20 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         self.assertFalse(mgmt.source_rekey_pending)
         self.assertEqual(mgmt.adapter_source_epoch, 2)
 
+    def test_stale_full_writer_save_preserves_a_pending_source_rekey(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+
+        stale = self._make_mgmt(adapter_device_id=7)
+        mirror_update(stale, source_rekey_pending=True)
+        stale.source_rekey_pending = False
+
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            save_management(stale)
+
+        stale.refresh_from_db()
+        self.assertTrue(stale.source_rekey_pending)
+        self.assertEqual(len(callbacks), 1)
+
     def test_ordinary_update_does_not_patch_device(self):
         mgmt = self._make_mgmt(adapter_device_id=7)
         mgmt._nso_source_changed = False
@@ -693,6 +744,157 @@ class TestSyncScopeToAdapter(_SignalDBBase):
         self.assertEqual(kw["oob_ip"], "192.0.2.5")  # /24 stripped → host only
 
 
+class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        manufacturer = Manufacturer.objects.create(name="Signal race", slug="signal-race")
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model="Signal race",
+            slug="signal-race",
+        )
+        role = DeviceRole.objects.create(name="Signal race", slug="signal-race")
+        site = Site.objects.create(name="Signal race", slug="signal-race")
+        self.device = Device.objects.create(
+            name="signal-race-device",
+            device_type=device_type,
+            role=role,
+            site=site,
+        )
+        self.nso_instance = NSOInstance.objects.create(
+            name="signal-race-instance",
+            adapter_instance_id="signal-race-instance",
+        )
+        row = NSODeviceManagement(
+            device=self.device,
+            nso_instance=self.nso_instance,
+            nso_device_name="signal-race-device",
+            adapter_device_id=7,
+        )
+        _bulk_create_management_without_signals([row])
+        self.mgmt = NSODeviceManagement.objects.get(pk=row.pk)
+
+    def test_adapter_failure_survives_a_stale_error_mirror_plan(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.signals import _sync_committed_scope_to_adapter
+
+        original_build = RendererMutationPlan.build
+        plan_staled = False
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal plan_staled
+            plan = original_build(*args, **kwargs)
+            if not plan_staled:
+                plan_staled = True
+                in_thread(
+                    lambda: NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_status="concurrent")
+                )
+            return plan
+
+        errors = []
+        with (
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
+            patch(
+                f"{_MOD}.set_scope",
+                side_effect=AdapterError("adapter unavailable", code="nso_unreachable"),
+            ),
+            self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as captured,
+        ):
+            try:
+                _sync_committed_scope_to_adapter(type(self.mgmt), self.mgmt.pk, False)
+            except Exception as exc:  # noqa: BLE001 (the assertion reports the escaped callback error)
+                errors.append(exc)
+
+        self.assertEqual(errors, [], f"the adapter callback raised {errors!r}")
+        self.assertTrue(any("adapter unavailable" in message for message in captured.output))
+        self.assertTrue(any("Skipped adapter error mirror update" in message for message in captured.output))
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.last_sync_status, "concurrent")
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+
+    def test_new_source_rekey_waits_for_adapter_finalization(self):
+        import select
+        import threading
+
+        from django.db import connection, transaction
+        from psycopg import pq
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.signals import _sync_source_change
+
+        mirror_update(self.mgmt, source_rekey_pending=True)
+        original_build = RendererMutationPlan.build
+        committed = threading.Event()
+        rekey_started = threading.Event()
+        worker_pid = []
+        worker_errors = []
+        workers = []
+
+        def commit_new_source():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    worker_pid.append(cursor.fetchone()[0])
+                with transaction.atomic():
+                    pg_connection = connection.connection.pgconn
+                    table = connection.ops.quote_name(NSODeviceManagement._meta.db_table)
+                    query = (
+                        f"UPDATE {table} SET nso_device_name = $1, source_rekey_pending = TRUE WHERE id = $2"
+                    ).encode()
+                    pg_connection.send_query_params(
+                        query,
+                        [b"newer-source", str(self.mgmt.pk).encode()],
+                    )
+                    while pg_connection.flush() == 1:
+                        select.select([], [pg_connection.socket], [])
+                    rekey_started.set()
+                    while pg_connection.is_busy():
+                        select.select([pg_connection.socket], [], [])
+                        pg_connection.consume_input()
+                    result = pg_connection.get_result()
+                    if result is None or result.status != pq.ExecStatus.COMMAND_OK:
+                        raise AssertionError("the competing source rekey UPDATE failed")
+                    if pg_connection.get_result() is not None:
+                        raise AssertionError("the competing source rekey returned an extra result")
+                committed.set()
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                worker_errors.append(exc)
+            finally:
+                connection.close()
+
+        def build_after_rekey_starts(*args, **kwargs):
+            if not workers:
+                worker = threading.Thread(target=commit_new_source)
+                workers.append(worker)
+                worker.start()
+                self.assertTrue(rekey_started.wait(10), "the competing source rekey did not start")
+                wait_until_postgres_blocks(worker_pid[0], "the competing source rekey", timeout=3)
+            return original_build(*args, **kwargs)
+
+        client = SimpleNamespace(patch_device=lambda **kwargs: {"source_epoch": 2})
+        with patch.object(RendererMutationPlan, "build", side_effect=build_after_rekey_starts):
+            finalized = _sync_source_change(self.mgmt, client)
+
+        for worker in workers:
+            worker.join(10)
+            self.assertFalse(worker.is_alive(), "the competing source rekey did not finish")
+        if worker_errors:
+            raise worker_errors[0]
+
+        self.assertTrue(finalized)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.nso_device_name, "newer-source")
+        self.assertTrue(self.mgmt.source_rekey_pending, "adapter finalization cleared the newer source fence")
+        self.assertTrue(committed.is_set())
+
+
 class TestOffboardDeviceFromAdapter(unittest.TestCase):
     """Tests for the offboard_device_from_adapter signal handler.
 
@@ -710,31 +912,40 @@ class TestOffboardDeviceFromAdapter(unittest.TestCase):
         self.addCleanup(on_commit.stop)
 
     def test_offboards_when_adapter_device_id_set(self):
+        from netbox_nso_plugin.signals import _queue_adapter_offboard
+
+        instance = SimpleNamespace(adapter_device_id=55)
+        with patch(f"{_MOD}.delete_device") as mock_delete:
+            _queue_adapter_offboard(instance)
+
+        mock_delete.assert_called_once_with(55)
+
+    def test_skips_when_adapter_device_id_none(self):
+        from netbox_nso_plugin.signals import _queue_adapter_offboard
+
+        instance = SimpleNamespace(adapter_device_id=None)
+        with patch(f"{_MOD}.delete_device") as mock_delete:
+            _queue_adapter_offboard(instance)
+
+        mock_delete.assert_not_called()
+
+    def test_adapter_error_swallowed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.signals import _queue_adapter_offboard
+
+        instance = SimpleNamespace(adapter_device_id=5)
+        with patch(f"{_MOD}.delete_device", side_effect=AdapterError("gone", code="not_found")):
+            # Should not raise — a warning is logged instead.
+            _queue_adapter_offboard(instance)
+
+    def test_foreign_delete_receiver_does_not_schedule_offboarding(self):
         from netbox_nso_plugin.signals import offboard_device_from_adapter
 
         instance = SimpleNamespace(adapter_device_id=55)
         with patch(f"{_MOD}.delete_device") as mock_delete:
             offboard_device_from_adapter(sender=None, instance=instance)
 
-        mock_delete.assert_called_once_with(55)
-
-    def test_skips_when_adapter_device_id_none(self):
-        from netbox_nso_plugin.signals import offboard_device_from_adapter
-
-        instance = SimpleNamespace(adapter_device_id=None)
-        with patch(f"{_MOD}.delete_device") as mock_delete:
-            offboard_device_from_adapter(sender=None, instance=instance)
-
         mock_delete.assert_not_called()
-
-    def test_adapter_error_swallowed(self):
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.signals import offboard_device_from_adapter
-
-        instance = SimpleNamespace(adapter_device_id=5)
-        with patch(f"{_MOD}.delete_device", side_effect=AdapterError("gone", code="not_found")):
-            # Should not raise — a warning is logged instead.
-            offboard_device_from_adapter(sender=None, instance=instance)
 
 
 class TestPushIntentOnAccept(_SignalDBBase):
@@ -1395,7 +1606,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row.delete()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            with renderer_writes(plan) as writer:
+                writer.delete(row)
         mock_put.assert_called_once()
         _dev, interfaces = mock_put.call_args[0]
         self.assertEqual(interfaces, [], "Deleted SVI must not appear in the push snapshot")
@@ -1463,13 +1678,20 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
     # change-detection cache), then DELETE it — without a post_delete receiver no
     # push fires and the adapter keeps applying the deleted intent forever.
 
-    def _delete_pushes(self, row, patch_target, expect_empty_list=True):
+    def _delete_pushes(self, row, patch_target, expect_empty_list=True, exact_writer=False):
         """Delete *row* and assert the reduced snapshot push fired at the client boundary."""
         with (
             patch(f"netbox_nso_plugin.adapter_client.{patch_target}") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row.delete()
+            if exact_writer:
+                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+                plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+                with renderer_writes(plan) as writer:
+                    writer.delete(row)
+            else:
+                row.delete()
         mock_put.assert_called_once()
         if expect_empty_list:
             self.assertEqual(mock_put.call_args[0][1], [], "Deleted row must not appear in the push snapshot")
@@ -1507,7 +1729,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=105, name="del-v105")
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent"), self.captureOnCommitCallbacks(execute=True):
             row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="del-v105", status="accepted")
-        self._delete_pushes(row, "put_vlan_intent")
+        self._delete_pushes(row, "put_vlan_intent", exact_writer=True)
 
     def test_bfd_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
@@ -1764,7 +1986,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 timer="fast",
                 status="accepted",
             )
-        self._delete_pushes(row, "apply_lag_config")
+        self._delete_pushes(row, "apply_lag_config", exact_writer=True)
 
     def test_lacp_member_delete_pushes_reduced_snapshot(self):
         from dcim.models import Interface
@@ -1802,7 +2024,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            member.delete()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(member),))
+            with renderer_writes(plan) as writer:
+                writer.delete(member)
         mock_put.assert_called_once()
 
     def test_switchport_delete_pushes_reduced_snapshot(self):
@@ -1824,7 +2050,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOSwitchportState.objects.create(
                 management=mgmt, interface=self.iface, mode="trunk", status="accepted"
             )
-        self._delete_pushes(row, "apply_switchport_config")
+        self._delete_pushes(row, "apply_switchport_config", exact_writer=True)
 
 
 class TestDeleteOriginMarking(_SignalDBBase):
@@ -1900,11 +2126,30 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         vlan = VLAN.objects.create(vid=444, name="do-v444")
         state = NSOSVIState(management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted")
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
-        with self._arranged(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(state, natural_key=("management", "interface", "vlan", "svi_type")),)
+        )
+        with self._arranged(), renderer_writes(plan) as writer:
+            writer.save(state)
         return state
+
+    @staticmethod
+    def _delete_with_writer(row):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+        with renderer_writes(plan) as writer:
+            writer.delete(row)
+
+    @staticmethod
+    def _save_with_writer(row):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        plan = RendererMutationPlan.build(saves=(planned_save(row),))
+        with renderer_writes(plan) as writer:
+            writer.save(row)
 
     @staticmethod
     def _static_route_assignment_footprint(route, device_id):
@@ -1916,7 +2161,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
     def test_overlay_delete_push_is_marked_delete_origin(self):
         mgmt = self._mgmt()
         row = self._owned_svi(mgmt)
-        params = self._recorded_params(row.delete)
+        params = self._recorded_params(lambda: self._delete_with_writer(row))
         self.assertTrue(params, "the delete must push")
         self.assertTrue(
             any(p.get("delete_origin") == "true" for p in params),
@@ -1929,7 +2174,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         def _unown():
             row.status = "imported"
-            row.save()
+            self._save_with_writer(row)
 
         params = self._recorded_params(_unown)
         self.assertTrue(params, "the un-own shrink must push")
@@ -2044,9 +2289,11 @@ class TestDeleteOriginMarking(_SignalDBBase):
         )
 
     def test_unmanaging_a_device_pushes_no_intent(self):
+        from netbox_nso_plugin.management_lifecycle import delete_management
+
         mgmt = self._mgmt()
         self._owned_svi(mgmt)
-        self._assert_teardown_touched_only_the_offboard(self._recorded_calls(mgmt.delete))
+        self._assert_teardown_touched_only_the_offboard(self._recorded_calls(lambda: delete_management(mgmt)))
 
     def test_deleting_a_device_pushes_no_intent(self):
         from django.db.models.signals import pre_delete
@@ -2067,6 +2314,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
             pre_delete.disconnect(capture_origin, sender=NSOSVIState)
 
         self.assertEqual(origins, [self.device])
+        self._assert_teardown_touched_only_the_offboard(calls)
+
+    def test_bulk_deleting_a_device_pushes_no_intent(self):
+        mgmt = self._mgmt()
+        self._owned_svi(mgmt)
+
+        calls = self._recorded_calls(lambda: type(self.device).objects.filter(pk=self.device.pk).delete())
+
         self._assert_teardown_touched_only_the_offboard(calls)
 
 
@@ -2116,9 +2371,10 @@ class TestSourceRekeyLocksOnlyItsManagementRow(_CascadeFlushMixin, IntentPushRes
 
         def rekey():
             try:
-                # No test transaction here, so the handler's on_commit callback runs at once.
+                # The post_save receiver now runs only under a renderer writer, so drive the
+                # committed callback it schedules: the rekey seam a plain save still reaches.
                 with connections["default"].execute_wrapper(hold_the_first_locking_read):
-                    signals.sync_scope_to_adapter(sender=NSODeviceManagement, instance=self.mgmt, created=False)
+                    signals._sync_committed_scope_to_adapter(NSODeviceManagement, self.mgmt.pk, created=False)
             except BaseException as exc:  # noqa: BLE001 (re-raised on the caller's thread)
                 failures.append(exc)
             finally:

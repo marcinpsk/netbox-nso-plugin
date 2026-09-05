@@ -38,19 +38,35 @@ class TestOwnershipManifestSchema(SimpleTestCase):
 
 
 class TestOwnershipManifestDurability(TestCase):
-    def test_device_deletion_keeps_manifest_evidence(self):
+    def test_device_deletion_retires_and_keeps_manifest_evidence(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import ownership_planner
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
         from ._outbox_case import make_managed
 
         device, _management = make_managed("manifest-durability", 1627)
+        device_id = device.pk
         manifest = NSOOwnershipManifest.objects.create(
-            device_id=device.pk,
+            device_id=device_id,
             scope="interface",
             native_model_label="dcim.interface",
-            native_key={"device_id": device.pk, "name": "Ethernet1"},
+            native_key={"device_id": device_id, "name": "Ethernet1"},
         )
 
-        device.delete()
+        with patch.object(
+            ownership_planner,
+            "retire_manifest_identity",
+            wraps=ownership_planner.retire_manifest_identity,
+        ) as retire_identity:
+            device.delete()
 
-        self.assertTrue(NSOOwnershipManifest.objects.filter(pk=manifest.pk).exists())
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+        retire_identity.assert_called_once_with(
+            device_ids=(device_id,),
+            scope="interface",
+            native_model_label="dcim.interface",
+            native_key={"device_id": device_id, "name": "Ethernet1"},
+        )

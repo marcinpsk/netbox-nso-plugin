@@ -242,6 +242,7 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             has_priv_secret=True,
             auth_protocol="sha",
             priv_protocol="aes-128",
+            vault_ref="network/netbox/snmp/v3/nms-user",
             status="deploying",
         )
         NSOSnmpHostState.objects.create(

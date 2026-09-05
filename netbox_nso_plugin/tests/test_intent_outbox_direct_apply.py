@@ -16,6 +16,7 @@ leaves it. Joining them to the protocol properly is §7.1's own card.
 
 from __future__ import annotations
 
+import copy
 from unittest.mock import patch
 
 from dcim.models import Interface
@@ -144,23 +145,37 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
 
     def _owned_bundle(self):
         from netbox_nso_plugin.models import NSOLACPBundleState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         with without_commit_drain(), transaction.atomic():
             # Committing LACP is a device write, so only auto-apply pushes it on save.
             self.mgmt.auto_apply = True
             self.mgmt.save(update_fields=["auto_apply"])
             lag = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
-            return NSOLACPBundleState.objects.create(
+            bundle = NSOLACPBundleState(
                 management=self.mgmt, interface=lag, lag_id=1, min_links=2, timer="fast", status="accepted"
             )
+            plan = RendererMutationPlan.build(
+                saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+            )
+            with renderer_writes(plan) as writer:
+                writer.save(bundle, force_insert=True)
+            return bundle
 
     def test_n_saves_in_one_transaction_reach_the_device_once(self):
         bundle = self._owned_bundle()
         config, session = self.adapter.patches()
 
         with config, session, transaction.atomic():
-            for _ in range(3):
-                bundle.save()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+            for min_links in (3, 4, 5):
+                candidate = copy.copy(bundle)
+                candidate.min_links = min_links
+                plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("min_links",)),))
+                with renderer_writes(plan) as writer:
+                    writer.save(candidate, update_fields=("min_links",))
+                bundle.min_links = min_links
 
         assert len(self.adapter.requests) == 1, self.adapter.requests
         assert self.adapter.requests[0]["push_seq"] is None

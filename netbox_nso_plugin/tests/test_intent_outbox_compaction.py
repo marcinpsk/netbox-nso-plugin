@@ -28,6 +28,7 @@ from django.test.utils import CaptureQueriesContext
 from ._outbox_case import (
     ReceiptAdapter,
     as_per_object,
+    delete_vlan_state,
     entries,
     in_thread,
     make_managed,
@@ -35,6 +36,7 @@ from ._outbox_case import (
     own_vlan,
     state_of,
     without_commit_drain,
+    write_vlan_state,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -445,10 +447,9 @@ class TestACompactedRowSendsWhatItsContributorsAuthorized(_CompactionCase):
         self.adapter.requests.clear()
 
         with without_commit_drain(), transaction.atomic():
-            kept.status = "imported"  # an unmarked shrink: the operator un-owns it
-            kept.save()
+            write_vlan_state(kept, status="imported")
         with without_commit_drain(), transaction.atomic():
-            going.delete()  # a marked shrink: the object is destroyed in NetBox
+            delete_vlan_state(going)
         assert len(self.rows("vlan")) == 2
 
         drain.compact(self.device.pk, "vlan")

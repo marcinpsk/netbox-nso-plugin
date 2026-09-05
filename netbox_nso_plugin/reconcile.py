@@ -614,7 +614,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 epoch=dev_id,
             )
             # LACP/LAG bundle + member overlay states (interface-level).
-            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
+            from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -632,7 +632,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     lag_doc,
                 ),
                 epoch=dev_id,
-                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
+                pre_body=lambda: lacp_reconcile_plan(device, lag_doc),
             )
             # VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -959,7 +959,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="interface_ips",
             )
         elif key == "lacp":
-            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
+            from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -970,7 +970,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_lag_config(device, lag_doc),
                 epoch=dev_id,
                 ctx_key="lacp_bundle_states",
-                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
+                pre_body=lambda: lacp_reconcile_plan(device, lag_doc),
             )
         elif key == "vlan":
             from .vlan_reconciler import reconcile_vlan_database

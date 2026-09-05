@@ -589,6 +589,18 @@ def _register_incarnation_observation(m, inc: str, born) -> None:
     # born < pending_born and no collision → monotonic marker: ignore
 
 
+def _save_management_mirror(instance, update_fields) -> None:
+    """Save lifecycle fields after the caller has locked the management row."""
+    from .intent_state import mirror_refresh
+    from .signals import suppress_intent_push
+
+    fields = tuple(update_fields)
+    with suppress_intent_push(), mirror_refresh(instance, fields) as locked:
+        for field_name in fields:
+            setattr(locked, field_name, getattr(instance, field_name))
+        locked.save(update_fields=fields)
+
+
 def _adopt_incarnation(m, inc: str, born) -> None:
     """Adopt *inc* and RESET every family row for this management (→ unknown).
 
@@ -625,7 +637,7 @@ def _adopt_incarnation(m, inc: str, born) -> None:
             m.reset_pending_incarnation = ""
             m.reset_pending_born = None
             m.reset_conflict_born = None
-    m.save(update_fields=[*_MARKER_FIELDS, "adapter_source_epoch", "reset_pending_source_epoch"])
+    _save_management_mirror(m, [*_MARKER_FIELDS, "adapter_source_epoch", "reset_pending_source_epoch"])
 
 
 def _maybe_clear_reset_marker(m) -> bool:
@@ -646,7 +658,7 @@ def _maybe_clear_reset_marker(m) -> bool:
     m.reset_pending_incarnation = ""
     m.reset_pending_born = None
     m.reset_conflict_born = None
-    m.save(update_fields=_MARKER_FIELDS)
+    _save_management_mirror(m, _MARKER_FIELDS)
     return True
 
 
@@ -661,7 +673,7 @@ def _maybe_clear_source_marker(m) -> bool:
     if NSOFamilyReadState.objects.filter(management=m, observed_outcome="").exists():
         return False
     m.reset_pending_source_epoch = None
-    m.save(update_fields=["reset_pending_source_epoch"])
+    _save_management_mirror(m, ["reset_pending_source_epoch"])
     return True
 
 
@@ -687,12 +699,13 @@ def _adopt_source_epoch(m, row, source_epoch) -> str | None:
     if m.adapter_source_epoch != source_epoch or not m.source_epoch_aware:
         m.adapter_source_epoch = source_epoch
         m.source_epoch_aware = True
-        m.save(
-            update_fields=[
+        _save_management_mirror(
+            m,
+            [
                 "adapter_source_epoch",
                 "source_epoch_aware",
                 "reset_pending_source_epoch",
-            ]
+            ],
         )
     return None
 
@@ -772,7 +785,7 @@ def _gate_and_record(mgmt, family: str, read_state: dict | None, *, epoch) -> _D
                     or pending_collision
                 ):
                     _register_incarnation_observation(m, inc, born)
-                    m.save(update_fields=_MARKER_FIELDS)
+                    _save_management_mirror(m, _MARKER_FIELDS)
                 return _Decision(SKIPPED_STALE_ATTEMPT, False)
             _adopt_incarnation(m, inc, born)
             row.refresh_from_db()
@@ -931,8 +944,13 @@ def gated_family_run(
             )
         elif isinstance(plan, MutationFootprint):
             plan = ReconcileMutationPlan(plan, detect_content_changes=True)
+        from .renderer_writer import RendererMutationPlan, renderer_mirror_writes, renderer_writes
 
-        with reconcile_transaction(plan):
+        if isinstance(plan, RendererMutationPlan):
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        else:
+            mutation = reconcile_transaction(plan)
+        with mutation:
             current_management = NSODeviceManagement.objects.select_for_update().get(pk=mgmt.pk)
             row = NSOFamilyReadState.objects.select_for_update().get(management=current_management, family=family)
             if not _locked_publication_matches(current_management, row, decision, epoch):
@@ -1044,13 +1062,14 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
                 row.save()
                 wrote = True
         if marker_dirty:
-            m.save(update_fields=_MARKER_FIELDS)
+            _save_management_mirror(m, _MARKER_FIELDS)
         if source_dirty:
-            m.save(
-                update_fields=[
+            _save_management_mirror(
+                m,
+                [
                     "source_epoch_aware",
                     "reset_pending_source_epoch",
-                ]
+                ],
             )
         cleared = _maybe_clear_reset_marker(m) if wrote else False
         source_cleared = _maybe_clear_source_marker(m) if wrote else False

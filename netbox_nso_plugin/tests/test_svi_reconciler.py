@@ -47,6 +47,36 @@ class TestSviReconciler(TestCase):
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
         self.assertEqual(rows[0].status, "imported")
 
+    def test_reconcile_preflights_native_and_overlay_creations(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+
+        plan = svi_reconcile_plan(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan1627", "vlan_id": 1627, "type": "svi"}]},
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "dcim.interface"),
+                ("save", "netbox_nso_plugin.nsosvistate"),
+            ],
+        )
+
+    def test_reconcile_plan_does_not_create_the_device_vlan_group(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+
+        svi_reconcile_plan(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan1628", "vlan_id": 1628, "type": "svi"}]},
+        )
+
+        self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
+
     def test_direct_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
@@ -85,11 +115,8 @@ class TestSviReconciler(TestCase):
     def test_a_concurrently_created_interface_is_reused(self):
         from django.db import connection
 
-        from netbox_nso_plugin.intent_state import reconcile_transaction
-        from netbox_nso_plugin.svi_reconciler import _reconcile_svi, svi_reconcile_plan
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
-        payload = {"interfaces": [{"interface_name": "Vlan201", "vlan_id": 201, "type": "svi"}]}
-        plan = svi_reconcile_plan(self.device, payload)
         inserted = None
 
         def insert_after_interface_read(execute, sql, params, many, context):
@@ -99,12 +126,56 @@ class TestSviReconciler(TestCase):
                 inserted = Interface.objects.create(device=self.device, name="Vlan201", type="virtual")
             return result
 
-        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
-            rows = _reconcile_svi(self.device, payload)
+        with connection.execute_wrapper(insert_after_interface_read):
+            rows = reconcile_svi(
+                self.device,
+                {"interfaces": [{"interface_name": "Vlan201", "vlan_id": 201, "type": "svi"}]},
+            )
 
         self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
         self.assertEqual(rows[0].interface_id, inserted.pk)
         self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan201").count(), 1)
+
+    def test_a_concurrently_completed_svi_creation_is_reused(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+        from netbox_nso_plugin.svi_reconciler import _reconcile_svi, svi_reconcile_plan
+
+        payload = {"interfaces": [{"interface_name": "Vlan202", "vlan_id": 202, "type": "svi"}]}
+        plan = svi_reconcile_plan(self.device, payload)
+        interface = Interface(device=self.device, name="Vlan202", type="virtual")
+        interface._site = self.device.site
+        interface._location = self.device.location
+        interface._rack = self.device.rack
+        state = NSOSVIState(
+            management=self.management,
+            interface=interface,
+            svi_type="svi",
+            status="imported",
+            last_sync_at=plan.planned_at,
+        )
+        winner = RendererMutationPlan.build(
+            saves=(
+                planned_save(interface, force_insert=True, natural_key=("device", "name")),
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "interface"),
+                ),
+            )
+        )
+        with renderer_mirror_writes(winner) as writer:
+            writer.save(interface, force_insert=True)
+            writer.save(state, force_insert=True)
+
+        with renderer_mirror_writes(plan) as writer:
+            rows = _reconcile_svi(self.device, payload, writer, plan.planned_at)
+
+        self.assertEqual(rows[0].pk, state.pk)
+        self.assertEqual(NSOSVIState.objects.filter(management=self.management, interface=interface).count(), 1)
 
     def test_irb_type_preserved(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
@@ -123,6 +194,36 @@ class TestSviReconciler(TestCase):
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan301", "vlan_id": 301, "type": "svi"}]})
         names = set(NSOSVIState.objects.filter(management=self.management).values_list("interface__name", flat=True))
         self.assertEqual(names, {"Vlan301"})
+
+    def test_stale_imported_svi_replans_after_status_flip(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import svi_reconciler
+
+        payload = {"interfaces": [{"interface_name": "Vlan302", "vlan_id": 302, "type": "svi"}]}
+        reconcile_svi = svi_reconciler.reconcile_svi
+        reconcile_svi(self.device, payload)
+        state = NSOSVIState.objects.get(management=self.management, interface__name="Vlan302")
+        real_plan = svi_reconciler.svi_reconcile_plan
+        plan_calls = 0
+
+        def plan_then_flip(device, candidate_payload):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan = real_plan(device, candidate_payload)
+            if plan_calls == 1:
+                from ._outbox_case import content_update
+
+                fresh = NSOSVIState.objects.get(pk=state.pk)
+                content_update(fresh, status="in_sync")
+            return plan
+
+        with patch.object(svi_reconciler, "svi_reconcile_plan", side_effect=plan_then_flip):
+            reconcile_svi(self.device, {"interfaces": []})
+
+        state.refresh_from_db()
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
 
 
 class TestSviWritePath(IntentPushResetMixin, TestCase):
@@ -243,8 +344,9 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         payload = {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]}
         plan = svi_reconcile_plan(self.device, payload)
         self.assertTrue(plan.changes_content)
+        self.assertFalse(plan.settles_deploying)
 
-        outer_plan = ReconcileMutationPlan(plan.footprint, detect_content_changes=True)
+        outer_plan = ReconcileMutationPlan(plan.lock_footprint, changes_content=True)
         with reconcile_transaction(outer_plan):
             reconcile_svi(self.device, payload)
 
@@ -297,10 +399,24 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         assert [i["interface_name"] for i in ifaces] == ["Vlan100"]
         assert ifaces[0]["vlan_id"] == 100 and ifaces[0]["vrf"] == "MGMT"
 
+    def test_foreign_overlay_save_does_not_schedule_svi_behavior(self):
+        from unittest.mock import patch
+
+        state = self._state(name="Vlan250", vid=250, status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.vrf = "FOREIGN"
+            state.save(update_fields=("vrf",))
+
+        schedule.assert_not_called()
+
     def test_accept_marks_owned(self):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
 
         state = self._state(name="Vlan300", vid=300, status="conflict")
         User = get_user_model()
@@ -311,3 +427,79 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="svi")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("svi", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="svi",
+            native_model_label="dcim.interface",
+            native_key={"device_id": state.interface.device_id, "name": state.interface.name},
+            ownership_state="owned",
+        ).exists()
+
+    def test_exhausted_save_protocol_error_retry_returns_an_operator_error(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+
+        state = self._state(name="Vlan301", vid=301, status="conflict")
+        user = get_user_model().objects.create_superuser(
+            username="svi-stale-admin",
+            password="pw",  # noqa: S106
+            email="stale-svi@example.test",
+        )
+        self.client.force_login(user)
+
+        with patch(
+            "netbox_nso_plugin.renderer_writer.RendererWriter.save",
+            side_effect=IntentMutationProtocolError("the stored row disappeared"),
+        ) as save:
+            response = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(save.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["Routing state changed. Refresh the page and try again."],
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertIsNone(state.accepted_at)
+
+    def test_exhausted_plan_protocol_error_retry_returns_an_operator_error(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+
+        state = self._state(name="Vlan302", vid=302, status="conflict")
+        user = get_user_model().objects.create_superuser(
+            username="svi-plan-stale-admin",
+            password="pw",  # noqa: S106
+            email="stale-svi-plan@example.test",
+        )
+        self.client.force_login(user)
+
+        with patch(
+            "netbox_nso_plugin.renderer_writer.RendererMutationPlan.build",
+            side_effect=IntentMutationProtocolError("the stored row disappeared"),
+        ) as build:
+            response = self.client.post(f"/plugins/nso/svi/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["Routing state changed. Refresh the page and try again."],
+        )
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertIsNone(state.accepted_at)

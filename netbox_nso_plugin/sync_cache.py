@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from .models import NSODeviceManagement
+
 logger = logging.getLogger(__name__)
 
 # Sort key for a row the link repair has never tried, so it goes to the front of the queue.
@@ -42,11 +44,30 @@ class _LinkReconcileNoOp(Exception):
     """Roll back a repair whose authoritative source identity changed."""
 
 
-def _mirror_management(mgmt, **values) -> None:
-    """Persist lifecycle-only adapter observations with one locked instance save."""
-    from .intent_state import update_mirror_fields
+def _mirror_management(mgmt, **values) -> bool:
+    """Persist lifecycle-only adapter observations through the exact writer."""
+    from .intent_state import RendererTargetsChanged
+    from .management_lifecycle import save_management
+    from .renderer_writer import IntentPlanStaleError
 
-    update_mirror_fields(mgmt, **values)
+    fields = frozenset(values)
+    current = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
+    if current is None:
+        return False
+    for field_name, value in values.items():
+        setattr(current, field_name, value)
+    try:
+        save_management(current, update_fields=fields)
+    except (IntentPlanStaleError, RendererTargetsChanged) as exc:
+        logger.warning(
+            "Skipped mirror update for management row %s because its renderer plan changed: %s",
+            mgmt.pk,
+            exc,
+        )
+        return False
+    for field_name, value in values.items():
+        setattr(mgmt, field_name, value)
+    return True
 
 
 def parse_adapter_timestamp(value, field="timestamp"):
@@ -69,9 +90,8 @@ def parse_adapter_timestamp(value, field="timestamp"):
 def refresh_sync_cache(mgmt, adapter_device):
     """Update one row's cached last_sync_* from an adapter device dict.
 
-    Writes only changed fields via a targeted ``.update()`` (no full save / no signals),
-    so it is cheap enough to call per-row on a list view. Returns the list of fields
-    actually changed (empty if already current).
+    Writes only changed fields through the lifecycle writer's exact mutation plan.
+    Returns the list of fields actually changed (empty if already current).
     """
     # Fail closed on identity: callers that fetch a single device by the stored id (the device
     # NSO tab) would otherwise copy a reused id's owner status onto this row — the same wrong
@@ -108,7 +128,13 @@ def refresh_sync_cache(mgmt, adapter_device):
     # the failure would retire a banner whose scope never landed. It is cleared by the successful
     # push (signals.sync_scope_to_adapter) or the banner's own "Retry adapter link" action.
     if update_fields:
-        _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
+        persisted = _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
+        if not persisted:
+            try:
+                mgmt.refresh_from_db(fields=update_fields)
+            except NSODeviceManagement.DoesNotExist:
+                pass
+            return []
     return update_fields
 
 
@@ -207,6 +233,24 @@ def _flag_link_error(mgmt, message) -> None:
         _mirror_management(mgmt, adapter_link_error=message)
 
 
+def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
+    """Return the ``(mgmt, state, adapter_device)`` rows whose mapping no longer resolves."""
+    broken = []
+    for mgmt in mapped:
+        # A row mid-provision has no adapter device yet by design and its push is gated.
+        # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
+        # the adapter still carries the old one, so it reads as "reused". Dropping its pointer
+        # here would strand it for good — _snapshot only considers rows that HAVE an id, and
+        # re-onboarding the new identity collides with the old row still holding this
+        # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
+        if mgmt.onboard_status or mgmt.source_rekey_pending:
+            continue
+        state, adapter_device = _classify(mgmt, by_id, by_identity)
+        if state is not _MATCHED:
+            broken.append((mgmt, state, adapter_device))
+    return broken
+
+
 def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     """Repair rows whose ``adapter_device_id`` no longer resolves to their own adapter device.
 
@@ -236,19 +280,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     if by_id is None:
         return 0, 0
 
-    broken = []
-    for mgmt in mapped:
-        # A row mid-provision has no adapter device yet by design and its push is gated.
-        # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
-        # the adapter still carries the old one, so it reads as "reused". Dropping its pointer
-        # here would strand it for good — _snapshot only considers rows that HAVE an id, and
-        # re-onboarding the new identity collides with the old row still holding this
-        # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
-        if mgmt.onboard_status or mgmt.source_rekey_pending:
-            continue
-        state, adapter_device = _classify(mgmt, by_id, by_identity)
-        if state is not _MATCHED:
-            broken.append((mgmt, state, adapter_device))
+    broken = _broken_links(mapped, by_id, by_identity)
     if not broken:
         return 0, 0
 
@@ -264,6 +296,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
         try:
             from .intent_state import footprint_for_instance, intent_transaction
+            from .management_lifecycle import save_management
 
             with intent_transaction(footprint_for_instance(mgmt)):
                 current = type(mgmt).objects.get(pk=mgmt.pk)
@@ -275,9 +308,12 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 # Stamp for being TRIED, not for succeeding, and before the try: whether the
                 # re-onboard worked is not observable here (it happens in an on_commit callback
                 # that logs and returns), so a stamp conditional on success would never move a
-                # permanently broken row to the back of the queue.
+                # permanently broken row to the back of the queue. Persist the mirror-only
+                # stamp through the lifecycle writer before attempting the repair. A rejected
+                # stamp persisted nothing, so this row was not tried and must not be repaired.
+                if not _mirror_management(current, adapter_link_attempted_at=now):
+                    continue
                 attempted += 1
-                _mirror_management(current, adapter_link_attempted_at=now)
                 if state is _MOVED:
                     logger.warning(
                         "Adapter device for %s moved from id %s to %s — adopting",
@@ -285,15 +321,17 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                         current.adapter_device_id,
                         adapter_device["id"],
                     )
-                    _mirror_management(current, adapter_device_id=adapter_device["id"])
+                    if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
+                        continue
                 elif state is _REUSED:
                     logger.warning(
                         "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
                         current.adapter_device_id,
                         current.nso_device_name,
                     )
-                    _mirror_management(current, adapter_device_id=None)
-                current.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+                    if not _mirror_management(current, adapter_device_id=None):
+                        continue
+                save_management(current)
         except _LinkReconcileNoOp:
             continue
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep

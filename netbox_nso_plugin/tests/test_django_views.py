@@ -32,6 +32,7 @@ from ._adapter_http import make_response, make_session
 from ._outbox_case import (
     ReceiptAdapter,
     content_bulk_update,
+    in_thread,
     make_managed,
     mirror_update,
     without_commit_drain,
@@ -948,6 +949,62 @@ class TestNSODeviceManagementEditView(ViewTestBase):
         form = NSODeviceManagementForm(initial={"device": 99999})
         # Should not raise; nso_device_name stays unset
         self.assertNotIn("nso_device_name", form.initial)
+
+    def test_edit_post_finalizes_the_exact_renderer_fingerprint(self):
+        """The production form update uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_edit", args=[self.mgmt.pk]),
+            {
+                "device": self.device.pk,
+                "nso_instance": self.nso_instance.pk,
+                "nso_device_name": self.mgmt.nso_device_name,
+                "manage_enabled": "on",
+                "sync_before_apply": "on",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="interface")
+        rendered = delivery.render("interface", self.device.pk, self.mgmt.adapter_device_id)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
+
+    def test_delete_post_finalizes_the_empty_renderer_fingerprint(self):
+        """The production form delete uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        device_id = self.device.pk
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_delete", args=[self.mgmt.pk]),
+            {"confirm": "on"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        revision = NSOIntentRevision.objects.get(device_id=device_id, scope="interface")
+        rendered = delivery.render("interface", device_id, None)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
+
+    def test_bulk_delete_finalizes_the_empty_renderer_fingerprint(self):
+        """The production bulk-delete flow uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        device_id = self.device.pk
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_bulk_delete"),
+            {"pk": [self.mgmt.pk], "_confirm": "Confirm", "confirm": "on"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        revision = NSOIntentRevision.objects.get(device_id=device_id, scope="interface")
+        rendered = delivery.render("interface", device_id, None)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
 
 
 class TestAdapterConnectionEditView(ViewTestBase):
@@ -4737,7 +4794,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOVLANState
 
         group = VLANGroup.objects.create(name="Shared Inline VLANs", slug="shared-inline-vlans")
         vlan = VLAN.objects.create(group=group, vid=120, name="OLD-NAME")
@@ -4781,11 +4839,33 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertIsNone(second.apply_attempt_id)
         self.assertIsNotNone(first.accepted_at)
         self.assertIsNotNone(second.accepted_at)
+        for state in (first, second):
+            revision = NSOIntentRevision.objects.get(device=state.management.device, scope="vlan")
+            self.assertEqual(revision.verified_revision, revision.revision)
+            self.assertEqual(
+                revision.verified_fingerprint,
+                delivery.canonical_fingerprint(
+                    delivery.render(
+                        "vlan",
+                        state.management.device_id,
+                        state.management.adapter_device_id,
+                    ).payload
+                ),
+            )
+            self.assertTrue(
+                NSOOwnershipManifest.objects.filter(
+                    device_id=state.management.device_id,
+                    scope="vlan",
+                    native_model_label="ipam.vlan",
+                    native_key={"group_id": vlan.group_id, "vid": vlan.vid},
+                    ownership_state="owned",
+                ).exists()
+            )
 
     def test_edit_vlan_name_reports_when_the_vlan_is_deleted_before_save(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction, vlan_footprint
+        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -4799,14 +4879,14 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         revisions_after_delete = []
 
-        def delete_then_resolve(vlan_id, scopes, **kwargs):
+        def delete_then_load(vlan_model, vlan_id):
             doomed = VLAN.objects.get(pk=vlan_id)
             with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
                 doomed.delete()
             revisions_after_delete.append(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision)
-            return vlan_footprint(vlan_id, scopes, **kwargs)
+            return None, ()
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", new=delete_then_resolve):
+        with patch("netbox_nso_plugin.views._vlan_name_edit_rows", new=delete_then_load):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "UNSAVED-NAME"})
 
         self.assertEqual(response.status_code, 400, response.content)
@@ -4819,10 +4899,14 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(revision.revision, revisions_after_delete[0])
 
     def test_edit_svi_vrf_takes_ownership_without_changing_structural_identity(self):
+        from datetime import timedelta
+
         from django.utils import timezone
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOSVIState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
 
         group = VLANGroup.objects.create(name="Inline SVI VLANs", slug="inline-svi-vlans")
         vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
@@ -4834,13 +4918,19 @@ class TestOverlayFieldEditView(ViewTestBase):
             svi_type="svi",
             vrf="OLD-VRF",
             status="deploying",
-            accepted_at=timezone.now(),
+            accepted_at=timezone.now() - timedelta(days=3),
             apply_attempt_id=uuid4(),
         )
+        planned_at = timezone.now()
 
-        response = self.client.post(self._url("svi", state.pk), {"vrf": "CUSTOMER"})
+        with (
+            patch("netbox_nso_plugin.views.timezone.now", return_value=planned_at),
+            patch.object(RendererMutationPlan, "build", wraps=RendererMutationPlan.build) as build,
+        ):
+            response = self.client.post(self._url("svi", state.pk), {"vrf": "CUSTOMER"})
 
         self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(build.call_args.kwargs["planned_at"], planned_at)
         state.refresh_from_db()
         self.assertEqual(state.vrf, "CUSTOMER")
         self.assertEqual(state.status, "accepted")
@@ -4849,6 +4939,21 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(state.interface_id, interface.pk)
         self.assertEqual(state.vlan_id, vlan.pk)
         self.assertEqual(state.svi_type, "svi")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="svi")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("svi", self.device.pk, self.mgmt.adapter_device_id).payload),
+        )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="svi",
+                native_model_label="dcim.interface",
+                native_key={"device_id": interface.device_id, "name": interface.name},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_subinterface_l3_values_takes_ownership_without_changing_identity(self):
         from netbox_nso_plugin.models import NSOSubinterfaceState
@@ -4962,7 +5067,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_vlan_name_reports_a_qinq_collision_created_after_validation(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import views
         from netbox_nso_plugin.models import NSOVLANState
 
         first_group = VLANGroup.objects.create(name="First Q-in-Q Group", slug="first-qinq-group")
@@ -4981,10 +5086,10 @@ class TestOverlayFieldEditView(ViewTestBase):
             device_name="KEEP-NAME",
             status="imported",
         )
-        original_footprint = intent_state.vlan_footprint
+        original_rows = views._vlan_name_edit_rows
 
-        def resolve_then_collide(vlan_id, scopes, **kwargs):
-            result = original_footprint(vlan_id, scopes, **kwargs)
+        def load_then_collide(vlan_model, vlan_id):
+            result = original_rows(vlan_model, vlan_id)
             VLAN.objects.create(
                 group=second_group,
                 vid=122,
@@ -4994,7 +5099,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             )
             return result
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_collide):
+        with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "TAKEN-NAME"})
 
         self.assertEqual(response.status_code, 400)
@@ -5007,7 +5112,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_vlan_name_reports_a_collision_created_after_validation(self):
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import views
         from netbox_nso_plugin.models import NSOVLANState
 
         group = VLANGroup.objects.create(name="Raced Inline VLANs", slug="raced-inline-vlans")
@@ -5018,14 +5123,14 @@ class TestOverlayFieldEditView(ViewTestBase):
             device_name="KEEP-NAME",
             status="imported",
         )
-        original_footprint = intent_state.vlan_footprint
+        original_rows = views._vlan_name_edit_rows
 
-        def resolve_then_collide(vlan_id, scopes, **kwargs):
-            result = original_footprint(vlan_id, scopes, **kwargs)
+        def load_then_collide(vlan_model, vlan_id):
+            result = original_rows(vlan_model, vlan_id)
             VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
             return result
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_collide):
+        with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "RACED-NAME"})
 
         self.assertEqual(response.status_code, 400, response.content)
@@ -6510,6 +6615,218 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         self.assertIn("192.0.2.99", body)  # persisted rows still render
 
 
+class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        manufacturer = Manufacturer.objects.create(name="LACP race", slug="lacp-race")
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model="LACP race",
+            slug="lacp-race",
+        )
+        role = DeviceRole.objects.create(name="LACP race", slug="lacp-race")
+        site = Site.objects.create(name="LACP race", slug="lacp-race")
+        self.device = Device.objects.create(
+            name="lacp-race-device",
+            device_type=device_type,
+            role=role,
+            site=site,
+        )
+        nso_instance = NSOInstance.objects.create(
+            name="lacp-race-instance",
+            adapter_instance_id="lacp-race-instance",
+        )
+        self.mgmt = NSODeviceManagement(
+            device=self.device,
+            nso_instance=nso_instance,
+            nso_device_name="lacp-race-device",
+        )
+        with intent_transaction(footprint_for_instance(self.mgmt)):
+            NSODeviceManagement.objects.bulk_create([self.mgmt])
+        self.user = User.objects.create_superuser(
+            username="lacp-race-admin",
+            password=TEST_PASSWORD,
+            email="lacp-race-admin@test.example",
+        )
+        self.client.force_login(self.user)
+
+        self.lag = Interface.objects.create(device=self.device, name="Port-channel20", type="lag")
+        member = Interface.objects.create(device=self.device, name="GigabitEthernet0/20", type="1000base-t")
+        with transaction.atomic():
+            self.bundle = NSOLACPBundleState.objects.create(
+                management=self.mgmt,
+                interface=self.lag,
+                lag_id=20,
+                status="imported",
+            )
+            self.member = NSOLACPMemberState.objects.create(
+                management=self.mgmt,
+                interface=member,
+                lag_bundle=self.lag,
+                mode="active",
+                port_priority=100,
+                status="imported",
+            )
+
+    def _post_with_member_changes(self, priorities):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOLACPMemberState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        original_build = RendererMutationPlan.build
+        pending_priorities = iter(priorities)
+
+        def change_priority(priority):
+            current = NSOLACPMemberState.objects.get(pk=self.member.pk)
+            with intent_transaction(footprint_for_instance(current)):
+                NSOLACPMemberState.objects.filter(pk=current.pk).update(port_priority=priority)
+
+        def build_then_change(*args, **kwargs):
+            plan = original_build(*args, **kwargs)
+            priority = next(pending_priorities, None)
+            if priority is not None:
+                in_thread(lambda: change_priority(priority))
+            return plan
+
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": self.bundle.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_change):
+            return self.client.post(url)
+
+    def test_accept_rebuilds_the_plan_after_one_concurrent_member_change(self):
+        response = self._post_with_member_changes([101])
+
+        self.assertEqual(response.status_code, 302)
+        self.bundle.refresh_from_db()
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.port_priority, 101)
+        self.assertEqual((self.bundle.status, self.member.status), ("in_sync", "in_sync"))
+
+    def test_accept_reports_a_refresh_conflict_after_two_member_changes(self):
+        from django.contrib.messages import get_messages
+
+        response = self._post_with_member_changes([101, 102])
+
+        self.assertEqual(response.status_code, 302)
+        message_text = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertTrue(any("Refresh the page and try again." in message for message in message_text))
+        self.assertFalse(any(message.startswith("Accepted LACP bundle") for message in message_text))
+        self.bundle.refresh_from_db()
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.port_priority, 102)
+        self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
+
+    def test_accept_reports_a_refresh_conflict_after_two_interface_retargets(self):
+        import copy
+
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        target_devices = (
+            make_managed("lacp-race-target-first", 16276)[0],
+            make_managed("lacp-race-target-second", 16277)[0],
+        )
+        targets = iter(target_devices)
+        original_build = RendererMutationPlan.build
+
+        def retarget_interface(target):
+            current = Interface.objects.get(pk=self.member.interface_id)
+            candidate = copy.copy(current)
+            candidate.device = target
+            plan = original_build(saves=(planned_save(candidate, update_fields=("device",)),))
+            mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+            with mutation(plan) as writer:
+                writer.save(candidate, update_fields=("device",))
+
+        def build_then_retarget(*args, **kwargs):
+            plan = original_build(*args, **kwargs)
+            target = next(targets, None)
+            if target is not None:
+                in_thread(lambda: retarget_interface(target))
+            return plan
+
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": self.bundle.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_retarget) as build:
+            response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["The LACP bundle changed. Refresh the page and try again."],
+        )
+        self.bundle.refresh_from_db()
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.interface.device_id, target_devices[-1].pk)
+        self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
+
+    def test_accept_reports_a_refresh_conflict_when_selected_members_are_deleted_before_build(self):
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.models import NSOLACPMemberState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        second_interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/21",
+            type="1000base-t",
+        )
+        with transaction.atomic():
+            second_member = NSOLACPMemberState.objects.create(
+                management=self.mgmt,
+                interface=second_interface,
+                lag_bundle=self.lag,
+                mode="active",
+                port_priority=100,
+                status="imported",
+            )
+        selected_members = iter((self.member, second_member))
+        original_build = RendererMutationPlan.build
+
+        def delete_member(member):
+            current = NSOLACPMemberState.objects.get(pk=member.pk)
+            plan = original_build(deletes=(planned_delete(current),))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer, suppress_intent_push():
+                writer.delete(current)
+
+        def delete_then_build(*args, **kwargs):
+            member = next(selected_members)
+            in_thread(lambda: delete_member(member))
+            return original_build(*args, **kwargs)
+
+        url = reverse("plugins:netbox_nso_plugin:lacp_accept_bundle", kwargs={"pk": self.bundle.pk})
+        self.client.raise_request_exception = False
+        with patch.object(RendererMutationPlan, "build", side_effect=delete_then_build) as build:
+            response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["The LACP bundle changed. Refresh the page and try again."],
+        )
+        self.bundle.refresh_from_db()
+        self.assertEqual(self.bundle.status, "imported")
+        self.assertFalse(NSOLACPMemberState.objects.filter(pk__in=(self.member.pk, second_member.pk)).exists())
+
+
 class TestRoutePolicyGrid(ViewTestBase):
     """route_policy as a client-side grid: the payload is built from persisted
     NSORoutePolicyState (no adapter call), rows carry the per-device / unsupported
@@ -6848,11 +7165,11 @@ class TestNSOVLANRescopeView(ViewTestBase):
     """POST-level cover for the rescope refusals the acquisition can raise."""
 
     def test_rescope_refuses_when_a_device_attaches_before_acquisition(self):
-        """A late renderer target must return the refusal redirect, not an unhandled exception."""
+        """A device that attaches after the membership snapshot must get the refusal redirect."""
         from django.contrib.messages import get_messages
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import intent_state, vlan_reconciler
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
@@ -6872,15 +7189,15 @@ class TestNSOVLANRescopeView(ViewTestBase):
             nso_instance=self.nso_instance,
             nso_device_name="late-rescope-router",
         )
-        original_footprint = intent_state.vlan_footprint
+        original_managed_device_ids = vlan_reconciler._rescope_managed_device_ids
         attached = False
         revisions_after_attach = {}
         late_state_pk = None
 
-        def attach_before_transaction(vlan_id, scopes, **kwargs):
+        def attach_before_acquisition(old_vlan):
             nonlocal attached, late_state_pk
-            footprint = original_footprint(vlan_id, scopes, **kwargs)
-            if not attached and vlan_id == source_vlan.pk:
+            device_ids = original_managed_device_ids(old_vlan)
+            if not attached and old_vlan.pk == source_vlan.pk:
                 attached = True
                 late_state = NSOVLANState(
                     management=late_mgmt,
@@ -6894,10 +7211,13 @@ class TestNSOVLANRescopeView(ViewTestBase):
                 revisions_after_attach.update(
                     dict(NSOIntentRevision.objects.values_list("id", "revision")),
                 )
-            # The stale footprint is what makes acquisition find the extra renderer target.
-            return footprint
+            # The stale membership snapshot is what makes the rescope find the extra device.
+            return device_ids
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=attach_before_transaction):
+        with patch(
+            "netbox_nso_plugin.vlan_reconciler._rescope_managed_device_ids",
+            side_effect=attach_before_acquisition,
+        ):
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
                 {"group": target_group.pk},

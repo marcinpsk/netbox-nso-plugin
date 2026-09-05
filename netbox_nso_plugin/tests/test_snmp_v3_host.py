@@ -96,6 +96,33 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
         self.assertEqual(hosts[0]["community_or_user"], "netmon-v3")
         self.assertEqual(hosts[0]["address"], "10.0.0.5")
 
+    def test_an_owned_blocker_aborts_the_full_snapshot(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.18.0.5",
+            version="2c",
+            notify_type="trap",
+            community_hash="abc123def456",
+            status="accepted",
+        )
+        NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.18.0.6",
+            version="3",
+            notify_type="trap",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot"):
+                deliver("snmp", self.device.pk, self.mgmt.adapter_device_id)
+
+        mock_put.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_errors["snmp"]["code"], "validation_error")
+
     def test_a_v3_host_WITHOUT_a_user_name_is_still_refused(self):
         """The half that must stay refused: with no user name there is nothing to key the receiver
         on. IOS-XR cannot even form the key; IOS would write a host bound to no user at all. A push

@@ -674,6 +674,21 @@ class NSODeviceManagement(NetBoxModel):
         A save that NAMES its fields is untouched: every writer of these columns names
         them deliberately, holding this same row lock.
         """
+        from .intent_state import mirror_refresh_is_active
+        from .management_lifecycle import save_management
+        from .renderer_writer import active_renderer_writer
+
+        if active_renderer_writer() is None and not mirror_refresh_is_active():
+            if args or kwargs.keys() - {"force_insert", "update_fields", "using"}:
+                raise TypeError("the management writer accepts only force_insert, update_fields, and using")
+            using = kwargs.get("using")
+            if using not in (None, "default"):
+                raise ValueError("the management writer supports only the default database")
+            return save_management(
+                self,
+                update_fields=kwargs.get("update_fields"),
+                force_insert=kwargs.get("force_insert", False),
+            )
         if kwargs.get("update_fields") is not None or not self.pk:
             with transaction.atomic():
                 return super().save(*args, **kwargs)
@@ -684,6 +699,17 @@ class NSODeviceManagement(NetBoxModel):
                 for field in protected:
                     setattr(self, field, current[field])
             return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        """Route sanctioned management CRUD deletes through the exact writer."""
+        from .management_lifecycle import delete_management
+        from .renderer_writer import active_renderer_writer
+
+        if active_renderer_writer() is None:
+            if args or kwargs:
+                raise TypeError("the management CRUD writer does not accept delete options")
+            return delete_management(self)
+        return super().delete(*args, **kwargs)
 
     def get_absolute_url(self):
         """Return the detail URL for this management record."""

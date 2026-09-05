@@ -182,7 +182,13 @@ class TestIntentGenerationAllocator(TestCase):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
-        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            planned_save,
+            renderer_writes,
+        )
 
         device = _make_device("recr")
         mgmt = _make_mgmt(device, "recr", 9104)
@@ -190,13 +196,91 @@ class TestIntentGenerationAllocator(TestCase):
         first = allocate_intent_generation()
         NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted", intent_generation=first)
 
-        mgmt.delete()  # cascades the overlay away — the adapter keeps its job history
+        delete_plan = RendererMutationPlan.build(deletes=(planned_delete(mgmt),))
+        with renderer_writes(delete_plan) as writer:
+            writer.delete(mgmt)
         assert not NSOStaticRouteState.objects.filter(static_route=sr).exists()
 
-        mgmt2 = _make_mgmt(device, "recr", 9104)
+        mgmt2 = NSODeviceManagement(
+            device=device,
+            nso_instance=mgmt.nso_instance,
+            nso_device_name=mgmt.nso_device_name,
+            adapter_device_id=mgmt.adapter_device_id,
+        )
+        create_plan = RendererMutationPlan.build(
+            saves=(planned_save(mgmt2, force_insert=True, natural_key=("device",)),)
+        )
+        with renderer_writes(create_plan) as writer:
+            writer.save(mgmt2, force_insert=True)
         second = allocate_intent_generation()
         NSOStaticRouteState.objects.create(
             management=mgmt2, static_route=sr, status="accepted", intent_generation=second
         )
 
+        assert second > first
+
+    def test_delete_and_recreate_use_separate_frozen_writer_plans(self):
+        """A management cascade cannot leak its writer permit into the new incarnation."""
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.intent_generation import allocate_intent_generation
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            active_renderer_writer,
+            planned_delete,
+            planned_save,
+            renderer_writes,
+        )
+
+        device = _make_device("writer-recr")
+        management = _make_mgmt(device, "writer-recr", 9105)
+        route = StaticRoute.objects.create(prefix="198.18.40.0/24", next_hop="198.18.40.1", metric=1)
+        first = allocate_intent_generation()
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="accepted",
+            intent_generation=first,
+        )
+
+        delete_plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        with renderer_writes(delete_plan) as writer:
+            writer.delete(management)
+
+        assert active_renderer_writer() is None
+        assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
+
+        replacement = NSODeviceManagement(
+            device=device,
+            nso_instance=management.nso_instance,
+            nso_device_name=management.nso_device_name,
+            adapter_device_id=management.adapter_device_id,
+        )
+        create_plan = RendererMutationPlan.build(
+            saves=(planned_save(replacement, force_insert=True, natural_key=("device",)),)
+        )
+        with renderer_writes(create_plan) as writer:
+            writer.save(replacement, force_insert=True)
+
+        second = allocate_intent_generation()
+        replacement_state = NSOStaticRouteState(
+            management=replacement,
+            static_route=route,
+            status="accepted",
+            intent_generation=second,
+        )
+        state_plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    replacement_state,
+                    force_insert=True,
+                    natural_key=("management", "static_route"),
+                ),
+            )
+        )
+        with renderer_writes(state_plan) as writer:
+            writer.save(replacement_state, force_insert=True)
+
+        assert active_renderer_writer() is None
         assert second > first

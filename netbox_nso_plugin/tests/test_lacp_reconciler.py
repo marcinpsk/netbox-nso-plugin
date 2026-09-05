@@ -7,7 +7,6 @@ from __future__ import annotations
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.db import connection
 from django.test import TestCase
-from django.test.utils import CaptureQueriesContext
 
 from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
 from netbox_nso_plugin.models import (
@@ -90,43 +89,152 @@ class TestReconcileLagConfig(TestCase):
         m2 = NSOLACPMemberState.objects.get(interface=self.m2)
         assert m2.port_priority is None
 
+    def test_repeated_member_entry_is_applied_once(self):
+        member = {"interface_name": self.m1.name, "mode": "active", "port_priority": 128}
+
+        reconcile_lag_config(self.device, _payload([self._bundle(members=[member, member | {"mode": "passive"}])]))
+
+        self.assertEqual(NSOLACPMemberState.objects.filter(management=self.mgmt, interface=self.m1).count(), 1)
+        self.assertEqual(NSOLACPMemberState.objects.get(management=self.mgmt, interface=self.m1).mode, "active")
+
+    def test_repeated_bundle_entry_is_applied_once(self):
+        reconcile_lag_config(
+            self.device,
+            _payload([self._bundle(min_links=1), self._bundle(min_links=2)]),
+        )
+
+        self.assertEqual(NSOLACPBundleState.objects.filter(management=self.mgmt, interface=self.lag).count(), 1)
+        self.assertEqual(NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag).min_links, 1)
+
+    def test_owned_member_move_bumps_the_lacp_document(self):
+        """A lag_bundle change affects the nested LACP document, not only the member row."""
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        second_lag = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        reconcile_lag_config(
+            self.device,
+            _payload(
+                [
+                    self._bundle(
+                        members=[{"interface_name": self.m1.name, "mode": "active"}],
+                    )
+                ]
+            ),
+        )
+        bundle = NSOLACPBundleState.objects.get(interface=self.lag)
+        member = NSOLACPMemberState.objects.get(interface=self.m1)
+        bundle.status = "accepted"
+        bundle.save(update_fields=["status"])
+        member.status = "accepted"
+        member.save(update_fields=["status"])
+        before = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+
+        moved = self._bundle(
+            name=second_lag.name, lag_id=2, members=[{"interface_name": self.m1.name, "mode": "active"}]
+        )
+        reconcile_lag_config(self.device, _payload([self._bundle(), moved]))
+
+        member.refresh_from_db()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        assert member.lag_bundle_id == second_lag.pk
+        assert revision.revision == before + 1
+
     def test_idempotent_second_reconcile(self):
         data = _payload([self._bundle(min_links=3)])
         reconcile_lag_config(self.device, data)
         reconcile_lag_config(self.device, data)
         assert NSOLACPBundleState.objects.filter(interface=self.lag).count() == 1
 
-    def test_plan_query_count_does_not_grow_with_overlay_rows(self):
-        from netbox_nso_plugin.lacp_reconciler import lag_config_reconcile_plan
+    def test_stale_bundle_planning_does_not_probe_each_interface(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
 
-        one_member = _payload(
-            [
-                self._bundle(
-                    members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}],
-                )
-            ]
+        from netbox_nso_plugin.lacp_reconciler import lacp_reconcile_plan
+
+        second = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        third = Interface.objects.create(device=self.device, name="Port-channel3", type="lag")
+        reconcile_lag_config(
+            self.device,
+            _payload(
+                [
+                    self._bundle(),
+                    self._bundle(name=second.name, lag_id=2),
+                    self._bundle(name=third.name, lag_id=3),
+                ]
+            ),
         )
-        two_members = _payload(
+
+        with CaptureQueriesContext(connection) as queries:
+            lacp_reconcile_plan(self.device, _payload([]))
+
+        lag_probes = [
+            query["sql"]
+            for query in queries
+            if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
+        ]
+        self.assertEqual(lag_probes, [])
+
+    def test_stale_bundle_apply_does_not_probe_each_interface(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        second = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        third = Interface.objects.create(device=self.device, name="Port-channel3", type="lag")
+        reconcile_lag_config(
+            self.device,
+            _payload(
+                [
+                    self._bundle(),
+                    self._bundle(name=second.name, lag_id=2),
+                    self._bundle(name=third.name, lag_id=3),
+                ]
+            ),
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            reconcile_lag_config(self.device, _payload([]))
+
+        lag_probes = [
+            query["sql"]
+            for query in queries
+            if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
+        ]
+        self.assertEqual(lag_probes, [])
+
+    def test_apply_does_not_probe_overlay_state_per_row(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        payload = _payload(
             [
                 self._bundle(
                     members=[
-                        {"interface_name": "GigabitEthernet0/1", "mode": "active"},
-                        {"interface_name": "GigabitEthernet0/2", "mode": "active"},
+                        {"interface_name": self.m1.name, "mode": "active"},
+                        {"interface_name": self.m2.name, "mode": "active"},
                     ]
                 )
             ]
         )
-        reconcile_lag_config(self.device, one_member)
+        reconcile_lag_config(self.device, payload)
 
-        with CaptureQueriesContext(connection) as one_member_queries:
-            one_member_plan = lag_config_reconcile_plan(self.device, one_member)
-        reconcile_lag_config(self.device, two_members)
-        with CaptureQueriesContext(connection) as two_member_queries:
-            plan = lag_config_reconcile_plan(self.device, two_members)
+        def is_overlay_probe(sql):
+            where = sql.partition(" WHERE ")[2]
+            return (
+                any(limit in sql for limit in ("LIMIT 1", "LIMIT 21"))
+                and '"management_id" =' in where
+                and '"interface_id" =' in where
+                and (NSOLACPBundleState._meta.db_table in sql or NSOLACPMemberState._meta.db_table in sql)
+            )
 
-        self.assertEqual(len(two_member_queries), len(one_member_queries))
-        self.assertFalse(one_member_plan.changes_content)
-        self.assertFalse(plan.changes_content)
+        with CaptureQueriesContext(connection) as control_queries:
+            NSOLACPMemberState.objects.get(management=self.mgmt, interface=self.m1)
+        self.assertTrue(any(is_overlay_probe(query["sql"]) for query in control_queries))
+
+        with CaptureQueriesContext(connection) as queries:
+            reconcile_lag_config(self.device, payload)
+
+        overlay_probes = [query["sql"] for query in queries if is_overlay_probe(query["sql"])]
+        self.assertEqual(overlay_probes, [])
 
     def test_missing_interface_skipped(self):
         reconcile_lag_config(self.device, _payload([{"name": "Port-channel99", "lag_id": 99, "members": []}]))
@@ -164,6 +272,151 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([]))
         state = NSOLACPBundleState.objects.get(interface=self.lag)
         assert state.status == "changed"
+
+    def test_stale_imported_bundle_replans_after_status_flip(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import lacp_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.m1.lag = self.lag
+        self.m1.save(update_fields=["lag"])
+        real_plan = lacp_reconciler.lacp_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, payload):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, payload)
+            if plan_calls == 1:
+                fresh = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+                content_update(fresh, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+            return plan
+
+        with patch.object(lacp_reconciler, "lacp_reconcile_plan", side_effect=plan_then_flip):
+            reconcile_lag_config(self.device, _payload([]))
+
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
+
+    def test_stale_accepted_bundle_replans_after_status_flip(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import lacp_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.m1.lag = self.lag
+        self.m1.save(update_fields=["lag"])
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        content_update(state, status="accepted")
+        real_plan = lacp_reconciler.lacp_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, payload):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, payload)
+            if plan_calls == 1:
+                fresh = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+                content_update(fresh, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+            return plan
+
+        with patch.object(lacp_reconciler, "lacp_reconcile_plan", side_effect=plan_then_flip):
+            reconcile_lag_config(self.device, _payload([]))
+
+        state.refresh_from_db()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
+
+    def test_bundle_preimage_change_reacquires_fresh_plan(self):
+        from datetime import UTC, datetime
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import lacp_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        control_device = Device.objects.create(
+            name="lag-rtr-control",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        control_management = NSODeviceManagement.objects.create(
+            device=control_device,
+            nso_instance=self.inst,
+            nso_device_name="lag-rtr-control",
+        )
+        control_lag = Interface.objects.create(device=control_device, name=self.lag.name, type="lag")
+        control_member = Interface.objects.create(device=control_device, name=self.m1.name, type="1000base-t")
+        payload = _payload([self._bundle(min_links=2)])
+        planned_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+        with patch("django.utils.timezone.now", return_value=planned_at):
+            reconcile_lag_config(self.device, payload)
+            reconcile_lag_config(control_device, payload)
+            self.m1.lag = self.lag
+            self.m1.save(update_fields=["lag"])
+            control_member.lag = control_lag
+            control_member.save(update_fields=["lag"])
+
+            control_state = NSOLACPBundleState.objects.get(
+                management=control_management,
+                interface=control_lag,
+            )
+            content_update(control_state, min_links=5, status="accepted")
+            reconcile_lag_config(control_device, payload)
+            control_state.refresh_from_db()
+
+            real_plan = lacp_reconciler.lacp_reconcile_plan
+            plan_calls = 0
+            revision_after_edit = None
+
+            def plan_then_edit(device, candidate_payload):
+                nonlocal plan_calls, revision_after_edit
+                plan_calls += 1
+                plan = real_plan(device, candidate_payload)
+                if plan_calls == 1:
+                    fresh = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+                    content_update(fresh, min_links=5, status="accepted")
+                    revision_after_edit = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
+                return plan
+
+            with patch.object(lacp_reconciler, "lacp_reconcile_plan", side_effect=plan_then_edit):
+                reconcile_lag_config(self.device, payload)
+
+        state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        compared_fields = (
+            "lag_id",
+            "min_links",
+            "system_priority",
+            "system_id",
+            "timer",
+            "admin_key",
+            "vpc_sensitive",
+            "status",
+            "last_sync_at",
+            "accepted_at",
+            "last_apply_at",
+            "last_apply_error",
+        )
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(
+            tuple(getattr(state, field) for field in compared_fields),
+            tuple(getattr(control_state, field) for field in compared_fields),
+        )
+        self.assertEqual(revision.revision, revision_after_edit + 1)
 
     def test_stale_owned_bundle_husk_preserved(self):
         # An owned (accepted) row is never pruned, even as a husk.

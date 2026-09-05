@@ -11,7 +11,7 @@ from uuid import uuid4
 import sqlparse
 from django.db import connection, transaction
 from django.db.models import F
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 
 from netbox_nso_plugin import delivery, outbox
 from netbox_nso_plugin.intent_state import (
@@ -35,6 +35,40 @@ from netbox_nso_plugin.signals import suppress_intent_push
 
 from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+class TestDeleteCollectorContract(SimpleTestCase):
+    def test_install_rejects_collector_without_positional_source(self):
+        from netbox_nso_plugin.intent_state import ensure_delete_signal_origin
+
+        class IncompatibleCollector:
+            def __init__(self, using, origin=None):
+                self.origin = origin
+
+            def collect(self, objs, nullable=False):
+                pass
+
+        with (
+            patch("netbox.models.deletion.CustomCollector", IncompatibleCollector),
+            self.assertRaisesRegex(RuntimeError, "CustomCollector.collect"),
+        ):
+            ensure_delete_signal_origin()
+
+    def test_install_rejects_collector_without_origin_state(self):
+        from netbox_nso_plugin.intent_state import ensure_delete_signal_origin
+
+        class IncompatibleCollector:
+            def __init__(self, using, origin=None):
+                pass
+
+            def collect(self, objs, source=None):
+                pass
+
+        with (
+            patch("netbox.models.deletion.CustomCollector", IncompatibleCollector),
+            self.assertRaisesRegex(RuntimeError, "CustomCollector.origin"),
+        ):
+            ensure_delete_signal_origin()
 
 
 class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -401,20 +435,20 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
-    def test_failed_post_save_behavior_closes_its_implicit_permit(self):
+    def test_foreign_post_save_skips_converted_behavior_and_closes_its_implicit_permit(self):
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
 
         self.state.device_name = "intent-permit-router"
-        with self.assertRaises(RuntimeError):
-            with (
-                transaction.atomic(),
-                patch(
-                    "netbox_nso_plugin.signals._schedule_intent_push",
-                    side_effect=RuntimeError("behavior failed"),
-                ),
-            ):
-                self.state.save(update_fields=["device_name"])
+        with (
+            transaction.atomic(),
+            patch(
+                "netbox_nso_plugin.signals._schedule_intent_push",
+                side_effect=RuntimeError("behavior failed"),
+            ) as schedule,
+        ):
+            self.state.save(update_fields=["device_name"])
 
+        schedule.assert_not_called()
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
     def test_content_permit_rejects_a_write_outside_its_footprint(self):
@@ -462,6 +496,20 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(revision.revision, before + 1)
         self.assertEqual(self.state.status, "accepted")
         self.assertIsNone(self.state.apply_attempt_id)
+
+    def test_content_mutation_rejects_a_bump_key_outside_its_locked_footprint(self):
+        from netbox_nso_plugin.intent_state import _bump_and_lock_deploying
+
+        footprint = MutationFootprint.for_keys({(self.device.pk, "vlan")})
+
+        with (
+            patch("netbox_nso_plugin.outbox.bump_intent_revision") as bump,
+            self.assertRaisesRegex(IntentMutationProtocolError, "not locked"),
+            transaction.atomic(),
+        ):
+            _bump_and_lock_deploying(footprint, ((self.device.pk, "bgp"),))
+
+        bump.assert_not_called()
 
     def test_detected_reconcile_can_delete_a_captured_deploying_row(self):
         attempt_id = uuid4()
