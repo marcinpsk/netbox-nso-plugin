@@ -687,6 +687,52 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
         self.assertEqual(single_result["errors"], [])
         self.assertEqual(wrapper_result[0]["errors"], [])
 
+    def test_pool_deleted_before_the_lock_names_the_lock_step(self):
+        """A pool row deleted between the candidate selection and the locked reload must be
+        reported against that step, not against the intent push that never ran."""
+        from django.db import connection
+
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+
+        deleters: list[threading.Thread] = []
+        joined: list[bool] = []
+        failures: list[BaseException] = []
+
+        def delete_pool():
+            try:
+                Prefix.objects.filter(pk=self.pool.pk).delete()
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        def delete_pool_before_the_lock(execute, sql, params, many, context):
+            # Fires on the select_for_update() reload, before it reads the row.
+            if not deleters and "FOR UPDATE" in sql and Prefix._meta.db_table in sql:
+                deleter = threading.Thread(target=delete_pool, name="pool-delete")
+                deleters.append(deleter)
+                # Registered before the allocation transaction that can block the delete ends,
+                # so teardown never truncates while the worker still holds a transaction.
+                self.addCleanup(deleter.join, 30)
+                deleter.start()
+                deleter.join(timeout=30)
+                joined.append(not deleter.is_alive())
+            return execute(sql, params, many, context)
+
+        result = {"allocated": [], "errors": [], "skipped": []}
+        with connection.execute_wrapper(delete_pool_before_the_lock):
+            _reserve_single(self.interface_a, self.management_a, "ipv4", self.pool, result, push=False)
+
+        assert deleters, "the wrapper never reached the locked pool reload"
+        assert joined and joined[0], "the concurrent pool delete did not finish"
+        assert not failures, failures
+        self.assertEqual(result["allocated"], [])
+        self.assertEqual(len(result["errors"]), 1, result)
+        reason = result["errors"][0]["reason"]
+        self.assertIn("Failed to lock the pool and check the fill-empty guard", reason)
+        self.assertNotIn("intent push", reason)
+        assert not IPAddress.objects.filter(assigned_object_id=self.interface_a.pk).exists()
+
 
 class TestRollbackAutoAssigned(TestCase):
     """rollback_auto_assigned: deletes IPAddress and NSOInterfaceIPState."""

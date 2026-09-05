@@ -588,7 +588,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
 
     # One transaction, so the reservation, the overlay and the outbox entry they schedule
     # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
-    failed_step = None
+    failed_step = "lock the pool and check the fill-empty guard"
     try:
         with transaction.atomic():
             pool = Prefix.objects.select_for_update().get(pk=pool.pk)
@@ -603,7 +603,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                         },
                     )
 
-                failed_step = "IPAddress"
+                failed_step = "create IPAddress"
                 available_str = pool.get_first_available_ip()
                 if available_str is None:
                     raise _AllocationNoOp(
@@ -622,7 +622,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                     ip_obj.save()
 
                     vrf_name = pool.vrf.name if pool.vrf else ""
-                    failed_step = "NSOInterfaceIPState"
+                    failed_step = "create NSOInterfaceIPState"
                     state, _ = NSOInterfaceIPState.objects.update_or_create(
                         interface=interface,
                         address=available_str,
@@ -637,22 +637,18 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                         },
                     )
 
-                failed_step = None
+                failed_step = "schedule the IP intent push"
                 if push:
                     _schedule_intent_push((mgmt.device_id, "ip"))
     except _AllocationNoOp as exc:
         result[exc.result_key].append(exc.entry)
         return
     except Exception as exc:
-        if failed_step is not None:
-            reason = f"Failed to create {failed_step}: {exc}"
-        else:
-            reason = f"Failed to schedule the IP intent push: {exc}"
         result["errors"].append(
             {
                 "interface": str(interface),
                 "family": family,
-                "reason": reason,
+                "reason": f"Failed to {failed_step}: {exc}",
             }
         )
         return
