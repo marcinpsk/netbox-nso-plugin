@@ -1906,16 +1906,10 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
     @staticmethod
     def _static_route_assignment_footprint(route, device_id):
-        from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow
+        """The production M2M footprint for assigning *device_id* to *route*."""
+        from netbox_nso_plugin.intent_state import _static_route_devices_footprint
 
-        return MutationFootprint.for_keys(
-            {(device_id, "static_route")},
-            source_rows=(
-                SourceRow("netbox_routing.staticroute", route.pk),
-                SourceRow("netbox_routing.staticroute_devices", None),
-            ),
-            overlay_rows=(SourceRow("netbox_nso_plugin.nsostaticroutestate", None),),
-        )
+        return _static_route_devices_footprint(route, "pre_add", {device_id}, False)
 
     def test_overlay_delete_push_is_marked_delete_origin(self):
         mgmt = self._mgmt()
