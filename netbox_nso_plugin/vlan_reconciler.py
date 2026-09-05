@@ -38,6 +38,7 @@ class _ReconcileExecution:
 
     operations: tuple
     rows: tuple
+    native_reads: tuple = ()
 
 
 def _rescope_plan_ready(plan):
@@ -413,7 +414,7 @@ def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None 
     if interface_pks is None:
         interface_pks = _switchport_interface_pks(device, payload)
     planned_at = timezone.now()
-    saves, deletes, m2m_writes, operations, rows = _switchport_reconcile_operations(
+    saves, deletes, m2m_writes, operations, rows, native_reads = _switchport_reconcile_operations(
         device,
         payload,
         planned_at,
@@ -425,7 +426,7 @@ def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None 
         m2m_writes=m2m_writes,
         planned_at=planned_at,
         additional_footprints=(_device_vlan_group_lock(device),),
-        execution=_ReconcileExecution(tuple(operations), tuple(rows)),
+        execution=_ReconcileExecution(tuple(operations), tuple(rows), tuple(native_reads)),
     )
 
 
@@ -446,7 +447,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
-        return [], [], [], [], []
+        return [], [], [], [], [], []
     items = _validated_switchport_items(payload)
     group = _device_vlan_group(device, create=False)
     tagged_vlans = Prefetch(
@@ -485,6 +486,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     m2m_operations = []
     delete_operations = []
     group_operations = []
+    native_reads = []
     rows = []
     seen = set()
 
@@ -567,6 +569,8 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
                 matches, conflict = False, True
             state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
 
+        # The comparison consumed this native content; a mirror also intends to write dev_hash.
+        native_reads.append((interface.pk, obj_hash, dev_hash if native_candidate is not None else None))
         state.untagged_vlan = resolve_vlan(nso_untagged, create=False) if nso_untagged is not None else None
         state_tagged = tuple(
             vlan for vlan in (resolve_vlan(vid, create=False) for vid in nso_tagged) if vlan is not None
@@ -626,7 +630,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         *m2m_operations,
         *delete_operations,
     )
-    return saves, deletes, m2m_writes, operations, rows
+    return saves, deletes, m2m_writes, operations, rows, native_reads
 
 
 def _rescope_managed_device_ids(old_vlan) -> set[int]:
@@ -1075,17 +1079,54 @@ def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAtte
         return _reconcile_switchport(device, payload, writer, plan)
 
 
+def _refuse_moved_switchport_reads(execution) -> None:
+    """Refuse a frozen replay whose native comparison inputs moved before the lock.
+
+    The owned branch only READS mode, the untagged VLAN and the tagged set, so neither a
+    write pre-image nor a read dependency covers them: a tagged row a foreign writer adds
+    is not a row the plan could have declared. Reload exactly the frozen interfaces under
+    the lock; each must still carry the content the comparison consumed, or the content
+    this plan intends to write (an identical winner that already mirrored it).
+    """
+    from dcim.models import Interface
+    from django.db.models import Prefetch
+    from ipam.models import VLAN
+
+    from . import merge_util
+    from .renderer_writer import IntentPlanStaleError
+
+    reads = execution.native_reads
+    if not reads:
+        return
+    tagged_vlans = Prefetch(
+        "tagged_vlans",
+        queryset=VLAN.objects.order_by("pk"),
+        to_attr="_intent_tagged_vlans",
+    )
+    current = {
+        row.pk: merge_util.content_hash(_switchport_object_content(row))
+        for row in Interface.objects.filter(pk__in={interface_pk for interface_pk, _read, _intent in reads})
+        .select_related("untagged_vlan")
+        .prefetch_related(tagged_vlans)
+    }
+    for interface_pk, read_hash, intended_hash in reads:
+        content = current.get(interface_pk)
+        if content is None or (content != read_hash and content != intended_hash):
+            raise IntentPlanStaleError(f"dcim.interface row {interface_pk!r} changed after planning")
+
+
 def _reconcile_switchport(device, payload: dict, writer, plan) -> list:
     """Execute the switchport operations after their write set is frozen.
 
-    The plan froze the interface pks resolved before acquisition and reloaded exactly those
-    rows under the lock, so no row outside the declared footprint is written and no pre-lock
-    copy is compared or saved.
+    The plan froze the interface pks resolved before acquisition; the native rows the
+    comparison read are re-read under the lock and must be unmoved, so no row outside the
+    declared footprint is written and no stale comparison is replayed.
     """
     _validated_switchport_items(payload)
     execution = plan.execution
     if not isinstance(execution, _ReconcileExecution):
         raise ValueError("switchport reconciliation requires its frozen execution steps")
+    _refuse_moved_switchport_reads(execution)
     operations = execution.operations
     for operation, instance, update_fields, force_insert, field_name, related in operations:
         if operation == "save":

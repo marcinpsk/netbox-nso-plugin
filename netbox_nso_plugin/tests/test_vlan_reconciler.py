@@ -644,6 +644,109 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "changed")  # existing-value branch, device differs
         self.assertTrue(state.device_base_hash)  # the device version is adopted as the merge base
 
+    def _seed_owned_in_sync_switchport(self):
+        """Seed an owned, in_sync switchport row whose native interface matches access/VLAN 10."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        from ._outbox_case import content_update
+
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "TEN"}, {"vlan_id": 20, "name": "TWENTY"}]}
+        )
+        payload = {
+            "interfaces": [
+                {"interface_name": self.interface.name, "mode": "access", "untagged_vlan": 10, "tagged_vlans": []}
+            ]
+        }
+        reconcile_switchport(self.device, payload)
+        state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        content_update(state, status="in_sync")
+        return payload, state
+
+    def _refuse_gated_replay_after(self, payload, move_native):
+        """Plan, let a foreign writer move the native row, then run the gated replay."""
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile, reconcile_switchport
+
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        move_native(Interface.objects.get(pk=self.interface.pk))
+
+        plan = attempt.plan  # the read gate opens the writer for the frozen plan, then runs the body
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with self.assertRaises(IntentPlanStaleError), mutation:
+            reconcile_switchport(self.device, payload, attempt)
+
+    def test_gated_switchport_replay_refuses_a_foreign_native_vlan_move(self):
+        """An owned row must never keep in_sync when the native VLAN moved before the lock.
+
+        The owned branch only READS the native interface, so no write pre-image and no read
+        dependency covers it. The body rebuilds the comparison under the lock and refuses the
+        frozen replay; the gate has no replan (card #1659), so the next read lands the status
+        a fresh comparison gives.
+        """
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        payload, state = self._seed_owned_in_sync_switchport()
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+
+        def move(interface):
+            interface.untagged_vlan = VLAN.objects.get(group=group, vid=20)
+            interface.save()
+
+        self._refuse_gated_replay_after(payload, move)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")  # the refused replay wrote nothing
+
+        reconcile_switchport(self.device, payload)  # a fresh read compares the moved row
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")  # sm.on_reconcile(in_sync, matches=False)
+
+    def test_gated_switchport_replay_refuses_a_foreign_tagged_set_change(self):
+        """The comparison also reads the tagged set, which no frozen read dependency can carry."""
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        payload, state = self._seed_owned_in_sync_switchport()
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+
+        def move(interface):
+            interface.tagged_vlans.add(VLAN.objects.get(group=group, vid=20))
+
+        self._refuse_gated_replay_after(payload, move)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
+        reconcile_switchport(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+
+    def test_standalone_switchport_replan_never_retains_a_stale_in_sync(self):
+        """The standalone entry meets the same race by replanning once, not by retaining in_sync."""
+        from netbox_nso_plugin.vlan_reconciler import (
+            prepare_switchport_reconcile,
+            reconcile_switchport,
+        )
+
+        payload, state = self._seed_owned_in_sync_switchport()
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        moved = Interface.objects.get(pk=self.interface.pk)
+        moved.untagged_vlan = VLAN.objects.get(group=group, vid=20)
+        moved.save()
+
+        reconcile_switchport(self.device, payload, attempt)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.untagged_vlan.vid, 20)  # the owned branch never writes back
+
     def test_two_nameless_vlans_get_unique_placeholder_names(self):
         """Live arcos shape (vlans 5/6, no names): NetBox's (group, name) unique
         constraint rejects a SECOND name='' VLAN in the per-device group, which
