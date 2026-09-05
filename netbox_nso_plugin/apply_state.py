@@ -182,6 +182,55 @@ def lock_intent_revisions(device_id: int, scopes) -> dict[str, int]:
     return current
 
 
+def _promotable_route_policy_rows(rows: list) -> list:
+    """Drop the unmaterialized LOCAL route-policy rows, classifying the whole batch in two queries."""
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.models.functions import Upper
+
+    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+
+    if not rows:
+        return rows
+    # Postgres folds BOTH sides, exactly as the object_name__iexact _group_mode uses: python
+    # str.upper()/lower() disagrees with UPPER() on names like the greek final sigma.
+    row_keys = {
+        pk: (family, name_key)
+        for pk, family, name_key in NSORoutePolicyState.objects.filter(pk__in=[row.pk for row in rows])
+        .annotate(name_key=Upper("object_name"))
+        .values_list("pk", "family", "name_key")
+    }
+    modes: dict[tuple[str, str], str] = {}
+    classified = (
+        NSORoutePolicyObjectClass.objects.annotate(name_key=Upper("object_name"))
+        .filter(
+            family__in={family for family, _name in row_keys.values()},
+            name_key__in={name for _family, name in row_keys.values()},
+        )
+        .order_by("family", "object_name")
+        .values_list("family", "name_key", "mode")
+    )
+    for family, name_key, mode in classified:
+        modes.setdefault((family, name_key), mode)
+    local_rows = [row for row in rows if modes.get(row_keys[row.pk], "master") == "local"]
+    if not local_rows:
+        return rows
+    wanted: dict[int, set[int]] = {}
+    for row in local_rows:
+        if row.content_type_id is not None and row.object_id is not None:
+            wanted.setdefault(row.content_type_id, set()).add(row.object_id)
+    # Both identifiers being set does not prove the target exists, so confirm the ids per content type.
+    existing: dict[int, set[int]] = {}
+    for content_type_id, object_ids in wanted.items():
+        target_model = ContentType.objects.get_for_id(content_type_id).model_class()
+        if target_model is None:
+            continue
+        existing[content_type_id] = set(
+            target_model._base_manager.filter(pk__in=object_ids).values_list("pk", flat=True)
+        )
+    unmaterialized = {row.pk for row in local_rows if row.object_id not in existing.get(row.content_type_id, ())}
+    return [row for row in rows if row.pk not in unmaterialized]
+
+
 def promote_current_intent(
     management,
     registry,
@@ -194,7 +243,6 @@ def promote_current_intent(
     from . import status_machine as sm
     from .intent_state import OVERLAY_MODEL_RANKS, mirror_refresh
     from .models import NSOApplyAttempt, NSODeviceManagement, NSORoutePolicyState, NSOStaticRouteState
-    from .route_policy_reconciler import _group_mode
     from .signals import suppress_intent_push
 
     expected_scopes = {entry.key for entry in registry.values() if entry.in_protocol}
@@ -220,19 +268,13 @@ def promote_current_intent(
             if model is NSOStaticRouteState and not static_route_stored:
                 continue
             _enter_level(8, (model_ranks[model._meta.label_lower], 0))
-            locked_statuses = [
-                row
-                for row in (
-                    model.objects.select_for_update(of=("self",))
-                    .filter(management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED))
-                    .order_by("pk")
-                )
-                if not (
-                    model is NSORoutePolicyState
-                    and _group_mode(row.family, row.object_name) == "local"
-                    and row.assigned_object is None
-                )
-            ]
+            locked_statuses = list(
+                model.objects.select_for_update(of=("self",))
+                .filter(management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED))
+                .order_by("pk")
+            )
+            if model is NSORoutePolicyState:
+                locked_statuses = _promotable_route_policy_rows(locked_statuses)
             locked_rows.append((scope, model, locked_statuses))
 
         selected = {
