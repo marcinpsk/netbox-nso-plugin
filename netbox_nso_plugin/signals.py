@@ -714,7 +714,10 @@ def _sync_source_change(instance, client) -> bool:
     with transaction.atomic(), lock_order_scope():
         lock_mutation()
         lock_device_intent_transaction(instance.device_id)
-        current = management_model.objects.select_for_update().select_related("nso_instance").get(pk=instance.pk)
+        # of=("self",): without it the joined instance row is locked too, and every device shares it.
+        current = (
+            management_model.objects.select_for_update(of=("self",)).select_related("nso_instance").get(pk=instance.pk)
+        )
         if (current.nso_instance_id, current.nso_device_name) != expected_source:
             return False
         invalidated = _invalidate_source_admissions(current)

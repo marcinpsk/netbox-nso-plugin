@@ -10,15 +10,17 @@ instances plus a sys.modules-injected fake `models` module, which bypassed exact
 queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.test import RequestFactory, TestCase
+from django.db import connections
+from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
 from ._outbox_case import content_bulk_update, mirror_update
-from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
 
@@ -2066,3 +2068,87 @@ class TestDeleteOriginMarking(_SignalDBBase):
 
         self.assertEqual(origins, [self.device])
         self._assert_teardown_touched_only_the_offboard(calls)
+
+
+class TestSourceRekeyLocksOnlyItsManagementRow(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """The rekey's first locking read joins NSOInstance, and a bare FOR UPDATE locks every
+    joined table, so it also held the instance row that every managed device shares.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from ._outbox_case import make_managed, mirror_update
+
+        self.device, self.mgmt = make_managed("rekeylock", 8801)
+        mirror_update(self.mgmt, source_rekey_pending=True)
+        self.mgmt.refresh_from_db()
+
+    def _can_lock(self, table, pk):
+        """Whether a second connection can take that row now, without waiting for the rekey."""
+        from django.db import connection
+        from django.db.utils import OperationalError
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT 1 FROM {table} WHERE id = %s FOR UPDATE NOWAIT", [pk])
+                cursor.fetchone()
+        except OperationalError:
+            return False
+        return True
+
+    def test_the_rekey_leaves_the_shared_nso_instance_row_lockable(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        held = threading.Event()
+        release = threading.Event()
+        failures: list[BaseException] = []
+        probes: dict[str, bool] = {}
+
+        def hold_the_first_locking_read(execute, sql, params, many, context):
+            # Only the rekey's first query joins the instance table into a locking read.
+            if held.is_set() or "FOR UPDATE" not in sql or NSOInstance._meta.db_table not in sql:
+                return execute(sql, params, many, context)
+            rows = execute(sql, params, many, context)
+            held.set()
+            assert release.wait(timeout=30), "the rekey hold was never released"
+            return rows
+
+        def rekey():
+            try:
+                # No test transaction here, so the handler's on_commit callback runs at once.
+                with connections["default"].execute_wrapper(hold_the_first_locking_read):
+                    signals.sync_scope_to_adapter(sender=NSODeviceManagement, instance=self.mgmt, created=False)
+            except BaseException as exc:  # noqa: BLE001 (re-raised on the caller's thread)
+                failures.append(exc)
+            finally:
+                held.set()
+                connections.close_all()
+
+        with (
+            patch(f"{_MOD}.patch_device", return_value={"source_epoch": 9}) as mock_patch,
+            patch(f"{_MOD}.set_scope", return_value={}),
+            patch(f"{_MOD}.sync_notify", return_value=None),
+            patch(f"{_MOD}.onboard_device") as mock_onboard,
+        ):
+            worker = threading.Thread(target=rekey, name="source-rekey")
+            worker.start()
+            self.addCleanup(worker.join, 30)
+            self.addCleanup(release.set)
+            assert held.wait(timeout=30), failures
+            try:
+                probes["instance"] = self._can_lock(NSOInstance._meta.db_table, self.mgmt.nso_instance_id)
+                probes["management"] = self._can_lock(NSODeviceManagement._meta.db_table, self.mgmt.pk)
+            finally:
+                release.set()
+            worker.join(timeout=30)
+
+        assert not worker.is_alive(), "the rekey never finished"
+        assert not failures, failures
+        self.assertTrue(probes["instance"], "the rekey locked the NSOInstance row every device shares")
+        self.assertFalse(probes["management"], "the rekey did not hold its own management row")
+        mock_patch.assert_called_once()
+        mock_onboard.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_source_epoch, 9)
+        self.assertFalse(self.mgmt.source_rekey_pending)
