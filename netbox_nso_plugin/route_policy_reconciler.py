@@ -52,6 +52,7 @@ class _Operations:
         self.operations = []
         self.content_groups = set()
         self.device_ids = set()
+        self.read_dependencies = {}
 
     def save(self, instance, *, update_fields=None, force_insert=False, natural_key=(), references=()):
         from .renderer_writer import planned_save
@@ -67,6 +68,10 @@ class _Operations:
             )
         )
         self.operations.append(("save", instance, update_fields, force_insert, references, None, ()))
+
+    def read(self, instance):
+        """Record one persisted row a planning decision reads but never writes."""
+        self.read_dependencies.setdefault((instance._meta.label_lower, instance.pk), instance)
 
     def delete(self, instance):
         from .renderer_writer import planned_delete
@@ -644,6 +649,21 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             self.operations.save(candidate, update_fields=("is_materialized",))
             self.modified_state_pks.add((candidate.management_id, candidate.family, candidate.object_name.casefold()))
 
+    def _declare_stale_group_reads(self, group, root=None):
+        """Freeze every row the omitted-group branch reads but leaves unwritten.
+
+        Without these the frozen pre-image check only covers this device's own row, so a
+        sibling that vanished or stopped reporting between planning and lock acquisition
+        would let a cached standalone replay run the wrong branch (issue: the unreferenced
+        native root survives with no capture left).
+        """
+        for row in group:
+            identity = (row.management_id, row.family, row.object_name.casefold())
+            if identity not in self.modified_state_pks:
+                self.operations.read(row)
+        if root is not None and root.pk is not None:
+            self.operations.read(root)
+
     def plan_stale_states(self):  # noqa: C901, PLR0912
         from . import status_machine as sm
 
@@ -653,6 +673,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             group = self._group_rows(state)
             if sm.is_owned(state.status) or any(sm.is_owned(row.status) for row in group):
                 self._flag_removed(state)
+                self._declare_stale_group_reads(group, state.assigned_object)
                 continue
             live = [row for row in group if row.pk != state.pk and row.device_present and row.captured]
             root = state.assigned_object
@@ -664,12 +685,21 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                     self.operations.content_groups.add(key)
                     self.operations.device_ids.add(self.device.pk)
                     self.plan_rematerialize(live[0], root, group, state.pk)
+                self._declare_stale_group_reads(group, None if state.is_materialized else root)
                 continue
-            if root is not None and (key in self.planned_reference_keys or _object_referenced(root, state.family)):
+            planned_reference = key in self.planned_reference_keys
+            # One capture decides retention AND becomes the plan's read dependencies.
+            referenced, reference_rows = (
+                _object_references(root, state.family) if root is not None and not planned_reference else (False, ())
+            )
+            if root is not None and (planned_reference or referenced):
                 for row in group:
                     identity = (row.management_id, row.family, row.object_name.casefold())
                     if identity not in self.modified_state_pks:
                         self._flag_removed(row)
+                self._declare_stale_group_reads(group, root)
+                for reference in reference_rows:
+                    self.operations.read(reference)
                 continue
             for row in group:
                 identity = (row.management_id, row.family, row.object_name.casefold())
@@ -1004,6 +1034,7 @@ def _mutation_plan(operations, planned_at):
         saves=operations.saves,
         deletes=operations.deletes,
         m2m_writes=operations.m2m_writes,
+        read_dependencies=tuple(operations.read_dependencies.values()),
         planned_at=planned_at,
         settles_deploying=False,
     )
@@ -1487,16 +1518,31 @@ def reconcile_route_policy(device, payload: dict) -> list:
     return list(NSORoutePolicyState.objects.filter(management=management).order_by("family", "object_name"))
 
 
-def _object_referenced(obj, family) -> bool:
-    """Return whether another netbox-routing object still references *obj*.
+def _object_references(obj, family):
+    """Return ``(referenced, rows)`` for one netbox-routing object, in a single capture.
 
     Deleting a referenced object would break that reference, so removal keeps it instead.
-    Conservative — an unrecognised family is treated as referenced (kept).
+    Retention and the plan's read dependencies both come from these rows, so a reference
+    cannot disappear between deciding and freezing. An unrecognised family is kept, but with
+    no rows to prove it: the conservative answer stays, unprovable.
     """
-    if family in ("prefix_list", "as_path"):
-        return obj.route_map_entries.exists()
-    if family == "community_list":
-        return obj.route_map_entries.exists() or obj.set_by_route_map_entries.exists()
-    if family == "route_map":
-        return obj.called_by_entries.exists() or obj.applied_by_entries.exists() or obj.redistribution_entries.exists()
-    return True
+    from django.db.models import Q
+    from netbox_routing.models import Redistribution, RouteMapEntry, RouteMapEntrySetCommunity
+
+    if family == "prefix_list":
+        rows = tuple(RouteMapEntry.match_prefix_list.through.objects.filter(prefixlist=obj))
+    elif family == "as_path":
+        rows = tuple(RouteMapEntry.match_aspath.through.objects.filter(aspath=obj))
+    elif family == "community_list":
+        rows = (
+            *RouteMapEntry.match_community_list.through.objects.filter(communitylist=obj),
+            *RouteMapEntrySetCommunity.objects.filter(community_list=obj),
+        )
+    elif family == "route_map":
+        rows = (
+            *RouteMapEntry.objects.filter(Q(call_policy=obj) | Q(apply_policy=obj)),
+            *Redistribution.objects.filter(route_map=obj),
+        )
+    else:
+        return True, ()
+    return bool(rows), rows
