@@ -196,6 +196,88 @@ class TestAutoAssignIP(TestCase):
 
         mgmt.delete()
 
+    def test_deleting_a_pool_prefix_needs_no_permit(self):
+        """An operator deletes a pool Prefix with no permit open. Django clears the audit-trail
+        FK with one lazy SET_NULL update, which the DML guard must not read as intent drift."""
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        mgmt = self._make_mgmt()
+        for index, referenced in enumerate((False, True)):
+            with self.subTest(referenced=referenced):
+                pool = Prefix.objects.create(prefix=f"10.20{index}.0.0/24", role=self.lb_role)
+                state = None
+                if referenced:
+                    iface = Interface.objects.create(device=self.device, name=f"Loopback20{index}", type="virtual")
+                    state = NSOInterfaceIPState.objects.create(
+                        interface=iface,
+                        address=f"10.20{index}.0.1/24",
+                        family="ipv4",
+                        status="accepted",
+                        auto_assigned=True,
+                        source_pool=pool,
+                    )
+
+                pool.delete()
+
+                self.assertFalse(Prefix.objects.filter(pk=pool.pk).exists())
+                if state is not None:
+                    state.refresh_from_db()
+                    self.assertIsNone(state.source_pool_id)
+        mgmt.delete()
+
+    def test_clearing_the_pool_pointer_outside_a_delete_still_needs_a_permit(self):
+        """The cascade exemption must not open a bare update path onto the same column."""
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        self._make_mgmt()
+        pool = Prefix.objects.create(prefix="10.202.0.0/24", role=self.lb_role)
+        iface = Interface.objects.create(device=self.device, name="Loopback202", type="virtual")
+        NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="10.202.0.1/24",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+            source_pool=pool,
+        )
+
+        with self.assertRaises(IntentMutationProtocolError):
+            NSOInterfaceIPState.objects.filter(source_pool_id__in=[pool.pk]).update(source_pool_id=None)
+
+    def test_an_aborted_pool_delete_leaves_no_reusable_authorization(self):
+        """A pre_delete receiver that raises rolls the delete back. The delete marker must not
+        outlive that transaction and authorize a later bare update."""
+        from django.db import transaction
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        self._make_mgmt()
+        pool = Prefix.objects.create(prefix="10.203.0.0/24", role=self.lb_role)
+        iface = Interface.objects.create(device=self.device, name="Loopback203", type="virtual")
+        NSOInterfaceIPState.objects.create(
+            interface=iface,
+            address="10.203.0.1/24",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
+            source_pool=pool,
+        )
+
+        def fail_the_delete(sender, instance, **kwargs):
+            raise RuntimeError("pre_delete receiver failed")
+
+        pre_delete.connect(fail_the_delete, sender=Prefix, dispatch_uid="test_pool_delete_abort", weak=False)
+        self.addCleanup(pre_delete.disconnect, fail_the_delete, sender=Prefix, dispatch_uid="test_pool_delete_abort")
+
+        with self.assertRaises(RuntimeError), transaction.atomic():
+            pool.delete()
+
+        with self.assertRaises(IntentMutationProtocolError):
+            NSOInterfaceIPState.objects.filter(source_pool_id__in=[pool.pk]).update(source_pool_id=None)
+
     def test_reserve_single_carries_pool_vrf(self):
         """A VRF-scoped pool (as a link-role resolves) must land the reserved IPAddress in that
         VRF — otherwise it goes into the global table (wrong IPAM accounting) and rollback, which

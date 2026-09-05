@@ -328,6 +328,13 @@ _DML_TABLE = re.compile(
     r'^\s*(?P<operation>INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?(?P<table>[A-Za-z0-9_]+)"?',
     re.IGNORECASE,
 )
+# Django's collector clears this FK with one lazy SET_NULL update on every ipam.Prefix delete.
+# The new value is a literal or a bound parameter, depending on the Django version.
+_SOURCE_POOL_CASCADE = re.compile(
+    r'SET\s+"source_pool_id"\s*=\s*(?P<value>NULL|%s)'
+    r'\s+WHERE\s+(?:"[A-Za-z0-9_]+"\.)?"source_pool_id"\s*(?:IN\s*\(|=)',
+    re.IGNORECASE,
+)
 _GLOBAL_LIFECYCLE_FIELDS = frozenset(
     {
         "created",
@@ -510,6 +517,11 @@ _IMPLICIT_PERMITS: contextvars.ContextVar[dict[object, tuple]] = contextvars.Con
     "nso_intent_implicit_permits", default={}
 )
 _MIGRATIONS_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar("nso_intent_migrations_active", default=False)
+# (alias, atomic block, prefix pk) per pool delete in flight; the block object is held so a
+# rolled-back delete can never be mistaken for an open one.
+_DELETING_POOLS: contextvars.ContextVar[frozenset[tuple]] = contextvars.ContextVar(
+    "nso_intent_deleting_pools", default=frozenset()
+)
 _RECONCILER_ACTIVE: contextvars.ContextVar[int] = contextvars.ContextVar("nso_intent_reconciler_active", default=0)
 
 
@@ -2363,6 +2375,64 @@ def _end_m2m_implicit(sender, instance, action, **kwargs):
         _close_m2m_implicit(sender, instance)
 
 
+def _pool_delete_scope(connection):
+    """Identify the connection and the still-open atomic block a pool delete runs in."""
+    blocks = getattr(connection, "atomic_blocks", None)
+    if not blocks:
+        return None
+    return (connection.alias, blocks[-1])
+
+
+def _begin_prefix_delete(sender, instance, using=None, **kwargs):
+    """Mark the pool whose delete makes Django clear the overlay's audit-trail FK."""
+    scope = _pool_delete_scope(transaction.get_connection(using))
+    if instance.pk is None or scope is None:
+        return
+    _DELETING_POOLS.set(_DELETING_POOLS.get() | {(*scope, instance.pk)})
+
+
+def _end_prefix_delete(sender, instance, using=None, **kwargs):
+    """Drop the marker once the pool row is gone."""
+    _DELETING_POOLS.set(
+        frozenset(entry for entry in _DELETING_POOLS.get() if entry[2] != instance.pk or entry[0] != using)
+    )
+
+
+def _live_pool_markers(connection) -> frozenset[tuple]:
+    """Purge markers whose delete transaction is over: a rollback leaves the block popped."""
+    entries = _DELETING_POOLS.get()
+    blocks = getattr(connection, "atomic_blocks", ())
+    live = frozenset(
+        entry for entry in entries if entry[0] != connection.alias or any(entry[1] is block for block in blocks)
+    )
+    if live != entries:
+        _DELETING_POOLS.set(live)
+    return live
+
+
+def _consume_pool_delete_cascade(statement, params, connection) -> bool:
+    """Consume the delete marker when this is the collector's SET_NULL update for a pool."""
+    entries = _live_pool_markers(connection)
+    match = _SOURCE_POOL_CASCADE.search(statement)
+    if not entries or match is None:
+        return False
+    values = list(params or ())
+    if match.group("value").upper() != "NULL":
+        # The bound new value must be the NULL the collector writes.
+        if not values or values[0] is not None:
+            return False
+        values = values[1:]
+    try:
+        targets = {int(value) for value in values}
+    except (TypeError, ValueError):
+        return False
+    consumed = {entry for entry in entries if entry[0] == connection.alias and entry[2] in targets}
+    if not targets or {entry[2] for entry in consumed} != targets:
+        return False
+    _DELETING_POOLS.set(entries - consumed)
+    return True
+
+
 def _dml_guard(execute, sql, params, many, context):
     statement = str(sql)
     match = _DML_TABLE.match(statement)
@@ -2396,7 +2466,13 @@ def _dml_guard(execute, sql, params, many, context):
         and permit.dml_kind == "content"
         and any(row.model_label == "dcim.interface" for row in permit.footprint.source_rows)
     )
-    if interface_assignment_cascade:
+    # The pool pointer is an audit trail, not part of the pushed IP intent.
+    source_pool_cascade = (
+        spec.model_label == "netbox_nso_plugin.nsointerfaceipstate"
+        and touched_columns == frozenset({"source_pool_id"})
+        and _consume_pool_delete_cascade(statement, params, context["connection"])
+    )
+    if interface_assignment_cascade or source_pool_cascade:
         return execute(sql, params, many, context)
     if remaining < 1 and table not in footprint_tables:
         _clear_failed_implicit_permit(permit)
@@ -2813,5 +2889,12 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
     for connection in connections.all():
         _install_guard(connection)
     connection_created.connect(_install_guard, dispatch_uid="nso_intent_dml_guard", weak=False)
+    prefix_model = apps.get_model("ipam.prefix")
+    pre_delete.connect(
+        _begin_prefix_delete, sender=prefix_model, dispatch_uid="nso_intent_prefix_pre_delete", weak=False
+    )
+    post_delete.connect(
+        _end_prefix_delete, sender=prefix_model, dispatch_uid="nso_intent_prefix_post_delete", weak=False
+    )
     pre_migrate.connect(_start_migrations, dispatch_uid="nso_intent_pre_migrate", weak=False)
     post_migrate.connect(_finish_migrations, dispatch_uid="nso_intent_post_migrate", weak=False)
