@@ -968,19 +968,19 @@ def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAtte
         with contextlib.nullcontext(active) as writer, suppress_intent_push():
             return _reconcile_switchport(device, payload, writer, active.plan.planned_at, attempt.interface_pks)
 
-    attempts = [attempt]
-    acquisitions = 0
+    served = False
 
     def plan_fn():
-        nonlocal acquisitions
-        acquisitions += 1
-        if acquisitions > 1:  # a replan re-freezes its own resolutions before re-acquiring
-            attempts.append(prepare_switchport_reconcile(device, payload))
-        return attempts[-1].plan
+        # The replan runs INSIDE the acquisition, so it re-reads the frozen pks only: names
+        # are never re-resolved and an interface that appeared since waits for the next read.
+        nonlocal served
+        if not served:
+            served = True
+            return attempt.plan
+        return switchport_reconcile_plan(device, payload, attempt.interface_pks)
 
     with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
-        frozen = next(candidate for candidate in attempts if candidate.plan is plan)
-        return _reconcile_switchport(device, payload, writer, plan.planned_at, frozen.interface_pks)
+        return _reconcile_switchport(device, payload, writer, plan.planned_at, attempt.interface_pks)
 
 
 def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_pks: dict) -> list:
