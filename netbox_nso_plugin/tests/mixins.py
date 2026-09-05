@@ -111,19 +111,20 @@ def _deliver_scheduled_keys():
         rows = list(
             NSOIntentOutboxEntry.objects.filter(device_id=device_id, scope=scope, consumed_by_push_seq__isnull=True)
             .order_by("id")
-            .values("id", "mark_and", "transitions")
+            .values("id", "kind", "mark_and", "transitions")
         )
         if not rows:
             continue
         entry_ids = [row["id"] for row in rows]
         state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).first() or NSOIntentOutboxState()
         folded = outbox.fold_state_transitions([record for row in rows for record in row["transitions"]], state)
+        ordinary = [row for row in rows if row["kind"] == outbox.CONTRIBUTION_KIND_ORDINARY]
         try:
             rendered = delivery.render(scope, device_id, adapter_device_id)
             delivery.send(
                 rendered,
                 rendered.payload,
-                mark=all(row["mark_and"] for row in rows),
+                mark=all(row["mark_and"] for row in ordinary) if ordinary else False,
                 deletions=list(folded.queued.values()),
             )
         except Exception:  # noqa: BLE001 (one key's failure must not abort its siblings)

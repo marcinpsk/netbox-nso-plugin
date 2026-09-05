@@ -165,3 +165,30 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
         assert len(self.adapter.requests) == 1, self.adapter.requests
         assert self.adapter.requests[0]["push_seq"] is None
         assert entries(self.device, "lacp") == [], "the entries are consumed on the attempt"
+
+
+class TestRepairContributionsAreNeutralForDirectApply(_DirectApplyCase):
+    tag = "directrepair"
+    adapter_device_id = 7804
+
+    def test_a_repair_cannot_strip_a_lacp_deletion_mark(self):
+        from netbox_nso_plugin import drain, outbox
+
+        enqueue(self.device, "lacp", delete_origin=True)
+        enqueue(self.device, "lacp", kind=outbox.CONTRIBUTION_KIND_REPAIR)
+
+        assert self.drain("lacp") == drain.SUCCEEDED
+        assert self.adapter.requests[-1]["params"].get("delete_origin") == "true"
+
+    def test_a_repair_only_switchport_burst_cannot_grant_a_deletion_mark(self):
+        from netbox_nso_plugin import drain, outbox
+
+        enqueue(
+            self.device,
+            "switchport",
+            delete_origin=True,
+            kind=outbox.CONTRIBUTION_KIND_REPAIR,
+        )
+
+        assert self.drain("switchport") == drain.SUCCEEDED
+        assert self.adapter.requests[-1]["params"].get("delete_origin") is None

@@ -24,6 +24,8 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import hashlib
+import json
 import threading
 from collections.abc import Callable
 
@@ -127,6 +129,17 @@ class Rendered:
     do_push: Callable
     #: The scope's own success side effect, run on the response the send returned.
     on_response: Callable | None = None
+
+
+def canonical_fingerprint(payload) -> str:
+    """Return the stable SHA-256 fingerprint of a rendered payload.
+
+    The caller supplies only :attr:`Rendered.payload`. Delivery mode, deletion
+    authority, mapping epoch, and the transport envelope are not renderer content.
+    Mapping keys are sorted, while list order remains significant.
+    """
+    canonical = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def capture(rendered: Rendered) -> bool:

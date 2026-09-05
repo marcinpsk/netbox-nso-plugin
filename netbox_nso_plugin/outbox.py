@@ -24,6 +24,14 @@ PUSH_SEQ_ADVANCE_BATCH = 10_000
 OP_DELETE = "delete"
 OP_REVOKE = "revoke"
 
+CONTRIBUTION_KIND_ORDINARY = "ordinary"
+CONTRIBUTION_KIND_REPAIR = "repair"
+CONTRIBUTION_KIND_CHOICES = (
+    (CONTRIBUTION_KIND_ORDINARY, "Ordinary"),
+    (CONTRIBUTION_KIND_REPAIR, "Repair"),
+)
+CONTRIBUTION_KINDS = frozenset(value for value, _label in CONTRIBUTION_KIND_CHOICES)
+
 
 def route_id_of(value) -> int:
     """Return the canonical integer form of a persisted route id."""
@@ -378,7 +386,14 @@ def bump_intent_revision(device_id: int, scope: str) -> int:
         return int(cursor.fetchone()[0])
 
 
-def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = False) -> None:
+def enqueue(
+    device_id,
+    scope: str,
+    *,
+    transitions=(),
+    delete_origin: bool = False,
+    kind: str = CONTRIBUTION_KIND_ORDINARY,
+) -> None:
     """Append this transaction's contribution to ``(device_id, scope)``.
 
     Writes nothing for a reconcile or render write (those mirror the adapter and are not
@@ -398,6 +413,8 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
 
     if scope not in delivery_keys():
         raise ValueError(f"unknown intent outbox scope {scope!r}")
+    if kind not in CONTRIBUTION_KINDS:
+        raise ValueError(f"unknown intent outbox contribution kind {kind!r}")
     _refuse_outside_a_transaction()
     lock_mutation()
     txid = current_txid()
@@ -414,6 +431,7 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     NSOIntentOutboxEntry.objects.create(
         device_id=device_id,
         scope=scope,
+        kind=kind,
         batch_id=txid,
         transitions=list(transitions),
         mark_and=delete_origin,
