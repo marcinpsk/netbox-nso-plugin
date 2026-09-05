@@ -233,6 +233,24 @@ def _flag_link_error(mgmt, message) -> None:
         _mirror_management(mgmt, adapter_link_error=message)
 
 
+def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
+    """Return the ``(mgmt, state, adapter_device)`` rows whose mapping no longer resolves."""
+    broken = []
+    for mgmt in mapped:
+        # A row mid-provision has no adapter device yet by design and its push is gated.
+        # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
+        # the adapter still carries the old one, so it reads as "reused". Dropping its pointer
+        # here would strand it for good — _snapshot only considers rows that HAVE an id, and
+        # re-onboarding the new identity collides with the old row still holding this
+        # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
+        if mgmt.onboard_status or mgmt.source_rekey_pending:
+            continue
+        state, adapter_device = _classify(mgmt, by_id, by_identity)
+        if state is not _MATCHED:
+            broken.append((mgmt, state, adapter_device))
+    return broken
+
+
 def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     """Repair rows whose ``adapter_device_id`` no longer resolves to their own adapter device.
 
@@ -262,19 +280,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     if by_id is None:
         return 0, 0
 
-    broken = []
-    for mgmt in mapped:
-        # A row mid-provision has no adapter device yet by design and its push is gated.
-        # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
-        # the adapter still carries the old one, so it reads as "reused". Dropping its pointer
-        # here would strand it for good — _snapshot only considers rows that HAVE an id, and
-        # re-onboarding the new identity collides with the old row still holding this
-        # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
-        if mgmt.onboard_status or mgmt.source_rekey_pending:
-            continue
-        state, adapter_device = _classify(mgmt, by_id, by_identity)
-        if state is not _MATCHED:
-            broken.append((mgmt, state, adapter_device))
+    broken = _broken_links(mapped, by_id, by_identity)
     if not broken:
         return 0, 0
 
@@ -303,9 +309,11 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 # re-onboard worked is not observable here (it happens in an on_commit callback
                 # that logs and returns), so a stamp conditional on success would never move a
                 # permanently broken row to the back of the queue. Persist the mirror-only
-                # stamp through the lifecycle writer before attempting the repair.
+                # stamp through the lifecycle writer before attempting the repair. A rejected
+                # stamp persisted nothing, so this row was not tried and must not be repaired.
+                if not _mirror_management(current, adapter_link_attempted_at=now):
+                    continue
                 attempted += 1
-                _mirror_management(current, adapter_link_attempted_at=now)
                 if state is _MOVED:
                     logger.warning(
                         "Adapter device for %s moved from id %s to %s — adopting",
