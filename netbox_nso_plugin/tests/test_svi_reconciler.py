@@ -102,6 +102,7 @@ class TestSviReconciler(TestCase):
         with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
             rows = _reconcile_svi(self.device, payload)
 
+        self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
         self.assertEqual(rows[0].interface_id, inserted.pk)
         self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan201").count(), 1)
 
