@@ -1008,9 +1008,8 @@ def push_intent_on_accept(sender, instance, **kwargs):
 
     Also wired to post_delete (deletion-marked, see _connect_g_activated): deleting an owned
     row must push the REDUCED snapshot, or the adapter keeps applying the intent NetBox just
-    dropped. The device is resolved through the FK id rather than ``instance.interface`` —
-    on the post_delete leg the Interface may already be gone (a cascade from its own
-    deletion), and a receiver that raised there would abort the whole delete.
+    dropped. The device id comes from one narrow query on the FK id because nothing here
+    needs the Interface loaded.
     """
     if instance.status not in _OWNED_PUSH_STATUSES:
         return
