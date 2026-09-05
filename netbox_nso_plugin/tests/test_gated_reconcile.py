@@ -718,10 +718,9 @@ class TestDefaultPlanContentMutation(TestCase):
             "interfaces": [
                 {
                     "interface_name": deploying_interface.name,
-                    "mtu": 9100,
-                    "ip_mtu": 9000,
-                    "mpls_mtu": 9088,
-                    "bound_port": "",
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
                 }
             ],
             "read_state": _rs(),
