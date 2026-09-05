@@ -521,7 +521,6 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "requests" },
-    { name = "sqlparse" },
 ]
 
 [package.dev-dependencies]
@@ -545,10 +544,7 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "requests", specifier = ">=2.34.2" },
-    { name = "sqlparse", specifier = ">=0.5.0" },
-]
+requires-dist = [{ name = "requests", specifier = ">=2.34.2" }]
 
 [package.metadata.requires-dev]
 dev = [

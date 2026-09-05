@@ -21,6 +21,7 @@ Design + per-scope parity audit: nso-adapter ``docs/intent-split-brain-design.md
 
 from __future__ import annotations
 
+import copy
 import logging
 
 from .deployment import guarded as _deployment_guarded
@@ -328,10 +329,9 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     broader "owned" one: a route with an interface-only next hop is owned but has no place
     in the snapshot, so arming it would mint a generation the adapter never receives — and
     a later run would find no sentinel row to retry, leaving an Apply free to promote a row
-    nothing can settle. The footprint acquired by :func:`intent_transaction` locks the
-    selected overlays and their renderer dependencies. The authoritative query repeats
-    the pusher predicate after those locks are held, so a route that became unpushable is
-    not armed.
+    nothing can settle. The exact writer locks and validates each candidate's renderer
+    dependencies. If a route becomes unpushable, the plan is stale and the retry applies
+    the pusher predicate again before it arms any row.
 
     Rows are locked in the same order the content transition takes them (``management_id``,
     then pk), and the pushes the arming saves would fire are suppressed: the caller's own
@@ -339,47 +339,71 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
     """
     from . import signals
     from .intent_generation import UNALLOCATED
-    from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
     from .models import NSOStaticRouteState
+    from .renderer_writer import IntentPlanStaleError, RendererMutationPlan, planned_save, renderer_writes
+    from .status_machine import DEPLOYING
 
-    candidates = list(
-        NSOStaticRouteState.objects.filter(
-            signals.PUSHED_STATIC_ROUTE_FILTER,
-            management=mgmt,
-            intent_generation=UNALLOCATED,
-        ).order_by("management_id", "pk")
-    )
-    if not candidates:
-        return []
-    footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
-    try:
-        with intent_transaction(footprint):
-            rows = list(
-                NSOStaticRouteState.objects.filter(
-                    signals.PUSHED_STATIC_ROUTE_FILTER,
-                    pk__in=[row.pk for row in candidates],
-                    intent_generation=UNALLOCATED,
-                ).order_by("management_id", "pk")
+    for attempt in range(2):
+        candidates = list(
+            NSOStaticRouteState.objects.filter(
+                signals.PUSHED_STATIC_ROUTE_FILTER,
+                management=mgmt,
+                intent_generation=UNALLOCATED,
             )
-            if not rows:
-                raise _StaticRouteBackfillNoOp
-            armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
-            before = [
-                {"pk": row.pk, "status": row.status, **{field: getattr(row, field) for field in armed_fields}}
-                for row in rows
-            ]
-            with signals.suppress_intent_push():
-                for row in rows:
-                    signals._arm_static_route_generation(row)
-                    row.save(update_fields=armed_fields)
-            for snapshot, row in zip(before, rows, strict=True):
-                # Restore only while both lifecycle coordinates remain as this pass left them.
-                snapshot["armed_generation"] = row.intent_generation
-                snapshot["armed_status"] = row.status
-    except _StaticRouteBackfillNoOp:
-        return []
-    logger.info("Armed %s static-route overlay(s) of device %s from the generation sentinel", len(rows), mgmt.device_id)
-    return before
+            .select_related("static_route")
+            .order_by("management_id", "pk")
+        )
+        if not candidates:
+            return []
+        armed_fields = signals._STATIC_ROUTE_ARMED_FIELDS
+        before = []
+        operations = []
+        route_checks = []
+        for row in candidates:
+            # apply_attempt_id rides with status: nso_static_deploy_attempt refuses
+            # `deploying` with a NULL attempt, so a rollback that put the status back
+            # without it raised out of the restore.
+            snapshot = {
+                "pk": row.pk,
+                "status": row.status,
+                "apply_attempt_id": row.apply_attempt_id,
+                **{field: getattr(row, field) for field in armed_fields},
+            }
+            candidate = copy.copy(row)
+            signals._arm_static_route_generation(candidate)
+            update_fields = list(armed_fields)
+            if candidate.status == DEPLOYING:
+                candidate.status = "accepted"
+                candidate.apply_attempt_id = None
+                update_fields.extend(("status", "apply_attempt_id"))
+            snapshot["armed_generation"] = candidate.intent_generation
+            snapshot["armed_status"] = candidate.status
+            before.append(snapshot)
+            operations.append((candidate, tuple(update_fields)))
+            route_checks.append(copy.copy(row.static_route))
+        plan = RendererMutationPlan.build(
+            saves=(
+                *(planned_save(route, update_fields=()) for route in route_checks),
+                *(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
+            )
+        )
+        try:
+            with signals.suppress_intent_push(), renderer_writes(plan) as writer:
+                for route in route_checks:
+                    writer.save(route, update_fields=())
+                for candidate, fields in operations:
+                    writer.save(candidate, update_fields=fields)
+        except IntentPlanStaleError:
+            if attempt:
+                raise
+            continue
+        logger.info(
+            "Armed %s static-route overlay(s) of device %s from the generation sentinel",
+            len(operations),
+            mgmt.device_id,
+        )
+        return before
+    raise AssertionError("unreachable")
 
 
 def _safe_restore(before: list[dict], device_id: int) -> tuple[int, list[dict]]:
@@ -419,8 +443,8 @@ def _restore_static_route_generations(before: list[dict]) -> int:
     status. An operator can re-accept, promote, or settle a row while the push is on the
     wire. A row that moved is left alone, and is not counted as rolled back.
     """
-    from .intent_state import footprint_for_instance, intent_transaction
     from .models import NSOStaticRouteState
+    from .renderer_writer import IntentPlanStaleError, RendererMutationPlan, planned_save, renderer_writes
     from .signals import suppress_intent_push
 
     restored = 0
@@ -436,18 +460,20 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         ).first()
         if state is None:
             continue
+        candidate = copy.copy(state)
+        for field_name, value in fields.items():
+            setattr(candidate, field_name, value)
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields, expected_before=state),))
         try:
-            with intent_transaction(footprint_for_instance(state)):
-                state.refresh_from_db()
-                if state.intent_generation != armed_generation or state.status != armed_status:
-                    raise _RestoreNoOp
-                for field_name, value in fields.items():
-                    setattr(state, field_name, value)
-                with suppress_intent_push():
-                    state.save(update_fields=fields)
-                restored += 1
-        except (_RestoreNoOp, NSOStaticRouteState.DoesNotExist):
+            with suppress_intent_push(), renderer_writes(plan) as writer:
+                writer.save(candidate, update_fields=fields)
+        except IntentPlanStaleError:
+            logger.warning(
+                "Static-route overlay %s kept its armed generation because its restore plan went stale",
+                pk,
+            )
             continue
+        restored += 1
     return restored
 
 

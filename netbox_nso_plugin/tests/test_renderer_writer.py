@@ -22,6 +22,7 @@ from netbox_nso_plugin.models import (
 
 from ._outbox_case import make_managed, mirror_update, own_vlan, without_commit_drain
 from .mixins import IntentPushResetMixin
+from .strict_writer import strict_writer_harness
 
 
 class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
@@ -94,6 +95,115 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         self.assertEqual(state.management_id, second_management.pk)
         self.assertEqual(state.status, "imported")
 
+    def test_expected_preimage_must_be_a_persisted_target(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        _device, management = make_managed("writer-unsaved-preimage", 16271)
+        row = own_vlan(management, 1627, "writer-unsaved-preimage")
+        candidate = NSOVLANState(management=management, vlan=row.vlan, status="accepted")
+        expected = copy.copy(candidate)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "persisted update target"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        candidate,
+                        update_fields={"status"},
+                        expected_before=expected,
+                    ),
+                )
+            )
+
+    def test_raced_unregistered_creation_is_consumed_from_its_full_plan(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        group = VLANGroup(name="Writer raced group", slug="writer-raced-group")
+        plan = RendererMutationPlan.build(saves=(planned_save(group, force_insert=True, natural_key=("slug",)),))
+        raced = VLANGroup.objects.create(name=group.name, slug=group.slug)
+
+        with renderer_mirror_writes(plan) as writer:
+            self.assertTrue(writer.consume_existing_creation(raced))
+
+        self.assertIsNotNone(raced.pk)
+
+    def test_raced_overlay_creation_with_different_lifecycle_is_rejected(self):
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_save,
+            renderer_writes,
+        )
+
+        device, management = make_managed("writer-raced-overlay", 16275)
+        from ipam.models import VLANGroup
+
+        group = VLANGroup.objects.create(name="Writer raced overlay", slug="writer-raced-overlay")
+        vlan = VLAN.objects.create(group=group, vid=1627, name="Writer raced overlay")
+        planned = NSOVLANState(management=management, vlan=vlan, device_name=vlan.name, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),)
+        )
+        mirror_update(
+            NSOVLANState.objects.create(management=management, vlan=vlan, device_name=vlan.name),
+            status="imported",
+        )
+
+        with self.assertRaises(IntentPlanStaleError), renderer_writes(plan) as writer:
+            writer.save(planned, force_insert=True)
+
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="vlan").exists())
+
+    def test_forward_creation_reference_is_rejected_during_planning(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        device, management = make_managed("writer-forward-ref", 16279)
+        group = VLANGroup(name="Writer forward ref", slug=f"writer-forward-ref-{device.pk}")
+        vlan = VLAN(group=group, vid=1627, name="Writer forward ref")
+        state = NSOVLANState(management=management, vlan=vlan)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "planned later"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        state,
+                        force_insert=True,
+                        natural_key=("management", "vlan"),
+                    ),
+                    planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
+                    planned_save(group, force_insert=True, natural_key=("slug",)),
+                )
+            )
+
+    def test_opt_in_harness_records_the_real_consumed_write_set(self):
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_set_update,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-harness", 16270)
+        row = own_vlan(management, 1626, "writer-harness")
+        plan = RendererMutationPlan.build(
+            set_updates=(
+                planned_set_update(
+                    NSOVLANState.objects.filter(pk=row.pk),
+                    last_apply_error="recorded",
+                ),
+            )
+        )
+
+        with strict_writer_harness() as records:
+            with renderer_mirror_writes(plan) as writer:
+                writer.set_update(NSOVLANState, plan.write_set[0], last_apply_error="recorded")
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].write_set, plan.write_set)
+        self.assertEqual(records[0].consumed_indexes, {0})
+
     def test_set_update_cannot_capture_a_row_created_after_planning(self):
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
@@ -147,7 +257,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from ipam.models import IPAddress
 
         from netbox_nso_plugin.models import NSOInterfaceIPState
-        from netbox_nso_plugin.renderer_writer import _manifest_binding
+        from netbox_nso_plugin.ownership_planner import manifest_binding
 
         device, management = make_managed("writer-missing-vrf", 16297)
         interface = Interface.objects.create(device=device, name="Loopback16297", type="virtual")
@@ -164,7 +274,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         state.management = management
 
-        self.assertIsNone(_manifest_binding(state))
+        self.assertIsNone(manifest_binding(state))
 
     def test_renderer_writer_declares_one_reference_resolver(self):
         import ast
@@ -564,6 +674,31 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert revision.revision == before + 1
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == expected
+
+    def test_a_reverse_m2m_add_cannot_bypass_the_forward_plan(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_add,
+            renderer_mirror_writes,
+        )
+
+        device, management = make_managed("writer-reverse-m2m", 16278)
+        interface = Interface.objects.create(device=device, name="Ethernet1/8", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=management,
+            interface=interface,
+            mode="tagged",
+            status="imported",
+        )
+        vlan = VLAN.objects.create(vid=1637, name="writer-reverse-m2m")
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),))
+
+        with renderer_mirror_writes(plan) as writer:
+            with self.assertRaisesRegex(IntentMutationProtocolError, "reverse M2M"), transaction.atomic():
+                vlan.nso_switchport_tagged_states.add(state)
+            writer.m2m_add(state, "tagged_vlans", (vlan,))
 
     def test_m2m_plan_refuses_an_unregistered_related_model(self):
         from extras.models import Tag
@@ -1106,3 +1241,69 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert deploying.apply_attempt_id == attempt_id
         assert (revision.revision, revision.verified_revision, revision.verified_fingerprint) == before
         assert not NSOIntentOutboxEntry.objects.filter(device=device, scope="vlan").exists()
+
+
+class TestContentOwnershipComesFromThePlan(IntentPushResetMixin, TestCase):
+    """The plan decides what is content; a caller's declaration cannot widen it."""
+
+    def _lifecycle_only_plan(self, tag, adapter_device_id, vid):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        device, management = make_managed(tag, adapter_device_id)
+        row = own_vlan(management, vid, tag)
+        candidate = copy.copy(NSOVLANState.objects.get(pk=row.pk))
+        candidate.last_apply_error = "lifecycle only"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        assert plan.content_keys == ()
+        return device, plan, candidate
+
+    def test_a_lifecycle_only_plan_grants_no_content_ownership(self):
+        from netbox_nso_plugin.intent_state import mirror_transaction
+        from netbox_nso_plugin.renderer_writer import consume_renderer_plan, renderer_writer_owns_key
+
+        device, plan, candidate = self._lifecycle_only_plan("writer-flag", 16292, 1640)
+
+        with mirror_transaction(plan.lock_footprint) as permit:
+            with consume_renderer_plan(plan, permit, content=True) as writer:
+                owned = renderer_writer_owns_key(device.pk, "vlan", content=True)
+                writer.save(candidate, update_fields=("last_apply_error",))
+
+        assert owned is False
+        assert NSOVLANState.objects.get(pk=candidate.pk).last_apply_error == "lifecycle only"
+
+    def test_renderer_writes_refuses_the_same_lifecycle_only_plan(self):
+        from netbox_nso_plugin.renderer_writer import renderer_writes
+
+        _device, plan, _candidate = self._lifecycle_only_plan("writer-flag-bump", 16293, 1641)
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "requires a content-changing plan"):
+            with renderer_writes(plan):
+                pass
+
+
+class TestDerivedDescriptionRequiresItsWriter(IntentPushResetMixin, TestCase):
+    """RF-1: a converted signal helper consumes its writer and never opens one."""
+
+    def test_a_recompute_without_an_active_writer_is_refused(self):
+        from dcim.models import Cable, CableTermination
+
+        from netbox_nso_plugin.derived_intent import SentinelTemplate
+        from netbox_nso_plugin.signals import _recompute_one
+
+        from ._outbox_case import make_device
+
+        device, _management = make_managed("writer-derived", 16294)
+        peer = make_device("writer-derived", index=2)
+        local = Interface.objects.create(device=device, name="Ethernet16294", type="1000base-t")
+        remote = Interface.objects.create(device=peer, name="Ethernet16295", type="1000base-t")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=local)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=remote)
+        local.description = "[auto]"
+        local.save(update_fields=["description"])
+        templates = [SentinelTemplate(sentinel="[auto]", template="[auto] to {peer_host}:{peer_iface}")]
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "renderer writer"):
+            _recompute_one(Interface.objects.get(pk=local.pk), templates)
+
+        assert Interface.objects.get(pk=local.pk).description == "[auto]"

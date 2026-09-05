@@ -77,7 +77,10 @@ class TestClaimFoldsEveryEntryOnce(_ClaimCase):
 
         assert len(entries(self.device, "vlan", unconsumed=True)) == 3
 
-        with patch("netbox_nso_plugin.delivery.render", wraps=delivery.render) as render:
+        with (
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes"),
+            patch("netbox_nso_plugin.delivery.render", wraps=delivery.render) as render,
+        ):
             outcome = self.drain()
 
         assert outcome == drain.SUCCEEDED
@@ -448,7 +451,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
             deadlines.append(kwargs["deadline"])
             return {"count": 1}
 
-        ticks = iter((100, 102, 105))
+        ticks = iter((100, 100, 102, 105))
         with (
             patch("netbox_nso_plugin.delivery.send", new=answer),
             patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks)),
@@ -789,3 +792,58 @@ class TestTheCapturedSequenceNamesTheCallersOwnClaim(_ClaimCase):
         assert pushed["vlan"].push_seq == self.adapter.sequences[-1], (
             "a caller-owned re-settle supersedes the sequence the earlier call named"
         )
+
+
+class TestARepairCommittedBeforeTheSnapshotIsClaimedAtItsOwnRevision(_ClaimCase):
+    """P4 M16 — the claim's own pre-capture audit is not the only repair it can meet.
+
+    Every other case in the outbox suites patches ``audit_renderer_scopes`` out, so the one
+    interleaving the audit exists for was untested: another connection repairs the same key
+    AFTER this claim's audit returned and BEFORE its repeatable-read transaction takes its
+    snapshot. The claim must fold that repair's contribution and bracket its send with the
+    revision the repair left, never the one it read a moment earlier.
+    """
+
+    tag = "auditrace"
+    adapter_device_id = 7520
+
+    def _bypass_the_writer_then_repair(self):
+        """A foreign rename, then the audit that finds it: one committed repair."""
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        VLAN.objects.filter(pk=self.state.vlan_id).update(name="audit-race-renamed")
+        audit_renderer_scopes(self.device.pk, ("vlan",), trigger="foreign-cadence")
+
+    def test_a_repair_landing_between_the_audit_and_the_snapshot_is_folded(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        from ._outbox_case import in_thread
+
+        self.state = own_vlan(self.mgmt, 861, self.tag)
+        assert self.drain() == drain.SUCCEEDED  # trusted baseline, so the claim's own audit is a no-op
+        self.clear_entries()
+        with without_commit_drain(), transaction.atomic():
+            enqueue(self.device, "vlan")
+
+        before = []
+        after_audit = drain._claim_after_audit
+
+        def repair_then_claim(device_id, scope, **kwargs):
+            if not before:
+                before.append(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision)
+                in_thread(self._bypass_the_writer_then_repair)
+            return after_audit(device_id, scope, **kwargs)
+
+        with patch("netbox_nso_plugin.drain._claim_after_audit", repair_then_claim):
+            claimed = drain.claim(self.device.pk, "vlan")
+
+        assert claimed is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        assert revision.revision > before[0], "the foreign repair advanced the durable revision"
+        assert claimed.revision == revision.revision, "the claim bracketed a revision the repair superseded"
+        assert delivery.canonical_fingerprint(claimed.payload) == revision.verified_fingerprint
+        assert [item["name"] for item in claimed.payload] == ["audit-race-renamed"]
+        assert entries(self.device, "vlan", unconsumed=True) == [], "the repair contribution folded into the claim"

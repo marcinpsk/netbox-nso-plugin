@@ -408,6 +408,19 @@ def _sha256(material) -> str:
 def claim(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False) -> Claim | None:
     """Form or replay the key's logical operation, and return it, or ``None`` if none is owed."""
     _refuse_in_transaction("claim")
+    from .renderer_audit import audit_renderer_scopes
+
+    audit_renderer_scopes(
+        device_id,
+        (scope,),
+        trigger="drain.claim",
+        pre_capture=True,
+    )
+    return _claim_after_audit(device_id, scope, mode=mode, force=force)
+
+
+def _claim_after_audit(device_id, scope, *, mode, force) -> Claim | None:
+    """Capture one claim after its public or drain-level audit has completed."""
     return _repeatable_read(lambda: _claim_locked(device_id, scope, mode, force))
 
 
@@ -510,14 +523,16 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     marking_mode = delivery.delivery_keys()[scope].marking_mode
     rows = list(_unconsumed(device_id, scope).select_for_update().order_by("id"))
     entry_ids = [row.pk for row in rows]
+    # RF-2: a repair asserts "the snapshot changed" and carries no authority, marks or
+    # transitions alike, so both folds read the ordinary partition alone.
+    ordinary = [row for row in rows if row.kind == CONTRIBUTION_KIND_ORDINARY]
     mark, mark_any = _contribution_marks(rows)
-    folded = fold_state_transitions([record for row in rows for record in row.transitions], state)
+    folded = fold_state_transitions([record for row in ordinary for record in row.transitions], state)
     deletions = list(folded.queued.values())
     if mode == delivery.MODE_STORE_ONLY:
         # A deletion mark on a key whose pending rows recorded no provenance at all is
         # authority the FOLD cannot see: the request flag is the whole of it. Where a row
         # DID record its transitions the fold decides, so a revocation withdraws it as usual.
-        ordinary = [row for row in rows if row.kind == CONTRIBUTION_KIND_ORDINARY]
         untracked = mark_any and not any(row.transitions for row in ordinary)
         return _form_store_only(state, mgmt, now, deletions, untracked, force)
 
@@ -1032,7 +1047,8 @@ def _pending_deletions(state, claim: Claim) -> list[dict]:
     """
     transitions = [
         record
-        for row in _unconsumed(state.device_id, state.scope).only("transitions").order_by("id")
+        for row in _unconsumed(state.device_id, state.scope).only("kind", "transitions").order_by("id")
+        if row.kind == CONTRIBUTION_KIND_ORDINARY
         for record in row.transitions
     ]
     folded = fold_transitions(
@@ -1428,6 +1444,7 @@ def _drain_once(
     deadline=None,
     _deadline_at=None,
     _chained=False,
+    _audit=True,
 ) -> tuple[str, object]:
     """Run one claim/send/outcome cycle, returning ``(outcome, the adapter's answer)``.
 
@@ -1435,8 +1452,22 @@ def _drain_once(
     its claim is nobody's operation to name, so it never records into an open capture.
     """
     _refuse_in_transaction("drain")
+    from .renderer_audit import audit_renderer_scopes
+
+    audit_deadline = None
     if deadline is not None and _deadline_at is None:
         _deadline_at = _send_clock() + deadline
+    if _audit and _deadline_at is not None:
+        audit_started_at = time.monotonic()
+        audit_deadline = audit_started_at + _remaining_send_deadline(_deadline_at)
+    if _audit:
+        audit_renderer_scopes(
+            device_id,
+            (scope,),
+            trigger="drain._drain_once",
+            pre_capture=True,
+            deadline=audit_deadline,
+        )
     if not delivery.delivery_keys()[scope].in_protocol:
         return _deliver_direct(device_id, scope, mode=mode, force=force, deadline_at=_deadline_at)
     # The mode THIS attempt may send in. The caller's own mode is what a re-form or a chain
@@ -1470,6 +1501,7 @@ def _drain_once(
             deadline=deadline,
             _deadline_at=_deadline_at,
             _chained=_chained,
+            _audit=False,
         )
     if answer is _PARKED_SEND:
         return PARKED, None
@@ -1520,9 +1552,12 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
             deadline=deadline,
             _deadline_at=deadline_at,
             _chained=chained,
+            _audit=False,
         )
     if chain > 0 and mode == delivery.MODE_NORMAL and _pending(device_id, scope):
         # This chain is a latency optimization. The tick guarantees any remaining tail.
+        from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed
+
         try:
             _drain_once(
                 device_id,
@@ -1533,9 +1568,10 @@ def _after_success(claimed, *, mode, force, chain, deadline, deadline_at, chaine
                 deadline=deadline,
                 _deadline_at=deadline_at,
                 _chained=True,
+                _audit=False,
             )
-        except DeploymentQuiesced:
-            logger.info("%s/%s left its tail to the tick because a deployment started", device_id, scope)
+        except (DeploymentQuiesced, RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
+            logger.info("%s/%s left its tail to the tick: %s", device_id, scope, exc)
     return None
 
 
@@ -1595,16 +1631,24 @@ def _rejected_at_boundary(exc) -> bool:
 
 
 def _dissolve(claim: Claim, exc) -> str:
-    """Abandon a refused body so the next claim folds the operator's correction.
+    """Retire an authority-free refused body until an operator edit records new work."""
+    from .models import NSOIntentOutboxEntry
 
-    §4.2's proven-no-effect abandon, without the withholding the fence adds: a shut fence is
-    a condition of the DEVICE that one backfill lifts, while an invalid body is a condition
-    of the request that only an operator edit changes. Replaying it would take that edit over
-    at the burned body on every later drain, so the correction could never reach the wire.
-    """
-    abandon(claim)
     with transaction.atomic():
         state = _lock_state(claim.device_id, claim.scope)
+        if state.push_seq != claim.push_seq:
+            return SUPERSEDED
+        entry_ids = list(
+            NSOIntentOutboxEntry.objects.filter(
+                device_id=claim.device_id,
+                scope=claim.scope,
+                consumed_by_push_seq=claim.push_seq,
+            ).values_list("pk", flat=True)
+        )
+        _abandon_locked(state)
+        if not claim.mark_any and not claim.deletions:
+            returned_entries = NSOIntentOutboxEntry.objects.filter(pk__in=entry_ids, consumed_by_push_seq__isnull=True)
+            _retire(returned_entries, entry_ids)
         state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
         state.last_error_at = _db_now()
         state.save()
@@ -1710,11 +1754,11 @@ def acknowledge_degraded_deletions(device_id=None, scope=None) -> list[tuple[int
 def _claim_or_wait(device_id, scope, *, mode, force) -> Claim | None:
     """Take the claim. A forced call waits a bounded time for an active one, then fails fast."""
     if not force:
-        return claim(device_id, scope, mode=mode)
+        return _claim_after_audit(device_id, scope, mode=mode, force=False)
     deadline = time.monotonic() + FORCE_WAIT.total_seconds()
     while True:
         try:
-            return claim(device_id, scope, mode=mode, force=True)
+            return _claim_after_audit(device_id, scope, mode=mode, force=True)
         except ClaimBusy:
             if time.monotonic() >= deadline:
                 raise

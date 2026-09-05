@@ -646,8 +646,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
-    def test_a_rename_after_preparation_repends_the_deploying_vlan(self):
-        """A later intent transaction must not inherit an earlier Apply's mark."""
+    def test_a_foreign_rename_after_preparation_repends_on_the_next_audit(self):
+        """A foreign rename stays neutral until the next audit repairs its scope."""
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
         from netbox_nso_plugin.views import _prepare_apply
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
@@ -661,6 +662,16 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             vlan = self.vlan_state.vlan
             vlan.name = "intent-changed-after-preparation"
             vlan.save(update_fields=["name"])
+
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "deploying")
+
+        audit_renderer_scopes(
+            self.device.pk,
+            ["vlan"],
+            trigger="test",
+            pre_capture=True,
+        )
 
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
@@ -830,187 +841,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         stale.refresh_from_db()
         self.assertEqual(stale.status, "accepted")
-
-    def test_a_stale_full_save_cannot_restore_deploying_without_an_intent_change(self):
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-
-        interface = self._create_interface(device=self.device, name="Ethernet9.15", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            stale = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                l2_mtu=1500,
-                status="deploying",
-                apply_attempt_id=uuid4(),
-            )
-        mirror_update(
-            NSOInterfaceMtuState.objects.get(pk=stale.pk),
-            status="accepted",
-        )
-
-        with without_commit_drain(), transaction.atomic():
-            stale.save()
-
-        stale.refresh_from_db()
-        self.assertEqual(stale.status, "accepted")
-
-    def test_a_stale_accepted_full_save_cannot_repend_unchanged_deploying_intent(self):
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-
-        interface = self._create_interface(device=self.device, name="Ethernet9.155", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            stale = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                l2_mtu=1500,
-                status="accepted",
-            )
-        mirror_update(
-            NSOInterfaceMtuState.objects.get(pk=stale.pk),
-            status="deploying",
-            apply_attempt_id=uuid4(),
-        )
-
-        with without_commit_drain(), transaction.atomic():
-            stale.save()
-
-        stale.refresh_from_db()
-        self.assertEqual(stale.status, "deploying")
-
-    def test_a_wire_field_update_repends_an_in_sync_row_when_status_is_not_in_update_fields(self):
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-
-        interface = self._create_interface(device=self.device, name="Ethernet9.16", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                l2_mtu=1500,
-                status="in_sync",
-            )
-
-        state.l2_mtu = 1600
-        with without_commit_drain(), transaction.atomic():
-            state.save(update_fields=["l2_mtu"])
-
-        state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
-
-    def test_a_stale_transient_owned_status_cannot_reclaim_an_unaccepted_row(self):
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-
-        for index, stale_status in enumerate(("deploying", "in_sync", "apply_failed")):
-            with self.subTest(status=stale_status):
-                interface = self._create_interface(
-                    device=self.device,
-                    name=f"Ethernet9.2{index}",
-                    type="1000base-t",
-                )
-                with without_commit_drain(), transaction.atomic():
-                    stale = NSOInterfaceMtuState.objects.create(
-                        management=self.mgmt,
-                        interface=interface,
-                        l2_mtu=1500,
-                        status=stale_status,
-                        apply_attempt_id=uuid4() if stale_status == "deploying" else None,
-                    )
-                content_update(
-                    NSOInterfaceMtuState.objects.get(pk=stale.pk),
-                    status="imported",
-                )
-
-                stale.l2_mtu = 1600
-                with without_commit_drain(), transaction.atomic():
-                    stale.save()
-
-                stale.refresh_from_db()
-                self.assertEqual(stale.status, "changed")
-
-    def test_a_stale_wire_only_update_persists_changed_after_unaccept(self):
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-
-        interface = self._create_interface(device=self.device, name="Ethernet9.29", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            stale = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                l2_mtu=1500,
-                status="in_sync",
-            )
-        content_update(
-            NSOInterfaceMtuState.objects.get(pk=stale.pk),
-            status="imported",
-        )
-
-        stale.l2_mtu = 1600
-        with without_commit_drain(), transaction.atomic():
-            stale.save(update_fields=["l2_mtu"])
-
-        stale.refresh_from_db()
-        self.assertEqual(stale.status, "changed")
-
-    def test_a_stale_transient_owned_status_cannot_undo_unaccept_when_intent_is_unchanged(self):
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-
-        for index, stale_status in enumerate(("deploying", "in_sync", "apply_failed")):
-            with self.subTest(status=stale_status):
-                interface = self._create_interface(
-                    device=self.device,
-                    name=f"Ethernet9.3{index}",
-                    type="1000base-t",
-                )
-                with without_commit_drain(), transaction.atomic():
-                    stale = NSOInterfaceMtuState.objects.create(
-                        management=self.mgmt,
-                        interface=interface,
-                        l2_mtu=1500,
-                        status=stale_status,
-                        apply_attempt_id=uuid4() if stale_status == "deploying" else None,
-                    )
-                content_update(
-                    NSOInterfaceMtuState.objects.get(pk=stale.pk),
-                    status="imported",
-                )
-
-                with without_commit_drain(), transaction.atomic():
-                    stale.save()
-
-                stale.refresh_from_db()
-                self.assertEqual(stale.status, "imported")
-
-    def test_suppressed_save_discards_the_previous_intent_change_verdict(self):
-        from django.utils import timezone
-
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
-        from netbox_nso_plugin.signals import suppress_intent_push
-
-        interface = self._create_interface(device=self.device, name="Ethernet9.35", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                l2_mtu=1500,
-                status="in_sync",
-            )
-
-        state.l2_mtu = 1600
-        with without_commit_drain(), transaction.atomic():
-            state.save(update_fields=["l2_mtu"])
-        self.assertEqual(NSOInterfaceMtuState.objects.get(pk=state.pk).status, "accepted")
-
-        state.status = "in_sync"
-        state.last_sync_at = timezone.now()
-        with suppress_intent_push(), transaction.atomic():
-            state.save(update_fields=["status", "last_sync_at"])
-
-        state.refresh_from_db()
-        self.assertEqual(state.status, "in_sync")
 
     def test_same_row_intent_writers_serialize_before_comparing(self):
         import threading
@@ -1242,326 +1072,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertFalse(renamer.is_alive())
         if errors:
             raise errors[0]
-
-    def test_interface_rename_locks_rows_referenced_by_indirect_dependencies_before_mutation(self):
-        import threading
-
-        from dcim.models import Interface
-        from django.contrib.contenttypes.models import ContentType
-        from django.db import connections
-        from django.db.models.signals import pre_save
-        from ipam.models import ASN, RIR, IPAddress
-        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
-
-        from netbox_nso_plugin.models import NSOBGPPeerState, NSOInterfaceIPState
-
-        with without_commit_drain(), transaction.atomic():
-            interface = self._create_interface(device=self.device, name="Ethernet9.395", type="lag")
-            child = self._create_interface(
-                device=self.device,
-                name="LAG395:395",
-                type="virtual",
-                parent=interface,
-            )
-            rir = RIR.objects.create(name="Rename fence private ASNs", slug="rename-fence-private-asns")
-            local_as = ASN.objects.create(asn=65042, rir=rir)
-            remote_as = ASN.objects.create(asn=65043, rir=rir)
-            router = BGPRouter.objects.create(
-                assigned_object_type=ContentType.objects.get_for_model(type(self.device)),
-                assigned_object_id=self.device.pk,
-                asn=local_as,
-                name="65042",
-            )
-            scope = BGPScope.objects.create(router=router)
-            peer_address = IPAddress.objects.create(address="198.18.95.2/32")
-            peer = BGPPeer.objects.create(
-                scope=scope,
-                peer=peer_address,
-                remote_as=remote_as,
-                update_source=interface,
-                enabled=True,
-            )
-            unlinked_bgp_state = NSOBGPPeerState.objects.create(
-                management=self.mgmt,
-                bgp_peer=peer,
-                asn_str=str(local_as.asn),
-                peer_address_str=str(peer_address.address),
-                status="accepted",
-            )
-        content_update(unlinked_bgp_state, bgp_peer=None)
-        rename_prepared = threading.Event()
-        release_rename = threading.Event()
-        ip_dependency_created = threading.Event()
-        bgp_dependency_created = threading.Event()
-        errors = []
-
-        def hold_rename_after_dependency_capture(sender, instance, update_fields=None, **kwargs):
-            if instance.pk == interface.pk and update_fields is not None and "name" in update_fields:
-                rename_prepared.set()
-                if not release_rename.wait(10):
-                    raise AssertionError("the dependency writer did not inspect the native lock")
-
-        def rename_interface():
-            try:
-                with without_commit_drain(), transaction.atomic():
-                    current = Interface.objects.get(pk=interface.pk)
-                    self._rename_interface(current, "Ethernet9.396")
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def create_ip_dependency():
-            try:
-                if not rename_prepared.wait(10):
-                    raise AssertionError("the rename did not reach its dependency fence")
-                with without_commit_drain(), transaction.atomic():
-                    NSOInterfaceIPState.objects.create(
-                        interface_id=child.pk,
-                        address="198.18.95.1/31",
-                        status="accepted",
-                    )
-                ip_dependency_created.set()
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def relink_bgp_dependency():
-            try:
-                if not rename_prepared.wait(10):
-                    raise AssertionError("the rename did not reach its dependency fence")
-                with without_commit_drain(), transaction.atomic():
-                    current = NSOBGPPeerState.objects.get(pk=unlinked_bgp_state.pk)
-                    current.bgp_peer_id = peer.pk
-                    current.save(update_fields=["bgp_peer"])
-                bgp_dependency_created.set()
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        pre_save.connect(hold_rename_after_dependency_capture, sender=Interface, weak=False)
-        renamer = threading.Thread(target=rename_interface)
-        ip_creator = threading.Thread(target=create_ip_dependency)
-        bgp_creator = threading.Thread(target=relink_bgp_dependency)
-        renamer.start()
-        ip_creator.start()
-        bgp_creator.start()
-        try:
-            self.assertTrue(rename_prepared.wait(10), f"the rename did not reach its dependency fence: {errors!r}")
-            ip_created_before_rename = ip_dependency_created.wait(1)
-            bgp_created_before_rename = bgp_dependency_created.wait(1)
-        finally:
-            release_rename.set()
-            renamer.join(10)
-            ip_creator.join(10)
-            bgp_creator.join(10)
-            pre_save.disconnect(hold_rename_after_dependency_capture, sender=Interface)
-
-        self.assertFalse(ip_created_before_rename, "an IP dependency was inserted before the rename committed")
-        self.assertFalse(bgp_created_before_rename, "a BGP dependency was linked before the rename committed")
-        self.assertFalse(renamer.is_alive())
-        self.assertFalse(ip_creator.is_alive())
-        self.assertFalse(bgp_creator.is_alive())
-        if errors:
-            raise errors[0]
-
-    def test_vlan_rename_fences_a_new_device_attachment_before_dependency_capture(self):
-        import threading
-
-        from django.db import connections
-        from django.db.models.signals import pre_save
-        from django.test import Client
-        from ipam.models import VLAN
-
-        from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.signals import suppress_intent_push
-
-        with transaction.atomic():
-            vlan = VLAN.objects.create(vid=3558, name="before-rename")
-        state = NSOVLANState(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
-        with suppress_intent_push(), mirror_transaction(footprint_for_instance(state)):
-            state.save(force_insert=True)
-        other_device, other_mgmt = make_managed("apply-selector-vlan-attach", 2558)
-        attach_client = Client()
-        attach_client.force_login(self.user)
-        rename_prepared = threading.Event()
-        release_rename = threading.Event()
-        attachment_reached_save = threading.Event()
-        attachment_done = threading.Event()
-        errors = []
-
-        def hold_rename_after_dependency_capture(sender, instance, update_fields=None, **kwargs):
-            if instance.pk == vlan.pk and update_fields is not None and "name" in update_fields:
-                rename_prepared.set()
-                if not release_rename.wait(10):
-                    raise AssertionError("the attachment did not inspect the VLAN fence")
-
-        def note_attachment_save(sender, instance, **kwargs):
-            if instance.management_id == other_mgmt.pk and instance.vlan_id == vlan.pk:
-                attachment_reached_save.set()
-
-        def rename_vlan():
-            try:
-                with without_commit_drain(), transaction.atomic():
-                    current = VLAN.objects.get(pk=vlan.pk)
-                    current.name = "after-rename"
-                    current.save(update_fields=["name"])
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def attach_vlan():
-            try:
-                if not rename_prepared.wait(10):
-                    raise AssertionError("the rename did not reach its dependency fence")
-                with without_commit_drain():
-                    response = attach_client.post(
-                        reverse("plugins:netbox_nso_plugin:vlan_attach", args=[other_device.pk]),
-                        {"vlan": vlan.pk},
-                    )
-                if response.status_code != 302:
-                    raise AssertionError(f"VLAN attachment returned HTTP {response.status_code}")
-                attachment_done.set()
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        pre_save.connect(hold_rename_after_dependency_capture, sender=VLAN, weak=False)
-        pre_save.connect(note_attachment_save, sender=NSOVLANState, weak=False)
-        renamer = threading.Thread(target=rename_vlan)
-        attacher = threading.Thread(target=attach_vlan)
-        renamer.start()
-        attacher.start()
-        try:
-            self.assertTrue(rename_prepared.wait(10), "the rename did not reach its dependency fence")
-            attachment_saved_before_rename = attachment_reached_save.wait(5)
-            attached_before_rename = attachment_done.wait(1)
-        finally:
-            release_rename.set()
-            renamer.join(10)
-            attacher.join(10)
-            pre_save.disconnect(hold_rename_after_dependency_capture, sender=VLAN)
-            pre_save.disconnect(note_attachment_save, sender=NSOVLANState)
-
-        self.assertFalse(attachment_saved_before_rename, "a new VLAN attachment reached its save before the rename")
-        self.assertFalse(attached_before_rename, "a new VLAN attachment committed before the rename")
-        self.assertFalse(renamer.is_alive())
-        self.assertFalse(attacher.is_alive())
-        if errors:
-            raise errors[0]
-        state = NSOVLANState.objects.get(management=other_mgmt, vlan=vlan)
-        self.assertEqual(state.status, "accepted")
-        vlan.refresh_from_db()
-        self.assertEqual(vlan.name, "after-rename")
-
-    def test_vlan_attachment_and_rename_use_the_same_lock_order(self):
-        import threading
-        from unittest.mock import patch
-
-        from django.db import connections
-        from django.test import Client
-        from ipam.models import VLAN
-
-        from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.intent_state import (
-            IntentMutationProtocolError,
-            footprint_for_instance,
-            mirror_transaction,
-        )
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.signals import suppress_intent_push
-
-        with transaction.atomic():
-            vlan = VLAN.objects.create(vid=3557, name="attach-before-rename")
-        state = NSOVLANState(management=self.mgmt, vlan=vlan, device_name=vlan.name, status="imported")
-        with suppress_intent_push(), mirror_transaction(footprint_for_instance(state)):
-            state.save(force_insert=True)
-        other_device, other_mgmt = make_managed("apply-selector-attach-order", 2557)
-        attach_client = Client()
-        attach_client.force_login(self.user)
-        attach_holds_vlan = threading.Event()
-        release_attach = threading.Event()
-        rename_acquired_vlan = threading.Event()
-        renamer_ready = threading.Event()
-        renamer_pid: list[int] = []
-        errors = []
-        original_shared_lock = apply_state.lock_shared_dependencies
-        attacher = None
-        renamer = None
-
-        def observe_shared_lock(keys):
-            original_shared_lock(keys)
-            if ("vlan", str(vlan.pk)) not in keys:
-                return
-            if threading.current_thread() is attacher:
-                attach_holds_vlan.set()
-                if not release_attach.wait(10):
-                    raise AssertionError("the VLAN attachment was not released")
-            elif threading.current_thread() is renamer:
-                rename_acquired_vlan.set()
-
-        def attach_vlan():
-            try:
-                with without_commit_drain():
-                    response = attach_client.post(
-                        reverse("plugins:netbox_nso_plugin:vlan_attach", args=[other_device.pk]),
-                        {"vlan": vlan.pk},
-                    )
-                if response.status_code != 302:
-                    raise AssertionError(f"VLAN attachment returned HTTP {response.status_code}")
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def rename_vlan():
-            try:
-                if not attach_holds_vlan.wait(10):
-                    raise AssertionError("the attachment did not acquire the shared VLAN lock")
-                with without_commit_drain(), transaction.atomic():
-                    current = VLAN.objects.get(pk=vlan.pk)
-                    current.name = "rename-after-attach-started"
-                    with connections["default"].cursor() as cursor:
-                        cursor.execute("SELECT pg_backend_pid()")
-                        renamer_pid.append(cursor.fetchone()[0])
-                    renamer_ready.set()
-                    current.save(update_fields=["name"])
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                errors.append(exc)
-            finally:
-                connections.close_all()
-
-        with (
-            patch("netbox_nso_plugin.apply_state.lock_shared_dependencies", side_effect=observe_shared_lock),
-        ):
-            attacher = threading.Thread(target=attach_vlan)
-            renamer = threading.Thread(target=rename_vlan)
-            attacher.start()
-            self.assertTrue(attach_holds_vlan.wait(10), "the attachment did not acquire the shared VLAN lock")
-            renamer.start()
-            try:
-                self.assertTrue(renamer_ready.wait(10), "the rename did not reach its database write")
-                wait_until_postgres_blocks(renamer_pid[0], "the rename", locktype="advisory")
-                self.assertFalse(rename_acquired_vlan.is_set(), "the rename bypassed the attachment's VLAN lock")
-            finally:
-                release_attach.set()
-                attacher.join(10)
-                renamer.join(10)
-            self.assertTrue(rename_acquired_vlan.is_set(), "the rename never acquired the released VLAN lock")
-
-        self.assertFalse(attacher.is_alive())
-        self.assertFalse(renamer.is_alive())
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], IntentMutationProtocolError)
-        self.assertIn("changed its renderer targets", str(errors[0]))
-        self.assertTrue(NSOVLANState.objects.filter(management=other_mgmt, vlan=vlan).exists())
-        vlan.refresh_from_db()
-        self.assertEqual(vlan.name, "attach-before-rename")
 
     def test_native_vlan_prelocks_leave_malformed_payloads_to_scope_isolation(self):
         from netbox_nso_plugin.intent_state import MutationFootprint
@@ -1925,84 +1435,6 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         svi_state.refresh_from_db()
         self.assertEqual(self.vlan_state.vlan_id, target_vlan.pk)
         self.assertEqual(svi_state.vlan_id, target_vlan.pk)
-
-    def test_vlan_rescope_target_slot_serializes_a_concurrent_vlan_creation(self):
-        import threading
-        from unittest.mock import patch
-
-        from django.db import IntegrityError, connections
-        from ipam.models import VLAN, VLANGroup
-
-        from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.vlan_reconciler import rescope_vlan
-
-        target_group = VLANGroup.objects.create(name="Concurrent target", slug="concurrent-target")
-        source_vid = self.vlan_state.vlan.vid
-        rescope_admitted = threading.Event()
-        release_rescope = threading.Event()
-        target_created = threading.Event()
-        rescope_moved = threading.Event()
-        rescope_errors = []
-        creator_errors = []
-        original_lock = apply_state.lock_shared_dependencies
-
-        def hold_target_slot(keys):
-            original_lock(keys)
-            if threading.current_thread() is rescoping and ("vlan-slot", f"{target_group.pk}:{source_vid}") in keys:
-                rescope_admitted.set()
-                if not release_rescope.wait(10):
-                    raise AssertionError("the concurrent VLAN creator did not inspect the target-group fence")
-
-        def move_vlan():
-            try:
-                rescope_vlan(type(self.vlan_state).objects.get(pk=self.vlan_state.pk), target_group)
-                rescope_moved.set()
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                rescope_errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def create_target_vlan():
-            try:
-                if not rescope_admitted.wait(10):
-                    raise AssertionError("the rescope did not reach its target lookup fence")
-                with transaction.atomic():
-                    VLAN.objects.create(group=target_group, vid=source_vid, name="concurrent")
-                target_created.set()
-            except IntegrityError as exc:
-                creator_errors.append(exc)
-            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
-                creator_errors.append(exc)
-            finally:
-                connections.close_all()
-
-        with patch(
-            "netbox_nso_plugin.apply_state.lock_shared_dependencies",
-            side_effect=hold_target_slot,
-        ):
-            rescoping = threading.Thread(target=move_vlan)
-            creator = threading.Thread(target=create_target_vlan)
-            rescoping.start()
-            creator.start()
-            try:
-                self.assertTrue(rescope_admitted.wait(10), "the rescope did not reach its target lookup fence")
-                created_before_rescope = target_created.wait(1)
-            finally:
-                release_rescope.set()
-                rescoping.join(10)
-                creator.join(10)
-
-        self.assertFalse(created_before_rescope, "the concurrent target VLAN bypassed the target-slot lock")
-        if rescope_errors:
-            raise rescope_errors[0]
-        self.assertEqual(len(creator_errors), 1)
-        self.assertIsInstance(creator_errors[0], IntegrityError)
-        self.assertTrue(rescope_moved.is_set(), "the rescope did not complete before the competing insert")
-        self.assertFalse(rescoping.is_alive())
-        self.assertFalse(creator.is_alive())
-        self.vlan_state.refresh_from_db()
-        self.assertEqual(self.vlan_state.vlan.group_id, target_group.pk)
-        self.assertEqual(VLAN.objects.filter(group=target_group, vid=source_vid).count(), 1)
 
     def test_vlan_rescope_merge_preserves_a_concurrent_accept(self):
         import threading
@@ -2564,7 +1996,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         switchport_state.refresh_from_db()
         self.assertEqual(
             (self.vlan_state.status, svi_state.status, switchport_state.status),
-            ("deploying", "deploying", "in_sync"),
+            ("deploying", "deploying", "accepted"),
         )
         with without_commit_drain(), transaction.atomic():
             vlan = self.vlan_state.vlan
@@ -2705,35 +2137,53 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         self.assertEqual(
             [type(state).objects.get(pk=state.pk).status for state in states],
-            ["deploying"] * 4 + ["in_sync"] * 7,
+            ["deploying"] * 4 + ["accepted"] * 7,
         )
         with without_commit_drain(), transaction.atomic():
             self._rename_interface(shared, "Ethernet9.41")
 
         self.assertEqual(
             [type(state).objects.get(pk=state.pk).status for state in states],
-            ["accepted"] * 4 + ["in_sync"] * 7,
+            ["accepted"] * 11,
         )
 
-    def test_overlay_intent_edit_requires_an_atomic_transaction_before_row_locking(self):
+    def test_the_finalize_audit_runs_before_the_irreversible_direct_pushes(self):
+        """A finalize repair aborts the Apply, so it may not run after a device write.
 
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        ``_push_direct_snapshots`` writes LAG and switchport config straight to the device
+        with no rollback. A finalize audit behind it can bump the revision and abort the
+        Apply with the device already changed and every promoted row stranded.
+        """
+        from unittest.mock import patch
 
-        interface = self._create_interface(device=self.device, name="Ethernet9.415", type="1000base-t")
-        with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt,
-                interface=interface,
-                l2_mtu=1500,
-                status="in_sync",
-            )
+        from netbox_nso_plugin import renderer_audit, views
+        from netbox_nso_plugin.views import _prepare_apply
 
-        state.l2_mtu = 1600
-        with self.assertRaisesRegex(RuntimeError, "intent_transaction requires transaction.atomic"):
-            state.save(update_fields=["l2_mtu"])
+        real_audit = renderer_audit.audit_renderer_scopes
+        real_direct = views._push_direct_snapshots
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        order = []
 
-        state.refresh_from_db()
-        self.assertEqual(state.l2_mtu, 1500)
+        def _recording_audit(*args, **kwargs):
+            trigger = kwargs.get("trigger", args[2] if len(args) > 2 else "")
+            if trigger.endswith(".finalize"):
+                order.append("finalize-audit")
+            return real_audit(*args, **kwargs)
+
+        def _recording_direct(*args, **kwargs):
+            order.append("direct-push")
+            return real_direct(*args, **kwargs)
+
+        config, session = adapter.patches()
+        with (
+            config,
+            session,
+            patch.object(renderer_audit, "audit_renderer_scopes", _recording_audit),
+            patch.object(views, "_push_direct_snapshots", _recording_direct),
+        ):
+            _prepare_apply(self.mgmt)
+
+        self.assertEqual(order, ["finalize-audit", "direct-push"])
 
     def test_interface_footprint_refuses_a_move_after_the_device_lock(self):
         from unittest.mock import patch

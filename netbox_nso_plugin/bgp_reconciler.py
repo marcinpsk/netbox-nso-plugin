@@ -1194,12 +1194,16 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         reported_templates = {}
         for value in sorted(self.reported_asns, key=lambda item: (len(item), item)):
             self.asn(value)
+        valid_routers = []
         for router_entry in routers:
-            asn_str = router_entry["asn"]
-            asn = self.asn(asn_str)
-            router = self.router(asn, router_entry["router_id"])
-            for scope_entry in sorted(router_entry["scopes"], key=lambda row: row["vrf"]):
-                vrf_name = scope_entry["vrf"]
+            asn_str = str(router_entry.get("asn") or "")
+            asn = self.asn(asn_str) if asn_str else None
+            if asn is not None:
+                valid_routers.append((router_entry, asn_str, asn))
+        for router_entry, asn_str, asn in valid_routers:
+            router = self.router(asn, router_entry.get("router_id"))
+            for scope_entry in sorted(router_entry.get("scopes") or [], key=lambda row: row.get("vrf") or ""):
+                vrf_name = scope_entry.get("vrf") or ""
                 scope = self.scope(router, vrf_name)
                 for value in sorted(scope_entry["address_families"]):
                     self.address_family(scope, value)

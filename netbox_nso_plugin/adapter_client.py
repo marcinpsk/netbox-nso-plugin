@@ -15,6 +15,7 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import requests
 from django.conf import settings
@@ -618,6 +619,55 @@ def put_failover_config(payload):
     return _request("PUT", "/api/v1/config/failover", json=payload)
 
 
+@dataclass(frozen=True)
+class AdapterControlState:
+    """The five authoritative control fields shared by adapter reads and writes."""
+
+    managed_attributes: tuple[str, ...]
+    auto_apply: bool
+    sync_before_apply: bool
+    primary_ip: str | None
+    oob_ip: str | None
+
+    def __post_init__(self):
+        object.__setattr__(self, "managed_attributes", tuple(sorted(self.managed_attributes)))
+
+    @classmethod
+    def from_adapter(cls, device_state: dict, scope_state: dict):
+        """Build canonical control state from the adapter's two read responses."""
+        if not isinstance(device_state, dict) or not isinstance(scope_state, dict):
+            raise AdapterError("Adapter returned malformed control state.", code="invalid_response")
+        if "failover" not in device_state:
+            raise AdapterError("Adapter returned malformed device control state.", code="invalid_response")
+        failover_state = device_state["failover"]
+        if failover_state is not None and not isinstance(failover_state, dict):
+            raise AdapterError("Adapter returned malformed failover state.", code="invalid_response")
+        if failover_state is not None and not {"primary_ip", "oob_ip"} <= failover_state.keys():
+            raise AdapterError("Adapter returned incomplete failover state.", code="invalid_response")
+
+        attributes = scope_state.get("attributes")
+        auto_apply = scope_state.get("auto_apply")
+        sync_before_apply = scope_state.get("sync_before_apply")
+        if not isinstance(attributes, list) or any(not isinstance(attribute, str) for attribute in attributes):
+            raise AdapterError("Adapter returned malformed managed attributes.", code="invalid_response")
+        if not isinstance(auto_apply, bool) or not isinstance(sync_before_apply, bool):
+            raise AdapterError("Adapter returned malformed scope settings.", code="invalid_response")
+
+        primary_ip = None if failover_state is None else failover_state["primary_ip"]
+        oob_ip = None if failover_state is None else failover_state["oob_ip"]
+        if primary_ip is not None and not isinstance(primary_ip, str):
+            raise AdapterError("Adapter returned malformed primary IP state.", code="invalid_response")
+        if oob_ip is not None and not isinstance(oob_ip, str):
+            raise AdapterError("Adapter returned malformed out-of-band IP state.", code="invalid_response")
+        return cls(
+            managed_attributes=tuple(attributes),
+            auto_apply=auto_apply,
+            sync_before_apply=sync_before_apply,
+            primary_ip=primary_ip,
+            oob_ip=oob_ip,
+        )
+
+
 def set_scope(
     adapter_device_id, attributes, auto_apply=False, sync_before_apply=True, *, primary_ip=_UNSET, oob_ip=_UNSET
 ):
@@ -637,6 +687,28 @@ def set_scope(
     if oob_ip is not _UNSET:
         payload["oob_ip"] = oob_ip
     return _request("PUT", f"/api/v1/devices/{adapter_device_id}/scope", json=payload)
+
+
+def get_scope(adapter_device_id):
+    """GET /api/v1/devices/{id}/scope."""
+    return _request("GET", f"/api/v1/devices/{adapter_device_id}/scope")
+
+
+def get_control_state(adapter_device_id) -> AdapterControlState:
+    """Read and combine the adapter's authoritative device control state."""
+    return AdapterControlState.from_adapter(get_device(adapter_device_id), get_scope(adapter_device_id))
+
+
+def set_control_state(adapter_device_id, state: AdapterControlState):
+    """Write one canonical adapter control state."""
+    return set_scope(
+        adapter_device_id,
+        list(state.managed_attributes),
+        auto_apply=state.auto_apply,
+        sync_before_apply=state.sync_before_apply,
+        primary_ip=state.primary_ip,
+        oob_ip=state.oob_ip,
+    )
 
 
 def patch_device(adapter_device_id, nso_instance=None, nso_device_name=None):

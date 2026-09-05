@@ -4,8 +4,22 @@
 
 from __future__ import annotations
 
+import copy
+import json
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
+
+from django.apps import apps
+
+ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
+    {
+        "prefix_list": "netbox_routing.prefixlist",
+        "community_list": "netbox_routing.communitylist",
+        "as_path": "netbox_routing.aspath",
+        "route_map": "netbox_routing.routemap",
+    }
+)
 
 
 class OwnershipAction(str, Enum):
@@ -287,12 +301,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "route_policy": ScopeOwnershipRule(
         scope="route_policy",
-        native_model_labels=(
-            "netbox_routing.prefixlist",
-            "netbox_routing.communitylist",
-            "netbox_routing.aspath",
-            "netbox_routing.routemap",
-        ),
+        native_model_labels=tuple(ROUTE_POLICY_NATIVE_MODEL_LABELS.values()),
         native_key_fields=("name",),
         overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
         overlay_native_fields=(("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),),
@@ -425,3 +434,189 @@ def retire_device_manifests(device_id: int) -> None:
         device_id=device_id,
         ownership_state="owned",
     ).update(ownership_state="retired")
+
+
+def _validated_native_key_fields(native, rule):
+    """Return validated native identity fields for one ownership rule."""
+    native_label = native._meta.label_lower
+    if native_label not in rule.native_model_labels:
+        return None
+    key_fields = dict(rule.native_key_fields_by_model).get(native_label, rule.native_key_fields)
+    for name in key_fields:
+        native._meta.get_field(native._meta.pk.name if name == "pk" else name)
+    return native_label, key_fields
+
+
+def manifest_binding(instance):
+    """Return the durable manifest identity for one overlay instance."""
+    label = instance._meta.label_lower
+    for rule in converted_scope_rules().values():
+        native_field = dict(rule.overlay_native_fields).get(label)
+        if native_field is None:
+            continue
+        if native_field == "__self__":
+            native = instance
+        elif native_field == "__ip_address__":
+            from dcim.models import Interface
+            from django.contrib.contenttypes.models import ContentType
+            from ipam.models import IPAddress
+
+            interface_type = ContentType.objects.get_for_model(Interface)
+            vrf_name = getattr(instance, "vrf", "")
+            vrf_id = None
+            if vrf_name:
+                from ipam.models import VRF
+
+                vrf_id = VRF.objects.filter(name=vrf_name).values_list("pk", flat=True).first()
+                if vrf_id is None:
+                    return None
+            native = IPAddress.objects.filter(
+                address=instance.address,
+                vrf_id=vrf_id,
+                assigned_object_type=interface_type,
+                assigned_object_id=instance.interface_id,
+            ).first()
+        elif native_field == "__ospf_interface__":
+            from netbox_routing.models import OSPFInterface
+
+            native = OSPFInterface.objects.filter(interface_id=instance.interface_id).first()
+        else:
+            native = getattr(instance, native_field, None)
+        management = getattr(instance, "management", None)
+        native_fields = None if native is None else _validated_native_key_fields(native, rule)
+        if native_fields is None or management is None:
+            return None
+        native_label, key_fields = native_fields
+        if rule.scope == "route_policy" and ROUTE_POLICY_NATIVE_MODEL_LABELS.get(instance.family) != native_label:
+            return None
+
+        def json_value(value):
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value
+            if isinstance(value, dict):
+                return {str(key): json_value(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [json_value(item) for item in value]
+            return str(value)
+
+        native_key = {name: json_value(getattr(native, name)) for name in key_fields}
+        scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
+        return rule, scope, management.device_id, native_label, native_key
+    return None
+
+
+def maintain_manifest(instance) -> None:
+    """Make one overlay's manifest agree with its persisted ownership state."""
+    from . import status_machine as sm
+    from .models import NSOOwnershipManifest
+
+    binding = manifest_binding(instance)
+    if binding is None:
+        return
+    rule, scope, device_id, native_model_label, native_key = binding
+    identity = {
+        "device_id": device_id,
+        "scope": scope,
+        "native_model_label": native_model_label,
+        "native_key": native_key,
+    }
+    if sm.is_owned(instance.status):
+        lineage = (
+            getattr(instance, rule.acknowledged_lineage_field, None)
+            if rule.acknowledged_lineage_field is not None
+            else None
+        )
+        defaults = {
+            "ownership_state": "owned",
+            "deletion_authority": rule.deletion_authority,
+        }
+        if lineage is not None:
+            defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
+        manifest, created = NSOOwnershipManifest.objects.get_or_create(
+            **identity,
+            defaults=defaults,
+        )
+        if not created:
+            NSOOwnershipManifest.objects.filter(pk=manifest.pk).exclude(ownership_state="retired").update(**defaults)
+    else:
+        NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
+
+
+def _manifest_record_actions(device_id, requested):
+    """Return owned overlays whose durable manifest evidence is absent."""
+    from .intent_state import OVERLAY_MODEL_RANKS, renderer_input_specs
+    from .models import NSOOwnershipManifest
+    from .status_machine import is_owned
+
+    planned = []
+    seen = set()
+    manifest_states = {
+        (scope, native_model_label, json.dumps(native_key, sort_keys=True)): ownership_state
+        for scope, native_model_label, native_key, ownership_state in NSOOwnershipManifest.objects.filter(
+            device_id=device_id,
+            scope__in=tuple(requested),
+        ).values_list("scope", "native_model_label", "native_key", "ownership_state")
+    }
+    for spec in renderer_input_specs().values():
+        if requested.isdisjoint(spec.scopes) or spec.model_label not in OVERLAY_MODEL_RANKS:
+            continue
+        model = apps.get_model(spec.model_label)
+        fields = {field.name for field in model._meta.concrete_fields}
+        if "status" not in fields:
+            continue
+        if "management" in fields:
+            rows = model.objects.filter(management__device_id=device_id)
+        elif "interface" in fields:
+            rows = model.objects.filter(interface__device_id=device_id)
+        else:
+            continue
+        for instance in rows.order_by("pk"):
+            identity = (instance._meta.label_lower, instance.pk)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            binding = manifest_binding(instance)
+            if binding is None:
+                continue
+            rule, scope, bound_device_id, native_model_label, native_key = binding
+            if scope not in requested or bound_device_id != device_id:
+                continue
+            manifest_state = manifest_states.get((scope, native_model_label, json.dumps(native_key, sort_keys=True)))
+            action = plan_ownership(
+                rule,
+                OwnershipSignature(
+                    native_present=True,
+                    native_qualifies=True,
+                    overlay_present=True,
+                    overlay_owned=is_owned(instance.status),
+                    manifest_state=manifest_state,
+                ),
+            )
+            if action is OwnershipAction.RECORD_MANIFEST:
+                planned.append((scope, instance._meta.label_lower, instance.pk))
+    return tuple(planned)
+
+
+def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object], ...]:
+    """Run the state-derived ownership planner before a renderer audit."""
+    from .intent_state import mirror_transaction, reconcile_family_footprint
+
+    requested = frozenset(str(scope) for scope in scopes)
+    if not requested:
+        return ()
+    planned = _manifest_record_actions(device_id, requested)
+    if not planned:
+        return ()
+    footprint = reconcile_family_footprint(device_id, requested)
+    completed = []
+    with mirror_transaction(footprint):
+        current = set(_manifest_record_actions(device_id, requested))
+        for scope, model_label, pk in planned:
+            instance = apps.get_model(model_label).objects.filter(pk=pk).first()
+            if instance is None:
+                continue
+            if (scope, model_label, pk) not in current:
+                continue
+            maintain_manifest(instance)
+            completed.append((scope, pk))
+    return tuple(completed)

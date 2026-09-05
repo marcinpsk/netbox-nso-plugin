@@ -23,7 +23,6 @@ from .intent_state import (
     IntentMutationProtocolError,
     MutationFootprint,
     SourceRow,
-    _authorize_dml,
     _effective_after,
     _intent_transaction,
     _normal,
@@ -74,6 +73,7 @@ class RendererSave:
     force_insert: bool = False
     natural_key_fields: tuple[str, ...] = ()
     reference_fields: tuple[tuple[str, Any], ...] = ()
+    expected_before: Any = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +127,7 @@ def planned_save(
     force_insert=False,
     natural_key=(),
     references=(),
+    expected_before=None,
 ) -> RendererSave:
     """Describe one save for :meth:`RendererMutationPlan.build`."""
     fields = None if update_fields is None else tuple(sorted(set(update_fields)))
@@ -137,6 +138,7 @@ def planned_save(
         force_insert=bool(force_insert),
         natural_key_fields=tuple(natural_key),
         reference_fields=normalized_references,
+        expected_before=expected_before,
     )
 
 
@@ -187,6 +189,7 @@ class RendererMutationPlan:
     planned_at: Any
     validate_after_acquire: Callable[[], None] | None = dataclass_field(default=None, compare=False, repr=False)
     settles_deploying: bool = True
+    execution: Any = dataclass_field(default=None, compare=False, repr=False)
 
     @property
     def changes_content(self) -> bool:
@@ -202,13 +205,15 @@ class RendererMutationPlan:
         m2m_writes=(),
         read_dependencies=(),
         planned_at=None,
+        additional_footprints=(),
         validate_after_acquire=None,
         settles_deploying=True,
+        execution=None,
     ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
         planned_at = planned_at or timezone.now()
         saves = tuple(saves)
-        save_states = tuple((proposed, _stored_instance(proposed.instance)) for proposed in saves)
+        save_states = tuple((proposed, _save_before(proposed)) for proposed in saves)
         creation_refs = _creation_refs(save_states)
         effective_save_states = tuple(
             (proposed, before, _effective_after(proposed.instance, before, proposed.update_fields))
@@ -265,6 +270,7 @@ class RendererMutationPlan:
 
         content_keys.update(_prospective_visibility_keys(effective_saves))
 
+        footprints.extend(additional_footprints)
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
         return cls(
             write_set=tuple(writes),
@@ -274,6 +280,7 @@ class RendererMutationPlan:
             planned_at=planned_at,
             validate_after_acquire=validate_after_acquire,
             settles_deploying=settles_deploying,
+            execution=execution,
         )
 
 
@@ -296,6 +303,21 @@ def _stored_instance(instance):
     if instance.pk is None or instance._state.adding:
         return None
     return type(instance)._default_manager.filter(pk=instance.pk).first()
+
+
+def _save_before(proposed):
+    expected = proposed.expected_before
+    if expected is None:
+        return _stored_instance(proposed.instance)
+    if (
+        proposed.force_insert
+        or expected.pk is None
+        or expected._state.adding
+        or expected._meta.label_lower != proposed.instance._meta.label_lower
+        or expected.pk != proposed.instance.pk
+    ):
+        raise IntentMutationProtocolError("a planned save expected pre-image must identify a persisted update target")
+    return expected
 
 
 def replay_creation_references(instance, references) -> None:
@@ -386,9 +408,15 @@ def _creation_refs(save_states):
             continue
         if not proposed.natural_key_fields:
             continue
-        for _attname, related in proposed.reference_fields:
-            if related.pk is None and id(related) in planned_creations and id(related) not in references:
-                raise IntentMutationProtocolError(f"{instance._meta.label_lower} references a row planned after it")
+        related_instances = [related for _attname, related in proposed.reference_fields]
+        for field_name in proposed.natural_key_fields:
+            field = instance._meta.get_field(field_name)
+            if field.is_relation and field.many_to_one and field.is_cached(instance):
+                related_instances.append(field.get_cached_value(instance))
+        if any(id(related) in planned_creations and id(related) not in references for related in related_instances):
+            raise IntentMutationProtocolError(
+                f"{instance._meta.label_lower} creation references a row planned after it (a creation planned later)"
+            )
         references[id(instance)] = RendererCreationRef(
             model_label=instance._meta.label_lower,
             natural_key=_natural_key(
@@ -648,18 +676,24 @@ def _plan_delete(proposed: RendererDelete):
     return writes, footprint, changed_keys
 
 
+def _load_frozen_set_rows(model, operation):
+    """Load one set operation only while every selected row matches its frozen pre-image."""
+    selected_rows = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
+    if (
+        tuple(row.pk for row in selected_rows) != operation.selected_pks
+        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_preimages
+    ):
+        raise IntentPlanStaleError(f"{operation.model_label} selected rows changed after planning")
+    return selected_rows
+
+
 def _plan_set_update(proposed: RendererSetUpdate):
     model = apps.get_model(proposed.model_label)
     spec = renderer_input_specs().get(proposed.model_label)
     if spec is None:
         raise IntentMutationProtocolError(f"{proposed.model_label} is not a registered renderer input")
     values = dict(proposed.values)
-    selected_rows = tuple(model._default_manager.filter(pk__in=proposed.selected_pks).order_by("pk"))
-    if (
-        tuple(row.pk for row in selected_rows) != proposed.selected_pks
-        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != proposed.selected_preimages
-    ):
-        raise IntentPlanStaleError(f"{proposed.model_label} selected rows changed after planning")
+    selected_rows = _load_frozen_set_rows(model, proposed)
     footprints = []
     changed_keys = set()
     for before in selected_rows:
@@ -835,94 +869,10 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
     return write, footprint, keys
 
 
-def _manifest_binding(instance):
-    from .ownership_planner import converted_scope_rules
-
-    label = instance._meta.label_lower
-    for rule in converted_scope_rules().values():
-        native_field = dict(rule.overlay_native_fields).get(label)
-        if native_field is None:
-            continue
-        if native_field == "__self__":
-            native = instance
-        elif native_field == "__ip_address__":
-            from dcim.models import Interface
-            from django.contrib.contenttypes.models import ContentType
-            from ipam.models import IPAddress
-
-            interface_type = ContentType.objects.get_for_model(Interface)
-            vrf_name = getattr(instance, "vrf", "")
-            vrf_id = None
-            if vrf_name:
-                from ipam.models import VRF
-
-                vrf_id = VRF.objects.filter(name=vrf_name).values_list("pk", flat=True).first()
-                if vrf_id is None:
-                    return None
-            native = IPAddress.objects.filter(
-                address=instance.address,
-                vrf_id=vrf_id,
-                assigned_object_type=interface_type,
-                assigned_object_id=instance.interface_id,
-            ).first()
-        elif native_field == "__ospf_interface__":
-            from netbox_routing.models import OSPFInterface
-
-            native = OSPFInterface.objects.filter(interface_id=instance.interface_id).first()
-        else:
-            native = getattr(instance, native_field, None)
-        management = getattr(instance, "management", None)
-        if native is None or management is None:
-            return None
-
-        def json_value(value):
-            if value is None or isinstance(value, (bool, int, float, str)):
-                return value
-            if isinstance(value, dict):
-                return {str(key): json_value(item) for key, item in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [json_value(item) for item in value]
-            return str(value)
-
-        key_fields = dict(rule.native_key_fields_by_model).get(native._meta.label_lower, rule.native_key_fields)
-        native_key = {name: json_value(getattr(native, name)) for name in key_fields}
-        scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
-        return rule, scope, management.device_id, native._meta.label_lower, native_key
-    return None
-
-
 def _maintain_manifest(instance):
-    from . import status_machine as sm
-    from .models import NSOOwnershipManifest
+    from .ownership_planner import maintain_manifest
 
-    binding = _manifest_binding(instance)
-    if binding is None:
-        return
-    rule, scope, device_id, native_model_label, native_key = binding
-    identity = {
-        "device_id": device_id,
-        "scope": scope,
-        "native_model_label": native_model_label,
-        "native_key": native_key,
-    }
-    if sm.is_owned(instance.status):
-        lineage = (
-            getattr(instance, rule.acknowledged_lineage_field, None)
-            if rule.acknowledged_lineage_field is not None
-            else None
-        )
-        defaults = {
-            "ownership_state": "owned",
-            "deletion_authority": rule.deletion_authority,
-        }
-        if lineage is not None:
-            defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
-        NSOOwnershipManifest.objects.update_or_create(
-            **identity,
-            defaults=defaults,
-        )
-    else:
-        NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
+    maintain_manifest(instance)
 
 
 class RendererWriter:
@@ -1023,11 +973,12 @@ class RendererWriter:
         )
 
     def _creation_matches(self, write, instance):
-        spec = renderer_input_specs().get(write.model_label)
-        if spec is None:
-            return bool(write.natural_key) and self._fields_match(write.natural_key, instance)
-        content_attnames = {spec.model._meta.get_field(field_name).attname for field_name in spec.content_fields}
-        expected = tuple((attname, value) for attname, value in write.values if attname in content_attnames)
+        from django.db.models import Field
+
+        fields = {field.attname: field for field in instance._meta.concrete_fields}
+        expected = tuple(
+            (attname, value) for attname, value in write.values if type(fields[attname]).pre_save is Field.pre_save
+        )
         return self._fields_match(expected, instance)
 
     def consume_existing_creation(self, instance) -> bool:
@@ -1123,8 +1074,12 @@ class RendererWriter:
                 except IntegrityError:
                     write = self.plan.write_set[index]
                     existing = self._resolve_creation(write) if write.natural_key else None
-                    if existing is None or not self._creation_matches(write, existing):
+                    if existing is None:
                         raise
+                    if not self._creation_matches(write, existing):
+                        raise IntentPlanStaleError(
+                            f"{write.model_label} creation {write.natural_key!r} changed after planning"
+                        ) from None
                     instance.pk = existing.pk
                     instance._state.adding = False
                     instance._state.db = existing._state.db
@@ -1180,21 +1135,6 @@ class RendererWriter:
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
             raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
-        from django.db.models.deletion import Collector
-
-        collector = Collector(using=instance._state.db or "default", origin=instance)
-        collector.collect([instance])
-        # _begin_delete_implicit substitutes the cascade ORIGIN on every child pre_delete,
-        # so child tables never accrue credits; the reconcile path has no footprint_tables
-        # (content-only), leaving this loop as the child tables' sole authorization.
-        for model_label in {write.model_label for write in closure if write.operation == "delete"}:
-            _authorize_dml(self.permit, apps.get_model(model_label)._meta.db_table)
-        for (_field, _value), querysets in collector.field_updates.items():
-            for rows in querysets:
-                model, _materialized = _materialize_field_update_rows(rows)
-                if model is None:
-                    continue
-                _authorize_dml(self.permit, model._meta.db_table)
         with self._operation(index):
             result = instance.delete()
         self._consumed.update(matched)
@@ -1290,13 +1230,7 @@ class RendererWriter:
             or operation.values != normalized
         ):
             raise IntentMutationProtocolError("set-based update is outside the frozen write set")
-        selected_rows = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
-        if (
-            tuple(row.pk for row in selected_rows) != operation.selected_pks
-            or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_preimages
-        ):
-            raise IntentPlanStaleError("the frozen set-based update has stale selected rows")
-        _authorize_dml(self.permit, model._meta.db_table)
+        _load_frozen_set_rows(model, operation)
         updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")
@@ -1364,6 +1298,27 @@ _ACTIVE_WRITER: contextvars.ContextVar[RendererWriter | None] = contextvars.Cont
 def active_renderer_writer() -> RendererWriter | None:
     """Return the current explicit writer, if this call entered one."""
     return _ACTIVE_WRITER.get()
+
+
+@contextlib.contextmanager
+def consume_renderer_plan(plan: RendererMutationPlan, permit, *, content: bool):
+    """Consume one exact plan inside a caller-owned lock transaction.
+
+    The audit owns a larger per-device lock footprint and decides which optimistic
+    mismatches still need repair only after its under-lock render. This seam retains
+    exact write-set enforcement without opening a nested transaction or bumping twice.
+    """
+    if active_renderer_writer() is not None:
+        raise IntentMutationProtocolError("renderer writer contexts cannot nest")
+    if not permit.footprint.covers(plan.lock_footprint):
+        raise IntentMutationProtocolError("the caller-owned lock footprint does not cover the renderer plan")
+    writer = RendererWriter(plan, content=content, permit=permit)
+    token = _ACTIVE_WRITER.set(writer)
+    try:
+        yield writer
+        writer.assert_complete()
+    finally:
+        _ACTIVE_WRITER.reset(token)
 
 
 def renderer_writer_owns_key(device_id, scope, *, content=False) -> bool:

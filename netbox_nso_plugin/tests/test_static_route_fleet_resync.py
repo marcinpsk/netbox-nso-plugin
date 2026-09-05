@@ -462,37 +462,43 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert results[0]["armed"] == 1
 
     def test_a_route_that_becomes_unpushable_before_arming_stays_unallocated(self):
-        """Recheck push eligibility after the content footprint is acquired."""
+        """Retry eligibility when an exact arming plan becomes stale."""
+        import copy
+
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
         from netbox_nso_plugin.intent_generation import UNALLOCATED
         from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         _, mgmt = self._managed_device("arming-race", 8106)
         row = self._own_route(mgmt, "198.18.32.0/24", "198.18.32.1")
-        revision, _ = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="static_route")
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="static_route")
         initial_revision = revision.revision
         revision_before_arming: list[int] = []
-        real_intent_transaction = intent_state.intent_transaction
+        real_renderer_writes = renderer_writes
+        raced = False
 
         @contextlib.contextmanager
-        def make_route_unpushable(footprint):
-            from netbox_nso_plugin.signals import suppress_intent_push
+        def make_route_unpushable(plan):
+            nonlocal raced
+            if not raced:
+                raced = True
+                route = StaticRoute.objects.get(pk=row.static_route_id)
+                candidate = copy.copy(route)
+                candidate.next_hop = None
+                candidate.interface_next_hop = "Ethernet1/1"
+                fields = ("next_hop", "interface_next_hop")
+                route_plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+                with without_commit_drain(), real_renderer_writes(route_plan) as writer:
+                    writer.save(candidate, update_fields=fields)
+                revision.refresh_from_db()
+                revision_before_arming.append(revision.revision)
+            with real_renderer_writes(plan) as writer:
+                yield writer
 
-            route = StaticRoute.objects.get(pk=row.static_route_id)
-            route_footprint = intent_state.footprint_for_instance(route)
-            with without_commit_drain(), suppress_intent_push(), real_intent_transaction(route_footprint):
-                route.next_hop = None
-                route.interface_next_hop = "Ethernet1/1"
-                route.save(update_fields=["next_hop", "interface_next_hop"])
-            revision.refresh_from_db()
-            revision_before_arming.append(revision.revision)
-            with real_intent_transaction(footprint):
-                yield
-
-        with patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=make_route_unpushable):
+        with patch("netbox_nso_plugin.renderer_writer.renderer_writes", new=make_route_unpushable):
             armed = _backfill_static_route_generations(mgmt)
 
         row.refresh_from_db()
@@ -810,17 +816,82 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert results[0]["armed"] == 1
         assert results[0]["armed_rolled_back"] == 1
 
-    def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
-        """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced."""
+    def test_a_stale_restore_plan_logs_the_row_left_armed(self):
+        from netbox_nso_plugin.intent_drift import (
+            _backfill_static_route_generations,
+            _restore_static_route_generations,
+        )
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        _, mgmt = self._managed_device("stale-restore-log", 8112)
+        state = self._own_route(mgmt, "198.18.84.0/24", "198.18.0.84")
+        before = _backfill_static_route_generations(mgmt)
+
+        with (
+            patch("netbox_nso_plugin.renderer_writer.renderer_writes", side_effect=IntentPlanStaleError),
+            self.assertLogs("netbox_nso_plugin.intent_drift", level="WARNING") as logged,
+        ):
+            restored = _restore_static_route_generations(before)
+
+        self.assertEqual(restored, 0)
+        self.assertTrue(any(str(state.pk) in message and "stale" in message for message in logged.output))
+
+    def test_an_unacknowledged_push_restores_the_demoted_deploying_identity(self):
+        """The demotion clears ``apply_attempt_id``, so the rollback has to put it back.
+
+        ``nso_static_deploy_attempt`` refuses ``deploying`` with a NULL attempt, and the raise
+        breaks out of ``_safe_restore``, leaving the row armed on a generation the adapter
+        never stored. The deploying row is armed last: a later restore is a content write, and
+        its re-pend would demote a row this one has just put back.
+        """
+        from uuid import uuid4
+
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
         from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.intent_state import mirror_refresh
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        _, mgmt = self._managed_device("deploying-rollback", 8111)
+        accepted = self._own_route(mgmt, "10.86.0.0/16", "10.0.0.87")
+        deploying = self._own_route(mgmt, "10.87.0.0/16", "10.0.0.88")
+        attempt_id = uuid4()
+        current = NSOStaticRouteState.objects.get(pk=deploying.pk)
+        fields = {"status", "apply_attempt_id"}
+        with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
+            locked.status = "deploying"
+            locked.apply_attempt_id = attempt_id
+            locked.save(update_fields=fields)
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=None):
+            results = resync_static_route_intent_fleet()
+
+        accepted.refresh_from_db()
+        deploying.refresh_from_db()
+        assert results[0]["ok"] is False
+        assert results[0]["armed_rolled_back"] == 2
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt_id)
+        assert deploying.intent_generation == UNALLOCATED
+        assert accepted.intent_generation == UNALLOCATED
+
+    def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
+        """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced.
+
+        The deploying row is armed LAST. Every later content write on the scope re-pends a
+        deploying row to accepted, so building it first made the demotion assertion pass
+        without the pass under test ever running.
+        """
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.models import NSOStaticRouteState
 
         _, mgmt = self._managed_device("demote", 8104)
-        deploying = self._own_route(mgmt, "10.73.0.0/16", "10.0.0.74", status="deploying")
         in_sync = self._own_route(mgmt, "10.74.0.0/16", "10.0.0.75", status="in_sync")
         failed = self._own_route(mgmt, "10.75.0.0/16", "10.0.0.76", status="apply_failed")
         accepted = self._own_route(mgmt, "10.76.0.0/16", "10.0.0.77")
+        deploying = self._own_route(mgmt, "10.73.0.0/16", "10.0.0.74", status="deploying")
         owned_since = deploying.accepted_at
+        assert NSOStaticRouteState.objects.get(pk=deploying.pk).status == "deploying"
 
         with patch(
             "netbox_nso_plugin.adapter_client.put_static_route_intent",
@@ -843,6 +914,41 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert in_sync.status == "in_sync", "a settled row's badge flickered on a pass that changed no content"
         assert failed.status == "apply_failed"
         assert accepted.status == "accepted"
+
+    def test_the_arming_write_records_the_demotion_in_its_rollback_snapshot(self):
+        """S6.2 at its own site — the rollback reads ``armed_status`` to decide what to put back.
+
+        The row ends ``accepted`` either way: the writer re-pends a deploying row on any
+        content change, and the fleet pass also fronts a repair audit that demotes. Only the
+        snapshot this pass returns tells the demotion apart from that, so it is what pins the
+        branch.
+        """
+        from uuid import uuid4
+
+        from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.intent_state import mirror_refresh
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        _, mgmt = self._managed_device("armdemote", 8112)
+        route = self._own_route(mgmt, "10.88.0.0/16", "10.0.0.89")
+        attempt_id = uuid4()
+        current = NSOStaticRouteState.objects.get(pk=route.pk)
+        fields = {"status", "apply_attempt_id"}
+        with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
+            locked.status = "deploying"
+            locked.apply_attempt_id = attempt_id
+            locked.save(update_fields=fields)
+
+        before = _backfill_static_route_generations(mgmt)
+
+        armed = NSOStaticRouteState.objects.get(pk=route.pk)
+        assert (armed.status, armed.apply_attempt_id) == ("accepted", None)
+        assert armed.intent_generation > UNALLOCATED
+        assert [(row["status"], row["apply_attempt_id"], row["armed_status"]) for row in before] == [
+            ("deploying", attempt_id, "accepted")
+        ]
 
     def test_unlinked_devices_are_skipped(self):
         """A management row with no ``adapter_device_id`` has nothing to push to."""

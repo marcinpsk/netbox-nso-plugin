@@ -102,3 +102,88 @@ def delete_management(instance):
     context = renderer_writes if plan.changes_content else renderer_mirror_writes
     with context(plan) as writer:
         return writer.delete(instance)
+
+
+def _control_footprint(device_id):
+    """Freeze the management row and current address owners for one control POST.
+
+    Exactly what the payload is read from, and nothing else: the device intent lock and the
+    management row (L4/L5) order the pushes for this device, and the device plus its address
+    rows (L6) keep the five values one snapshot. The 18 delivery families are not read here
+    and must never be frozen across the adapter round trip.
+    """
+    from dcim.models import Device
+
+    from .intent_state import MutationFootprint, SourceRow
+
+    identity = (
+        Device.objects.filter(pk=device_id).values_list("pk", "primary_ip4_id", "primary_ip6_id", "oob_ip_id").first()
+    )
+    if identity is None:
+        return None
+    address_ids = {value for value in identity[1:] if value is not None}
+    return MutationFootprint(
+        device_ids=(device_id,),
+        source_rows=(
+            SourceRow("dcim.device", device_id),
+            *(SourceRow("ipam.ipaddress", address_id) for address_id in sorted(address_ids)),
+        ),
+    )
+
+
+def _update_management_control(device_id: int, *, compare_adapter: bool) -> bool:
+    """Write adapter control fields while their owners stay locked."""
+    from . import adapter_client
+    from .intent_state import mirror_transaction
+    from .models import NSODeviceManagement
+    from .onboarding import device_mgmt_addresses
+
+    footprint = _control_footprint(int(device_id))
+    if footprint is None:
+        return False
+    with mirror_transaction(footprint):
+        management = (
+            NSODeviceManagement.objects.select_related(
+                "device__primary_ip4",
+                "device__primary_ip6",
+                "device__oob_ip",
+            )
+            .filter(device_id=device_id)
+            .first()
+        )
+        if management is None or management.adapter_device_id is None:
+            return False
+        locked_address_ids = {row.pk for row in footprint.source_rows if row.model_label == "ipam.ipaddress"}
+        current_address_ids = {
+            address_id
+            for address_id in (
+                management.device.primary_ip4_id,
+                management.device.primary_ip6_id,
+                management.device.oob_ip_id,
+            )
+            if address_id is not None
+        }
+        if not current_address_ids.issubset(locked_address_ids):
+            return False
+        primary_ip, oob_ip = device_mgmt_addresses(management.device)
+        desired = adapter_client.AdapterControlState(
+            managed_attributes=tuple(management.managed_attributes),
+            auto_apply=management.auto_apply,
+            sync_before_apply=management.sync_before_apply,
+            primary_ip=primary_ip,
+            oob_ip=oob_ip,
+        )
+        if compare_adapter and adapter_client.get_control_state(management.adapter_device_id) == desired:
+            return False
+        adapter_client.set_control_state(management.adapter_device_id, desired)
+        return True
+
+
+def reconcile_management_control(device_id: int) -> bool:
+    """Update divergent adapter control fields while their owners stay locked."""
+    return _update_management_control(device_id, compare_adapter=True)
+
+
+def push_management_control(device_id: int) -> bool:
+    """Push a control change while its authoritative owners stay locked."""
+    return _update_management_control(device_id, compare_adapter=False)

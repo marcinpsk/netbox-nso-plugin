@@ -12,56 +12,19 @@ from pathlib import Path
 
 import pytest
 import yaml
-from packaging.requirements import InvalidRequirement, Requirement
-from packaging.version import InvalidVersion, Version
+from packaging.requirements import Requirement
 
 ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "lint-format.yaml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 UV_LOCK = ROOT / "uv.lock"
-SQLPARSE_MINIMUM = Version("0.5.0")
-
-
-def _has_supported_sqlparse_floor(dependency: str) -> bool:
-    try:
-        requirement = Requirement(dependency)
-    except InvalidRequirement:
-        return False
-    if requirement.name.casefold() != "sqlparse":
-        return False
-    for specifier in requirement.specifier:
-        if specifier.operator not in {">", ">=", "~=", "==", "==="}:
-            continue
-        try:
-            floor = Version(specifier.version)
-        except InvalidVersion:
-            continue
-        if floor >= SQLPARSE_MINIMUM:
-            return True
-    return False
-
-
-def test_sqlparse_is_a_runtime_dependency():
-    dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
-
-    assert any(_has_supported_sqlparse_floor(dependency) for dependency in dependencies)
-
-
-@pytest.mark.parametrize("dependency", ["sqlparse>=0.5.0", "sqlparse>0.5.0"])
-def test_sqlparse_dependency_accepts_a_supported_floor(dependency):
-    assert _has_supported_sqlparse_floor(dependency)
 
 
 def test_packaging_is_a_direct_test_dependency():
     dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
 
     assert any(Requirement(dependency).name == "packaging" for dependency in dependencies)
-
-
-@pytest.mark.parametrize("dependency", ["sqlparse", "sqlparse>=0.4.4"])
-def test_sqlparse_dependency_rejects_an_unsupported_floor(dependency):
-    assert not _has_supported_sqlparse_floor(dependency)
 
 
 def _workflow_tool_commands(tool: str) -> list[list[str]]:

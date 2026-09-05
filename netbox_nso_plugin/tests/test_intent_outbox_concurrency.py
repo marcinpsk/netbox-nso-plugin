@@ -230,6 +230,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
 
         with (
             without_commit_drain(),
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes"),
             patch("netbox_nso_plugin.delivery.render", side_effect=pause_between_the_fold_and_the_render),
         ):
             claimant = threading.Thread(target=claim)

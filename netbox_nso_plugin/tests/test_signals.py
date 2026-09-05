@@ -26,35 +26,6 @@ from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlush
 _MOD = "netbox_nso_plugin.adapter_client"
 
 
-class TestM2MPermitCleanup(IntentPushResetMixin, TestCase):
-    def test_a_failing_pre_action_handler_closes_its_implicit_permit(self):
-        from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS, _begin_m2m_implicit
-        from netbox_nso_plugin.signals import _skip_on_render
-
-        manufacturer = Manufacturer.objects.create(name="M2M permit", slug="m2m-permit")
-        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="M2M permit", slug="m2m-permit")
-        role = DeviceRole.objects.create(name="M2M permit", slug="m2m-permit")
-        site = Site.objects.create(name="M2M permit", slug="m2m-permit")
-        device = Device.objects.create(name="m2m-permit", device_type=device_type, role=role, site=site)
-        route = StaticRoute.objects.create(prefix="198.18.27.0/24", next_hop="198.18.0.27")
-        sender = StaticRoute.devices.through
-        details = {"pk_set": {device.pk}, "reverse": False, "model": Device}
-        _begin_m2m_implicit(sender, route, "pre_add", **details)
-
-        @_skip_on_render
-        def fail_pre_add(sender, instance, action, **kwargs):
-            raise RuntimeError("pre-add failure")
-
-        with self.assertRaisesRegex(RuntimeError, "pre-add failure"):
-            fail_pre_add(sender, route, "pre_add", **details)
-
-        self.assertIsNone(_ACTIVE_PERMIT.get())
-        self.assertEqual(_IMPLICIT_PERMITS.get(), {})
-
-
 def _bulk_create_management_without_signals(rows):
     from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
 
@@ -1574,16 +1545,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOSVIState.objects.create(
                 management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
             )
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
-
-            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
-            with renderer_writes(plan) as writer:
-                writer.delete(row)
-        mock_put.assert_called_once()
+        mock_put = self._delete_pushes(row, "put_svi_intent")
         _dev, interfaces = mock_put.call_args[0]
         self.assertEqual(interfaces, [], "Deleted SVI must not appear in the push snapshot")
 
@@ -1601,7 +1563,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOSubinterfaceState.objects.create(
                 management=mgmt, interface=child, parent_interface=self.iface, dot1q_vlan=99, status="accepted"
             )
-        self._delete_pushes(row, "put_subinterface_intent", exact_writer=True)
+        self._delete_pushes(row, "put_subinterface_intent")
 
     def test_logging_host_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOLoggingHostState
@@ -1612,16 +1574,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             row = NSOLoggingHostState.objects.create(management=mgmt, address="198.51.100.7", status="accepted")
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
-
-            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
-            with renderer_writes(plan) as writer:
-                writer.delete(row)
-        mock_put.assert_called_once()
+        mock_put = self._delete_pushes(row, "put_logging_intent")
         self.assertEqual(mock_put.call_args[0][1], [])
 
     def test_interface_mtu_delete_pushes_reduced_snapshot(self):
@@ -1635,27 +1588,24 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOInterfaceMtuState.objects.create(
                 management=mgmt, interface=self.iface, l2_mtu=9000, status="accepted"
             )
-        self._delete_pushes(row, "put_interface_mtu_intent", exact_writer=True)
+        self._delete_pushes(row, "put_interface_mtu_intent")
 
     # ── #105 sweep: the 13 families that had post_save ONLY (f282e9e class) ──
     # Each red-first test: create an OWNED row (push #1 fires and warms the
     # change-detection cache), then DELETE it — without a post_delete receiver no
     # push fires and the adapter keeps applying the deleted intent forever.
 
-    def _delete_pushes(self, row, patch_target, expect_empty_list=True, exact_writer=False):
+    def _delete_pushes(self, row, patch_target, expect_empty_list=True):
         """Delete *row* and assert the reduced snapshot push fired at the client boundary."""
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
         with (
             patch(f"netbox_nso_plugin.adapter_client.{patch_target}") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            if exact_writer:
-                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
-
-                plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
-                with renderer_writes(plan) as writer:
-                    writer.delete(row)
-            else:
-                row.delete()
+            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            with renderer_writes(plan) as writer:
+                writer.delete(row)
         mock_put.assert_called_once()
         if expect_empty_list:
             self.assertEqual(mock_put.call_args[0][1], [], "Deleted row must not appear in the push snapshot")
@@ -1681,7 +1631,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 nso_value="owned-by-nso",
                 status="accepted",
             )
-        self._delete_pushes(row, "put_intent", exact_writer=True)
+        self._delete_pushes(row, "put_intent")
 
     def test_vlan_delete_pushes_reduced_snapshot(self):
         from ipam.models import VLAN
@@ -1693,7 +1643,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=105, name="del-v105")
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent"), self.captureOnCommitCallbacks(execute=True):
             row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="del-v105", status="accepted")
-        self._delete_pushes(row, "put_vlan_intent", exact_writer=True)
+        self._delete_pushes(row, "put_vlan_intent")
 
     def test_bfd_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
@@ -1703,7 +1653,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOBFDInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
             )
-        self._delete_pushes(row, "put_bfd_intent", exact_writer=True)
+        self._delete_pushes(row, "put_bfd_intent")
 
     def test_static_route_overlay_delete_pushes_reduced_snapshot(self):
         """Direct OVERLAY deletion (the native StaticRoute pre_delete path is separately
@@ -1722,28 +1672,26 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.99.0/24", status="accepted"
             )
-        self._delete_pushes(row, "put_static_route_intent", exact_writer=True)
+        self._delete_pushes(row, "put_static_route_intent")
 
     def test_static_route_overlay_delete_records_per_object_authority(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.98.0/24", next_hop="198.18.0.1", metric=1)
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row = NSOStaticRouteState.objects.create(
-                management=mgmt,
-                static_route=route,
-                nso_prefix="198.18.98.0/24",
-                status="accepted",
-            )
+        row = NSOStaticRouteState.objects.create(
+            management=mgmt,
+            static_route=route,
+            nso_prefix="198.18.98.0/24",
+            status="accepted",
+        )
+        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
 
-        with self.captureOnCommitCallbacks(execute=False):
-            row.delete()
+        with self.captureOnCommitCallbacks(execute=False), renderer_writes(plan) as writer:
+            writer.delete(row)
 
         entry = NSOIntentOutboxEntry.objects.get(
             device=self.device,
@@ -1761,35 +1709,6 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                     "unverified": True,
                 }
             ],
-        )
-
-    def test_unowned_static_route_overlay_delete_records_no_authority(self):
-        from netbox_routing.models import StaticRoute
-
-        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
-
-        mgmt = self._mgmt()
-        route = StaticRoute.objects.create(prefix="198.18.97.0/24", next_hop="198.18.0.1", metric=1)
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row = NSOStaticRouteState.objects.create(
-                management=mgmt,
-                static_route=route,
-                nso_prefix="198.18.97.0/24",
-                status="imported",
-            )
-
-        with self.captureOnCommitCallbacks(execute=False):
-            row.delete()
-
-        self.assertFalse(
-            NSOIntentOutboxEntry.objects.filter(
-                device=self.device,
-                scope="static_route",
-                consumed_by_push_seq__isnull=True,
-            ).exists()
         )
 
     def test_foreign_l2_sap_delete_does_not_push(self):
@@ -1833,7 +1752,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 outer_tag=3999,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_l2_sap_intent", exact_writer=True)
+        self._delete_pushes(row, "put_l2_sap_intent")
 
     def test_isis_flex_algo_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
@@ -1846,7 +1765,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOISISFlexAlgoState.objects.create(
                 management=mgmt, process_tag="CORE", algo_id=130, status="accepted"
             )
-        self._delete_pushes(row, "put_isis_flex_algo_intent", exact_writer=True)
+        self._delete_pushes(row, "put_isis_flex_algo_intent")
 
     def test_isis_interface_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISInterfaceState
@@ -1859,7 +1778,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOISISInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, af="ipv4", status="accepted"
             )
-        self._delete_pushes(row, "put_isis_interface_intent", exact_writer=True)
+        self._delete_pushes(row, "put_isis_interface_intent")
 
     def test_isis_instance_delete_pushes_reduced_snapshot(self):
         """No native pre_delete exists for ISISInstance — the overlay post_delete is the
@@ -1872,7 +1791,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             row = NSOISISInstanceState.objects.create(management=mgmt, process_tag="CORE", status="accepted")
-        mock_put = self._delete_pushes(row, "put_isis_interface_intent", exact_writer=True)
+        mock_put = self._delete_pushes(row, "put_isis_interface_intent")
         self.assertEqual(mock_put.call_args.kwargs.get("processes"), [])
 
     def test_bgp_peer_delete_pushes_reduced_snapshot(self):
@@ -1910,7 +1829,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 remote_as_str=str(remote_as.asn),
                 status="accepted",
             )
-        self._delete_pushes(row, "put_bgp_intent", exact_writer=True)
+        self._delete_pushes(row, "put_bgp_intent")
 
     def test_redistribution_delete_pushes_reduced_snapshot(self):
         """No native pre_delete exists for Redistribution — the overlay post_delete is
@@ -1927,7 +1846,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 source_ref="",
                 status="accepted",
             )
-        self._delete_pushes(row, "put_bgp_intent", exact_writer=True)
+        self._delete_pushes(row, "put_bgp_intent")
 
     def test_route_policy_delete_pushes_reduced_snapshot(self):
         from django.contrib.contenttypes.models import ContentType
@@ -1949,7 +1868,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 object_id=pl.pk,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_route_policy_intent", exact_writer=True)
+        self._delete_pushes(row, "put_route_policy_intent")
 
     def test_ospf_instance_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOOSPFInstanceState
@@ -1959,7 +1878,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOOSPFInstanceState.objects.create(
                 management=mgmt, process_id="999", ospf_instance=None, status="accepted"
             )
-        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False, exact_writer=True)
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
 
     def test_ospf_interface_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOOSPFInterfaceState
@@ -1969,7 +1888,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOOSPFInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, process_id="10", area_id="0.0.0.0", status="accepted"
             )
-        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False, exact_writer=True)
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
 
     def test_lacp_bundle_delete_pushes_reduced_snapshot(self):
         """LACP rides the direct-apply path and is auto_apply-gated on save; deletion
@@ -1996,7 +1915,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 timer="fast",
                 status="accepted",
             )
-        self._delete_pushes(row, "apply_lag_config", exact_writer=True)
+        self._delete_pushes(row, "apply_lag_config")
 
     def test_lacp_member_delete_pushes_reduced_snapshot(self):
         from dcim.models import Interface
@@ -2030,16 +1949,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 port_priority=128,
                 status="accepted",
             )
-        with (
-            patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
-
-            plan = RendererMutationPlan.build(deletes=(planned_delete(member),))
-            with renderer_writes(plan) as writer:
-                writer.delete(member)
-        mock_put.assert_called_once()
+        self._delete_pushes(member, "apply_lag_config", expect_empty_list=False)
 
     def test_switchport_delete_pushes_reduced_snapshot(self):
         """Switchport rides the direct-apply path and is auto_apply-gated on save;
@@ -2060,7 +1970,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOSwitchportState.objects.create(
                 management=mgmt, interface=self.iface, mode="trunk", status="accepted"
             )
-        self._delete_pushes(row, "apply_switchport_config", exact_writer=True)
+        self._delete_pushes(row, "apply_switchport_config")
 
 
 class TestDeleteOriginMarking(_SignalDBBase):

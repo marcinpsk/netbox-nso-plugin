@@ -16,6 +16,34 @@ logger = logging.getLogger(__name__)
 # Minutes between last-sync mirror refreshes. The adapter polls devices far more often
 # than this; the window only bounds how stale a NetBox page can be with nobody on it.
 SYNC_CACHE_REFRESH_MINUTES = 5
+RENDERER_AUDIT_MINUTES = 5
+
+
+@system_job(interval=RENDERER_AUDIT_MINUTES)
+class AuditRendererScopesJob(JobRunner):
+    """Repair signal-less renderer drift on the periodic five-minute cadence."""
+
+    class Meta:
+        name = "Audit NSO renderer scopes"
+
+    def run(self, *args, **kwargs):
+        """Run one bounded fleet audit, or defer it while deployment is quiesced."""
+        from .renderer_audit import audit_renderer_fleet
+
+        try:
+            result = audit_renderer_fleet()
+        except DeploymentQuiesced:
+            logger.info("AuditRendererScopesJob: paused for an intent deployment")
+            return None
+        logger.info(
+            "AuditRendererScopesJob: %d devices, %d repairs, %d deferred, %d unknown, %d failed",
+            result.devices,
+            result.repaired,
+            result.deferred,
+            result.unknown,
+            result.failed,
+        )
+        return result
 
 
 @system_job(interval=JobIntervalChoices.INTERVAL_HOURLY)

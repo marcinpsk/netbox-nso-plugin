@@ -7,6 +7,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from ._outbox_case import trust_scope
 from ._static_route_case import _assign_without_push
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
 
@@ -418,7 +419,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             interface_next_hop="GigabitEthernet0/0" if next_hop_is_none else "",
         )
         _assign_without_push(sr, self.device)
-        return NSOStaticRouteState.objects.create(
+        state = NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
             status="accepted",
@@ -426,6 +427,8 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             nso_next_hop="" if next_hop_is_none else next_hop,
             intent_generation=generation,
         )
+        trust_scope(self.device, mgmt, "static_route")
+        return state
 
     def test_push_names_the_netbox_pk_and_the_allocated_generation(self):
         """P1.1 — the pk is what opens the fence; the generation is what a result correlates on."""

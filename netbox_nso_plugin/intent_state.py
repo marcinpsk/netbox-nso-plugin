@@ -11,26 +11,13 @@ import functools
 import inspect
 import logging
 import operator
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-import sqlparse
 from django.apps import apps
 from django.db import connections, transaction
-from django.db.backends.signals import connection_created
-from django.db.models.signals import (
-    m2m_changed,
-    post_delete,
-    post_migrate,
-    post_save,
-    pre_delete,
-    pre_migrate,
-    pre_save,
-)
-from sqlparse.sql import Comparison, Function, Identifier, IdentifierList
-from sqlparse.tokens import Comment, Keyword, Literal
+from django.db.models.signals import m2m_changed, pre_delete, pre_save
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +169,7 @@ _PROMOTED_CONTENT_FIELDS = {
         "vrf",
         "source",
     },
+    "netbox_nso_plugin.nsobgppeertemplatestate": set(),
     "netbox_nso_plugin.nsovlanstate": {"management", "vlan"},
     "netbox_nso_plugin.nsoswitchportstate": {
         "management",
@@ -347,13 +335,6 @@ _FRAGMENT_GATE_FIELDS = {
     "netbox_nso_plugin.nsovlanstate": {"status", "device_name"},
 }
 
-# Django's collector clears this FK with one lazy SET_NULL update on every ipam.Prefix delete.
-# The new value is a literal or a bound parameter, depending on the Django version.
-_SOURCE_POOL_CASCADE = re.compile(
-    r'SET\s+"source_pool_id"\s*=\s*(?P<value>NULL|%s)'
-    r'\s+WHERE\s+(?:"[A-Za-z0-9_]+"\.)?"source_pool_id"\s*(?:IN\s*\(|=)',
-    re.IGNORECASE,
-)
 _GLOBAL_LIFECYCLE_FIELDS = frozenset(
     {
         "created",
@@ -408,12 +389,6 @@ class IntentTransactionNoOp(Exception):
 
 class RendererTargetsChanged(IntentMutationProtocolError):
     """A source row changed the devices that render it during acquisition."""
-
-
-@dataclass(frozen=True)
-class _DMLTarget:
-    operation: str
-    table: str
 
 
 @dataclass(frozen=True, order=True)
@@ -522,64 +497,23 @@ class RendererInputSpec:
 class _Permit:
     footprint: MutationFootprint
     dml_kind: str
-    bump_revisions: bool = True
-    join_deployment_gate: bool = True
     mirror_table: str | None = None
     mirror_pk: Any = None
     mirror_before: Any = None
     mirror_instance: Any = None
     mirror_update_fields: frozenset[str] | None = None
-    authorized_dml: dict[str, int] = field(default_factory=dict)
-    tokens: list = field(default_factory=list)
-    implicit: bool = False
-    deferred_update: dict[str, Any] = field(default_factory=dict)
-    atomic_block_id: int | None = None
     detect_reconcile_content: bool = False
     settles_deploying: bool = True
     initial_deploying_rows: tuple[SourceRow, ...] = ()
     deferred_repend_rows: tuple[SourceRow, ...] = ()
+    deleted_rows: set[SourceRow] = field(default_factory=set)
 
 
 _REGISTRY: dict[str, RendererInputSpec] = {}
-_TABLE_REGISTRY: dict[str, RendererInputSpec] = {}
 _ACTIVE_PERMIT: contextvars.ContextVar[_Permit | None] = contextvars.ContextVar(
     "nso_intent_mutation_permit", default=None
 )
-_IMPLICIT_PERMITS: contextvars.ContextVar[dict[object, tuple]] = contextvars.ContextVar(
-    "nso_intent_implicit_permits", default={}
-)
-_MIGRATIONS_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar("nso_intent_migrations_active", default=False)
-# (alias, atomic block, prefix pk) per pool delete in flight; the block object is held so a
-# rolled-back delete can never be mistaken for an open one.
-_DELETING_POOLS: contextvars.ContextVar[frozenset[tuple]] = contextvars.ContextVar(
-    "nso_intent_deleting_pools", default=frozenset()
-)
 _RECONCILER_ACTIVE: contextvars.ContextVar[int] = contextvars.ContextVar("nso_intent_reconciler_active", default=0)
-_DML_PARSE_SKIP_KEYWORDS = frozenset(
-    {"SELECT", "SET", "SAVEPOINT", "RELEASE", "SHOW", "BEGIN", "COMMIT", "ROLLBACK", "DECLARE", "FETCH", "CLOSE"}
-)
-_FIRST_SQL_KEYWORD = re.compile(
-    r"\A(?:\s+|--[^\r\n]*(?:\r\n?|\n|\Z)|/\*.*?\*/)*([A-Za-z]+)",
-    re.DOTALL,
-)
-
-
-@functools.lru_cache(maxsize=1)
-def _registered_table_names() -> tuple[str, ...]:
-    """Return lower-case table names for the guard's raw SQL prescan."""
-    return tuple(table.lower() for table in _TABLE_REGISTRY)
-
-
-def _discard_rolled_back_implicit_permit() -> None:
-    """Drop an implicit permit whose acquisition savepoint no longer exists."""
-    permit = _ACTIVE_PERMIT.get()
-    if permit is None or not permit.implicit or permit.atomic_block_id is None:
-        return
-    active_blocks = transaction.get_connection().atomic_blocks
-    if any(id(block) == permit.atomic_block_id for block in active_blocks):
-        return
-    _ACTIVE_PERMIT.set(None)
-    _IMPLICIT_PERMITS.set({})
 
 
 def renderer_input_specs() -> dict[str, RendererInputSpec]:
@@ -626,6 +560,35 @@ def reconcile_family_footprint(device_id: int, scopes) -> MutationFootprint:
         source_rows=(SourceRow(label, None) for label in source_labels),
         overlay_rows=(*overlay_rows, *(SourceRow(label, None) for label in overlay_labels)),
     )
+
+
+def audit_scope_footprint(device_id: int, scopes) -> MutationFootprint:
+    """Freeze the concrete rows that contribute to one repair candidate set."""
+    device_id = int(device_id)
+    requested = frozenset(str(scope) for scope in scopes)
+    requested_keys = {(device_id, scope) for scope in requested}
+    # The device's own overlays are the entry point: the repair writes only overlay rows,
+    # and every scan wider than the device fronts an Apply, a drain and a deliver.
+    base = reconcile_family_footprint(device_id, requested)
+    footprints = [base]
+    pks_by_label: dict[str, set[Any]] = {}
+    for row in base.overlay_rows:
+        if row.pk is None or row.model_label not in _REGISTRY:
+            continue
+        pks_by_label.setdefault(row.model_label, set()).add(row.pk)
+    for label, pks in sorted(pks_by_label.items()):
+        spec = _REGISTRY[label]
+        for instance in apps.get_model(label)._default_manager.filter(pk__in=pks).order_by("pk"):
+            footprint = footprint_for_instance(instance, spec)
+            if not requested_keys.intersection(footprint.revision_keys):
+                continue
+            footprints.append(footprint)
+            if spec.dependency_resolver is not None:
+                # The declared dependencies are how a native anchor a repair may write
+                # through (a shared VLAN, a LAG, a tagged-VLAN edge) enters the footprint.
+                dependency_footprint, _changed = spec.dependency_resolver(None, instance, spec)
+                footprints.append(dependency_footprint)
+    return MutationFootprint.merge(*footprints)
 
 
 @contextlib.contextmanager
@@ -682,6 +645,11 @@ def _declared_fields_fragment(instance):
         (name, _normal(getattr(instance, instance._meta.get_field(name).attname)))
         for name in sorted(spec.content_fields)
     )
+
+
+def _lifecycle_only_fragment(instance):
+    """Exclude one tracked compliance row that does not contribute to the wire body."""
+    return ABSENT
 
 
 def canonical_fragment(instance, spec: RendererInputSpec | None = None):
@@ -863,7 +831,7 @@ def _switchport_fragment(instance):
 
     if instance.status not in ("accepted", "deploying", "in_sync"):
         return ABSENT
-    tagged = (vlan.vid for vlan in instance.tagged_vlans.all()) if instance.pk else ()
+    tagged = instance.tagged_vlans.values_list("vid", flat=True) if instance.pk else ()
     return _normal(switchport_intent_item(instance, tagged))
 
 
@@ -2100,12 +2068,20 @@ def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
     """Force rows captured as deploying back to pending Apply state."""
     from .signals import suppress_intent_push
 
+    permit = _ACTIVE_PERMIT.get()
+    consumed = permit.deleted_rows if permit is not None else frozenset()
     with suppress_intent_push():
         for row_ref in rows:
             if row_ref.pk is None:
                 continue
             row = apps.get_model(row_ref.model_label).objects.filter(pk=row_ref.pk).first()
             if row is None:
+                # Only a delete this very transaction performed may consume a row from the
+                # initially deploying set; anything else vanished behind the locks that hold it.
+                if row_ref not in consumed:
+                    raise IntentMutationProtocolError(
+                        f"{row_ref.model_label} row {row_ref.pk!r} vanished before its repend"
+                    )
                 continue
             row.status = "accepted"
             update_fields = ["status"]
@@ -2203,7 +2179,6 @@ def _upgrade_detected_reconcile(
         bump_intent_revision(device_id, scope)
     permit.deferred_repend_rows = permit.initial_deploying_rows
     permit.dml_kind = "content"
-    permit.bump_revisions = True
     permit.detect_reconcile_content = False
 
 
@@ -2232,7 +2207,6 @@ def _intent_transaction(
     bump_keys=None,
 ):
     """Acquire one content permit and apply the requested re-pend timing."""
-    _discard_rolled_back_implicit_permit()
     active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
         yield active
@@ -2271,17 +2245,24 @@ def mirror_transaction(
     footprint: MutationFootprint,
     *,
     detect_content_changes: bool = False,
+    repeatable_read: bool = False,
     settles_deploying: bool = True,
 ):
     """Acquire a complete read-side footprint without advancing intent identity."""
-    _discard_rolled_back_implicit_permit()
     active = _join_active_permit(footprint, settles_deploying=settles_deploying)
     if active is not None:
         yield active
         return
     from .apply_state import lock_order_scope
 
+    connection = connections["default"]
+    outer_atomic = connection.in_atomic_block
     with transaction.atomic(), lock_order_scope():
+        # PostgreSQL accepts an isolation change only at the start of the outer transaction.
+        # A caller-owned transaction keeps its established isolation level.
+        if repeatable_read and not outer_atomic:
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         permit = _Permit(
             footprint=footprint,
             dml_kind="reconcile",
@@ -2380,7 +2361,6 @@ def mirror_refresh(instance, update_fields):
 @contextlib.contextmanager
 def locked_mirror_refresh(instance, update_fields):
     """Yield the locked save target without shadowing an active exact mutation permit."""
-    _discard_rolled_back_implicit_permit()
     if _ACTIVE_PERMIT.get() is not None:
         yield instance
         return
@@ -2389,16 +2369,22 @@ def locked_mirror_refresh(instance, update_fields):
 
 
 def update_mirror_fields(instance, **values):
-    """Lock and save lifecycle fields through the instance yielded by ``mirror_refresh``."""
+    """Lock and save lifecycle fields, guarding registered renderer inputs."""
     from .signals import suppress_intent_push
 
     fields = frozenset(values)
-    with transaction.atomic(), suppress_intent_push(), mirror_refresh(instance, fields) as locked:
-        if locked is None:
-            return None
-        for field_name, value in values.items():
-            setattr(locked, field_name, value)
-        locked.save(update_fields=fields)
+    with transaction.atomic(), suppress_intent_push():
+        if instance._meta.label_lower in _REGISTRY:
+            refresh = mirror_refresh(instance, fields)
+        else:
+            locked = type(instance).objects.select_for_update(of=("self",)).filter(pk=instance.pk).first()
+            refresh = contextlib.nullcontext(locked)
+        with refresh as locked:
+            if locked is None:
+                return None
+            for field_name, value in values.items():
+                setattr(locked, field_name, value)
+            locked.save(update_fields=fields)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
     return locked
@@ -2423,7 +2409,6 @@ def mirror_reconciler(function):
 
 def revision_was_acquired(device_id: int, scope: str) -> bool:
     """Return whether this transaction acquired and bumped one revision key."""
-    _discard_rolled_back_implicit_permit()
     permit = _ACTIVE_PERMIT.get()
     return permit is not None and (int(device_id), str(scope)) in permit.footprint.revision_keys
 
@@ -2434,864 +2419,86 @@ def mirror_refresh_is_active() -> bool:
     return permit is not None and permit.dml_kind == "mirror"
 
 
-def _authorize_dml(permit: _Permit, table: str) -> None:
-    permit.authorized_dml[table] = permit.authorized_dml.get(table, 0) + 1
+def _validate_explicit_write(sender, instance, update_fields=None, **kwargs):
+    """Validate a registered save only while an explicit writer is active."""
+    from .renderer_writer import active_renderer_writer, require_planned_signal_write
+
+    if active_renderer_writer() is not None:
+        require_planned_signal_write(instance, update_fields=update_fields)
 
 
-@contextlib.contextmanager
-def reconcile_cascade_dml(model):
-    """Authorize one framework cascade statement inside a covered read transaction."""
-    permit = _ACTIVE_PERMIT.get()
-    if permit is None or permit.dml_kind != "reconcile":
-        yield
-        return
-    label = model._meta.label_lower
-    footprint_rows = (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
-    if not any(row.model_label == label for row in footprint_rows):
-        raise IntentMutationProtocolError(f"reconcile cascade table {label!r} is outside the active footprint")
-    table = model._meta.db_table
-    previous = permit.authorized_dml.get(table, 0)
-    _authorize_dml(permit, table)
-    try:
-        yield
-    finally:
-        if previous:
-            permit.authorized_dml[table] = previous
-        else:
-            permit.authorized_dml.pop(table, None)
+def _delete_origin_label(origin) -> str | None:
+    """Return the model label for one instance or queryset deletion origin."""
+    origin_model = getattr(origin, "model", type(origin))
+    return getattr(getattr(origin_model, "_meta", None), "label_lower", None)
 
 
-def _footprint_covers_row(instance, permit: _Permit) -> bool:
-    rows = (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
-    return (
-        SourceRow(instance._meta.label_lower, instance.pk) in rows
-        or SourceRow(instance._meta.label_lower, None) in rows
-    )
+def _deletion_roots(origin):
+    """Return the complete registered root set for one Collector deletion."""
+    origin_label = _delete_origin_label(origin)
+    if origin_label not in {"dcim.device", "netbox_nso_plugin.nsodevicemanagement"}:
+        raise IntentMutationProtocolError(f"unsupported management deletion origin {origin_label!r}")
+    if hasattr(origin, "model"):
+        return tuple(origin.order_by("pk"))
+    return (origin,)
 
 
-def _implicit_key(instance):
-    """Identify one persisted row across Collector's distinct Python objects."""
-    existing = getattr(instance, "_renderer_mutation_key", None)
-    if existing is not None:
-        return existing
-    identity = instance.pk if instance.pk is not None else id(instance)
-    key = (instance._meta.label_lower, identity)
-    instance._renderer_mutation_key = key
-    return key
-
-
-def _raw_content_values(instance, spec: RendererInputSpec):
-    """Return declared content fields without the overlay ownership gate."""
-    return tuple(
-        (name, _normal(getattr(instance, instance._meta.get_field(name).attname)))
-        for name in sorted(spec.content_fields)
-    )
-
-
-def _normalize_overlay_lifecycle(instance, spec, update_fields):
-    """Derive an overlay edit from the current database row, never stale lifecycle state."""
-    if instance._meta.label_lower not in OVERLAY_MODEL_RANKS or instance.pk is None:
-        return {}
-    current = type(instance).objects.filter(pk=instance.pk).first()
-    if current is None:
-        return {}
-    changed = _raw_content_values(current, spec) != _raw_content_values(instance, spec)
-    requested = None if update_fields is None else frozenset(update_fields)
-    explicit_status = (requested is not None and "status" in requested) or getattr(
-        instance,
-        "_nso_explicit_status_update",
-        False,
-    )
-    if instance.status != current.status and explicit_status:
-        if (
-            hasattr(instance, "apply_attempt_id")
-            and instance.status != "deploying"
-            and instance.apply_attempt_id == current.apply_attempt_id
-        ):
-            instance.apply_attempt_id = None
-            return {} if "apply_attempt_id" in requested else {"apply_attempt_id": None}
-        return {}
-    from .status_machine import is_owned
-
-    desired_status = "accepted" if changed and is_owned(current.status) else current.status
-    if changed and not is_owned(current.status):
-        desired_status = "changed"
-    desired_attempt_id = None if changed else getattr(current, "apply_attempt_id", None)
-    corrections = {"status": desired_status}
-    if hasattr(instance, "apply_attempt_id"):
-        corrections["apply_attempt_id"] = desired_attempt_id
-    deferred = {}
-    for field_name, value in corrections.items():
-        setattr(instance, field_name, value)
-        if requested is not None and field_name not in requested:
-            deferred[field_name] = value
-    return deferred
-
-
-def _secondary_dml_footprint(instance, spec):
-    """Cover registered rows touched by framework-maintained secondary DML."""
-    if instance._meta.label_lower == "dcim.interface" and instance.device_id is not None:
-        return footprint_for_instance(instance, spec)
-    if instance._meta.label_lower != "dcim.device" or instance.pk is None:
-        return None
-    return footprint_for_instance(instance, spec)
-
-
-def _benign_unrendered_insert(instance, before, after) -> bool:
-    """Identify native inserts that cannot create renderer intent."""
-    if not instance._state.adding or before != ABSENT or after != ABSENT:
-        return False
-    if instance._meta.label_lower == "ipam.ipaddress":
-        return instance.assigned_object_type_id is None and instance.assigned_object_id is None
-    if instance._meta.label_lower != "dcim.interface":
-        return False
-    name = instance.name or ""
-    suffix = name.rsplit(".", 1)[-1]
-    return instance.parent_id is None or "." not in name or not suffix.isdigit()
-
-
-def _suppressed_permit(instance, spec, before, after, update_fields, footprint_override=None):
-    declared_mirror = update_fields is not None and frozenset(update_fields) <= spec.lifecycle_fields
-    if declared_mirror:
-        if not transaction.get_connection().in_atomic_block:
-            raise IntentMutationProtocolError("suppressed mirror writes require transaction.atomic()")
-        locked = type(instance).objects.select_for_update(of=("self",)).filter(pk=instance.pk).first()
-        before = ABSENT if locked is None else canonical_fragment(locked, spec)
-    if not _RECONCILER_ACTIVE.get():
-        if before != after:
-            raise IntentMutationProtocolError(f"suppressed {instance._meta.label_lower} write changes rendered content")
-        if not declared_mirror:
-            raise IntentMutationProtocolError(
-                f"suppressed {instance._meta.label_lower} write requires content_mutation or mirror_refresh"
-            )
-    if before != after:
-        return _Permit(
-            footprint=footprint_override or footprint_for_instance(instance, spec),
-            dml_kind="content",
-            implicit=True,
-        )
-    if not declared_mirror:
-        return _Permit(
-            footprint=footprint_override or footprint_for_instance(instance, spec),
-            dml_kind="content",
-            bump_revisions=False,
-            implicit=True,
-        )
-    if footprint := _secondary_dml_footprint(instance, spec):
-        return _Permit(
-            footprint=footprint,
-            dml_kind="content",
-            bump_revisions=False,
-            implicit=True,
-        )
-    return _Permit(
-        footprint=MutationFootprint(),
-        dml_kind="mirror",
-        mirror_table=spec.table,
-        mirror_pk=instance.pk,
-        mirror_before=before,
-        mirror_instance=instance,
-        mirror_update_fields=frozenset(update_fields),
-        implicit=True,
-    )
-
-
-def _authorize_active_write(active, sender, instance, spec, *, deleting, update_fields):
-    """Validate one nested registered write against the current immutable permit."""
-    from .renderer_writer import active_renderer_writer
-
-    writer = active_renderer_writer()
-    if active.dml_kind == "mirror":
-        requested = frozenset(update_fields or ())
-        if (
-            spec.table != active.mirror_table
-            or instance.pk != active.mirror_pk
-            or not requested
-            or not requested <= (active.mirror_update_fields or frozenset())
-        ):
-            raise IntentMutationProtocolError("the write is outside the active mirror_refresh permit")
-    elif active.dml_kind == "reconcile" and writer is None:
-        if not _footprint_covers_row(instance, active):
-            raise IntentMutationProtocolError(
-                f"{sender._meta.label_lower} row {instance.pk!r} is outside the active mirror footprint"
-            )
-        before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-        after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
-        if before != after:
-            if active.detect_reconcile_content and sender._meta.label_lower in OVERLAY_MODEL_RANKS:
-                requested = MutationFootprint.for_keys(
-                    active.footprint.revision_keys,
-                    overlay_rows=(SourceRow(sender._meta.label_lower, instance.pk),),
-                )
-                _upgrade_detected_reconcile(active, requested)
-            else:
-                raise IntentMutationProtocolError(
-                    f"read-side {sender._meta.label_lower} write changes rendered content"
-                )
-    elif writer is None and not _footprint_covers_row(instance, active):
-        before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-        after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
-        if before != after:
-            raise IntentMutationProtocolError(
-                f"{sender._meta.label_lower} row {instance.pk!r} is outside the active mutation footprint"
-            )
-    _authorize_dml(active, spec.table)
-    if instance._meta.label_lower == "dcim.interface" and instance.device_id is not None:
-        device_row = SourceRow("dcim.device", instance.device_id)
-        if device_row in active.footprint.source_rows:
-            _authorize_dml(active, apps.get_model("dcim.device")._meta.db_table)
-
-
-def _begin_implicit(
-    sender,
-    instance,
-    *,
-    deleting=False,
-    update_fields=None,
-    footprint_override=None,
-    **kwargs,
-):
-    _discard_rolled_back_implicit_permit()
-    spec = _REGISTRY.get(sender._meta.label_lower)
-    if spec is None:
-        return
-    active = _ACTIVE_PERMIT.get()
-    if active is not None:
-        from .renderer_writer import require_planned_signal_write
-
-        require_planned_signal_write(instance, deleting=deleting, update_fields=update_fields)
-        _authorize_active_write(
-            active,
-            sender,
-            instance,
-            spec,
-            deleting=deleting,
-            update_fields=update_fields,
-        )
-        return
-    from .signals import _is_intent_push_suppressed
-
-    deferred = {}
-    if not deleting and not _is_intent_push_suppressed():
-        deferred = _normalize_overlay_lifecycle(instance, spec, update_fields)
-    before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-    after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
-    if _is_intent_push_suppressed():
-        permit = _suppressed_permit(
-            instance,
-            spec,
-            before,
-            after,
-            update_fields,
-            footprint_override,
-        )
-    else:
-        proposed_footprint = footprint_override or footprint_for_instance(instance, spec)
-        benign_insert = _benign_unrendered_insert(instance, before, after)
-    if (
-        not _is_intent_push_suppressed()
-        and before == after
-        and not (instance._state.adding and proposed_footprint.overlay_rows and not benign_insert)
-    ):
-        benign_footprint = MutationFootprint() if benign_insert else proposed_footprint
-        secondary_footprint = (
-            None if benign_insert or footprint_override is not None else _secondary_dml_footprint(instance, spec)
-        )
-        if secondary_footprint is not None or benign_footprint.shared_keys or benign_footprint.overlay_rows:
-            permit = _Permit(
-                footprint=secondary_footprint or benign_footprint,
-                dml_kind="content",
-                bump_revisions=False,
-                join_deployment_gate=not (
-                    before == ABSENT
-                    and after == ABSENT
-                    and bool(benign_footprint.shared_keys)
-                    and not benign_footprint.revision_keys
-                    and not benign_footprint.overlay_rows
-                ),
-                implicit=True,
-            )
-        else:
-            permit = _Permit(
-                footprint=MutationFootprint(),
-                dml_kind="mirror",
-                mirror_table=spec.table,
-                mirror_pk=instance.pk,
-                mirror_before=before,
-                mirror_instance=instance,
-                mirror_update_fields=frozenset(update_fields or (spec.content_fields | spec.lifecycle_fields)),
-                implicit=True,
-            )
-    elif not _is_intent_push_suppressed():
-        permit = _Permit(footprint=proposed_footprint, dml_kind="content", implicit=True)
-    token = _ACTIVE_PERMIT.set(permit)
-    if transaction.get_connection().atomic_blocks:
-        permit.atomic_block_id = id(transaction.get_connection().atomic_blocks[-1])
-    permit.tokens.append(token)
-    permit.deferred_update.update(deferred)
-    if permit.mirror_update_fields is not None:
-        permit.mirror_update_fields = permit.mirror_update_fields | frozenset(deferred)
-    if permit.dml_kind == "content":
-        try:
-            if (
-                permit.footprint.shared_keys
-                or permit.footprint.revision_keys
-                or permit.footprint.source_rows
-                or permit.footprint.overlay_rows
-            ):
-                _acquire(
-                    permit.footprint,
-                    bump=permit.bump_revisions,
-                    join_deployment_gate=permit.join_deployment_gate,
-                )
-        except Exception:
-            _ACTIVE_PERMIT.reset(token)
-            raise
-    _authorize_dml(permit, spec.table)
-    permits = dict(_IMPLICIT_PERMITS.get())
-    permits[_implicit_key(instance)] = token
-    _IMPLICIT_PERMITS.set(permits)
-
-
-def _transition_management_manifests(instance, origin) -> None:
-    """Transition management manifests after the renderer acquires its locks."""
+def _lock_management_delete(instance, origin) -> None:
+    """Hold one complete deletion footprint before management teardown evidence changes."""
     if instance._meta.label_lower != "netbox_nso_plugin.nsodevicemanagement":
         return
-    origin_model = getattr(origin, "model", type(origin))
-    origin_label = getattr(getattr(origin_model, "_meta", None), "label_lower", None)
+    roots = _deletion_roots(origin)
+    footprint = MutationFootprint.merge(*(deletion_footprint_for_instance(root) for root in roots))
+    active = _ACTIVE_PERMIT.get()
+    if active is None:
+        connection = transaction.get_connection()
+        atomic_block = connection.atomic_blocks[-1]
+        if getattr(origin, "_nso_renderer_delete_lock", None) is not atomic_block:
+            from .apply_state import lock_order_scope
+
+            with lock_order_scope():
+                _acquire(footprint, bump=False)
+            setattr(origin, "_nso_renderer_delete_lock", atomic_block)
+    elif not active.footprint.covers(footprint):
+        raise IntentMutationProtocolError("the active mutation footprint does not cover the management deletion")
+
     from .ownership_planner import detach_device_manifests, retire_device_manifests
 
-    transition = retire_device_manifests if origin_label == "dcim.device" else detach_device_manifests
+    transition = retire_device_manifests if _delete_origin_label(origin) == "dcim.device" else detach_device_manifests
     transition(instance.device_id)
 
 
-def _begin_delete_implicit(sender, instance, origin=None, **kwargs):
-    """Keep a cascade permit alive until the registered root's post-delete."""
-    from .renderer_writer import active_renderer_writer
+def _validate_explicit_delete(sender, instance, origin=None, **kwargs):
+    """Validate explicit deletes and lock management teardown evidence."""
+    from .renderer_writer import active_renderer_writer, require_planned_signal_write
 
     if active_renderer_writer() is not None:
-        _begin_implicit(sender, instance, deleting=True, origin=origin, **kwargs)
-    else:
-        origin_label = getattr(getattr(origin, "_meta", None), "label_lower", None)
-        if origin_label in _REGISTRY:
-            target = origin
-            footprint = deletion_footprint_for_instance(target) if _ACTIVE_PERMIT.get() is None else None
-        else:
-            origin_model = getattr(origin, "model", None)
-            origin_label = getattr(getattr(origin_model, "_meta", None), "label_lower", None)
-            roots = list(origin.order_by("pk")) if origin_label in _REGISTRY and _ACTIVE_PERMIT.get() is None else []
-            target = roots[0] if roots else instance
-            footprint = (
-                MutationFootprint.merge(*(deletion_footprint_for_instance(root) for root in roots)) if roots else None
-            )
-        if footprint is None and _ACTIVE_PERMIT.get() is None:
-            footprint = deletion_footprint_for_instance(target)
-        _begin_implicit(
-            type(target),
-            target,
-            deleting=True,
-            origin=origin,
-            footprint_override=footprint,
-            **kwargs,
-        )
-    _transition_management_manifests(instance, origin)
+        require_planned_signal_write(instance, deleting=True)
+    _lock_management_delete(instance, origin)
+    permit = _ACTIVE_PERMIT.get()
+    # The repend runs after the block's writes: this is what tells it which of the rows it
+    # captured as deploying were consumed by a delete rather than lost.
+    if permit is not None and instance.pk is not None:
+        permit.deleted_rows.add(SourceRow(instance._meta.label_lower, instance.pk))
 
 
-def _end_implicit(sender, instance, **kwargs):
-    permits = dict(_IMPLICIT_PERMITS.get())
-    token = permits.pop(_implicit_key(instance), None)
-    instance.__dict__.pop("_renderer_mutation_key", None)
-    _IMPLICIT_PERMITS.set(permits)
-    if token is not None:
-        permit = _ACTIVE_PERMIT.get()
-        try:
-            if permit is not None and permit.deferred_update:
-                from .signals import suppress_intent_push
-
-                fields = set(permit.deferred_update)
-                for field_name, value in permit.deferred_update.items():
-                    setattr(instance, field_name, value)
-                permit.deferred_update.clear()
-                with suppress_intent_push():
-                    instance.save(update_fields=fields)
-        finally:
-            _ACTIVE_PERMIT.reset(token)
-
-
-def _static_route_devices_footprint(instance, action, pk_set, reverse):
-    """Resolve the exact device assignments before the static-route M2M write."""
-    StaticRoute = apps.get_model("netbox_routing.staticroute")
-    StaticRouteState = apps.get_model("netbox_nso_plugin.nsostaticroutestate")
-    if reverse:
-        device_ids = {instance.pk}
-        route_ids = set(pk_set or ())
-        if action == "pre_clear":
-            route_ids = set(StaticRoute.objects.filter(devices=instance).values_list("pk", flat=True))
-    else:
-        route_ids = {instance.pk}
-        device_ids = set(pk_set or ())
-        if action == "pre_clear":
-            device_ids = set(instance.devices.values_list("pk", flat=True))
-    keys = _management_keys(device_ids, ("static_route",))
-    overlays = StaticRouteState.objects.filter(
-        management__device_id__in=device_ids,
-        static_route_id__in=route_ids,
-    )
-    return MutationFootprint.for_keys(
-        keys,
-        source_rows=(
-            SourceRow("netbox_routing.staticroute_devices", None),
-            *(SourceRow("netbox_routing.staticroute", route_id) for route_id in route_ids),
-        ),
-        overlay_rows=(
-            SourceRow("netbox_nso_plugin.nsostaticroutestate", None),
-            *(SourceRow("netbox_nso_plugin.nsostaticroutestate", pk) for pk in overlays.values_list("pk", flat=True)),
-        ),
-    )
-
-
-def _begin_m2m_implicit(sender, instance, action, **kwargs):
+def _validate_explicit_m2m(sender, instance, action, reverse=False, pk_set=None, **kwargs):
+    """Validate a registered M2M operation only while an explicit writer is active."""
     if not action.startswith("pre_"):
         return
-    _discard_rolled_back_implicit_permit()
-    label = sender._meta.label_lower
-    if not kwargs.get("reverse", False):
-        from .renderer_writer import active_renderer_writer, require_planned_m2m_signal
+    from .renderer_writer import active_renderer_writer, require_planned_m2m_signal
 
-        if active_renderer_writer() is not None:
-            field_name = next(
-                (field.name for field in instance._meta.many_to_many if field.remote_field.through is sender),
-                None,
-            )
-            if field_name is None:
-                raise IntentMutationProtocolError("the active writer cannot resolve the M2M field")
-            require_planned_m2m_signal(instance, action, field_name, kwargs.get("pk_set"))
-    static_route_assignment = label == "netbox_routing.staticroute_devices"
-    spec = None if static_route_assignment else _REGISTRY[label]
-    token_key = (id(instance), label)
-    active = _ACTIVE_PERMIT.get()
-    if static_route_assignment:
-        footprint = _static_route_devices_footprint(
-            instance,
-            action,
-            kwargs.get("pk_set"),
-            kwargs.get("reverse", False),
-        )
-        keys = set(footprint.revision_keys)
-    else:
-        owner_spec = _REGISTRY.get(instance._meta.label_lower)
-        keys = set() if owner_spec is None else owner_spec.resolver(instance, owner_spec)
-        keys = {(device_id, scope) for device_id, scope in keys if scope in spec.scopes}
-        row = SourceRow(instance._meta.label_lower, instance.pk)
-        row_fields = (
-            {"overlay_rows": (row,)} if instance._meta.label_lower in OVERLAY_MODEL_RANKS else {"source_rows": (row,)}
-        )
-        footprint = MutationFootprint.for_keys(keys, **row_fields)
-    if active is not None:
-        if not active.footprint.covers(footprint):
-            raise IntentMutationProtocolError("the M2M write is outside the active mutation footprint")
-        if spec is not None:
-            _authorize_dml(active, spec.table)
+    if active_renderer_writer() is None:
         return
-    from .signals import _is_intent_push_suppressed
-
-    if _is_intent_push_suppressed() and keys:
-        raise IntentMutationProtocolError("a suppressed renderer M2M write requires content_mutation")
-    permit = _Permit(footprint=footprint, dml_kind="content", implicit=True)
-    token = _ACTIVE_PERMIT.set(permit)
-    if transaction.get_connection().atomic_blocks:
-        permit.atomic_block_id = id(transaction.get_connection().atomic_blocks[-1])
-    permit.tokens.append(token)
-    try:
-        if keys:
-            _acquire(footprint)
-    except Exception:
-        _ACTIVE_PERMIT.reset(token)
-        raise
-    if spec is not None:
-        _authorize_dml(permit, spec.table)
-    permits = dict(_IMPLICIT_PERMITS.get())
-    permits[token_key] = token
-    _IMPLICIT_PERMITS.set(permits)
-
-
-def _close_m2m_implicit(sender, instance):
-    """Close the implicit permit for one M2M mutation."""
-    token_key = (id(instance), sender._meta.label_lower)
-    permits = dict(_IMPLICIT_PERMITS.get())
-    token = permits.pop(token_key, None)
-    _IMPLICIT_PERMITS.set(permits)
-    if token is not None:
-        _ACTIVE_PERMIT.reset(token)
-
-
-def _abort_m2m_implicit(sender, instance):
-    """Close an M2M permit when a pre-action behavior handler fails."""
-    _close_m2m_implicit(sender, instance)
-
-
-def _end_m2m_implicit(sender, instance, action, **kwargs):
-    if action.startswith("post_"):
-        _close_m2m_implicit(sender, instance)
-
-
-def _pool_delete_scope(connection):
-    """Identify the connection and the still-open atomic block a pool delete runs in."""
-    blocks = getattr(connection, "atomic_blocks", None)
-    if not blocks:
-        return None
-    return (connection.alias, blocks[-1])
-
-
-def _begin_prefix_delete(sender, instance, using=None, **kwargs):
-    """Mark the pool whose delete makes Django clear the overlay's audit-trail FK."""
-    scope = _pool_delete_scope(transaction.get_connection(using))
-    if instance.pk is None or scope is None:
-        return
-    _DELETING_POOLS.set(_DELETING_POOLS.get() | {(*scope, instance.pk)})
-
-
-def _end_prefix_delete(sender, instance, using=None, **kwargs):
-    """Drop the marker once the pool row is gone."""
-    _DELETING_POOLS.set(
-        frozenset(entry for entry in _DELETING_POOLS.get() if entry[2] != instance.pk or entry[0] != using)
-    )
-
-
-def _live_pool_markers(connection) -> frozenset[tuple]:
-    """Purge markers whose delete transaction is over: a rollback leaves the block popped."""
-    entries = _DELETING_POOLS.get()
-    blocks = getattr(connection, "atomic_blocks", ())
-    live = frozenset(
-        entry for entry in entries if entry[0] != connection.alias or any(entry[1] is block for block in blocks)
-    )
-    if live != entries:
-        _DELETING_POOLS.set(live)
-    return live
-
-
-def _is_pool_delete_cascade(spec, touched_columns, statement, params, connection) -> bool:
-    """Report whether this is the collector's SET_NULL update for a pool being deleted."""
-    if spec.model_label != "netbox_nso_plugin.nsointerfaceipstate":
-        return False
-    if touched_columns != frozenset({"source_pool_id"}):
-        return False
-    entries = _live_pool_markers(connection)
-    match = _SOURCE_POOL_CASCADE.search(statement)
-    if not entries or match is None:
-        return False
-    values = list(params or ())
-    if match.group("value").upper() != "NULL":
-        # The bound new value must be the NULL the collector writes.
-        if not values or values[0] is not None:
-            return False
-        values = values[1:]
-    try:
-        targets = {int(value) for value in values}
-    except (TypeError, ValueError):
-        return False
-    # The marker stays until post_delete, so a same-shape peer update cannot starve the collector.
-    marked = {entry[2] for entry in entries if entry[0] == connection.alias}
-    return bool(targets) and targets <= marked
-
-
-def _execute_with_permit_cleanup(execute, sql, params, many, context, permit):
-    """Execute SQL and retire an implicit permit when the database rejects it."""
-    try:
-        return execute(sql, params, many, context)
-    except Exception:
-        _clear_failed_implicit_permit(permit)
-        raise
-
-
-def _permit_footprint_tables(permit) -> set[str]:
-    """Tables a content permit already authorizes through its footprint."""
-    if permit is None or permit.dml_kind != "content":
-        return set()
-    tables = {
-        apps.get_model(row.model_label)._meta.db_table
-        for row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
-    }
-    if permit.footprint.device_ids:
-        tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
-    return tables
-
-
-def _dml_guard(execute, sql, params, many, context):
-    statement = str(sql)
-    if _MIGRATIONS_ACTIVE.get():
-        return execute(sql, params, many, context)
-    lowered_statement = statement.lower()
-    if not any(table in lowered_statement for table in _registered_table_names()):
-        return execute(sql, params, many, context)
-    first_keyword = _FIRST_SQL_KEYWORD.match(statement)
-    if first_keyword is not None and first_keyword.group(1).upper() in _DML_PARSE_SKIP_KEYWORDS:
-        return execute(sql, params, many, context)
-    target, unparseable = _parse_dml_target(statement)
-    if target is None:
-        mentioned = _mentioned_registered_tables(statement)
-        if unparseable and mentioned:
-            raise IntentMutationProtocolError(f"unparseable SQL mentions renderer input tables {sorted(mentioned)!r}")
-        return execute(sql, params, many, context)
-    if target.table not in _TABLE_REGISTRY:
-        return execute(sql, params, many, context)
-    touched_columns = _dml_columns(statement, target.operation)
-    permit = _ACTIVE_PERMIT.get()
-    if target.operation == "INSERT INTO" and touched_columns == frozenset():
-        if permit is None:
-            # drift signal: this creation skips the pre_save bookkeeping (revision bump, re-pend)
-            logger.warning("unpermitted creation on renderer input %s proceeded without bookkeeping", target.table)
-        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
-    table = target.table
-    spec = _TABLE_REGISTRY[table]
-    guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
-    content_columns = {spec.model._meta.get_field(field_name).column for field_name in guarded_fields}
-    if touched_columns and touched_columns.isdisjoint(content_columns):
-        return execute(sql, params, many, context)
-    if permit is not None and permit.dml_kind == "offline":
-        return execute(sql, params, many, context)
-    # source_pool is a declared content field, so the column-aware admission cannot reach the
-    # collector's SET_NULL update: the pool pointer is an audit trail, not pushed IP intent.
-    if _is_pool_delete_cascade(spec, touched_columns, statement, params, context["connection"]):
-        return execute(sql, params, many, context)
-    remaining = 0 if permit is None else permit.authorized_dml.get(table, 0)
-    footprint_tables = _permit_footprint_tables(permit)
-    if remaining < 1 and table not in footprint_tables:
-        column_detail = "unknown" if touched_columns is None else sorted(touched_columns)
-        _clear_failed_implicit_permit(permit)
-        raise IntentMutationProtocolError(
-            f"bulk/raw DML on renderer input {table} requires an exact content_mutation permit; "
-            f"active={getattr(permit, 'dml_kind', None)!r}, columns={column_detail!r}, "
-            f"tables={sorted(footprint_tables)!r}"
-        )
-    if remaining:
-        permit.authorized_dml[table] = remaining - 1
-    return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
-
-
-def _clear_failed_implicit_permit(permit) -> None:
-    """Retire an implicit permit when its guarded SQL cannot complete."""
-    if permit is None or not permit.implicit or not permit.tokens:
-        return
-    token = permit.tokens.pop()
-    implicit_permits = {key: candidate for key, candidate in _IMPLICIT_PERMITS.get().items() if candidate is not token}
-    _IMPLICIT_PERMITS.set(implicit_permits)
-    _ACTIVE_PERMIT.reset(token)
-
-
-@functools.lru_cache(maxsize=512)
-def _parse_dml_target(statement: str) -> tuple[_DMLTarget | None, bool]:
-    """Return one parsed mutation target and whether classification failed."""
-    parsed = sqlparse.parse(statement)
-    if len(parsed) != 1:
-        classified = [_parse_dml_target(str(candidate)) for candidate in parsed]
-        return None, any(target is not None or unparseable for target, unparseable in classified)
-    parsed_statement = parsed[0]
-    statement_type = parsed_statement.get_type().upper()
-    operations = {
-        "UPDATE": ("UPDATE", "UPDATE"),
-        "INSERT": ("INSERT INTO", "INTO"),
-        "DELETE": ("DELETE FROM", "FROM"),
-    }
-    operation = operations.get(statement_type)
-    if operation is None:
-        flattened = tuple(
-            token for token in parsed_statement.flatten() if not token.is_whitespace and token.ttype not in Comment
-        )
-        mutation_tokens = tuple(
-            (index, token)
-            for index, token in enumerate(flattened)
-            if token.ttype in sqlparse.tokens.DML and token.normalized in {"UPDATE", "INSERT", "DELETE", "MERGE"}
-        )
-        if statement_type == "SELECT":
-            lock_prefixes = (("FOR",), ("FOR", "NO", "KEY"))
-
-            def is_locking_update(index, token) -> bool:
-                if token.normalized != "UPDATE":
-                    return False
-                return any(
-                    tuple(candidate.normalized for candidate in flattened[index - len(prefix) : index]) == prefix
-                    for prefix in lock_prefixes
-                    if index >= len(prefix)
-                )
-
-            return None, any(not is_locking_update(index, token) for index, token in mutation_tokens)
-        return None, bool(mutation_tokens)
-    operation_name, anchor = operation
-    tokens = _sql_tokens(parsed_statement)
-    anchor_index = next(
-        (
-            index
-            for index, token in enumerate(tokens)
-            if (anchor == "UPDATE" and token.ttype in sqlparse.tokens.DML and token.normalized == anchor)
-            or (anchor != "UPDATE" and token.ttype in Keyword and token.normalized == anchor)
-        ),
+    if reverse:
+        raise IntentMutationProtocolError("a reverse M2M mutation bypassed the active renderer writer")
+    field_name = next(
+        (field.name for field in instance._meta.many_to_many if field.remote_field.through is sender),
         None,
     )
-    if anchor_index is None:
-        return None, True
-    target_token = next(
-        (token for token in tokens[anchor_index + 1 :] if not (token.ttype in Keyword and token.normalized == "ONLY")),
-        None,
-    )
-    if not isinstance(target_token, Identifier | Function) or (
-        isinstance(target_token, Function) and operation_name != "INSERT INTO"
-    ):
-        return None, True
-    if not target_token.get_real_name():
-        return None, True
-    return _DMLTarget(operation_name, _postgres_identifier_name(target_token)), False
-
-
-def _postgres_identifier_name(identifier: Identifier | Function) -> str:
-    """Return one identifier with PostgreSQL's unquoted case folding applied."""
-    real_name = identifier.get_real_name()
-    for token in identifier.tokens:
-        if token.ttype == Literal.String.Symbol:
-            quoted = token.value[1:-1].replace('""', '"')
-            if quoted == real_name:
-                return quoted
-    return real_name.lower()
-
-
-def _mentioned_registered_tables(statement: str) -> set[str]:
-    """Return registered table names present in otherwise unclassified SQL."""
-    return {
-        table
-        for table in _TABLE_REGISTRY
-        if re.search(rf'(?<![A-Za-z0-9_])"?{re.escape(table)}"?(?![A-Za-z0-9_])', statement, re.IGNORECASE)
-    }
-
-
-@functools.lru_cache(maxsize=512)
-def _dml_columns(statement: str, operation: str) -> frozenset[str] | None:
-    """Return columns that can mutate existing rows, or None when they are unknown."""
-    if operation == "DELETE FROM":
-        return None
-    parsed = sqlparse.parse(statement)
-    if len(parsed) != 1:
-        return None
-    tokens = _sql_tokens(parsed[0])
-    if operation == "UPDATE":
-        set_index = next(
-            (index for index, token in enumerate(tokens) if token.ttype in Keyword and token.normalized == "SET"),
-            None,
-        )
-        if set_index is None or set_index + 1 >= len(tokens):
-            return None
-        assignments = tokens[set_index + 1]
-        if isinstance(assignments, Comparison):
-            comparisons = (assignments,)
-        elif isinstance(assignments, IdentifierList):
-            comparisons = tuple(assignments.get_identifiers())
-        else:
-            return None
-        columns = tuple(_comparison_column(comparison) for comparison in comparisons)
-        return None if not columns or any(column is None for column in columns) else frozenset(columns)
-    if operation == "INSERT INTO":
-        return _insert_update_columns(parsed[0])
-    return None
-
-
-def _insert_update_columns(statement) -> frozenset[str] | None:
-    """Return ON CONFLICT DO UPDATE columns, with an empty set for creation."""
-    tokens = tuple(token for token in statement.flatten() if not token.is_whitespace and token.ttype not in Comment)
-    conflict_index = next(
-        (
-            index
-            for index in range(len(tokens) - 1)
-            if tokens[index].normalized == "ON" and tokens[index + 1].normalized == "CONFLICT"
-        ),
-        None,
-    )
-    if conflict_index is None:
-        return frozenset()
-    do_index = next(
-        (index for index in range(conflict_index + 2, len(tokens)) if tokens[index].normalized == "DO"),
-        None,
-    )
-    if do_index is None or do_index + 1 >= len(tokens):
-        return None
-    if tokens[do_index + 1].normalized == "NOTHING":
-        return frozenset()
-    if (
-        tokens[do_index + 1].normalized != "UPDATE"
-        or do_index + 2 >= len(tokens)
-        or tokens[do_index + 2].normalized != "SET"
-    ):
-        return None
-    return _flattened_assignment_columns(tokens[do_index + 3 :])
-
-
-def _flattened_assignment_columns(tokens) -> frozenset[str] | None:
-    """Return columns from a flattened PostgreSQL assignment list."""
-    columns = []
-    index = 0
-    while index < len(tokens):
-        column = _postgres_column_token_name(tokens[index])
-        if column is None or index + 1 >= len(tokens) or tokens[index + 1].value != "=":
-            return None
-        columns.append(column)
-        index += 2
-        expression_started = False
-        depth = 0
-        while index < len(tokens):
-            token = tokens[index]
-            if depth == 0 and token.ttype in Keyword and token.normalized in {"WHERE", "RETURNING"}:
-                return frozenset(columns) if expression_started else None
-            if depth == 0 and token.value == ",":
-                if not expression_started:
-                    return None
-                index += 1
-                break
-            if token.value in {"(", "[", "{"}:
-                depth += 1
-            elif token.value in {")", "]", "}"}:
-                depth -= 1
-                if depth < 0:
-                    return None
-            expression_started = True
-            index += 1
-        else:
-            return frozenset(columns) if expression_started and depth == 0 else None
-    return None
-
-
-def _postgres_column_token_name(token) -> str | None:
-    """Return one PostgreSQL assignment column with case folding applied."""
-    if token.ttype == Literal.String.Symbol:
-        return token.value[1:-1].replace('""', '"')
-    if token.ttype in sqlparse.tokens.Name:
-        return token.value.lower()
-    return None
-
-
-def _comparison_column(comparison) -> str | None:
-    """Return the column assigned by one parsed UPDATE comparison."""
-    if not isinstance(comparison, Comparison):
-        return None
-    tokens = _sql_tokens(comparison)
-    if len(tokens) < 3 or tokens[1].value != "=" or not isinstance(tokens[0], Identifier):
-        return None
-    return _postgres_identifier_name(tokens[0])
-
-
-def _sql_tokens(group) -> tuple:
-    """Return significant direct children from one parsed SQL token group."""
-    return tuple(token for token in group.tokens if not token.is_whitespace and token.ttype not in Comment)
-
-
-def _install_guard(connection, **kwargs):
-    if _dml_guard not in connection.execute_wrappers:
-        connection.execute_wrappers.append(_dml_guard)
-
-
-def _start_migrations(**kwargs):
-    _MIGRATIONS_ACTIVE.set(True)
-
-
-def _finish_migrations(**kwargs):
-    _MIGRATIONS_ACTIVE.set(False)
+    if field_name is None:
+        raise IntentMutationProtocolError("the active writer cannot resolve the M2M field")
+    require_planned_m2m_signal(instance, action, field_name, pk_set)
 
 
 def ensure_delete_signal_origin() -> None:
@@ -3327,7 +2534,7 @@ def ensure_delete_signal_origin() -> None:
     CustomCollector.collect = collect_with_origin
 
 
-def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = True) -> None:
+def register_renderer_input(spec: RendererInputSpec) -> None:
     """Register one concrete or auto-created-through renderer input."""
     label = spec.model_label.lower()
     model = apps.get_model(label)
@@ -3344,36 +2551,11 @@ def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = Tru
         prospective_visibility=spec.prospective_visibility,
     )
     _REGISTRY[label] = normalized
-    _TABLE_REGISTRY[model._meta.db_table] = normalized
-    _registered_table_names.cache_clear()
-    uid = f"nso_intent_guard_{label}"
-    pre_save.connect(_begin_implicit, sender=model, dispatch_uid=f"{uid}_pre_save", weak=False)
-    pre_delete.connect(_begin_delete_implicit, sender=model, dispatch_uid=f"{uid}_pre_delete", weak=False)
-    if connect_ends:
-        _connect_renderer_input_ends(model)
+    uid = f"nso_renderer_writer_{label}"
+    pre_save.connect(_validate_explicit_write, sender=model, dispatch_uid=f"{uid}_pre_save", weak=False)
+    pre_delete.connect(_validate_explicit_delete, sender=model, dispatch_uid=f"{uid}_pre_delete", weak=False)
     if model._meta.auto_created:
-        m2m_changed.connect(_begin_m2m_implicit, sender=model, dispatch_uid=f"{uid}_m2m_begin", weak=False)
-
-
-def _connect_renderer_input_ends(model) -> None:
-    uid = f"nso_intent_guard_{model._meta.label_lower}"
-    post_save.connect(_end_implicit, sender=model, dispatch_uid=f"{uid}_post_save", weak=False)
-    post_delete.connect(_end_implicit, sender=model, dispatch_uid=f"{uid}_post_delete", weak=False)
-    if model._meta.auto_created:
-        m2m_changed.connect(_end_m2m_implicit, sender=model, dispatch_uid=f"{uid}_m2m_end", weak=False)
-
-
-def connect_renderer_input_end_handlers() -> None:
-    """Close implicit permits after every renderer behavior handler has run."""
-    for label in _REGISTRY:
-        _connect_renderer_input_ends(apps.get_model(label))
-    StaticRoute = apps.get_model("netbox_routing.staticroute")
-    m2m_changed.connect(
-        _end_m2m_implicit,
-        sender=StaticRoute.devices.through,
-        dispatch_uid="nso_intent_guard_static_route_devices_m2m_end",
-        weak=False,
-    )
+        m2m_changed.connect(_validate_explicit_m2m, sender=model, dispatch_uid=f"{uid}_m2m", weak=False)
 
 
 def _field_sets(model):
@@ -3390,7 +2572,6 @@ def _register(
     fixtures=None,
     model=None,
     content_fields=None,
-    connect_ends=True,
 ):
     model = model or apps.get_model(label)
     content, lifecycle = _field_sets(model)
@@ -3404,15 +2585,14 @@ def _register(
             content_fields=content,
             lifecycle_fields=lifecycle,
             resolver=_generic_keys,
-            required_trace_fixtures=tuple(fixtures or scopes),
+            required_trace_fixtures=tuple(scopes if fixtures is None else fixtures),
             fragment=_declared_fields_fragment,
             shared_kind=shared_kind,
         ),
-        connect_ends=connect_ends,
     )
 
 
-def _register_auto_through(model, scopes, *, shared_kind=None, field_names=None, connect_ends=True):
+def _register_auto_through(model, scopes, *, shared_kind=None, field_names=None):
     for m2m_field in model._meta.many_to_many:
         if field_names is not None and m2m_field.name not in field_names:
             continue
@@ -3427,12 +2607,11 @@ def _register_auto_through(model, scopes, *, shared_kind=None, field_names=None,
                 shared_kind=shared_kind,
                 model=through,
                 content_fields=content_fields,
-                connect_ends=connect_ends,
             )
 
 
-def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
-    """Install the declared renderer-input registry and every runtime sentinel."""
+def register_builtin_renderer_inputs() -> None:
+    """Install the declared renderer-input registry and writer validators."""
     if _REGISTRY:
         return
     all_scopes = (
@@ -3475,6 +2654,7 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         "netbox_nso_plugin.nsoisisinstancestate": ("isis",),
         "netbox_nso_plugin.nsoisisinterfacestate": ("isis",),
         "netbox_nso_plugin.nsobgppeerstate": ("bgp",),
+        "netbox_nso_plugin.nsobgppeertemplatestate": ("bgp",),
         "netbox_nso_plugin.nsoredistributionstate": ("bgp", "isis", "ospf"),
         "netbox_nso_plugin.nsoroutepolicystate": ("route_policy",),
         "netbox_nso_plugin.nsoospfinstancestate": ("ospf",),
@@ -3516,13 +2696,12 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
             scopes,
             model=model,
             content_fields=content_fields,
-            connect_ends=connect_ends,
+            fixtures=() if label == "netbox_nso_plugin.nsobgppeertemplatestate" else None,
         )
     _register_auto_through(
         apps.get_model("netbox_nso_plugin.nsoswitchportstate"),
         ("switchport",),
         field_names={"tagged_vlans"},
-        connect_ends=connect_ends,
     )
     vlan_model = apps.get_model("ipam.vlan")
     _register(
@@ -3531,29 +2710,24 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         shared_kind="vlan",
         model=vlan_model,
         content_fields={"vid", "name"},
-        connect_ends=connect_ends,
     )
     _REGISTRY["netbox_nso_plugin.nsovlanstate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsovlanstate"],
         fragment=_vlan_state_fragment,
     )
-    _TABLE_REGISTRY[_REGISTRY["netbox_nso_plugin.nsovlanstate"].table] = _REGISTRY["netbox_nso_plugin.nsovlanstate"]
     _REGISTRY["ipam.vlan"] = replace(
         _REGISTRY["ipam.vlan"],
         fragment=_native_vlan_fragment,
     )
-    _TABLE_REGISTRY[_REGISTRY["ipam.vlan"].table] = _REGISTRY["ipam.vlan"]
     _REGISTRY["netbox_nso_plugin.nsolacpbundlestate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsolacpbundlestate"],
         fragment=_lacp_bundle_fragment,
         dependency_resolver=_lacp_bundle_dependencies,
     )
-    _TABLE_REGISTRY[_REGISTRY["netbox_nso_plugin.nsolacpbundlestate"].table] = _REGISTRY[
-        "netbox_nso_plugin.nsolacpbundlestate"
-    ]
     exact_direct_fragments = {
         "netbox_nso_plugin.nsobfdinterfacestate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsobgppeerstate": _direct_overlay_fragment,
+        "netbox_nso_plugin.nsobgppeertemplatestate": _lifecycle_only_fragment,
         "netbox_nso_plugin.nsointerfaceipstate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsointerfacemtustate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsoisisflexalgostate": _direct_overlay_fragment,
@@ -3588,24 +2762,18 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
                 _route_policy_prospective_visibility if label == "netbox_nso_plugin.nsoroutepolicystate" else None
             ),
         )
-        _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
     _REGISTRY["netbox_nso_plugin.nsovlanstate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsovlanstate"],
         dependency_resolver=_vlan_state_dependencies,
     )
-    _TABLE_REGISTRY[_REGISTRY["netbox_nso_plugin.nsovlanstate"].table] = _REGISTRY["netbox_nso_plugin.nsovlanstate"]
     _REGISTRY["dcim.interface"] = replace(
         _REGISTRY["dcim.interface"],
         dependency_resolver=_interface_dependencies,
     )
-    _TABLE_REGISTRY[_REGISTRY["dcim.interface"].table] = _REGISTRY["dcim.interface"]
     _REGISTRY["netbox_nso_plugin.nsointerfacestate"] = replace(
         _REGISTRY["netbox_nso_plugin.nsointerfacestate"],
         fragment=_interface_state_fragment,
     )
-    _TABLE_REGISTRY[_REGISTRY["netbox_nso_plugin.nsointerfacestate"].table] = _REGISTRY[
-        "netbox_nso_plugin.nsointerfacestate"
-    ]
     snmp_fragments = {
         "netbox_nso_plugin.nsosnmpcommunitystate": _snmp_community_fragment,
         "netbox_nso_plugin.nsosnmpv3userstate": _snmp_v3_user_fragment,
@@ -3613,7 +2781,6 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
     }
     for label, fragment in snmp_fragments.items():
         _REGISTRY[label] = replace(_REGISTRY[label], fragment=fragment)
-        _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
 
     native_declarations = {
         "netbox_routing.staticroute": ("static_route",),
@@ -3634,28 +2801,20 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         content_fields = None
         if label == "netbox_routing.staticroute":
             content_fields = {"vrf", "prefix", "next_hop", "permanent", "tag", "metric"}
-        _register(label, scopes, model=model, content_fields=content_fields, connect_ends=connect_ends)
+        _register(label, scopes, model=model, content_fields=content_fields)
 
     if "netbox_routing.staticroute" in _REGISTRY:
         _REGISTRY["netbox_routing.staticroute"] = replace(
             _REGISTRY["netbox_routing.staticroute"],
             fragment=_static_route_fragment,
         )
-        _TABLE_REGISTRY[_REGISTRY["netbox_routing.staticroute"].table] = _REGISTRY["netbox_routing.staticroute"]
         StaticRoute = apps.get_model("netbox_routing.staticroute")
         m2m_changed.connect(
-            _begin_m2m_implicit,
+            _validate_explicit_m2m,
             sender=StaticRoute.devices.through,
-            dispatch_uid="nso_intent_guard_static_route_devices_m2m_begin",
+            dispatch_uid="nso_renderer_writer_static_route_devices_m2m",
             weak=False,
         )
-        if connect_ends:
-            m2m_changed.connect(
-                _end_m2m_implicit,
-                sender=StaticRoute.devices.through,
-                dispatch_uid="nso_intent_guard_static_route_devices_m2m_end",
-                weak=False,
-            )
 
     from .shared_object_ownership import registered_specs
 
@@ -3673,7 +2832,6 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
             shared_kind="route_policy",
             model=model,
             content_fields=_ROUTE_POLICY_CONTENT_FIELDS[label],
-            connect_ends=connect_ends,
         )
         route_m2m_fields = {
             "netbox_routing.routemapentry": {
@@ -3688,18 +2846,4 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
             ("route_policy", "bgp", "isis", "ospf"),
             shared_kind="route_policy",
             field_names=route_m2m_fields,
-            connect_ends=connect_ends,
         )
-
-    for connection in connections.all():
-        _install_guard(connection)
-    connection_created.connect(_install_guard, dispatch_uid="nso_intent_dml_guard", weak=False)
-    prefix_model = apps.get_model("ipam.prefix")
-    pre_delete.connect(
-        _begin_prefix_delete, sender=prefix_model, dispatch_uid="nso_intent_prefix_pre_delete", weak=False
-    )
-    post_delete.connect(
-        _end_prefix_delete, sender=prefix_model, dispatch_uid="nso_intent_prefix_post_delete", weak=False
-    )
-    pre_migrate.connect(_start_migrations, dispatch_uid="nso_intent_pre_migrate", weak=False)
-    post_migrate.connect(_finish_migrations, dispatch_uid="nso_intent_post_migrate", weak=False)

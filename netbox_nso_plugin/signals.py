@@ -83,7 +83,7 @@ def _require_converted_writer(handler):
     return _wrapped
 
 
-def _schedule_exact_writer_scope(target_scope) -> None:
+def _schedule_exact_writer_scope(target_scope, *, device_ids=None) -> None:
     """Schedule keys for one scope only from its active exact content writer."""
     from .renderer_writer import active_renderer_writer
 
@@ -91,7 +91,11 @@ def _schedule_exact_writer_scope(target_scope) -> None:
     if writer is None:
         return
     for device_id, scope in writer.plan.content_keys:
-        if scope == target_scope and _converted_writer_owns_content(device_id, scope):
+        if (
+            scope == target_scope
+            and (device_ids is None or device_id in device_ids)
+            and _converted_writer_owns_content(device_id, scope)
+        ):
             _schedule_intent_push((device_id, scope))
 
 
@@ -168,41 +172,12 @@ def _skip_on_render(handler):
 
     @functools.wraps(handler)
     def _wrapped(*args, **kwargs):
-        try:
-            # suppress_intent_push() (the reconcile/import path) is the authoritative
-            # guard; the GET-render check is a belt-and-suspenders for the legacy
-            # render-time reconcile and becomes redundant once render is read-only.
-            if _is_intent_push_suppressed() or _is_render_request():
-                return None
-            return handler(*args, **kwargs)
-        except BaseException:
-            from .intent_state import _abort_m2m_implicit, _end_implicit
-
-            sender = kwargs.get("sender", args[0] if len(args) > 0 else None)
-            instance = kwargs.get("instance", args[1] if len(args) > 1 else None)
-            action = kwargs.get("action", args[2] if len(args) > 2 else None)
-            details = {key: value for key, value in kwargs.items() if key not in {"sender", "instance", "action"}}
-            if action is not None:
-                _abort_m2m_implicit(sender, instance)
-            else:
-                _end_implicit(sender, instance, **details)
-            raise
-
-    return _wrapped
-
-
-def _close_renderer_m2m_permit(handler):
-    """Close an implicit M2M permit even when a behavior handler raises."""
-
-    @functools.wraps(handler)
-    def _wrapped(sender, instance, action, **kwargs):
-        try:
-            return handler(sender, instance, action, **kwargs)
-        finally:
-            if action.startswith("post_"):
-                from .intent_state import _end_m2m_implicit
-
-                _end_m2m_implicit(sender, instance, action, **kwargs)
+        # suppress_intent_push() (the reconcile/import path) is the authoritative
+        # guard; the GET-render check is a belt-and-suspenders for the legacy
+        # render-time reconcile and becomes redundant once render is read-only.
+        if _is_intent_push_suppressed() or _is_render_request():
+            return None
+        return handler(*args, **kwargs)
 
     return _wrapped
 
@@ -349,14 +324,19 @@ def _schedule_intent_push(key, transitions=()) -> None:
     writer's transaction (O1.2), so by the time there is anything to drain there is a
     commit to wait for.
     """
-    from django.db import transaction
-
     from . import outbox
     from .intent_state import mirror_refresh_is_active
 
     if _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active():
         return  # a reconcile or render write mirrors the adapter; it is not operator intent
     outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
+    _schedule_intent_drain(key)
+
+
+def _schedule_intent_drain(key) -> None:
+    """Arrange an on-commit drain for an outbox contribution already appended to *key*."""
+    from django.db import transaction
+
     _pending_intent_keys().add(tuple(key))
     transaction.on_commit(_drain_intent_pushes)
 
@@ -901,27 +881,10 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
             if not _sync_source_change(instance, client):
                 return
 
-        # Carry the device's management addresses so the adapter's failover loop can probe
-        # primary and fall back to OOB. Resolved by the SAME helper onboarding uses, so the
-        # provision address and the failover-probed addresses never diverge. Explicit values
-        # (incl. None to clear) — the plugin is authoritative, so a removed OOB IP in NetBox
-        # clears it adapter-side.
-        from .onboarding import device_mgmt_addresses
-
-        primary_ip, oob_ip = device_mgmt_addresses(instance.device)
-
-        def push_scope():
-            client.set_scope(
-                instance.adapter_device_id,
-                instance.managed_attributes,
-                auto_apply=instance.auto_apply,
-                sync_before_apply=instance.sync_before_apply,
-                primary_ip=primary_ip,
-                oob_ip=oob_ip,
-            )
+        from .management_lifecycle import push_management_control
 
         try:
-            push_scope()
+            push_management_control(instance.device_id)
         except AdapterError as exc:
             # The stored id points at an adapter device row that no longer exists (a provision
             # that rolled back, a manual delete, a restored DB). Without this the branch above
@@ -936,7 +899,7 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
                 instance.device_id,
             )
             _onboard_into_adapter(instance, client)
-            push_scope()
+            push_management_control(instance.device_id)
 
         notify_result = client.sync_notify(instance.adapter_device_id)
         if notify_result and notify_result.get("job_id"):
@@ -1887,14 +1850,16 @@ def _on_vlan_state_save(sender, instance, **kwargs):
 
 @_skip_on_render
 def _on_vlan_pre_save(sender, instance, **kwargs):
-    """Record the exact VLAN or SVI fields changed by this save."""
+    """Record the exact VLAN or SVI fields changed by a sanctioned writer save."""
+    from .renderer_writer import active_renderer_writer
+
     update_fields = kwargs.get("update_fields")
     candidate_fields = {"name", "vid"}
     if update_fields is not None:
         candidate_fields.intersection_update(update_fields)
     instance._intent_vlan_changed_fields = frozenset()
     instance._intent_vlan_rows = {}
-    if instance._state.adding or not candidate_fields:
+    if active_renderer_writer() is None or instance._state.adding or not candidate_fields:
         return
 
     from .apply_state import vlan_intent_targets
@@ -1923,7 +1888,6 @@ def _on_vlan_change(sender, instance, **kwargs):
         return
     from . import delivery
     from . import status_machine as sm
-    from .intent_state import revision_was_acquired
 
     rows = getattr(instance, "_intent_vlan_rows", {})
     vid_changed = "vid" in changed_fields
@@ -1939,10 +1903,7 @@ def _on_vlan_change(sender, instance, **kwargs):
                 was_owned
                 and state.management.adapter_device_id is not None
                 and may_deliver
-                and (
-                    _converted_writer_owns_content(state.management.device_id, scope)
-                    or revision_was_acquired(state.management.device_id, scope)
-                )
+                and _converted_writer_owns_content(state.management.device_id, scope)
             ):
                 targets.add((state.management.device_id, scope))
     for key in sorted(targets):
@@ -1959,14 +1920,10 @@ def _on_ipam_vlan_pre_delete(sender, instance, **kwargs):
     by the time it runs (post-commit) the overlays are gone, so the snapshot omits this
     vid and the adapter PUT-replaces the vlan-reconciler instance → FASTMAP reverts it.
     """
-    from .intent_state import revision_was_acquired
-
     targets = []
     for state in instance.nso_vlan_states.select_related("management").all():
         mgmt = state.management
-        if mgmt.adapter_device_id is not None and (
-            _converted_writer_owns_content(mgmt.device_id, "vlan") or revision_was_acquired(mgmt.device_id, "vlan")
-        ):
+        if mgmt.adapter_device_id is not None and _converted_writer_owns_content(mgmt.device_id, "vlan"):
             targets.append((mgmt.device_id, mgmt.adapter_device_id))
     for device_id, adapter_device_id in targets:
         _schedule_intent_push((device_id, "vlan"))
@@ -2173,8 +2130,9 @@ def _on_static_route_state_save(sender, instance, **kwargs):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_static_route_state_delete(sender, instance, **kwargs):
-    """Push a reduced static-route snapshot with this row's deletion authority."""
+    """Schedule an exact-writer deletion with its per-object authority."""
     from .models import NSODeviceManagement
 
     if instance.status not in _OWNED_PUSH_STATUSES:
@@ -2183,11 +2141,10 @@ def _on_static_route_state_delete(sender, instance, **kwargs):
         mgmt = instance.management
     except NSODeviceManagement.DoesNotExist:
         return
-    if mgmt.adapter_device_id is None:
+    if mgmt.adapter_device_id is None or not _converted_writer_owns_content(mgmt.device_id, "static_route"):
         return
-
     transition = _static_route_delete_transition(instance, instance.static_route_id)
-    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=[transition])
+    _schedule_intent_push((mgmt.device_id, "static_route"), transitions=(transition,))
 
 
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
@@ -2323,33 +2280,27 @@ def _static_route_delete_transition(row, static_route_id):
     )
 
 
-def _remove_static_route_for_device(static_route, device) -> None:
-    """Drop the overlay for (device, route) and push the removal (full-replace)."""
-    from .models import NSODeviceManagement, NSOStaticRouteState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    rows = NSOStaticRouteState.objects.filter(management=mgmt, static_route=static_route)
-    rows.delete()
-
-
 @_skip_on_render
 def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
     """Schedule only the static-route keys declared by the active exact writer."""
     _schedule_exact_writer_scope("static_route")
 
 
-@_close_renderer_m2m_permit
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
     """Schedule only exact-writer assignment changes, without acquiring in the signal."""
-    if not action.startswith("post_"):
+    if reverse or action not in {"post_add", "post_remove"}:
         return
-    _schedule_exact_writer_scope("static_route")
+    changed_device_ids = set(pk_set or ())
+
+    def schedule_content_keys():
+        _schedule_exact_writer_scope("static_route", device_ids=changed_device_ids)
+
+    if action == "post_remove":
+        with _delete_origin_dispatch():
+            schedule_content_keys()
+    else:
+        schedule_content_keys()
 
 
 @_skip_on_render
@@ -3060,6 +3011,14 @@ def route_policy_intent_item(row):
     obj = row.assigned_object
     if obj is None:
         return None
+    from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
+    from .renderer_audit import RendererAuditRepairFailed
+
+    target_label = obj._meta.label_lower
+    if ROUTE_POLICY_NATIVE_MODEL_LABELS.get(row.family) != target_label:
+        raise RendererAuditRepairFailed(
+            f"route-policy family {row.family!r} cannot render target model {target_label!r}"
+        )
     return {
         "family": row.family,
         "name": row.object_name,
@@ -4246,8 +4205,8 @@ def _connect_g_activated():  # pragma: no cover
             sender=StaticRoute,
             dispatch_uid="nso_plugin_routing_static_route_post_save",
         )
-        # NOT _as_delete_origin: m2m_changed also carries post_add — the handler opens the
-        # deletion mark itself, around its post_remove / post_clear branches only.
+        # NOT _as_delete_origin: m2m_changed also carries post_add. The handler opens the
+        # deletion mark itself around post_remove only.
         m2m_changed.connect(
             _on_routing_static_route_devices_changed,
             sender=StaticRoute.devices.through,
