@@ -679,8 +679,8 @@ class TestAttemptSettlement(TestCase):
                         static_route_feed_drained=True,
                     )
 
-        row.refresh_from_db()
-        self.assertEqual(row.status, "deploying")
+                row.refresh_from_db()
+                self.assertEqual(row.status, "deploying")
 
     def test_an_aged_settled_attempt_without_device_readback_fails_its_row(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
