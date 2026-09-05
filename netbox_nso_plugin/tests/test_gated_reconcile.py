@@ -312,6 +312,8 @@ class TestRealReconcilerGateFootprints(TestCase):
         self.assertEqual(state.bgp_peer_id, peer.pk)
 
     def test_bfd_gate_covers_native_and_overlay_creations(self):
+        from netbox_routing.models import BFDInterface
+
         from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.reconcile import reconcile_category
 
@@ -334,6 +336,13 @@ class TestRealReconcilerGateFootprints(TestCase):
             ctx = reconcile_category(self.device, self.mgmt, "bfd")
 
         self.assertEqual(ctx["_gate"]["bfd"], "ran")
+        native = BFDInterface.objects.get(interface=interface)
+        self.assertTrue(native.micro_bfd)
+        self.assertTrue(native.enabled)
+        profile = native.bfd_profile
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.name, "bfd-300-300-x3")  # shared, deduped by its timer-set
+        self.assertEqual((profile.min_tx_int, profile.min_rx_int, profile.multiplier), (300, 300, 3))
         state = NSOBFDInterfaceState.objects.get(management=self.mgmt, interface=interface)
         self.assertEqual(state.status, "imported")
 
