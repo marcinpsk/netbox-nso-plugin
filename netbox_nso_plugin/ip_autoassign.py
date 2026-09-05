@@ -603,7 +603,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                         },
                     )
 
-                failed_step = "create IPAddress"
+                failed_step = "select an available address"
                 available_str = pool.get_first_available_ip()
                 if available_str is None:
                     raise _AllocationNoOp(
@@ -617,6 +617,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
 
                 with transaction.atomic():
                     # Reserve the IPAddress so concurrent allocations do not collide.
+                    failed_step = "create IPAddress"
                     ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
                     ip_obj.assigned_object = interface
                     ip_obj.save()

@@ -19,7 +19,7 @@ from unittest.mock import patch
 from dcim.models import Cable, CableTermination, Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.db import connections
 from django.test import TestCase, TransactionTestCase
-from ipam.models import IPAddress, Prefix, Role
+from ipam.models import IPAddress, IPRange, Prefix, Role
 
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -846,6 +846,36 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
         self.assertIn("Failed to lock the pool and check the fill-empty guard", reason)
         self.assertNotIn("intent push", reason)
         assert not IPAddress.objects.filter(assigned_object_id=self.interface_a.pk).exists()
+
+    def test_a_failing_availability_query_names_the_selection_step(self):
+        """A database failure while the pool picks an address is a selection failure, not a create."""
+        from django.db import connection
+        from django.db.utils import OperationalError
+
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        fired: list[str] = []
+
+        def fail_the_availability_query(execute, sql, params, many, context):
+            # get_first_available_ip() reads the child IP ranges first; the locked pool reload does not.
+            if not fired and IPRange._meta.db_table in sql:
+                fired.append(sql)
+                raise OperationalError("the availability query failed")
+            return execute(sql, params, many, context)
+
+        result = {"allocated": [], "errors": [], "skipped": []}
+        with connection.execute_wrapper(fail_the_availability_query):
+            _reserve_single(self.interface_a, self.management_a, "ipv4", self.pool, result, push=False)
+
+        assert fired, "the availability computation never queried the child IP ranges"
+        self.assertEqual(result["allocated"], [])
+        self.assertEqual(len(result["errors"]), 1, result)
+        reason = result["errors"][0]["reason"]
+        self.assertIn("Failed to select an available address", reason)
+        self.assertNotIn("create IPAddress", reason)
+        assert not IPAddress.objects.filter(assigned_object_id=self.interface_a.pk).exists()
+        assert not NSOInterfaceIPState.objects.filter(interface=self.interface_a).exists()
 
 
 class TestRollbackAutoAssigned(TestCase):
