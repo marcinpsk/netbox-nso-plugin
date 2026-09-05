@@ -331,21 +331,25 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         rendered-membership change advances the scope revision, but the read is not apply
         evidence, so the in-flight sibling keeps ``deploying`` and its attempt identity.
         """
-        from netbox_nso_plugin.models import NSOSubinterfaceState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
         deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="deploying")
         attempt = deploying.apply_attempt_id
         confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
+        before = revision.revision
         reconcile_subinterface(self.device, {"interfaces": []})  # device stops reporting all subifs
         assert NSOSubinterfaceState.objects.filter(pk=deploying.pk).exists(), (
             "deploying (apply-in-flight) overlay deleted"
         )
         assert NSOSubinterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         deploying.refresh_from_db()
+        revision.refresh_from_db()
         assert deploying.status == "deploying"
         assert deploying.apply_attempt_id == attempt
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+        assert revision.revision == before + 1  # the vanished confirmed subinterface is a content change
 
     def _payload(self, name, dot1q):
         """The device read that exactly matches a fixture row's parent, dot1q and VRF."""
