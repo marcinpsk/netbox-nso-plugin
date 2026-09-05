@@ -576,7 +576,6 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         The vanished confirmed host still bears content, so the scope revision advances, but
         ``settles_deploying=False`` on the logging plan keeps the in-flight row untouched.
         """
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
         from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
 
@@ -591,10 +590,9 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         self.assertEqual((row.status, row.apply_attempt_id), ("deploying", attempt_id))
         payload = {"hosts": [], "local_levels": {"console_severity": "WARNING"}, "refresh_source": "test"}
 
-        plan = logging_reconcile_plan(self.device, payload)
-        self.assertTrue(plan.changes_content)  # the vanished confirmed host bears the content
-        with reconcile_transaction(plan):
-            _reconcile_logging_config(self.device, payload)
+        # the vanished confirmed host bears the content
+        self.assertTrue(logging_reconcile_plan(self.device, payload).changes_content)
+        _reconcile_logging_config(self.device, payload)
 
         row.refresh_from_db()
         host.refresh_from_db()
@@ -610,7 +608,6 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         A matching read is not apply evidence, and ``settles_deploying=False`` on the logging
         plan keeps the drift re-pend off the row, so it stays ``deploying`` with its attempt.
         """
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
         from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
 
@@ -625,10 +622,9 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         self.assertEqual((row.status, row.apply_attempt_id), ("deploying", attempt_id))
         payload = {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
 
-        plan = logging_reconcile_plan(self.device, payload)
-        self.assertTrue(plan.changes_content)  # the vanished confirmed host bears the content
-        with reconcile_transaction(plan):
-            _reconcile_logging_config(self.device, payload)
+        # the vanished confirmed host bears the content
+        self.assertTrue(logging_reconcile_plan(self.device, payload).changes_content)
+        _reconcile_logging_config(self.device, payload)
 
         row.refresh_from_db()
         host.refresh_from_db()
