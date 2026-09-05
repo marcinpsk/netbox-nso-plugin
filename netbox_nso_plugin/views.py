@@ -6826,7 +6826,6 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         from ipam.models import VLANGroup
 
-        from .intent_state import RendererTargetsChanged
         from .vlan_reconciler import VLANRescopeConflict, rescope_vlan
 
         state = get_object_or_404(NSOVLANState, pk=pk)
@@ -6834,8 +6833,8 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
         device_id = state.management.device_id
         try:
             action, vlan = rescope_vlan(state, group)
-        # A device that starts rendering the source VLAN during acquisition is the same refusal.
-        except (VLANRescopeConflict, RendererTargetsChanged):
+        # rescope_vlan converts every acquisition-time protocol error into this refusal.
+        except VLANRescopeConflict:
             messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
             return redirect(_device_nso_tab_url(device_id))
         if action == "noop":

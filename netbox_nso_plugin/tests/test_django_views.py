@@ -7165,11 +7165,11 @@ class TestNSOVLANRescopeView(ViewTestBase):
     """POST-level cover for the rescope refusals the acquisition can raise."""
 
     def test_rescope_refuses_when_a_device_attaches_before_acquisition(self):
-        """A late renderer target must return the refusal redirect, not an unhandled exception."""
+        """A device that attaches after the membership snapshot must get the refusal redirect."""
         from django.contrib.messages import get_messages
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin import intent_state, vlan_reconciler
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
@@ -7189,15 +7189,15 @@ class TestNSOVLANRescopeView(ViewTestBase):
             nso_instance=self.nso_instance,
             nso_device_name="late-rescope-router",
         )
-        original_footprint = intent_state.vlan_footprint
+        original_managed_device_ids = vlan_reconciler._rescope_managed_device_ids
         attached = False
         revisions_after_attach = {}
         late_state_pk = None
 
-        def attach_before_transaction(vlan_id, scopes, **kwargs):
+        def attach_before_acquisition(old_vlan):
             nonlocal attached, late_state_pk
-            footprint = original_footprint(vlan_id, scopes, **kwargs)
-            if not attached and vlan_id == source_vlan.pk:
+            device_ids = original_managed_device_ids(old_vlan)
+            if not attached and old_vlan.pk == source_vlan.pk:
                 attached = True
                 late_state = NSOVLANState(
                     management=late_mgmt,
@@ -7211,10 +7211,13 @@ class TestNSOVLANRescopeView(ViewTestBase):
                 revisions_after_attach.update(
                     dict(NSOIntentRevision.objects.values_list("id", "revision")),
                 )
-            # The stale footprint is what makes acquisition find the extra renderer target.
-            return footprint
+            # The stale membership snapshot is what makes the rescope find the extra device.
+            return device_ids
 
-        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=attach_before_transaction):
+        with patch(
+            "netbox_nso_plugin.vlan_reconciler._rescope_managed_device_ids",
+            side_effect=attach_before_acquisition,
+        ):
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
                 {"group": target_group.pk},
