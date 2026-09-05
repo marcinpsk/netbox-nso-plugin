@@ -30,7 +30,7 @@ def subinterface_reconcile_plan(device, payload: dict):
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
-        return ReconcileMutationPlan(MutationFootprint(), settles_deploying=False)
+        return ReconcileMutationPlan(MutationFootprint())
     raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
     items = raw_items if isinstance(raw_items, list) else []
     interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
@@ -53,7 +53,6 @@ def subinterface_reconcile_plan(device, payload: dict):
             ),
         ),
         changes_content=changes_content,
-        settles_deploying=False,
     )
 
 

@@ -456,8 +456,8 @@ class ReconcileMutationPlan:
 
     footprint: MutationFootprint
     changes_content: bool = False
-    # A read is never apply evidence, so a read plan must not settle a deploying row.
-    settles_deploying: bool = False
+    # A content-bearing read re-pends the deploying rows in its scope; families opt out per plan.
+    settles_deploying: bool = True
     validate_after_acquire: Callable[[], None] | None = field(default=None, compare=False, repr=False)
 
 

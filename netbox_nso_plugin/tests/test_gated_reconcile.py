@@ -27,7 +27,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
 
-from ._outbox_case import content_update
+from ._outbox_case import content_update, mirror_update
 
 User = get_user_model()
 
@@ -167,24 +167,32 @@ class TestGatedReconcileBehavior(_L2Base):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
-    def test_a_vanished_confirmed_sap_does_not_reset_a_deploying_sibling(self):
-        """A content-bearing read must not re-pend an in-flight sibling in the same scope."""
-        from netbox_nso_plugin.models import NSOApplyAttempt
+    def test_a_vanished_confirmed_sap_repends_a_deploying_sibling(self):
+        """A vanished confirmed SAP bears content, so every deploying row in the scope is stale."""
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision
 
         self._reconcile(_l2_payload(("TL", "TL2"), read_state=_rs(attempt_id=1)))
         deploying = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
         confirmed = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL2")
-        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
-        content_update(deploying, status="deploying", apply_attempt_id=attempt.pk)
+        content_update(deploying, status="accepted")
         content_update(confirmed, status="in_sync")
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
+        # Marked LAST, and lifecycle-only: a sibling content write re-pends a deploying row.
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt.pk)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="l2_sap")
+        before = revision.revision
+        deploying.refresh_from_db()
+        self.assertEqual((deploying.status, deploying.apply_attempt_id), ("deploying", attempt.pk))
 
         self._reconcile(_l2_payload(("TL",), read_state=_rs(attempt_id=2)))  # TL2 vanishes
 
         deploying.refresh_from_db()
         confirmed.refresh_from_db()
-        self.assertEqual(deploying.status, "deploying")
-        self.assertEqual(deploying.apply_attempt_id, attempt.pk)
+        revision.refresh_from_db()
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
         self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
 
     def test_missing_read_state_key_is_legacy_and_runs(self):
         self._prime()

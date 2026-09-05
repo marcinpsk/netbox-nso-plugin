@@ -570,15 +570,17 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(revision.revision, before + 1)
         self.assertTrue(sr.devices.filter(pk=self.device.pk).exists())  # association kept
 
-    def test_a_vanished_confirmed_route_does_not_reset_a_deploying_sibling(self):
-        """A content-bearing read must not re-pend an in-flight sibling in the same scope."""
+    def test_a_vanished_confirmed_route_repends_a_deploying_sibling(self):
+        """A vanished confirmed route bears content, so every deploying row in the scope is stale."""
         from uuid import uuid4
 
         from netbox_routing.models import StaticRoute
 
         self._make_mgmt(self.device, nso_device_name="sr-deploying-sibling")
-        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
         from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        from ._outbox_case import mirror_update
 
         both = self._route_payload(
             self._route_entry("10.66.0.0/16", "10.0.0.2"),
@@ -593,12 +595,17 @@ class TestReconcileStaticRoutes(TestCase):
         confirmed = NSOStaticRouteState.objects.get(
             management__device=self.device, static_route=StaticRoute.objects.get(prefix="10.77.0.0/16")
         )
-        attempt_id = uuid4()
-        deploying.status = "deploying"
-        deploying.apply_attempt_id = attempt_id
-        deploying.save(update_fields=["status", "apply_attempt_id"])
+        deploying.status = "accepted"
+        deploying.save(update_fields=["status"])
         confirmed.status = "in_sync"
         confirmed.save(update_fields=["status"])
+        attempt_id = uuid4()
+        # Marked LAST, and lifecycle-only: a sibling content write re-pends a deploying row.
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt_id)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
+        before = revision.revision
+        deploying.refresh_from_db()
+        self.assertEqual((deploying.status, deploying.apply_attempt_id), ("deploying", attempt_id))
 
         with self._auto_create_ctx(True):
             # 10.77.0.0/16 vanishes, so the read is content-bearing for the scope.
@@ -606,9 +613,11 @@ class TestReconcileStaticRoutes(TestCase):
 
         deploying.refresh_from_db()
         confirmed.refresh_from_db()
-        self.assertEqual(deploying.status, "deploying")
-        self.assertEqual(deploying.apply_attempt_id, attempt_id)
+        revision.refresh_from_db()
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
         self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
 
     def test_stale_owned_interface_route_does_not_advance_revision(self):
         """Removing an already excluded interface route changes lifecycle only."""
