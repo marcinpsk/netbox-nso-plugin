@@ -44,11 +44,11 @@ import hashlib
 import json
 
 import requests
-from django.db import transaction
 from django.test import LiveServerTestCase
 
 from ._settlement_adapter import FakeAdapter, SettlementStore
 from ._settlement_case import _AdapterDoubleMixin, _CarrierMixin, _make_device, _make_mgmt
+from ._static_route_case import _assign_and_accept, _edit_owned_route
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 ADAPTER_DEVICE_ID = 70
@@ -225,7 +225,7 @@ class TestTheIdentityEditSettlesEndToEnd(
 
     def _own(self):
         """The operator adds the device to the route — the production accept path."""
-        self.route.devices.add(self.device)
+        _assign_and_accept(self.route, self.device)
 
     def _state(self):
         return self.states.get(static_route=self.route, management=self.mgmt)
@@ -236,9 +236,7 @@ class TestTheIdentityEditSettlesEndToEnd(
         self.assertEqual(self._state().status, "in_sync", "the greenfield accept never settled")
 
         first_generation = self._state().intent_generation
-        self.route.prefix = "10.9.0.0/24"  # A → B: the identity itself moves
-        with transaction.atomic():
-            self.route.save()
+        _edit_owned_route(self.route, prefix="10.9.0.0/24")  # A → B: the identity itself moves
         self._drain()
 
         state = self._state()
@@ -272,9 +270,7 @@ class TestTheIdentityEditSettlesEndToEnd(
 
         # The device kept the pre-edit content: the apply reports A's fingerprint for B.
         self.store.apply_fingerprint = stale
-        self.route.prefix = "10.9.0.0/24"
-        with transaction.atomic():
-            self.route.save()
+        _edit_owned_route(self.route, prefix="10.9.0.0/24")
         self._drain()
 
         state = self._state()
@@ -287,9 +283,7 @@ class TestTheIdentityEditSettlesEndToEnd(
         self._drain()
 
         self.store.apply_generation_delta = -1  # the result names the generation before this one
-        self.route.prefix = "10.9.0.0/24"
-        with transaction.atomic():
-            self.route.save()
+        _edit_owned_route(self.route, prefix="10.9.0.0/24")
         self._drain()
 
         self.assertEqual(self._state().status, "accepted")
@@ -306,15 +300,11 @@ class TestTheIdentityEditSettlesEndToEnd(
         ``contract_tests/test_live_adapter_contract.py`` and in the adapter's own
         ``tests/api/test_static_route_pending_clear.py``.
         """
-        self.route.metric = 3
-        with transaction.atomic():
-            self.route.save()
+        _edit_owned_route(self.route, metric=3)
         self._own()
         self._drain()
 
-        self.route.metric = 5
-        with transaction.atomic():
-            self.route.save()
+        _edit_owned_route(self.route, metric=5)
         self._drain()
 
         entry = self.store.pushes[-1][1][0]

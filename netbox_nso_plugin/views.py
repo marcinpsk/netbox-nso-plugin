@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+import copy
 import logging
 import re
 from dataclasses import dataclass
@@ -3846,6 +3847,83 @@ class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
 
+    def post(self, request, **kwargs):
+        """Delete the confirmed frozen row set through one renderer plan."""
+        if "_confirm" not in request.POST:
+            return super().post(request, **kwargs)
+
+        from django.db.models import ProtectedError, RestrictedError
+        from django.utils.safestring import mark_safe
+        from django.utils.translation import gettext as _
+        from utilities.error_handlers import handle_protectederror
+        from utilities.exceptions import AbortRequest
+        from utilities.forms import BulkDeleteForm
+        from utilities.jobs import is_background_request, process_request_as_job
+
+        model = self.queryset.model
+        form = BulkDeleteForm(model, request.POST)
+        if not form.is_valid():
+            table = self.table(self.queryset.none(), orderable=False)
+            return render(
+                request,
+                self.template_name,
+                {
+                    "model": model,
+                    "form": form,
+                    "table": table,
+                    "return_url": self.get_return_url(request),
+                    **self.get_extra_context(request),
+                },
+            )
+        if request.POST.get("_all"):
+            queryset = model.objects.all()
+            if self.filterset is not None:
+                queryset = self.filterset(request.GET, queryset, request=request).qs
+        else:
+            queryset = self.queryset.filter(pk__in=form.cleaned_data["pk"])
+        if form.cleaned_data["background_job"]:
+            job_name = _("Bulk delete {count} {object_type}").format(
+                count=len(form.cleaned_data["pk"]),
+                object_type=model._meta.verbose_name_plural,
+            )
+            if process_request_as_job(self.__class__, request, name=job_name):
+                return redirect(self.get_return_url(request))
+
+        rows = list(queryset.order_by("pk"))
+        for obj in rows:
+            if hasattr(obj, "snapshot"):
+                obj.snapshot()
+            obj._changelog_message = form.cleaned_data.get("changelog_message")
+        try:
+            from .renderer_writer import (
+                RendererMutationPlan,
+                planned_delete,
+                renderer_mirror_writes,
+                renderer_writes,
+            )
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(obj) for obj in rows))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                for obj in rows:
+                    writer.delete(obj)
+                    if is_background_request(request):
+                        request.job.logger.info(f"Deleted {obj}")
+        except (ProtectedError, RestrictedError) as exc:
+            handle_protectederror(queryset, request, exc)
+        except AbortRequest as exc:
+            messages.error(request, mark_safe(exc.message))
+        else:
+            msg = _("Deleted {count} {object_type}").format(
+                count=len(rows),
+                object_type=model._meta.verbose_name_plural,
+            )
+            if is_background_request(request):
+                request.job.logger.info(msg)
+                return None
+            messages.success(request, msg)
+        return redirect(self.get_return_url(request))
+
 
 class NSOInterfaceStateView(generic.ObjectView):
     """Detail view for an NSOInterfaceState record."""
@@ -3858,6 +3936,58 @@ class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
 
     template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOInterfaceState.objects.all()
+
+    def post(self, request, *args, **kwargs):
+        """Delete one state through its exact renderer plan."""
+        from django.db.models import ProtectedError, RestrictedError
+        from django.utils.safestring import mark_safe
+        from utilities.error_handlers import handle_protectederror
+        from utilities.exceptions import AbortRequest
+        from utilities.forms import DeleteForm
+
+        from .renderer_writer import RendererMutationPlan, planned_delete, renderer_mirror_writes, renderer_writes
+
+        obj = self.get_object(**kwargs)
+        form = DeleteForm(request.POST, instance=obj)
+        if not form.is_valid():
+            return render(
+                request,
+                self.template_name,
+                {
+                    "object": obj,
+                    "form": form,
+                    "return_url": self.get_return_url(request, obj),
+                    **self.get_extra_context(request, obj),
+                },
+            )
+
+        if hasattr(obj, "snapshot"):
+            obj.snapshot()
+        obj._changelog_message = form.cleaned_data.pop("changelog_message", "")
+        label = str(obj)
+        try:
+            plan = RendererMutationPlan.build(deletes=(planned_delete(obj),))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                writer.delete(obj)
+        except (ProtectedError, RestrictedError) as exc:
+            handle_protectederror([obj], request, exc)
+            return redirect(obj.get_absolute_url())
+        except AbortRequest as exc:
+            messages.error(request, mark_safe(exc.message))
+            return redirect(obj.get_absolute_url())
+
+        messages.success(request, f"Deleted {self.queryset.model._meta.verbose_name} {label}")
+        return_url = form.cleaned_data.get("return_url")
+        from django.utils.http import url_has_allowed_host_and_scheme
+
+        if return_url and url_has_allowed_host_and_scheme(
+            return_url,
+            allowed_hosts={request.get_host()},
+            require_https=request.is_secure(),
+        ):
+            return redirect(return_url)
+        return redirect(self.get_return_url(request, obj))
 
 
 # ── Accept workflow ───────────────────────────────────────────────────────────
@@ -3888,17 +4018,26 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         Accepting a value that matches the device → in_sync (nothing to apply);
         a differing value → accepted, and the post_save signal pushes intent.
         """
-        state = get_object_or_404(NSOInterfaceState, pk=pk)
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at"])
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        msg = f"Accepted {state.attribute} on {state.interface}."
+        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(state.status)
+        candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields),),
+            planned_at=candidate.accepted_at,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate, update_fields=fields)
+
+        msg = f"Accepted {candidate.attribute} on {candidate.interface}."
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return JsonResponse({"status": "ok", "message": msg})
         messages.success(request, msg)
-        return redirect(_device_nso_tab_url(state.interface.device_id))
+        return redirect(_device_nso_tab_url(candidate.interface.device_id))
 
 
 class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
@@ -3912,22 +4051,31 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):
         """Copy the device value onto the interface and mark the state in_sync."""
-        from .intent_state import footprint_for_instance, intent_transaction
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
         from .signals import suppress_intent_push
 
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         iface = state.interface
         dev_val = state.nso_value
-        with intent_transaction(footprint_for_instance(iface)), suppress_intent_push():
-            if state.attribute == "description":
-                iface.description = dev_val or ""
-                iface.save(update_fields=["description"])
-            elif state.attribute == "enabled":
-                iface.enabled = str(dev_val).lower() == "true"
-                iface.save(update_fields=["enabled"])
-            state.status = "in_sync"
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        iface_candidate = copy.copy(iface)
+        state_candidate = copy.copy(state)
+        saves = []
+        if state.attribute == "description":
+            iface_candidate.description = dev_val or ""
+            saves.append(planned_save(iface_candidate, update_fields=("description",)))
+        elif state.attribute == "enabled":
+            iface_candidate.enabled = str(dev_val).lower() == "true"
+            saves.append(planned_save(iface_candidate, update_fields=("enabled",)))
+        state_candidate.status = "in_sync"
+        state_candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        saves.append(planned_save(state_candidate, update_fields=state_fields))
+        plan = RendererMutationPlan.build(saves=saves, planned_at=state_candidate.accepted_at)
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer, suppress_intent_push():
+            if state.attribute in {"description", "enabled"}:
+                writer.save(iface_candidate, update_fields=(state.attribute,))
+            writer.save(state_candidate, update_fields=state_fields)
 
         msg = f"Adopted device value for {state.attribute} on {iface}."
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -3939,33 +4087,51 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
 class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
     """Inline-edit a managed interface attribute (description / enabled) from the NSO tab.
 
-    Writes the new value onto the ``dcim.Interface`` and saves it, which fires the
-    Decision-G signal chain (:func:`signals._push_intent_on_interface_edit`) exactly
-    as editing the interface through the NetBox UI would: the attribute becomes
-    NetBox-owned intent and is pushed to the adapter. AJAX-only — returns JSON so the
-    tab's inline editor can refresh just the rows without collapsing the category.
+    One exact writer changes the native value and acquires the matching overlay.
+    AJAX returns JSON so the tab can refresh rows without collapsing the category.
     """
 
     _EDITABLE = ("description", "enabled")
     _TRUE = ("true", "1", "on", "yes")
 
     def post(self, request, pk):
-        """Apply the new value to the interface; Decision-G handles ownership + push."""
+        """Apply and acquire the new value through one frozen mutation plan."""
         state = get_object_or_404(NSOInterfaceState, pk=pk)
         attribute = state.attribute
         if attribute not in self._EDITABLE:
             return JsonResponse({"status": "error", "message": f"{attribute} is not editable here."}, status=400)
 
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+        from .summary import matches_device_value
+
         iface = state.interface
         raw = request.POST.get("value", "")
+        iface_candidate = copy.copy(iface)
         if attribute == "description":
-            iface.description = raw.strip()
+            iface_candidate.description = raw.strip()
         else:  # enabled
-            iface.enabled = raw.strip().lower() in self._TRUE
-        with transaction.atomic():
-            iface.save(update_fields=[attribute])
+            iface_candidate.enabled = raw.strip().lower() in self._TRUE
+        state_candidate = copy.copy(state)
+        new_value = getattr(iface_candidate, attribute)
+        state_candidate.status = (
+            "in_sync" if matches_device_value(attribute, new_value, state_candidate.nso_value) else "accepted"
+        )
+        if state_candidate.accepted_at is None:
+            state_candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(iface_candidate, update_fields=(attribute,)),
+                planned_save(state_candidate, update_fields=state_fields),
+            ),
+            planned_at=state_candidate.accepted_at,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(iface_candidate, update_fields=(attribute,))
+            writer.save(state_candidate, update_fields=state_fields)
 
-        return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface.name}."})
+        return JsonResponse({"status": "ok", "message": f"Updated {attribute} on {iface_candidate.name}."})
 
 
 def _unique_collision_response(obj, editable):
@@ -4264,135 +4430,330 @@ def _subinterface_errors(obj):
     return errors
 
 
-def _sync_native_bfd(obj):
-    """Keep netbox-routing's native BFD row aligned with an edited overlay."""
-    try:
-        from netbox_routing.models import BFDInterface, BFDProfile
-    except ImportError:
-        return
+def _save_owned_bfd_edit(obj, old_values):
+    """Claim one BFD edit and apply its exact native and overlay write set."""
+    import copy
 
-    from .bfd_reconciler import _get_or_create_bfd_profile
+    from netbox_routing.models import BFDInterface, BFDProfile
 
-    profile = _get_or_create_bfd_profile(
-        {"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier},
-        BFDProfile,
-        {},
+    from . import status_machine as sm
+    from .bfd_reconciler import _profile_values
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    saves = []
+    operations = []
+
+    profile_values = _profile_values({"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier})
+    profile = None
+    if profile_values is not None:
+        name, tx, rx, multiplier = profile_values
+        profile = BFDProfile.objects.filter(name=name).first()
+        if profile is None:
+            profile = BFDProfile(name=name, min_tx_int=tx, min_rx_int=rx, multiplier=multiplier)
+            saves.append(planned_save(profile, force_insert=True, natural_key=("name",)))
+            operations.append((profile, None, True))
+
+    current_native = BFDInterface.objects.filter(interface=obj.interface).first()
+    native = (
+        BFDInterface(interface=obj.interface, bfd_profile=profile, micro_bfd=obj.micro_bfd, enabled=True)
+        if current_native is None
+        else copy.copy(current_native)
     )
-    native, created = BFDInterface.objects.get_or_create(
-        interface=obj.interface,
-        defaults={"bfd_profile": profile, "micro_bfd": obj.micro_bfd, "enabled": True},
-    )
-    if not created and (
-        native.bfd_profile_id != (profile.pk if profile else None) or native.micro_bfd != obj.micro_bfd
-    ):
+    native_fields = None
+    native_created = current_native is None
+    if current_native is not None:
         native.bfd_profile = profile
         native.micro_bfd = obj.micro_bfd
-        native.save(update_fields=["bfd_profile", "micro_bfd"])
-
-
-def _sync_native_ospf_instance(obj):
-    """Keep the native OSPF instance aligned with an edited overlay."""
-    from .signals import suppress_intent_push
-
-    native = obj.ospf_instance
-    vrf_model = native._meta.get_field("vrf").remote_field.model
-    vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
-    native.router_id = obj.router_id
-    native.vrf = vrf
-    with suppress_intent_push():
-        native.save(update_fields=["router_id", "vrf"])
-
-
-def _sync_native_ospf_interface(obj):
-    """Mirror the whole owned overlay row into its native OSPF interface."""
-    from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
-
-    from .signals import suppress_intent_push
-    from .template_content import _OSPF_AUTH_MAP, _resolve_ospf_area
-
-    native = OSPFInterface.objects.get(interface=obj.interface)
-    native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
-    native.area = _resolve_ospf_area(OSPFArea, obj.area_id)
-    native.passive = obj.passive
-    native.priority = obj.priority
-    native.cost = obj.cost
-    native.network_type = obj.network_type or None
-    native.authentication = _OSPF_AUTH_MAP.get(obj.auth_type or "")
-    with suppress_intent_push():
-        native.save(
-            update_fields=[
-                "instance",
-                "area",
-                "passive",
-                "priority",
-                "cost",
-                "network_type",
-                "authentication",
-            ]
+        if (
+            current_native.bfd_profile_id != (profile.pk if profile is not None else None)
+            or current_native.micro_bfd != obj.micro_bfd
+        ):
+            native_fields = ("bfd_profile", "micro_bfd")
+        else:
+            native = None
+    if native is not None:
+        saves.append(
+            planned_save(
+                native,
+                update_fields=native_fields,
+                force_insert=native_created,
+                natural_key=("interface",),
+            )
         )
+        operations.append((native, native_fields, native_created))
+
+    state = copy.copy(obj)
+    if not sm.is_owned(state.status):
+        state.accepted_at = planned_at
+    state.status = sm.on_operator_edit(state.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(state, field_name) != old_value
+    }
+    state_fields.add("status")
+    if state.accepted_at is not None:
+        state_fields.add("accepted_at")
+    saves.append(planned_save(state, update_fields=state_fields))
+    operations.append((state, state_fields, False))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields, force_insert in operations:
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
-def _sync_native_isis_instance(obj):
-    """Mirror editable process intent into the native IS-IS instance."""
-    from .signals import suppress_intent_push
+def _save_owned_static_route_edit(obj, old_values):
+    """Apply one shared static-route edit and re-arm its owned overlays exactly."""
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .signals import _STATIC_ROUTE_TRANSITION_FIELDS, _arm_static_route_generation
 
-    native = obj.isis_instance
-    fields = ("net", "is_type", "metric_style", "overload_bit", "fast_reroute", "microloop_avoidance")
-    for name in fields:
-        setattr(native, name, getattr(obj, name))
-    with suppress_intent_push():
-        native.save(update_fields=list(fields))
+    route = obj.static_route
+    native_fields = tuple(name for name, value in old_values.items() if getattr(route, name) != value)
+    saves = [planned_save(route, update_fields=native_fields)]
+    operations = [(route, native_fields)]
+    planned_at = timezone.now()
+    for state in NSOStaticRouteState.objects.filter(static_route=route).select_related("management").order_by("pk"):
+        if state.pk != obj.pk and not sm.is_owned(state.status):
+            continue
+        candidate = copy.copy(state)
+        candidate.status = sm.on_operator_edit(candidate.status)
+        fields = list(_STATIC_ROUTE_TRANSITION_FIELDS)
+        if state.pk == obj.pk and candidate.accepted_at is None:
+            candidate.accepted_at = planned_at
+            fields.append("accepted_at")
+        candidate.nso_vrf = route.vrf.name if route.vrf else ""
+        candidate.nso_prefix = str(route.prefix or "")
+        candidate.nso_next_hop = str(route.next_hop or "")
+        _arm_static_route_generation(candidate)
+        saves.append(planned_save(candidate, update_fields=fields))
+        operations.append((candidate, fields))
 
-
-def _sync_native_isis_interface(obj):
-    """Mirror editable interface intent into the native IS-IS interface."""
-    from netbox_routing.models import ISISInstance
-
-    from .signals import suppress_intent_push
-
-    native = obj.isis_interface
-    native.instance = ISISInstance.objects.get(device=obj.interface.device, process_tag=obj.process_tag)
-    fields = (
-        "circuit_type",
-        "network_type",
-        "metric",
-        "passive",
-        "bfd_enabled",
-        "frr_enabled",
-        "frr_protection",
-    )
-    for name in fields:
-        setattr(native, name, getattr(obj, name))
-    with suppress_intent_push():
-        native.save(update_fields=["instance", *fields])
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields in operations:
+            writer.save(instance, update_fields=update_fields)
 
 
-def _sync_native_bgp_peer(obj):
-    """Mirror remote-AS and admin state into the linked native BGP peer."""
-    from ipam.models import ASN
-
-    from .bgp_reconciler import _get_or_create_asn
-    from .signals import suppress_intent_push
-
-    native = obj.bgp_peer
-    native.remote_as = _get_or_create_asn(obj.remote_as_str, ASN) if obj.remote_as_str else None
-    native.enabled = obj.enabled
-    with suppress_intent_push():
-        native.save(update_fields=["remote_as", "enabled"])
-
-
-def _sync_native_redistribution(obj):
-    """Mirror route-map and metric policy into the linked native redistribution."""
+def _save_owned_redistribution_edit(obj, old_values):
+    """Apply one destination-specific redistribution edit through an exact plan."""
     from netbox_routing.models import RouteMap
 
-    from .signals import suppress_intent_push
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
-    native = obj.redistribution
+    planned_at = timezone.now()
+    native = copy.copy(obj.redistribution)
     native.route_map = RouteMap.objects.filter(name=obj.route_map).first() if obj.route_map else None
     native.metric = obj.metric
     native.metric_type = obj.metric_type
-    with suppress_intent_push():
-        native.save(update_fields=["route_map", "metric", "metric_type"])
+    native_fields = ("route_map", "metric", "metric_type")
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(native, update_fields=native_fields),
+            planned_save(candidate, update_fields=state_fields),
+        ),
+        planned_at=planned_at,
+    )
+    with renderer_writes(plan) as writer:
+        writer.save(native, update_fields=native_fields)
+        writer.save(candidate, update_fields=state_fields)
+
+
+def _save_owned_ospf_edit(obj, key, old_values):
+    """Apply one OSPF process or interface edit through an exact plan."""
+    from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+    from . import status_machine as sm
+    from .ospf_reconciler import _area_candidates
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .template_content import _OSPF_AUTH_MAP
+
+    planned_at = timezone.now()
+    saves = []
+    operations = []
+    if key == "ospf_instance":
+        native = copy.copy(obj.ospf_instance)
+        vrf_model = native._meta.get_field("vrf").remote_field.model
+        native.router_id = obj.router_id
+        native.vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
+        native_fields = ("router_id", "vrf")
+        saves.append(planned_save(native, update_fields=native_fields))
+        operations.append((native, native_fields, False))
+    else:
+        current_native = OSPFInterface.objects.get(interface=obj.interface)
+        native = copy.copy(current_native)
+        area = OSPFArea.objects.filter(area_id__in=_area_candidates(obj.area_id)).first()
+        if area is None:
+            area = OSPFArea(area_id=obj.area_id, area_type="standard")
+            saves.append(planned_save(area, force_insert=True, natural_key=("area_id",)))
+            operations.append((area, None, True))
+        native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
+        native.area = area
+        native.passive = obj.passive
+        native.priority = obj.priority
+        native.cost = obj.cost
+        native.network_type = obj.network_type or None
+        native.authentication = _OSPF_AUTH_MAP.get(obj.auth_type or "")
+        native_fields = (
+            "instance",
+            "area",
+            "passive",
+            "priority",
+            "cost",
+            "network_type",
+            "authentication",
+        )
+        saves.append(planned_save(native, update_fields=native_fields))
+        operations.append((native, native_fields, False))
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    saves.append(planned_save(candidate, update_fields=state_fields))
+    operations.append((candidate, state_fields, False))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields, force_insert in operations:
+            writer.save(
+                instance,
+                update_fields=update_fields,
+                force_insert=force_insert,
+            )
+
+
+def _save_owned_isis_edit(obj, key, old_values):
+    """Claim one IS-IS edit and update its graph root through one exact plan."""
+    import copy
+
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+
+    if key == "isis_instance":
+        native = copy.copy(candidate.isis_instance)
+        native_fields = (
+            "net",
+            "is_type",
+            "metric_style",
+            "overload_bit",
+            "fast_reroute",
+            "microloop_avoidance",
+        )
+    else:
+        from netbox_routing.models import ISISInstance
+
+        native = copy.copy(candidate.isis_interface)
+        native.instance = ISISInstance.objects.get(
+            device=candidate.interface.device,
+            process_tag=candidate.process_tag,
+        )
+        native_fields = (
+            "instance",
+            "circuit_type",
+            "network_type",
+            "metric",
+            "passive",
+            "bfd_enabled",
+            "frr_enabled",
+            "frr_protection",
+        )
+    for name in native_fields:
+        if name != "instance":
+            setattr(native, name, getattr(candidate, name))
+
+    state_fields = {
+        field_name
+        for field_name, old_value in old_values.items()
+        if hasattr(candidate, field_name) and getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(native, update_fields=native_fields),
+            planned_save(candidate, update_fields=state_fields),
+        ),
+        planned_at=planned_at,
+    )
+    with renderer_writes(plan) as writer:
+        writer.save(native, update_fields=native_fields)
+        writer.save(candidate, update_fields=state_fields)
+
+
+def _save_owned_bgp_edit(obj, old_values):
+    """Claim one BGP peer edit and update its native root through an exact plan."""
+    from ipam.models import ASN, RIR
+
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    saves = []
+    operations = []
+    remote_as = None
+    if obj.remote_as_str:
+        asn_number = int(obj.remote_as_str)
+        remote_as = ASN.objects.filter(asn=asn_number).first()
+        if remote_as is None:
+            rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
+            if rir is None:
+                rir = RIR(name="NSO Auto-Discovered", slug="nso-auto-discovered", is_private=True)
+                saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
+                operations.append((rir, None, True))
+            remote_as = ASN(asn=asn_number, rir=rir)
+            saves.append(planned_save(remote_as, force_insert=True, natural_key=("asn",)))
+            operations.append((remote_as, None, True))
+
+    native = copy.copy(obj.bgp_peer)
+    native.remote_as = remote_as
+    native.enabled = obj.enabled
+    native_fields = ("remote_as", "enabled")
+    saves.append(planned_save(native, update_fields=native_fields))
+    operations.append((native, native_fields, False))
+
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    state_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    saves.append(planned_save(candidate, update_fields=state_fields))
+    operations.append((candidate, state_fields, False))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    with renderer_writes(plan) as writer:
+        for instance, update_fields, force_insert in operations:
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
 def _owned_overlay_edit_footprint(obj, key):
@@ -4405,7 +4766,6 @@ def _owned_overlay_edit_footprint(obj, key):
         "ospf_interface": getattr(obj, "ospf_interface", None),
         "isis_instance": getattr(obj, "isis_instance", None),
         "isis_interface": getattr(obj, "isis_interface", None),
-        "bgp_peer": getattr(obj, "bgp_peer", None),
         "redistribution": getattr(obj, "redistribution", None),
         "static_route": getattr(obj, "static_route", None),
     }.get(key)
@@ -4427,8 +4787,8 @@ def _clear_apply_attempt(obj, update_fields) -> None:
     update_fields.add("apply_attempt_id")
 
 
-def _save_owned_svi_edit(obj, old_values):
-    """Claim one edited SVI overlay through its exact writer plan."""
+def _save_owned_overlay_only_edit(obj, old_values):
+    """Claim one edited overlay that has no matching native write."""
     import copy
 
     from . import status_machine as sm
@@ -4455,10 +4815,95 @@ def _save_owned_svi_edit(obj, old_values):
         writer.save(candidate, update_fields=update_fields)
 
 
+def _write_owned_interface_mtu(candidate, update_fields):
+    """Write one MTU ownership claim and its native interface value."""
+    import copy
+
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+    saves = []
+    interface_candidate = None
+    if candidate.l2_mtu is not None:
+        clamped = min(int(candidate.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
+        if candidate.interface.mtu != clamped:
+            interface_candidate = copy.copy(candidate.interface)
+            interface_candidate.mtu = clamped
+            saves.append(planned_save(interface_candidate, update_fields=("mtu",)))
+    saves.append(planned_save(candidate, update_fields=update_fields))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=candidate.accepted_at)
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        if interface_candidate is not None:
+            writer.save(interface_candidate, update_fields=("mtu",))
+        writer.save(candidate, update_fields=update_fields)
+
+
+def _save_owned_interface_mtu_edit(obj, old_values):
+    """Claim an inline MTU edit and write its native value through one plan."""
+    import copy
+
+    from . import status_machine as sm
+    from .renderer_writer import IntentPlanStaleError
+
+    edited_values = {
+        field_name: getattr(obj, field_name)
+        for field_name, old_value in old_values.items()
+        if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
+    }
+    current = obj
+    for attempt in range(2):
+        candidate = copy.copy(current)
+        for field_name, value in edited_values.items():
+            setattr(candidate, field_name, value)
+        if not sm.is_owned(candidate.status):
+            candidate.accepted_at = timezone.now()
+        candidate.status = sm.on_operator_edit(candidate.status)
+        update_fields = {*edited_values, "status"}
+        if candidate.accepted_at is not None:
+            update_fields.add("accepted_at")
+        try:
+            _write_owned_interface_mtu(candidate, update_fields)
+            return
+        except IntentPlanStaleError:
+            if attempt:
+                raise
+            current = type(obj).objects.get(pk=obj.pk)
+
+
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
-    if key == "svi":
-        _save_owned_svi_edit(obj, old_values)
+    if key in {
+        "logging_host",
+        "logging_levels",
+        "snmp_community",
+        "snmp_host",
+        "snmp_system_info",
+        "svi",
+        "subinterface",
+    }:
+        _save_owned_overlay_only_edit(obj, old_values)
+        return
+    if key == "bfd":
+        _save_owned_bfd_edit(obj, old_values)
+        return
+    if key == "static_route":
+        _save_owned_static_route_edit(obj, old_values)
+        return
+    if key == "redistribution":
+        _save_owned_redistribution_edit(obj, old_values)
+        return
+    if key in {"ospf_instance", "ospf_interface"}:
+        _save_owned_ospf_edit(obj, key, old_values)
+        return
+    if key in {"isis_instance", "isis_interface"}:
+        _save_owned_isis_edit(obj, key, old_values)
+        return
+    if key == "bgp_peer":
+        _save_owned_bgp_edit(obj, old_values)
+        return
+    if key == "interface_mtu":
+        _save_owned_interface_mtu_edit(obj, old_values)
         return
 
     from . import status_machine as sm
@@ -4468,31 +4913,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
         if not sm.is_owned(obj.status):
             obj.accepted_at = timezone.now()
         obj.status = sm.on_operator_edit(obj.status)
-        if key == "interface_mtu" and obj.l2_mtu is not None:
-            iface = obj.interface
-            clamped = min(int(obj.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
-            if iface.mtu != clamped:
-                iface.mtu = clamped
-                iface.save(update_fields=["mtu"])
-        if key == "bfd":
-            _sync_native_bfd(obj)
-        if key == "ospf_instance":
-            _sync_native_ospf_instance(obj)
-        if key == "ospf_interface":
-            _sync_native_ospf_interface(obj)
-        if key == "isis_instance":
-            _sync_native_isis_instance(obj)
-        if key == "isis_interface":
-            _sync_native_isis_interface(obj)
-        if key == "bgp_peer":
-            _sync_native_bgp_peer(obj)
-        if key == "redistribution":
-            _sync_native_redistribution(obj)
-        if key == "static_route":
-            from .signals import suppress_intent_push
-
-            with suppress_intent_push():
-                obj.static_route.save(update_fields=["metric", "permanent", "tag"])
         update_fields = {
             field_name
             for field_name, old_value in old_values.items()
@@ -4503,14 +4923,6 @@ def _save_owned_overlay_edit(obj, key, old_values):
         if obj.accepted_at is not None:
             update_fields.add("accepted_at")
         obj.save(update_fields=update_fields)
-        if key == "static_route":
-            from .signals import _transition_static_route_content
-
-            # The native save above ran suppressed and only THIS overlay was saved, but the
-            # fork object is shared by every device the route is on — editing through one
-            # device's row silently changes the others' content. Re-arm them all.
-            _transition_static_route_content(obj.static_route)
-            obj.refresh_from_db()
 
 
 def _route_map_name_errors(state, old_name):
@@ -4528,8 +4940,19 @@ def _route_map_name_errors(state, old_name):
         route_map._meta.get_field("name").clean(state.object_name, route_map)
     except ValidationError as exc:
         errors["object_name"] = [str(message) for message in exc.messages]
-    if type(route_map).objects.filter(name__iexact=state.object_name).exclude(pk=route_map.pk).exists():
-        errors.setdefault("object_name", []).append("A route map with this name already exists.")
+    old_class_ids = tuple(
+        NSORoutePolicyObjectClass.objects.filter(
+            family="route_map",
+            object_name__iexact=old_name,
+        ).values_list("pk", flat=True)
+    )
+    for field_name, messages_list in _route_map_name_collision_errors(
+        type(route_map),
+        route_map.pk,
+        state.object_name,
+        old_class_ids,
+    ).items():
+        errors.setdefault(field_name, []).extend(messages_list)
 
     attached = NSORoutePolicyState.objects.filter(
         content_type_id=state.content_type_id,
@@ -4547,13 +4970,6 @@ def _route_map_name_errors(state, old_name):
     ):
         errors.setdefault("object_name", []).append("A route-map row with this name already exists on a device.")
 
-    old_class = NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name)
-    if old_class.exists() and (
-        NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=state.object_name)
-        .exclude(pk__in=old_class.values("pk"))
-        .exists()
-    ):
-        errors.setdefault("object_name", []).append("A route-map classification with this name already exists.")
     return errors
 
 
@@ -4588,124 +5004,152 @@ def _route_map_rename_dependents(route_map, old_name):
     return bgp_states, redistribution_states, dependent_groups
 
 
+def _route_map_name_collision_errors(route_map_model, route_map_pk, new_name, class_ids):
+    """Return case-insensitive native and classification rename conflicts."""
+    from .models import NSORoutePolicyObjectClass
+
+    if route_map_model.objects.filter(name__iexact=new_name).exclude(pk=route_map_pk).exists():
+        return {"object_name": ["A route map with this name already exists."]}
+    if class_ids and (
+        NSORoutePolicyObjectClass.objects.filter(
+            family="route_map",
+            object_name__iexact=new_name,
+        )
+        .exclude(pk__in=class_ids)
+        .exists()
+    ):
+        return {"object_name": ["A route-map classification with this name already exists."]}
+    return {}
+
+
+def _route_map_name_edit_operations(state, old_name, planned_at):
+    """Build one prospective route-map rename and its dependent targets."""
+    import copy
+
+    from . import signals
+    from . import status_machine as sm
+    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .renderer_writer import RendererMutationPlan, planned_save
+
+    assigned = state.assigned_object
+    route_map = type(assigned).objects.get(pk=assigned.pk)
+    new_name = state.object_name
+    bgp_states, redistribution_states, dependent_groups = _route_map_rename_dependents(route_map, old_name)
+    attached = list(
+        NSORoutePolicyState.objects.filter(
+            content_type_id=state.content_type_id,
+            object_id=state.object_id,
+        ).order_by("pk")
+    )
+    classes = list(
+        NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
+    )
+    class_ids = tuple(policy_class.pk for policy_class in classes)
+    attached_ids = tuple(attached_state.pk for attached_state in attached)
+    attached_management_ids = tuple(attached_state.management_id for attached_state in attached)
+    fallback_redistribution = [
+        row
+        for row in redistribution_states
+        if row.redistribution_id is None and row.route_map.casefold() == old_name.casefold()
+    ]
+    operations = []
+    for attached_state in attached:
+        candidate = copy.copy(attached_state)
+        candidate.object_name = new_name
+        update_fields = {"object_name"}
+        if candidate.pk == state.pk:
+            if not sm.is_owned(candidate.status):
+                candidate.accepted_at = planned_at
+            candidate.status = sm.on_operator_edit(candidate.status)
+            candidate.apply_attempt_id = None
+            update_fields.update({"status", "accepted_at", "apply_attempt_id"})
+        operations.append((candidate, tuple(sorted(update_fields))))
+    for policy_class in classes:
+        candidate = copy.copy(policy_class)
+        candidate.object_name = new_name
+        operations.append((candidate, ("object_name",)))
+    route_map_candidate = copy.copy(route_map)
+    route_map_candidate.name = new_name
+    operations.append((route_map_candidate, ("name",)))
+    for redistribution_state in fallback_redistribution:
+        candidate = copy.copy(redistribution_state)
+        candidate.route_map = new_name
+        operations.append((candidate, ("route_map",)))
+
+    def validate_after_acquire():
+        errors = _route_map_name_collision_errors(type(route_map), route_map.pk, new_name, class_ids)
+        if not errors and (
+            NSORoutePolicyState.objects.filter(
+                management_id__in=attached_management_ids,
+                family="route_map",
+                object_name__iexact=new_name,
+            )
+            .exclude(pk__in=attached_ids)
+            .exists()
+        ):
+            errors = {"object_name": ["A route map with this name already exists."]}
+        if errors:
+            raise _IntentTransactionNoOp(errors)
+
+    plan = RendererMutationPlan.build(
+        saves=(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
+        planned_at=planned_at,
+        validate_after_acquire=validate_after_acquire,
+    )
+    dependent_route_policy_targets = set()
+    for family, name in dependent_groups:
+        dependent_route_policy_targets.update(
+            NSORoutePolicyState.objects.filter(
+                family=family,
+                object_name__iexact=name,
+                status__in=signals._OWNED_PUSH_STATUSES,
+                management__adapter_device_id__isnull=False,
+            ).values_list("management__device_id", flat=True)
+        )
+    targets = (
+        dependent_route_policy_targets
+        | {
+            attached_state.management.device_id
+            for attached_state in attached
+            if attached_state.management.adapter_device_id is not None
+        },
+        {row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None},
+        {
+            (row.management.device_id, row.dest_protocol)
+            for row in redistribution_states
+            if row.management.adapter_device_id is not None
+        },
+    )
+    return plan, operations, targets
+
+
+def _route_map_name_edit_plan(state, old_name):
+    """Freeze a shared route-map rename without changing the database."""
+    plan, _operations, _targets = _route_map_name_edit_operations(state, old_name, timezone.now())
+    return plan
+
+
 def _save_route_map_name_edit(state, old_name):
     """Atomically rename a shared route map and refresh every dependent intent scope."""
     from django.db import IntegrityError
 
     from . import signals
-    from . import status_machine as sm
-    from .intent_state import (
-        MutationFootprint,
-        footprint_for_instance,
-        intent_transaction,
-        route_policy_footprint,
-    )
-    from .models import NSORedistributionState, NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .renderer_writer import renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
-    route_map = state.assigned_object
-    new_name = state.object_name
-    bgp_states, redistribution_states, dependent_groups = _route_map_rename_dependents(route_map, old_name)
-    groups = {("route_map", old_name), ("route_map", new_name), *dependent_groups}
-    footprint = MutationFootprint.merge(
-        route_policy_footprint(groups),
-        *(footprint_for_instance(row) for row in (*bgp_states, *redistribution_states)),
-    )
+    plan, operations, targets = _route_map_name_edit_operations(state, old_name, timezone.now())
+    route_policy_targets, bgp_targets, redistribution_targets = targets
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     try:
-        with intent_transaction(footprint):
-            attached = list(
-                NSORoutePolicyState.objects.filter(
-                    content_type_id=state.content_type_id,
-                    object_id=state.object_id,
-                ).order_by("pk")
-            )
-            classes = list(
-                NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by(
-                    "pk"
-                )
-            )
-            fallback_redistribution = list(
-                NSORedistributionState.objects.filter(
-                    pk__in=[row.pk for row in redistribution_states],
-                    redistribution__isnull=True,
-                    route_map__iexact=old_name,
-                ).order_by("pk")
-            )
-            now = timezone.now()
-            with suppress_intent_push():
-                class_ids = [policy_class.pk for policy_class in classes]
-                try:
-                    with transaction.atomic():
-                        for attached_state in attached:
-                            attached_state.object_name = new_name
-                            update_fields = {"object_name"}
-                            if attached_state.pk == state.pk:
-                                if not sm.is_owned(attached_state.status):
-                                    attached_state.accepted_at = now
-                                attached_state.status = sm.on_operator_edit(attached_state.status)
-                                attached_state.apply_attempt_id = None
-                                update_fields.update({"status", "accepted_at", "apply_attempt_id"})
-                            attached_state.save(update_fields=update_fields)
-                        for policy_class in classes:
-                            policy_class.object_name = new_name
-                            policy_class.save(update_fields=["object_name"])
-                        route_map.name = new_name
-                        route_map.save(update_fields=["name"])
-                        classification_collision = (
-                            NSORoutePolicyObjectClass.objects.filter(
-                                family="route_map",
-                                object_name__iexact=new_name,
-                            )
-                            .exclude(pk__in=class_ids)
-                            .exists()
-                        )
-                        if classes and classification_collision:
-                            raise IntegrityError
-                except IntegrityError:
-                    attached_collision = (
-                        NSORoutePolicyState.objects.filter(
-                            management_id__in=[row.management_id for row in attached],
-                            family="route_map",
-                            object_name=new_name,
-                        )
-                        .exclude(pk__in=[row.pk for row in attached])
-                        .exists()
-                    )
-                    if attached_collision:
-                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
-                    collision = type(route_map).objects.filter(name__iexact=new_name).exclude(pk=route_map.pk)
-                    if collision.exists():
-                        raise _IntentTransactionNoOp({"object_name": ["A route map with this name already exists."]})
-                    classification_collision = (
-                        NSORoutePolicyObjectClass.objects.filter(
-                            family="route_map",
-                            object_name__iexact=new_name,
-                        )
-                        .exclude(pk__in=class_ids)
-                        .exists()
-                    )
-                    if classes and classification_collision:
-                        raise _IntentTransactionNoOp(
-                            {"object_name": ["A route-map classification with this name already exists."]}
-                        )
-                    raise
-                for redistribution_state in fallback_redistribution:
-                    redistribution_state.route_map = new_name
-                    redistribution_state.save(update_fields=["route_map"])
-
-            route_policy_targets = {
-                attached_state.management.device_id
-                for attached_state in attached
-                if attached_state.management.adapter_device_id is not None
-            }
-            bgp_targets = {
-                row.management.device_id for row in bgp_states if row.management.adapter_device_id is not None
-            }
-            redistribution_targets = {
-                (row.management.device_id, row.dest_protocol)
-                for row in redistribution_states
-                if row.management.adapter_device_id is not None
-            }
+        with mutation as writer:
+            try:
+                with transaction.atomic(), suppress_intent_push():
+                    for candidate, update_fields in operations:
+                        writer.save(candidate, update_fields=update_fields)
+                    plan.validate_after_acquire()
+            except IntegrityError:
+                plan.validate_after_acquire()
+                raise
             # Appended here, not on commit: the entry belongs to the transaction that renamed
             # the map, and the drain it schedules still runs after that transaction commits.
             for device_id in route_policy_targets:
@@ -5080,24 +5524,28 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
         now = timezone.now()
         base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
-        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         candidates = list(base.filter(status__in=("imported", "changed")).order_by("pk"))
-        footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
-        # One transaction for the ownership and the entry that records it: appended after
-        # the commit, the entry could be lost while the rows read as owned.
-        with intent_transaction(footprint):
-            updated = 0
-            for row in base.filter(pk__in=[candidate.pk for candidate in candidates]).order_by("pk"):
-                if row.status not in {"imported", "changed"}:
-                    continue
-                row.status = "in_sync" if row.status == "imported" else "accepted"
-                update_fields = {"status"}
-                if row.accepted_at is None:
-                    row.accepted_at = now
-                    update_fields.add("accepted_at")
-                row.save(update_fields=update_fields)
-                updated += 1
+        planned_candidates = []
+        for row in candidates:
+            candidate = copy.copy(row)
+            candidate.status = "in_sync" if row.status == "imported" else "accepted"
+            fields = ("status",)
+            if candidate.accepted_at is None:
+                candidate.accepted_at = now
+                fields = ("status", "accepted_at")
+            planned_candidates.append((candidate, fields))
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields) for candidate, fields in planned_candidates),
+            planned_at=now,
+        )
+        if planned_candidates:
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
+                for candidate, fields in planned_candidates:
+                    writer.save(candidate, update_fields=fields)
+        updated = len(planned_candidates)
 
         if updated:
             messages.success(request, f"Accepted {updated} interface attribute(s).")
@@ -5513,7 +5961,7 @@ class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
 
 
 class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
-    """Per-row accept for a routing state model — sets status to 'accepted' and fires push signal."""
+    """Accept one routing row through an exact renderer mutation plan."""
 
     model_class = None
     # Extra columns _arm_accept() writes, saved in the same UPDATE as the status.
@@ -5522,30 +5970,51 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
     def _arm_accept(self, state) -> None:
         """Set family-specific state on *state* before the accepted row is saved."""
 
+    def _accept_blocker(self, state) -> str:
+        """Return why *state* cannot become owned, or an empty string."""
+        return ""
+
     def post(self, request, pk):  # noqa: D102
+        import copy
+
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
         state = get_object_or_404(self.model_class, pk=pk)
+        if blocker := self._accept_blocker(state):
+            messages.error(request, f"Cannot accept {state}: {blocker}")
+            return redirect(_device_nso_tab_url(state.management.device_id))
+        candidate = copy.copy(state)
         # Matching (imported/in_sync) → nothing to apply → in_sync; differing → accepted.
-        state.status = _status_after_accept(state.status)
+        candidate.status = _status_after_accept(state.status)
         # First acceptance only — staged_days measures waiting time since the operator
         # FIRST took ownership, so a re-accept must not reset it (#107 staleness badge).
-        if state.accepted_at is None:
-            state.accepted_at = timezone.now()
-        self._arm_accept(state)
-        # One transaction, so the row and the outbox entry it schedules commit together.
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at", *self.accept_extra_fields])
-        messages.success(request, f"Accepted routing state {state.pk}.")
-        return redirect(_device_nso_tab_url(state.management.device_id))
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        self._arm_accept(candidate)
+        fields = ("status", "accepted_at", *self.accept_extra_fields)
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields),),
+            planned_at=candidate.accepted_at,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate, update_fields=fields)
+        messages.success(request, f"Accepted routing state {candidate.pk}.")
+        return redirect(_device_nso_tab_url(candidate.management.device_id))
 
 
 class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
 
-    Saving the accepted row fires the post_save signal which pushes the device's full
-    L2 SAP intent snapshot to the adapter (write path), mirroring static routes.
+    The exact writer saves the accepted row, finalizes its fingerprint, and lets the
+    writer-gated signal schedule the device's complete L2 SAP intent snapshot.
     """
 
     def post(self, request, pk):  # noqa: D102
+        import copy
+
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
         state = get_object_or_404(NSOL2SapState, pk=pk)
         if state.service_type not in ("epipe", "vpls"):
             messages.error(
@@ -5554,11 +6023,15 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
                 "the current writer supports only epipe and vpls SAPs.",
             )
             return redirect(_device_nso_tab_url(state.management.device_id))
-        state.status = _status_after_accept(state.status)
-        if state.accepted_at is None:
-            state.accepted_at = timezone.now()
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at"])
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(candidate.status)
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted L2 SAP {state.service_name}:{state.sap_id}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
@@ -5802,51 +6275,69 @@ def _ip_update_collision_errors(updates):
     return errors
 
 
-def _apply_ip_update(update, now):
-    """Re-key one overlay and create/update its assigned native IPAddress."""
+def _ip_edit_plan_and_operations(updates, planned_at):
+    """Freeze every native and overlay write for one paired-address edit."""
     from ipam.models import IPAddress
 
-    state = update["state"]
-    changed = update["address"] != state.address
-    state.address = update["address"]
-    state.family = update["family"]
-    state.status = "accepted" if changed else _status_after_accept(state.status)
-    state.accepted_at = now
-    update_fields = ["address", "family", "status", "accepted_at"]
-    if changed and state.auto_assigned:
-        if state.peer_state_id:
-            state.__class__.objects.filter(pk=state.peer_state_id, peer_state_id=state.pk).update(peer_state=None)
-        state.auto_assigned = False
-        state.source_pool = None
-        state.peer_state = None
-        update_fields.extend(["auto_assigned", "source_pool", "peer_state"])
-    state.full_clean()
-    state.save(update_fields=update_fields)
+    from .renderer_writer import RendererMutationPlan, planned_save
 
-    ip_obj = update["native"] or IPAddress(vrf=update["vrf"], status="active")
-    ip_obj.address = update["address"]
-    ip_obj.vrf = update["vrf"]
-    ip_obj.assigned_object = state.interface
-    ip_obj.full_clean()
-    ip_obj.save()
+    saves = []
+    native_operations = []
+    state_candidates = {}
+    state_fields = {}
+    state_order = []
+    update_ids = {update["state"].pk for update in updates}
 
+    for update in updates:
+        state = update["state"]
+        changed = update["address"] != state.address
+        candidate = state_candidates.setdefault(state.pk, copy.copy(state))
+        if state.pk not in state_order:
+            state_order.append(state.pk)
+        fields = state_fields.setdefault(state.pk, set())
+        candidate.address = update["address"]
+        candidate.family = update["family"]
+        candidate.status = "accepted" if changed else _status_after_accept(state.status)
+        candidate.accepted_at = planned_at
+        fields.update(("address", "family", "status", "accepted_at"))
+        if changed and state.auto_assigned:
+            candidate.auto_assigned = False
+            candidate.source_pool = None
+            candidate.peer_state = None
+            fields.update(("auto_assigned", "source_pool", "peer_state"))
+            if state.peer_state_id and state.peer_state_id not in update_ids:
+                inverse = state.__class__.objects.filter(pk=state.peer_state_id, peer_state_id=state.pk).first()
+                if inverse is not None:
+                    inverse_candidate = state_candidates.setdefault(inverse.pk, copy.copy(inverse))
+                    inverse_candidate.peer_state = None
+                    state_fields.setdefault(inverse.pk, set()).add("peer_state")
+                    if inverse.pk not in state_order:
+                        state_order.append(inverse.pk)
+        candidate.full_clean()
 
-def _ip_edit_footprint(updates):
-    """Freeze every native and overlay row that one paired-address edit can write."""
-    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance
+        current_native = update["native"]
+        native = copy.copy(current_native) if current_native is not None else IPAddress(status="active")
+        native.address = update["address"]
+        native.vrf = update["vrf"]
+        native.assigned_object = state.interface
+        native.full_clean()
+        created = current_native is None
+        saves.append(
+            planned_save(
+                native,
+                force_insert=created,
+                natural_key=("address", "vrf"),
+            )
+        )
+        native_operations.append((native, created))
 
-    states = [update["state"] for update in updates]
-    inverse_ids = {state.peer_state_id for state in states if state.auto_assigned and state.peer_state_id is not None}
-    source_rows = [SourceRow("ipam.ipaddress", None)]
-    source_rows.extend(
-        SourceRow("ipam.ipaddress", update["native"].pk) for update in updates if update["native"] is not None
-    )
-    overlay_rows = [SourceRow(states[0]._meta.label_lower, pk) for pk in inverse_ids]
-    keys = {(state.interface.device_id, "ip") for state in states}
-    return MutationFootprint.merge(
-        *(footprint_for_instance(state) for state in states),
-        MutationFootprint.for_keys(keys, source_rows=source_rows, overlay_rows=overlay_rows),
-    )
+    state_operations = []
+    for state_id in state_order:
+        candidate = state_candidates[state_id]
+        fields = tuple(sorted(state_fields[state_id]))
+        saves.append(planned_save(candidate, update_fields=fields))
+        state_operations.append((candidate, fields))
+    return RendererMutationPlan.build(saves=saves, planned_at=planned_at), native_operations, state_operations
 
 
 class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
@@ -5862,8 +6353,8 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         from django.core.exceptions import ValidationError
         from django.db import IntegrityError
 
-        from .intent_state import intent_transaction
         from .models import NSODeviceManagement, NSOInterfaceIPState
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
         from .signals import _schedule_intent_push, suppress_intent_push
 
         state = get_object_or_404(
@@ -5902,19 +6393,20 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                 raise PermissionDenied
 
         try:
-            with intent_transaction(_ip_edit_footprint(updates)):
-                now = timezone.now()
+            plan, native_operations, state_operations = _ip_edit_plan_and_operations(updates, timezone.now())
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            with mutation as writer:
                 with suppress_intent_push():
-                    for update in updates:
-                        _apply_ip_update(update, now)
-
+                    for native, created in native_operations:
+                        writer.save(native, force_insert=created)
+                    for candidate, update_fields in state_operations:
+                        writer.save(candidate, update_fields=update_fields)
                 device_ids = {update["state"].interface.device_id for update in updates}
                 for mgmt in NSODeviceManagement.objects.filter(
                     device_id__in=device_ids,
                     adapter_device_id__isnull=False,
                 ):
-                    device_id = mgmt.device_id
-                    _schedule_intent_push((device_id, "ip"))
+                    _schedule_intent_push((mgmt.device_id, "ip"))
         except (ValidationError, IntegrityError) as exc:
             messages_list = getattr(exc, "messages", None) or ["The address conflicts with an existing object."]
             return JsonResponse(
@@ -5944,7 +6436,6 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
         from ipam.models import IPAddress
 
         try:
@@ -5953,23 +6444,36 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
             VRF = None
 
         from .models import NSOInterfaceIPState
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from .signals import suppress_intent_push
 
         state = get_object_or_404(NSOInterfaceIPState, pk=pk)
         iface = state.interface
         vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf and VRF is not None else None
 
-        with transaction.atomic():
-            existing = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
-            if existing is None:
-                existing = IPAddress(address=state.address, vrf=vrf_obj, status="active")
-            existing.assigned_object = iface
-            existing.save()  # signal skips the push while this row is still `conflict`
-            # Device already has the address on `iface`; NetBox now matches → in_sync, owned.
-            state.status = "in_sync"
-            state.accepted_at = timezone.now()
-            state.save(update_fields=["status", "accepted_at"])
+        current_native = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
+        native = copy.copy(current_native) if current_native is not None else IPAddress(status="active")
+        native.address = state.address
+        native.vrf = vrf_obj
+        native.assigned_object = iface
+        native.full_clean()
+        candidate = copy.copy(state)
+        candidate.status = "in_sync"
+        candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        created = current_native is None
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(native, force_insert=created, natural_key=("address", "vrf")),
+                planned_save(candidate, update_fields=state_fields),
+            ),
+            planned_at=candidate.accepted_at,
+        )
+        with renderer_writes(plan) as writer, suppress_intent_push():
+            writer.save(native, force_insert=created)
+            writer.save(candidate, update_fields=state_fields)
 
-        messages.success(request, f"Adopted {state.address} onto {iface.name}.")
+        messages.success(request, f"Adopted {candidate.address} onto {iface.name}.")
         return redirect(_device_nso_tab_url(iface.device_id))
 
 
@@ -6001,6 +6505,9 @@ class NSOISISInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
 class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
+    def _accept_blocker(self, state):
+        return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
+
 
 class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
     """Accept one BGP peer-group template — take ownership (no device apply path).
@@ -6011,14 +6518,47 @@ class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
+        import copy
+
         from .models import NSOBGPPeerTemplateState
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         state = get_object_or_404(NSOBGPPeerTemplateState, pk=pk)
-        state.status = _status_after_accept(state.status)
-        state.accepted_at = timezone.now()
-        state.save(update_fields=["status", "accepted_at"])
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(candidate.status)
+        candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields),),
+            planned_at=candidate.accepted_at,
+        )
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted BGP peer-group template {state.template_name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
+
+
+def _warn_route_policy_cascade(request, route_map_name, device_name, cascade):
+    """Report referenced policy objects that acquisition could not own silently."""
+    if cascade is None:
+        return
+    if cascade.drifted:
+        refs = ", ".join(f"{family.replace('_', ' ')} {name}" for family, name in cascade.drifted)
+        messages.warning(
+            request,
+            f"Route-map {route_map_name} references {len(cascade.drifted)} object(s) that differ on "
+            f"{device_name}; left as-is (not overwritten). Resolve their drift before they ship: {refs}.",
+        )
+    if cascade.cross_device:
+        refs = ", ".join(
+            f"{family.replace('_', ' ')} {name} (from {source})" for family, name, source in cascade.cross_device
+        )
+        messages.warning(
+            request,
+            f"Route-map {route_map_name} references {len(cascade.cross_device)} shared object(s) whose "
+            f"NetBox version was sourced from another device. Applying here pushes that version onto "
+            f"{device_name}: {refs}.",
+        )
 
 
 class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
@@ -6031,17 +6571,36 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
     model_class = NSORoutePolicyState
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
+        import copy
 
-        from .signals import _own_route_map_contributors
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
+        from .signals import _route_policy_acquisition_plan
 
         state = get_object_or_404(NSORoutePolicyState, pk=pk)
-        with transaction.atomic():
-            state.status = _status_after_accept(state.status)
-            state.save(update_fields=["status"])
-            if state.family == "route_map" and state.assigned_object is not None:
-                _own_route_map_contributors(state.management, state.assigned_object)
-        messages.success(request, f"Accepted routing state {state.pk}.")
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(candidate.status)
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        route_maps = (
+            (candidate.assigned_object,) if candidate.family == "route_map" and candidate.assigned_object else ()
+        )
+        plan, operations, cascade = _route_policy_acquisition_plan(
+            candidate.management,
+            primary_operations=((candidate, fields, False),),
+            route_maps=route_maps,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            for operation, update_fields, created in operations:
+                writer.save(operation, update_fields=update_fields, force_insert=created)
+        _warn_route_policy_cascade(
+            request,
+            candidate.object_name,
+            candidate.management.device.name,
+            cascade,
+        )
+        messages.success(request, f"Accepted routing state {candidate.pk}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
@@ -6225,7 +6784,9 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device_pk))
 
 
-class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):  # noqa: D101
+class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):
+    """Re-point one route-policy group through its exact graph plan."""
+
     model_class = NSORoutePolicyState
 
 
@@ -6308,16 +6869,25 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
     def _push(self, mgmt):
         """Record the accepted rows in the outbox; override in subclasses."""
 
-    def _after_accept(self, mgmt, accepted_pks):
-        """Run after the bulk ownership update, before the push (override in subclasses).
+    def _prepare_accept(self, current, candidate, *, drift):
+        """Add family-specific accepted fields to one candidate."""
+        return ()
 
-        *accepted_pks* are the rows this call moved from drift into ownership — the ones
-        that now carry intent the device does not have.
-        """
+    def _accept_blocker(self, state) -> str:
+        """Return why *state* cannot become owned, or an empty string."""
+        return ""
+
+    def _build_accept_plan(self, mgmt, accepted, saves):
+        """Build the family-specific exact plan and replay operations."""
+        from .renderer_writer import RendererMutationPlan
+
+        return RendererMutationPlan.build(saves=saves), [(*operation, False) for operation in accepted]
 
     def post(self, request, device_pk):  # noqa: D102
-        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
-        from .signals import suppress_intent_push
+        import copy
+
+        from .intent_state import IntentMutationProtocolError
+        from .renderer_writer import planned_save, renderer_mirror_writes, renderer_writes
 
         try:
             mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
@@ -6329,34 +6899,49 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         # and for drift. Already-owned rows (in_sync/accepted) are skipped (accepting
         # them was a repeatable no-op). Matching (imported) -> in_sync (nothing to
         # push); drift -> accepted (pending apply). _push() sends the snapshot once.
-        candidates = list(
-            self.model_class.objects.filter(management=mgmt, status__in=["imported", "changed", "conflict"])
-            .select_related("management")
-            .order_by("pk")
-        )
-        footprint = MutationFootprint.merge(*(footprint_for_instance(row) for row in candidates))
-        # One transaction: a request is not wrapped in one, so committing the status ahead
-        # of _after_accept() would publish rows that read as owned while still carrying the
-        # state the previous apply named — which a concurrent Apply would then act on.
-        with intent_transaction(footprint):
-            current = list(self.model_class.objects.filter(pk__in=[row.pk for row in candidates]).order_by("pk"))
-            drift_pks = [row.pk for row in current if row.status in {"changed", "conflict"}]
-            accepted = [row for row in current if row.status in {"imported", "changed", "conflict"}]
-            now = timezone.now()
-            with suppress_intent_push():
-                for row in accepted:
-                    row.status = "in_sync" if row.status == "imported" else "accepted"
-                    update_fields = ["status"]
-                    if row.accepted_at is None:
-                        row.accepted_at = now
-                        update_fields.append("accepted_at")
-                    row.save(update_fields=update_fields)
+        count = 0
+        for _attempt in range(2):
+            candidates = list(
+                self.model_class.objects.filter(management=mgmt, status__in=["imported", "changed", "conflict"])
+                .select_related("management")
+                .order_by("pk")
+            )
+            blocked = next(((row, reason) for row in candidates if (reason := self._accept_blocker(row))), None)
+            if blocked is not None:
+                row, reason = blocked
+                messages.error(request, f"Cannot accept {row}: {reason}")
+                return redirect(_device_nso_tab_url(device_pk))
+            accepted = []
+            saves = []
+            for row in candidates:
+                candidate = copy.copy(row)
+                drift = row.status in {"changed", "conflict"}
+                candidate.status = "accepted" if drift else "in_sync"
+                fields = ["status"]
+                if candidate.accepted_at is None:
+                    candidate.accepted_at = timezone.now()
+                    fields.append("accepted_at")
+                extra_fields = self._prepare_accept(row, candidate, drift=drift)
+                fields = (*fields, *extra_fields)
+                accepted.append((candidate, fields))
+                saves.append(planned_save(candidate, update_fields=fields))
             count = len(accepted)
-            if count and mgmt.adapter_device_id is not None:
-                self._after_accept(mgmt, drift_pks)
-                # Inside the same transaction as the ownership it records: appended after
-                # the commit, the entry could be lost while the rows read as owned.
-                self._push(mgmt)
+            if not count:
+                break
+            plan, write_operations = self._build_accept_plan(mgmt, accepted, saves)
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            try:
+                with mutation as writer:
+                    for candidate, fields, created in write_operations:
+                        writer.save(candidate, update_fields=fields, force_insert=created)
+                    if mgmt.adapter_device_id is not None:
+                        self._push(mgmt)
+            except IntentMutationProtocolError:
+                continue
+            break
+        else:
+            messages.error(request, "Routing state changed. Refresh the page and try again.")
+            return redirect(_device_nso_tab_url(device_pk))
 
         if count:
             messages.success(request, f"Accepted {count} routing state(s).")
@@ -6368,19 +6953,14 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
 class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOStaticRouteState
 
-    def _after_accept(self, mgmt, accepted_pks):
-        """Arm a generation on every row this accept moved from drift into ownership.
+    def _prepare_accept(self, current, candidate, *, drift):
+        """Arm every static route this bulk action moves from drift into ownership."""
+        if not drift:
+            return ()
+        from .signals import _arm_static_route_generation
 
-        Suppressed: a request is not wrapped in a transaction, so each unsuppressed save
-        would PUT the full snapshot on the spot — N adapter calls carrying half-armed
-        intent. ``_push()`` sends the finished snapshot once, immediately after.
-        """
-        from .signals import _arm_static_route_generation, suppress_intent_push
-
-        with suppress_intent_push():
-            for state in self.model_class.objects.filter(pk__in=accepted_pks, status="accepted"):
-                _arm_static_route_generation(state)
-                state.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
+        _arm_static_route_generation(candidate)
+        return _STATIC_ROUTE_ARMED_FIELDS
 
     def _push(self, mgmt):
         _schedule_intent_push((mgmt.device_id, "static_route"))
@@ -6403,6 +6983,9 @@ class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
+    def _accept_blocker(self, state):
+        return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
+
     def _push(self, mgmt):
         _schedule_intent_push((mgmt.device_id, "bgp"))
 
@@ -6410,15 +6993,19 @@ class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORoutePolicyState
 
-    def _after_accept(self, mgmt, accepted_pks):
-        from .signals import _own_route_map_contributors
+    def _build_accept_plan(self, mgmt, accepted, saves):
+        from .signals import _route_policy_acquisition_plan
 
-        # Owning a route-map owns its contributors — cascade for every now-owned route-map.
-        owned = ("accepted", "deploying", "in_sync", "apply_failed")
-        for st in NSORoutePolicyState.objects.filter(management=mgmt, family="route_map", status__in=owned):
-            obj = st.assigned_object
-            if obj is not None:
-                _own_route_map_contributors(mgmt, obj)
+        route_maps = tuple(
+            candidate.assigned_object
+            for candidate, _fields in accepted
+            if candidate.family == "route_map" and candidate.assigned_object is not None
+        )
+        return _route_policy_acquisition_plan(
+            mgmt,
+            primary_operations=tuple((candidate, fields, False) for candidate, fields in accepted),
+            route_maps=route_maps,
+        )[:2]
 
     def _push(self, mgmt):
         _schedule_intent_push((mgmt.device_id, "route_policy"))
@@ -6547,10 +7134,12 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
 class NSOSnmpCommunityStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpCommunityState
+    renderer_scope = "snmp"
 
 
 class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpV3UserState
+    renderer_scope = "snmp"
 
     def push_blocker(self, state):
         """Never let an accept downgrade a device-held authPriv user to noAuthNoPriv."""
@@ -6561,6 +7150,7 @@ class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpHostState
+    renderer_scope = "snmp"
 
     def push_blocker(self, state):
         """v3 trap hosts have no username source on the overlay — not pushable."""
@@ -6571,6 +7161,17 @@ class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSnmpSystemInfoState
+    renderer_scope = "snmp"
+
+
+def _save_exact_overlay_fields(state, fields):
+    """Save exact overlay fields and finalize content fingerprints when needed."""
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+    plan = RendererMutationPlan.build(saves=(planned_save(state, update_fields=fields),))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(state, update_fields=fields)
 
 
 class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
@@ -6605,8 +7206,7 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         if result.get("exists") and key in hashes:
             state.vault_secret_hash = hashes[key]
             state.vault_secret_version = result.get("version")
-            with transaction.atomic():
-                state.save(update_fields=["vault_secret_hash", "vault_secret_version"])
+            _save_exact_overlay_fields(state, ("vault_secret_hash", "vault_secret_version"))
             verdict = (
                 "matches the device value"
                 if state.vault_secret_hash == state.community_hash
@@ -6638,8 +7238,7 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         fields = set(result.get("fields") or [])
         state.vault_has_auth = "auth" in fields
         state.vault_has_priv = "priv" in fields
-        with transaction.atomic():
-            state.save(update_fields=["vault_has_auth", "vault_has_priv"])
+        _save_exact_overlay_fields(state, ("vault_has_auth", "vault_has_priv"))
         if fields:
             messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
         else:
@@ -6684,8 +7283,10 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
         state.vault_ref = result.get("vault_ref") or ref
         state.vault_secret_hash = result.get("secret_hash") or ""
         state.vault_secret_version = result.get("version")
-        with transaction.atomic():
-            state.save(update_fields=["vault_ref", "vault_secret_hash", "vault_secret_version"])
+        _save_exact_overlay_fields(
+            state,
+            ("vault_ref", "vault_secret_hash", "vault_secret_version"),
+        )
         messages.success(
             request,
             f"Community harvested into Vault at {state.vault_ref!r} (v{result.get('version')}).",
@@ -6695,10 +7296,12 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
 
 class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOLoggingHostState
+    renderer_scope = "logging"
 
 
 class NSOLoggingLevelStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOLoggingLevelState
+    renderer_scope = "logging"
 
     def push_blocker(self, state):
         """Refuse ownership of an all-blank row — it manages nothing, so the push would un-manage."""
@@ -6730,10 +7333,18 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
         if not sm.is_owned(state.status):
             messages.error(request, f"Cannot un-accept {state}: it is not owned.")
             return redirect(_device_nso_tab_url(device_id))
-        state.status = sm.advance(state.status, sm.REVERT, to=sm.IMPORTED)
-        state.accepted_at = None
-        with transaction.atomic():
-            state.save(update_fields=["status", "accepted_at"])
+        import copy
+
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        candidate = copy.copy(state)
+        candidate.status = sm.advance(candidate.status, sm.REVERT, to=sm.IMPORTED)
+        candidate.accepted_at = None
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=fields)
+        state = candidate
         messages.warning(
             request,
             f"Un-accepted {state}: the managed levels are being retracted from the device — "
@@ -6749,6 +7360,7 @@ class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSubinterfaceState
+    renderer_scope = "subinterface"
 
     def push_blocker(self, state):
         """Refuse ownership when the full-replace serializer would omit the row."""
@@ -6770,28 +7382,15 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     _NETBOX_MTU_MAX = 65536
 
     def post(self, request, pk):  # noqa: D102
-        state = get_object_or_404(self.model_class, pk=pk)
-        from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
+        import copy
 
-        footprint = MutationFootprint.merge(
-            footprint_for_instance(state),
-            footprint_for_instance(state.interface),
-        )
-        # One transaction, so the native adoption, the row and the outbox entry it
-        # schedules commit together.
-        with intent_transaction(footprint):
-            state = get_object_or_404(self.model_class, pk=state.pk)
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = timezone.now()
-            if state.l2_mtu is not None:
-                iface = state.interface
-                clamped = min(int(state.l2_mtu), self._NETBOX_MTU_MAX)
-                if iface.mtu != clamped:
-                    iface.mtu = clamped
-                    iface.save(update_fields=["mtu"])
-            state.save(update_fields=["status", "accepted_at"])
-        messages.success(request, f"Accepted {state}.")
-        return redirect(_device_nso_tab_url(state.management.device_id))
+        state = get_object_or_404(self.model_class, pk=pk)
+        candidate = copy.copy(state)
+        candidate.status = _status_after_accept(state.status)
+        candidate.accepted_at = timezone.now()
+        _write_owned_interface_mtu(candidate, ("status", "accepted_at"))
+        messages.success(request, f"Accepted {candidate}.")
+        return redirect(_device_nso_tab_url(candidate.management.device_id))
 
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
@@ -6921,52 +7520,51 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
                 },
             )
 
-        with transaction.atomic():
-            state, created = NSORoutePolicyState.objects.get_or_create(
+        import copy
+
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
+        from .signals import _OWNED_PUSH_STATUSES, _route_policy_acquisition_plan
+
+        planned_at = timezone.now()
+        current = NSORoutePolicyState.objects.filter(
+            management=mgmt,
+            family=family,
+            object_name__iexact=obj.name,
+        ).first()
+        created = current is None
+        if current is None:
+            candidate = NSORoutePolicyState(
                 management=mgmt,
                 family=family,
                 object_name=obj.name,
-                defaults={
-                    "content_type": ct,
-                    "object_id": obj.pk,
-                    "status": "accepted",
-                    "accepted_at": timezone.now(),
-                },
+                content_type=ct,
+                object_id=obj.pk,
+                status="accepted",
+                accepted_at=planned_at,
+                last_sync_at=planned_at,
             )
-            if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-                state.status = "accepted"
-                state.accepted_at = timezone.now()
-            state.content_type = ct
-            state.object_id = obj.pk
-            state.last_sync_at = timezone.now()
-            state.save()  # → _on_route_policy_state_save schedules the push
-            cascade = None
-            if family == "route_map":
-                # Owning a route-map owns its contributors too (else dangling device references).
-                from .signals import _own_route_map_contributors
-
-                cascade = _own_route_map_contributors(mgmt, obj)
-        if cascade is not None:
-            if cascade.drifted:
-                # A referenced object the device already has but that diverges from NetBox was
-                # NOT overwritten — tell the operator so they can resolve it explicitly.
-                refs = ", ".join(f"{fam.replace('_', ' ')} {nm}" for fam, nm in cascade.drifted)
-                messages.warning(
-                    request,
-                    f"Route-map {obj.name} references {len(cascade.drifted)} object(s) that differ on "
-                    f"{mgmt.device.name} — left as-is (not overwritten); resolve their drift before "
-                    f"they ship: {refs}.",
-                )
-            if cascade.cross_device:
-                # A greenfield reference whose NetBox content came from another device — owning
-                # the route-map here pushes that device's version. Make the provenance explicit.
-                refs = ", ".join(f"{fam.replace('_', ' ')} {nm} (from {src})" for fam, nm, src in cascade.cross_device)
-                messages.warning(
-                    request,
-                    f"Route-map {obj.name} references {len(cascade.cross_device)} shared object(s) whose "
-                    f"NetBox version was sourced from another device — applying here pushes that version "
-                    f"onto {mgmt.device.name}: {refs}.",
-                )
+            fields = None
+        else:
+            candidate = copy.copy(current)
+            fields_set = {"content_type", "object_id", "last_sync_at"}
+            if candidate.status not in _OWNED_PUSH_STATUSES:
+                candidate.status = "accepted"
+                candidate.accepted_at = planned_at
+                fields_set.update(("status", "accepted_at"))
+            candidate.content_type = ct
+            candidate.object_id = obj.pk
+            candidate.last_sync_at = planned_at
+            fields = tuple(sorted(fields_set))
+        plan, operations, cascade = _route_policy_acquisition_plan(
+            mgmt,
+            primary_operations=((candidate, fields, created),),
+            route_maps=(obj,) if family == "route_map" else (),
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            for operation, update_fields, force_insert in operations:
+                writer.save(operation, update_fields=update_fields, force_insert=force_insert)
+        _warn_route_policy_cascade(request, obj.name, mgmt.device.name, cascade)
         if override:
             # Operator overrode a known-negative verdict — be explicit about what won't land.
             messages.warning(
@@ -7001,10 +7599,8 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
 
     Builds the netbox-routing object graph (BGPRouter → BGPScope → BGPPeer + address
     families) the reconciler would build for a brownfield peer, reusing the reconciler's
-    own get_or_create helpers so a greenfield peer and a later reconcile of the same peer
-    converge on one identity. The BGPPeer save fires the greenfield signal, which owns an
-    accepted NSOBGPPeerState overlay and pushes the (owned-only) BGP intent — written to
-    the device on the next Apply.
+    natural identities so a greenfield peer and a later reconcile of the same peer
+    converge on one object. One exact writer creates the graph and accepted overlay.
 
     Authorization is TWO-sided, because this view is a door into another app: the caller
     must hold the netbox_routing add permission for the object graph it mints (the NSO
@@ -7016,6 +7612,10 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
     required_permission = (
         "netbox_nso_plugin.change_nsodevicemanagement",
         "netbox_routing.add_bgppeer",
+        "netbox_routing.add_bgprouter",
+        "netbox_routing.add_bgpscope",
+        "netbox_routing.add_bgpaddressfamily",
+        "netbox_routing.add_bgppeeraddressfamily",
     )
 
     @staticmethod
@@ -7048,21 +7648,9 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
 
     @staticmethod
     def _create_peer(device, data):
-        """Assemble the router→scope→peer→AF graph via the reconciler's helpers.
-
-        The whole graph is built inside one ``transaction.atomic()`` block so the intent
-        push — fired by the ``BGPPeer`` post_save signal — is DEFERRED to ``on_commit`` and
-        runs only after the peer's address-families are attached. Without the wrapper the
-        view runs outside any transaction (NetBox sets no ``ATOMIC_REQUESTS``), so
-        ``_schedule_intent_push`` runs the push INLINE at ``BGPPeer.create()`` time — before
-        ``_write_peer_afs`` — and the pushed intent carries an empty ``address_families``.
-        The bgp-reconciler then writes a neighbor with no ``address-family`` activation, i.e.
-        an inert session (device-caught on ra1.lab via a greenfield dry-run). Atomicity also
-        makes the create all-or-nothing on error.
-        """
+        """Create one owned router, scope, peer, and AF graph through an exact plan."""
         from dcim.models import Device
         from django.contrib.contenttypes.models import ContentType
-        from django.db import transaction
         from netbox_routing.models import (
             BGPAddressFamily,
             BGPPeer,
@@ -7071,26 +7659,115 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             BGPScope,
         )
 
-        from .bgp_reconciler import _get_or_create_router, _get_or_create_scope, _write_peer_afs
+        from .models import NSOBGPPeerState, NSODeviceManagement
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from .signals import _schedule_intent_push, suppress_intent_push
 
-        with transaction.atomic():
-            router = _get_or_create_router(device, data["local_asn"], BGPRouter, ContentType, Device)
-            scope = _get_or_create_scope(router, data.get("vrf"), BGPScope)
-            peer = BGPPeer.objects.create(
-                scope=scope,
-                peer=data["peer"],
-                name=None,
-                remote_as=data.get("remote_as"),
-                local_as=data.get("peer_local_as"),
-                ttl=data.get("ttl"),
-                enabled=data.get("enabled", True),
-                password=data.get("password") or None,
-                peer_group=data.get("peer_group"),
-                source=data.get("source"),
-                update_source=data.get("update_source"),
+        management = NSODeviceManagement.objects.get(device=device)
+        planned_at = timezone.now()
+        device_type = ContentType.objects.get_for_model(Device)
+        router = BGPRouter.objects.filter(
+            assigned_object_type=device_type,
+            assigned_object_id=device.pk,
+            asn=data["local_asn"],
+        ).first()
+        saves = []
+        operations = []
+
+        def save(instance, *, force_insert=False, natural_key=(), references=()):
+            references = tuple(references)
+            saves.append(
+                planned_save(
+                    instance,
+                    force_insert=force_insert,
+                    natural_key=natural_key,
+                    references=references,
+                )
             )
-            af_list = [{"af": af, "enabled": True} for af in (data.get("address_families") or ["ipv4-unicast"])]
-            _write_peer_afs(peer, af_list, scope, BGPAddressFamily, BGPPeerAddressFamily)
+            operations.append((instance, force_insert, references))
+
+        if router is None:
+            router = BGPRouter(
+                assigned_object_type=device_type,
+                assigned_object_id=device.pk,
+                asn=data["local_asn"],
+                name=str(data["local_asn"].asn),
+            )
+            save(
+                router,
+                force_insert=True,
+                natural_key=("assigned_object_type", "assigned_object_id", "asn"),
+            )
+        scope = BGPScope.objects.filter(router=router, vrf=data.get("vrf")).first() if router.pk is not None else None
+        if scope is None:
+            scope = BGPScope(router=router, vrf=data.get("vrf"))
+            save(scope, force_insert=True, natural_key=("router", "vrf"))
+        peer = BGPPeer(
+            scope=scope,
+            peer=data["peer"],
+            name=None,
+            remote_as=data.get("remote_as"),
+            local_as=data.get("peer_local_as"),
+            ttl=data.get("ttl"),
+            enabled=data.get("enabled", True),
+            password=data.get("password") or None,
+            peer_group=data.get("peer_group"),
+            source=data.get("source"),
+            update_source=data.get("update_source"),
+        )
+        save(peer, force_insert=True, natural_key=("scope", "peer", "name"))
+        peer_type = ContentType.objects.get_for_model(BGPPeer)
+        address_families = data.get("address_families") or ["ipv4-unicast"]
+        for value in address_families:
+            address_family = (
+                BGPAddressFamily.objects.filter(scope=scope, address_family=value).first()
+                if scope.pk is not None
+                else None
+            )
+            if address_family is None:
+                address_family = BGPAddressFamily(scope=scope, address_family=value)
+                save(
+                    address_family,
+                    force_insert=True,
+                    natural_key=("scope", "address_family"),
+                )
+            peer_address_family = BGPPeerAddressFamily(
+                assigned_object_type=peer_type,
+                assigned_object_id=None,
+                address_family=address_family,
+                enabled=True,
+            )
+            save(
+                peer_address_family,
+                force_insert=True,
+                natural_key=("assigned_object_type", "assigned_object_id", "address_family"),
+                references=(("assigned_object_id", peer),),
+            )
+        state = NSOBGPPeerState(
+            management=management,
+            asn_str=str(data["local_asn"].asn),
+            vrf_name=data["vrf"].name if data.get("vrf") else "",
+            peer_address_str=str(data["peer"].address).split("/")[0],
+            bgp_peer=peer,
+            remote_as_str=str(data["remote_as"].asn) if data.get("remote_as") else "",
+            enabled=data.get("enabled", True),
+            status="accepted",
+            accepted_at=planned_at,
+            last_sync_at=planned_at,
+        )
+        save(
+            state,
+            force_insert=True,
+            natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
+        )
+        plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+        with renderer_writes(plan) as writer:
+            with suppress_intent_push():
+                for instance, force_insert, references in operations:
+                    for field_name, related in references:
+                        setattr(instance, field_name, related.pk)
+                    writer.save(instance, force_insert=force_insert)
+            _schedule_intent_push((device.pk, "bgp"))
         return peer
 
 
@@ -7256,6 +7933,7 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
 
 class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOBFDInterfaceState
+    renderer_scope = "bfd"
 
 
 class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101

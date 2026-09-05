@@ -196,12 +196,32 @@ class TestManifestRetirement(TestCase):
 
 
 class TestConvertedScopeRuleTable(SimpleTestCase):
-    def test_first_tranche_has_reviewed_acquisition_and_retirement_entries(self):
+    def test_converted_scopes_have_reviewed_acquisition_and_retirement_entries(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules
 
         rules = converted_scope_rules()
 
-        assert set(rules) == {"lacp", "vlan", "svi", "switchport"}
+        assert set(rules) == {
+            "bfd",
+            "bgp",
+            "interface",
+            "interface_mtu",
+            "ip",
+            "isis",
+            "isis_flex_algo",
+            "lacp",
+            "l2_sap",
+            "logging",
+            "ospf",
+            "redistribution",
+            "route_policy",
+            "snmp",
+            "static_route",
+            "subinterface",
+            "vlan",
+            "svi",
+            "switchport",
+        }
         for scope, rule in rules.items():
             assert rule.scope == scope
             assert rule.native_model_labels
@@ -209,3 +229,98 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.deletion_authority
             assert rule.intentional_semantic_delta
             assert rule.foreign_overlay_delete == "reown"
+
+        retirement_clauses = {
+            "bgp": "Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot",
+            "route_policy": "Native policy deletes no longer delete per-device overlays and push reduced snapshots",
+        }
+        for scope, clause in retirement_clauses.items():
+            assert clause in rules[scope].intentional_semantic_delta
+        assert "missing graph dependencies fail fast" in rules["bgp"].intentional_semantic_delta
+        assert "foreign-key merge identities use natural graph identities" in rules["bgp"].intentional_semantic_delta
+        assert "Legacy PK-shaped peer and template merge bases are reset" in rules["bgp"].intentional_semantic_delta
+
+    def test_static_route_rule_names_only_acknowledged_lineage(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["static_route"]
+
+        assert rule.acknowledged_lineage_field == "last_acked_triple"
+
+    def test_flex_algo_rule_uses_the_native_process_and_algorithm_identity(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["isis_flex_algo"]
+
+        assert rule.native_model_labels == ("netbox_routing.isisflexalgo",)
+        assert rule.native_key_fields == ("instance_id", "algo_id")
+        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsoisisflexalgostate", "isis_flex_algo"),)
+
+    def test_redistribution_rule_uses_its_destination_protocol_as_manifest_scope(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["redistribution"]
+
+        assert rule.native_model_labels == ("netbox_routing.redistribution",)
+        assert rule.native_key_fields == (
+            "destination_type_id",
+            "destination_id",
+            "source_protocol",
+            "source_ref",
+        )
+        assert rule.manifest_scope_field == "dest_protocol"
+
+    def test_ospf_rule_names_process_and_interface_native_identities(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["ospf"]
+
+        assert rule.native_model_labels == (
+            "netbox_routing.ospfinstance",
+            "netbox_routing.ospfinterface",
+        )
+        assert rule.native_key_fields_by_model == (
+            ("netbox_routing.ospfinstance", ("device_id", "process_id")),
+            ("netbox_routing.ospfinterface", ("interface_id",)),
+        )
+
+    def test_isis_rule_names_graph_roots_and_keeps_children_as_dependencies(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["isis"]
+
+        assert rule.native_model_labels == (
+            "netbox_routing.isisinstance",
+            "netbox_routing.isisinterface",
+        )
+        assert rule.native_key_fields_by_model == (
+            ("netbox_routing.isisinstance", ("device_id", "process_tag")),
+            ("netbox_routing.isisinterface", ("interface_id", "address_family")),
+        )
+        assert rule.overlay_native_fields == (
+            ("netbox_nso_plugin.nsoisisinstancestate", "isis_instance"),
+            ("netbox_nso_plugin.nsoisisinterfacestate", "isis_interface"),
+        )
+
+    def test_bgp_rule_names_peer_root_and_keeps_graph_rows_as_dependencies(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["bgp"]
+
+        assert rule.native_model_labels == ("netbox_routing.bgppeer",)
+        assert rule.native_key_fields == ("scope_id", "peer_id", "name")
+        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),)
+
+    def test_route_policy_rule_names_shared_roots_and_keeps_graph_rows_as_dependencies(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        rule = converted_scope_rules()["route_policy"]
+
+        assert rule.native_model_labels == (
+            "netbox_routing.prefixlist",
+            "netbox_routing.communitylist",
+            "netbox_routing.aspath",
+            "netbox_routing.routemap",
+        )
+        assert rule.native_key_fields == ("name",)
+        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),)

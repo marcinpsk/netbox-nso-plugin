@@ -48,6 +48,9 @@ class ScopeOwnershipRule:
     foreign_overlay_delete: str
     deletion_authority: bool
     intentional_semantic_delta: str
+    acknowledged_lineage_field: str | None = None
+    manifest_scope_field: str | None = None
+    native_key_fields_by_model: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 _CONVERTED_SCOPE_RULES = {
@@ -98,6 +101,268 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=("Acquire from current L2 state. M2M edit events are not ownership evidence."),
+    ),
+    "interface_mtu": ScopeOwnershipRule(
+        scope="interface_mtu",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsointerfacemtustate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsointerfacemtustate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from persisted per-interface MTU state. A save event is not ownership evidence."
+        ),
+    ),
+    "subinterface": ScopeOwnershipRule(
+        scope="subinterface",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsosubinterfacestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsosubinterfacestate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence."
+        ),
+    ),
+    "bfd": ScopeOwnershipRule(
+        scope="bfd",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsobfdinterfacestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsobfdinterfacestate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from persisted per-interface BFD state. Save events are not ownership evidence."
+        ),
+    ),
+    "bgp": ScopeOwnershipRule(
+        scope="bgp",
+        native_model_labels=("netbox_routing.bgppeer",),
+        native_key_fields=("scope_id", "peer_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsobgppeerstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted BGP peer and linked overlay. Native and overlay save events are not ownership "
+            "evidence. Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot "
+            "synchronously. Greenfield acceptance uses exact acquisition planning and outbox delivery instead of "
+            "accepting and pushing directly. Routers, scopes, address families, peer templates, ASNs, and peer IPs "
+            "are graph dependencies. BGP reconciliation no longer suppresses missing netbox-routing or IPAM imports; "
+            "missing graph dependencies fail fast. BGP foreign-key merge identities use natural graph identities. "
+            "Legacy PK-shaped peer and template merge bases are reset before reconciliation."
+        ),
+    ),
+    "interface": ScopeOwnershipRule(
+        scope="interface",
+        native_model_labels=("dcim.interface",),
+        native_key_fields=("device_id", "name"),
+        overlay_model_labels=("netbox_nso_plugin.nsointerfacestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsointerfacestate", "interface"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire description and enabled intent from explicit persisted state changes. "
+            "Native interface and cable events are not ownership evidence and do not recompute derived values."
+        ),
+    ),
+    "ip": ScopeOwnershipRule(
+        scope="ip",
+        native_model_labels=("ipam.ipaddress",),
+        native_key_fields=("address", "vrf_id", "assigned_object_type_id", "assigned_object_id"),
+        overlay_model_labels=("netbox_nso_plugin.nsointerfaceipstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsointerfaceipstate", "__ip_address__"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from an exact persisted IPAddress and interface-IP state pair. "
+            "Native IP save and delete events are not ownership evidence. Reconcile activation and unassignment are atomic."
+        ),
+    ),
+    "l2_sap": ScopeOwnershipRule(
+        scope="l2_sap",
+        native_model_labels=("netbox_nso_plugin.nsol2sapstate",),
+        native_key_fields=("management_id", "service_name", "sap_id"),
+        overlay_model_labels=("netbox_nso_plugin.nsol2sapstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsol2sapstate", "__self__"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted SAP overlay because the rendered SAP values live on that row. "
+            "VPN and termination mirrors do not establish ownership, and save events are not ownership evidence."
+        ),
+    ),
+    "logging": ScopeOwnershipRule(
+        scope="logging",
+        native_model_labels=(
+            "netbox_nso_plugin.nsologginghoststate",
+            "netbox_nso_plugin.nsologginglevelstate",
+        ),
+        native_key_fields=("management_id", "pk"),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsologginghoststate",
+            "netbox_nso_plugin.nsologginglevelstate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsologginghoststate", "__self__"),
+            ("netbox_nso_plugin.nsologginglevelstate", "__self__"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=("Acquire from persisted logging rows. Save events are not ownership evidence."),
+    ),
+    "snmp": ScopeOwnershipRule(
+        scope="snmp",
+        native_model_labels=(
+            "netbox_nso_plugin.nsosnmpcommunitystate",
+            "netbox_nso_plugin.nsosnmpv3userstate",
+            "netbox_nso_plugin.nsosnmphoststate",
+            "netbox_nso_plugin.nsosnmpsysteminfostate",
+        ),
+        native_key_fields=("management_id", "pk"),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsosnmpcommunitystate",
+            "netbox_nso_plugin.nsosnmpv3userstate",
+            "netbox_nso_plugin.nsosnmphoststate",
+            "netbox_nso_plugin.nsosnmpsysteminfostate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsosnmpcommunitystate", "__self__"),
+            ("netbox_nso_plugin.nsosnmpv3userstate", "__self__"),
+            ("netbox_nso_plugin.nsosnmphoststate", "__self__"),
+            ("netbox_nso_plugin.nsosnmpsysteminfostate", "__self__"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=("Acquire from persisted SNMP rows. Save events are not ownership evidence."),
+    ),
+    "static_route": ScopeOwnershipRule(
+        scope="static_route",
+        native_model_labels=("netbox_routing.staticroute",),
+        native_key_fields=("vrf_id", "prefix", "next_hop", "interface_next_hop"),
+        overlay_model_labels=("netbox_nso_plugin.nsostaticroutestate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsostaticroutestate", "static_route"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted route assignment and overlay. Native route and assignment events are not "
+            "ownership evidence. Deletion authority carries only the adapter-acknowledged route triple."
+        ),
+        acknowledged_lineage_field="last_acked_triple",
+    ),
+    "isis_flex_algo": ScopeOwnershipRule(
+        scope="isis_flex_algo",
+        native_model_labels=("netbox_routing.isisflexalgo",),
+        native_key_fields=("instance_id", "algo_id"),
+        overlay_model_labels=("netbox_nso_plugin.nsoisisflexalgostate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsoisisflexalgostate", "isis_flex_algo"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted Flex-Algo and linked overlay. Native Flex-Algo save and delete events are not "
+            "ownership evidence."
+        ),
+    ),
+    "redistribution": ScopeOwnershipRule(
+        scope="redistribution",
+        native_model_labels=("netbox_routing.redistribution",),
+        native_key_fields=(
+            "destination_type_id",
+            "destination_id",
+            "source_protocol",
+            "source_ref",
+        ),
+        overlay_model_labels=("netbox_nso_plugin.nsoredistributionstate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsoredistributionstate", "redistribution"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted destination-specific redistribution and linked overlay. Native and overlay "
+            "save events are not ownership evidence. The manifest delivery scope comes from the destination protocol."
+        ),
+        manifest_scope_field="dest_protocol",
+    ),
+    "route_policy": ScopeOwnershipRule(
+        scope="route_policy",
+        native_model_labels=(
+            "netbox_routing.prefixlist",
+            "netbox_routing.communitylist",
+            "netbox_routing.aspath",
+            "netbox_routing.routemap",
+        ),
+        native_key_fields=("name",),
+        overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
+        overlay_native_fields=(("netbox_nso_plugin.nsoroutepolicystate", "assigned_object"),),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted named policy root and its linked device overlay. Native root, entry, M2M, "
+            "and through-row events are not ownership evidence. Native policy deletes no longer delete per-device "
+            "overlays and push reduced snapshots synchronously. Acceptance and contributor cascades use exact "
+            "acquisition planning and outbox delivery instead of owning and pushing directly. Entries and references "
+            "are graph dependencies."
+        ),
+    ),
+    "isis": ScopeOwnershipRule(
+        scope="isis",
+        native_model_labels=(
+            "netbox_routing.isisinstance",
+            "netbox_routing.isisinterface",
+        ),
+        native_key_fields=(),
+        native_key_fields_by_model=(
+            ("netbox_routing.isisinstance", ("device_id", "process_tag")),
+            ("netbox_routing.isisinterface", ("interface_id", "address_family")),
+        ),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsoisisinstancestate",
+            "netbox_nso_plugin.nsoisisinterfacestate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsoisisinstancestate", "isis_instance"),
+            ("netbox_nso_plugin.nsoisisinterfacestate", "isis_interface"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted native process or interface and its linked overlay. Native and overlay save "
+            "events are not ownership evidence. Native interface edits no longer refresh owned overlays. Native "
+            "interface deletes no longer delete overlays and push retirement synchronously. ISISLevel edits and "
+            "deletes no longer re-push immediately. Reconciliation and ownership audits handle these changes. "
+            "Settings, levels, Segment Routing, Flex-Algo, Prefix-SID, and SRv6 locator rows are graph dependencies, "
+            "not independently owned device objects."
+        ),
+    ),
+    "ospf": ScopeOwnershipRule(
+        scope="ospf",
+        native_model_labels=(
+            "netbox_routing.ospfinstance",
+            "netbox_routing.ospfinterface",
+        ),
+        native_key_fields=(),
+        native_key_fields_by_model=(
+            ("netbox_routing.ospfinstance", ("device_id", "process_id")),
+            ("netbox_routing.ospfinterface", ("interface_id",)),
+        ),
+        overlay_model_labels=(
+            "netbox_nso_plugin.nsoospfinstancestate",
+            "netbox_nso_plugin.nsoospfinterfacestate",
+        ),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsoospfinstancestate", "ospf_instance"),
+            ("netbox_nso_plugin.nsoospfinterfacestate", "__ospf_interface__"),
+        ),
+        foreign_overlay_delete="reown",
+        deletion_authority=True,
+        intentional_semantic_delta=(
+            "Acquire from a persisted native process or interface and its overlay. Native and overlay save events "
+            "are not ownership evidence and no longer create or refresh owned overlays. Native process and interface "
+            "deletes no longer delete overlays and push retirement synchronously. Reconciliation and ownership "
+            "audits handle these changes. A shared OSPF area is a dependency, not a device-owned object."
+        ),
     ),
 }
 
@@ -153,17 +418,10 @@ def detach_device_manifests(device_id: int) -> None:
 
 
 def retire_device_manifests(device_id: int) -> None:
-    """Retire each owned manifest identity for a device teardown."""
+    """Retire all owned manifest identities for a device teardown."""
     from .models import NSOOwnershipManifest
 
-    manifests = NSOOwnershipManifest.objects.filter(
+    NSOOwnershipManifest.objects.filter(
         device_id=device_id,
         ownership_state="owned",
-    ).only("scope", "native_model_label", "native_key")
-    for manifest in manifests.iterator():
-        retire_manifest_identity(
-            device_ids=(device_id,),
-            scope=manifest.scope,
-            native_model_label=manifest.native_model_label,
-            native_key=manifest.native_key,
-        )
+    ).update(ownership_state="retired")

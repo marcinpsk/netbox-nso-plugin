@@ -257,8 +257,8 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
         _assign_without_push(sr, self.device)
         return sr
 
-    def test_save_triggers_intent_push(self):
-        """Saving NSOStaticRouteState triggers put_static_route_intent."""
+    def test_foreign_state_save_does_not_trigger_intent_push(self):
+        """A save event outside the exact writer is not ownership evidence."""
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         mgmt = self._make_mgmt()
@@ -274,9 +274,7 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
             )
             with self.captureOnCommitCallbacks(execute=True):
                 _invoke_static_route_state_save(state)
-            mock_push.assert_called_once()
-            args = mock_push.call_args[0]
-            assert args[0] == 99  # adapter_device_id
+            mock_push.assert_not_called()
 
     def test_no_push_when_no_adapter_device_id(self):
         """No push when management.adapter_device_id is None."""
@@ -305,9 +303,8 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
             mock_push.assert_not_called()
 
 
-class TestGreenfieldStaticRoute(IntentPushDeliveryMixin, TestCase):
-    """Greenfield write path: an operator-created route assigned to a managed device
-    becomes accepted intent + pushes; removing/deleting it pushes the removal."""
+class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
+    """Native route events outside the exact writer do not acquire or retire intent."""
 
     @classmethod
     def setUpTestData(cls):
@@ -326,7 +323,7 @@ class TestGreenfieldStaticRoute(IntentPushDeliveryMixin, TestCase):
             defaults={"nso_instance": inst, "nso_device_name": "nso-gf", "adapter_device_id": 77},
         )[0]
 
-    def test_assign_device_owns_and_pushes(self):
+    def test_assign_device_does_not_own_or_push(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -337,54 +334,42 @@ class TestGreenfieldStaticRoute(IntentPushDeliveryMixin, TestCase):
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.devices.add(self.device)  # operator assignment (not suppressed)
-            state = NSOStaticRouteState.objects.get(management=mgmt, static_route=sr)
-            self.assertEqual(state.status, "accepted")
-            mock_push.assert_called()
-            routes = mock_push.call_args[0][1]
-            self.assertTrue(any(r["prefix"] == "10.9.9.0/24" and r["next_hop"] == "10.0.0.9" for r in routes))
+            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+            mock_push.assert_not_called()
 
-    def test_unassign_device_drops_overlay_and_pushes_removal(self):
+    def test_unassign_device_does_not_retire_overlay_or_push(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.10.0/24", next_hop="10.0.0.10", metric=1)
-        with patch(PUT), self.captureOnCommitCallbacks(execute=True):
-            sr.devices.add(self.device)
-        self.assertTrue(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+        sr.devices.add(self.device)
+        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
 
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.devices.remove(self.device)
-            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
-            mock_push.assert_called()
-            routes = mock_push.call_args[0][1]
-            self.assertFalse(any(r["prefix"] == "10.9.10.0/24" for r in routes))
+            self.assertTrue(NSOStaticRouteState.objects.filter(pk=state.pk).exists())
+            mock_push.assert_not_called()
 
-    def test_clear_devices_drops_overlay_and_pushes_removal(self):
-        """StaticRoute.devices.clear() sends pk_set=None (post_clear). The overlay for every
-        detached device must still be dropped + a removal pushed. Regression: `pk_set or []`
-        silently removed nothing, orphaning the overlay and stranding stale adapter intent."""
+    def test_clear_devices_does_not_retire_overlay_or_push(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.12.0/24", next_hop="10.0.0.12", metric=1)
-        with patch(PUT), self.captureOnCommitCallbacks(execute=True):
-            sr.devices.add(self.device)
-        self.assertTrue(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
+        sr.devices.add(self.device)
+        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
 
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.devices.clear()  # pk_set=None on post_clear
-            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route=sr).exists())
-            mock_push.assert_called()
-            routes = mock_push.call_args[0][1]
-            self.assertFalse(any(r["prefix"] == "10.9.12.0/24" for r in routes))
+            self.assertTrue(NSOStaticRouteState.objects.filter(pk=state.pk).exists())
+            mock_push.assert_not_called()
 
-    def test_delete_route_pushes_removal(self):
+    def test_delete_route_only_applies_the_database_cascade(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -398,9 +383,7 @@ class TestGreenfieldStaticRoute(IntentPushDeliveryMixin, TestCase):
             with self.captureOnCommitCallbacks(execute=True):
                 sr.delete()
             self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route__isnull=False).exists())
-            mock_push.assert_called()
-            routes = mock_push.call_args[0][1]
-            self.assertFalse(any(r["prefix"] == "10.9.11.0/24" for r in routes))
+            mock_push.assert_not_called()
 
 
 class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):

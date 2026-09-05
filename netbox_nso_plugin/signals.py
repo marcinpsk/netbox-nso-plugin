@@ -4,6 +4,7 @@
 
 import contextlib
 import contextvars
+import copy
 import functools
 import json
 import logging
@@ -66,6 +67,32 @@ def _converted_writer_owns_content(device_id, scope) -> bool:
     from .renderer_writer import renderer_writer_owns_key
 
     return renderer_writer_owns_key(device_id, scope, content=True)
+
+
+def _require_converted_writer(handler):
+    """Run a converted state handler only inside an exact writer context."""
+
+    @functools.wraps(handler)
+    def _wrapped(*args, **kwargs):
+        from .renderer_writer import active_renderer_writer
+
+        if active_renderer_writer() is None:
+            return None
+        return handler(*args, **kwargs)
+
+    return _wrapped
+
+
+def _schedule_exact_writer_scope(target_scope) -> None:
+    """Schedule keys for one scope only from its active exact content writer."""
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
+    if writer is None:
+        return
+    for device_id, scope in writer.plan.content_keys:
+        if scope == target_scope and _converted_writer_owns_content(device_id, scope):
+            _schedule_intent_push((device_id, scope))
 
 
 class suppress_intent_push:  # noqa: N801 — context-manager named like a verb on purpose
@@ -1049,6 +1076,8 @@ def push_intent_on_accept(sender, instance, **kwargs):
     device_id = Interface.objects.filter(pk=instance.interface_id).values_list("device_id", flat=True).first()
     if device_id is None:
         return
+    if not _converted_writer_owns_content(device_id, "interface"):
+        return
     try:
         mgmt = NSODeviceManagement.objects.get(device_id=device_id)
     except NSODeviceManagement.DoesNotExist:
@@ -1082,7 +1111,7 @@ def _affected_interfaces(cable):
 
 
 def _recompute_one(interface, templates):
-    """Recompute the description for *interface* if it is managed by a sentinel.
+    """Recompute one managed description through an exact writer.
 
     Idempotent: no write if the current value already matches.
     """
@@ -1104,16 +1133,28 @@ def _recompute_one(interface, templates):
         return  # skip-logged inside compute_description
     if interface.description == new_value:
         return  # idempotent — terminates signal chain
-    interface.description = new_value
-    interface.save(update_fields=["description"])
+    candidate = copy.copy(interface)
+    candidate.description = new_value
+
+    from .intent_state import IntentMutationProtocolError
+    from .renderer_writer import active_renderer_writer
+
+    active = active_renderer_writer()
+    # RF-1: every call site gates on _converted_writer_owns_content, so a writer is always
+    # active here. Opening one of its own from a signal is the thing that rule forbids.
+    if active is None:
+        raise IntentMutationProtocolError("a derived description recompute requires an active renderer writer")
+    active.save(candidate, update_fields=("description",))
 
 
 def _recompute_on_cable_change(sender, instance, **kwargs):
-    """Recompute descriptions for both ends of a cable after it is saved."""
+    """Recompute planned cable endpoints only for an active interface writer."""
     templates = _templates()
     if not templates:
         return
     for iface in _affected_interfaces(instance):
+        if not _converted_writer_owns_content(iface.device_id, "interface"):
+            continue
         _recompute_one(iface, templates)
 
 
@@ -1127,6 +1168,8 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
     if not templates:
         return
     for iface in _affected_interfaces(instance):
+        if not _converted_writer_owns_content(iface.device_id, "interface"):
+            continue
         # The termination objects retained by Django's post_delete signal still carry
         # the deleted cable's PK. NetBox's cached ``link_peers`` property would follow
         # that stale FK and raise Cable.DoesNotExist instead of seeing a disconnected
@@ -1138,29 +1181,35 @@ def _recompute_on_cable_delete(sender, instance, **kwargs):
 
 
 def _recompute_on_interface_save(sender, instance, created, **kwargs):
-    """Recompute description when an interface is saved (description may have changed)."""
-    if _is_adapter_origin_write():
-        return  # adapter import — not an operator edit; don't recompute derived intent
+    """Consume a preplanned derived description only for an exact interface writer."""
+    from .intent_state import IntentMutationProtocolError
+
+    if (
+        _is_intent_push_suppressed()
+        or _is_adapter_origin_write()
+        or not _converted_writer_owns_content(instance.device_id, "interface")
+    ):
+        return
     templates = _templates()
     if not templates:
         return
-    _recompute_one(instance, templates)
+    try:
+        _recompute_one(instance, templates)
+    except IntentMutationProtocolError:
+        update_fields = kwargs.get("update_fields")
+        if not update_fields or "description" in update_fields:
+            raise
+        logger.warning(
+            "derived_intent.unplanned_write field=description interface_id=%s",
+            instance.pk,
+        )
 
 
 def _stash_interface_old_values(sender, instance, **kwargs):
-    """Capture native interface fields rendered by intent.
-
-    Lets :func:`_push_intent_on_interface_edit` tell which attribute the operator
-    actually changed. Without it, every save would promote *every* managed attribute
-    — so editing the description would silently own/accept ``enabled`` too (a value
-    the operator never accepted).
-    """
+    """Capture the owned scope targets of a planned interface rename."""
     if not instance.pk:
-        instance._nso_old_values = None
         instance._intent_rename_targets = set()
         return
-    fields = ("name", "description", "enabled")
-    instance._nso_old_values = sender.objects.filter(pk=instance.pk).values(*fields).first()
     instance._intent_rename_targets = set()
     update_fields = kwargs.get("update_fields")
     if (
@@ -1171,8 +1220,8 @@ def _stash_interface_old_values(sender, instance, **kwargs):
     ):
         return
 
-    current = instance._nso_old_values
-    if current is None or instance.name == current["name"]:
+    current_name = sender.objects.filter(pk=instance.pk).values_list("name", flat=True).first()
+    if current_name is None or instance.name == current_name:
         return
     from .apply_state import interface_intent_targets
 
@@ -1182,30 +1231,16 @@ def _stash_interface_old_values(sender, instance, **kwargs):
 
 @_skip_on_render
 def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
-    """Queue each scope whose payload contains a renamed interface."""
+    """Queue exact-writer scopes whose payload contains a renamed interface."""
     if created:
         return
     from . import delivery
-    from . import status_machine as sm
-    from .intent_state import interface_name_intent_rows
     from .models import NSODeviceManagement
 
     targets = getattr(instance, "_intent_rename_targets", set())
+    targets = {key for key in targets if _converted_writer_owns_content(*key)}
     if not targets:
         return
-    with suppress_intent_push():
-        for state in interface_name_intent_rows(instance.pk):
-            if not sm.is_owned(state.status):
-                continue
-            new_status = "accepted" if state.status == "deploying" else sm.on_reconcile(state.status, matches=False)
-            if new_status == state.status:
-                continue
-            state.status = new_status
-            update_fields = ["status"]
-            if state.status != "deploying" and getattr(state, "apply_attempt_id", None) is not None:
-                state.apply_attempt_id = None
-                update_fields.append("apply_attempt_id")
-            state.save(update_fields=update_fields)
     auto_apply = dict(
         NSODeviceManagement.objects.filter(device_id__in={device_id for device_id, _scope in targets}).values_list(
             "device_id", "auto_apply"
@@ -1220,74 +1255,15 @@ def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
 
 @_skip_on_render
 def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
-    """Treat direct edits to description/enabled on managed interfaces as intent.
+    """Schedule explicit interface writer changes without acquiring in a signal.
 
-    Only the attribute(s) the operator actually CHANGED in this save are promoted —
-    determined by comparing against the pre-save snapshot captured in
-    :func:`_stash_interface_old_values`. A changed attribute becomes owned (NetBox
-    is the source of truth) and pending apply (its value now differs from the
-    device). Untouched attributes are left exactly as they were.
-
-    Decision G (activated in Phase 2): editing description/enabled on a managed
-    interface IS an intent change — identical to an explicit Accept action.
-
-    Adapter-origin writes (imports/applies) are skipped: importing a value is not
-    an operator accept, and re-promoting + pushing it back would both corrupt the
-    imported→accepted gate and, during a bulk sync, fire one full-device intent
-    push per interface (the device-27 sync wall).
+    The mutation planner owns the interface and overlay transition. The signal only
+    schedules behavior when that exact content writer is active. A foreign native
+    save is not ownership evidence and has no side effects.
     """
-    if created:
-        return  # new interface — nothing to accept yet
-
-    if _is_adapter_origin_write():
-        return  # import/apply, not an operator intent edit
-
-    old_values = getattr(instance, "_nso_old_values", None)
-    if old_values is None:
-        # No pre-save snapshot (signal not wired / programmatic save). Be
-        # conservative and own nothing, rather than risk adopting untouched
-        # attributes — the pre_save handler supplies this for every real edit.
+    if created or not _converted_writer_owns_content(instance.device_id, "interface"):
         return
-
-    from .models import NSODeviceManagement, NSOInterfaceState
-    from .summary import matches_device_value
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=instance.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    now = timezone.now()
-    updated = False
-    for attribute in ("description", "enabled"):
-        if attribute not in mgmt.managed_attributes:
-            continue
-        new_value = instance.description if attribute == "description" else instance.enabled
-        if new_value == old_values.get(attribute):
-            continue  # operator did not change this attribute — leave it untouched
-        state = NSOInterfaceState.objects.filter(
-            interface=instance,
-            attribute=attribute,
-        ).first()
-        if state is None:
-            continue
-        # Operator changed this attribute → NetBox owns it. Whether it is "pending
-        # apply" depends on the value: editing it back to the device's value (e.g.
-        # flip enabled off then on) leaves nothing to apply → in_sync, not accepted.
-        state.status = "in_sync" if matches_device_value(attribute, new_value, state.nso_value) else "accepted"
-        if state.accepted_at is None:
-            state.accepted_at = now
-        state.save(update_fields=["status", "accepted_at"])
-        updated = True
-
-    if not updated:
-        return
-
-    device_id = instance.device_id
-    _schedule_intent_push((device_id, "interface"))
+    _schedule_intent_push((instance.device_id, "interface"))
 
 
 def _create_greenfield_subif_state(sender, instance, created, **kwargs):
@@ -1320,16 +1296,23 @@ def _create_greenfield_subif_state(sender, instance, created, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    # Brand-new interface → no prior state; create + own it. The post_save signal on the
-    # new state pushes the device's full subinterface intent snapshot to the adapter.
-    NSOSubinterfaceState.objects.create(
+    if not _converted_writer_owns_content(instance.device_id, "subinterface"):
+        return
+
+    from .renderer_writer import active_renderer_writer
+
+    active = active_renderer_writer()
+    if active is None:
+        return
+    candidate = NSOSubinterfaceState(
         management=mgmt,
         interface=instance,
         parent_interface=instance.parent,
         dot1q_vlan=int(suffix),
         status="accepted",
-        accepted_at=timezone.now(),
+        accepted_at=active.plan.planned_at,
     )
+    active.save(candidate, force_insert=True)
 
 
 def interface_ip_intent_item(row):
@@ -1581,6 +1564,7 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_snmp_state_save(sender, instance, **kwargs):
     """Push SNMP intent whenever an SNMP state row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -1594,6 +1578,8 @@ def _on_snmp_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "snmp"):
+        return
     _schedule_intent_push((device_id, "snmp"))
 
 
@@ -1656,6 +1642,7 @@ def _push_logging_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_logging_state_save(sender, instance, **kwargs):
     """Push logging intent whenever an NSOLogging*State row is saved (accept → push)."""
     from .models import NSODeviceManagement
@@ -1669,6 +1656,8 @@ def _on_logging_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "logging"):
+        return
     _schedule_intent_push((device_id, "logging"))
 
 
@@ -1710,6 +1699,7 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_svi_state_save(sender, instance, **kwargs):
     """Push SVI intent whenever an NSOSVIState row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -1766,6 +1756,7 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_subinterface_state_save(sender, instance, **kwargs):
     """Push subinterface intent whenever an NSOSubinterfaceState row is saved."""
     from .models import NSODeviceManagement
@@ -1779,6 +1770,8 @@ def _on_subinterface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "subinterface"):
+        return
     _schedule_intent_push((device_id, "subinterface"))
 
 
@@ -1819,6 +1812,7 @@ def _push_interface_mtu_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_mtu_state_save(sender, instance, **kwargs):
     """Push MTU intent whenever an NSOInterfaceMtuState row is saved."""
     from .models import NSODeviceManagement
@@ -1832,6 +1826,8 @@ def _on_mtu_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "interface_mtu"):
+        return
     _schedule_intent_push((device_id, "interface_mtu"))
 
 
@@ -1870,6 +1866,7 @@ def _push_vlan_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_vlan_state_save(sender, instance, **kwargs):
     """Push VLAN intent whenever an NSOVLANState row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -2010,6 +2007,7 @@ def _push_bfd_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_bfd_state_save(sender, instance, **kwargs):
     """Push BFD intent whenever an NSOBFDInterfaceState row is saved (accept triggers push)."""
     from .models import NSODeviceManagement
@@ -2023,169 +2021,23 @@ def _on_bfd_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "bfd"):
+        return
     _schedule_intent_push((device_id, "bfd"))
-
-
-def _on_ip_address_pre_save(sender, instance, **kwargs):
-    """Stash the IPAddress's pre-save interface binding for the reassignment cleanup.
-
-    A GenericForeignKey change fires a single post_save keyed on the NEW interface; without
-    the previous binding, the OLD interface's ``NSOInterfaceIPState`` is orphaned and its
-    device keeps an IP NetBox just moved away. Not ``@_skip_on_render``: it only reads + stashes
-    on the instance (no push), and post_save's own guard decides whether the cleanup runs.
-    """
-    from dcim.models import Interface as _Interface
-
-    instance._nso_prev_ip_binding = None
-    if not instance.pk:
-        return
-    try:
-        prev = sender.objects.get(pk=instance.pk)
-    except sender.DoesNotExist:
-        return
-    prev_assigned = prev.assigned_object
-    if isinstance(prev_assigned, _Interface):
-        instance._nso_prev_ip_binding = (prev_assigned, str(prev.address), prev.vrf.name if prev.vrf else "")
-
-
-def _cleanup_reassigned_ip_overlay(instance) -> None:
-    """Drop the OLD interface's IP overlay + push the reduced intent when an IP moved.
-
-    Fires when an IPAddress's interface/address/vrf changed vs its pre-save binding (captured by
-    :func:`_on_ip_address_pre_save`): the overlay keyed on the OLD (interface, address, vrf) is
-    orphaned, so delete it and full-replace-push the OLD device's IP intent (which drops it on the
-    device). The new binding's overlay is (re)created by the normal post_save path.
-    """
-    from dcim.models import Interface as _Interface
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-
-    prev = getattr(instance, "_nso_prev_ip_binding", None)
-    if not prev:
-        return
-    prev_iface, prev_addr, prev_vrf = prev
-    assigned = instance.assigned_object
-    cur_addr = str(instance.address)
-    cur_vrf = instance.vrf.name if instance.vrf else ""
-    if (
-        isinstance(assigned, _Interface)
-        and assigned.pk == prev_iface.pk
-        and prev_addr == cur_addr
-        and prev_vrf == cur_vrf
-    ):
-        return  # same binding → not a move, nothing to clean
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=prev_iface.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    deleted, _ = NSOInterfaceIPState.objects.filter(interface=prev_iface, address=prev_addr, vrf=prev_vrf).delete()
-    if not deleted:
-        return
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "ip"))
 
 
 @_skip_on_render
 def _on_ip_address_change(sender, instance, **kwargs):
-    """Push IP intent when an IPAddress assigned to a managed interface changes.
-
-    Decorated ``@_skip_on_render`` like every other push handler so that
-    ``suppress_intent_push()`` (the rqworker reconcile/import guard) also silences
-    the IP path — otherwise a reconciler saving an interface IP would push intent
-    back to the adapter and force-promote imported rows to ``accepted``. The
-    P2P-pair guard (``_p2p_allocation_active``) is orthogonal and stays below.
-    """
-    from dcim.models import Interface as _Interface
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-
-    # If this IP was reassigned off another interface (or unassigned), drop the OLD
-    # interface's overlay first so it isn't stranded (device keeps a moved-away IP).
-    _cleanup_reassigned_ip_overlay(instance)
-
-    assigned = instance.assigned_object
-    if not isinstance(assigned, _Interface):
+    """Schedule only the IP keys declared by the active exact writer."""
+    if getattr(_p2p_allocation_active, "active", False):
         return
-
-    device_id = assigned.device_id
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    addr_str = str(instance.address)  # "ip/plen"
-    vrf_name = instance.vrf.name if instance.vrf else ""
-    family = "ipv6" if ":" in addr_str.split("/")[0] else "ipv4"
-
-    ip_state, created = NSOInterfaceIPState.objects.get_or_create(
-        interface=assigned,
-        address=addr_str,
-        vrf=vrf_name,
-        defaults={
-            "status": "accepted",
-            "accepted_at": timezone.now(),
-            "family": family,
-            "secondary": False,
-        },
-    )
-
-    if not created:
-        if ip_state.status == "conflict":
-            logger.debug(
-                "IP %s on interface %s is in conflict state; skipping intent push",
-                addr_str,
-                assigned.name,
-            )
-            return
-        if ip_state.status != "accepted":
-            ip_state.status = "accepted"
-            ip_state.accepted_at = timezone.now()
-            ip_state.save(update_fields=["status", "accepted_at"])
-
-    if not getattr(_p2p_allocation_active, "active", False):
-        _schedule_intent_push((device_id, "ip"))
+    _schedule_exact_writer_scope("ip")
 
 
 @_skip_on_render
 def _on_ip_address_delete(sender, instance, **kwargs):
-    """Push IP intent (with the deleted IP removed) when an IPAddress is deleted.
-
-    Decorated ``@_skip_on_render`` so ``suppress_intent_push()`` silences the push
-    when a reconciler (or a rolled-back allocation) deletes an interface IP.
-    """
-    from dcim.models import Interface as _Interface
-
-    from .models import NSODeviceManagement, NSOInterfaceIPState
-
-    assigned = instance.assigned_object
-    if not isinstance(assigned, _Interface):
-        return
-
-    device_id = assigned.device_id
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-
-    if mgmt.adapter_device_id is None:
-        return
-
-    addr_str = str(instance.address)
-    vrf_name = instance.vrf.name if instance.vrf else ""
-    NSOInterfaceIPState.objects.filter(
-        interface=assigned,
-        address=addr_str,
-        vrf=vrf_name,
-    ).delete()
-
-    _schedule_intent_push((device_id, "ip"))
+    """Schedule only the IP keys declared by the active exact delete writer."""
+    _on_ip_address_change(sender, instance, **kwargs)
 
 
 #: The overlays a static-route push actually serializes: owned, and carrying an IP next
@@ -2301,8 +2153,9 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_static_route_state_save(sender, instance, **kwargs):
-    """Push static route intent whenever an NSOStaticRouteState row is saved."""
+    """Schedule static-route intent only for an active exact content writer."""
     from .models import NSODeviceManagement
 
     try:
@@ -2314,6 +2167,8 @@ def _on_static_route_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
+    if not _converted_writer_owns_content(device_id, "static_route"):
+        return
     _schedule_intent_push((device_id, "static_route"))
 
 
@@ -2452,81 +2307,6 @@ def _transition_static_route_content(static_route, previous=None) -> list:
     return rows
 
 
-def _carried_last_acked(mgmt, route_id):
-    """Read the acknowledged triple a pending deletion of *route_id* hands to a new overlay.
-
-    Both the state row's own homes and the key's unfolded entries are read, because the
-    deletion may not have been folded yet: the codex sequence that needs this — delete,
-    re-own, re-delete, all before the drain — has the record sitting in an entry.
-    """
-    from . import outbox
-    from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
-
-    state = NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").first()
-    transitions = [
-        record
-        for row in NSOIntentOutboxEntry.objects.filter(
-            device_id=mgmt.device_id, scope="static_route", consumed_by_push_seq__isnull=True
-        ).order_by("id")
-        for record in row.transitions
-    ]
-    return outbox.carried_triple(
-        route_id,
-        transitions=transitions,
-        queued=(state.queued_deletions if state else ()),
-        claim_deletions=(state.claim_deletions if state else ()),
-        lineage_carry=(state.lineage_carry if state else None),
-    )
-
-
-def _accept_static_route_for_device(static_route, device) -> None:
-    """Own a greenfield route for *device* (accepted overlay) → its save pushes intent."""
-    from .models import NSODeviceManagement, NSOStaticRouteState
-
-    if static_route.next_hop is None:
-        return  # interface-only next-hop not supported by static-route-reconciler v1
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOStaticRouteState.objects.get_or_create(
-        management=mgmt,
-        static_route=static_route,
-        defaults={
-            "status": "accepted",
-            "accepted_at": timezone.now(),
-        },
-    )
-    if created:
-        # A fresh row inherits the last acknowledged triple from its pending deletion.
-        state.last_acked_triple = _carried_last_acked(mgmt, static_route.pk)
-    was_owned = not created and state.status in _OWNED_PUSH_STATUSES
-    if not created and not was_owned:
-        state.status = "accepted"
-        state.accepted_at = timezone.now()
-    if not was_owned:
-        # Entering ownership is intent this device did not carry before, so it needs a
-        # generation of its own — an already-owned row keeps the one it is mid-flight on.
-        _arm_static_route_generation(state)
-    # nso_vrf too: the residue key is the (vrf, prefix, next_hop) triple, so a VRF route
-    # adopted with an empty mirror never matches its own device row.
-    state.nso_vrf = static_route.vrf.name if static_route.vrf else ""
-    state.nso_prefix = str(static_route.prefix or "")
-    state.nso_next_hop = str(static_route.next_hop or "")
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_static_route_state_save schedules the push
-    if not was_owned:
-        from . import outbox
-
-        # Re-ownership withdraws whatever deletion authority is pending for this pk: without
-        # the record, a delete/re-own/re-delete sequence would ship the deletion of a route
-        # NetBox owns again.
-        device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-        _schedule_intent_push((device_id, "static_route"), transitions=[outbox.revoke_transition(static_route.pk)])
-
-
 def _static_route_delete_transition(row, static_route_id):
     """Record what is leaving, from the overlay that still mirrors it.
 
@@ -2557,96 +2337,25 @@ def _remove_static_route_for_device(static_route, device) -> None:
     rows.delete()
 
 
-def _on_routing_static_route_pre_save(sender, instance, **kwargs):
-    """Stash the committed row's wire-visible content so post_save can see the delta.
-
-    The stash lives on the instance, so a save of a *different* route on the same thread
-    can never be read as this one's baseline. Re-reading on every save is deliberate:
-    within one transaction a second save sees the transaction's own first write, which is
-    what makes an A→B→A edit two real transitions instead of a silently swallowed one.
-
-    The baseline is read under the row's own lock, held to COMMIT. Two concurrent edits
-    would otherwise both load A; the one that lands second — writing A back over the
-    first's B — would compare A against A, transition nothing and push nothing, leaving
-    the adapter holding B while NetBox reads A.
-    """
-    from django.db import connection
-
-    instance._nso_static_route_content = None
-    # Same guard as post_save's @_skip_on_render: with no transition to feed there is no
-    # baseline to read, and reconcile writes must not take a route lock.
-    if _is_intent_push_suppressed() or _is_render_request() or not instance.pk:
-        return
-    # order_by(pk): the model's Meta ordering starts at the nullable ``vrf``, whose LEFT
-    # JOIN PostgreSQL refuses to lock ("FOR UPDATE cannot be applied to the nullable side").
-    rows = sender.objects.filter(pk=instance.pk).order_by("pk")
-    if connection.in_atomic_block:
-        rows = rows.select_for_update()  # outside a transaction there is nothing to hold it to
-    previous = rows.first()
-    if previous is not None:
-        instance._nso_static_route_content = _static_route_content(previous)
-
-
 @_skip_on_render
 def _on_routing_static_route_save(sender, instance, created=False, **kwargs):
-    """Re-arm every overlay owning this route when its content changed, and push.
-
-    Delta-gated against the pre-save row: a save that touches nothing the wire carries is
-    not intent and must neither bump a generation nor push. The comparison itself happens
-    inside the transition, against the *committed* row. A create is left to the
-    ``post_add`` that assigns the route its first devices — there is no overlay yet.
-    """
-    previous = getattr(instance, "_nso_static_route_content", None)
-    if created or previous is None:
-        return
-    _transition_static_route_content(instance, previous=previous)
+    """Schedule only the static-route keys declared by the active exact writer."""
+    _schedule_exact_writer_scope("static_route")
 
 
 @_close_renderer_m2m_permit
 @_skip_on_render
 def _on_routing_static_route_devices_changed(sender, instance, action, pk_set, reverse, **kwargs):
-    """Device assigned to / removed from a route → own / remove + push (greenfield).
-
-    m2m_changed is NOT a deletion-only signal, so this handler must not be registered under
-    _as_delete_origin: that would stamp ``?delete_origin=true`` on the push born from an
-    ADD, authorizing the adapter to retract from the live device any route the full-replace
-    snapshot happens not to carry. Only the removal branches open the mark.
-    """
-    from dcim.models import Device
-
-    try:
-        from netbox_routing.models import StaticRoute
-    except ImportError:
+    """Schedule only exact-writer assignment changes, without acquiring in the signal."""
+    if not action.startswith("post_"):
         return
-    if reverse or not isinstance(instance, StaticRoute):
-        return  # only the StaticRoute.devices side
-    if action == "post_add":
-        for device in Device.objects.filter(pk__in=pk_set or []):
-            _accept_static_route_for_device(instance, device)
-    elif action == "post_remove":
-        with _delete_origin_dispatch():
-            for device in Device.objects.filter(pk__in=pk_set or []):
-                _remove_static_route_for_device(instance, device)
-    elif action == "post_clear":
-        # Django sends pk_set=None on .clear(): every device was detached. `pk_set or []`
-        # would silently remove nothing, orphaning every overlay + leaving stale adapter
-        # intent. Drive the removal from the overlay rows still referencing this route —
-        # their devices are exactly the ones just detached.
-        from .models import NSOStaticRouteState
-
-        device_ids = set(
-            NSOStaticRouteState.objects.filter(static_route=instance).values_list("management__device_id", flat=True)
-        )
-        with _delete_origin_dispatch():
-            for device in Device.objects.filter(pk__in=device_ids):
-                _remove_static_route_for_device(instance, device)
+    _schedule_exact_writer_scope("static_route")
 
 
 @_skip_on_render
 def _on_routing_static_route_pre_delete(sender, instance, **kwargs):
-    """Route deleted in NetBox → drop overlays + push removal before the cascade lands."""
-    for device in instance.devices.all():
-        _remove_static_route_for_device(instance, device)
+    """Schedule only exact-writer route deletions, without mutating overlays."""
+    _schedule_exact_writer_scope("static_route")
 
 
 # ── IS-IS Flex-Algorithm intent (process-tag scoped) ────────────────────────
@@ -2685,8 +2394,9 @@ def _push_isis_flex_algo_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
-    """Push Flex-Algo intent whenever an NSOISISFlexAlgoState row is saved."""
+    """Schedule Flex-Algo intent only for a declared exact writer mutation."""
     from .models import NSODeviceManagement
 
     try:
@@ -2696,118 +2406,20 @@ def _on_isis_flex_algo_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
     device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "isis_flex_algo"))
-
-
-# ── Greenfield Flex-Algo (operator-created in NetBox, not yet on the device) ──
-#
-# ISISFlexAlgo belongs to an ISISInstance which carries the device + process-tag,
-# so a flex-algo the operator creates becomes an *accepted* overlay (owned intent)
-# and pushes; editing re-pushes; deleting pushes the removal (full-replace).
-
-
-def _accept_isis_flex_algo(flex_algo) -> None:
-    """Own a greenfield flex-algo (accepted overlay) → its save pushes intent."""
-    from .models import NSODeviceManagement, NSOISISFlexAlgoState
-
-    inst = flex_algo.instance
-    device = getattr(inst, "device", None)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOISISFlexAlgoState.objects.get_or_create(
-        management=mgmt,
-        process_tag=inst.process_tag or "",
-        algo_id=int(flex_algo.algo_id),
-        defaults={
-            "isis_flex_algo": flex_algo,
-            "status": "accepted",
-            "accepted_at": timezone.now(),
-        },
-    )
-    if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-        state.status = "accepted"
-        state.accepted_at = timezone.now()
-    state.isis_flex_algo = flex_algo
-    state.metric_type = flex_algo.metric_type or ""
-    state.priority = flex_algo.priority
-    state.admin_group_exclude = flex_algo.admin_group_exclude or ""
-    state.admin_group_include_any = flex_algo.admin_group_include_any or ""
-    state.admin_group_include_all = flex_algo.admin_group_include_all or ""
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_isis_flex_algo_state_save schedules the push
-
-
-def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
-    """Capture linked overlays before Django clears their native foreign key."""
-    from .models import NSOISISFlexAlgoState
-
-    instance._nso_linked_flex_algo_state_pks = tuple(
-        NSOISISFlexAlgoState.objects.filter(isis_flex_algo=instance).values_list("pk", flat=True)
-    )
-
-
-def _remove_isis_flex_algo(flex_algo) -> None:
-    """Drop the overlay for this flex-algo and push the removal (full-replace)."""
-    from django.db import transaction
-
-    from .apply_state import lock_device_intent_transaction, lock_order_scope
-    from .deployment import lock_mutation
-    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
-    from .models import NSODeviceManagement, NSOISISFlexAlgoState
-
-    inst = flex_algo.instance
-    device = getattr(inst, "device", None)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    key = (device_id, "isis_flex_algo")
-    footprint = MutationFootprint.for_keys(
-        {key},
-        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", None),),
-    )
-    with transaction.atomic(), lock_order_scope():
-        lock_mutation()
-        lock_device_intent_transaction(device_id)
-        try:
-            with intent_transaction(footprint):
-                state_pks = set(getattr(flex_algo, "_nso_linked_flex_algo_state_pks", ()))
-                state_pks.update(
-                    NSOISISFlexAlgoState.objects.filter(
-                        management=mgmt,
-                        process_tag=inst.process_tag or "",
-                        algo_id=int(flex_algo.algo_id),
-                    ).values_list("pk", flat=True)
-                )
-                if not state_pks:
-                    raise IntentTransactionNoOp
-                NSOISISFlexAlgoState.objects.filter(pk__in=state_pks).delete()
-                _schedule_intent_push(key)
-        except IntentTransactionNoOp:
-            return
+    if _converted_writer_owns_content(device_id, "isis_flex_algo"):
+        _schedule_intent_push((device_id, "isis_flex_algo"))
 
 
 @_skip_on_render
 def _on_routing_isis_flex_algo_save(sender, instance, **kwargs):
-    """Flex-algo created/edited in NetBox → own it (accepted overlay) + push."""
-    _accept_isis_flex_algo(instance)
+    """Schedule native Flex-Algo saves only for their exact writer."""
+    _schedule_exact_writer_scope("isis_flex_algo")
 
 
 @_skip_on_render
-def _on_routing_isis_flex_algo_post_delete(sender, instance, **kwargs):
-    """Flex-algo deleted in NetBox → drop its overlay and push the removal."""
-    _remove_isis_flex_algo(instance)
+def _on_routing_isis_flex_algo_pre_delete(sender, instance, **kwargs):
+    """Schedule native Flex-Algo deletes only for their exact writer."""
+    _schedule_exact_writer_scope("isis_flex_algo")
 
 
 def l2_sap_intent_item(row):
@@ -2842,8 +2454,9 @@ def _push_l2_sap_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_l2_sap_state_save(sender, instance, **kwargs):
-    """Push L2 SAP intent whenever an NSOL2SapState row is saved."""
+    """Schedule L2 SAP intent only for an active exact content writer."""
     from .models import NSODeviceManagement
 
     try:
@@ -2855,7 +2468,8 @@ def _on_l2_sap_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "l2_sap"))
+    if _converted_writer_owns_content(device_id, "l2_sap"):
+        _schedule_intent_push((device_id, "l2_sap"))
 
 
 def lacp_member_intent_item(row):
@@ -2919,6 +2533,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_lacp_state_save(sender, instance, **kwargs):
     """On accept, commit LACP to the device only in auto-apply mode.
 
@@ -2978,6 +2593,7 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_switchport_state_save(sender, instance, **kwargs):
     """On accept, commit switchport to the device only in auto-apply mode.
 
@@ -3104,8 +2720,9 @@ def _push_isis_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_isis_interface_state_save(sender, instance, **kwargs):
-    """Push IS-IS interface intent whenever an NSOISISInterfaceState row is saved."""
+    """Schedule IS-IS only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3117,12 +2734,14 @@ def _on_isis_interface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "isis"))
+    if _converted_writer_owns_content(device_id, "isis"):
+        _schedule_intent_push((device_id, "isis"))
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_isis_instance_state_save(sender, instance, **kwargs):
-    """Push IS-IS intent (interfaces + processes) whenever an NSOISISInstanceState row is saved."""
+    """Schedule IS-IS only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3134,7 +2753,8 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "isis"))
+    if _converted_writer_owns_content(device_id, "isis"):
+        _schedule_intent_push((device_id, "isis"))
 
 
 def _build_bgp_router_list(routers: dict, scope_afs: dict, router_ids: dict | None = None) -> list:
@@ -3259,6 +2879,8 @@ def bgp_peer_address_family_intent_item(row):
 
 def bgp_peer_intent_item(row, address_families):
     """Return one BGP peer in the adapter's exact nested wire shape."""
+    if row.bgp_peer is None:
+        return None
     entry = {
         "peer_address": row.peer_address_str,
         "enabled": row.enabled if row.enabled is not None else True,
@@ -3299,6 +2921,29 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     from . import adapter_client as client
     from .models import NSOBGPPeerState
 
+    owned_rows = list(
+        NSOBGPPeerState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group")
+    )
+    incomplete = next((row for row in owned_rows if row.bgp_peer_id is None), None)
+    blocked = (
+        {
+            "message": f"BGP snapshot is blocked by peer state {incomplete.pk} without a linked BGP peer.",
+            "detail": {
+                "reason": "missing_bgp_peer",
+                "state_id": incomplete.pk,
+                "asn": incomplete.asn_str,
+                "vrf": incomplete.vrf_name,
+                "peer_address": incomplete.peer_address_str,
+            },
+        }
+        if incomplete is not None
+        else None
+    )
+    renderable_rows = () if blocked is not None else owned_rows
+
     # BGP redistribution: dest_ref = f"{asn}:{vrf}:{af}"
     redist_by_af = _collect_redistribution_by_dest_ref(device_id, "bgp")
 
@@ -3316,10 +2961,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         scope_afs.setdefault((asn_str, vrf_str), {})[af_str] = redist_entries
 
     routers: dict[str, dict] = {}
-    for row in NSOBGPPeerState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group"):
+    for row in renderable_rows:
         asn_str = row.asn_str
         vrf_name = row.vrf_name or ""
         if asn_str not in routers:
@@ -3328,31 +2970,46 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         if vrf_name not in scopes:
             scopes[vrf_name] = {"vrf": vrf_name, "address_families": [], "peers": []}
 
-        # Build address-family list from the linked BGPPeer if available.
+        # Build the address-family list from the validated BGPPeer link.
         peer_afs = []
-        if row.bgp_peer is not None:
-            for paf in row.bgp_peer.address_families.select_related(
-                "address_family",
-                "prefixlist_in",
-                "prefixlist_out",
-                "routemap_in",
-                "routemap_out",
-            ):
-                peer_afs.append(bgp_peer_address_family_intent_item(paf))
+        for paf in row.bgp_peer.address_families.select_related(
+            "address_family",
+            "prefixlist_in",
+            "prefixlist_out",
+            "routemap_in",
+            "routemap_out",
+        ):
+            peer_afs.append(bgp_peer_address_family_intent_item(paf))
 
         scopes[vrf_name]["peers"].append(bgp_peer_intent_item(row, peer_afs))
 
-    router_list = _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
+    router_list = (
+        {"blocked": blocked}
+        if blocked is not None
+        else _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
+    )
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            blocker = body["blocked"]
+            raise client.AdapterError(
+                blocker["message"],
+                code="validation_error",
+                detail=blocker["detail"],
+            )
+        return client.put_bgp_intent(adapter_device_id, body)
+
     _push_changed(
         (device_id, "bgp"),
         router_list,
-        lambda body: client.put_bgp_intent(adapter_device_id, body),
+        push,
     )
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_bgp_peer_state_save(sender, instance, **kwargs):
-    """Push BGP intent whenever an NSOBGPPeerState row is saved."""
+    """Schedule BGP only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3364,125 +3021,26 @@ def _on_bgp_peer_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "bgp"))
-
-
-# ── Greenfield BGP peers (operator-created in NetBox, not yet on the device) ──
-#
-# The reconcile path only creates an NSOBGPPeerState overlay for a peer the device already
-# reports (brownfield adoption). These handlers add the missing direction: a
-# netbox_routing.BGPPeer the operator creates/edits under a managed device's BGP router
-# becomes an *accepted* overlay (owned intent) and pushes; deleting the peer drops the
-# overlay and retracts (full-replace). This fills the "no native BGPPeer pre_delete" gap:
-# the overlay's bgp_peer FK is on_delete=SET_NULL, so a BGPPeer delete would otherwise only
-# null the FK and leave the intent stranded on the device.
-
-
-def _bgp_peer_device(peer):
-    """Resolve the managed Device a BGPPeer belongs to (scope→router→assigned_object), or None."""
-    from dcim.models import Device
-
-    scope = getattr(peer, "scope", None)
-    router = getattr(scope, "router", None) if scope is not None else None
-    if router is None:
-        return None
-    obj = router.assigned_object
-    return obj if isinstance(obj, Device) else None
-
-
-def _bgp_peer_overlay_key(peer):
-    """Return (asn_str, vrf_name, peer_address_str) for a BGPPeer.
-
-    MUST match the reconcile derivation (bgp_reconciler: asn_str=str(router.asn.asn),
-    vrf_name=scope.vrf.name or '', peer_address_str=host IP) so a greenfield-created
-    overlay and a later reconcile of the same peer share ONE identity key (no duplicate).
-    """
-    router = peer.scope.router
-    asn_str = str(router.asn.asn) if router.asn_id else ""
-    vrf = peer.scope.vrf
-    vrf_name = vrf.name if vrf is not None else ""
-    # peer.peer.address is a netaddr IPNetwork once loaded from the DB, but a plain
-    # "10.0.0.2/32" str on a freshly-created in-memory IPAddress — take the bare host
-    # part robustly in both cases, matching the reconciler's peer_address_str (the raw
-    # payload "peer_address", e.g. "10.0.0.2", with no mask).
-    peer_address_str = str(peer.peer.address).split("/")[0] if peer.peer_id else ""
-    return asn_str, vrf_name, peer_address_str
-
-
-def _accept_bgp_peer_for_device(peer, device) -> None:
-    """Own a greenfield BGP peer for *device* (accepted overlay) → its save pushes intent."""
-    from .models import NSOBGPPeerState, NSODeviceManagement
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    asn_str, vrf_name, peer_address_str = _bgp_peer_overlay_key(peer)
-    if not asn_str or not peer_address_str:
-        return  # incomplete peer (no ASN / no address) — nothing to own yet
-    state, created = NSOBGPPeerState.objects.get_or_create(
-        management=mgmt,
-        asn_str=asn_str,
-        vrf_name=vrf_name,
-        peer_address_str=peer_address_str,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    # Greenfield-only ownership (mirrors _accept_ospf_interface): own a peer whose overlay
-    # was just created here, or one already owned. A pre-existing UNOWNED (brownfield-adopted)
-    # overlay is left to the 3-way reconcile — editing the netbox-routing object surfaces as
-    # 'changed' for an explicit Accept, it is NOT force-owned/pushed. (The reconciler that
-    # materialized the brownfield peer runs under suppress_intent_push, so this handler never
-    # sees that create; it only fires on a genuine operator create/edit.)
-    if not created and state.status not in _OWNED_PUSH_STATUSES:
-        return
-    state.bgp_peer = peer
-    state.remote_as_str = str(peer.remote_as.asn) if peer.remote_as_id else ""
-    state.enabled = peer.enabled
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_bgp_peer_state_save schedules the push
+    if _converted_writer_owns_content(device_id, "bgp"):
+        _schedule_intent_push((device_id, "bgp"))
 
 
 @_skip_on_render
 def _on_routing_bgp_peer_save(sender, instance, **kwargs):
-    """netbox_routing BGPPeer created/edited on a managed device → own + push (greenfield)."""
-    device = _bgp_peer_device(instance)
-    if device is not None:
-        _accept_bgp_peer_for_device(instance, device)
+    """Keep foreign native BGP peer saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("bgp")
 
 
 @_skip_on_render
 def _on_routing_bgp_peer_pre_delete(sender, instance, **kwargs):
-    """Operator deletes a BGP peer → drop its overlay + push the removal before the cascade.
-
-    Deleting the overlay yields a reduced push snapshot (owned rows only), retracting a
-    previously-owned peer; an un-owned (imported) peer was never in the snapshot, so its
-    delete is a safe no-op. Registered under _as_delete_origin so the removal is marked
-    delete-origin (real retraction, not a detach).
-    """
-    from .models import NSOBGPPeerState, NSODeviceManagement
-
-    device = _bgp_peer_device(instance)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    asn_str, vrf_name, peer_address_str = _bgp_peer_overlay_key(instance)
-    NSOBGPPeerState.objects.filter(
-        management=mgmt, asn_str=asn_str, vrf_name=vrf_name, peer_address_str=peer_address_str
-    ).delete()
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "bgp"))
+    """Keep foreign native BGP peer deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("bgp")
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_redistribution_state_save(sender, instance, **kwargs):
-    """Push the relevant routing protocol intent when an NSORedistributionState row is saved."""
+    """Schedule redistribution only when its exact writer owns the destination key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3493,7 +3051,8 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
     if mgmt.adapter_device_id is None:
         return
 
-    _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
+    if _converted_writer_owns_content(mgmt.device_id, instance.dest_protocol):
+        _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
 
 
 def route_policy_intent_item(row):
@@ -3862,8 +3421,9 @@ def _as_json_dict(value):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_route_policy_state_save(sender, instance, **kwargs):
-    """Push route-policy intent whenever an NSORoutePolicyState row is saved."""
+    """Schedule route policy only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -3875,34 +3435,14 @@ def _on_route_policy_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "route_policy"))
+    if _converted_writer_owns_content(device_id, "route_policy"):
+        _schedule_intent_push((device_id, "route_policy"))
 
 
 @_skip_on_render
 def _on_routing_policy_pre_delete(sender, instance, **kwargs):
-    """Drop overlays + push the reduced snapshot when a netbox-routing policy is deleted.
-
-    Reverts the removal on each attached device.
-    The overlay links via a content-type GFK (no DB cascade), so the overlays must be
-    removed explicitly here, before the object is gone. Captures attached devices first,
-    then a deferred push (post-commit, overlays gone) sends the reduced snapshot.
-    """
-    from django.contrib.contenttypes.models import ContentType
-
-    from .models import NSORoutePolicyState
-
-    ct = ContentType.objects.get_for_model(type(instance))
-    states = list(
-        NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).select_related("management")
-    )
-    targets = []
-    for state in states:
-        mgmt = state.management
-        if mgmt.adapter_device_id is not None:
-            targets.append((mgmt.device_id, mgmt.adapter_device_id))
-    NSORoutePolicyState.objects.filter(content_type=ct, object_id=instance.pk).delete()
-    for device_id, adapter_device_id in targets:
-        _schedule_intent_push((device_id, "route_policy"))
+    """Keep foreign policy-root deletions outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 # ── netbox_routing route-policy edit write path ─────────────────────────────
@@ -3923,35 +3463,9 @@ def _on_routing_policy_pre_delete(sender, instance, **kwargs):
 CascadeResult = namedtuple("CascadeResult", ["drifted", "cross_device"])
 
 
-def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
-    """Own (accepted) the prefix-lists / community-lists / as-paths a route-map references.
-
-    Owning a top-level object cascades ownership to everything it depends on: a route-map
-    references prefix-lists / community-lists / as-paths by name, and owning the route-map
-    WITHOUT owning a GREENFIELD reference leaves a dangling reference on the device (the
-    ``match`` line is written but the referenced list/path is never pushed — the exact gap
-    that left an ``ip as-path access-list`` missing after a route-map apply).
-
-    BUT a reference that has DRIFTED on the device (``changed``/``conflict`` — the device has a
-    diverging version) is NOT force-owned: that would silently overwrite the device's version.
-    It already exists on the device, so the route-map's reference still resolves against it — we
-    leave it for explicit drift resolution and RETURN the skipped ``(family, name)`` tuples so
-    the caller can warn the operator. Already-owned contributors (accepted / deploying / in_sync
-    / apply_failed) are left untouched.
-
-    A GREENFIELD reference (no overlay on this device yet) whose shared NetBox content was
-    *materialized from a different device* is still owned — the route-map needs it — but its
-    provenance is collected into ``cross_device`` so the caller can warn that owning the
-    route-map here will push another device's version of that object onto this device.
-    """
-    from django.contrib.contenttypes.models import ContentType
-
-    from .models import NSORoutePolicyState
-    from .shared_object_ownership import materialized_row
-    from .status_machine import CHANGED, CONFLICT
-
-    now = timezone.now()
-    referenced: list = []  # (family, obj), de-duplicated by (family, name)
+def _route_map_contributors(route_maps):
+    """Return de-duplicated policy objects referenced by route maps."""
+    referenced = []
     seen_refs: set = set()
 
     def _add_ref(family, obj):
@@ -3960,107 +3474,127 @@ def _own_route_map_contributors(mgmt, route_map) -> CascadeResult:
             seen_refs.add(key)
             referenced.append((family, obj))
 
-    for entry in route_map.route_map_entries.all():
-        for o in entry.match_prefix_list.all():
-            _add_ref("prefix_list", o)
-        for o in entry.match_community_list.all():
-            _add_ref("community_list", o)
-        for o in entry.match_aspath.all():
-            _add_ref("as_path", o)
-        # SET community-list references (`set community <list> add|delete|…`) are dependencies
-        # too — a `set comm-list delete <CL>` rejects on the device if <CL> isn't defined.
-        for sc in entry.set_communities.all():
-            if sc.community_list_id:
-                _add_ref("community_list", sc.community_list)
-    drifted: list = []
-    cross_device: list = []
-    for family, obj in referenced:
-        ct = ContentType.objects.get_for_model(obj)
-        state, created = NSORoutePolicyState.objects.get_or_create(
-            management=mgmt,
-            family=family,
-            object_name=obj.name,
-            defaults={"content_type": ct, "object_id": obj.pk, "status": "accepted", "accepted_at": now},
+    for route_map in route_maps:
+        entries = route_map.route_map_entries.prefetch_related(
+            "match_prefix_list",
+            "match_community_list",
+            "match_aspath",
+            "set_communities__community_list",
         )
-        if created:
-            # Greenfield on this device — owned. If the shared NetBox content was materialized
-            # from ANOTHER device, owning here pushes that device's version; surface provenance.
-            owner = materialized_row(NSORoutePolicyState, family, obj.name)
-            if owner is not None and owner.management.device_id != mgmt.device_id:
-                cross_device.append((family, obj.name, owner.management.device.name))
-            continue
-        if state.status in _OWNED_PUSH_STATUSES:
-            continue  # already owned → nothing to do
-        if state.status in (CHANGED, CONFLICT):
-            # The device has a diverging version — don't silently overwrite it. The reference
-            # resolves against the device's existing object; surface it for explicit resolution.
-            drifted.append((family, obj.name))
-            continue
-        # imported / unknown — device matches NetBox (no drift) → safe to adopt.
-        state.content_type, state.object_id = ct, obj.pk
-        state.status, state.accepted_at = "accepted", now
-        state.save()
-    return CascadeResult(drifted=drifted, cross_device=cross_device)
+        for entry in entries:
+            for obj in entry.match_prefix_list.all():
+                _add_ref("prefix_list", obj)
+            for obj in entry.match_community_list.all():
+                _add_ref("community_list", obj)
+            for obj in entry.match_aspath.all():
+                _add_ref("as_path", obj)
+            for set_community in entry.set_communities.all():
+                if set_community.community_list_id:
+                    _add_ref("community_list", set_community.community_list)
+    return referenced
 
 
-def _accept_route_policy_object(obj) -> None:
-    """Re-own + push every OWNED overlay attached to a saved route-policy object."""
+def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()):
+    """Freeze explicit root acquisitions and eligible route-map contributors."""
     from django.contrib.contenttypes.models import ContentType
-    from django.db import transaction
 
     from .models import NSORoutePolicyState
+    from .renderer_writer import RendererMutationPlan, planned_save
+    from .shared_object_ownership import materialized_row
+    from .status_machine import CHANGED, CONFLICT
 
-    is_route_map = hasattr(obj, "route_map_entries")
-    ct = ContentType.objects.get_for_model(type(obj))
-    with transaction.atomic():
-        states = NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related("management")
-        for state in states:
-            mgmt = state.management
-            if mgmt.adapter_device_id is None:
-                continue
-            # Only re-own an already-owned overlay (incl. in_sync). A brownfield/un-owned
-            # (imported/unknown) overlay must surface the edit via reconcile, not be force-owned.
-            if state.status not in _OWNED_PUSH_STATUSES:
-                continue
-            if state.status != "accepted":
-                state.status = "accepted"
-            state.last_sync_at = timezone.now()
-            state.save(update_fields=["status", "last_sync_at"])
-            if is_route_map:
-                # Owning a route-map owns its contributors (else dangling device references).
-                _own_route_map_contributors(mgmt, obj)
+    planned_at = timezone.now()
+    saves = []
+    operations = list(primary_operations)
+    staged = {(candidate.family, candidate.object_name.casefold()) for candidate, _fields, _created in operations}
+    for candidate, fields, created in operations:
+        saves.append(
+            planned_save(
+                candidate,
+                update_fields=fields,
+                force_insert=created,
+                natural_key=("management", "family", "object_name") if created else (),
+            )
+        )
+    drifted: list = []
+    cross_device: list = []
+    for family, obj in _route_map_contributors(route_maps):
+        key = (family, obj.name.casefold())
+        if key in staged:
+            continue
+        ct = ContentType.objects.get_for_model(obj)
+        state = NSORoutePolicyState.objects.filter(
+            management=mgmt,
+            family=family,
+            object_name__iexact=obj.name,
+        ).first()
+        created = state is None
+        if state is None:
+            candidate = NSORoutePolicyState(
+                management=mgmt,
+                family=family,
+                object_name=obj.name,
+                content_type=ct,
+                object_id=obj.pk,
+                status="accepted",
+                accepted_at=planned_at,
+            )
+            fields = None
+        elif state.status in _OWNED_PUSH_STATUSES:
+            continue  # already owned → nothing to do
+        elif state.status in (CHANGED, CONFLICT):
+            drifted.append((family, obj.name))
+            continue
+        else:
+            candidate = copy.copy(state)
+            candidate.content_type = ct
+            candidate.object_id = obj.pk
+            candidate.status = "accepted"
+            candidate.accepted_at = planned_at
+            fields = ("content_type", "object_id", "status", "accepted_at")
+        owner = materialized_row(NSORoutePolicyState, family, obj.name)
+        if owner is not None and owner.management.device_id != mgmt.device_id:
+            cross_device.append((family, obj.name, owner.management.device.name))
+        saves.append(
+            planned_save(
+                candidate,
+                update_fields=fields,
+                force_insert=created,
+                natural_key=("management", "family", "object_name") if created else (),
+            )
+        )
+        operations.append((candidate, fields, created))
+        staged.add(key)
+    return (
+        RendererMutationPlan.build(saves=saves, planned_at=planned_at),
+        operations,
+        CascadeResult(drifted=drifted, cross_device=cross_device),
+    )
 
 
 @_skip_on_render
 def _on_routing_policy_object_save(sender, instance, **kwargs):
-    """netbox_routing CommunityList/RouteMap/PrefixList/ASPath edited → own + push."""
-    _accept_route_policy_object(instance)
+    """Keep foreign policy-root saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 @_skip_on_render
 def _on_routing_policy_entry_save(sender, instance, **kwargs):
-    """Own + push the parent object when a route-policy ENTRY (member) is edited/added."""
-    parent = (
-        getattr(instance, "community_list", None)
-        or getattr(instance, "prefix_list", None)
-        or getattr(instance, "route_map", None)
-        or getattr(instance, "aspath", None)
-    )
-    if parent is not None:
-        _accept_route_policy_object(parent)
+    """Keep foreign policy-entry saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 @_skip_on_render
 def _on_routing_policy_entry_delete(sender, instance, **kwargs):
-    """Own + push the parent object when a route-policy ENTRY is removed (reduced member set)."""
-    _on_routing_policy_entry_save(sender, instance, **kwargs)
+    """Keep foreign policy-entry deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("route_policy")
 
 
 def redistribution_intent_item(row):
     """Return one redistribution row in the adapter's exact nested wire shape."""
     entry = {"source_protocol": row.source_protocol, "source_ref": row.source_ref}
-    if row.redistribution_id is not None:
-        fork = row.redistribution
+    fork = row.redistribution
+    if fork is not None:
         if fork.route_map:
             entry["route_map"] = fork.route_map.name
         if fork.metric is not None:
@@ -4148,8 +3682,9 @@ def _push_ospf_intent_for_device(device_id, adapter_device_id):
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_ospf_instance_state_save(sender, instance, **kwargs):
-    """Push OSPF intent whenever an NSOOSPFInstanceState row is saved."""
+    """Schedule OSPF only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -4161,12 +3696,14 @@ def _on_ospf_instance_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "ospf"))
+    if _converted_writer_owns_content(device_id, "ospf"):
+        _schedule_intent_push((device_id, "ospf"))
 
 
 @_skip_on_render
+@_require_converted_writer
 def _on_ospf_interface_state_save(sender, instance, **kwargs):
-    """Push OSPF intent whenever an NSOOSPFInterfaceState row is saved."""
+    """Schedule OSPF only when the exact writer owns this device key."""
     from .models import NSODeviceManagement
 
     try:
@@ -4178,308 +3715,72 @@ def _on_ospf_interface_state_save(sender, instance, **kwargs):
         return
 
     device_id = mgmt.device_id
-    _schedule_intent_push((device_id, "ospf"))
+    if _converted_writer_owns_content(device_id, "ospf"):
+        _schedule_intent_push((device_id, "ospf"))
 
 
 # ── netbox_routing OSPF greenfield write path ───────────────────────────────
-# The reconcile path only creates NSOOSPF*State overlays for OSPF the device already
-# reports (brownfield adoption). These handlers add the operator-created direction: a
-# netbox_routing OSPFInstance/OSPFInterface created on a managed device becomes an
-# *accepted* overlay (owned intent) whose save pushes the OSPF intent → ospf-reconciler.
-
-_OWNED_OSPF = ("accepted", "deploying", "in_sync", "apply_failed")
-
-
-def _accept_ospf_instance(ospf_instance) -> None:
-    """Own a greenfield OSPF process for its device (accepted overlay → push)."""
-    from .models import NSODeviceManagement, NSOOSPFInstanceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=ospf_instance.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOOSPFInstanceState.objects.get_or_create(
-        management=mgmt,
-        process_id=str(ospf_instance.process_id),
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    # Only own a GREENFIELD process (overlay newly created here) or one already owned.
-    # A pre-existing unowned overlay is brownfield-adopted: editing the netbox-routing
-    # object must surface via the 3-way reconcile (changed/conflict), not be force-owned.
-    if not created and state.status not in _OWNED_OSPF:
-        return
-    state.router_id = str(ospf_instance.router_id or "")
-    state.vrf = ospf_instance.vrf.name if ospf_instance.vrf else ""
-    state.ospf_instance = ospf_instance
-    # Greenfield default: an operator-created OSPF process is meant to be enabled —
-    # set the admin-state intent True (re-asserts Nokia SR OS 'admin-state enable',
-    # which a freshly-created instance lacks). Preserve an explicit prior value.
-    if state.enabled is None:
-        state.enabled = True
-    # Instance-level area list (the timos apply binds areas per-interface, but other
-    # NEDs surface the area set here) — collect distinct areas from bound interfaces.
-    areas, seen = [], set()
-    for oi in ospf_instance.interfaces.all():
-        if oi.area and oi.area.area_id not in seen:
-            seen.add(oi.area.area_id)
-            areas.append({"area_id": oi.area.area_id, "area_type": oi.area.area_type or "standard"})
-    state.areas = areas
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_ospf_instance_state_save schedules the push
-
-
-def _accept_ospf_interface(ospf_iface) -> None:
-    """Own a greenfield OSPF interface (accepted overlay → push)."""
-    from .models import NSODeviceManagement, NSOOSPFInterfaceState
-
-    iface = ospf_iface.interface
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOOSPFInterfaceState.objects.get_or_create(
-        management=mgmt,
-        interface=iface,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    # Greenfield-only ownership (see _accept_ospf_instance): don't force-own a
-    # pre-existing unowned (brownfield) overlay — leave it to the 3-way reconcile.
-    if not created and state.status not in _OWNED_OSPF:
-        return
-    state.process_id = str(ospf_iface.instance.process_id) if ospf_iface.instance else None
-    state.area_id = ospf_iface.area.area_id if ospf_iface.area else ""
-    state.passive = bool(ospf_iface.passive)
-    state.priority = ospf_iface.priority
-    state.cost = ospf_iface.cost
-    state.network_type = ospf_iface.network_type or ""
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_ospf_interface_state_save schedules the push
-    # Refresh the instance overlay so its area list reflects the new binding.
-    if ospf_iface.instance is not None:
-        _accept_ospf_instance(ospf_iface.instance)
+# Native OSPF signals are delivery notifications only. Exact planners establish ownership.
 
 
 @_skip_on_render
 def _on_routing_ospf_instance_save(sender, instance, **kwargs):
-    """netbox_routing OSPFInstance created/edited on a managed device → own + push."""
-    _accept_ospf_instance(instance)
+    """Keep foreign native OSPF process saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
 def _on_routing_ospf_interface_save(sender, instance, **kwargs):
-    """netbox_routing OSPFInterface created/edited → own + push."""
-    _accept_ospf_interface(instance)
-
-
-_OWNED_ISIS = ("accepted", "deploying", "in_sync", "apply_failed")
-
-
-def _accept_isis_interface(isis_iface) -> None:
-    """Own a greenfield IS-IS interface (operator-edited ISISInterface → accepted overlay → push).
-
-    Mirrors _accept_ospf_interface: copies the operator's metric / network-type /
-    circuit-type / passive from the netbox_routing.ISISInterface into the
-    NSOISISInterfaceState overlay (keyed by interface + address-family) and marks it
-    owned so _on_isis_interface_state_save pushes. Greenfield-only: a pre-existing
-    unowned (brownfield) overlay is left to the 3-way reconcile.
-    """
-    from .models import NSODeviceManagement, NSOISISInterfaceState
-
-    iface = isis_iface.interface
-    af = isis_iface.address_family
-    if not af:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    state, created = NSOISISInterfaceState.objects.get_or_create(
-        management=mgmt,
-        interface=iface,
-        af=af,
-        defaults={"status": "accepted", "accepted_at": timezone.now()},
-    )
-    if not created and state.status not in _OWNED_ISIS:
-        return
-    state.process_tag = isis_iface.instance.process_tag if isis_iface.instance else ""
-    state.circuit_type = isis_iface.circuit_type or ""
-    state.network_type = isis_iface.network_type or ""
-    state.metric = isis_iface.metric
-    state.passive = bool(isis_iface.passive)
-    # tri-state (None/True/False preserved verbatim): clearing bfd_enabled on the
-    # ISISInterface flows None into the overlay → the push retracts the owned BFD.
-    state.bfd_enabled = getattr(isis_iface, "bfd_enabled", None)
-    # FRR (#83): same contract as bfd_enabled; the protection kind rides along.
-    state.frr_enabled = getattr(isis_iface, "frr_enabled", None)
-    state.frr_protection = getattr(isis_iface, "frr_protection", "") or ""
-    state.isis_interface = isis_iface
-    state.last_sync_at = timezone.now()
-    state.save()  # → _on_isis_interface_state_save schedules the push
-
-
-@_skip_on_render
-def _push_isis_for_routing_level(level) -> None:
-    """Re-push the isis intent when a fork ISISLevel of an OWNED instance changes.
-
-    Levels ride the process intent (a level is accepted with its process), so an
-    operator edit/delete on ISISLevel re-pushes the full snapshot for the owning
-    device — but only when the instance is linked to an owned NSOISISInstanceState
-    (an unowned instance's levels stay NetBox-local).
-    """
-    from .models import NSODeviceManagement, NSOISISInstanceState
-
-    inst = getattr(level, "instance", None)
-    device = getattr(inst, "device", None)
-    if device is None:
-        return
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    if not NSOISISInstanceState.objects.filter(
-        management=mgmt,
-        process_tag=inst.process_tag or "",
-        status__in=_OWNED_PUSH_STATUSES,
-    ).exists():
-        return
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "isis"))
+    """Keep foreign native OSPF interface saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
 def _on_routing_isis_level_save(sender, instance, **kwargs):
-    """netbox_routing ISISLevel created/edited → re-push the owning process intent."""
-    _push_isis_for_routing_level(instance)
+    """Keep foreign native IS-IS child saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
 
 @_skip_on_render
 def _on_routing_isis_level_post_delete(sender, instance, **kwargs):
-    """Operator deletes a per-level row → push the reduced snapshot (full-replace)."""
-    _push_isis_for_routing_level(instance)
-
-
-def _on_routing_isis_interface_save(sender, instance, **kwargs):
-    """netbox_routing ISISInterface created/edited → own + push."""
-    _accept_isis_interface(instance)
-
-
-def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
-    """Capture linked overlays before Django clears their native foreign key."""
-    from .models import NSOISISInterfaceState
-
-    instance._nso_linked_isis_interface_state_pks = tuple(
-        NSOISISInterfaceState.objects.filter(isis_interface=instance).values_list("pk", flat=True)
-    )
+    """Keep foreign native IS-IS child deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
 
 @_skip_on_render
-def _on_routing_isis_interface_post_delete(sender, instance, **kwargs):
-    """Operator deletes an IS-IS interface → drop its overlay + push the removal (parity with OSPF).
+def _on_routing_isis_interface_save(sender, instance, **kwargs):
+    """Keep foreign native IS-IS interface saves outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
-    Without this, deleting an ISISInterface only SET_NULLs NSOISISInterfaceState.isis_interface;
-    the overlay row lingers with its owned status and no reduced IS-IS intent is pushed, so the
-    device keeps the IS-IS config NetBox just removed.
-    """
-    from django.db import transaction
 
-    from .apply_state import lock_device_intent_transaction, lock_order_scope
-    from .deployment import lock_mutation
-    from .intent_state import IntentTransactionNoOp, MutationFootprint, SourceRow, intent_transaction
-    from .models import NSODeviceManagement, NSOISISInterfaceState
-
-    iface = instance.interface
-    af = instance.address_family
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    qs = NSOISISInterfaceState.objects.filter(management=mgmt, interface=iface)
-    if af:
-        qs = qs.filter(af=af)  # scope to this ISISInterface's address-family; leave a sibling AF alone
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    key = (device_id, "isis")
-    footprint = MutationFootprint.for_keys(
-        {key},
-        overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None),),
-    )
-    with transaction.atomic(), lock_order_scope():
-        lock_mutation()
-        lock_device_intent_transaction(device_id)
-        try:
-            with intent_transaction(footprint):
-                state_pks = set(getattr(instance, "_nso_linked_isis_interface_state_pks", ()))
-                state_pks.update(qs.values_list("pk", flat=True))
-                if not state_pks:
-                    raise IntentTransactionNoOp
-                NSOISISInterfaceState.objects.filter(pk__in=state_pks).delete()
-                _schedule_intent_push(key)
-        except IntentTransactionNoOp:
-            return
+def _on_routing_isis_interface_pre_delete(sender, instance, **kwargs):
+    """Keep foreign native IS-IS interface deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("isis")
 
 
 @_skip_on_render
 def _on_routing_ospf_instance_pre_delete(sender, instance, **kwargs):
-    """Operator deletes an OSPF process → drop its overlay + push the removal."""
-    from .models import NSODeviceManagement, NSOOSPFInstanceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=instance.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    NSOOSPFInstanceState.objects.filter(management=mgmt, process_id=str(instance.process_id)).delete()
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "ospf"))
+    """Keep foreign native OSPF process deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
 def _on_routing_ospf_interface_pre_delete(sender, instance, **kwargs):
-    """Operator deletes an OSPF interface → drop its overlay + push the removal."""
-    from .models import NSODeviceManagement, NSOOSPFInterfaceState
-
-    iface = instance.interface
-    try:
-        mgmt = NSODeviceManagement.objects.get(device=iface.device)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-    NSOOSPFInterfaceState.objects.filter(management=mgmt, interface=iface).delete()
-    device_id, _adapter_device_id = mgmt.device_id, mgmt.adapter_device_id
-    _schedule_intent_push((device_id, "ospf"))
+    """Keep foreign native OSPF interface deletes outside ownership bookkeeping."""
+    _schedule_exact_writer_scope("ospf")
 
 
 @_skip_on_render
 def _on_redistribution_fork_save(sender, instance, **kwargs):
-    """Push protocol intent when a netbox_routing.Redistribution fork object is saved.
+    """Keep foreign native redistribution saves outside synchronous bookkeeping."""
+    from .renderer_writer import active_renderer_writer
 
-    Finds all NSORedistributionState rows linked to this Redistribution, determines
-    their destination protocol, and triggers the appropriate intent push.
-    Deduplicates pushes so each (device, dest_protocol) pair is pushed at most once.
-    """
-    from .models import NSORedistributionState
-
-    seen: set[tuple] = set()
-    for state in NSORedistributionState.objects.filter(redistribution=instance).select_related("management"):
-        mgmt = state.management
-        if mgmt.adapter_device_id is None:
-            continue
-        key = (mgmt.device_id, state.dest_protocol)
-        if key in seen:
-            continue
-        seen.add(key)
-        _schedule_redistribution_push(mgmt.device_id, state.dest_protocol)
+    writer = active_renderer_writer()
+    if writer is None:
+        return
+    for device_id, scope in writer.plan.content_keys:
+        if scope in redistribution_destinations() and _converted_writer_owns_content(device_id, scope):
+            _schedule_redistribution_push(device_id, scope)
 
 
 def _connect_g_activated():  # pragma: no cover
@@ -4526,11 +3827,6 @@ def _connect_g_activated():  # pragma: no cover
         _create_greenfield_subif_state,
         sender=Interface,
         dispatch_uid="nso_plugin_iface_greenfield_subif",
-    )
-    pre_save.connect(
-        _on_ip_address_pre_save,
-        sender=IPAddress,
-        dispatch_uid="nso_plugin_ipaddress_pre_save",
     )
     post_save.connect(
         _on_ip_address_change,
@@ -4822,9 +4118,7 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOBGPPeerState,
         dispatch_uid="nso_plugin_bgp_peer_state_post_save",
     )
-    # Retraction path: deleting an overlay row pushes the reduced (owned-only) snapshot.
-    # Fired both by a direct overlay delete and by the native BGPPeer pre_delete below,
-    # which drops the row before the FK cascade would merely SET_NULL it.
+    # An exact overlay deletion pushes the reduced owned snapshot.
     post_delete.connect(
         _as_delete_origin(_on_bgp_peer_state_save),
         sender=NSOBGPPeerState,
@@ -4947,13 +4241,6 @@ def _connect_g_activated():  # pragma: no cover
     try:
         from netbox_routing.models import StaticRoute
 
-        # The pre_save stash is what makes post_save delta-gated; without it every save
-        # (including one that touched only ``name``) would bump a generation and push.
-        pre_save.connect(
-            _on_routing_static_route_pre_save,
-            sender=StaticRoute,
-            dispatch_uid="nso_plugin_routing_static_route_pre_save",
-        )
         post_save.connect(
             _on_routing_static_route_save,
             sender=StaticRoute,
@@ -4975,7 +4262,7 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — static-route greenfield signals not registered")
 
-    # netbox_routing OSPF greenfield write path (operator-created OSPF → accepted overlay → push)
+    # netbox_routing OSPF exact-writer delivery notifications.
     try:
         from netbox_routing.models import OSPFInstance, OSPFInterface
 
@@ -5004,7 +4291,7 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — OSPF greenfield signals not registered")
 
-    # netbox_routing.BGPPeer greenfield write path (operator-created peers → accepted overlay → push)
+    # netbox_routing.BGPPeer exact-writer delivery notifications.
     try:
         from netbox_routing.models import BGPPeer
 
@@ -5035,12 +4322,6 @@ def _connect_g_activated():  # pragma: no cover
             _on_routing_isis_flex_algo_pre_delete,
             sender=ISISFlexAlgo,
             dispatch_uid="nso_plugin_routing_isis_flex_algo_pre_delete_capture",
-        )
-        post_delete.connect(
-            _as_delete_origin(_on_routing_isis_flex_algo_post_delete),
-            sender=ISISFlexAlgo,
-            dispatch_uid="nso_plugin_routing_isis_flex_algo_post_delete",
-            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — flex-algo greenfield signals not registered")
@@ -5077,12 +4358,6 @@ def _connect_g_activated():  # pragma: no cover
             _on_routing_isis_interface_pre_delete,
             sender=ISISInterface,
             dispatch_uid="nso_plugin_routing_isis_interface_pre_delete_capture",
-        )
-        post_delete.connect(
-            _as_delete_origin(_on_routing_isis_interface_post_delete),
-            sender=ISISInterface,
-            dispatch_uid="nso_plugin_routing_isis_interface_post_delete",
-            weak=False,
         )
     except ImportError:
         logger.debug("netbox_routing not installed — IS-IS interface greenfield signals not registered")

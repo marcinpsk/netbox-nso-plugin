@@ -98,6 +98,23 @@ class TestSnmpLoggingContractConsumer(TestCase):
         self.assertTrue(NSOSnmpHostState.objects.filter(management=self.mgmt, address="10.0.0.9").exists())
         self.assertEqual(NSOSnmpSystemInfoState.objects.get(management=self.mgmt).location, "DC1")
 
+    def test_snmp_reconcile_preflights_every_exact_overlay_creation(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.template_content import snmp_reconcile_plan
+
+        plan = snmp_reconcile_plan(self.device, SNMP_PAYLOAD)
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "netbox_nso_plugin.nsosnmpcommunitystate"),
+                ("save", "netbox_nso_plugin.nsosnmpv3userstate"),
+                ("save", "netbox_nso_plugin.nsosnmphoststate"),
+                ("save", "netbox_nso_plugin.nsosnmpsysteminfostate"),
+            ],
+        )
+
     def test_logging_consumer(self):
         _reconcile_logging_config(self.device, LOGGING_PAYLOAD)
         self.assertEqual(NSOLoggingHostState.objects.filter(management=self.mgmt).count(), 2)

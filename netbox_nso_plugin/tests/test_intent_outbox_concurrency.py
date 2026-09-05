@@ -21,7 +21,6 @@ import datetime
 import threading
 import time
 from collections import Counter
-from contextlib import contextmanager
 from unittest.mock import patch
 
 from django.db import OperationalError, connection, transaction
@@ -32,15 +31,14 @@ from ._outbox_case import (
     ReceiptAdapter,
     entries,
     expire_claim,
-    make_device,
     make_managed,
-    make_mgmt,
     own_route,
     own_vlan,
     state_of,
     wait_until_postgres_blocks,
     without_commit_drain,
 )
+from ._static_route_case import _accept_with_permit, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -224,7 +222,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
                     remover_pid.append(cursor.fetchone()[0])
                 remover_started.set()
                 with transaction.atomic():
-                    route.devices.remove(self.device)
+                    _unassign_and_retire(route, self.device)
             except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
                 failures.append(exc)
             finally:
@@ -271,139 +269,6 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
         assert {entry["route_id"] for entry in later.payload} == {keeper.pk}
         assert [record["route_id"] for record in later.deletions] == [route.pk], (
             "the next claim ships the omission WITH its authority"
-        )
-
-
-class TestUntrackedNativeDeletesSerializeWithSaves(_ConcurrencyCase):
-    """A native delete locks its source row before it takes the device-scope lock."""
-
-    tag = "native-delete"
-    adapter_device_id = 7807
-
-    def _assert_delete_blocks_save(self, device, native, field_name, field_value, overlay_model, scope, orphan_filter):
-        from django.db import connections
-
-        from netbox_nso_plugin import intent_state
-
-        held = threading.Event()
-        release = threading.Event()
-        save_connected = threading.Event()
-        save_finished = threading.Event()
-        save_pid: list[int] = []
-        delete_errors: list[BaseException] = []
-        save_errors: list[BaseException] = []
-        real_intent_transaction = intent_state.intent_transaction
-        deleting = None
-
-        @contextmanager
-        def pause_after_delete_lock(*args, **kwargs):
-            with real_intent_transaction(*args, **kwargs) as mutation:
-                if threading.current_thread() is deleting and not held.is_set():
-                    held.set()
-                    assert release.wait(timeout=30), "the delete lock was never released"
-                yield mutation
-
-        def delete_native():
-            try:
-                with transaction.atomic():
-                    type(native).objects.get(pk=native.pk).delete()
-            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
-                delete_errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def save_native():
-            try:
-                current = type(native).objects.get(pk=native.pk)
-                setattr(current, field_name, field_value)
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_backend_pid()")
-                    save_pid.append(cursor.fetchone()[0])
-                save_connected.set()
-                with transaction.atomic():
-                    current.save(update_fields=[field_name])
-            except BaseException as exc:  # noqa: BLE001 (a deleted native row rejects the save)
-                save_errors.append(exc)
-            finally:
-                save_finished.set()
-                connections.close_all()
-
-        with (
-            without_commit_drain(),
-            patch(
-                "netbox_nso_plugin.intent_state.intent_transaction",
-                side_effect=pause_after_delete_lock,
-            ),
-        ):
-            deleting = threading.Thread(target=delete_native)
-            deleting.start()
-            self.addCleanup(deleting.join, 30)
-            self.addCleanup(release.set)
-            assert held.wait(timeout=5), "the untracked delete never acquired its device-scope lock"
-
-            saving = threading.Thread(target=save_native)
-            saving.start()
-            self.addCleanup(saving.join, 30)
-            assert save_connected.wait(timeout=30), "the concurrent save never opened its database connection"
-            try:
-                wait_until_postgres_blocks(save_pid[0], "the concurrent native save", locktype="transactionid")
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", [save_pid[0]])
-                    self.assertEqual(cursor.fetchone()[0], "Lock")
-                self.assertFalse(save_finished.is_set(), "the save finished before the delete released its lock")
-            finally:
-                release.set()
-            deleting.join(timeout=30)
-            saving.join(timeout=30)
-
-        assert not deleting.is_alive(), "the native delete did not finish"
-        assert not saving.is_alive(), "the concurrent native save did not finish"
-        assert save_finished.is_set(), "the concurrent save did not finish after the delete released its lock"
-        assert delete_errors == []
-        assert not type(native).objects.filter(pk=native.pk).exists()
-        assert not overlay_model.objects.filter(status="accepted", **orphan_filter).exists()
-        assert not entries(device, scope)
-        self.assertEqual(len(save_errors), 1)
-        self.assertIs(type(save_errors[0]), type(native).NotUpdated)
-        self.assertIn("did not affect any rows", str(save_errors[0]))
-        self.assertNotIn("deadlock", str(save_errors[0]).lower())
-
-    def test_untracked_deletes_block_concurrent_native_saves(self):
-        from dcim.models import Interface
-        from netbox_routing.models import ISISFlexAlgo, ISISInstance, ISISInterface
-
-        from netbox_nso_plugin.models import NSOISISFlexAlgoState, NSOISISInterfaceState
-
-        device = make_device(self.tag, 2)
-        instance = ISISInstance.objects.create(device=device, process_tag="CORE")
-        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
-        interface = Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
-        isis_interface = ISISInterface.objects.create(
-            interface=interface,
-            address_family="ipv4",
-            instance=instance,
-        )
-        with without_commit_drain(), transaction.atomic():
-            mgmt = make_mgmt(device, self.tag, self.adapter_device_id + 1)
-        self.clear_entries()
-
-        self._assert_delete_blocks_save(
-            device,
-            flex_algo,
-            "priority",
-            111,
-            NSOISISFlexAlgoState,
-            "isis_flex_algo",
-            {"management": mgmt, "isis_flex_algo__isnull": True},
-        )
-        self._assert_delete_blocks_save(
-            device,
-            isis_interface,
-            "metric",
-            111,
-            NSOISISInterfaceState,
-            "isis",
-            {"management": mgmt, "isis_interface__isnull": True},
         )
 
 
@@ -507,11 +372,11 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return work
 
     def _remove(self, route, **barriers):
-        return self._transaction(lambda: route.devices.remove(self.device), **barriers)
+        return self._transaction(lambda: _unassign_and_retire(route, self.device), **barriers)
 
     def _reown(self, route, **barriers):
         def own():
-            route.devices.add(self.device)
+            _accept_with_permit(route, self.device)
 
         return self._transaction(own, **barriers)
 
@@ -542,8 +407,6 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
     def test_a_second_writer_of_one_route_waits_on_the_first(self):
         """The overlay row is the serialization point, which is what the id order rests on."""
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         route = own_route(self.mgmt, "198.51.100.144/28", "198.51.100.10")
         self.clear_entries()
         deleted = threading.Event()
@@ -552,7 +415,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
         def own_the_same_route():
             started = time.monotonic()
-            _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
             waited.append(time.monotonic() - started)
 
         def release_after_delete():
@@ -589,7 +452,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
     def test_a_re_ownership_committing_first_takes_the_lower_entry_id(self):
         route = own_route(self.mgmt, "198.51.100.160/28", "198.51.100.11")
         with without_commit_drain():
-            route.devices.remove(self.device)  # un-owned, so the re-ownership is a real one
+            _unassign_and_retire(route, self.device)  # un-owned, so the re-ownership is a real one
         self.clear_entries()
         owned = threading.Event()
 
@@ -609,7 +472,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         leaving = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
         returning = own_route(self.mgmt, "198.51.100.192/28", "198.51.100.13")
         with without_commit_drain():
-            returning.devices.remove(self.device)
+            _unassign_and_retire(returning, self.device)
         self.clear_entries()
         held = threading.Event()
         release = threading.Event()

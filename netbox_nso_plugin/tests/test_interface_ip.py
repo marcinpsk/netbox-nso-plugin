@@ -472,12 +472,7 @@ class TestReconcileInterfaceIps(TestCase):
 
 
 class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
-    """Reassigning an IPAddress from interface A to B must drop A's overlay.
-
-    Regression: _on_ip_address_change keyed get_or_create on the NEW interface only, so the OLD
-    interface's NSOInterfaceIPState was orphaned and the adapter's full-snapshot push carried both
-    — device A kept an IP NetBox had moved to device/interface B.
-    """
+    """Foreign native reassignments do not manufacture IP ownership evidence."""
 
     @classmethod
     def setUpTestData(cls):
@@ -495,24 +490,28 @@ class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
             device=cls.device, nso_instance=nso, nso_device_name="ra-router", adapter_device_id=321
         )
 
-    def test_reassign_drops_old_interface_overlay(self):
+    def test_foreign_reassign_keeps_overlay_unchanged(self):
         from ipam.models import IPAddress
 
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
-        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
-            ip = IPAddress.objects.create(address="10.44.0.1/24", assigned_object=self.if_a)
-        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists())
+        ip = IPAddress.objects.create(address="10.44.0.1/24", assigned_object=self.if_a)
+        NSOInterfaceIPState.objects.create(
+            interface=self.if_a,
+            address="10.44.0.1/24",
+            status="accepted",
+        )
 
-        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             ip.assigned_object = self.if_b
             ip.save()
 
-        self.assertFalse(
-            NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists(),
-            "old interface overlay was orphaned on reassignment",
-        )
-        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_b, address="10.44.0.1/24").exists())
+        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.if_b, address="10.44.0.1/24").exists())
+        mock_put.assert_not_called()
 
 
 class TestAcceptInterfaceIPConflict(TestCase):
@@ -567,6 +566,9 @@ class TestAcceptInterfaceIPConflict(TestCase):
     def test_accept_moves_ip_to_ned_interface_and_settles_in_sync(self):
         from django.urls import reverse
 
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
         url = reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_accept", kwargs={"pk": self.state.pk})
         resp = self.client.post(url)
         self.assertEqual(resp.status_code, 302)
@@ -576,6 +578,12 @@ class TestAcceptInterfaceIPConflict(TestCase):
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "in_sync")
         self.assertIsNotNone(self.state.accepted_at)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("ip", self.device.pk, None).payload),
+        )
 
 
 class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
@@ -645,6 +653,9 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         )
 
     def test_edit_rekeys_native_ip_and_overlay(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
         response = self.client.post(
             self._url(),
             {"address": "198.18.20.2/31"},
@@ -658,6 +669,34 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         self.assertEqual(self.local_ip.assigned_object, self.local)
         self.assertEqual(self.local_state.address, "198.18.20.2/31")
         self.assertEqual(self.local_state.status, "accepted")
+        revision = NSOIntentRevision.objects.get(device=self.device_a, scope="ip")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("ip", self.device_a.pk, None).payload),
+        )
+
+    def test_edit_schedules_the_ip_snapshot_after_write_suppression(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _is_intent_push_suppressed
+
+        management = NSODeviceManagement.objects.get(device=self.device_a)
+        management.adapter_device_id = 1627
+        management.save(update_fields=["adapter_device_id"])
+
+        suppression_states = []
+        with patch(
+            "netbox_nso_plugin.signals._schedule_intent_push",
+            side_effect=lambda _key: suppression_states.append(_is_intent_push_suppressed()),
+        ):
+            response = self.client.post(
+                self._url(),
+                {"address": "198.18.20.2/31"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(suppression_states, [False])
 
     def test_unchanged_prefilled_peer_is_not_modified(self):
         """The real two-field popover always submits the displayed peer value.

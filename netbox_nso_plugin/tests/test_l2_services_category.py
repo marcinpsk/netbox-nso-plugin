@@ -168,6 +168,8 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
 
     def test_accept_marks_owned(self):
         self.client.force_login(self.user)
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.reconcile import reconcile_category
 
         with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_PAYLOAD):
@@ -181,6 +183,11 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
         st.refresh_from_db()
         assert st.accepted_at is not None
         assert st.status == "accepted"
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="l2_sap")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("l2_sap", self.device.pk, self.mgmt.adapter_device_id).payload
+        )
 
     def test_reaccept_keeps_first_accepted_timestamp(self):
         self.client.force_login(self.user)
@@ -202,6 +209,27 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
         self.assertEqual(response.status_code, 302)
         state.refresh_from_db()
         self.assertEqual(state.accepted_at, first_accepted_at)
+
+    def test_reaccept_in_sync_sap_is_a_noop(self):
+        self.client.force_login(self.user)
+        accepted_at = timezone.now() - timezone.timedelta(days=3)
+        state = NSOL2SapState.objects.create(
+            management=self.mgmt,
+            service_name="ALREADY-SYNCED",
+            service_type="epipe",
+            sap_id="lag-60:101",
+            port="lag-60",
+            outer_tag=101,
+            status="in_sync",
+            accepted_at=accepted_at,
+        )
+
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:l2_accept_sap", kwargs={"pk": state.pk}))
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.accepted_at, accepted_at)
 
     def test_accept_rejects_service_types_the_writer_cannot_apply(self):
         self.client.force_login(self.user)

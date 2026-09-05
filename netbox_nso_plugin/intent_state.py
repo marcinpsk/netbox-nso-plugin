@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 ABSENT = ("ABSENT",)
 
 SOURCE_MODEL_RANKS = (
+    "ipam.rir",
     "ipam.vlan",
     "ipam.vlangroup",
     "ipam.vrf",
@@ -44,6 +45,8 @@ SOURCE_MODEL_RANKS = (
     "dcim.device",
     "dcim.interface",
     "dcim.interface_tagged_vlans",
+    "vpn.l2vpn",
+    "vpn.l2vpntermination",
     "ipam.ipaddress",
     "netbox_routing.prefixlist",
     "netbox_routing.customprefix",
@@ -64,7 +67,16 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.staticroute_devices",
     "netbox_routing.ospfinstance",
     "netbox_routing.isisinstance",
+    "netbox_routing.isissetting",
     "netbox_routing.isislevel",
+    "netbox_routing.isissegmentrouting",
+    "netbox_routing.isisflexalgo",
+    "netbox_routing.isissrv6locator",
+    "netbox_routing.isisinterface",
+    "netbox_routing.isisinterfacelevel",
+    "netbox_routing.isisprefixsid",
+    "netbox_routing.ospfarea",
+    "netbox_routing.ospfinterface",
     "netbox_routing.bgprouter",
     "netbox_routing.bgpscope",
     "netbox_routing.bgppeer",
@@ -72,6 +84,8 @@ SOURCE_MODEL_RANKS = (
     "netbox_routing.bgpaddressfamily",
     "netbox_routing.bgppeeraddressfamily",
     "netbox_routing.redistribution",
+    "netbox_routing.bfdprofile",
+    "netbox_routing.bfdinterface",
     "netbox_nso_plugin.nsodevicemanagement",
     "netbox_nso_plugin.nsoinstance",
     "netbox_nso_plugin.nsoroutepolicyobjectclass",
@@ -99,6 +113,7 @@ OVERLAY_MODEL_RANKS = (
     "netbox_nso_plugin.nsoisisinstancestate",
     "netbox_nso_plugin.nsoisisinterfacestate",
     "netbox_nso_plugin.nsobgppeerstate",
+    "netbox_nso_plugin.nsobgppeertemplatestate",
     "netbox_nso_plugin.nsoroutepolicystate",
     "netbox_nso_plugin.nsoospfinstancestate",
     "netbox_nso_plugin.nsoospfinterfacestate",
@@ -492,6 +507,7 @@ class RendererInputSpec:
     fragment: Any
     shared_kind: str | None = None
     dependency_resolver: Any = None
+    prospective_visibility: Any = None
 
     @property
     def model(self):
@@ -934,6 +950,10 @@ def _direct_overlay_fragment(instance):
     if label == "netbox_nso_plugin.nsoisisinterfacestate":
         return _owned_wire_fragment(instance, signals.isis_interface_intent_item)
     if label == "netbox_nso_plugin.nsoisisinstancestate":
+        from .status_machine import is_owned
+
+        if not is_owned(instance.status):
+            return ABSENT
         redist = signals._collect_redistribution_by_dest_ref(
             instance.management.device_id,
             "isis",
@@ -1069,6 +1089,72 @@ def _route_policy_groups(instance) -> tuple[tuple[str, str], ...]:
             )
         )
     return tuple(sorted(groups, key=lambda group: (group[0], group[1].casefold())))
+
+
+def _route_policy_prospective_visibility(effective_saves):
+    """Return keys exposed by route-policy ownership acquired in one plan."""
+    from . import status_machine as sm
+
+    state_label = "netbox_nso_plugin.nsoroutepolicystate"
+    acquired_groups = {
+        (after.family, after.object_name.casefold())
+        for before, after in effective_saves
+        if after._meta.label_lower == state_label
+        and (before is None or not sm.is_owned(before.status))
+        and sm.is_owned(after.status)
+    }
+    if not acquired_groups:
+        return set()
+
+    keys = set()
+    for before, after in effective_saves:
+        spec = _REGISTRY.get(after._meta.label_lower)
+        if spec is None or spec.shared_kind != "route_policy" or after._meta.label_lower == state_label:
+            continue
+        groups = {
+            (family, name.casefold())
+            for candidate in (before, after)
+            if candidate is not None
+            for family, name in _route_policy_groups(candidate)
+        }
+        if groups & acquired_groups:
+            keys.update(spec.resolver(after, spec))
+    return keys
+
+
+def _route_map_consumer_rows(instance):
+    """Return owned overlays whose rendered body reads one route-map name."""
+    if instance._meta.label_lower != "netbox_routing.routemap" or instance.pk is None:
+        return ()
+
+    from django.db.models import Q
+
+    from .models import NSOBGPPeerState, NSORedistributionState
+    from .status_machine import OWNED_STATES
+
+    bgp_states = NSOBGPPeerState.objects.filter(
+        Q(bgp_peer__address_families__routemap_in_id=instance.pk)
+        | Q(bgp_peer__address_families__routemap_out_id=instance.pk),
+        status__in=OWNED_STATES,
+    ).select_related("management")
+    redistribution_states = NSORedistributionState.objects.filter(
+        Q(redistribution__route_map_id=instance.pk) | Q(redistribution__isnull=True, route_map__iexact=instance.name),
+        status__in=OWNED_STATES,
+    ).select_related("management")
+    return (*bgp_states, *redistribution_states)
+
+
+def _route_map_consumer_keys(instance) -> set[tuple[int, str]]:
+    """Resolve route-map consumers to their actual delivery scopes."""
+    keys = set()
+    supported_scopes = set(_REGISTRY[instance._meta.label_lower].scopes)
+    for row in _route_map_consumer_rows(instance):
+        if row._meta.label_lower == "netbox_nso_plugin.nsobgppeerstate":
+            if "bgp" in supported_scopes:
+                keys.add((row.management.device_id, "bgp"))
+        elif row.dest_protocol in supported_scopes:
+            keys.add((row.management.device_id, row.dest_protocol))
+    return keys
 
 
 def _indirect_route_policy_groups(instance, label) -> set[tuple[str, str]]:
@@ -1324,18 +1410,28 @@ def _database_fragment(instance, spec):
     return ABSENT if current is None else canonical_fragment(current, spec)
 
 
-def _effective_after_fragment(instance, spec, update_fields):
-    """Serialize only values this save will persist, not unrelated stale attributes."""
-    if instance.pk is None or instance._state.adding or update_fields is None:
-        return canonical_fragment(instance, spec)
-    current = type(instance).objects.filter(pk=instance.pk).first()
-    if current is None:
-        return canonical_fragment(instance, spec)
-    effective = copy.copy(current)
+def _effective_after(instance, before, update_fields):
+    """Apply the fields saved by this write to the stored instance shape."""
+    if before is None or update_fields is None:
+        return instance
+    effective = copy.copy(before)
     for field_name in update_fields:
         field = instance._meta.get_field(field_name)
         setattr(effective, field.attname, getattr(instance, field.attname))
-    return canonical_fragment(effective, spec)
+        if field.is_relation:
+            if field.is_cached(instance):
+                field.set_cached_value(effective, field.get_cached_value(instance))
+            elif field.is_cached(effective):
+                field.delete_cached_value(effective)
+    return effective
+
+
+def _effective_after_fragment(instance, spec, update_fields):
+    """Serialize only values this save will persist, not unrelated stale attributes."""
+    current = (
+        None if instance.pk is None or instance._state.adding else type(instance).objects.filter(pk=instance.pk).first()
+    )
+    return canonical_fragment(_effective_after(instance, current, update_fields), spec)
 
 
 def _management_keys(device_ids, scopes):
@@ -1403,6 +1499,26 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
                 dest_protocol__in=spec.scopes,
             ).values_list("management__device_id", "dest_protocol")
         }
+    if instance._meta.label_lower == "ipam.ipaddress":
+        from dcim.models import Interface
+        from django.db.models import Q
+
+        from .models import NSOBGPPeerState
+        from .status_machine import OWNED_STATES
+
+        keys = set()
+        assigned = getattr(instance, "assigned_object", None)
+        if isinstance(assigned, Interface):
+            keys.update(_management_keys({assigned.device_id}, ("ip",)))
+        if instance.pk is not None:
+            keys.update(
+                (device_id, "bgp")
+                for device_id in NSOBGPPeerState.objects.filter(
+                    Q(bgp_peer__peer_id=instance.pk) | Q(bgp_peer__source_id=instance.pk),
+                    status__in=OWNED_STATES,
+                ).values_list("management__device_id", flat=True)
+            )
+        return keys
     if instance._meta.label_lower == "ipam.vrf":
         StaticRouteState = apps.get_model("netbox_nso_plugin.nsostaticroutestate")
         device_ids = StaticRouteState.objects.filter(
@@ -1486,7 +1602,7 @@ def _generic_keys(instance, spec: RendererInputSpec) -> set[tuple[int, str]]:
         if family and name:
             rows = rows.filter(family=family, object_name__iexact=name)
         device_ids = set(rows.values_list("management__device_id", flat=True))
-        return _management_keys(device_ids, spec.scopes)
+        return _management_keys(device_ids, spec.scopes) | _route_map_consumer_keys(instance)
     if instance._meta.label_lower in {
         "netbox_nso_plugin.nsoinstance",
         "netbox_nso_plugin.nsoplatformnedmapping",
@@ -1581,11 +1697,29 @@ def footprint_for_instance(instance, spec: RendererInputSpec | None = None) -> M
 def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
     """Include current and stored groups so a rename locks both identities."""
     groups = set(_route_policy_groups(instance))
+    if instance._meta.label_lower == "netbox_nso_plugin.nsoroutepolicystate":
+        family = getattr(instance, "family", "")
+        name = getattr(instance, "object_name", "")
+        management = getattr(instance, "management", None)
+        if family and name and management is not None:
+            return route_policy_footprint(
+                {(family, name)},
+                device_ids=(management.device_id,),
+            )
+    candidates = [instance]
     if instance.pk is not None:
         current = type(instance).objects.filter(pk=instance.pk).first()
         if current is not None:
             groups.update(_route_policy_groups(current))
-    return route_policy_footprint(groups) if groups else _regular_instance_footprint(instance, spec)
+            candidates.append(current)
+    base = route_policy_footprint(groups) if groups else _regular_instance_footprint(instance, spec)
+    consumers = {
+        (row._meta.label_lower, row.pk): row for candidate in candidates for row in _route_map_consumer_rows(candidate)
+    }
+    return MutationFootprint.merge(
+        base,
+        *(_regular_instance_footprint(row, _REGISTRY[row._meta.label_lower]) for row in consumers.values()),
+    )
 
 
 def _regular_instance_footprint(instance, spec) -> MutationFootprint:
@@ -1757,7 +1891,7 @@ def deletion_footprint_for_instance(instance) -> MutationFootprint:
 
     def add(model, pks, *, future=False):
         label = model._meta.label_lower
-        if label not in _REGISTRY or label == "netbox_nso_plugin.nsodevicemanagement":
+        if label not in _REGISTRY:
             return
         target = overlay_rows if label in OVERLAY_MODEL_RANKS else source_rows
         if future:
@@ -2045,7 +2179,12 @@ def _acquire(
     return _still_deploying_rows(deploying_rows)
 
 
-def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -> None:
+def _upgrade_detected_reconcile(
+    permit: _Permit,
+    requested: MutationFootprint,
+    *,
+    bump_keys=None,
+) -> None:
     """Upgrade a locked read transaction when its body proves a content delta."""
     if not permit.detect_reconcile_content:
         raise IntentMutationProtocolError("read-side content mutation requires a predicted reconcile plan")
@@ -2054,9 +2193,13 @@ def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -
     if missing_rows:
         details = sorted((row.model_label, repr(row.pk)) for row in missing_rows)
         raise IntentMutationProtocolError(f"detected reconcile content rows were not prelocked: {details!r}")
+    revision_keys = tuple(permit.footprint.revision_keys if bump_keys is None else bump_keys)
+    if not set(revision_keys) <= set(permit.footprint.revision_keys):
+        raise IntentMutationProtocolError("detected reconcile content keys were not prelocked")
+
     from .outbox import bump_intent_revision
 
-    for device_id, scope in permit.footprint.revision_keys:
+    for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
     permit.deferred_repend_rows = permit.initial_deploying_rows
     permit.dml_kind = "content"
@@ -2318,18 +2461,6 @@ def reconcile_cascade_dml(model):
             permit.authorized_dml.pop(table, None)
 
 
-def _content_permit_covers(instance, spec: RendererInputSpec, permit: _Permit) -> bool:
-    row = SourceRow(instance._meta.label_lower, instance.pk)
-    future = SourceRow(instance._meta.label_lower, None)
-    if row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows) or future in (
-        *permit.footprint.source_rows,
-        *permit.footprint.overlay_rows,
-    ):
-        return True
-    resolved = spec.resolver(instance, spec)
-    return bool(resolved) and resolved <= set(permit.footprint.revision_keys)
-
-
 def _footprint_covers_row(instance, permit: _Permit) -> bool:
     rows = (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
     return (
@@ -2497,7 +2628,7 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
                 raise IntentMutationProtocolError(
                     f"read-side {sender._meta.label_lower} write changes rendered content"
                 )
-    elif writer is None and not _content_permit_covers(instance, spec, active):
+    elif writer is None and not _footprint_covers_row(instance, active):
         before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
         after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
         if before != after:
@@ -3210,6 +3341,7 @@ def register_renderer_input(spec: RendererInputSpec, *, connect_ends: bool = Tru
         fragment=spec.fragment,
         shared_kind=spec.shared_kind,
         dependency_resolver=spec.dependency_resolver,
+        prospective_visibility=spec.prospective_visibility,
     )
     _REGISTRY[label] = normalized
     _TABLE_REGISTRY[model._meta.db_table] = normalized
@@ -3451,6 +3583,10 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
             _REGISTRY[label],
             fragment=fragment,
             dependency_resolver=dependency_resolvers.get(label),
+            shared_kind="route_policy" if label == "netbox_nso_plugin.nsoroutepolicystate" else None,
+            prospective_visibility=(
+                _route_policy_prospective_visibility if label == "netbox_nso_plugin.nsoroutepolicystate" else None
+            ),
         )
         _TABLE_REGISTRY[_REGISTRY[label].table] = _REGISTRY[label]
     _REGISTRY["netbox_nso_plugin.nsovlanstate"] = replace(

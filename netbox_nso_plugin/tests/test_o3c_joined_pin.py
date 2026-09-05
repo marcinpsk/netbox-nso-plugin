@@ -682,9 +682,10 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         _AdapterWireSession.reset(self.environment.adapter_port)
 
         with transaction.atomic():
-            route.next_hop = "198.18.3.2"
-            route.save()
-            route.devices.remove(removed_device)
+            from ._static_route_case import _edit_owned_route, _unassign_and_retire
+
+            _edit_owned_route(route, next_hop="198.18.3.2")
+            _unassign_and_retire(route, removed_device)
 
         assert self.environment.restconf.removal_read_started.wait(45), (
             "the real adapter worker did not reach the removed device's RESTCONF read\n" + self.environment.log_text()

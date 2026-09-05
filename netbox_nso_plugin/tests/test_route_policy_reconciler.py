@@ -19,6 +19,63 @@ from django.urls import reverse
 
 
 class TestReconcileRoutePolicy(TestCase):
+    def test_object_classification_lookups_are_batched(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from django.utils import timezone
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
+        from netbox_nso_plugin.route_policy_reconciler import _RoutePolicyGraphPlanner
+
+        self._make_mgmt(self.device)
+        payload = {"prefix_lists": [{"name": f"CLASS-BATCH-{index}", "entries": []} for index in range(4)]}
+        PrefixList.objects.bulk_create(PrefixList(name=row["name"]) for row in payload["prefix_lists"])
+
+        with CaptureQueriesContext(connection) as captured:
+            _RoutePolicyGraphPlanner(self.device, payload, timezone.now()).build()
+
+        class_table = NSORoutePolicyObjectClass._meta.db_table
+        class_queries = [query for query in captured if class_table in query["sql"]]
+        self.assertEqual(len(class_queries), 1)
+
+    def test_prefix_unit_owner_lookup_is_batched(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from django.utils import timezone
+
+        from netbox_nso_plugin.route_policy_reconciler import _RoutePolicyGraphPlanner
+
+        self._make_mgmt(self.device)
+        payload = {
+            "prefix_lists": [
+                {"name": f"BATCH-{index}", "entries": [{"prefix": f"198.18.{index}.0/24"}]} for index in range(3)
+            ]
+        }
+        planner = _RoutePolicyGraphPlanner(self.device, payload, timezone.now())
+
+        with CaptureQueriesContext(connection) as captured:
+            planner._seed_prefix_units()
+
+        self.assertEqual(len(captured), 1)
+
+    def test_direct_reconcile_builds_the_route_policy_graph_once(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import route_policy_reconciler
+
+        self._make_mgmt(self.device)
+        payload = self._pl_payload("ONE-PLAN", "198.18.4.0/24")
+
+        with patch.object(
+            route_policy_reconciler,
+            "_route_policy_reconcile_operations",
+            wraps=route_policy_reconciler._route_policy_reconcile_operations,
+        ) as build_operations:
+            route_policy_reconciler.reconcile_route_policy(self.device, payload)
+
+        self.assertEqual(build_operations.call_count, 1)
+
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="RpMfg", slug="rpmfg")
@@ -49,34 +106,6 @@ class TestReconcileRoutePolicy(TestCase):
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         self.assertEqual(reconcile_route_policy(self.device, self._payload()), [])
-
-    def test_reconcile_plan_marks_only_materialized_content_changes(self):
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
-
-        self._make_mgmt(self.device)
-        payload = {
-            "prefix_lists": [
-                {"name": "PL-PLAN", "family": 4, "entries": [{"action": "permit", "prefix": "198.18.0.0/15"}]}
-            ]
-        }
-
-        self.assertTrue(route_policy_reconcile_plan(self.device, payload).changes_content)
-        reconcile_route_policy(self.device, payload)
-        self.assertFalse(route_policy_reconcile_plan(self.device, payload).changes_content)
-
-        changed = {
-            "prefix_lists": [
-                {
-                    "name": "PL-PLAN",
-                    "family": 4,
-                    "entries": [
-                        {"action": "permit", "prefix": "198.18.0.0/15"},
-                        {"action": "permit", "prefix": "198.20.0.0/15"},
-                    ],
-                }
-            ]
-        }
-        self.assertTrue(route_policy_reconcile_plan(self.device, changed).changes_content)
 
     def test_reconcile_plan_marks_empty_shell_fills_as_content_changes(self):
         from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
@@ -140,9 +169,8 @@ class TestReconcileRoutePolicy(TestCase):
         from uuid import uuid4
 
         self._make_mgmt(self.device)
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         payload = {"community_lists": [{"name": "CL-EMPTY", "entries": []}]}
         reconcile_route_policy(self.device, payload)
@@ -154,8 +182,7 @@ class TestReconcileRoutePolicy(TestCase):
         st.apply_attempt_id = attempt_id
         st.save(update_fields=["status", "apply_attempt_id"])
 
-        with reconcile_transaction(route_policy_reconcile_plan(self.device, payload)):
-            reconcile_route_policy(self.device, payload)
+        reconcile_route_policy(self.device, payload)
         st.refresh_from_db()
         self.assertEqual(st.status, "deploying")
         self.assertEqual(st.apply_attempt_id, attempt_id)
@@ -481,6 +508,150 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(CommunityList.objects.filter(name="CL-LOCAL").count(), 1)
         self.assertEqual(ASPath.objects.filter(name="AP-PRIVATE").count(), 1)
         self.assertEqual(RouteMap.objects.filter(name="RM-IMPORT").count(), 1)
+
+    def test_preflight_plan_freezes_roots_entries_m2m_and_through_rows_without_writes(self):
+        """One route-policy plan covers every materialized graph write before locking."""
+        from netbox_routing.models import (
+            ASPath,
+            ASPathEntry,
+            Community,
+            CommunityList,
+            CommunityListEntry,
+            CustomPrefix,
+            PrefixList,
+            PrefixListEntry,
+            RouteMap,
+            RouteMapEntry,
+            RouteMapEntrySetCommunity,
+        )
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        payload = {
+            "prefix_lists": [
+                {
+                    "name": "PLAN-PREFIXES",
+                    "family": 4,
+                    "entries": [{"action": "permit", "prefix": "198.18.0.0/24"}],
+                }
+            ],
+            "community_lists": [
+                {"name": "PLAN-COMMUNITIES", "entries": [{"action": "permit", "community": "64512:7"}]}
+            ],
+            "as_paths": [{"name": "PLAN-AS-PATH", "entries": [{"action": "permit", "pattern": "^64512$"}]}],
+            "route_maps": [
+                {
+                    "name": "PLAN-ROUTE-MAP",
+                    "entries": [
+                        {
+                            "action": "permit",
+                            "match_prefix_lists": ["PLAN-PREFIXES"],
+                            "match_community_lists": ["PLAN-COMMUNITIES"],
+                            "match_as_paths": ["PLAN-AS-PATH"],
+                            "set": '{"community_add": ["PLAN-COMMUNITIES", "64512:99"]}',
+                        }
+                    ],
+                }
+            ],
+        }
+        models = (
+            PrefixList,
+            CustomPrefix,
+            PrefixListEntry,
+            CommunityList,
+            Community,
+            CommunityListEntry,
+            ASPath,
+            ASPathEntry,
+            RouteMap,
+            RouteMapEntry,
+            RouteMapEntrySetCommunity,
+            NSORoutePolicyState,
+        )
+        before = {model._meta.label_lower: model.objects.count() for model in models}
+
+        plan = route_policy_reconcile_plan(self.device, payload)
+
+        self.assertEqual({model._meta.label_lower: model.objects.count() for model in models}, before)
+        save_labels = {write.model_label for write in plan.write_set if write.operation == "save"}
+        self.assertTrue({model._meta.label_lower for model in models} <= save_labels)
+        through_models = {
+            dict(write.values)["through_model"] for write in plan.write_set if write.operation == "m2m_add"
+        }
+        self.assertEqual(
+            through_models,
+            {
+                "netbox_routing.routemapentry_match_aspath",
+                "netbox_routing.routemapentry_match_community_list",
+                "netbox_routing.routemapentry_match_prefix_list",
+                "netbox_routing.routemapentrysetcommunity_communities",
+            },
+        )
+        self.assertFalse(plan.content_keys)
+        self.assertEqual(
+            set(plan.lock_footprint.revision_keys),
+            {
+                (self.device.pk, "bgp"),
+                (self.device.pk, "isis"),
+                (self.device.pk, "ospf"),
+                (self.device.pk, "route_policy"),
+            },
+        )
+
+    def test_preflight_filters_shared_dependency_prefetches_to_the_payload(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import ASPath, Community, CommunityList, CustomPrefix, PrefixList, RouteMap
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        PrefixList.objects.create(name="PAYLOAD-PL")
+        CommunityList.objects.create(name="PAYLOAD-CL")
+        ASPath.objects.create(name="PAYLOAD-AP")
+        RouteMap.objects.create(name="PAYLOAD-RM")
+        CustomPrefix.objects.create(prefix="198.18.32.0/24")
+        Community.objects.create(community="64532:100")
+        payload = {
+            "prefix_lists": [
+                {
+                    "name": "PAYLOAD-PL",
+                    "entries": [{"action": "permit", "prefix": "198.18.32.0/24"}],
+                }
+            ],
+            "community_lists": [
+                {
+                    "name": "PAYLOAD-CL",
+                    "entries": [{"action": "permit", "community": "64532:100"}],
+                }
+            ],
+            "as_paths": [{"name": "PAYLOAD-AP", "entries": [{"action": "permit", "pattern": "^64532$"}]}],
+            "route_maps": [{"name": "PAYLOAD-RM", "entries": []}],
+        }
+
+        with CaptureQueriesContext(connection) as captured:
+            route_policy_reconcile_plan(self.device, payload)
+
+        sql = [query["sql"] for query in captured.captured_queries]
+        for model in (PrefixList, CommunityList, ASPath, RouteMap, CustomPrefix, Community):
+            table = model._meta.db_table
+            prefetches = [query for query in sql if query.startswith("SELECT") and f'FROM "{table}"' in query]
+            self.assertEqual(len(prefetches), 1)
+            self.assertIn(" WHERE ", prefetches[0])
+
+    def test_display_projection_rejects_a_registered_through_model(self):
+        from netbox_routing.models import CommunityList, RouteMapEntry
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.route_policy_reconciler import _Operations
+
+        operations = _Operations()
+        entry = RouteMapEntry()
+        community_list = CommunityList(name="REGISTERED-DISPLAY")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "registered renderer input"):
+            operations.display_m2m_add(entry, "match_community_list", (community_list,))
 
     def test_prefix_list_family_propagated_from_capture(self):
         """The materialized PrefixList mirrors the owner capture's address family.
@@ -858,7 +1029,11 @@ class TestReconcileRoutePolicy(TestCase):
         """A row left 'conflict' after its hash converged with the owner's (the device not
         re-read) settles via the recompute pass, without a device round-trip."""
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, resettle_false_conflicts
+        from netbox_nso_plugin.route_policy_reconciler import (
+            reconcile_route_policy,
+            resettle_false_conflicts,
+            route_policy_resettle_plan,
+        )
 
         self._make_mgmt(self.device)
         self._make_mgmt(self.device2)
@@ -872,6 +1047,15 @@ class TestReconcileRoutePolicy(TestCase):
         owner = NSORoutePolicyState.objects.get(family="prefix_list", object_name="SHARED", is_materialized=True)
         s2.content_hash = owner.content_hash  # hashes converged, but device2 wasn't re-read
         s2.save(update_fields=["content_hash"])
+
+        plan = route_policy_resettle_plan({("prefix_list", "SHARED")})
+
+        s2.refresh_from_db()
+        self.assertEqual(s2.status, "conflict")
+        self.assertEqual(
+            {(write.operation, write.model_label) for write in plan.write_set},
+            {("save", "netbox_nso_plugin.nsoroutepolicystate")},
+        )
 
         cleared = resettle_false_conflicts()
 
@@ -922,6 +1106,49 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertTrue(
             NSORoutePolicyState.objects.filter(family="prefix_list", object_name="LGI", is_materialized=True).exists()
         )
+
+    def test_master_reclassification_reuses_the_existing_root(self):
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, set_classification
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(self.device, self._pl_payload("REUSE-ROOT", "198.18.2.0/24"))
+        root = PrefixList.objects.get(name="REUSE-ROOT")
+        set_classification("prefix_list", "REUSE-ROOT", "local")
+        reconcile_route_policy(self.device, self._pl_payload("REUSE-ROOT", "198.18.3.0/24"))
+
+        set_classification("prefix_list", "REUSE-ROOT", "master")
+
+        self.assertEqual(PrefixList.objects.filter(name="REUSE-ROOT").count(), 1)
+        self.assertEqual(PrefixList.objects.get(name="REUSE-ROOT").pk, root.pk)
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list=root).count(), 1)
+        self.assertEqual(str(PrefixListEntry.objects.get(prefix_list=root).assigned_prefix), "198.18.3.0/24")
+
+    def test_classification_preflight_freezes_master_graph_without_writes(self):
+        """LOCAL-to-MASTER classification plans the class, graph, and every overlay first."""
+        from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import (
+            reconcile_route_policy,
+            route_policy_classification_plan,
+            set_classification,
+        )
+
+        self._make_mgmt(self.device)
+        self._make_mgmt(self.device2)
+        set_classification("prefix_list", "PLAN-CLASSIFICATION", "local")
+        reconcile_route_policy(self.device, self._pl_payload("PLAN-CLASSIFICATION", "198.18.0.0/24"))
+        reconcile_route_policy(self.device2, self._pl_payload("PLAN-CLASSIFICATION", "198.18.1.0/24"))
+        models = (NSORoutePolicyObjectClass, NSORoutePolicyState, PrefixList, CustomPrefix, PrefixListEntry)
+        before = {model._meta.label_lower: model.objects.count() for model in models}
+
+        plan = route_policy_classification_plan("prefix_list", "PLAN-CLASSIFICATION", "master")
+
+        self.assertEqual({model._meta.label_lower: model.objects.count() for model in models}, before)
+        save_labels = {write.model_label for write in plan.write_set if write.operation == "save"}
+        self.assertTrue({model._meta.label_lower for model in models} <= save_labels)
 
     def test_community_invert_match_reconciled(self):
         """A community-list reported with invert_match=True sets the field; a plain
@@ -1062,6 +1289,84 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(rme.set, {"local_preference": 200})
         self.assertEqual([p.name for p in rme.match_prefix_list.all()], ["PL-A"])
         self.assertEqual([a.name for a in rme.match_aspath.all()], ["AP-A"])
+
+    def test_route_map_keeps_existing_policy_references_absent_from_its_payload(self):
+        from netbox_routing.models import CommunityList, PrefixList, RouteMapEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        PrefixList.objects.create(name="PL-EXISTING")
+        CommunityList.objects.create(name="CL-EXISTING")
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-EXISTING-REFERENCE",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match_prefix_lists": ["PL-EXISTING"],
+                                "set": '{"community_add": ["CL-EXISTING"]}',
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        entry = RouteMapEntry.objects.get(route_map__name="RM-EXISTING-REFERENCE")
+        self.assertEqual(list(entry.match_prefix_list.values_list("name", flat=True)), ["PL-EXISTING"])
+        self.assertEqual(
+            list(entry.set_communities.values_list("community_list__name", flat=True)),
+            ["CL-EXISTING"],
+        )
+
+    def test_new_route_map_reference_keeps_an_unreported_materialized_object(self):
+        from netbox_routing.models import PrefixList, RouteMapEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {
+                "prefix_lists": [
+                    {
+                        "name": "PL-NEW-REFERENCE",
+                        "entries": [{"sequence": 10, "action": "permit", "prefix": "198.18.0.0/24"}],
+                    }
+                ]
+            },
+        )
+
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-NEW-REFERENCE",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match_prefix_lists": ["PL-NEW-REFERENCE"],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-NEW-REFERENCE")
+        self.assertFalse(state.device_present)
+        self.assertTrue(PrefixList.objects.filter(name="PL-NEW-REFERENCE").exists())
+        entry = RouteMapEntry.objects.get(route_map__name="RM-NEW-REFERENCE")
+        self.assertEqual(list(entry.match_prefix_list.values_list("name", flat=True)), ["PL-NEW-REFERENCE"])
 
     def test_flow_control_lifted_from_set_json(self):
         """flow_control (IOS continue) rides in set-json → lifted into the field and
@@ -1295,21 +1600,18 @@ class TestReconcileRoutePolicy(TestCase):
         """The plan must predict the stale-row cascade: the gate refuses it under a mirror permit."""
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         self._make_mgmt(self.device)
         seeded = {"route_maps": [{"name": "RM-OMIT", "entries": [{"sequence": 10, "action": "permit"}]}]}
-        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
-            reconcile_route_policy(self.device, seeded)
+        reconcile_route_policy(self.device, seeded)
         before = self._rp_revision()
 
         empty = {"route_maps": []}
         plan = route_policy_reconcile_plan(self.device, empty)
         self.assertTrue(plan.changes_content)
-        with reconcile_transaction(plan):
-            reconcile_route_policy(self.device, empty)
+        reconcile_route_policy(self.device, empty)
 
         self.assertFalse(NSORoutePolicyState.objects.filter(family="route_map", object_name="RM-OMIT").exists())
         self.assertFalse(RouteMap.objects.filter(name="RM-OMIT").exists())
@@ -1319,14 +1621,13 @@ class TestReconcileRoutePolicy(TestCase):
         """in_sync -> changed drops the owned group from the wire, so the plan must bump."""
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, reconcile_transaction
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         self._make_mgmt(self.device)
         seeded = {"route_maps": [{"name": "RM-SYNCED", "entries": [{"sequence": 10, "action": "permit"}]}]}
-        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
-            reconcile_route_policy(self.device, seeded)
+        reconcile_route_policy(self.device, seeded)
         state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-SYNCED")
         with intent_transaction(footprint_for_instance(state)):
             state.status = "in_sync"
@@ -1336,8 +1637,7 @@ class TestReconcileRoutePolicy(TestCase):
         empty = {"route_maps": []}
         plan = route_policy_reconcile_plan(self.device, empty)
         self.assertTrue(plan.changes_content)
-        with reconcile_transaction(plan):
-            reconcile_route_policy(self.device, empty)
+        reconcile_route_policy(self.device, empty)
 
         state.refresh_from_db()
         self.assertEqual(state.status, "changed")
@@ -1349,14 +1649,13 @@ class TestReconcileRoutePolicy(TestCase):
         """An accepted row keeps its status on absence: flags only, no bump."""
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, reconcile_transaction
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         self._make_mgmt(self.device)
         seeded = {"route_maps": [{"name": "RM-ACCEPTED", "entries": [{"sequence": 10, "action": "permit"}]}]}
-        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
-            reconcile_route_policy(self.device, seeded)
+        reconcile_route_policy(self.device, seeded)
         state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-ACCEPTED")
         with intent_transaction(footprint_for_instance(state)):
             state.status = "accepted"
@@ -1366,8 +1665,7 @@ class TestReconcileRoutePolicy(TestCase):
         empty = {"route_maps": []}
         plan = route_policy_reconcile_plan(self.device, empty)
         self.assertFalse(plan.changes_content)
-        with reconcile_transaction(plan):
-            reconcile_route_policy(self.device, empty)
+        reconcile_route_policy(self.device, empty)
 
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
@@ -1379,7 +1677,6 @@ class TestReconcileRoutePolicy(TestCase):
         """A still-referenced object is kept and flagged, so absence writes no content."""
         from netbox_routing.models import PrefixList
 
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
@@ -1391,15 +1688,13 @@ class TestReconcileRoutePolicy(TestCase):
             "prefix_lists": [{"name": "PL-KEPT", "entries": [{"sequence": 10, "prefix": "10.0.0.0/8"}]}],
             "route_maps": rmaps,
         }
-        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
-            reconcile_route_policy(self.device, seeded)
+        reconcile_route_policy(self.device, seeded)
         before = self._rp_revision()
 
         dropped = {"route_maps": rmaps}
         plan = route_policy_reconcile_plan(self.device, dropped)
         self.assertFalse(plan.changes_content)
-        with reconcile_transaction(plan):
-            reconcile_route_policy(self.device, dropped)
+        reconcile_route_policy(self.device, dropped)
 
         state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-KEPT")
         self.assertFalse(state.device_present)
@@ -1440,6 +1735,40 @@ class TestReconcileRoutePolicy(TestCase):
         matched = {str(c.community) for c in rme.match_community.all()}
         self.assertEqual(matched, {"65000:1", "65000:2"})
         self.assertEqual(Community.objects.filter(community__in=["65000:1", "65000:2"]).count(), 2)
+
+    def test_same_operation_literal_communities_share_one_set_row(self):
+        from netbox_routing.models import RouteMapEntrySetCommunity
+
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {
+                "route_maps": [
+                    {
+                        "name": "RM-LITERAL-GROUP",
+                        "entries": [
+                            {
+                                "action": "permit",
+                                "set": '{"community_add": ["64540:10", "64540:20"]}',
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        rows = RouteMapEntrySetCommunity.objects.filter(
+            route_map_entry__route_map__name="RM-LITERAL-GROUP",
+            operation="add",
+            community_list__isnull=True,
+        )
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(
+            set(rows.get().communities.values_list("community", flat=True)),
+            {"64540:10", "64540:20"},
+        )
 
 
 class TestDeviceCaughtUpSettle(TestCase):
@@ -1770,48 +2099,12 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(st.is_materialized)
         self.assertEqual(st.status, "imported")
 
-    def test_group_lock_rechecks_an_owner_that_finished_after_discovery(self):
-        from contextlib import contextmanager
-
-        from netbox_routing.models import PrefixList, PrefixListEntry
-
-        from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
-
-        from ._outbox_case import content_update
-
-        self._mgmt(self.d1)
-        self._mgmt(self.d2)
-        name = "PL-OWNER-RACE"
-        reconcile_route_policy(self.d1, self._pl(name, ["198.18.0.0/24"]))
-        owner = NSORoutePolicyState.objects.get(management__device=self.d1, object_name=name)
-        content_update(owner, is_materialized=False)
-
-        from netbox_nso_plugin import route_policy_reconciler
-
-        group_content_mutation = route_policy_reconciler._group_content_mutation
-
-        @contextmanager
-        def owner_finishes_before_content_write(family, object_name):
-            with group_content_mutation(family, object_name):
-                NSORoutePolicyState.objects.filter(pk=owner.pk).update(is_materialized=True)
-                yield
-
-        with patch(
-            "netbox_nso_plugin.route_policy_reconciler._group_content_mutation",
-            owner_finishes_before_content_write,
-        ):
-            reconcile_route_policy(self.d2, self._pl(name, ["198.18.1.0/24"]))
-
-        owner.refresh_from_db()
-        root = PrefixList.objects.get(name=name)
-        prefixes = {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list=root)}
-        self.assertTrue(owner.is_materialized)
-        self.assertEqual(prefixes, {"198.18.0.0/24"})
-
     def test_reconcile_plan_rechecks_owner_after_acquisition(self):
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         from ._outbox_case import content_update
@@ -1825,13 +2118,18 @@ class TestSharedObjectOwnership(TestCase):
         self.assertFalse(plan.changes_content)
         content_update(owner, is_materialized=False)
 
-        with self.assertRaises(RendererTargetsChanged), reconcile_transaction(plan):
-            self.fail("the stale route-policy plan entered its body")
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+            with renderer_mirror_writes(plan):
+                reconcile_route_policy(self.d2, payload)
+
+        entries = PrefixListEntry.objects.filter(prefix_list__name="PL-OWNER-PREDICTION")
+        self.assertEqual({str(entry.assigned_prefix) for entry in entries}, {"198.18.0.0/24"})
 
     def test_reconcile_plan_rechecks_route_map_prefix_list_dependencies_after_acquisition(self):
         from netbox_nso_plugin import shared_object_ownership as ownership
-        from netbox_nso_plugin.intent_state import RendererTargetsChanged, reconcile_transaction
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         from ._outbox_case import content_update
@@ -1897,9 +2195,14 @@ class TestSharedObjectOwnership(TestCase):
             content_hash=ownership.hash_captured("prefix_list", changed_prefix_capture),
         )
 
-        with self.assertRaisesRegex(RendererTargetsChanged, "route-policy materialized owner changed"):
-            with reconcile_transaction(plan):
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+            with renderer_mirror_writes(plan):
                 reconcile_route_policy(self.d2, payload)
+
+        d2_prefix.refresh_from_db()
+        d2_route_map.refresh_from_db()
+        self.assertEqual((d2_prefix.status, d2_prefix.is_materialized), ("imported", False))
+        self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
 
     def test_first_prefix_list_capture_replaces_a_populated_unowned_root(self):
         from django.contrib.contenttypes.models import ContentType
@@ -1911,7 +2214,7 @@ class TestSharedObjectOwnership(TestCase):
 
         root = PrefixList.objects.create(name="PL-FIRST-CAPTURE")
         old_prefix = CustomPrefix.objects.create(prefix="198.18.40.0/24")
-        PrefixListEntry.objects.create(
+        old_entry = PrefixListEntry.objects.create(
             prefix_list=root,
             assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
             assigned_prefix_id=old_prefix.pk,
@@ -1921,7 +2224,15 @@ class TestSharedObjectOwnership(TestCase):
         management = self._mgmt(self.d1)
         payload = self._pl(root.name, [])
 
-        self.assertTrue(route_policy_reconcile_plan(self.d1, payload).changes_content)
+        plan = route_policy_reconcile_plan(self.d1, payload)
+        planned_deletes = [
+            write
+            for write in plan.write_set
+            if write.operation == "delete"
+            and write.model_label == "netbox_routing.prefixlistentry"
+            and write.pk == old_entry.pk
+        ]
+        self.assertEqual(len(planned_deletes), 1)
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
@@ -1982,7 +2293,55 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(state.is_materialized)
         self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
 
-    def test_resettle_sibling_bumps_last_sync_at(self):
+    def test_reconcile_plans_duplicate_materialized_owner_retirement(self):
+        from netbox_nso_plugin.intent_state import SourceRow
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        payload = self._pl("PL-SOLE", ["198.18.0.0/24"])
+        reconcile_route_policy(self.d1, payload)
+        reconcile_route_policy(self.d2, payload)
+        owner = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-SOLE")
+        sibling = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-SOLE")
+        content_update(sibling, is_materialized=True)
+
+        plan = route_policy_reconcile_plan(self.d1, payload)
+
+        sibling_writes = [
+            write
+            for write in plan.write_set
+            if write.operation == "save"
+            and write.model_label == "netbox_nso_plugin.nsoroutepolicystate"
+            and write.pk == sibling.pk
+        ]
+        self.assertEqual(len(sibling_writes), 1)
+        self.assertEqual(sibling_writes[0].update_fields, ("is_materialized",))
+        self.assertFalse(dict(sibling_writes[0].values)["is_materialized"])
+        self.assertIn(
+            SourceRow("netbox_nso_plugin.nsoroutepolicystate", sibling.pk),
+            plan.lock_footprint.overlay_rows,
+        )
+
+        reconcile_route_policy(self.d1, payload)
+
+        owner.refresh_from_db()
+        sibling.refresh_from_db()
+        self.assertTrue(owner.is_materialized)
+        self.assertFalse(sibling.is_materialized)
+        self.assertEqual(
+            NSORoutePolicyState.objects.filter(
+                family="prefix_list",
+                object_name="PL-SOLE",
+                is_materialized=True,
+            ).count(),
+            1,
+        )
+
+    def test_rematerialize_bumps_former_owner_last_sync_at(self):
         """Re-pointing a shared object resettles the old owner's sibling row and recomputes its
         status — its last_sync_at must be bumped too, else the UI shows a stale 'last seen' next
         to the freshly-recomputed status."""
@@ -2132,7 +2491,6 @@ class TestSharedObjectOwnership(TestCase):
         """Dropping a non-materialized row leaves the shared object untouched: no bump."""
         from netbox_routing.models import PrefixList
 
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
@@ -2140,15 +2498,13 @@ class TestSharedObjectOwnership(TestCase):
         self._mgmt(self.d2)
         for device in (self.d1, self.d2):
             payload = self._pl("PL-DROP", ["10.0.0.0/8"])
-            with reconcile_transaction(route_policy_reconcile_plan(device, payload)):
-                reconcile_route_policy(device, payload)
+            reconcile_route_policy(device, payload)
         before = (self._rp_revision(self.d1), self._rp_revision(self.d2))
 
         empty = {"prefix_lists": []}
         plan = route_policy_reconcile_plan(self.d2, empty)
         self.assertFalse(plan.changes_content)
-        with reconcile_transaction(plan):
-            reconcile_route_policy(self.d2, empty)
+        reconcile_route_policy(self.d2, empty)
 
         self.assertFalse(NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-DROP").exists())
         self.assertTrue(PrefixList.objects.filter(name="PL-DROP").exists())
@@ -2158,7 +2514,6 @@ class TestSharedObjectOwnership(TestCase):
         """Re-pointing refills the shared object from the sibling, so the plan must bump."""
         from netbox_routing.models import PrefixList
 
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
@@ -2166,15 +2521,13 @@ class TestSharedObjectOwnership(TestCase):
         self._mgmt(self.d2)
         for device in (self.d1, self.d2):
             payload = self._pl("PL-HANDOVER", ["10.0.0.0/8"])
-            with reconcile_transaction(route_policy_reconcile_plan(device, payload)):
-                reconcile_route_policy(device, payload)
+            reconcile_route_policy(device, payload)
         before = self._rp_revision(self.d1)
 
         empty = {"prefix_lists": []}
         plan = route_policy_reconcile_plan(self.d1, empty)
         self.assertTrue(plan.changes_content)
-        with reconcile_transaction(plan):
-            reconcile_route_policy(self.d1, empty)
+        reconcile_route_policy(self.d1, empty)
 
         self.assertFalse(
             NSORoutePolicyState.objects.filter(management__device=self.d1, object_name="PL-HANDOVER").exists()
@@ -2184,6 +2537,213 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(PrefixList.objects.filter(name="PL-HANDOVER").exists())
         self.assertGreater(self._rp_revision(self.d1), before)
 
+    def _race_standalone(self, device, payload, mutate):
+        """Run the standalone reconcile with *mutate* applied between plan and lock."""
+        from netbox_nso_plugin import renderer_writer
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        real_mirror = renderer_writer.renderer_mirror_writes
+        fired = []
+
+        def racing_mirror(plan):
+            if not fired:
+                fired.append(True)
+                mutate()
+            return real_mirror(plan)
+
+        with patch.object(renderer_writer, "renderer_mirror_writes", racing_mirror):
+            reconcile_route_policy(device, payload)
+        self.assertTrue(fired, "the raced mirror acquisition never ran")
+
+    def test_standalone_replay_refuses_a_sibling_removed_after_planning(self):
+        """The omitted-group branch reads the live sibling, so its removal must refuse the replay."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        payload = self._pl("PL-RACE-GONE", ["10.0.0.0/8"])
+        reconcile_route_policy(self.d1, payload)
+        reconcile_route_policy(self.d2, payload)
+        self.assertTrue(
+            NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RACE-GONE").is_materialized
+        )
+        empty = {"prefix_lists": []}
+        self.assertFalse(route_policy_reconcile_plan(self.d2, empty).changes_content)
+
+        with self.assertRaises(IntentPlanStaleError):
+            self._race_standalone(
+                self.d2,
+                empty,
+                lambda: NSODeviceManagement.objects.get(device=self.d1).delete(),
+            )
+
+        # Nothing was written: the unreferenced root is still there with D2's row.
+        self.assertTrue(PrefixList.objects.filter(name="PL-RACE-GONE").exists())
+        self.assertTrue(
+            NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-RACE-GONE").exists()
+        )
+
+        before = self._rp_revision(self.d2)
+        plan = route_policy_reconcile_plan(self.d2, empty)
+        self.assertTrue(plan.changes_content)
+        reconcile_route_policy(self.d2, empty)
+        self.assertFalse(NSORoutePolicyState.objects.filter(object_name="PL-RACE-GONE").exists())
+        self.assertFalse(PrefixList.objects.filter(name="PL-RACE-GONE").exists())
+        self.assertGreater(self._rp_revision(self.d2), before)
+
+    def test_standalone_replay_refuses_a_sibling_whose_liveness_flipped_after_planning(self):
+        """A sibling that stops reporting between plan and lock changes the stale-group branch."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        payload = self._pl("PL-RACE-FLIP", ["10.0.0.0/8"])
+        reconcile_route_policy(self.d1, payload)
+        reconcile_route_policy(self.d2, payload)
+        owner = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RACE-FLIP")
+        empty = {"prefix_lists": []}
+        self.assertFalse(route_policy_reconcile_plan(self.d2, empty).changes_content)
+
+        with self.assertRaises(IntentPlanStaleError):
+            self._race_standalone(self.d2, empty, lambda: content_update(owner, device_present=False))
+
+        self.assertTrue(PrefixList.objects.filter(name="PL-RACE-FLIP").exists())
+        self.assertTrue(
+            NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-RACE-FLIP").exists()
+        )
+
+    def _drop_match_edge(self, prefix_list_name):
+        """Another writer drops the match edge, exactly as a re-read of that route-map would."""
+        from dataclasses import replace
+
+        from netbox_routing.models import RouteMapEntry
+
+        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        edge = RouteMapEntry.match_prefix_list.through.objects.get(prefixlist__name=prefix_list_name)
+        footprint = deletion_footprint_for_instance(edge)
+        footprint = replace(footprint, device_ids=tuple(sorted({self.d1.pk, self.d2.pk})))
+        with suppress_intent_push(), intent_transaction(footprint):
+            edge.delete()
+
+    def _seed_referenced_prefix_list(self, prefix_list_name, route_map_name):
+        """D1 owns the prefix list; D2's route-map entry is its only reference."""
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl(prefix_list_name, ["10.0.0.0/8"]))
+        reconcile_route_policy(
+            self.d2,
+            {
+                "route_maps": [
+                    {
+                        "name": route_map_name,
+                        "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": [prefix_list_name]}],
+                    }
+                ]
+            },
+        )
+
+    def test_standalone_replay_refuses_a_reference_deleted_at_the_capture_seam(self):
+        """Retention and its read dependencies share one capture, so nothing escapes between them."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin import route_policy_reconciler
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._seed_referenced_prefix_list("PL-SEAM-REF", "RM-SEAM-REF")
+        real_references = route_policy_reconciler._object_references
+        fired = []
+
+        def racing_references(obj, family):
+            captured = real_references(obj, family)
+            if not fired and family == "prefix_list":
+                fired.append(True)
+                self._drop_match_edge("PL-SEAM-REF")
+            return captured
+
+        empty = {"prefix_lists": []}
+        with patch.object(route_policy_reconciler, "_object_references", racing_references):
+            with self.assertRaisesRegex(IntentMutationProtocolError, "routemapentry_match_prefix_list"):
+                reconcile_route_policy(self.d1, empty)
+        self.assertTrue(fired, "the reference capture never ran")
+
+        # The retention branch never ran: D1 still reports the group as present.
+        self.assertTrue(
+            NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-SEAM-REF").device_present
+        )
+        self.assertTrue(PrefixList.objects.filter(name="PL-SEAM-REF").exists())
+
+        before = self._rp_revision(self.d1)
+        self.assertTrue(route_policy_reconcile_plan(self.d1, empty).changes_content)
+        reconcile_route_policy(self.d1, empty)
+        self.assertFalse(NSORoutePolicyState.objects.filter(object_name="PL-SEAM-REF").exists())
+        self.assertFalse(PrefixList.objects.filter(name="PL-SEAM-REF").exists())
+        self.assertGreater(self._rp_revision(self.d1), before)
+
+    def test_retention_enumerates_the_reference_rows_once(self):
+        """One enumeration decides retention and freezes it, so the two-query interval cannot return."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import RouteMapEntry
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        self._seed_referenced_prefix_list("PL-ONCE-REF", "RM-ONCE-REF")
+        through = RouteMapEntry.match_prefix_list.through._meta
+        enumeration = f'"{through.db_table}"."{through.get_field("prefixlist").attname}" ='
+
+        with CaptureQueriesContext(connection) as captured:
+            plan = route_policy_reconcile_plan(self.d1, {"prefix_lists": []})
+
+        self.assertFalse(plan.changes_content)
+        # Only the by-pk re-fetch that freezes the declared row may follow it.
+        enumerations = [query["sql"] for query in captured if enumeration in query["sql"]]
+        self.assertEqual(len(enumerations), 1, enumerations)
+
+    def test_standalone_replay_refuses_a_reference_removed_after_planning(self):
+        """The retention branch reads the rows referencing the root, so their loss must refuse."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._seed_referenced_prefix_list("PL-RACE-REF", "RM-RACE-REF")
+        empty = {"prefix_lists": []}
+        self.assertFalse(route_policy_reconcile_plan(self.d1, empty).changes_content)
+
+        # The frozen match edge refuses the cached retention branch.
+        with self.assertRaisesRegex(IntentMutationProtocolError, "routemapentry_match_prefix_list"):
+            self._race_standalone(self.d1, empty, lambda: self._drop_match_edge("PL-RACE-REF"))
+
+        # The retention branch never ran: D1 still reports the group as present.
+        d1_row = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RACE-REF")
+        self.assertTrue(d1_row.device_present)
+        self.assertTrue(PrefixList.objects.filter(name="PL-RACE-REF").exists())
+
+        before = self._rp_revision(self.d1)
+        plan = route_policy_reconcile_plan(self.d1, empty)
+        self.assertTrue(plan.changes_content)
+        reconcile_route_policy(self.d1, empty)
+        self.assertFalse(NSORoutePolicyState.objects.filter(object_name="PL-RACE-REF").exists())
+        self.assertFalse(PrefixList.objects.filter(name="PL-RACE-REF").exists())
+        self.assertGreater(self._rp_revision(self.d1), before)
+
     def test_rematerialize_repoints_ownership(self):
         """Operator picks the second device's version → the shared object is refilled from
         it, ownership flips, and the former owner becomes the conflict."""
@@ -2191,7 +2751,7 @@ class TestSharedObjectOwnership(TestCase):
 
         from netbox_nso_plugin import shared_object_ownership as ownership
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_rematerialize_plan
 
         self._mgmt(self.d1)
         self._mgmt(self.d2)
@@ -2199,6 +2759,17 @@ class TestSharedObjectOwnership(TestCase):
         reconcile_route_policy(self.d2, self._pl("PL-RE", ["10.0.0.0/8", "192.168.0.0/16"]))
 
         s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-RE")
+        plan = route_policy_rematerialize_plan(s2)
+        s2.refresh_from_db()
+        self.assertFalse(s2.is_materialized)
+        self.assertTrue(
+            {
+                "netbox_routing.prefixlistentry",
+                "netbox_routing.customprefix",
+                "netbox_nso_plugin.nsoroutepolicystate",
+            }
+            <= {write.model_label for write in plan.write_set}
+        )
         ownership.rematerialize(s2)
 
         pl = PrefixList.objects.get(name="PL-RE")
@@ -2476,6 +3047,27 @@ class TestRouteMapStructuredMaterialisation(TestCase):
                 ],
             }
         )
+        self.assertEqual(self._entry().call_policy.name, "SUB-POLICY")
+
+    def test_call_policy_can_reference_a_later_greenfield_route_map(self):
+        self._reconcile(
+            {
+                "route_maps": [
+                    {
+                        "name": "RM",
+                        "entries": [
+                            {
+                                "sequence": 10,
+                                "action": "permit",
+                                "match": '{"_junos_from_policy": ["SUB-POLICY"]}',
+                            }
+                        ],
+                    },
+                    {"name": "SUB-POLICY", "entries": []},
+                ]
+            }
+        )
+
         self.assertEqual(self._entry().call_policy.name, "SUB-POLICY")
 
     def test_timos_default_action_projected_to_route_map(self):

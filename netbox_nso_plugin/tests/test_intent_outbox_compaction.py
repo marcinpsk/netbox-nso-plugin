@@ -38,6 +38,7 @@ from ._outbox_case import (
     without_commit_drain,
     write_vlan_state,
 )
+from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 TRIPLE_A = {"vrf": "", "prefix": "203.0.113.0/28", "next_hop": "203.0.113.1"}
@@ -260,7 +261,7 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
 
         route = own_route(self.mgmt, "198.51.100.0/28", "198.51.100.1")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert [record["route_id"] for record in held.deletions] == [route.pk]
         self.clear_entries()
@@ -279,7 +280,7 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
 
         route = own_route(self.mgmt, "198.51.100.16/28", "198.51.100.2")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert held.deletions
         self.clear_entries()
@@ -312,7 +313,7 @@ class TestTheTwoClassesOfGrowth(_CompactionCase):
 
         route = own_route(self.mgmt, "198.51.100.48/28", "198.51.100.4")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert held.deletions, "the key now carries a live claim, so no drain may take it"
         self.clear_entries()
@@ -588,7 +589,7 @@ class TestCompactionRewritesInPlace(_CompactionCase):
 
         route = own_route(self.mgmt, "198.51.100.32/28", "198.51.100.3")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert [record["route_id"] for record in held.deletions] == [route.pk]
         self.clear_entries()

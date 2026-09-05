@@ -1881,6 +1881,59 @@ class TestNSOAcceptDeviceView(ViewTestBase):
         self.assertEqual(self.iface_state.status, "in_sync")
 
 
+class TestNSOInterfaceStateDeleteView(ViewTestBase):
+    """The plugin delete endpoint executes the overlay removal as an own write."""
+
+    def test_delete_uses_exact_writer_and_pushes_reduced_snapshot(self):
+        mirror_update(self.mgmt, adapter_device_id=42)
+        content_bulk_update(self.iface_state, status="accepted", accepted_at=datetime.now(UTC))
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", args=[self.iface_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(url, {"confirm": "true"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
+        mock_put.assert_called_once()
+        self.assertEqual(mock_put.call_args.args[1], [])
+
+    def test_delete_foreign_row_uses_mirror_writer_without_push(self):
+        mirror_update(self.mgmt, adapter_device_id=42)
+        content_bulk_update(self.iface_state, status="imported", accepted_at=None)
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", args=[self.iface_state.pk])
+
+        with patch("netbox_nso_plugin.adapter_client.put_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(url, {"confirm": "true"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
+        mock_put.assert_not_called()
+
+    def test_confirmed_bulk_delete_reports_an_invalid_primary_key(self):
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate_bulk_delete"),
+            {"pk": ["not-a-primary-key"], "_confirm": "Confirm", "confirm": "on"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("pk", response.context["form"].errors)
+        self.assertTrue(NSOInterfaceState.objects.filter(pk=self.iface_state.pk).exists())
+
+    def test_delete_rejects_a_protocol_relative_return_url(self):
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", args=[self.iface_state.pk]),
+            {"confirm": "true", "return_url": "//attacker.invalid/redirect"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.url,
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate_list"),
+        )
+
+
 class TestNSOInterfaceEditFieldView(ViewTestBase):
     """Tests for NSOInterfaceEditFieldView (inline edit of description/enabled from the tab)."""
 
@@ -1909,6 +1962,49 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         self.assertEqual(self.iface_state.status, "accepted")  # Decision-G: NetBox now owns it
         self.assertIsNotNone(self.iface_state.accepted_at)
         mock_put.assert_called()
+
+    def test_derived_description_edit_rejects_an_unplanned_rendered_value(self):
+        from dcim.models import Cable, CableTermination
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+
+        self._make_managed()
+        interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/1",
+            type="1000base-t",
+        )
+        state = NSOInterfaceState.objects.create(
+            interface=interface,
+            attribute="description",
+            status="changed",
+            nso_value="device description",
+        )
+        peer = Device.objects.create(
+            name="view-peer-01",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        peer_interface = Interface.objects.create(
+            device=peer,
+            name="GigabitEthernet0/2",
+            type="1000base-t",
+        )
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=interface)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=peer_interface)
+        NSODerivedIntentTemplate.objects.create(
+            sentinel="[auto]",
+            template="[auto] to {peer_host}:{peer_iface}",
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[state.pk])
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
+            self.client.post(url, {"value": "[auto]"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        interface.refresh_from_db()
+        self.assertEqual(interface.description, "")
 
     def test_toggle_enabled_flips_and_owns(self):
         """Inline toggle of enabled flips the interface and owns the 'enabled' attribute."""
@@ -2585,8 +2681,7 @@ class TestDeviceNSOTabView(ViewTestBase):
             ("netbox_nso_plugin.template_content._upsert_interface_states", {}),
             ("netbox_nso_plugin.template_content._reconcile_snmp_config", {}),
             ("netbox_nso_plugin.template_content._reconcile_static_routes", []),
-            ("netbox_nso_plugin.template_content._reconcile_isis_interfaces", []),
-            ("netbox_nso_plugin.template_content._reconcile_isis_process", []),
+            ("netbox_nso_plugin.isis_reconciler.reconcile_isis", {"interfaces": [], "processes": []}),
             ("netbox_nso_plugin.template_content._reconcile_ospf", {"instances": [], "interfaces": []}),
             ("netbox_nso_plugin.route_policy_reconciler.reconcile_route_policy", []),
             ("netbox_nso_plugin.redistribution_reconciler.reconcile_redistribution", []),
@@ -3687,8 +3782,14 @@ class TestInterfaceIntentDelivery(ViewTestBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             with transaction.atomic():
+                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
                 self.iface_state.status = "accepted"
-                self.iface_state.save(update_fields={"status"})
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(self.iface_state, update_fields=("status",)),),
+                )
+                with renderer_writes(plan) as writer:
+                    writer.save(self.iface_state, update_fields=("status",))
 
         assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists()
         assert session.request.called, "the test did not reach the transport failure"
@@ -3928,6 +4029,54 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.port, 1514)
         self.assertEqual(row.status, "accepted")
 
+    def test_full_logging_level_edit_repends_a_deploying_row(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = NSOLoggingLevelState.objects.create(
+            management=self.mgmt,
+            console_severity="WARNING",
+            status="deploying",
+            apply_attempt_id=uuid4(),
+        )
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsologginglevelstate_edit", kwargs={"pk": row.pk}),
+            {
+                "console_severity": "INFORMATIONAL",
+                "monitor_severity": "",
+                "module_severity": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302, response.content)
+        row.refresh_from_db()
+        self.assertEqual(row.console_severity, "INFORMATIONAL")
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+
+    def test_full_logging_level_edit_takes_ownership_of_an_imported_row(self):
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = NSOLoggingLevelState.objects.create(
+            management=self.mgmt,
+            console_severity="WARNING",
+            status="imported",
+        )
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsologginglevelstate_edit", kwargs={"pk": row.pk}),
+            {
+                "console_severity": "INFORMATIONAL",
+                "monitor_severity": "",
+                "module_severity": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302, response.content)
+        row.refresh_from_db()
+        self.assertEqual(row.console_severity, "INFORMATIONAL")
+        self.assertEqual(row.status, "accepted")
+
     def test_logging_host_rejects_port_outside_writer_uint16(self):
         from netbox_nso_plugin.models import NSOLoggingHostState
 
@@ -4017,7 +4166,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.address, "198.51.100.2", "the colliding edit must not be persisted")
 
     def test_edit_mtu_takes_ownership_and_adopts_native_l2(self):
-        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOOwnershipManifest
 
         row = NSOInterfaceMtuState.objects.create(
             management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
@@ -4030,6 +4179,15 @@ class TestOverlayFieldEditView(ViewTestBase):
         # Same side effect as the Accept view: the native NetBox interface MTU follows.
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.mtu, 9000)
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="interface_mtu",
+                native_model_label="dcim.interface",
+                native_key={"device_id": self.device.pk, "name": self.interface.name},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_mtu_keeps_owned_status(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState
@@ -4046,7 +4204,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_bfd_updates_overlay_and_native_profile(self):
         from netbox_routing.models import BFDInterface, BFDProfile
 
-        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentRevision
 
         old_profile = BFDProfile.objects.create(
             name="bfd-inline-old",
@@ -4086,6 +4245,12 @@ class TestOverlayFieldEditView(ViewTestBase):
             (native.bfd_profile.min_tx_int, native.bfd_profile.min_rx_int, native.bfd_profile.multiplier),
             (500, 600, 5),
         )
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bfd")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("bfd", self.device.pk, self.mgmt.adapter_device_id).payload),
+        )
 
     def test_edit_bfd_rejects_out_of_range_timer_without_writing(self):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
@@ -4110,7 +4275,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_ospf_interface_updates_overlay_and_native_object(self):
         from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
-        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState, NSOOwnershipManifest
 
         instance = OSPFInstance.objects.create(
             device=self.device,
@@ -4158,6 +4323,15 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         self.assertEqual(native.area.area_id, "0.0.0.1")
         self.assertEqual((native.network_type, native.cost, native.passive), ("point-to-point", 25, True))
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="ospf",
+                native_model_label="netbox_routing.ospfinterface",
+                native_key={"interface_id": self.interface.pk},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_ospf_interface_rejects_invalid_config_without_writing(self):
         from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
@@ -4206,7 +4380,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_ospf_instance_router_id_updates_native_object(self):
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.models import NSOOSPFInstanceState, NSOOwnershipManifest
 
         native = OSPFInstance.objects.create(
             device=self.device,
@@ -4233,11 +4407,20 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.router_id, "192.0.2.10")
         self.assertEqual(str(native.router_id), "192.0.2.10")
         self.assertEqual(row.status, "accepted")
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="ospf",
+                native_model_label="netbox_routing.ospfinstance",
+                native_key={"device_id": self.device.pk, "process_id": "9"},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_isis_interface_updates_overlay_and_native_object(self):
         from netbox_routing.models import ISISInstance, ISISInterface
 
-        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.models import NSOISISInterfaceState, NSOOwnershipManifest
 
         instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
         native = ISISInterface.objects.create(
@@ -4292,6 +4475,15 @@ class TestOverlayFieldEditView(ViewTestBase):
             ),
             ("level-2-only", "point-to-point", 25, True, True, True, "node"),
         )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="isis",
+                native_model_label="netbox_routing.isisinterface",
+                native_key={"interface_id": self.interface.pk, "address_family": "ipv4"},
+                ownership_state="owned",
+            ).exists()
+        )
         self.assertEqual(
             (
                 native.circuit_type,
@@ -4308,7 +4500,7 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_isis_instance_updates_safe_core_fields(self):
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.models import NSOISISInstanceState
+        from netbox_nso_plugin.models import NSOISISInstanceState, NSOOwnershipManifest
 
         native = ISISInstance.objects.create(
             device=self.device,
@@ -4359,6 +4551,15 @@ class TestOverlayFieldEditView(ViewTestBase):
             expected,
         )
         self.assertEqual(row.status, "accepted")
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="isis",
+                native_model_label="netbox_routing.isisinstance",
+                native_key={"device_id": self.device.pk, "process_tag": "CORE"},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_edit_isis_rejects_invalid_net_and_inconsistent_frr(self):
         from netbox_routing.models import ISISInstance, ISISInterface
@@ -5141,6 +5342,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(state.status, "imported")
 
     def test_edit_route_map_name_updates_shared_object_overlays_and_dependent_intent(self):
+        from copy import copy
+
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
 
@@ -5150,6 +5353,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             NSORoutePolicyObjectClass,
             NSORoutePolicyState,
         )
+        from netbox_nso_plugin.views import _route_map_name_edit_plan
 
         route_map = RouteMap.objects.create(name="RM-INLINE-OLD")
         route_map_ct = ContentType.objects.get_for_model(RouteMap)
@@ -5192,6 +5396,27 @@ class TestOverlayFieldEditView(ViewTestBase):
         )
         mirror_update(self.mgmt, adapter_device_id=321)
 
+        candidate = copy(row)
+        candidate.object_name = "RM-INLINE-NEW"
+        plan = _route_map_name_edit_plan(candidate, route_map.name)
+
+        route_map.refresh_from_db()
+        row.refresh_from_db()
+        policy_class.refresh_from_db()
+        self.assertEqual((route_map.name, row.object_name, policy_class.object_name), ("RM-INLINE-OLD",) * 3)
+        self.assertEqual(
+            {write.model_label for write in plan.write_set},
+            {
+                "netbox_routing.routemap",
+                "netbox_nso_plugin.nsoroutepolicystate",
+                "netbox_nso_plugin.nsoroutepolicyobjectclass",
+            },
+        )
+        self.assertTrue(
+            {(self.device.pk, "route_policy"), (self.device.pk, "ospf")} <= set(plan.content_keys),
+            plan.content_keys,
+        )
+
         with (
             patch("netbox_nso_plugin.adapter_client.put_route_policy_intent") as put_policy,
             patch("netbox_nso_plugin.adapter_client.put_ospf_intent") as put_ospf,
@@ -5219,7 +5444,6 @@ class TestOverlayFieldEditView(ViewTestBase):
         from netbox_routing.models import RouteMap
 
         from netbox_nso_plugin import status_machine as sm
-        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import _save_route_map_name_edit
@@ -5242,13 +5466,10 @@ class TestOverlayFieldEditView(ViewTestBase):
             object_id=route_map.pk,
             status="imported",
         )
-        footprint = MutationFootprint.merge(footprint_for_instance(row), footprint_for_instance(attached))
-        with without_commit_drain(), intent_transaction(footprint):
-            for promoted in (row, attached):
-                type(promoted).objects.filter(pk=promoted.pk).update(
-                    status="deploying",
-                    apply_attempt_id=uuid4(),
-                )
+        content_bulk_update(row, status="accepted")
+        content_bulk_update(attached, status="accepted")
+        mirror_update(row, status="deploying", apply_attempt_id=uuid4())
+        mirror_update(attached, status="deploying", apply_attempt_id=uuid4())
         row.refresh_from_db()
         attached.refresh_from_db()
         self.assertEqual(row.status, "deploying")
@@ -5270,12 +5491,13 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.status, "accepted")
 
-    def test_edit_route_map_name_rechecks_fallback_references_after_locking(self):
+    def test_edit_route_map_name_rejects_a_stale_fallback_reference(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import intent_transaction, offline_mutation
+        from netbox_nso_plugin.intent_state import _intent_transaction, offline_mutation
         from netbox_nso_plugin.models import NSORedistributionState, NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import _save_route_map_name_edit
 
@@ -5296,20 +5518,25 @@ class TestOverlayFieldEditView(ViewTestBase):
             status="accepted",
         )
 
-        def acquire_after_competing_edit(footprint):
+        def acquire_after_competing_edit(footprint, **kwargs):
             with offline_mutation():
                 NSORedistributionState.objects.filter(pk=fallback.pk).update(route_map="RM-RACE-OTHER")
-            return intent_transaction(footprint)
+            return _intent_transaction(footprint, **kwargs)
 
         state.object_name = "RM-RACE-NEW"
         with (
             suppress_intent_push(),
-            patch("netbox_nso_plugin.intent_state.intent_transaction", side_effect=acquire_after_competing_edit),
+            patch("netbox_nso_plugin.renderer_writer._intent_transaction", side_effect=acquire_after_competing_edit),
         ):
-            _save_route_map_name_edit(state, route_map.name)
+            with self.assertRaises(IntentPlanStaleError):
+                _save_route_map_name_edit(state, route_map.name)
 
         fallback.refresh_from_db()
+        route_map.refresh_from_db()
+        state.refresh_from_db()
         self.assertEqual(fallback.route_map, "RM-RACE-OTHER")
+        self.assertEqual(route_map.name, "RM-RACE-OLD")
+        self.assertEqual(state.object_name, "RM-RACE-OLD")
 
     def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
         from django.contrib.contenttypes.models import ContentType
@@ -6952,21 +7179,56 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         return applied, [str(message) for message in get_messages(response.wsgi_request)]
 
     def _own_a_community(self):
-        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        import copy
 
-        with without_commit_drain(), transaction.atomic():
-            return NSOSnmpCommunityState.objects.create(
-                management=self.mgmt,
-                community_hash="ab12cd34ef56ab78",
-                access="RO",
-                status="accepted",
-                vault_ref="test/snmp/community",
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        community = NSOSnmpCommunityState(
+            management=self.mgmt,
+            community_hash="ab12cd34ef56ab78",
+            access="RO",
+            status="imported",
+            vault_ref="secret/snmp/community#community",
+        )
+        create_plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    community,
+                    force_insert=True,
+                    natural_key=("management", "community_hash"),
+                ),
             )
+        )
+        with renderer_mirror_writes(create_plan) as writer:
+            writer.save(community, force_insert=True)
+
+        acquired = copy.copy(community)
+        acquired.status = "accepted"
+        acquired.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        accept_plan = RendererMutationPlan.build(
+            saves=(planned_save(acquired, update_fields=fields),),
+            planned_at=acquired.accepted_at,
+        )
+        with without_commit_drain(), renderer_writes(accept_plan) as writer:
+            writer.save(acquired, update_fields=fields)
+        return acquired
 
     def _own_then_delete_a_community(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
         community = self._own_a_community()
-        with without_commit_drain(), transaction.atomic():
-            community.delete()
+        plan = RendererMutationPlan.build(deletes=(planned_delete(community),))
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            writer.delete(community)
 
     def test_a_pending_snmp_deletion_stops_the_apply(self):
         self._own_then_delete_a_community()

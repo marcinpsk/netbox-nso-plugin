@@ -235,6 +235,34 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with without_commit_drain(), transaction.atomic():
             return Interface.objects.create(**values)
 
+    @staticmethod
+    def _rename_interface(interface, name):
+        """Rename one interface through its exact native renderer plan."""
+        import copy
+
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        current = interface
+        for attempt in range(2):
+            candidate = copy.copy(current)
+            candidate.name = name
+            plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("name",)),))
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            try:
+                with mutation as writer:
+                    writer.save(candidate, update_fields=("name",))
+                return
+            except IntentPlanStaleError:
+                if attempt:
+                    raise
+                current = type(interface).objects.get(pk=interface.pk)
+
     def _post(self, adapter):
         config, session = adapter.patches()
         url = reverse(
@@ -1189,8 +1217,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     raise AssertionError("the native writer did not lock the interface")
                 with without_commit_drain(), transaction.atomic():
                     current = Interface.objects.get(pk=interface.pk)
-                    current.name = "Ethernet9.390"
-                    current.save(update_fields=["name"])
+                    self._rename_interface(current, "Ethernet9.390")
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -1254,7 +1281,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 update_source=interface,
                 enabled=True,
             )
-        unlinked_bgp_state = NSOBGPPeerState.objects.get(bgp_peer=peer)
+            unlinked_bgp_state = NSOBGPPeerState.objects.create(
+                management=self.mgmt,
+                bgp_peer=peer,
+                asn_str=str(local_as.asn),
+                peer_address_str=str(peer_address.address),
+                status="accepted",
+            )
         content_update(unlinked_bgp_state, bgp_peer=None)
         rename_prepared = threading.Event()
         release_rename = threading.Event()
@@ -1272,8 +1305,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             try:
                 with without_commit_drain(), transaction.atomic():
                     current = Interface.objects.get(pk=interface.pk)
-                    current.name = "Ethernet9.396"
-                    current.save(update_fields=["name"])
+                    self._rename_interface(current, "Ethernet9.396")
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -1317,7 +1349,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         ip_creator.start()
         bgp_creator.start()
         try:
-            self.assertTrue(rename_prepared.wait(10), "the rename did not reach its dependency fence")
+            self.assertTrue(rename_prepared.wait(10), f"the rename did not reach its dependency fence: {errors!r}")
             ip_created_before_rename = ip_dependency_created.wait(1)
             bgp_created_before_rename = bgp_dependency_created.wait(1)
         finally:
@@ -1618,6 +1650,58 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             self.assertIn(("vlan", str(self.vlan_state.vlan_id)), footprint.shared_keys)
             self.assertIn(
                 ("ipam.vlan", self.vlan_state.vlan_id), {(row.model_label, row.pk) for row in footprint.source_rows}
+            )
+
+    def test_native_vlan_plans_lock_a_payload_vlan_without_an_overlay(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+        from netbox_nso_plugin.vlan_reconciler import (
+            _device_vlan_group,
+            switchport_reconcile_plan,
+            vlan_reconcile_plan,
+        )
+
+        vid = 3559
+        with without_commit_drain(), transaction.atomic():
+            vlan = VLAN.objects.create(
+                group=_device_vlan_group(self.device),
+                vid=vid,
+                name="payload-only",
+            )
+        interface = self._create_interface(device=self.device, name="Ethernet3559", type="1000base-t")
+        self.assertFalse(NSOVLANState.objects.filter(management=self.mgmt, vlan=vlan).exists())
+
+        plans = [
+            vlan_reconcile_plan(
+                self.device,
+                {"vlans": [{"vlan_id": vid, "name": vlan.name}]},
+            ),
+            svi_reconcile_plan(
+                self.device,
+                {"interfaces": [{"interface_name": f"Vlan{vid}", "vlan_id": vid, "type": "svi"}]},
+            ),
+            switchport_reconcile_plan(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": interface.name,
+                            "mode": "access",
+                            "untagged_vlan": vid,
+                            "tagged_vlans": [],
+                        }
+                    ]
+                },
+            ),
+        ]
+
+        for plan in plans:
+            self.assertIn(("vlan", str(vlan.pk)), plan.lock_footprint.shared_keys)
+            self.assertIn(
+                ("ipam.vlan", vlan.pk),
+                {(row.model_label, row.pk) for row in plan.lock_footprint.source_rows},
             )
 
     def test_advisory_lock_helpers_use_the_two_declared_transaction_namespaces(self):
@@ -2541,8 +2625,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 update_source=shared,
                 enabled=True,
             )
-        bgp_state = NSOBGPPeerState.objects.get(bgp_peer=peer)
-        mirror_update(bgp_state, status="in_sync")
+            bgp_state = NSOBGPPeerState.objects.create(
+                management=self.mgmt,
+                bgp_peer=peer,
+                asn_str=str(local_as.asn),
+                peer_address_str=str(peer_address.address),
+                status="in_sync",
+            )
         with without_commit_drain(), transaction.atomic():
             states = [
                 NSOSVIState.objects.create(
@@ -2619,12 +2708,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             ["deploying"] * 4 + ["in_sync"] * 7,
         )
         with without_commit_drain(), transaction.atomic():
-            shared.name = "Ethernet9.41"
-            shared.save(update_fields=["name"])
+            self._rename_interface(shared, "Ethernet9.41")
 
         self.assertEqual(
             [type(state).objects.get(pk=state.pk).status for state in states],
-            ["accepted"] * 11,
+            ["accepted"] * 4 + ["in_sync"] * 7,
         )
 
     def test_overlay_intent_edit_requires_an_atomic_transaction_before_row_locking(self):
@@ -2707,14 +2795,13 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as apply_switchport,
             transaction.atomic(),
         ):
-            interface.name = "Ethernet9.420"
-            interface.save(update_fields=["name"])
+            self._rename_interface(interface, "Ethernet9.420")
 
         apply_lag.assert_not_called()
         apply_switchport.assert_not_called()
         lacp.refresh_from_db()
         switchport.refresh_from_db()
-        self.assertEqual((lacp.status, switchport.status), ("accepted", "accepted"))
+        self.assertEqual((lacp.status, switchport.status), ("in_sync", "in_sync"))
 
     def test_a_vlan_id_change_keeps_an_import_placeholder_out_of_the_wire_payload(self):
         from netbox_nso_plugin import delivery

@@ -16,7 +16,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
-from netbox_nso_plugin.template_content import _reconcile_static_routes
+from netbox_nso_plugin.template_content import _reconcile_static_routes, static_route_reconcile_plan
 
 TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "routes"}
 ROUTE_REQUIRED_KEYS = {"vrf", "prefix", "next_hop"}
@@ -74,3 +74,10 @@ class TestStaticRoutesContractConsumer(TestCase):
         self.assertIsInstance(result, list)
         for row in NSOStaticRouteState.objects.filter(management=self.mgmt):
             self.assertIn(row.nso_prefix, {"10.0.0.0/8", "0.0.0.0/0"})
+
+    def test_reconcile_preflight_is_an_exact_renderer_plan(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        plan = static_route_reconcile_plan(self.device, CONTRACT_PAYLOAD)
+
+        self.assertIsInstance(plan, RendererMutationPlan)

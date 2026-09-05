@@ -229,17 +229,18 @@ class TestIsisCompoundGate(TestCase):
 
         with (
             patch("netbox_nso_plugin.adapter_client.get_isis_interfaces", return_value=doc),
-            patch("netbox_nso_plugin.template_content._reconcile_isis_interfaces", return_value=[]) as m_if,
-            patch("netbox_nso_plugin.template_content._reconcile_isis_process", return_value=[]) as m_proc,
+            patch(
+                "netbox_nso_plugin.isis_reconciler.reconcile_isis",
+                return_value={"interfaces": [], "processes": []},
+            ) as reconcile,
         ):
             ctx = reconcile_category(self.device, self.mgmt, "isis")
-        return ctx, m_if, m_proc
+        return ctx, reconcile
 
     def test_admit_runs_both_bodies_exactly_once(self):
         doc = {"interfaces": [], "processes": [], "read_state": _rs()}
-        ctx, m_if, m_proc = self._reconcile(doc)
-        self.assertEqual(m_if.call_count, 1)
-        self.assertEqual(m_proc.call_count, 1)
+        ctx, reconcile = self._reconcile(doc)
+        self.assertEqual(reconcile.call_count, 1)
         self.assertEqual(ctx["_gate"]["isis"], "ran")
 
     def test_skip_runs_zero_bodies(self):
@@ -248,10 +249,35 @@ class TestIsisCompoundGate(TestCase):
             "processes": [],
             "read_state": _rs(outcome="unavailable", reason="not_ready", result=None, succeeded=None),
         }
-        ctx, m_if, m_proc = self._reconcile(doc)
-        self.assertEqual(m_if.call_count, 0)
-        self.assertEqual(m_proc.call_count, 0)
+        ctx, reconcile = self._reconcile(doc)
+        self.assertEqual(reconcile.call_count, 0)
         self.assertEqual(ctx["_gate"]["isis"], "skipped_unavailable")
+
+    def test_category_reconcile_fault_marks_unowned_rows_error(self):
+        from netbox_nso_plugin.models import NSOISISInstanceState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        state = NSOISISInstanceState.objects.create(
+            management=self.mgmt,
+            process_tag="CORE",
+            status="imported",
+        )
+        doc = {"interfaces": [], "processes": [], "read_state": _rs()}
+
+        def fail_isis(*_args):
+            raise RuntimeError("broken IS-IS")
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_isis_interfaces", return_value=doc),
+            patch("netbox_nso_plugin.isis_reconciler.reconcile_isis", new=fail_isis),
+        ):
+            ctx = reconcile_category(self.device, self.mgmt, "isis")
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "error")
+        self.assertEqual(ctx["_gate"]["isis"], "skipped_unavailable")
+        self.assertEqual(ctx["isis_interfaces"], [])
+        self.assertEqual(ctx["isis_processes"], [])
 
 
 class TestRealReconcilerGateFootprints(TestCase):
@@ -392,11 +418,13 @@ class TestRealReconcilerGateFootprints(TestCase):
             "routers": [
                 {
                     "asn": "64512",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
                             "address_families": ["ipv4-unicast"],
                             "peers": [peer],
+                            "peer_groups": [],
                         }
                     ],
                 }
@@ -409,43 +437,148 @@ class TestOptionalRoutingDependencyPlans(TestCase):
     """Preflight keeps the reconcilers' optional dependency boundary."""
 
     def test_missing_netbox_routing_returns_empty_plans(self):
+        from django.apps import apps
+
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
         from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan
+        from netbox_nso_plugin.intent_state import MutationFootprint
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
-        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         device, _management = _make("missing-routing")
-        empty_plan = ReconcileMutationPlan(MutationFootprint())
+        Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
         bgp_payload = {
             "routers": [
                 {
                     "asn": "64512",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
-                            "peers": [{"peer_address": "198.18.0.1", "remote_as": "64513"}],
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [
+                                {
+                                    "peer_address": "198.18.0.1",
+                                    "remote_as": "64513",
+                                    "enabled": True,
+                                    "address_families": [],
+                                }
+                            ],
+                            "peer_groups": [],
                         }
                     ],
                 }
             ]
         }
         planners = (
+            (
+                bfd_reconcile_plan,
+                [
+                    {
+                        "interface_name": "Ethernet1",
+                        "min_tx": 300,
+                        "min_rx": 300,
+                        "multiplier": 3,
+                    }
+                ],
+            ),
             (bgp_reconcile_plan, bgp_payload),
             (route_policy_reconcile_plan, {"prefix_lists": [{"name": "PL", "entries": []}]}),
             (
-                _static_route_reconcile_plan,
+                static_route_reconcile_plan,
                 {"routes": [{"prefix": "198.18.0.0/15", "next_hop": "198.18.0.1", "metric": 1}]},
             ),
         )
 
-        for planner, payload in planners:
-            with self.subTest(control=planner.__name__):
-                self.assertNotEqual(planner(device, payload), empty_plan)
+        config = apps.get_app_config("netbox_nso_plugin")
+        with patch.object(config, "_static_route_auto_create", True):
+            for planner, payload in planners:
+                with self.subTest(control=planner.__name__):
+                    self.assertTrue(planner(device, payload).write_set)
 
         with patch.dict(sys.modules, {"netbox_routing.models": None}):
-            for planner, payload in planners:
+            from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan
+            from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
+            from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+            missing_dependency_planners = (
+                *planners,
+                (isis_reconcile_plan, {"processes": [], "interfaces": []}),
+                (ospf_reconcile_plan, {"instances": [], "interfaces": []}),
+                (redistribution_reconcile_plan, {"entries": []}),
+            )
+            for planner, payload in missing_dependency_planners:
                 with self.subTest(planner=planner.__name__):
-                    self.assertEqual(planner(device, payload), empty_plan)
+                    plan = planner(device, payload)
+                    self.assertIsInstance(plan, RendererMutationPlan)
+                    self.assertEqual(plan.write_set, ())
+                    self.assertEqual(plan.lock_footprint, MutationFootprint())
+                    self.assertFalse(plan.changes_content)
+
+    def test_missing_netbox_routing_returns_an_empty_bgp_reconcile_result(self):
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+
+        device, _management = _make("missing-routing-bgp-entry")
+
+        with patch.dict(sys.modules, {"netbox_routing.models": None}):
+            result = _reconcile_bgp_config(device, {"routers": []})
+
+        self.assertEqual(result, [])
+
+    def test_bgp_plan_propagates_unrelated_import_failures(self):
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+
+        device, _management = _make("bgp-import-failure")
+        failures = (
+            ImportError("planner import failed"),
+            ModuleNotFoundError("No module named 'planner_dependency'", name="planner_dependency"),
+        )
+
+        for failure in failures:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                patch(
+                    "netbox_nso_plugin.bgp_reconciler._bgp_reconcile_operations",
+                    side_effect=failure,
+                ),
+                self.assertRaises(type(failure)),
+            ):
+                bgp_reconcile_plan(device, {"routers": []})
+
+    def test_missing_netbox_routing_skips_reconcile_entry_points(self):
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        device, _management = _make("missing-routing-entry")
+        entry_points = (
+            (
+                reconcile_isis,
+                {"processes": [], "interfaces": []},
+                {"processes": [], "interfaces": []},
+                "netbox_nso_plugin.isis_reconciler",
+            ),
+            (
+                reconcile_ospf,
+                {"instances": [], "interfaces": []},
+                {"instances": [], "interfaces": []},
+                "netbox_nso_plugin.ospf_reconciler",
+            ),
+            (
+                reconcile_redistribution,
+                {"entries": []},
+                [],
+                "netbox_nso_plugin.redistribution_reconciler",
+            ),
+        )
+
+        with patch.dict(sys.modules, {"netbox_routing.models": None}):
+            for reconciler, payload, expected, logger_name in entry_points:
+                with self.subTest(reconciler=reconciler.__name__):
+                    with self.assertLogs(logger_name, level="WARNING") as captured:
+                        self.assertEqual(reconciler(device, payload), expected)
+                    self.assertIn("netbox_routing not installed", captured.output[0])
 
 
 #: every family fetcher reconcile_device consumes, with a minimal doc shape.

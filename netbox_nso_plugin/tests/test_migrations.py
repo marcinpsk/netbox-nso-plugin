@@ -25,6 +25,8 @@ OUTBOX = "0018_intent_outbox"
 PRE_OUTBOX = "0017_settlement_cursor_epoch"
 DEPLOYMENT_CONTROL = "0019_intent_deployment_control"
 APPLY_IDENTITY = "0020_nsoapplyattempt_nsointentrevision_and_more"
+PRE_BGP_MERGE_BASE_RESET = "0023_outbox_contribution_kind"
+BGP_MERGE_BASE_RESET = "0024_reset_bgp_merge_bases"
 
 
 class TestMigrationGraph(SimpleTestCase):
@@ -250,3 +252,98 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(single.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
         self.assertEqual(peer.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
         self.assertEqual(point_to_point.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
+
+
+class TestBGPMergeBaseMigration(_CascadeFlushMixin, TransactionTestCase):
+    def _migrate(self, target):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate([(APP, target)])
+
+    def _migrate_to_leaves(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes(APP))
+
+    def test_legacy_bgp_merge_bases_bootstrap_drift_as_changed(self):
+        import copy
+
+        from netbox_nso_plugin.bgp_reconciler import (
+            _PEER_FIELDS,
+            _PEER_FK_FIELDS,
+            _af_object_content,
+            _content_hash,
+            _drop_unset_update_source,
+            _reconcile_bgp_config,
+        )
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPPeerTemplateState
+
+        from ._outbox_case import make_managed, mirror_update
+
+        device, management = make_managed("bgp-base-migration", 1627)
+        payload = {
+            "device_id": device.pk,
+            "routers": [
+                {
+                    "asn": "64512",
+                    "router_id": None,
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [
+                                {
+                                    "peer_address": "198.18.1.1",
+                                    "enabled": True,
+                                    "remote_as": "64513",
+                                    "ttl": 1,
+                                    "address_families": [{"af": "ipv4-unicast", "enabled": True}],
+                                }
+                            ],
+                            "peer_groups": [
+                                {
+                                    "name": "EDGE",
+                                    "remote_as": "64513",
+                                    "address_families": [{"af": "ipv4-unicast", "enabled": True}],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        _reconcile_bgp_config(device, payload)
+        peer_state = NSOBGPPeerState.objects.get(management=management)
+        template_state = NSOBGPPeerTemplateState.objects.get(management=management)
+        peer = peer_state.bgp_peer
+        legacy_peer_content = {
+            field: getattr(peer, field).pk
+            if field in _PEER_FK_FIELDS and getattr(peer, field) is not None
+            else getattr(peer, field)
+            for field in _PEER_FIELDS
+        }
+        _drop_unset_update_source(legacy_peer_content)
+        legacy_peer_content["afs"] = _af_object_content(peer)
+        legacy_template_content = {
+            "remote_as": template_state.template.remote_as_id,
+            "afs": _af_object_content(template_state.template),
+        }
+        mirror_update(peer_state, device_base_hash=_content_hash(legacy_peer_content))
+        mirror_update(template_state, device_base_hash=_content_hash(legacy_template_content))
+
+        self.addCleanup(self._migrate_to_leaves)
+        self._migrate(PRE_BGP_MERGE_BASE_RESET)
+        self._migrate(BGP_MERGE_BASE_RESET)
+        template_state.refresh_from_db()
+        template_base_was_reset = template_state.device_base_hash == ""
+
+        drifted = copy.deepcopy(payload)
+        drifted["routers"][0]["scopes"][0]["peers"][0]["ttl"] = 2
+        result = _reconcile_bgp_config(device, drifted)
+
+        self.assertEqual(result[0].status, "changed")
+        self.assertTrue(template_base_was_reset)

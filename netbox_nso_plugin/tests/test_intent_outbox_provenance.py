@@ -21,6 +21,7 @@ from django.db import connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 
 from ._outbox_case import marking_mode, without_commit_drain
+from ._static_route_case import _assign_and_accept, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 PUT_STATIC = "netbox_nso_plugin.adapter_client.put_static_route_intent"
@@ -179,7 +180,7 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with without_commit_drain():
             try:
                 with transaction.atomic():
-                    route.devices.add(self.device)
+                    _assign_and_accept(route, self.device)
                     raise _Abort
             except _Abort:
                 pass
@@ -187,7 +188,7 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         assert _entries(self.device, "static_route") == []
 
         with without_commit_drain(), transaction.atomic():
-            route.devices.add(self.device)
+            _assign_and_accept(route, self.device)
 
         pending = [e for e in _entries(self.device, "static_route") if e.consumed_by_push_seq is None]
         assert pending, "the fresh edit must leave the drain a durable record of its work"
@@ -206,11 +207,11 @@ class TestOutboxRollback(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with without_commit_drain(), transaction.atomic():
             try:
                 with transaction.atomic():  # a savepoint Django rolls back on its own
-                    route_r.devices.remove(self.device)
+                    _unassign_and_retire(route_r, self.device)
                     raise _Abort
             except _Abort:
                 pass
-            route_s.devices.remove(self.device)
+            _unassign_and_retire(route_s, self.device)
 
         folded = fold_transitions(_transitions(self.device, "static_route"))
         assert set(folded.queued) == {route_s.pk}
@@ -301,7 +302,7 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
 
             with marking_mode("static_route", mode):
                 with without_commit_drain():
-                    route.devices.remove(self.device)
+                    _unassign_and_retire(route, self.device)
 
             recorded = [t for t in _transitions(self.device, "static_route") if t["op"] == "delete"]
             assert [(t["op"], t["route_id"]) for t in recorded] == [("delete", route.pk)], f"{mode}: {recorded}"
@@ -317,7 +318,7 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         NSOIntentOutboxEntry.objects.all().delete()
 
         with marking_mode("static_route", MARKING_QUERY_FLAG):
-            params = self._recorded_params(lambda: route.devices.remove(self.device))
+            params = self._recorded_params(lambda: _unassign_and_retire(route, self.device))
 
         assert any(p.get("delete_origin") == "true" for p in params), f"saw {params}"
 
@@ -391,7 +392,7 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         route = _own_route(self.mgmt, "203.0.113.192/28", "203.0.113.6")
         NSOIntentOutboxEntry.objects.all().delete()
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         assert _entries(self.device, "static_route"), "the deletion must have been recorded"
         return route
 

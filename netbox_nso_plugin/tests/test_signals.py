@@ -10,6 +10,7 @@ instances plus a sys.modules-injected fake `models` module, which bypassed exact
 queries — e.g. the OWNED-states filter — and so could not catch a regression in them.)
 """
 
+import copy
 import threading
 import unittest
 from types import SimpleNamespace
@@ -64,11 +65,22 @@ def _bulk_create_management_without_signals(rows):
 
 
 def _invoke_push_intent_on_accept(state):
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
-    from netbox_nso_plugin.signals import push_intent_on_accept
+    from datetime import timedelta
 
-    with intent_transaction(footprint_for_instance(state)):
-        push_intent_on_accept(sender=type(state), instance=state)
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
+
+    candidate = copy.copy(state)
+    candidate.accepted_at = (candidate.accepted_at or timezone.now()) + timedelta(microseconds=1)
+    fields = ("accepted_at",)
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, update_fields=fields)
 
 
 def _invoke_interface_edit(interface):
@@ -224,48 +236,6 @@ class TestUntrackedNativeDeleteIsNoOp(_SignalDBBase):
             before_outbox,
         )
         push.assert_not_called()
-
-
-class TestRekeyedNativeDelete(_SignalDBBase):
-    def test_rekeyed_isis_flex_algo_delete_removes_every_linked_overlay(self):
-        from netbox_routing.models import ISISFlexAlgo, ISISInstance
-
-        from netbox_nso_plugin.models import NSOISISFlexAlgoState
-
-        management = self._make_mgmt(adapter_device_id=42)
-        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
-        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"):
-            with self.captureOnCommitCallbacks(execute=True):
-                flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=128)
-                flex_algo.algo_id = 129
-                flex_algo.save(update_fields=["algo_id"])
-
-        self.assertEqual(NSOISISFlexAlgoState.objects.filter(management=management).count(), 2)
-        flex_algo.delete()
-
-        self.assertFalse(NSOISISFlexAlgoState.objects.filter(management=management).exists())
-
-    def test_rekeyed_isis_interface_delete_removes_every_linked_overlay(self):
-        from netbox_routing.models import ISISInstance, ISISInterface
-
-        from netbox_nso_plugin.models import NSOISISInterfaceState
-
-        management = self._make_mgmt(adapter_device_id=42)
-        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
-        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
-            with self.captureOnCommitCallbacks(execute=True):
-                isis_interface = ISISInterface.objects.create(
-                    interface=self.iface,
-                    address_family="ipv4",
-                    instance=instance,
-                )
-                isis_interface.address_family = "ipv6"
-                isis_interface.save(update_fields=["address_family"])
-
-        self.assertEqual(NSOISISInterfaceState.objects.filter(management=management).count(), 2)
-        isis_interface.delete()
-
-        self.assertFalse(NSOISISInterfaceState.objects.filter(management=management).exists())
 
 
 class TestSyncScopeToAdapter(_SignalDBBase):
@@ -972,6 +942,19 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
         mock_put.assert_not_called()
 
+    def test_foreign_owned_overlay_save_does_not_schedule_interface_behavior(self):
+        """A registered row save is behavior-neutral without its exact writer."""
+        state = self._accepted_state(self.iface, "description", nso_value="uplink")
+
+        with (
+            patch("netbox_nso_plugin.signals._schedule_intent_push") as mock_schedule,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            state.status = "in_sync"
+            state.save(update_fields=["status"])
+
+        mock_schedule.assert_not_called()
+
     def test_skips_when_status_unowned_despite_stale_accepted_at(self):
         # Behavior change: ownership is status-based, NOT accepted_at. An attribute reverted/
         # drifted back to an unowned status keeps a stale accepted_at from a past acceptance
@@ -1080,17 +1063,18 @@ class TestPushIntentOnAccept(_SignalDBBase):
         mock_put.assert_not_called()
 
     def test_skips_unknown_attribute(self):
-        """An owned state with an attribute outside (description, enabled) is dropped."""
+        """An owned row outside the wire schema schedules no interface behavior."""
+        from netbox_nso_plugin.signals import interface_intent_item
+
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "mtu", nso_value="1500")
 
+        self.assertIsNone(interface_intent_item(state))
         with patch(f"{_MOD}.put_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
                 _invoke_push_intent_on_accept(state)
 
-        # put_intent is still called, but the unknown attribute was filtered out.
-        attrs = mock_put.call_args[0][1]
-        self.assertEqual(attrs, [])
+        mock_put.assert_not_called()
 
     def test_put_intent_error_is_swallowed(self):
         """put_intent raising AdapterError is caught and logged, not propagated."""
@@ -1116,12 +1100,18 @@ class TestSkipOnRenderGuard(_SignalDBBase):
 
     def _fire_with_method(self, method):
         """Drive push_intent_on_accept with current_request set to a real GET/POST/None."""
+        import uuid
+
+        from django.contrib.auth import get_user_model
         from netbox.context import current_request
 
         self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
         req = None if method is None else getattr(RequestFactory(), method.lower())("/")
+        if req is not None:
+            req.user = get_user_model().objects.create_user(username=f"render-{method.lower()}", password="x")
+            req.id = uuid.uuid4()
         token = current_request.set(req)
         try:
             with patch(f"{_MOD}.put_intent") as mock_put:
@@ -1142,6 +1132,24 @@ class TestSkipOnRenderGuard(_SignalDBBase):
     def test_no_request_pushes(self):
         """Programmatic / CLI context (no request) still pushes."""
         self._fire_with_method(None).assert_called_once()
+
+
+class TestExactWriterNativeNotifications(unittest.TestCase):
+    def test_flex_algo_save_schedules_the_exact_writer_scope(self):
+        from netbox_nso_plugin.signals import _on_routing_isis_flex_algo_save
+
+        with patch("netbox_nso_plugin.signals._schedule_exact_writer_scope") as schedule:
+            _on_routing_isis_flex_algo_save(sender=None, instance=None)
+
+        schedule.assert_called_once_with("isis_flex_algo")
+
+    def test_flex_algo_delete_schedules_the_exact_writer_scope(self):
+        from netbox_nso_plugin.signals import _on_routing_isis_flex_algo_pre_delete
+
+        with patch("netbox_nso_plugin.signals._schedule_exact_writer_scope") as schedule:
+            _on_routing_isis_flex_algo_pre_delete(sender=None, instance=None)
+
+        schedule.assert_called_once_with("isis_flex_algo")
 
 
 # ---------------------------------------------------------------------------
@@ -1196,8 +1204,8 @@ try:
             return ContentType.objects.get_for_model(Interface)
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
-        def test_post_save_creates_ip_state_accepted_and_pushes(self, mock_put):
-            """Creating an IPAddress on a managed interface → state=accepted + push."""
+        def test_foreign_post_save_does_not_acquire_or_push(self, mock_put):
+            """A native IP save event is not persisted ownership evidence."""
             from ipam.models import IPAddress
 
             from netbox_nso_plugin.models import NSOInterfaceIPState
@@ -1207,20 +1215,12 @@ try:
                     address="10.1.0.1/24", assigned_object_type=self._ct(), assigned_object_id=self.iface.pk
                 )
 
-            state = NSOInterfaceIPState.objects.get(interface=self.iface, address="10.1.0.1/24", vrf="")
-            self.assertEqual(state.status, "accepted")
-            self.assertIsNotNone(state.accepted_at)
-
-            mock_put.assert_called_once()
-            call_device_id, call_addresses = mock_put.call_args[0]
-            self.assertEqual(call_device_id, 42)
-            self.assertEqual(len(call_addresses), 1)
-            self.assertEqual(call_addresses[0]["address"], "10.1.0.1/24")
-            self.assertEqual(call_addresses[0]["interface"], "GigabitEthernet0/0")
+            self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.iface, address="10.1.0.1/24").exists())
+            mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
-        def test_greenfield_nokia_routed_binding_in_push(self, mock_put):
-            """A parented LAG99:99 sub-interface pushes routed/parent_binding/encap_tag."""
+        def test_foreign_greenfield_nokia_ip_does_not_push(self, mock_put):
+            """A native IP event is not ownership evidence, including on a Nokia sub-interface."""
             from dcim.models import Interface
             from ipam.models import IPAddress
 
@@ -1232,12 +1232,7 @@ try:
                     address="198.18.249.160/31", assigned_object_type=self._ct(), assigned_object_id=sub.pk
                 )
 
-            mock_put.assert_called_once()
-            _, call_addresses = mock_put.call_args[0]
-            entry = next(a for a in call_addresses if a["interface"] == "LAG99:99")
-            self.assertTrue(entry["routed"])
-            self.assertEqual(entry["parent_binding"], "lag-99")
-            self.assertEqual(entry["encap_tag"], "99")
+            mock_put.assert_not_called()
 
         def test_nokia_routed_binding_helper(self):
             """_nokia_routed_binding: only emits for a parented :tag interface."""
@@ -1322,8 +1317,8 @@ try:
             mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
-        def test_post_delete_pushes_snapshot_without_deleted_ip(self, mock_put):
-            """Deleting an IPAddress fires push with that address excluded."""
+        def test_foreign_post_delete_does_not_push(self, mock_put):
+            """A native IP delete event is not ownership evidence."""
             from ipam.models import IPAddress
 
             with self.captureOnCommitCallbacks(execute=True):
@@ -1335,13 +1330,7 @@ try:
             with self.captureOnCommitCallbacks(execute=True):
                 ip.delete()
 
-            mock_put.assert_called_once()
-            call_device_id, call_addresses = mock_put.call_args[0]
-            self.assertEqual(call_device_id, 42)
-            self.assertFalse(
-                any(a["address"] == "10.1.2.1/30" for a in call_addresses),
-                "Deleted IP must not appear in the push snapshot",
-            )
+            mock_put.assert_not_called()
 
         @patch("netbox_nso_plugin.adapter_client.put_ip_intent")
         def test_ip_not_assigned_skipped(self, mock_put):
@@ -1426,15 +1415,11 @@ try:
 
             return NSOInterfaceState.objects.get(interface=self.iface, attribute="description")
 
-        def test_operator_edit_promotes_and_pushes(self):
-            """A normal (non-adapter) edit promotes imported→accepted and pushes intent.
-
-            (put_intent may fire more than once — the state's own post_save also
-            pushes — so assert it was called, not the exact count.)
-            """
+        def test_foreign_native_edit_does_not_acquire_or_push(self):
+            """A native save event is not persisted ownership evidence."""
             mock_put = self._fire(header=None)
-            self.assertEqual(self._state().status, "accepted")
-            mock_put.assert_called()
+            self.assertEqual(self._state().status, "imported")
+            mock_put.assert_not_called()
 
         def test_adapter_origin_edit_is_skipped(self):
             """An adapter-origin write (import header) does NOT promote or push."""
@@ -1468,11 +1453,10 @@ try:
             enabled_state.refresh_from_db()
             self.assertEqual(enabled_state.status, "imported")
             self.assertIsNone(enabled_state.accepted_at)
-            # the changed attribute (description) IS promoted
-            self.assertEqual(self._state().status, "accepted")
+            self.assertEqual(self._state().status, "imported")
 
-    class TestGreenfieldOspfSignals(IntentPushDeliveryMixin, DjangoTestCase):
-        """Operator-created netbox_routing OSPF → accepted overlays + OSPF intent push."""
+    class TestForeignOspfSignals(IntentPushDeliveryMixin, DjangoTestCase):
+        """Foreign native OSPF writes remain outside ownership and delivery."""
 
         @classmethod
         def setUpTestData(cls):
@@ -1500,7 +1484,7 @@ try:
             )
 
         @patch("netbox_nso_plugin.adapter_client.put_ospf_intent")
-        def test_create_ospf_iface_owns_overlays_and_pushes(self, mock_put):
+        def test_create_ospf_graph_does_not_acquire_or_push(self, mock_put):
             from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
             from netbox_nso_plugin.models import NSOOSPFInstanceState, NSOOSPFInterfaceState
@@ -1512,21 +1496,9 @@ try:
                 area = OSPFArea.objects.create(area_id="0", area_type="standard")
                 OSPFInterface.objects.create(instance=inst, area=area, interface=self.iface, cost=100)
 
-            inst_state = NSOOSPFInstanceState.objects.get(management__device=self.device, process_id="1")
-            self.assertEqual(inst_state.status, "accepted")
-            iface_state = NSOOSPFInterfaceState.objects.get(management__device=self.device, interface=self.iface)
-            self.assertEqual(iface_state.status, "accepted")
-            self.assertEqual(iface_state.area_id, "0")
-            self.assertEqual(iface_state.process_id, "1")
-            self.assertEqual(iface_state.cost, 100)
-
-            self.assertTrue(mock_put.called)
-            _, payload = mock_put.call_args[0]
-            iface_entry = next(i for i in payload["interfaces"] if i["interface_name"] == "LAG99:99")
-            self.assertEqual(iface_entry["area_id"], "0")
-            self.assertEqual(iface_entry["process_id"], "1")
-            self.assertEqual(iface_entry["cost"], 100)
-            self.assertTrue(any(i["process_id"] == "1" for i in payload["instances"]))
+            self.assertFalse(NSOOSPFInstanceState.objects.exists())
+            self.assertFalse(NSOOSPFInterfaceState.objects.exists())
+            mock_put.assert_not_called()
 
 except ImportError:
     pass  # Outside devcontainer — Django not available; tests skipped
@@ -1629,13 +1601,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOSubinterfaceState.objects.create(
                 management=mgmt, interface=child, parent_interface=self.iface, dot1q_vlan=99, status="accepted"
             )
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row.delete()
-        mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args[0][1], [])
+        self._delete_pushes(row, "put_subinterface_intent", exact_writer=True)
 
     def test_logging_host_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOLoggingHostState
@@ -1650,7 +1616,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row.delete()
+            from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            with renderer_writes(plan) as writer:
+                writer.delete(row)
         mock_put.assert_called_once()
         self.assertEqual(mock_put.call_args[0][1], [])
 
@@ -1665,13 +1635,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOInterfaceMtuState.objects.create(
                 management=mgmt, interface=self.iface, l2_mtu=9000, status="accepted"
             )
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent") as mock_put,
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row.delete()
-        mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args[0][1], [])
+        self._delete_pushes(row, "put_interface_mtu_intent", exact_writer=True)
 
     # ── #105 sweep: the 13 families that had post_save ONLY (f282e9e class) ──
     # Each red-first test: create an OWNED row (push #1 fires and warms the
@@ -1717,7 +1681,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 nso_value="owned-by-nso",
                 status="accepted",
             )
-        self._delete_pushes(row, "put_intent")
+        self._delete_pushes(row, "put_intent", exact_writer=True)
 
     def test_vlan_delete_pushes_reduced_snapshot(self):
         from ipam.models import VLAN
@@ -1739,7 +1703,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOBFDInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
             )
-        self._delete_pushes(row, "put_bfd_intent")
+        self._delete_pushes(row, "put_bfd_intent", exact_writer=True)
 
     def test_static_route_overlay_delete_pushes_reduced_snapshot(self):
         """Direct OVERLAY deletion (the native StaticRoute pre_delete path is separately
@@ -1758,7 +1722,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOStaticRouteState.objects.create(
                 management=mgmt, static_route=route, nso_prefix="198.18.99.0/24", status="accepted"
             )
-        self._delete_pushes(row, "put_static_route_intent")
+        self._delete_pushes(row, "put_static_route_intent", exact_writer=True)
 
     def test_static_route_overlay_delete_records_per_object_authority(self):
         from netbox_routing.models import StaticRoute
@@ -1828,6 +1792,30 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             ).exists()
         )
 
+    def test_foreign_l2_sap_delete_does_not_push(self):
+        from netbox_nso_plugin.models import NSOL2SapState
+
+        mgmt = self._mgmt()
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row = NSOL2SapState.objects.create(
+                management=mgmt,
+                service_name="TL",
+                service_type="epipe",
+                sap_id="lag-60:3999",
+                port="lag-60",
+                outer_tag=3999,
+                status="accepted",
+            )
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            row.delete()
+        push.assert_not_called()
+
     def test_l2_sap_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOL2SapState
 
@@ -1845,7 +1833,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 outer_tag=3999,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_l2_sap_intent")
+        self._delete_pushes(row, "put_l2_sap_intent", exact_writer=True)
 
     def test_isis_flex_algo_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
@@ -1858,7 +1846,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOISISFlexAlgoState.objects.create(
                 management=mgmt, process_tag="CORE", algo_id=130, status="accepted"
             )
-        self._delete_pushes(row, "put_isis_flex_algo_intent")
+        self._delete_pushes(row, "put_isis_flex_algo_intent", exact_writer=True)
 
     def test_isis_interface_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOISISInterfaceState
@@ -1871,7 +1859,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOISISInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, af="ipv4", status="accepted"
             )
-        self._delete_pushes(row, "put_isis_interface_intent")
+        self._delete_pushes(row, "put_isis_interface_intent", exact_writer=True)
 
     def test_isis_instance_delete_pushes_reduced_snapshot(self):
         """No native pre_delete exists for ISISInstance — the overlay post_delete is the
@@ -1884,23 +1872,45 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             self.captureOnCommitCallbacks(execute=True),
         ):
             row = NSOISISInstanceState.objects.create(management=mgmt, process_tag="CORE", status="accepted")
-        mock_put = self._delete_pushes(row, "put_isis_interface_intent")
+        mock_put = self._delete_pushes(row, "put_isis_interface_intent", exact_writer=True)
         self.assertEqual(mock_put.call_args.kwargs.get("processes"), [])
 
     def test_bgp_peer_delete_pushes_reduced_snapshot(self):
-        """Deleting the overlay row directly pushes the reduced (owned-only) snapshot.
+        """An exact overlay deletion pushes the reduced owned snapshot."""
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 
-        This is the mechanism the native BGPPeer pre_delete reuses (it drops the overlay
-        row, firing this post_delete); greenfield end-to-end coverage is in
-        test_bgp_greenfield.TestBgpPeerGreenfieldDelete."""
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
-            row = NSOBGPPeerState.objects.create(
-                management=mgmt, asn_str="65000", peer_address_str="192.0.2.1", status="accepted"
+            rir = RIR.objects.create(name="Signal private ASNs", slug="signal-private-asns", is_private=True)
+            local_as = ASN.objects.create(asn=64512, rir=rir)
+            remote_as = ASN.objects.create(asn=64513, rir=rir)
+            router = BGPRouter.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(Device),
+                assigned_object_id=self.device.pk,
+                asn=local_as,
+                name=str(local_as.asn),
             )
-        self._delete_pushes(row, "put_bgp_intent")
+            scope = BGPScope.objects.create(router=router)
+            peer = BGPPeer.objects.create(
+                scope=scope,
+                peer=IPAddress.objects.create(address="198.18.0.2/32"),
+                remote_as=remote_as,
+                enabled=True,
+            )
+            row = NSOBGPPeerState.objects.create(
+                management=mgmt,
+                bgp_peer=peer,
+                asn_str=str(local_as.asn),
+                peer_address_str="198.18.0.2",
+                remote_as_str=str(remote_as.asn),
+                status="accepted",
+            )
+        self._delete_pushes(row, "put_bgp_intent", exact_writer=True)
 
     def test_redistribution_delete_pushes_reduced_snapshot(self):
         """No native pre_delete exists for Redistribution — the overlay post_delete is
@@ -1917,7 +1927,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 source_ref="",
                 status="accepted",
             )
-        self._delete_pushes(row, "put_bgp_intent")
+        self._delete_pushes(row, "put_bgp_intent", exact_writer=True)
 
     def test_route_policy_delete_pushes_reduced_snapshot(self):
         from django.contrib.contenttypes.models import ContentType
@@ -1939,7 +1949,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 object_id=pl.pk,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_route_policy_intent")
+        self._delete_pushes(row, "put_route_policy_intent", exact_writer=True)
 
     def test_ospf_instance_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOOSPFInstanceState
@@ -1949,7 +1959,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOOSPFInstanceState.objects.create(
                 management=mgmt, process_id="999", ospf_instance=None, status="accepted"
             )
-        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False, exact_writer=True)
 
     def test_ospf_interface_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOOSPFInterfaceState
@@ -1959,7 +1969,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             row = NSOOSPFInterfaceState.objects.create(
                 management=mgmt, interface=self.iface, process_id="10", area_id="0.0.0.0", status="accepted"
             )
-        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
+        self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False, exact_writer=True)
 
     def test_lacp_bundle_delete_pushes_reduced_snapshot(self):
         """LACP rides the direct-apply path and is auto_apply-gated on save; deletion
@@ -2151,13 +2161,6 @@ class TestDeleteOriginMarking(_SignalDBBase):
         with renderer_writes(plan) as writer:
             writer.save(row)
 
-    @staticmethod
-    def _static_route_assignment_footprint(route, device_id):
-        """The production M2M footprint for assigning *device_id* to *route*."""
-        from netbox_nso_plugin.intent_state import _static_route_devices_footprint
-
-        return _static_route_devices_footprint(route, "pre_add", {device_id}, False)
-
     def test_overlay_delete_push_is_marked_delete_origin(self):
         mgmt = self._mgmt()
         row = self._owned_svi(mgmt)
@@ -2188,19 +2191,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
         its activated push must leave the legacy query flag off."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.models import NSOStaticRouteState
-
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.77.0/24", next_hop="198.18.0.1", name="do-sr", metric=1)
-        from netbox_nso_plugin.intent_state import intent_transaction
+        from ._static_route_case import _assign_and_accept, _delete_owned_route
 
-        with self._arranged(), intent_transaction(self._static_route_assignment_footprint(route, mgmt.device_id)):
-            route.devices.add(mgmt.device)
-            NSOStaticRouteState.objects.create(
-                management=mgmt, static_route=route, nso_prefix="198.18.77.0/24", status="accepted"
-            )
+        with self._arranged():
+            _assign_and_accept(route, mgmt.device)
         route_id = route.pk
-        requests = self._recorded_requests(route.delete)
+        requests = self._recorded_requests(lambda: _delete_owned_route(route))
         params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "the native delete must push")
         self.assertFalse(
@@ -2224,11 +2222,10 @@ class TestDeleteOriginMarking(_SignalDBBase):
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-add", metric=1)
 
-        from django.db import transaction
+        from ._static_route_case import _assign_and_accept
 
         def assign():
-            with transaction.atomic():
-                route.devices.add(mgmt.device)
+            _assign_and_accept(route, mgmt.device)
 
         params = self._recorded_params(assign)
         self.assertTrue(params, "assigning the device must push the (grown) snapshot")
@@ -2241,18 +2238,14 @@ class TestDeleteOriginMarking(_SignalDBBase):
         """post_remove is a deletion, but its activated push uses no legacy query flag."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.1", name="do-rm", metric=1)
-        from netbox_nso_plugin.intent_state import intent_transaction
+        from ._static_route_case import _assign_and_accept, _unassign_and_retire
 
-        with self._arranged(), intent_transaction(self._static_route_assignment_footprint(route, mgmt.device_id)):
-            # The assignment handler is suppressed too, so the overlay is owned explicitly.
-            route.devices.add(mgmt.device)
-            _accept_static_route_for_device(route, mgmt.device)
+        with self._arranged():
+            _assign_and_accept(route, mgmt.device)
 
-        requests = self._recorded_requests(lambda: route.devices.remove(mgmt.device))
+        requests = self._recorded_requests(lambda: _unassign_and_retire(route, mgmt.device))
         params = [params for _method, _url, params, _body in requests]
         self.assertTrue(params, "un-assigning the device must push the reduced snapshot")
         self.assertFalse(

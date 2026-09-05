@@ -62,10 +62,34 @@ class _SnmpBase(IntentPushDeliveryMixin, TestCase):
 
 
 class TestSnmpAcceptView(_SnmpBase):
+    def test_exhausted_stale_accept_retry_returns_an_operator_error(self):
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        mgmt = self._make_mgmt()
+        community = self._community(mgmt, status="imported")
+        self.client.force_login(_superuser())
+
+        with patch(
+            "netbox_nso_plugin.renderer_writer.RendererWriter.save",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ):
+            response = self.client.post(f"/plugins/nso/snmp/community-state/{community.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            "Routing state changed. Refresh the page and try again.",
+            [str(message) for message in get_messages(response.wsgi_request)],
+        )
+
     def test_accept_differing_marks_accepted(self):
         """Accepting a differing (conflict) row creates intent → 'accepted' (pending apply)."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
+
         mgmt = self._make_mgmt()
-        c = self._community(mgmt, status="conflict")
+        c = self._community(mgmt, status="conflict", vault_ref="secret/snmp/community#community")
         self.client.force_login(_superuser())
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent"):
             resp = self.client.post(f"/plugins/nso/snmp/community-state/{c.pk}/accept/")
@@ -73,6 +97,28 @@ class TestSnmpAcceptView(_SnmpBase):
         c.refresh_from_db()
         assert c.status == "accepted"
         assert c.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="snmp")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("snmp", self.device.pk, mgmt.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="snmp",
+            native_model_label="netbox_nso_plugin.nsosnmpcommunitystate",
+            native_key={"management_id": mgmt.pk, "pk": c.pk},
+            ownership_state="owned",
+        ).exists()
+
+    def test_foreign_community_save_does_not_schedule_snmp_behavior(self):
+        mgmt = self._make_mgmt()
+        community = self._community(mgmt, status="accepted", vault_ref="secret/snmp/community#community")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            community.access = "RW"
+            community.save(update_fields=("access",))
+
+        schedule.assert_not_called()
 
     def test_accept_matching_marks_in_sync_owned(self):
         """Accepting an imported (already-matching) row just marks it owned → in_sync."""
@@ -89,19 +135,27 @@ class TestSnmpAcceptView(_SnmpBase):
     def test_accept_with_vault_ref_pushes_intent(self):
         """Accepting a community that has a Vault ref stores it in the SNMP intent
         mirror (deferred); the device Apply later commits it."""
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
-        from netbox_nso_plugin.models import NSOSnmpCommunityState
-        from netbox_nso_plugin.signals import _on_snmp_state_save, reset_intent_push_state
+        import copy
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt()
-        c = self._community(mgmt, status="accepted", vault_ref="secret/snmp#community")
+        c = self._community(mgmt, status="imported", vault_ref="secret/snmp#community")
+        candidate = copy.copy(c)
+        candidate.status = "in_sync"
+        candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
         # Creating the row already fired the real signal (coalesced on the rolled-back
         # test txn); clear that stale coalescing state before the assertion run.
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                with intent_transaction(footprint_for_instance(c)):
-                    _on_snmp_state_save(sender=NSOSnmpCommunityState, instance=c)
+                with renderer_writes(plan) as writer:
+                    writer.save(candidate, update_fields=fields)
             mock_put.assert_called_once()
             # communities arg carries the vault_ref-bearing row
             communities = mock_put.call_args[0][1]

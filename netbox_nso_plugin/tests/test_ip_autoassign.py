@@ -166,12 +166,13 @@ class TestAutoAssignIP(TestCase):
         )
 
     def test_loopback_allocates_from_loopback_pool(self):
-        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOInterfaceIPState
 
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback100", type="virtual")
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             from netbox_nso_plugin.ip_autoassign import auto_assign_ip
 
             result = auto_assign_ip(iface, families=("ipv4",))
@@ -193,6 +194,12 @@ class TestAutoAssignIP(TestCase):
         self.assertTrue(state.auto_assigned)
         self.assertEqual(state.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
         self.assertEqual(state.source_pool_id, self.pool_lo4.pk)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("ip", self.device.pk, mgmt.adapter_device_id).payload),
+        )
 
         mgmt.delete()
 
@@ -327,7 +334,7 @@ class TestAutoAssignIP(TestCase):
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback150", type="virtual")
         result = {"allocated": [], "errors": [], "skipped": []}
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
         self.assertTrue(result["allocated"], result)
         ip = IPAddress.objects.get(address=result["allocated"][0]["address"])
@@ -343,11 +350,11 @@ class TestAutoAssignIP(TestCase):
         pool = Prefix.objects.get(pk=self.pool_lo4.pk)
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback151", type="virtual")
-        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="ip")
         before = revision.revision
         result = {"allocated": [], "errors": [], "skipped": []}
         with (
-            patch.object(NSOInterfaceIPState.objects, "update_or_create", side_effect=IntegrityError("duplicate")),
+            patch.object(NSOInterfaceIPState, "save", side_effect=IntegrityError("duplicate")),
             patch.object(IPAddress, "delete", wraps=IPAddress.delete) as delete,
         ):
             _reserve_single(iface, mgmt, "ipv4", pool, result, push=False)
@@ -420,11 +427,11 @@ class TestAutoAssignIP(TestCase):
 
         with patch(
             "netbox_nso_plugin.signals._schedule_intent_push",
-            side_effect=[None, RuntimeError("schedule failed")],
+            side_effect=RuntimeError("schedule failed"),
         ) as schedule:
             _reserve_single(iface, mgmt, "ipv4", pool, result, push=True)
 
-        self.assertEqual(schedule.call_count, 2)
+        self.assertEqual(schedule.call_count, 1)
         assert result["errors"] == [
             {
                 "interface": str(iface),
@@ -433,6 +440,21 @@ class TestAutoAssignIP(TestCase):
             }
         ]
         assert not IPAddress.objects.filter(assigned_object_id=iface.pk).exists()
+
+    def test_reserve_single_enqueues_the_requested_push(self):
+        from netbox_nso_plugin.ip_autoassign import _reserve_single
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        pool = Prefix.objects.get(pk=self.pool_lo4.pk)
+        mgmt = self._make_mgmt()
+        iface = Interface.objects.create(device=self.device, name="Loopback153", type="virtual")
+        result = {"allocated": [], "errors": [], "skipped": []}
+
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+            _reserve_single(iface, mgmt, "ipv4", pool, result, push=True)
+
+        self.assertTrue(result["allocated"], result)
+        self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="ip").exists())
 
     def test_fill_empty_skips_interface_with_managed_ip(self):
         from netbox_nso_plugin.models import NSOInterfaceIPState
@@ -447,7 +469,7 @@ class TestAutoAssignIP(TestCase):
             status="accepted",
         )
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             from netbox_nso_plugin.ip_autoassign import auto_assign_ip
 
             result = auto_assign_ip(iface, families=("ipv4",))
@@ -462,7 +484,7 @@ class TestAutoAssignIP(TestCase):
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback102", type="virtual")
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             with patch("netbox_nso_plugin.ip_autoassign.find_pool", return_value=None):
                 from netbox_nso_plugin.ip_autoassign import auto_assign_ip
 
@@ -491,7 +513,7 @@ class TestAutoAssignIP(TestCase):
         iface = Interface.objects.create(device=self.device, name="Gi99/0", type="1000base-t")
         iface.tags.add(tag)
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             from netbox_nso_plugin.ip_autoassign import auto_assign_ip
 
             result = auto_assign_ip(iface, families=("ipv4",))
@@ -883,13 +905,24 @@ class TestRollbackAutoAssigned(TestCase):
 
     @classmethod
     def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
         manufacturer = Manufacturer.objects.create(name="RbMfg", slug="rbmfg")
         device_type = DeviceType.objects.create(manufacturer=manufacturer, model="RbDev", slug="rbdev")
         role = DeviceRole.objects.create(name="RbRole", slug="rbrole")
         site = Site.objects.create(name="RbSite", slug="rbsite")
         cls.device = Device.objects.create(name="rb-router", device_type=device_type, role=role, site=site)
+        nso = NSOInstance.objects.create(name="rb-nso", adapter_instance_id="rb-nso-inst")
+        NSODeviceManagement.objects.create(
+            device=cls.device,
+            nso_instance=nso,
+            nso_device_name="rb-router",
+            adapter_device_id=1,
+        )
 
     def test_rollback_deletes_ip_and_state(self):
+        from unittest.mock import patch
+
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
@@ -905,10 +938,12 @@ class TestRollbackAutoAssigned(TestCase):
             auto_assigned=True,
         )
 
-        rollback_auto_assigned(state)
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            rollback_auto_assigned(state)
 
         self.assertFalse(IPAddress.objects.filter(address="10.200.0.1/32").exists())
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state.pk).exists())
+        schedule.assert_called_once_with((self.device.pk, "ip"))
 
     def test_single_address_rollback_preserves_the_shared_source_pool(self):
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
@@ -1215,7 +1250,7 @@ class TestAutoAssignIPP2P(TestCase):
         tag = Tag.objects.create(name="p2p-core-asg", slug="p2p-core")
         iface_a.tags.add(tag)
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             result = auto_assign_ip(iface_a, families=("ipv4",))
 
         self.assertEqual(len(result["allocated"]), 2, result)
@@ -1249,7 +1284,7 @@ class TestAutoAssignIPP2P(TestCase):
         iface_a = Interface.objects.create(device=self.device_a, name="Gi11/0/0", type="1000base-t")
         iface_b = Interface.objects.create(device=self.device_b, name="Gi11/0/0", type="1000base-t")
         result = {"allocated": [], "errors": [], "skipped": []}
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             _assign_one_p2p_family(
                 iface_a,
                 iface_b,
@@ -1287,8 +1322,8 @@ class TestAutoAssignIPP2P(TestCase):
 
         prefixes_before = Prefix.objects.count()
         with (
-            patch("netbox_nso_plugin.signals._push_ip_intent_for_device"),
-            patch.object(NSOInterfaceIPState.objects, "update_or_create", side_effect=Exception("state boom")),
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent"),
+            patch.object(NSOInterfaceIPState, "save", side_effect=Exception("state boom")),
         ):
             result = auto_assign_ip(iface_a, families=("ipv4",))
         self.assertTrue(result["errors"], result)
@@ -1326,7 +1361,7 @@ class TestAutoAssignIPP2P(TestCase):
             auto_assigned=True,
         )
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             result = auto_assign_ip(iface_a, families=("ipv4",))
 
         self.assertEqual(len(result["skipped"]), 1)
@@ -1359,7 +1394,7 @@ class TestAutoAssignIPP2P(TestCase):
         self.assertEqual(len(revisions), 2, "both device ip revisions must exist for this pin to mean anything")
         before = [(revision.pk, revision.revision) for revision in revisions]
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             with patch("netbox_nso_plugin.ip_autoassign.find_pool", return_value=None):
                 result = auto_assign_ip(iface_a, families=("ipv4",))
 
@@ -1392,7 +1427,7 @@ class TestAutoAssignIPP2P(TestCase):
         tag = Tag.objects.get_or_create(name="p2p-core-asg", slug="p2p-core")[0]
         iface_a.tags.add(tag)
 
-        with patch("netbox_nso_plugin.signals._push_ip_intent_for_device"):
+        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
             result = auto_assign_ip(iface_a, families=("ipv4",))
 
         self.assertEqual(len(result["errors"]), 1)
@@ -1692,10 +1727,8 @@ class TestP2PAllocationFailureCleanup(TestCase):
     def test_state_link_failure_leaves_no_orphan_peer_state(self):
         """If linking peer_state raises after both state rows exist, neither survives.
 
-        Uses a VRF-scoped pool: ``state_b.vrf`` is then the pool VRF while the
-        reserved ``ip_b`` carries no VRF, so deleting ip_b in the cleanup does NOT
-        cascade to state_b via ``_on_ip_address_delete`` — the state cleanup must
-        remove state_b explicitly. This is exactly the orphan the fix closes.
+        Uses a VRF-scoped pool to prove that rollback removes the exact native and
+        overlay rows without relying on an IPAddress signal cascade.
         """
         from ipam.models import VRF
 
@@ -1712,14 +1745,14 @@ class TestP2PAllocationFailureCleanup(TestCase):
         real_save = NSOInterfaceIPState.save
 
         def boom_on_peer_link(self, *args, **kwargs):
-            if kwargs.get("update_fields") == ["peer_state"]:
+            if tuple(kwargs.get("update_fields") or ()) == ("peer_state",):
                 raise RuntimeError("simulated failure while linking peer_state")
             return real_save(self, *args, **kwargs)
 
         result = {"allocated": [], "skipped": [], "errors": []}
         with (
             patch.object(NSOInterfaceIPState, "save", boom_on_peer_link),
-            patch("netbox_nso_plugin.signals._push_ip_intent_for_device"),
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent"),
         ):
             _assign_one_p2p_family(
                 iface_a,
@@ -1742,22 +1775,22 @@ class TestP2PAllocationFailureCleanup(TestCase):
         )
 
     def test_reserve_failure_leaves_no_orphan_peer_ip(self):
-        """If the peer IPAddress post-save signal raises after INSERT, ip_b is cleaned up."""
+        """If the peer IPAddress save raises after INSERT, ip_b is cleaned up."""
         from netbox_nso_plugin.ip_autoassign import auto_assign_ip
-        from netbox_nso_plugin.models import NSOInterfaceIPState
 
         iface_a, iface_b = self._p2p_pair()
 
-        real_goc = NSOInterfaceIPState.objects.get_or_create
+        real_save = IPAddress.save
 
-        def boom_on_peer(*args, **kwargs):
-            if kwargs.get("interface") == iface_b:
-                raise RuntimeError("simulated post-save signal failure on the peer IP")
-            return real_goc(*args, **kwargs)
+        def boom_on_peer(instance, *args, **kwargs):
+            result = real_save(instance, *args, **kwargs)
+            if instance.assigned_object_id == iface_b.pk:
+                raise RuntimeError("simulated post-save failure on the peer IP")
+            return result
 
         with (
-            patch.object(NSOInterfaceIPState.objects, "get_or_create", boom_on_peer),
-            patch("netbox_nso_plugin.signals._push_ip_intent_for_device"),
+            patch.object(IPAddress, "save", boom_on_peer),
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent"),
         ):
             result = auto_assign_ip(iface_a, families=("ipv4",))
 

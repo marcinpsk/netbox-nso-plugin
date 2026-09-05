@@ -40,6 +40,32 @@ class TestSubinterfaceReconciler(TestCase):
             reconcile_subinterface(orphan, {"interfaces": [{"interface_name": "Gi0/1.100", "dot1q_vlan": 100}]}) == []
         )
 
+    def test_reconcile_preflights_native_and_overlay_creations(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.subinterface_reconciler import subinterface_reconcile_plan
+
+        plan = subinterface_reconcile_plan(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1.1627",
+                        "parent_interface": self.parent.name,
+                        "dot1q_vlan": 1627,
+                    }
+                ]
+            },
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "dcim.interface"),
+                ("save", "netbox_nso_plugin.nsosubinterfacestate"),
+            ],
+        )
+
     def test_creates_subinterface_with_parent_and_records_dot1q(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -66,6 +92,109 @@ class TestSubinterfaceReconciler(TestCase):
         self.assertEqual(rows[0].status, "imported")
         # A dot1q tag must NOT create a device VLAN object.
         self.assertEqual(VLAN.objects.count(), 0)
+
+    def test_duplicate_interface_entries_use_the_first_observation(self):
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        rows = reconcile_subinterface(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": "GigabitEthernet0/1.101",
+                        "parent_interface": self.parent.name,
+                        "dot1q_vlan": 101,
+                    },
+                    {
+                        "interface_name": "GigabitEthernet0/1.101",
+                        "parent_interface": self.parent.name,
+                        "dot1q_vlan": 202,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        state = NSOSubinterfaceState.objects.get(interface__name="GigabitEthernet0/1.101")
+        self.assertEqual(state.dot1q_vlan, 101)
+
+    def test_unowned_existing_subinterface_tracks_a_new_parent(self):
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        new_parent = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/2",
+            type="1000base-t",
+        )
+        interface = Interface.objects.create(
+            device=self.device,
+            name="GigabitEthernet0/1.200",
+            type="virtual",
+            parent=self.parent,
+        )
+        NSOSubinterfaceState.objects.create(
+            management=self.management,
+            interface=interface,
+            parent_interface=self.parent,
+            dot1q_vlan=200,
+            status="imported",
+        )
+
+        reconcile_subinterface(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": interface.name,
+                        "parent_interface": new_parent.name,
+                        "dot1q_vlan": 200,
+                    }
+                ]
+            },
+        )
+
+        interface.refresh_from_db()
+        self.assertEqual(interface.parent_id, new_parent.pk)
+
+    def test_a_concurrently_created_subinterface_is_reused(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
+
+        inserted = None
+
+        def insert_after_interface_read(execute, sql, params, many, context):
+            nonlocal inserted
+            result = execute(sql, params, many, context)
+            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                inserted = Interface.objects.create(
+                    device=self.device,
+                    name="GigabitEthernet0/1.101",
+                    type="virtual",
+                    parent=self.parent,
+                )
+            return result
+
+        with connection.execute_wrapper(insert_after_interface_read):
+            rows = reconcile_subinterface(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": "GigabitEthernet0/1.101",
+                            "parent_interface": self.parent.name,
+                            "dot1q_vlan": 101,
+                        }
+                    ]
+                },
+            )
+
+        self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
+        self.assertEqual(rows[0].interface_id, inserted.pk)
+        self.assertEqual(
+            Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.101").count(),
+            1,
+        )
 
     def test_direct_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
@@ -155,49 +284,6 @@ class TestSubinterfaceReconciler(TestCase):
         )
         self.assertEqual(Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.200").count(), 1)
 
-    def test_a_concurrently_created_subinterface_is_reused(self):
-        from django.db import connection
-
-        from netbox_nso_plugin.intent_state import reconcile_transaction
-        from netbox_nso_plugin.subinterface_reconciler import (
-            _reconcile_subinterface,
-            subinterface_reconcile_plan,
-        )
-
-        payload = {
-            "interfaces": [
-                {
-                    "interface_name": "GigabitEthernet0/1.201",
-                    "parent_interface": self.parent.name,
-                    "dot1q_vlan": 201,
-                }
-            ]
-        }
-        plan = subinterface_reconcile_plan(self.device, payload)
-        inserted = None
-
-        def insert_after_interface_read(execute, sql, params, many, context):
-            nonlocal inserted
-            result = execute(sql, params, many, context)
-            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
-                inserted = Interface.objects.create(
-                    device=self.device,
-                    name="GigabitEthernet0/1.201",
-                    type="virtual",
-                    parent=self.parent,
-                )
-            return result
-
-        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
-            rows = _reconcile_subinterface(self.device, payload)
-
-        self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
-        self.assertEqual(rows[0].interface_id, inserted.pk)
-        self.assertEqual(
-            Interface.objects.filter(device=self.device, name="GigabitEthernet0/1.201").count(),
-            1,
-        )
-
     def test_stale_state_pruned(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -245,25 +331,15 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         from uuid import uuid4
 
         iface = Interface.objects.create(device=self.device, name=name, type="virtual", parent=self.parent)
-        # Creating a NEW parent+dot1q interface on a managed device (adapter_device_id set)
-        # fires the greenfield post_save signal (_create_greenfield_subif_state), which
-        # ALREADY creates an owned NSOSubinterfaceState. Cooperate with it via
-        # update_or_create rather than a second create that would violate the unique
-        # (management, interface) constraint.
-        state, _ = NSOSubinterfaceState.objects.update_or_create(
+        return NSOSubinterfaceState.objects.create(
             management=self.management,
             interface=iface,
-            defaults={
-                "parent_interface": self.parent,
-                "dot1q_vlan": dot1q,
-                "vrf": "MTI",
-                "status": status,
-                "apply_attempt_id": uuid4() if status == "deploying" else None,
-            },
+            parent_interface=self.parent,
+            dot1q_vlan=dot1q,
+            vrf="MTI",
+            status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
         )
-        if state.status != status:
-            state = content_update(state, status=status)
-        return state
 
     def test_reconcile_preserves_owned_status(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
@@ -283,6 +359,27 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
             },
         )
         self.assertEqual(NSOSubinterfaceState.objects.get(interface__name="ge-0/0/0.100").status, "accepted")
+
+    def test_foreign_overlay_save_does_not_schedule_subinterface_behavior(self):
+        from unittest.mock import patch
+
+        state = self._state(name="ge-0/0/0.1627", dot1q=1627, status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.vrf = "FOREIGN"
+            state.save(update_fields=("vrf",))
+
+        schedule.assert_not_called()
+
+    def test_foreign_native_creation_does_not_acquire_subinterface_ownership(self):
+        interface = Interface.objects.create(
+            device=self.device,
+            name="ge-0/0/0.1628",
+            type="virtual",
+            parent=self.parent,
+        )
+
+        self.assertFalse(NSOSubinterfaceState.objects.filter(interface=interface).exists())
 
     def test_reconcile_preserves_owned_values_until_the_device_matches(self):
         """A refresh must compare device values without replacing pending NetBox intent."""
@@ -487,6 +584,9 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
         from django.contrib.auth import get_user_model
 
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
+
         state = self._state(name="ge-0/0/0.300", dot1q=300, status="conflict")
         User = get_user_model()
         admin = User.objects.create_superuser(username="subif-admin", password="pw", email="s@x.y")  # noqa: S106
@@ -496,6 +596,18 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("subinterface", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="subinterface",
+            native_model_label="dcim.interface",
+            native_key={"device_id": state.interface.device_id, "name": state.interface.name},
+            ownership_state="owned",
+        ).exists()
 
     def test_accept_refuses_a_row_the_push_snapshot_would_skip(self):
         from django.contrib.auth import get_user_model

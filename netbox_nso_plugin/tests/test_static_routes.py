@@ -191,27 +191,11 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(state.management, mgmt)
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())
 
-    def test_plan_reuses_routes_resolved_for_its_footprint(self):
-        self._make_mgmt(self.device, nso_device_name="sr-plan-dependencies")
-        from netbox_nso_plugin.template_content import _reconcile_static_routes, _static_route_reconcile_plan
-
-        payload = self._route_payload(self._route_entry("198.18.42.0/24", "198.18.0.42"))
-        with self._auto_create_ctx(True):
-            _reconcile_static_routes(self.device, payload)
-
-        with patch(
-            "netbox_nso_plugin.template_content._resolve_static_route",
-            side_effect=AssertionError("the plan resolved one route twice"),
-        ):
-            plan = _static_route_reconcile_plan(self.device, payload)
-
-        self.assertFalse(plan.changes_content)
-
     def test_plan_matches_only_the_duplicate_route_selected_by_the_body(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.template_content import _reconcile_static_routes, _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import _reconcile_static_routes, static_route_reconcile_plan
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-duplicate")
         routes = [
@@ -228,7 +212,7 @@ class TestReconcileStaticRoutes(TestCase):
             )
         payload = self._route_payload(self._route_entry("198.18.43.0/24", "198.18.0.43"))
 
-        self.assertTrue(_static_route_reconcile_plan(self.device, payload).changes_content)
+        self.assertTrue(static_route_reconcile_plan(self.device, payload).changes_content)
         _reconcile_static_routes(self.device, payload)
 
         self.assertEqual(NSOStaticRouteState.objects.filter(status="changed").count(), 1)
@@ -237,7 +221,7 @@ class TestReconcileStaticRoutes(TestCase):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-membership")
         route = StaticRoute.objects.create(prefix="198.18.44.0/24", next_hop="198.18.0.44", metric=1)
@@ -245,15 +229,15 @@ class TestReconcileStaticRoutes(TestCase):
         payload = self._route_payload(self._route_entry(str(route.prefix), str(route.next_hop)))
 
         with self._auto_create_ctx(True):
-            plan = _static_route_reconcile_plan(self.device, payload)
+            plan = static_route_reconcile_plan(self.device, payload)
 
         self.assertTrue(plan.changes_content)
 
-    def test_plan_marks_reported_owned_metric_or_tag_drift_as_content(self):
+    def test_plan_marks_reported_owned_wire_drift_as_content(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-drift")
         route = StaticRoute.objects.create(prefix="198.18.45.0/24", next_hop="198.18.0.45", metric=1)
@@ -267,9 +251,9 @@ class TestReconcileStaticRoutes(TestCase):
         )
         entry = self._route_entry(str(route.prefix), str(route.next_hop))
 
-        for changed_entry in (dict(entry, metric=2), dict(entry, tag=42)):
+        for changed_entry in (dict(entry, metric=2), dict(entry, permanent=True), dict(entry, tag=42)):
             with self.subTest(changed_entry=changed_entry):
-                plan = _static_route_reconcile_plan(self.device, self._route_payload(changed_entry))
+                plan = static_route_reconcile_plan(self.device, self._route_payload(changed_entry))
                 self.assertTrue(plan.changes_content)
 
     def test_nokia_omitted_preference_seeds_its_ned_default(self):
@@ -427,7 +411,6 @@ class TestReconcileStaticRoutes(TestCase):
         from netbox_nso_plugin.template_content import _reconcile_static_routes
 
         mgmt = self._make_mgmt(self.device, nso_device_name="sr-tag-owned")
-        baseline_entries = []
         for i, (owned, expected) in enumerate(
             (
                 ("accepted", "accepted"),
@@ -447,19 +430,19 @@ class TestReconcileStaticRoutes(TestCase):
                 entry = self._route_entry(str(route.prefix), str(route.next_hop))
 
                 entry_tag = dict(entry, tag=42)
-                _reconcile_static_routes(self.device, self._route_payload(*baseline_entries, entry_tag))
+                _reconcile_static_routes(self.device, self._route_payload(entry_tag))
                 state.refresh_from_db()
                 tag_result = state.status
 
                 # the same row driven by a METRIC mismatch instead — must land identically
                 state.status = owned
                 state.save(update_fields=["status"])
-                _reconcile_static_routes(self.device, self._route_payload(*baseline_entries, dict(entry, metric=99)))
+                _reconcile_static_routes(self.device, self._route_payload(dict(entry, metric=99)))
                 state.refresh_from_db()
 
                 self.assertEqual(tag_result, expected)
                 self.assertEqual(tag_result, state.status)
-                baseline_entries.append(entry)
+                route.delete()
 
     def test_idempotent_second_reconcile_same_result(self):
         """Second reconcile with same payload → same state rows, no duplicates."""

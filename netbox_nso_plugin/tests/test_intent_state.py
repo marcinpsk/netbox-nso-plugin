@@ -306,7 +306,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(updated, ("after",))
         self.assertEqual(parse_calls, 0)
 
-    def test_repeated_insert_shape_is_parsed_at_most_once(self):
+    def test_unregistered_insert_shape_is_never_parsed(self):
         statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
         real_parse = sqlparse.parse
         parse_calls = 0
@@ -322,7 +322,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 cursor.execute(statement, [1])
                 cursor.execute(statement, [2])
 
-        self.assertLessEqual(parse_calls, 1)
+        self.assertEqual(parse_calls, 0)
 
     def test_repeated_registered_dml_shape_caches_column_classification(self):
         table = NSOVLANState._meta.db_table
@@ -339,7 +339,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             cursor.execute(statement, ["first", self.state.pk])
             cursor.execute(statement, ["second", self.state.pk])
 
-        self.assertLessEqual(parse_calls, 2)
+        self.assertEqual(parse_calls, 2)
 
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():
@@ -417,22 +417,22 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         device.delete()
         self.assertFalse(IPAddress.objects.filter(pk=address.pk).exists())
 
-    def test_failed_static_route_m2m_behavior_closes_its_implicit_permit(self):
+    def test_foreign_static_route_m2m_skips_behavior_and_closes_its_implicit_permit(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
 
         route = StaticRoute.objects.create(prefix="198.18.16.0/28", next_hop="198.18.16.1", metric=1)
-        with self.assertRaises(RuntimeError):
-            with (
-                transaction.atomic(),
-                patch(
-                    "netbox_nso_plugin.signals._schedule_intent_push",
-                    side_effect=RuntimeError("behavior failed"),
-                ),
-            ):
-                route.devices.add(self.device)
+        with (
+            transaction.atomic(),
+            patch(
+                "netbox_nso_plugin.signals._schedule_intent_push",
+                side_effect=RuntimeError("behavior failed"),
+            ) as schedule,
+        ):
+            route.devices.add(self.device)
 
+        schedule.assert_not_called()
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
     def test_foreign_post_save_skips_converted_behavior_and_closes_its_implicit_permit(self):
@@ -451,6 +451,23 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         schedule.assert_not_called()
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
+    def test_writerless_save_preserves_a_cached_foreign_key_created_later(self):
+        from ipam.models import VLAN
+
+        planned_vlan = VLAN(
+            pk=self.state.vlan_id + 1_000_000,
+            vid=1624,
+            name="intent-planned-vlan",
+        )
+        self.state.vlan = planned_vlan
+
+        with without_commit_drain(), transaction.atomic():
+            self.state.save(update_fields=["vlan"])
+            VLAN.objects.bulk_create([planned_vlan])
+
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.vlan, planned_vlan)
+
     def test_content_permit_rejects_a_write_outside_its_footprint(self):
         other_device, other_management = make_managed("intent-other", 1624, index=2)
         other = own_vlan(other_management, 1624, "intent-other")
@@ -467,6 +484,20 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         other.refresh_from_db()
         self.assertEqual(other.device_name, "")
         self.assertNotEqual(other_device.pk, self.device.pk)
+
+    def test_revision_locks_alone_do_not_authorize_registered_content_dml(self):
+        vlan = self.state.vlan
+        spec = renderer_input_specs()[vlan._meta.label_lower]
+        footprint = MutationFootprint.for_keys(spec.resolver(vlan, spec))
+        original_name = vlan.name
+
+        with self.assertRaises(IntentMutationProtocolError), transaction.atomic(), suppress_intent_push():
+            with intent_transaction(footprint):
+                vlan.name = "revision-only-permit"
+                vlan.save(update_fields=["name"])
+
+        vlan.refresh_from_db()
+        self.assertEqual(vlan.name, original_name)
 
     def test_content_mutation_bumps_before_write_and_repends_deploying_rows(self):
         attempt_id = uuid4()
@@ -712,6 +743,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertTrue(required <= declared, required - declared)
 
     def test_registry_has_frozen_ranks_and_trace_fixtures(self):
+        self.assertEqual(len(SOURCE_MODEL_RANKS), len(set(SOURCE_MODEL_RANKS)))
         declared = set(renderer_input_specs())
         classified = set(SOURCE_MODEL_RANKS) | set(OVERLAY_MODEL_RANKS) | {"netbox_nso_plugin.nsodevicemanagement"}
         self.assertEqual(declared - classified, set())
@@ -719,11 +751,27 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             classified - declared,
             {
                 "dcim.interface_tagged_vlans",
+                "ipam.rir",
                 "ipam.vlangroup",
+                "netbox_nso_plugin.nsobgppeertemplatestate",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.ospfinstance",
+                "netbox_routing.bfdinterface",
+                "netbox_routing.bfdprofile",
+                "netbox_routing.isisflexalgo",
+                "netbox_routing.isisinterface",
+                "netbox_routing.isisinterfacelevel",
+                "netbox_routing.isisprefixsid",
+                "netbox_routing.isissegmentrouting",
+                "netbox_routing.isissetting",
+                "netbox_routing.isissrv6locator",
+                "netbox_routing.ospfarea",
+                "netbox_routing.ospfinstance",
+                "netbox_routing.ospfinterface",
                 "netbox_routing.staticroute_devices",
+                "vpn.l2vpn",
+                "vpn.l2vpntermination",
             },
         )
         self.assertTrue(all(spec.required_trace_fixtures for spec in renderer_input_specs().values()))
@@ -807,6 +855,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         )
 
         from netbox_nso_plugin.models import (
+            NSOBGPPeerState,
             NSOISISInstanceState,
             NSOLACPBundleState,
             NSOLACPMemberState,
@@ -878,6 +927,16 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 local_as=local_as,
                 peer_group=peer_group,
                 enabled=True,
+            )
+            peer.refresh_from_db()
+            NSOBGPPeerState.objects.create(
+                management=self.management,
+                asn_str=str(local_as.asn),
+                peer_address_str=str(peer.peer.address).split("/")[0],
+                remote_as_str=str(remote_as.asn),
+                enabled=True,
+                bgp_peer=peer,
+                status="accepted",
             )
             BGPPeerAddressFamily.objects.create(
                 assigned_object_type=ContentType.objects.get_for_model(BGPPeer),

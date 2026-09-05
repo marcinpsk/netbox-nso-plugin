@@ -72,8 +72,8 @@ class TestPushIsisFlexAlgoIntent(_FlexAlgoBase):
         assert flex_algos[0]["priority"] == 200
 
 
-class TestGreenfieldFlexAlgo(_FlexAlgoBase):
-    def test_create_flex_algo_owns_and_pushes(self):
+class TestFlexAlgoOwnershipSignals(_FlexAlgoBase):
+    def test_foreign_flex_algo_create_is_neutral(self):
         from netbox_routing.models import ISISFlexAlgo
 
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
@@ -85,15 +85,10 @@ class TestGreenfieldFlexAlgo(_FlexAlgoBase):
             with self.captureOnCommitCallbacks(execute=True):
                 ISISFlexAlgo.objects.create(instance=inst, algo_id=130, metric_type="delay-metric", priority=200)
 
-        state = NSOISISFlexAlgoState.objects.get(algo_id=130)
-        assert state.status == "accepted"
-        assert state.process_tag == "CORE"
-        assert state.metric_type == "delay-metric"
-        mock_put.assert_called()
-        _, flex_algos = mock_put.call_args[0]
-        assert flex_algos[0]["algo_id"] == 130
+        assert not NSOISISFlexAlgoState.objects.filter(algo_id=130).exists()
+        mock_put.assert_not_called()
 
-    def test_delete_flex_algo_drops_overlay_and_pushes_removal(self):
+    def test_foreign_flex_algo_delete_is_neutral(self):
         from netbox_routing.models import ISISFlexAlgo
 
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
@@ -101,17 +96,58 @@ class TestGreenfieldFlexAlgo(_FlexAlgoBase):
         self._mgmt()
         inst = self._isis_instance(process_tag="CORE")
 
-        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"):
-            with self.captureOnCommitCallbacks(execute=True):
-                fa = ISISFlexAlgo.objects.create(instance=inst, algo_id=130)
-        assert NSOISISFlexAlgoState.objects.filter(algo_id=130).exists()
+        fa = ISISFlexAlgo.objects.create(instance=inst, algo_id=130)
+        NSOISISFlexAlgoState.objects.create(
+            management=self._mgmt(),
+            process_tag="CORE",
+            algo_id=130,
+            isis_flex_algo=fa,
+            status="accepted",
+        )
 
         with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
                 fa.delete()
 
-        assert not NSOISISFlexAlgoState.objects.filter(algo_id=130).exists()
-        # Removal push sends the now-empty snapshot.
-        mock_put.assert_called()
-        _, flex_algos = mock_put.call_args[0]
-        assert flex_algos == []
+        state = NSOISISFlexAlgoState.objects.get(algo_id=130)
+        assert state.isis_flex_algo_id is None
+        mock_put.assert_not_called()
+
+    def test_exact_overlay_write_pushes_and_records_ownership(self):
+        from netbox_routing.models import ISISFlexAlgo
+
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState, NSOOwnershipManifest
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        mgmt = self._mgmt()
+        native = ISISFlexAlgo.objects.create(instance=self._isis_instance(process_tag="CORE"), algo_id=130)
+        state = NSOISISFlexAlgoState(
+            management=mgmt,
+            process_tag="CORE",
+            algo_id=130,
+            isis_flex_algo=native,
+            status="accepted",
+        )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    state,
+                    force_insert=True,
+                    natural_key=("management", "process_tag", "algo_id"),
+                ),
+            )
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                with renderer_writes(plan) as writer:
+                    writer.save(state, force_insert=True)
+
+        mock_put.assert_called_once()
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="isis_flex_algo",
+            native_model_label="netbox_routing.isisflexalgo",
+            native_key={"instance_id": native.instance_id, "algo_id": 130},
+            ownership_state="owned",
+        ).exists()
