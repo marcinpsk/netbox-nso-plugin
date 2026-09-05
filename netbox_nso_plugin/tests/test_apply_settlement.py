@@ -454,13 +454,19 @@ class TestAttemptSettlement(TestCase):
         self.assertTrue(any("device 1626" in message for message in logs.output))
 
     def test_rowless_lost_responses_expire_from_evidence_replay(self):
-        from netbox_nso_plugin.apply_settlement import deployment_evidence_attempt_ids
+        from netbox_nso_plugin.apply_settlement import (
+            LOST_RESPONSE_REPLAY_WINDOW,
+            deployment_evidence_attempt_ids,
+        )
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         expired_id, recent_id = uuid4(), uuid4()
         expired = self._local_attempt(expired_id, 66, {"vlan": 406}, answered=False)
         self._local_attempt(recent_id, 67, {"vlan": 407}, answered=False)
-        NSOApplyAttempt.objects.filter(pk=expired.pk).update(created_at=timezone.now() - timedelta(days=2))
+        # Age the attempt one day past the replay window so the exclusion holds if the window changes.
+        NSOApplyAttempt.objects.filter(pk=expired.pk).update(
+            created_at=timezone.now() - LOST_RESPONSE_REPLAY_WINDOW - timedelta(days=1)
+        )
 
         attempt_ids = deployment_evidence_attempt_ids(self.management)
 
