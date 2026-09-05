@@ -640,7 +640,8 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         watcher.start()
         self.addCleanup(release.set)
         # The route rows are disjoint, but both changes bump the same device and scope
-        # revision. The revision row serializes the two renderer mutations.
+        # revision. The device advisory gate serializes the two renderer mutations before
+        # either reaches that shared revision row.
         self._run(
             self._remove(leaving, after=held, hold=release),
             measured_reown,
