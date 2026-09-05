@@ -227,6 +227,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         state.status = sm.on_reconcile(
             state.status,
             matches=vlan_name_matches(state),
+            settles_deploying=False,
         )
         created = current is None
         proposal = planned_save(
