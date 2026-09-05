@@ -610,9 +610,10 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
                 with transaction.atomic():
                     row = StaticRoute.objects.get(pk=sr.pk)
                     row.next_hop = next_hop
+                    row.save(update_fields=["next_hop"])
+                    # Release the main thread only now: the row lock pre_save took is held.
                     if before is not None:
                         before.set()
-                    row.save(update_fields=["next_hop"])
                     if after is not None:
                         after.wait(timeout=30)
             except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
