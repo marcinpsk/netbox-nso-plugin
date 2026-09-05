@@ -5270,6 +5270,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         self.mgmt = fixtures["mgmt"]
 
     def test_concurrent_case_variant_route_map_insert_returns_a_field_error(self):
+        import contextlib
         from threading import Barrier, Thread
 
         from django.contrib.contenttypes.models import ContentType
@@ -5338,7 +5339,8 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
             except Exception as exc:  # noqa: BLE001
                 results["collision_error"] = exc
             finally:
-                collision_committed.wait(timeout=20)
+                with contextlib.suppress(Exception):
+                    collision_committed.wait(timeout=20)
                 connections.close_all()
                 results["collision_connection_closed"] = connections["default"].connection is None
 
@@ -5379,6 +5381,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         )
 
     def test_concurrent_route_policy_state_insert_returns_a_field_error(self):
+        import contextlib
         from threading import Barrier, Thread
 
         from django.contrib.contenttypes.models import ContentType
@@ -5460,7 +5463,8 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
             except Exception as exc:  # noqa: BLE001
                 results["collision_error"] = exc
             finally:
-                collision_committed.wait(timeout=20)
+                with contextlib.suppress(Exception):
+                    collision_committed.wait(timeout=20)
                 connections.close_all()
                 results["collision_connection_closed"] = connections["default"].connection is None
 
@@ -5505,6 +5509,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         )
 
     def test_concurrent_case_variant_classification_insert_returns_a_field_error(self):
+        import contextlib
         from threading import Barrier, Thread
 
         from django.contrib.contenttypes.models import ContentType
@@ -5577,7 +5582,8 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
             except Exception as exc:  # noqa: BLE001
                 results["collision_error"] = exc
             finally:
-                collision_committed.wait(timeout=20)
+                with contextlib.suppress(Exception):
+                    collision_committed.wait(timeout=20)
                 connections.close_all()
                 results["collision_connection_closed"] = connections["default"].connection is None
 
