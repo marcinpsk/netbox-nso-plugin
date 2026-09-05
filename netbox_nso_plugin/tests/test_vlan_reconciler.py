@@ -235,6 +235,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_switchport(self.device, payload)  # the next read resolves it and seeds it
         self.assertTrue(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+        # The overlay row is created before the native seed, so assert the native write too.
+        late.refresh_from_db()
+        self.assertEqual(late.mode, "access")
+        self.assertEqual(late.untagged_vlan.vid, 10)
 
     def test_switchport_body_reloads_the_frozen_interfaces_after_acquisition(self):
         """An operator edit committed after the plan must not be clobbered from a stale copy."""
