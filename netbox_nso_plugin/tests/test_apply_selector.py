@@ -2718,6 +2718,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         import threading
 
         from django.db import connections
+        from django.db.models.signals import pre_save
 
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
@@ -2736,9 +2737,16 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         mirror_update(second, status="deploying", apply_attempt_id=attempt_id)
 
         first_locked = threading.Event()
+        editor_ready = threading.Event()
+        first_repend_started = threading.Event()
         second_committed = threading.Event()
         release_first = threading.Event()
+        editor_pid: list[int] = []
         errors = []
+
+        def mark_first_repend(sender, instance, **kwargs):
+            if instance.pk == first.pk:
+                first_repend_started.set()
 
         def hold_first():
             try:
@@ -2759,6 +2767,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 with without_commit_drain():
                     current = NSOInterfaceMtuState.objects.get(pk=second.pk)
                     current.l2_mtu = 1600
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute("SELECT pg_backend_pid()")
+                        editor_pid.append(cursor.fetchone()[0])
+                    editor_ready.set()
                     _save_owned_overlay_edit(current, "interface_mtu", {"l2_mtu": 1500})
                 second_committed.set()
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
@@ -2766,14 +2778,25 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             finally:
                 connections.close_all()
 
+        pre_save.connect(mark_first_repend, sender=NSOInterfaceMtuState, weak=False)
+        self.addCleanup(pre_save.disconnect, mark_first_repend, sender=NSOInterfaceMtuState)
         holder = threading.Thread(target=hold_first)
         editor = threading.Thread(target=edit_second)
         holder.start()
+        self.addCleanup(holder.join, 10)
+        self.addCleanup(release_first.set)
         editor.start()
-        try:
-            self.assertFalse(second_committed.wait(1), "the edit did not lock the complete deploying scope")
-        finally:
-            release_first.set()
+        self.addCleanup(editor.join, 10)
+        self.addCleanup(release_first.set)
+
+        self.assertTrue(editor_ready.wait(10), "the edit did not reach its database work")
+        # The holder locks only first, so a transactionid wait proves the edit asked for that row.
+        wait_until_postgres_blocks(editor_pid[0], "the complete-scope edit", locktype="transactionid")
+        # The repend writes first as well, so only an unstarted repend pins the wait on the prelock.
+        self.assertFalse(first_repend_started.is_set(), "the edit reached the repend without prelocking first")
+        self.assertFalse(second_committed.is_set(), "the edit did not lock the complete deploying scope")
+
+        release_first.set()
         holder.join(10)
         editor.join(10)
 
