@@ -925,6 +925,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         """
         from uuid import uuid4
 
+        from django.db.models.signals import pre_save
+
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
         from netbox_nso_plugin.intent_generation import UNALLOCATED
         from netbox_nso_plugin.intent_state import mirror_refresh
@@ -941,9 +943,20 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             locked.apply_attempt_id = attempt_id
             locked.save(update_fields=fields)
 
-        before = _backfill_static_route_generations(mgmt)
+        arming_statuses = []
+
+        def record_arming_status(sender, instance, update_fields=None, **kwargs):
+            if instance.pk == route.pk and update_fields is not None and "intent_generation" in update_fields:
+                arming_statuses.append((instance.status, instance.apply_attempt_id))
+
+        pre_save.connect(record_arming_status, sender=NSOStaticRouteState, weak=False)
+        try:
+            before = _backfill_static_route_generations(mgmt)
+        finally:
+            pre_save.disconnect(record_arming_status, sender=NSOStaticRouteState)
 
         armed = NSOStaticRouteState.objects.get(pk=route.pk)
+        assert arming_statuses == [("accepted", None)]
         assert (armed.status, armed.apply_attempt_id) == ("accepted", None)
         assert armed.intent_generation > UNALLOCATED
         assert [(row["status"], row["apply_attempt_id"], row["armed_status"]) for row in before] == [

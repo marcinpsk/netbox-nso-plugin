@@ -842,7 +842,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         stale.refresh_from_db()
         self.assertEqual(stale.status, "accepted")
 
-    def test_same_row_intent_writers_serialize_before_comparing(self):
+    def test_stale_mtu_retry_preserves_a_concurrent_edit_to_an_untouched_field(self):
         import threading
 
         from django.db import connections
@@ -858,10 +858,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
+                ip_mtu=1500,
                 status="deploying",
                 apply_attempt_id=uuid4(),
             )
         stale = NSOInterfaceMtuState.objects.get(pk=state.pk)
+        stale.l2_mtu = 1600
         first_locked = threading.Event()
         release_first = threading.Event()
         comparison_finished = threading.Event()
@@ -876,7 +878,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 current = NSOInterfaceMtuState.objects.get(pk=state.pk)
                 with intent_transaction(footprint_for_instance(current)):
                     NSOInterfaceMtuState.objects.select_for_update().filter(pk=state.pk).update(
-                        l2_mtu=1600,
+                        ip_mtu=9000,
                         status="accepted",
                     )
                     comparison_finished.clear()
@@ -893,7 +895,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not first_locked.wait(10):
                     raise AssertionError("the first writer did not lock the row")
                 with without_commit_drain():
-                    _save_owned_overlay_edit(stale, "interface_mtu", {"l2_mtu": 1500})
+                    _save_owned_overlay_edit(
+                        stale,
+                        "interface_mtu",
+                        {"l2_mtu": 1500, "ip_mtu": 1500, "mpls_mtu": None},
+                    )
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -918,6 +924,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         if errors:
             raise errors[0]
         state.refresh_from_db()
+        self.assertEqual((state.l2_mtu, state.ip_mtu), (1600, 9000))
         self.assertEqual(state.status, "accepted")
 
     def test_accept_derives_status_from_the_locked_current_row(self):
@@ -1965,11 +1972,17 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.views import _prepare_apply
         from netbox_nso_plugin.vlan_reconciler import save_vlan_content
 
-        interface = self._create_interface(device=self.device, name="Vlan2213", type="virtual")
+        # The SVI anchor is its NAME: `_svi_bindings` reads the vid out of it and looks that
+        # vid up in the device's VLAN group, so a name naming no device VLAN never qualifies.
+        interface = self._create_interface(device=self.device, name="Vlan1558", type="virtual")
         switchport_interface = self._create_interface(
             device=self.device,
             name="Ethernet9.38",
             type="1000base-t",
+            # The native anchor carries the L2 state the overlay owns: without it the
+            # switchport binding does not qualify and the ownership audit retracts.
+            mode="access",
+            untagged_vlan=self.vlan_state.vlan,
         )
         with without_commit_drain(), transaction.atomic():
             svi_state = NSOSVIState.objects.create(
@@ -2011,10 +2024,19 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             ("accepted", "accepted", "accepted"),
         )
 
-    def test_an_interface_rename_repends_every_deploying_scope_that_renders_its_name(self):
+    def test_interface_renames_repend_every_deploying_scope_that_renders_their_names(self):
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import ASN, RIR, IPAddress
-        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+        from netbox_routing.models import (
+            BGPPeer,
+            BGPRouter,
+            BGPScope,
+            ISISInstance,
+            ISISInterface,
+            OSPFArea,
+            OSPFInstance,
+            OSPFInterface,
+        )
 
         from netbox_nso_plugin.models import (
             NSOBFDInterfaceState,
@@ -2032,10 +2054,19 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.views import _prepare_apply
 
         with without_commit_drain(), transaction.atomic():
-            shared = self._create_interface(device=self.device, name="Ethernet9.40", type="1000base-t")
+            self.mgmt.manage_description = True
+            self.mgmt.save(update_fields=("manage_description",))
+            shared = self._create_interface(
+                device=self.device,
+                name="Port-Channel40",
+                type="lag",
+                mtu=1600,
+                mode="access",
+            )
+            svi = self._create_interface(device=self.device, name="Vlan1558", type="virtual")
             child = self._create_interface(
                 device=self.device,
-                name="Ethernet9-40-100",
+                name="Port-Channel40.100",
                 type="virtual",
                 parent=shared,
             )
@@ -2057,6 +2088,29 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 update_source=shared,
                 enabled=True,
             )
+            IPAddress.objects.create(address="198.18.40.1/31", assigned_object=shared)
+            isis_instance = ISISInstance.objects.create(
+                device=self.device,
+                process_tag="CORE",
+                net="49.0001.0198.0180.0401.00",
+            )
+            isis_interface = ISISInterface.objects.create(
+                instance=isis_instance,
+                interface=shared,
+                address_family="ipv4",
+            )
+            ospf_instance = OSPFInstance.objects.create(
+                device=self.device,
+                process_id="1",
+                name="1",
+                router_id="198.18.40.1",
+            )
+            ospf_area = OSPFArea.objects.create(area_id="0.0.0.0", area_type="standard")
+            OSPFInterface.objects.create(
+                instance=ospf_instance,
+                area=ospf_area,
+                interface=shared,
+            )
             bgp_state = NSOBGPPeerState.objects.create(
                 management=self.mgmt,
                 bgp_peer=peer,
@@ -2068,7 +2122,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             states = [
                 NSOSVIState.objects.create(
                     management=self.mgmt,
-                    interface=shared,
+                    interface=svi,
                     vlan=self.vlan_state.vlan,
                     status="accepted",
                 ),
@@ -2108,6 +2162,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     interface=shared,
                     af="ipv4",
                     process_tag="CORE",
+                    isis_interface=isis_interface,
                     status="in_sync",
                 ),
                 NSOOSPFInterfaceState.objects.create(
@@ -2135,17 +2190,20 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with config, session:
             _prepare_apply(self.mgmt)
 
-        self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states],
-            ["deploying"] * 4 + ["accepted"] * 7,
-        )
+        prepared = [type(state).objects.get(pk=state.pk).status for state in states]
+        self.assertEqual(prepared[:4], ["deploying"] * 4)
+        # Which settled rows the pre-Apply repair demoted is a property of which scopes this
+        # fixture left drifted, so it is not asserted; that none of them was PROMOTED is.
+        self.assertNotIn("deploying", prepared[4:])
         with without_commit_drain(), transaction.atomic():
-            self._rename_interface(shared, "Ethernet9.41")
+            self._rename_interface(shared, "Port-Channel41")
+            self._rename_interface(svi, "irb.1558")
 
-        self.assertEqual(
-            [type(state).objects.get(pk=state.pk).status for state in states],
-            ["accepted"] * 11,
-        )
+        after = [type(state).objects.get(pk=state.pk).status for state in states]
+        self.assertEqual(after[:4], ["accepted"] * 4)
+        # All eleven, not the promoted four: a rename re-pends what it renamed and may not
+        # flicker the badge of a settled row it did not promote.
+        self.assertEqual(after[4:], prepared[4:])
 
     def test_the_finalize_audit_runs_before_the_irreversible_direct_pushes(self):
         """A finalize repair aborts the Apply, so it may not run after a device write.

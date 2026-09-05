@@ -23,6 +23,18 @@ def _make_device(tag="mtu"):
     return Device.objects.create(name=f"rtr-{tag}", device_type=dt, role=role, site=site)
 
 
+def _mtu_entry(interface_name, **values):
+    entry = {
+        "interface_name": interface_name,
+        "mtu": None,
+        "ip_mtu": None,
+        "mpls_mtu": None,
+        "bound_port": "",
+    }
+    entry.update(values)
+    return entry
+
+
 class TestInterfaceMtuReconciler(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -38,7 +50,7 @@ class TestInterfaceMtuReconciler(TestCase):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
         orphan = _make_device("orphan")
-        assert reconcile_interface_mtu(orphan, {"interfaces": [{"interface_name": "X", "mtu": 9000}]}) == []
+        assert reconcile_interface_mtu(orphan, {"interfaces": [_mtu_entry("X", mtu=9000)]}) == []
 
     def test_reconcile_preflights_exact_overlay_creation(self):
         from netbox_nso_plugin.interface_mtu_reconciler import interface_mtu_reconcile_plan
@@ -46,7 +58,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
         plan = interface_mtu_reconcile_plan(
             self.device,
-            {"interfaces": [{"interface_name": self.po1.name, "mtu": 9000}]},
+            {"interfaces": [_mtu_entry(self.po1.name, mtu=9000)]},
         )
 
         self.assertIsInstance(plan, RendererMutationPlan)
@@ -63,9 +75,9 @@ class TestInterfaceMtuReconciler(TestCase):
         )
         from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
 
-        payload = {"interfaces": [{"interface_name": self.po1.name, "mtu": 9000}]}
+        payload = {"interfaces": [_mtu_entry(self.po1.name, mtu=9000)]}
         plan = interface_mtu_reconcile_plan(self.device, payload)
-        payload["interfaces"][0] = {"interface_name": self.lag99.name, "mtu": 1500}
+        payload["interfaces"][0] = _mtu_entry(self.lag99.name, mtu=1500)
 
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation:
@@ -109,28 +121,108 @@ class TestInterfaceMtuReconciler(TestCase):
         self.assertEqual(lag.ip_mtu, 9170)
         self.assertEqual(lag.bound_port, "lag-99")
 
-    def test_duplicate_interface_entries_use_the_first_observation(self):
+    def test_conflicting_duplicate_interface_entries_are_rejected(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
-        rows = reconcile_interface_mtu(
-            self.device,
-            {
-                "interfaces": [
-                    {"interface_name": self.po1.name, "mtu": 1500},
-                    {"interface_name": self.po1.name, "mtu": 9000},
-                ]
-            },
+        with self.assertRaisesRegex(AdapterError, "duplicate interface_name") as raised:
+            reconcile_interface_mtu(
+                self.device,
+                {
+                    "interfaces": [
+                        _mtu_entry(self.po1.name, mtu=1500),
+                        _mtu_entry(self.po1.name, mtu=9000),
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
+    def test_missing_interface_collection_is_rejected_before_stale_rows_are_changed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=1500,
+            status="imported",
         )
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).l2_mtu, 1500)
+        with self.assertRaisesRegex(AdapterError, "interfaces must be a list") as raised:
+            reconcile_interface_mtu(self.device, {})
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertTrue(NSOInterfaceMtuState.objects.filter(pk=state.pk).exists())
+
+    def test_missing_required_interface_members_are_rejected(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        complete = {
+            "interface_name": self.po1.name,
+            "mtu": 1500,
+            "ip_mtu": None,
+            "mpls_mtu": None,
+            "bound_port": "",
+        }
+        for field_name in complete:
+            with self.subTest(field_name=field_name):
+                entry = dict(complete)
+                entry.pop(field_name)
+                with self.assertRaisesRegex(AdapterError, f"{field_name} is required") as raised:
+                    reconcile_interface_mtu(self.device, {"interfaces": [entry]})
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
+    def test_missing_interface_name_is_rejected_before_stale_rows_are_changed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=1500,
+            status="imported",
+        )
+
+        for invalid_name in (None, ""):
+            with self.subTest(interface_name=invalid_name):
+                with self.assertRaisesRegex(AdapterError, "interface_name must be a non-empty string") as raised:
+                    reconcile_interface_mtu(
+                        self.device,
+                        {"interfaces": [_mtu_entry(invalid_name, mtu=9000)]},
+                    )
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertTrue(NSOInterfaceMtuState.objects.filter(pk=state.pk).exists())
+
+    def test_malformed_mtu_values_are_rejected_before_planning(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        invalid_entries = (
+            _mtu_entry(self.po1.name, mtu=1500.9),
+            _mtu_entry(self.po1.name, ip_mtu=True),
+            _mtu_entry(self.po1.name, mpls_mtu=-1),
+            _mtu_entry(self.po1.name, bound_port=0),
+        )
+        for entry in invalid_entries:
+            with self.subTest(entry=entry):
+                with self.assertRaises(AdapterError) as raised:
+                    reconcile_interface_mtu(self.device, {"interfaces": [entry]})
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
 
     def test_interface_absent_in_netbox_is_skipped(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
         rows = reconcile_interface_mtu(
             self.device,
-            {"interfaces": [{"interface_name": "TenGig9/9/9", "mtu": 9216}]},
+            {"interfaces": [_mtu_entry("TenGig9/9/9", mtu=9216)]},
         )
         self.assertEqual(rows, [])
         self.assertEqual(NSOInterfaceMtuState.objects.count(), 0)
@@ -138,8 +230,8 @@ class TestInterfaceMtuReconciler(TestCase):
     def test_stale_state_pruned(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]})
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "LAG99:99", "ip_mtu": 9170}]})
+        reconcile_interface_mtu(self.device, {"interfaces": [_mtu_entry("Port-channel1", mtu=9216)]})
+        reconcile_interface_mtu(self.device, {"interfaces": [_mtu_entry("LAG99:99", ip_mtu=9170)]})
         names = set(
             NSOInterfaceMtuState.objects.filter(management=self.management).values_list("interface__name", flat=True)
         )
@@ -148,8 +240,8 @@ class TestInterfaceMtuReconciler(TestCase):
     def test_value_update_on_resync(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]})
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]})
+        reconcile_interface_mtu(self.device, {"interfaces": [_mtu_entry("Port-channel1", mtu=9216)]})
+        reconcile_interface_mtu(self.device, {"interfaces": [_mtu_entry("Port-channel1", mtu=1500)]})
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).l2_mtu, 1500)
 
     def test_category_reconcile_declares_interface_mtu_rows(self):
@@ -157,7 +249,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
         from ._outbox_case import mirror_update
 
-        payload = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 9216}]}
+        payload = {"interfaces": [_mtu_entry("Port-channel1", mtu=9216)]}
         mirror_update(self.management, adapter_device_id=76)
         self.addCleanup(mirror_update, self.management, adapter_device_id=None)
         with (
@@ -177,7 +269,10 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         cls.management = NSODeviceManagement.objects.create(
             device=cls.device, nso_instance=cls.instance, nso_device_name="rtr-mtuwp", adapter_device_id=77
         )
-        cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
+        # `mtu` is the native anchor the MTU binding reads. Only this class sets it: the
+        # reconciler class above asserts what a device read CREATES, and seeding it there
+        # would pre-answer the question those cases ask.
+        cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag", mtu=9216)
 
     def _state(self, l2_mtu=9216, status="accepted"):
         from uuid import uuid4
@@ -195,7 +290,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
 
         self._state(l2_mtu=9216, status="accepted")
         # Device still reports the OLD mtu (operator's change not applied yet).
-        reconcile_interface_mtu(self.device, {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]})
+        reconcile_interface_mtu(self.device, {"interfaces": [_mtu_entry("Port-channel1", mtu=1500)]})
         state = NSOInterfaceMtuState.objects.get(interface=self.po1)
         self.assertEqual(state.l2_mtu, 9216)  # operator intent preserved, not overwritten
         self.assertEqual(state.status, "accepted")  # device mismatch → holds accepted
@@ -232,11 +327,11 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         state = mirror_update(state, status="deploying", apply_attempt_id=attempt_id)
         matching = {
             "interfaces": [
-                {"interface_name": "Port-channel1", "mtu": 9000},
-                {"interface_name": "Port-channel2", "mtu": 1500},
+                _mtu_entry("Port-channel1", mtu=9000),
+                _mtu_entry("Port-channel2", mtu=1500),
             ]
         }
-        non_matching_with_content_delta = {"interfaces": [{"interface_name": "Port-channel1", "mtu": 1500}]}
+        non_matching_with_content_delta = {"interfaces": [_mtu_entry("Port-channel1", mtu=1500)]}
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
@@ -358,6 +453,40 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")  # differing value → pending apply
         self.assertIsNotNone(state.accepted_at)
+
+    def test_accept_retries_when_mtu_changes_before_planning(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        state = self._state(l2_mtu=1500, status="changed")
+        User = get_user_model()
+        admin = User.objects.create_superuser(username="mtu-race", password="pw", email="r@x.y")  # noqa: S106
+        self.client.force_login(admin)
+        original_build = RendererMutationPlan.build
+        changed = False
+
+        def build_after_concurrent_edit(**kwargs):
+            nonlocal changed
+            if not changed:
+                NSOInterfaceMtuState.objects.filter(pk=state.pk).update(l2_mtu=9000)
+                changed = True
+            return original_build(**kwargs)
+
+        with (
+            patch.object(RendererMutationPlan, "build", side_effect=build_after_concurrent_edit),
+            patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"),
+        ):
+            response = self.client.post(f"/plugins/nso/interface-mtu/state/{state.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.po1.refresh_from_db()
+        self.assertEqual(state.l2_mtu, 9000)
+        self.assertEqual(self.po1.mtu, 9000)
 
     def test_edit_form_flags_unowned_changed(self):
         from netbox_nso_plugin.forms import NSOInterfaceMtuStateForm

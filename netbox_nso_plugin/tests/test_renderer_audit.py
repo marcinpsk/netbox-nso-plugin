@@ -206,11 +206,11 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         )
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
-        own_vlan(self.management, 1629, "renderer-audit-baseline")
+        baseline = own_vlan(self.management, 1629, "renderer-audit-baseline")
         revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
         before_revision = revision.revision
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
-        vlan = VLAN(vid=1630, name="renderer-audit-created")
+        vlan = VLAN(group=baseline.vlan.group, vid=1630, name="renderer-audit-created")
         VLAN.objects.bulk_create([vlan])
         state = NSOVLANState(
             management=self.management,
@@ -235,7 +235,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
                 device_id=self.device.pk,
                 scope="vlan",
                 native_model_label="ipam.vlan",
-                native_key={"group_id": None, "vid": 1630},
+                native_key={"group_id": baseline.vlan.group_id, "vid": 1630},
                 ownership_state="owned",
             ).exists()
         )
@@ -454,7 +454,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
 
         def _touch_then_delegate(device_id, scopes):
             # Runs after the plan is frozen and before the repair takes its locks.
-            NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now())
+            in_thread(lambda: NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now()))
             return audit_scope_footprint(device_id, scopes)
 
         with patch(

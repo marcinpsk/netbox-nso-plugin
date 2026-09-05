@@ -431,6 +431,7 @@ def _fleet_rotation(device_ids):
 def audit_renderer_fleet() -> RendererFleetAuditResult:
     """Audit managed devices until the one shared cadence deadline expires."""
     from .models import NSODeviceManagement
+    from .provision_lifecycle import sweep_provision_tombstones
 
     budget = _setting(
         "renderer_audit_tick_budget_seconds",
@@ -439,6 +440,15 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
     )
     deadline = _monotonic() + budget
     scopes = tuple(delivery.delivery_keys())
+    # The provision backstop belongs on this five-minute cadence rather than on the hourly job:
+    # an orphan offboard or a stranded onboard would otherwise wait an hour. It runs before
+    # the device loop, which can spend the whole budget, and its failure is not this pass's.
+    try:
+        sweep_provision_tombstones(deadline=deadline)
+    except DeploymentQuiesced:
+        raise
+    except Exception:  # noqa: BLE001 (the next cadence retries the sweep)
+        logger.exception("renderer cadence provision-tombstone sweep failed")
     device_ids = tuple(
         NSODeviceManagement.objects.filter(adapter_device_id__isnull=False)
         .order_by("device_id")

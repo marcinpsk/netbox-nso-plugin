@@ -641,6 +641,7 @@ class TestRealBodyGateSweep(TestCase):
                             "mtu": 9100,
                             "ip_mtu": 9000,
                             "mpls_mtu": 9088,
+                            "bound_port": "",
                         }
                     ]
                 elif fetcher == "get_l2_services":

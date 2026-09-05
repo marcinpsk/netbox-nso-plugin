@@ -51,12 +51,9 @@ _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagg
 
 
 def _validated_vlan_id(value, field_name):
-    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+    if type(value) is not int:
         raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response")
-    try:
-        vlan_id = int(value)
-    except (TypeError, ValueError) as exc:
-        raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response") from exc
+    vlan_id = value
     if not 1 <= vlan_id <= 4094:
         raise AdapterError(f"{field_name} must be between 1 and 4094", code="invalid_response")
     return vlan_id
@@ -78,11 +75,11 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
             vlan_id = _validated_vlan_id(item.get("vlan_id"), "VLAN payload entry vlan_id")
         except AdapterError as exc:
             raise AdapterError(f"VLAN payload entry is invalid: {exc}", code="invalid_response") from exc
+        name = item.get("name")
+        if "name" not in item or not isinstance(name, str):
+            raise AdapterError("VLAN payload entry name must be a string", code="invalid_response")
         if vlan_id in seen:
             continue
-        name = item.get("name")
-        if name is not None and not isinstance(name, str):
-            raise AdapterError("VLAN payload entry name must be a string or null", code="invalid_response")
         seen.add(vlan_id)
         normalized.append({**item, "vlan_id": vlan_id})
     return tuple(normalized)
@@ -120,6 +117,8 @@ def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
                 f"switchport payload entry {name} contains duplicate tagged VLANs",
                 code="invalid_response",
             )
+        if "untagged_vlan" not in item:
+            raise AdapterError("switchport payload entry untagged_vlan is required", code="invalid_response")
         untagged = item.get("untagged_vlan")
         if untagged is not None:
             untagged = _validated_vlan_id(untagged, "untagged_vlan")

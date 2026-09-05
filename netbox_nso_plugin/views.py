@@ -218,10 +218,8 @@ class DeviceNSOTabView(generic.ObjectView):
         device = instance
         mgmt = getattr(device, "nso_management", None)
 
-        # Self-heal a stranded async onboard: if the provision job already finished but no
-        # dashboard/status poll was open to catch it, advance the row now so simply opening
-        # this tab completes onboarding (flip to ready → the un-gated signal maps/scopes/syncs).
-        # Best-effort: a poll error leaves the row provisioning and never breaks the render.
+        # Give the fenced provision tombstone sweep another completion opportunity. A transient
+        # attempt lookup error leaves the row provisioning and never breaks the render.
         if mgmt is not None and mgmt.onboard_status == "provisioning":
             from .onboarding import advance_provisioning
 
@@ -2266,7 +2264,10 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
                 f"Provisioning {device} into NSO ({instance.name})… this list updates automatically.",
             )
         else:
-            messages.error(request, f"Could not onboard {device}: {result['error']}")
+            error = result["error"]
+            if isinstance(error, dict):
+                error = error.get("message") or "A provision attempt is already active."
+            messages.error(request, f"Could not onboard {device}: {error}")
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
 
@@ -2314,19 +2315,10 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
 
 
 class NSOOnboardStatusView(NSOActionPermissionMixin, View):
-    """Advance + report an async onboarding job — polled by the dashboard while a row provisions.
+    """Run the fenced provision-attempt sweep and report the management status.
 
-    Provisioning runs as a background adapter job; the NSODeviceManagement row sits in
-    ``provisioning`` (its adapter-push signal gated) until this view, polled client-side,
-    sees the job finish and advances the row:
-
-      * job succeeded + result.ok  → ``onboard_status=""`` (ready). Saving re-fires
-        ``sync_scope_to_adapter`` (no longer gated) → adapter mapping + scope + sync-notify.
-      * job succeeded + ``ok=False`` (a blocking step failed) or job failed/timeout →
-        ``provision_failed`` + recorded steps/error (no adapter push).
-
-    Idempotent: once the row is terminal (``""`` / ``provision_failed``) it just reports that.
-    A transient adapter error while polling keeps the row provisioning so the client retries.
+    The dashboard invokes this view while a row is provisioning. The durable tombstone remains
+    the sole completion owner. Once the row is terminal, this view only reports its status.
 
     URL: POST /plugins/nso/onboard-status/<pk>/  (pk = NSODeviceManagement id)
     """
@@ -2334,7 +2326,7 @@ class NSOOnboardStatusView(NSOActionPermissionMixin, View):
     required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
 
     def post(self, request, pk):
-        """Poll the provision job and advance the row; return its onboarding status as JSON."""
+        """Sweep the provision attempt and return its onboarding status as JSON."""
         from .onboarding import advance_provisioning
 
         mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
@@ -4847,60 +4839,99 @@ def _save_owned_overlay_only_edit(obj, old_values):
         writer.save(candidate, update_fields=update_fields)
 
 
-def _write_owned_interface_mtu(candidate, update_fields):
+def _write_owned_interface_mtu(
+    candidate,
+    update_fields,
+    *,
+    planned_at,
+    expected_state_values,
+    expected_interface_mtu,
+):
     """Write one MTU ownership claim and its native interface value."""
     import copy
 
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import (
+        IntentPlanStaleError,
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
     saves = []
-    interface_candidate = None
+    operations = []
+    state_fields = set(update_fields) | set(expected_state_values)
     if candidate.l2_mtu is not None:
         clamped = min(int(candidate.l2_mtu), NSOInterfaceMtuStateAcceptView._NETBOX_MTU_MAX)
-        if candidate.interface.mtu != clamped:
-            interface_candidate = copy.copy(candidate.interface)
-            interface_candidate.mtu = clamped
-            saves.append(planned_save(interface_candidate, update_fields=("mtu",)))
-    saves.append(planned_save(candidate, update_fields=update_fields))
+        interface = copy.copy(candidate.interface)
+        interface.mtu = clamped
+        fields = ("mtu",)
+        saves.append(planned_save(interface, update_fields=fields))
+        operations.append((interface, fields))
+    saves.append(planned_save(candidate, update_fields=state_fields))
+    operations.append((candidate, state_fields))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=candidate.accepted_at)
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    expected_before = {
+        (candidate._meta.label_lower, candidate.pk): expected_state_values,
+    }
+    if candidate.l2_mtu is not None:
+        expected_before[(candidate.interface._meta.label_lower, candidate.interface.pk)] = {
+            "mtu": expected_interface_mtu
+        }
+    for write in plan.write_set:
+        expected = expected_before.get((write.model_label, write.pk))
+        if expected is None:
+            continue
+        before_values = dict(write.before_values)
+        if any(before_values.get(field) != value for field, value in expected.items()):
+            raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed before planning")
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
-        if interface_candidate is not None:
-            writer.save(interface_candidate, update_fields=("mtu",))
-        writer.save(candidate, update_fields=update_fields)
+        for instance, fields in operations:
+            writer.save(instance, update_fields=fields)
 
 
-def _save_owned_interface_mtu_edit(obj, old_values):
-    """Claim an inline MTU edit and write its native value through one plan."""
+def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
+    """Claim one MTU edit and save its native interface through one exact plan."""
     import copy
 
     from . import status_machine as sm
     from .renderer_writer import IntentPlanStaleError
 
-    edited_values = {
-        field_name: getattr(obj, field_name)
-        for field_name, old_value in old_values.items()
-        if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
+    planned_at = timezone.now()
+    candidate = copy.copy(obj)
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    edited_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
     }
-    current = obj
-    for attempt in range(2):
-        candidate = copy.copy(current)
-        for field_name, value in edited_values.items():
-            setattr(candidate, field_name, value)
-        if not sm.is_owned(candidate.status):
-            candidate.accepted_at = timezone.now()
-        candidate.status = sm.on_operator_edit(candidate.status)
-        update_fields = {*edited_values, "status"}
-        if candidate.accepted_at is not None:
-            update_fields.add("accepted_at")
-        try:
-            _write_owned_interface_mtu(candidate, update_fields)
-            return
-        except IntentPlanStaleError:
-            if attempt:
-                raise
-            current = type(obj).objects.get(pk=obj.pk)
+    state_fields = set(edited_fields)
+    state_fields.add("status")
+    if candidate.accepted_at is not None:
+        state_fields.add("accepted_at")
+    expected_state_values = {
+        field_name: old_values.get(field_name, getattr(obj, field_name)) for field_name in state_fields
+    }
+    expected_state_values["l2_mtu"] = old_values.get("l2_mtu", obj.l2_mtu)
+
+    try:
+        _write_owned_interface_mtu(
+            candidate,
+            state_fields,
+            planned_at=planned_at,
+            expected_state_values=expected_state_values,
+            expected_interface_mtu=obj.interface.mtu,
+        )
+    except IntentPlanStaleError:
+        if not _retry_on_stale:
+            raise
+        current = type(obj).objects.select_related("interface").get(pk=obj.pk)
+        current_old_values = {field_name: getattr(current, field_name) for field_name in edited_fields}
+        for field_name in edited_fields:
+            setattr(current, field_name, getattr(obj, field_name))
+        _save_owned_interface_mtu_edit(current, current_old_values, _retry_on_stale=False)
 
 
 def _save_owned_overlay_edit(obj, key, old_values):
@@ -4937,24 +4968,7 @@ def _save_owned_overlay_edit(obj, key, old_values):
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
         return
-
-    from . import status_machine as sm
-    from .intent_state import intent_transaction
-
-    with intent_transaction(_owned_overlay_edit_footprint(obj, key)):
-        if not sm.is_owned(obj.status):
-            obj.accepted_at = timezone.now()
-        obj.status = sm.on_operator_edit(obj.status)
-        update_fields = {
-            field_name
-            for field_name, old_value in old_values.items()
-            if hasattr(obj, field_name) and getattr(obj, field_name) != old_value
-        }
-        update_fields.add("status")
-        _clear_apply_attempt(obj, update_fields)
-        if obj.accepted_at is not None:
-            update_fields.add("accepted_at")
-        obj.save(update_fields=update_fields)
+    raise ValueError(f"unsupported owned overlay edit family: {key}")
 
 
 def _route_map_name_errors(state, old_name):
@@ -5511,13 +5525,21 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
         if changed:
+            from .renderer_writer import IntentPlanStaleError
+
             collision = None if key in ("static_route", "vlan_name") else _unique_collision_response(obj, editable)
             if collision is not None:
                 return collision
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
-            errors = _save_overlay_edit(obj, key, old_values)
+            try:
+                errors = _save_overlay_edit(obj, key, old_values)
+            except IntentPlanStaleError:
+                return JsonResponse(
+                    {"status": "error", "message": "Routing state changed. Refresh the page and try again."},
+                    status=409,
+                )
             if errors:
                 return JsonResponse({"status": "error", "errors": errors}, status=400)
         return JsonResponse({"status": "ok", "changed": changed})
@@ -7413,14 +7435,45 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     # NetBox dcim.Interface.mtu max (and the read-side clamp ceiling).
     _NETBOX_MTU_MAX = 65536
 
-    def post(self, request, pk):  # noqa: D102
+    @staticmethod
+    def _accept(state, *, retry_on_stale=True):
         import copy
 
-        state = get_object_or_404(self.model_class, pk=pk)
+        from .renderer_writer import IntentPlanStaleError
+
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(state.status)
         candidate.accepted_at = timezone.now()
-        _write_owned_interface_mtu(candidate, ("status", "accepted_at"))
+        fields = ("status", "accepted_at")
+        expected_state_values = {
+            "status": state.status,
+            "accepted_at": state.accepted_at,
+            "l2_mtu": state.l2_mtu,
+        }
+        try:
+            _write_owned_interface_mtu(
+                candidate,
+                fields,
+                planned_at=candidate.accepted_at,
+                expected_state_values=expected_state_values,
+                expected_interface_mtu=state.interface.mtu,
+            )
+        except IntentPlanStaleError:
+            if not retry_on_stale:
+                raise
+            current = type(state).objects.select_related("interface", "management").get(pk=state.pk)
+            return NSOInterfaceMtuStateAcceptView._accept(current, retry_on_stale=False)
+        return candidate
+
+    def post(self, request, pk):  # noqa: D102
+        from .renderer_writer import IntentPlanStaleError
+
+        state = get_object_or_404(self.model_class.objects.select_related("interface", "management"), pk=pk)
+        try:
+            candidate = self._accept(state)
+        except IntentPlanStaleError:
+            messages.error(request, "Routing state changed. Refresh the page and try again.")
+            return redirect(_device_nso_tab_url(state.management.device_id))
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 

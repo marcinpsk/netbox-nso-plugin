@@ -27,7 +27,7 @@ from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping
 
 from ._adapter_http import make_response
-from ._outbox_case import mirror_update
+from ._outbox_case import mirror_update, open_provision_attempt
 from .test_django_views import ViewTestBase
 
 # Shaped like something that must never be echoed to a client: a requests transport error
@@ -197,9 +197,11 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
                 self.assertIn(_PUBLIC_ADAPTER_ERROR, body)
                 self.assertFalse(any(_LEAK in line for line in logs.output))
 
-    def test_onboard_status_poll_reports_a_fixed_public_error(self):
-        """A transient adapter outage while polling keeps the row provisioning, with no leak."""
+    def test_onboard_status_poll_keeps_a_transport_failure_retryable(self):
+        """A transient attempt lookup failure keeps the row provisioning, with no leak."""
         mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
+        self.mgmt.refresh_from_db()
+        open_provision_attempt(self.mgmt)
 
         with self.assertLogs(_ADAPTER_LOG, level="WARNING"):
             resp = self.client.post(self._url("onboard_status", pk=self.mgmt.pk), **_AJAX)
@@ -207,6 +209,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
         body = resp.json()
         self.assertEqual(body["status"], "provisioning")
         self.assertEqual(body["poll_error"], _PUBLIC_ADAPTER_ERROR)
+        self.assertNotIn(_LEAK, resp.content.decode())
 
     def test_onboarding_api_reports_a_fixed_public_error(self):
         """The API must not copy the dashboard's caught exception into its response."""
@@ -429,6 +432,7 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
 
         mirror_update(self.mgmt, onboard_status="provisioning", onboard_job_id="job-42")
         self.mgmt.refresh_from_db()
+        open_provision_attempt(self.mgmt)
 
         result = advance_provisioning(self.mgmt)
 

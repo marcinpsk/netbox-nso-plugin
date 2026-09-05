@@ -830,8 +830,13 @@ def _queue_scope_sync(sender, instance, created, *, update_fields=None):
     """Queue the adapter-link work for one sanctioned management-row save."""
     from django.db import transaction
 
-    if update_fields and set(update_fields) <= _MANAGEMENT_MIRROR_FIELDS:
-        return
+    fields = set(update_fields or ())
+    if fields and fields <= _MANAGEMENT_MIRROR_FIELDS:
+        from .management_lifecycle import ONBOARD_EVIDENCE_FIELDS
+
+        completed_provision = fields == set(ONBOARD_EVIDENCE_FIELDS) and not instance.onboard_status
+        if not completed_provision:
+            return
     if getattr(instance, "onboard_status", "") in ("provisioning", "provision_failed"):
         return
     transaction.on_commit(lambda: _sync_committed_scope_to_adapter(sender, instance.pk, created))
@@ -1227,55 +1232,6 @@ def _push_intent_on_interface_edit(sender, instance, created, **kwargs):
     if created or not _converted_writer_owns_content(instance.device_id, "interface"):
         return
     _schedule_intent_push((instance.device_id, "interface"))
-
-
-def _create_greenfield_subif_state(sender, instance, created, **kwargs):
-    """Own + push a routed sub-interface the operator just created in NetBox (greenfield write).
-
-    Mirror of the greenfield IP path: a NEW virtual sub-interface (``parent`` set, a numeric
-    dot1q tag in the name suffix — ``ae99.999`` / ``Gi0/1.100``) on a managed device becomes
-    owned intent immediately, so the subinterface-reconciler creates ``<parent> unit <n>
-    vlan-id <n>`` (+ flexible-vlan-tagging / encapsulation flexible-ethernet-services on Junos —
-    see junos-flexible-ethernet-services-dep) on the device. Adapter-origin writes
-    (imports/applies) are skipped — importing a subif from the device is not an operator create.
-    Nokia ``:`` logical subifs ride the IP-path greenfield binding, so only ``.``<digits>
-    (Junos/IOS) is handled here.
-    """
-    if not created or _is_adapter_origin_write() or instance.parent_id is None:
-        return
-    name = instance.name or ""
-    if "." not in name:
-        return
-    suffix = name.rsplit(".", 1)[1]
-    if not suffix.isdigit():
-        return
-
-    from .models import NSODeviceManagement, NSOSubinterfaceState
-
-    try:
-        mgmt = NSODeviceManagement.objects.get(device_id=instance.device_id)
-    except NSODeviceManagement.DoesNotExist:
-        return
-    if mgmt.adapter_device_id is None:
-        return
-
-    if not _converted_writer_owns_content(instance.device_id, "subinterface"):
-        return
-
-    from .renderer_writer import active_renderer_writer
-
-    active = active_renderer_writer()
-    if active is None:
-        return
-    candidate = NSOSubinterfaceState(
-        management=mgmt,
-        interface=instance,
-        parent_interface=instance.parent,
-        dot1q_vlan=int(suffix),
-        status="accepted",
-        accepted_at=active.plan.planned_at,
-    )
-    active.save(candidate, force_insert=True)
 
 
 def interface_ip_intent_item(row):
@@ -2149,30 +2105,9 @@ def _on_static_route_state_delete(sender, instance, **kwargs):
 
 # ── Greenfield static routes (operator-created in NetBox, not yet on the device) ──
 #
-# The reconcile path only ever creates an NSOStaticRouteState overlay for a route the
-# device already reports (brownfield adoption). These handlers add the missing direction:
-# a netbox_routing.StaticRoute the operator assigns to a managed device becomes an
-# *accepted* overlay (owned intent) and pushes; removing/deleting it pushes the removal
-# (full-replace). All wired from the plugin against the netbox_routing model — no fork edit.
-
-
-def _static_route_content(static_route) -> tuple:
-    """Return the wire-visible content of *static_route* — what a push would carry.
-
-    A delta here is new intent for every device that owns the route; a delta anywhere
-    else is not. ``name`` and ``interface_next_hop`` never reach the wire for a pushable
-    route, so editing them is not an intent change.
-    """
-    return (
-        static_route.vrf_id,
-        str(static_route.prefix or ""),
-        str(static_route.next_hop or ""),
-        static_route.metric,
-        # The wire sends ``permanent or False``, so None and False are one value there —
-        # treating them as a delta would bump a generation over an identical payload.
-        bool(static_route.permanent),
-        static_route.tag,
-    )
+# Exact writers own static-route mutations and overlay transitions. These handlers only
+# schedule the content keys frozen in the active plan. Native signals do not infer
+# ownership or rebuild a write set after persistence.
 
 
 #: Every field :func:`_arm_static_route_generation` writes. The accept paths save the row
@@ -2189,10 +2124,8 @@ _STATIC_ROUTE_ARMED_FIELDS = (
 def _arm_static_route_generation(state) -> None:
     """Give *state* a fresh generation in memory — the caller saves it.
 
-    For the accept paths, which never save the native route (so no ``pre_save`` fires and
-    the content transition cannot see them) yet are still a new statement of intent: the
-    result of the apply that already failed must not be able to settle the row the
-    operator has just re-accepted.
+    An accept is a new statement of intent. An apply result for the prior generation must
+    not settle the row that the operator has just re-accepted.
     """
     from .intent_generation import allocate_intent_generation
 
@@ -2210,58 +2143,6 @@ _STATIC_ROUTE_TRANSITION_FIELDS = (
     "status",
     *_STATIC_ROUTE_ARMED_FIELDS,
 )
-
-
-def _transition_static_route_content(static_route, previous=None) -> list:
-    """Re-arm every owned overlay of *static_route* as fresh, unsettled intent.
-
-    *previous* is the pre-save content the delta is judged against; ``None`` means the
-    caller already knows this is a change and wants the transition unconditionally.
-
-    Any operator content edit — identity or not — makes every prior apply result stale.
-    The row goes back to ``accepted`` (fail-closed: "pending apply"), takes a generation
-    no in-flight result can name, and drops the error and advisory that described the
-    generation just superseded. Leaving an edited row ``in_sync`` is a green badge over
-    content the device does not have, and leaving it ``deploying`` lets the apply already
-    in flight settle the *new* intent from the *old* result.
-
-    The fan-out is resolved by querying the overlays, never through ``instance.devices``:
-    the fork's form writes the row before ``devices.set()``, so at ``post_save`` the M2M
-    still reads the pre-edit membership. Rows are locked in ascending management-id order
-    so two edits of one shared route touching the same devices in opposite order cannot
-    deadlock. ``accepted_at`` is left alone — it dates first ownership (staged_days).
-    """
-    from django.db import transaction
-
-    from .models import NSOStaticRouteState
-
-    with transaction.atomic():
-        # The committed row, never the instance: a save(update_fields=…) persists only the
-        # named columns, so an unsaved attribute would otherwise be mirrored and bumped as
-        # intent the push — which re-queries the row — could never send.
-        route_rows = type(static_route)._default_manager.filter(pk=static_route.pk).order_by("pk")
-        committed = route_rows.select_for_update().first()
-        if committed is None:
-            return []
-        if previous is not None and previous == _static_route_content(committed):
-            return []  # nothing the wire carries actually changed
-        vrf_name = committed.vrf.name if committed.vrf else ""
-        prefix = str(committed.prefix or "")
-        next_hop = str(committed.next_hop or "")
-        rows = list(
-            NSOStaticRouteState.objects.select_for_update()
-            .filter(static_route=static_route, status__in=_OWNED_PUSH_STATUSES)
-            .order_by("management_id")
-        )
-        for row in rows:
-            row.nso_vrf = vrf_name
-            row.nso_prefix = prefix
-            row.nso_next_hop = next_hop
-            row.status = "accepted"
-            _arm_static_route_generation(row)
-            # → _on_static_route_state_save, which coalesces to one push per device.
-            row.save(update_fields=list(_STATIC_ROUTE_TRANSITION_FIELDS))
-    return rows
 
 
 def _static_route_delete_transition(row, static_route_id):
@@ -3783,11 +3664,6 @@ def _connect_g_activated():  # pragma: no cover
         dispatch_uid="nso_plugin_iface_derived_intent",
     )
     post_save.connect(
-        _create_greenfield_subif_state,
-        sender=Interface,
-        dispatch_uid="nso_plugin_iface_greenfield_subif",
-    )
-    post_save.connect(
         _on_ip_address_change,
         sender=IPAddress,
         dispatch_uid="nso_plugin_ipaddress_post_save",
@@ -4196,7 +4072,7 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — redistribution fork signal not registered")
 
-    # netbox_routing.StaticRoute greenfield write path (operator-created routes → push)
+    # netbox_routing.StaticRoute exact-writer delivery notifications.
     try:
         from netbox_routing.models import StaticRoute
 

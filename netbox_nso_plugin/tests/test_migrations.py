@@ -27,9 +27,26 @@ DEPLOYMENT_CONTROL = "0019_intent_deployment_control"
 APPLY_IDENTITY = "0020_nsoapplyattempt_nsointentrevision_and_more"
 PRE_BGP_MERGE_BASE_RESET = "0023_outbox_contribution_kind"
 BGP_MERGE_BASE_RESET = "0024_reset_bgp_merge_bases"
+PRE_OWNERSHIP_EXECUTION = BGP_MERGE_BASE_RESET
 
 
 class TestMigrationGraph(SimpleTestCase):
+    def test_interface_ip_allocation_kind_is_added_once(self):
+        from django.db import migrations
+
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        additions = [
+            name
+            for (app, name), migration in loader.disk_migrations.items()
+            if app == APP
+            for operation in migration.operations
+            if isinstance(operation, migrations.AddField)
+            and operation.model_name == "nsointerfaceipstate"
+            and operation.name == "allocation_kind"
+        ]
+
+        self.assertEqual(additions, [APPLY_IDENTITY])
+
     def test_the_push_sequence_reverse_is_a_noop(self):
         from django.db import migrations
 
@@ -340,6 +357,7 @@ class TestBGPMergeBaseMigration(_CascadeFlushMixin, TransactionTestCase):
         self._migrate(BGP_MERGE_BASE_RESET)
         template_state.refresh_from_db()
         template_base_was_reset = template_state.device_base_hash == ""
+        self._migrate_to_leaves()
 
         drifted = copy.deepcopy(payload)
         drifted["routers"][0]["scopes"][0]["peers"][0]["ttl"] = 2
@@ -347,3 +365,40 @@ class TestBGPMergeBaseMigration(_CascadeFlushMixin, TransactionTestCase):
 
         self.assertEqual(result[0].status, "changed")
         self.assertTrue(template_base_was_reset)
+
+
+class TestOwnershipIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
+    def _migrate(self, target):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate([(APP, target)])
+        return executor.loader.project_state([(APP, target)]).apps
+
+    def _migrate_to_leaves(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes(APP))
+
+    def test_pre_target_manifests_are_discarded(self):
+        from ._outbox_case import make_managed
+
+        device, _management = make_managed("ownership-identity-migration", 1627)
+        self.addCleanup(self._migrate_to_leaves)
+        old_apps = self._migrate(PRE_OWNERSHIP_EXECUTION)
+        OldManifest = old_apps.get_model(APP, "NSOOwnershipManifest")
+        OldManifest.objects.create(
+            device_id=device.pk,
+            scope="interface",
+            native_model_label="dcim.interface",
+            native_key={"device_id": device.pk, "name": "Ethernet1"},
+        )
+
+        self._migrate_to_leaves()
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        self.assertFalse(NSOOwnershipManifest.objects.exists())

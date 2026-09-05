@@ -23,6 +23,7 @@ from dcim.models import Device
 from django.db import connection
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
@@ -68,6 +69,24 @@ def _adapter_row(mgmt, **overrides):
     }
     row.update(overrides)
     return row
+
+
+def _stamp_verified_baselines(mgmt):
+    """Give *mgmt* a verified delivery baseline on every scope, as a settled audit leaves it."""
+    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.models import NSOIntentRevision
+
+    for scope in delivery.delivery_keys():
+        NSOIntentRevision.objects.update_or_create(
+            device=mgmt.device,
+            scope=scope,
+            defaults={
+                "revision": 4,
+                "verified_revision": 4,
+                "verified_fingerprint": f"verified-{scope}",
+                "verified_at": timezone.now(),
+            },
+        )
 
 
 def _scope_404_for(*dead_ids):
@@ -123,6 +142,29 @@ class _SyncCacheTestBase(TestCase):
             adapter_device_id=adapter_device_id,
             **kwargs,
         )
+
+
+class TestInvalidateDeliveryBaselines(_SyncCacheTestBase):
+    def test_a_partially_held_scope_set_locks_only_the_remaining_revisions(self):
+        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin.intent_state import MutationFootprint, mirror_transaction
+        from netbox_nso_plugin.sync_cache import invalidate_delivery_baselines
+
+        management = self._mgmt("cache-partial-baseline-lock", 618)
+        _stamp_verified_baselines(management)
+        scopes = tuple(delivery.delivery_keys())
+        self.assertGreater(len(scopes), 1)
+        held = min(scopes)
+        unlocked = tuple(scope for scope in scopes if scope != held)
+
+        with mirror_transaction(MutationFootprint.for_keys(((management.device_id, held),))):
+            with patch(
+                "netbox_nso_plugin.apply_state.lock_intent_revisions",
+                wraps=apply_state.lock_intent_revisions,
+            ) as lock_revisions:
+                invalidate_delivery_baselines(management.device_id)
+
+        lock_revisions.assert_called_once_with(management.device_id, unlocked)
 
 
 class TestRefreshSyncCaches(_SyncCacheTestBase):
@@ -524,6 +566,68 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertNotIn(196, [call.args[0] for call in set_scope.call_args_list])
         self.assertEqual(onboard.call_count, 1)
 
+    def test_repairs_an_unmapped_management_row(self):
+        """A row with no stored adapter id is an explicit repair class, not invisible."""
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-unmapped", None)
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 704}) as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        onboard.assert_called_once()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 704)
+
+    def test_unmapped_row_adopts_its_one_matching_adapter_device(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-unmapped-adopt", None)
+        _stamp_verified_baselines(mgmt)
+        present = _adapter_row(mgmt, id=812)
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[present]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        onboard.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 812)
+        self.assertEqual(set_scope.call_args[0][0], 812)
+        self.assertFalse(NSOIntentRevision.objects.filter(device=mgmt.device, verified_revision__isnull=False).exists())
+
+    def test_unmapped_row_with_multiple_matching_devices_is_ambiguous(self):
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-unmapped-ambiguous", None)
+        twins = [_adapter_row(mgmt, id=813), _adapter_row(mgmt, id=814)]
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=twins),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertIsNone(mgmt.adapter_device_id)
+        self.assertEqual(mgmt.adapter_link_error, "Adapter identity is ambiguous; repair requires operator action.")
+
     def test_relink_pushes_scope_against_the_fresh_id(self):
         """The dead id is tried, then the whole link is redone against the new device row.
 
@@ -637,6 +741,164 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual(stale.last_sync_status, "concurrent")
         self.assertEqual(healthy.adapter_device_id, 807)  # the next row still proceeds
 
+    def test_remap_invalidates_every_delivery_baseline(self):
+        """A new mapping identity creates audit work instead of only changing the pointer."""
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-remap-baseline", 196)
+        _stamp_verified_baselines(mgmt)
+        moved = _adapter_row(mgmt, id=809)
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[moved]),
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertFalse(
+            NSOIntentRevision.objects.filter(
+                device=mgmt.device,
+                verified_revision__isnull=False,
+            ).exists()
+        )
+
+    def test_ambiguous_identity_keeps_its_verified_baselines_across_sweeps(self):
+        """A mapping only an operator can repair must not blank 18 baselines every sweep.
+
+        Two adapter rows claim this device's logical identity, so the sweep can prove nothing
+        and writes nothing. It flags the row and moves on. Invalidating on the way in made
+        that no-op branch throw away every verified fingerprint on the device, every five
+        minutes, forcing a full 18-scope repair for as long as the ambiguity lasts.
+        """
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-ambiguous", 196)
+        _stamp_verified_baselines(mgmt)
+        twins = [_adapter_row(mgmt, id=810), _adapter_row(mgmt, id=811)]
+
+        for _sweep in range(2):
+            with (
+                patch("netbox_nso_plugin.adapter_client.list_devices", return_value=twins),
+                patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+                patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+                patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+                self.captureOnCommitCallbacks(execute=True),
+            ):
+                broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+            self.assertEqual((broken, attempted), (1, 1))
+            onboard.assert_not_called()
+            set_scope.assert_not_called()
+
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 196)  # nothing was remapped
+        self.assertEqual(mgmt.adapter_link_error, "Adapter identity is ambiguous; repair requires operator action.")
+        self.assertEqual(
+            NSOIntentRevision.objects.filter(device=mgmt.device, verified_revision=4).count(),
+            len(delivery.delivery_keys()),
+        )
+
+    def test_identity_change_routes_through_the_fenced_rekey(self):
+        """The same adapter mapping under an old source tuple is patched, not re-onboarded."""
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-identity-changed", 196)
+        adapter_row = _adapter_row(mgmt, nso_device_name="old-device-name")
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[adapter_row]),
+            patch(
+                "netbox_nso_plugin.adapter_client.patch_device",
+                return_value={"source_epoch": 9},
+            ) as rekey,
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        rekey.assert_called_once_with(
+            adapter_device_id=196,
+            nso_instance=mgmt.nso_instance.adapter_instance_id,
+            nso_device_name=mgmt.nso_device_name,
+        )
+        onboard.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 196)
+        self.assertFalse(mgmt.source_rekey_pending)
+
+    def test_failed_rekey_fence_skips_the_full_save(self):
+        """A rejected fence write must not let the re-save push under the old source identity."""
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-fence-stale", 196)
+        _stamp_verified_baselines(mgmt)
+        second = self._mgmt("cache-fence-next", 197)
+        renamed = _adapter_row(mgmt, nso_device_name="old-device-name")
+        original_build = RendererMutationPlan.build
+        full_save_pks = []
+        scope_calls = []
+        fence_plan_staled = False
+
+        def build_then_stale_fence(*args, **kwargs):
+            nonlocal fence_plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
+            if proposed_save is not None and proposed_save.update_fields is None:
+                full_save_pks.append(proposed_save.instance.pk)
+            plan = original_build(*args, **kwargs)
+            if (
+                proposed_save is not None
+                and proposed_save.update_fields == ("source_rekey_pending",)
+                and proposed_save.instance.pk == mgmt.pk
+            ):
+                fence_plan_staled = True
+                concurrent = NSODeviceManagement.objects.get(pk=mgmt.pk)
+                concurrent.last_sync_status = "concurrent"
+                save_management(concurrent, update_fields={"last_sync_status"})
+            return plan
+
+        def fake_set_scope(adapter_device_id, *args, **kwargs):
+            scope_calls.append(adapter_device_id)
+            if adapter_device_id == 197:
+                raise AdapterError("Device not found", code="not_found")
+            return {}
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[renamed]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 700}),
+            patch("netbox_nso_plugin.adapter_client.patch_device") as rekey,
+            patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=fake_set_scope),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale_fence),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (2, 2))
+        self.assertTrue(fence_plan_staled)
+        self.assertNotIn(mgmt.pk, full_save_pks)  # the rejected row never reached the full save
+        self.assertEqual(scope_calls, [197, 700])  # nothing pushed under the old source identity
+        rekey.assert_not_called()
+        self.assertEqual(
+            NSOIntentRevision.objects.filter(device=mgmt.device, verified_revision=4).count(),
+            len(delivery.delivery_keys()),
+        )
+        mgmt.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 196)
+        self.assertFalse(mgmt.source_rekey_pending)  # still unfenced, for a later sweep to retry
+        self.assertEqual(mgmt.last_sync_status, "concurrent")
+        self.assertEqual(second.adapter_device_id, 700)  # the next row still repaired
+
     def test_drops_a_reused_id_before_pushing_anything(self):
         """An id owned by another device is dropped FIRST, so no scope reaches that device.
 
@@ -711,6 +973,28 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 619)
         self.assertEqual(mgmt.last_sync_status, "concurrent")
+
+    def test_drops_an_unlinked_id_owned_by_another_logical_device(self):
+        """An unlinked foreign row is reuse, not evidence of an in-place source rekey."""
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-reused-unlinked", 620)
+        stranger = _adapter_row(mgmt, nso_device_name="somebody-else", netbox_device_id=None)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[stranger]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 901}) as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        onboard.assert_called_once()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 901)
+        self.assertFalse(mgmt.source_rekey_pending)
 
     def test_leaves_healthy_rows_alone(self):
         """Every mapping resolving to its own device → nothing to reconcile, no onboard call."""

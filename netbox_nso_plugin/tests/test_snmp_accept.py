@@ -132,9 +132,8 @@ class TestSnmpAcceptView(_SnmpBase):
         assert c.status == "in_sync"
         assert c.accepted_at is not None
 
-    def test_accept_with_vault_ref_pushes_intent(self):
-        """Accepting a community that has a Vault ref stores it in the SNMP intent
-        mirror (deferred); the device Apply later commits it."""
+    def test_writer_with_vault_ref_pushes_intent(self):
+        """The writer sends a stored Vault reference in SNMP intent."""
         import copy
 
         from django.utils import timezone

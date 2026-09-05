@@ -32,10 +32,11 @@ _NEVER_ATTEMPTED = datetime.min.replace(tzinfo=UTC)
 MAX_RELINKS_PER_RUN = 10
 
 # Row classifications against one adapter snapshot.
-_MATCHED = "matched"  # our id, and it is our device — safe to mirror
-_REUSED = "reused"  # our id exists but belongs to a DIFFERENT device — never touch it
-_MOVED = "moved"  # our device is there under a different id — adopt it
-_MISSING = "missing"  # our device is not in the adapter at all — re-link it
+_MATCHED = "matched"
+_UNMAPPED = "unmapped"
+_REMAPPED = "remapped"
+_DELETED = "deleted"
+_IDENTITY_CHANGED = "identity_changed"
 
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
 
@@ -168,21 +169,28 @@ def _index(payload):
 
 def _classify(mgmt, by_id, by_identity):
     """Classify one management row against the snapshot. Returns ``(state, adapter_device)``."""
+    if mgmt.adapter_device_id is None:
+        candidates = [d for d in by_identity.get(_row_identity(mgmt), []) if _is_ours(mgmt, d)]
+        if len(candidates) == 1:
+            return _REMAPPED, candidates[0]
+        if len(candidates) > 1:
+            return _IDENTITY_CHANGED, None
+        return _UNMAPPED, None
     current = by_id.get(mgmt.adapter_device_id)
     if current is not None:
-        return (_MATCHED, current) if _is_ours(mgmt, current) else (_REUSED, current)
+        return (_MATCHED, current) if _is_ours(mgmt, current) else (_IDENTITY_CHANGED, current)
     candidates = [d for d in by_identity.get(_row_identity(mgmt), []) if _is_ours(mgmt, d)]
     # Exactly one unambiguous owner can be adopted; several means duplicate adapter rows for
     # one node, which is a conflict to surface rather than a mapping to guess at.
     if len(candidates) == 1:
-        return _MOVED, candidates[0]
+        return _REMAPPED, candidates[0]
     if len(candidates) > 1:
-        return _REUSED, None
-    return _MISSING, None
+        return _IDENTITY_CHANGED, None
+    return _DELETED, None
 
 
 def _snapshot(rows):
-    """Fetch one adapter device snapshot for *rows*. Returns ``(mapped, by_id, by_identity)``.
+    """Fetch one adapter device snapshot for *rows*. Returns ``(rows, by_id, by_identity)``.
 
     ``by_id`` is None when the adapter could not be reached — nothing is provable, so callers
     must do nothing rather than treat an outage as "every mapping is broken".
@@ -190,16 +198,16 @@ def _snapshot(rows):
     from . import adapter_client as client
     from .adapter_client import AdapterError
 
-    mapped = [m for m in rows if m.adapter_device_id is not None]
-    if not mapped:
+    candidates = list(rows)
+    if not candidates:
         return [], None, None
     try:
         payload = client.list_devices() or []
     except AdapterError as exc:
         logger.debug("adapter snapshot unavailable: %s", exc)
-        return mapped, None, None
+        return candidates, None, None
     by_id, by_identity = _index(payload)
-    return mapped, by_id, by_identity
+    return candidates, by_id, by_identity
 
 
 def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
@@ -210,7 +218,14 @@ def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
     Only rows whose stored id still resolves to their own device are mirrored — see the module
     docstring on why a bare id match is unsafe. An adapter outage leaves the mirror untouched.
     """
-    mapped, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
+    if snapshot is None:
+        mapped = [m for m in rows if m.adapter_device_id is not None]
+        if not mapped:
+            return 0, 0
+        candidates, by_id, by_identity = _snapshot(mapped)
+    else:
+        candidates, by_id, by_identity = snapshot
+        mapped = [m for m in candidates if m.adapter_device_id is not None]
     if by_id is None:
         return len(mapped), 0
     updated = 0
@@ -219,7 +234,7 @@ def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
         if state is _MATCHED:
             if refresh_sync_cache(mgmt, adapter_device):
                 updated += 1
-        elif state in (_REUSED, _MISSING) and not (mgmt.onboard_status or mgmt.source_rekey_pending):
+        elif state is not _MATCHED and not (mgmt.onboard_status or mgmt.source_rekey_pending):
             # A page render can PROVE the mapping is wrong but does not repair it (that is the
             # job's work). Record it now, or the row keeps rendering its last good 'succeeded'
             # until the next sweep — the stale-green lie this whole change exists to remove.
@@ -239,10 +254,10 @@ def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
     for mgmt in mapped:
         # A row mid-provision has no adapter device yet by design and its push is gated.
         # A row mid-rekey is NOT broken either: NetBox already carries the new NSO name while
-        # the adapter still carries the old one, so it reads as "reused". Dropping its pointer
-        # here would strand it for good — _snapshot only considers rows that HAVE an id, and
-        # re-onboarding the new identity collides with the old row still holding this
-        # netbox_device_id. _sync_source_change owns that transition, dead mapping included.
+        # the adapter still carries the old one, so it classifies as identity_changed. Dropping
+        # its pointer would let the generic repair re-onboard the new identity while the old
+        # adapter row still holds this netbox_device_id. _sync_source_change owns that fenced
+        # transition, including a dead mapping.
         if mgmt.onboard_status or mgmt.source_rekey_pending:
             continue
         state, adapter_device = _classify(mgmt, by_id, by_identity)
@@ -251,7 +266,33 @@ def _broken_links(mapped, by_id, by_identity) -> list[tuple]:
     return broken
 
 
-def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
+def invalidate_delivery_baselines(device_id: int) -> None:
+    """Create audit work for every scope after adapter identity recovery.
+
+    The blanking UPDATE takes the same L7 revision rows either way; taking them through
+    ``lock_intent_revisions`` first is what puts them in canonical scope order, the order every
+    other writer of these rows uses (``renderer_audit._leave_unknown``, ``_acquire``).
+    """
+    from django.db import transaction
+
+    from . import delivery
+    from .apply_state import lock_intent_revisions
+    from .intent_state import revision_was_acquired
+    from .models import NSOIntentRevision
+
+    scopes = tuple(delivery.delivery_keys())
+    with transaction.atomic():
+        unlocked_scopes = tuple(scope for scope in scopes if not revision_was_acquired(device_id, scope))
+        if unlocked_scopes:
+            lock_intent_revisions(device_id, unlocked_scopes)
+        NSOIntentRevision.objects.filter(device_id=device_id, scope__in=scopes).update(
+            verified_revision=None,
+            verified_fingerprint=None,
+            verified_at=None,
+        )
+
+
+def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C901
     """Repair rows whose ``adapter_device_id`` no longer resolves to their own adapter device.
 
     An adapter device row can disappear under a live management row — a provision that rolled
@@ -263,10 +304,12 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     Repairs, all of which re-save the row so the real link path (onboard → scope → sync-notify)
     runs and records its own outcome on the row:
 
-    * *moved* — our device is present under a different id → adopt that id, no onboard needed.
-    * *reused* — our id belongs to someone else → drop the pointer FIRST, so the re-save can
-      never push this device's scope onto the other one, then re-link by identity.
-    * *missing* — our device is absent → re-save; the not-found scope push re-onboards it.
+    * *remapped*: our device is present under another id. Adopt that id, no onboard is needed.
+    * *identity_changed*: our id resolves to a different owner. If the NetBox device is still
+      ours, arm the source-rekey fence. If it belongs to someone else, drop the pointer first, so the re-save can
+      never push this device's scope onto theirs. Several adapter rows claiming our identity is
+      ambiguous: flag it for the operator and write nothing.
+    * *unmapped* / *deleted*: no live mapping. Re-save the row. The not-found scope push re-onboards it.
 
     Returns ``(broken, attempted)``. Attempts are capped at :data:`MAX_RELINKS_PER_RUN`; rows
     over the cap keep an ``adapter_link_error`` so nothing is silently deferred, and the
@@ -276,11 +319,11 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
     row that repaired nothing still spends the cap, on every run. With ``B`` broken rows and
     cap ``C`` every one of them is attempted within ``ceil(B / C)`` ticks — five minutes each.
     """
-    mapped, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
+    candidates, by_id, by_identity = snapshot if snapshot is not None else _snapshot(rows)
     if by_id is None:
         return 0, 0
 
-    broken = _broken_links(mapped, by_id, by_identity)
+    broken = _broken_links(candidates, by_id, by_identity)
     if not broken:
         return 0, 0
 
@@ -314,23 +357,50 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                 if not _mirror_management(current, adapter_link_attempted_at=now):
                     continue
                 attempted += 1
-                if state is _MOVED:
+                if state is _REMAPPED:
                     logger.warning(
-                        "Adapter device for %s moved from id %s to %s — adopting",
+                        "Adapter device for %s now resolves to id %s (previous mapping: %s). Adopting it.",
                         current.nso_device_name,
-                        current.adapter_device_id,
                         adapter_device["id"],
+                        "none" if current.adapter_device_id is None else current.adapter_device_id,
                     )
                     if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
                         continue
-                elif state is _REUSED:
+                    invalidate_delivery_baselines(current.device_id)
+                elif state is _IDENTITY_CHANGED:
+                    if adapter_device is None:
+                        # Nothing is provable and nothing is written, so nothing may be invalidated:
+                        # blanking here cost the device its whole verified baseline on every sweep.
+                        _flag_link_error(current, "Adapter identity is ambiguous; repair requires operator action.")
+                        continue
+                    if adapter_device.get("netbox_device_id") == current.device_id:
+                        logger.warning(
+                            "Adapter source identity changed for device id %s. Routing through the rekey fence.",
+                            current.adapter_device_id,
+                        )
+                        if not _mirror_management(current, source_rekey_pending=True):
+                            continue
+                    else:
+                        logger.warning(
+                            "Adapter device id %s belongs to another NetBox device. Dropping the stale pointer.",
+                            current.adapter_device_id,
+                        )
+                        if not _mirror_management(current, adapter_device_id=None):
+                            continue
+                    invalidate_delivery_baselines(current.device_id)
+                elif state is _UNMAPPED:
+                    # The pointer is already null and this branch does not change it. The repair
+                    # that cleared it already invalidated, and a new row never delivered.
+                    logger.warning("Management row %s has no adapter mapping. Re-linking it.", current.pk)
+                elif state is _DELETED:
                     logger.warning(
-                        "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
+                        "Adapter device id %s for %s was deleted. Re-linking it.",
                         current.adapter_device_id,
                         current.nso_device_name,
                     )
-                    if not _mirror_management(current, adapter_device_id=None):
-                        continue
+                    # The row that held every verified baseline is gone. The re-link creates a
+                    # fresh adapter device that holds none of it.
+                    invalidate_delivery_baselines(current.device_id)
                 save_management(current)
         except _LinkReconcileNoOp:
             continue

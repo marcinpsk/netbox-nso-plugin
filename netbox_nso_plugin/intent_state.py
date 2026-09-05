@@ -1670,6 +1670,8 @@ def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
         name = getattr(instance, "object_name", "")
         management = getattr(instance, "management", None)
         if family and name and management is not None:
+            # The shared revision keys serialize consumer writes. This state-row path
+            # does not mutate consumer overlays, so it needs no consumer row locks.
             return route_policy_footprint(
                 {(family, name)},
                 device_ids=(management.device_id,),

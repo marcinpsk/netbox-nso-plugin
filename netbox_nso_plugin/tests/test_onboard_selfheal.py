@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Self-healing of stranded async-onboarding rows.
+"""Self-healing of stranded asynchronous provision attempts.
 
-A provision job that finishes while nobody is polling the dashboard would otherwise strand
-the NSODeviceManagement row in ``provisioning`` forever — NSO has onboarded the node, yet the
-gated adapter-push signal never fires, so the plugin never maps/scopes/syncs it (the reported
-bug: device onboarded in NSO, but the NSO tab shows nothing and there is no journal/changelog).
-
-Two backstops advance such a row without the dashboard being open, both via
-``advance_provisioning`` so the un-gated signal re-fires on success:
-  * opening the device NSO tab (:class:`DeviceNSOTabView`), and
-  * the hourly :class:`AdvanceStaleOnboardingJob` sweep.
+The durable provision tombstone owns completion even when the dashboard is closed. The device
+NSO tab and the hourly system job both invoke the same fenced tombstone sweep.
 """
 
 from unittest.mock import patch
@@ -19,16 +12,29 @@ from dcim.models import Device
 from django.test import TestCase
 
 from netbox_nso_plugin.adapter_client import AdapterError
-from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOProvisionTombstone
 
 from .test_django_views import ViewTestBase
 from .test_onboarding import _device
 
-# A finished, successful provision job as the adapter's /jobs/{id} would report it.
+# Finished evidence returned by the provision-attempt endpoint.
 _SUCCEEDED_OK = {
     "status": "succeeded",
     "result": {"ok": True, "steps": [{"step": "sync_from", "status": "ok"}], "device_id": None},
 }
+
+
+def _provision_tombstone(mgmt, job_id):
+    tombstone = NSOProvisionTombstone(
+        netbox_device_id=mgmt.device_id,
+        nso_instance=mgmt.nso_instance.adapter_instance_id,
+        nso_device_name=mgmt.nso_device_name,
+        canonical_request={},
+        adapter_job_id=job_id,
+    )
+    tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+    tombstone.save(force_insert=True)
+    return tombstone
 
 
 class TestOnboardTabSelfHeal(ViewTestBase):
@@ -46,16 +52,16 @@ class TestOnboardTabSelfHeal(ViewTestBase):
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
-        return dev, mgmt
+        return dev, mgmt, _provision_tombstone(mgmt, job_id)
 
     @patch("netbox_nso_plugin.adapter_client.get_device", side_effect=AdapterError("no adapter"))
     @patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None)
     @patch("netbox_nso_plugin.adapter_client.set_scope")
     @patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 4242})
-    @patch("netbox_nso_plugin.adapter_client.get_job", return_value=_SUCCEEDED_OK)
-    def test_tab_render_advances_finished_row(self, _job, onboard, _scope, _notify, _dev):
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value=_SUCCEEDED_OK)
+    def test_tab_render_advances_finished_row(self, _attempt, onboard, _scope, _notify, _dev):
         """GET on the device NSO tab flips a finished provisioning row to ready and maps it."""
-        dev, mgmt = self._provisioning_device("tab-heal-rtr")
+        dev, mgmt, _tombstone = self._provisioning_device("tab-heal-rtr")
         # The adapter push is deferred to transaction.on_commit (signals.py
         # sync_scope_to_adapter); TestCase rolls its transaction back, so without this the
         # callback never runs and onboard_device is never called.
@@ -67,10 +73,10 @@ class TestOnboardTabSelfHeal(ViewTestBase):
         onboard.assert_called_once()  # the gated adapter-push signal re-fired
         self.assertEqual(mgmt.adapter_device_id, 4242)  # device now mapped in the adapter
 
-    @patch("netbox_nso_plugin.adapter_client.get_job", return_value={"status": "running"})
-    def test_tab_render_leaves_running_row_provisioning(self, _job):
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value={"status": "running"})
+    def test_tab_render_leaves_running_row_provisioning(self, _attempt):
         """A still-running job leaves the row provisioning (nothing to map yet)."""
-        dev, mgmt = self._provisioning_device("tab-still-running")
+        dev, mgmt, _tombstone = self._provisioning_device("tab-still-running")
         resp = self.client.get(f"/dcim/devices/{dev.pk}/nso/")
         self.assertEqual(resp.status_code, 200)
         mgmt.refresh_from_db()
@@ -78,10 +84,10 @@ class TestOnboardTabSelfHeal(ViewTestBase):
         self.assertIsNone(mgmt.adapter_device_id)  # signal still gated
 
     @patch("netbox_nso_plugin.adapter_client.get_device", side_effect=AdapterError("no adapter"))
-    @patch("netbox_nso_plugin.adapter_client.get_job", side_effect=AdapterError("adapter down"))
-    def test_tab_render_survives_poll_error(self, _job, _dev):
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=AdapterError("adapter down"))
+    def test_tab_render_survives_poll_error(self, _attempt, _dev):
         """A transient adapter outage during the self-heal never 500s the tab; row stays provisioning."""
-        dev, mgmt = self._provisioning_device("tab-adapter-down")
+        dev, mgmt, _tombstone = self._provisioning_device("tab-adapter-down")
         resp = self.client.get(f"/dcim/devices/{dev.pk}/nso/")
         self.assertEqual(resp.status_code, 200)
         mgmt.refresh_from_db()
@@ -97,13 +103,14 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
 
     def _provisioning(self, name, job_id):
         dev = _device(name)
-        return NSODeviceManagement.objects.create(
+        mgmt = NSODeviceManagement.objects.create(
             device=dev,
             nso_instance=self.instance,
             nso_device_name=name,
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
+        return mgmt, _provision_tombstone(mgmt, job_id)
 
     @patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None)
     @patch("netbox_nso_plugin.adapter_client.set_scope")
@@ -112,15 +119,15 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         """Sweep advances the row whose job finished, leaves the still-running one alone."""
         from netbox_nso_plugin.onboarding import advance_stale_onboarding_rows
 
-        done = self._provisioning("sweep-done", "J-DONE")
-        running = self._provisioning("sweep-run", "J-RUN")
+        done, done_attempt = self._provisioning("sweep-done", "J-DONE")
+        running, _running_attempt = self._provisioning("sweep-run", "J-RUN")
 
-        def fake_get_job(job_id):
-            return _SUCCEEDED_OK if job_id == "J-DONE" else {"status": "running"}
+        def fake_get_attempt(attempt_id):
+            return _SUCCEEDED_OK if attempt_id == done_attempt.provision_attempt_id else {"status": "running"}
 
         with (
-            patch("netbox_nso_plugin.adapter_client.get_job", side_effect=fake_get_job),
-            # the mapping push is an on_commit callback — execute it inside the test txn
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=fake_get_attempt),
+            # The mapping push is an on_commit callback. Execute it inside the test transaction.
             self.captureOnCommitCallbacks(execute=True),
         ):
             checked, advanced = advance_stale_onboarding_rows()
@@ -140,15 +147,15 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         """One row raising must not abort the sweep — the healthy row still advances."""
         from netbox_nso_plugin.onboarding import advance_stale_onboarding_rows
 
-        bad = self._provisioning("sweep-bad", "J-BAD")  # created first → visited first
-        good = self._provisioning("sweep-good", "J-GOOD")
+        bad, bad_attempt = self._provisioning("sweep-bad", "J-BAD")
+        good, _good_attempt = self._provisioning("sweep-good", "J-GOOD")
 
-        def fake_get_job(job_id):
-            if job_id == "J-BAD":
-                raise ValueError("boom")  # NOT AdapterError → propagates out of advance_provisioning
+        def fake_get_attempt(attempt_id):
+            if attempt_id == bad_attempt.provision_attempt_id:
+                raise ValueError("boom")
             return _SUCCEEDED_OK
 
-        with patch("netbox_nso_plugin.adapter_client.get_job", side_effect=fake_get_job):
+        with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=fake_get_attempt):
             checked, advanced = advance_stale_onboarding_rows()
 
         self.assertEqual(checked, 2)
@@ -169,16 +176,34 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
 
         for index, steps in enumerate(("boom", 3, [{"status": "failed"}, "boom"])):
             with self.subTest(steps=steps):
-                mgmt = self._provisioning(f"sweep-steps-{index}", "J-STEPS")
+                mgmt, _attempt = self._provisioning(f"sweep-steps-{index}", "J-STEPS")
                 job = {"status": "succeeded", "result": {"ok": False, "steps": steps}}
 
-                with patch("netbox_nso_plugin.adapter_client.get_job", return_value=job):
+                with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value=job):
                     result = advance_provisioning(mgmt)
 
                 self.assertEqual(result["status"], "provision_failed")
                 mgmt.refresh_from_db()
                 self.assertEqual(mgmt.onboard_status, "provision_failed")
                 self.assertTrue(mgmt.onboard_error)
+
+    def test_untracked_failure_does_not_overwrite_concurrent_completion(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        stale, tombstone = self._provisioning("sweep-concurrent-completion", "J-COMPLETE")
+        tombstone.delete()
+        current = NSODeviceManagement.objects.get(pk=stale.pk)
+        current.onboard_status = ""
+        current.onboard_error = ""
+        save_management(current, update_fields=["onboard_status", "onboard_error"])
+
+        result = advance_provisioning(stale)
+
+        self.assertEqual(result, {"status": "ready", "error": ""})
+        current.refresh_from_db()
+        self.assertEqual(current.onboard_status, "")
+        self.assertEqual(current.onboard_error, "")
 
     def test_system_job_run_delegates_to_sweep(self):
         """The JobRunner.run wrapper calls the sweep (thin shell around the domain function)."""
@@ -192,13 +217,13 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         from netbox_nso_plugin.deployment import quiesce, resume
         from netbox_nso_plugin.jobs import AdvanceStaleOnboardingJob
 
-        mgmt = self._provisioning("sweep-quiesced", "J-QUIESCED")
+        mgmt, _attempt = self._provisioning("sweep-quiesced", "J-QUIESCED")
         quiesce()
         try:
             with (
                 self.assertNoLogs("netbox_nso_plugin.onboarding", level="ERROR"),
                 self.assertLogs("netbox_nso_plugin.jobs", level="INFO") as logged,
-                patch("netbox_nso_plugin.adapter_client.get_job") as get_job,
+                patch("netbox_nso_plugin.adapter_client.get_provision_attempt") as get_provision_attempt,
             ):
                 result = AdvanceStaleOnboardingJob.run(None)
         finally:
@@ -207,7 +232,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         self.assertIsNone(result)
         self.assertEqual(len(logged.output), 1)
         self.assertIn("paused for an intent deployment", logged.output[0])
-        get_job.assert_not_called()
+        get_provision_attempt.assert_not_called()
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
 
@@ -221,8 +246,8 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         self.assertEqual(registry["system_jobs"][AdvanceStaleOnboardingJob]["interval"], 60)
 
 
-class TestOnboardAdvanceJob(TestCase):
-    """run_onboard_advance is the RQ job body enqueued by the provision-complete callback."""
+class TestProvisionTombstoneSweepJob(TestCase):
+    """The attempt-addressed RQ job invokes the sole completion owner."""
 
     @classmethod
     def setUpTestData(cls):
@@ -231,10 +256,10 @@ class TestOnboardAdvanceJob(TestCase):
     @patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None)
     @patch("netbox_nso_plugin.adapter_client.set_scope")
     @patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 909})
-    @patch("netbox_nso_plugin.adapter_client.get_job", return_value=_SUCCEEDED_OK)
-    def test_run_onboard_advance_flips_ready_and_maps(self, _job, onboard, _scope, _notify):
-        """The job advances a finished provisioning row to ready and fires the mapping signal."""
-        from netbox_nso_plugin.reconcile import run_onboard_advance
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value=_SUCCEEDED_OK)
+    def test_run_sweep_flips_ready_and_maps(self, _attempt, onboard, _scope, _notify):
+        """The job advances a finished attempt and fires the mapping signal."""
+        from netbox_nso_plugin.reconcile import run_provision_tombstone_sweep
 
         dev = _device("advjob-rtr")
         mgmt = NSODeviceManagement.objects.create(
@@ -244,15 +269,21 @@ class TestOnboardAdvanceJob(TestCase):
             onboard_status="provisioning",
             onboard_job_id="J1",
         )
-        with self.captureOnCommitCallbacks(execute=True):  # deferred adapter push
-            run_onboard_advance(mgmt.id)
+        tombstone = _provision_tombstone(mgmt, "J1")
+        with self.captureOnCommitCallbacks(execute=True):
+            run_provision_tombstone_sweep(tombstone.provision_attempt_id)
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "")
         self.assertEqual(mgmt.adapter_device_id, 909)
         onboard.assert_called_once()
 
-    def test_run_onboard_advance_missing_row_is_noop(self):
-        """A deleted/unknown row id is a safe no-op (the callback can race a row delete)."""
-        from netbox_nso_plugin.reconcile import run_onboard_advance
+    def test_run_sweep_missing_attempt_is_noop(self):
+        """An unknown attempt is a safe no-op."""
+        from uuid import UUID
 
-        run_onboard_advance(9_999_999)  # must not raise
+        from netbox_nso_plugin.reconcile import run_provision_tombstone_sweep
+
+        self.assertEqual(
+            run_provision_tombstone_sweep(UUID("00000000-0000-4000-8000-000000000001")),
+            (0, 0),
+        )

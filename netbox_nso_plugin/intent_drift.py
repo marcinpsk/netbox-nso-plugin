@@ -381,11 +381,28 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
             before.append(snapshot)
             operations.append((candidate, tuple(update_fields)))
             route_checks.append(copy.copy(row.static_route))
+
+        expected_pks = tuple(row.pk for row in candidates)
+
+        def validate_armable_rows():
+            armable_pks = tuple(
+                NSOStaticRouteState.objects.filter(
+                    signals.PUSHED_STATIC_ROUTE_FILTER,
+                    pk__in=expected_pks,
+                    intent_generation=UNALLOCATED,
+                )
+                .order_by("management_id", "pk")
+                .values_list("pk", flat=True)
+            )
+            if not armable_pks:
+                raise _StaticRouteBackfillNoOp
+
         plan = RendererMutationPlan.build(
             saves=(
                 *(planned_save(route, update_fields=()) for route in route_checks),
                 *(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
-            )
+            ),
+            validate_after_acquire=validate_armable_rows,
         )
         try:
             with signals.suppress_intent_push(), renderer_writes(plan) as writer:
@@ -393,6 +410,8 @@ def _backfill_static_route_generations(mgmt) -> list[dict]:
                     writer.save(route, update_fields=())
                 for candidate, fields in operations:
                     writer.save(candidate, update_fields=fields)
+        except _StaticRouteBackfillNoOp:
+            return []
         except IntentPlanStaleError:
             if attempt:
                 raise
@@ -463,10 +482,24 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         candidate = copy.copy(state)
         for field_name, value in fields.items():
             setattr(candidate, field_name, value)
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields, expected_before=state),))
+
+        def validate_restore_target():
+            if not NSOStaticRouteState.objects.filter(
+                pk=pk,
+                intent_generation=armed_generation,
+                status=armed_status,
+            ).exists():
+                raise _RestoreNoOp
+
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields, expected_before=state),),
+            validate_after_acquire=validate_restore_target,
+        )
         try:
             with suppress_intent_push(), renderer_writes(plan) as writer:
                 writer.save(candidate, update_fields=fields)
+        except _RestoreNoOp:
+            continue
         except IntentPlanStaleError:
             logger.warning(
                 "Static-route overlay %s kept its armed generation because its restore plan went stale",

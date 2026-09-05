@@ -109,6 +109,15 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertEqual(locked.pk, self.state.pk)
 
+    def test_owned_vlan_fixture_reuses_the_production_vlan_group(self):
+        group = self.state.vlan.group
+        group.name = "Operator renamed group"
+        group.save(update_fields=["name"])
+
+        second = own_vlan(self.management, 1624, "intent-permit-second")
+
+        self.assertEqual(second.vlan.group, group)
+
     def test_interface_create_updates_the_registered_device_counter(self):
         from dcim.models import Interface
 

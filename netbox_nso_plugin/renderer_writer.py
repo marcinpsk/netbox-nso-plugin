@@ -51,7 +51,7 @@ class RendererWrite:
     values: tuple[tuple[str, Any], ...] = ()
     before_values: tuple[tuple[str, Any], ...] = ()
     selected_pks: tuple[Any, ...] = ()
-    selected_preimages: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...] = ()
+    selected_before_values: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...] = ()
     cascade: bool = False
     force_insert: bool = False
 
@@ -98,7 +98,7 @@ class RendererSetUpdate:
 
     model_label: str
     selected_pks: tuple[Any, ...]
-    selected_preimages: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...]
+    selected_before_values: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...]
     values: tuple[tuple[str, Any], ...]
 
 
@@ -150,7 +150,7 @@ def planned_delete(instance) -> RendererDelete:
 def planned_set_update(queryset, **values) -> RendererSetUpdate:
     """Freeze one queryset and its exact set-based update values."""
     model = queryset.model
-    selected_rows = tuple(queryset.order_by("pk"))
+    selected = tuple(queryset.order_by("pk"))
     normalized = tuple(
         sorted(
             (
@@ -162,8 +162,8 @@ def planned_set_update(queryset, **values) -> RendererSetUpdate:
     )
     return RendererSetUpdate(
         model_label=model._meta.label_lower,
-        selected_pks=tuple(row.pk for row in selected_rows),
-        selected_preimages=tuple((row.pk, _field_values(row, None)) for row in selected_rows),
+        selected_pks=tuple(row.pk for row in selected),
+        selected_before_values=tuple((row.pk, _field_values(row, None)) for row in selected),
         values=normalized,
     )
 
@@ -546,13 +546,19 @@ def _materialize_field_update_rows(rows):
     return type(materialized[0]), materialized
 
 
-def _collector_writes(instance):
+def _append_deleted_overlay(deleted_overlays, row):
+    if row._meta.label_lower in OVERLAY_MODEL_RANKS:
+        deleted_overlays.append(row)
+
+
+def _collector_closure(instance):
     from django.db.models.deletion import Collector
 
     collector = Collector(using=instance._state.db or "default", origin=instance)
     collector.collect([instance])
     root_identity = (instance._meta.label_lower, instance.pk)
     writes = []
+    deleted_overlays = []
     footprints = []
     changed_keys = set()
     specs = renderer_input_specs()
@@ -570,6 +576,7 @@ def _collector_writes(instance):
 
     for model, rows in collector.data.items():
         for row in sorted(rows, key=lambda instance: instance.pk):
+            _append_deleted_overlay(deleted_overlays, row)
             writes.append(
                 RendererWrite(
                     operation="delete",
@@ -582,6 +589,7 @@ def _collector_writes(instance):
             record_change(row, None)
     for queryset in collector.fast_deletes:
         for row in queryset.order_by("pk"):
+            _append_deleted_overlay(deleted_overlays, row)
             writes.append(
                 RendererWrite(
                     operation="delete",
@@ -614,7 +622,12 @@ def _collector_writes(instance):
                     field.delete_cached_value(after)
                 record_change(row, after)
     footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
-    return tuple(writes), footprint, changed_keys
+    return tuple(writes), tuple(deleted_overlays), footprint, changed_keys
+
+
+def _collector_writes(instance):
+    writes, _deleted_overlays, footprint, changed_keys = _collector_closure(instance)
+    return writes, footprint, changed_keys
 
 
 def _plan_delete(proposed: RendererDelete):
@@ -681,7 +694,7 @@ def _load_frozen_set_rows(model, operation):
     selected_rows = tuple(model._default_manager.filter(pk__in=operation.selected_pks).order_by("pk"))
     if (
         tuple(row.pk for row in selected_rows) != operation.selected_pks
-        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_preimages
+        or tuple((row.pk, _field_values(row, None)) for row in selected_rows) != operation.selected_before_values
     ):
         raise IntentPlanStaleError(f"{operation.model_label} selected rows changed after planning")
     return selected_rows
@@ -710,7 +723,7 @@ def _plan_set_update(proposed: RendererSetUpdate):
         update_fields=tuple(sorted(values)),
         values=proposed.values,
         selected_pks=proposed.selected_pks,
-        selected_preimages=proposed.selected_preimages,
+        selected_before_values=proposed.selected_before_values,
     )
     footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
     return write, footprint, changed_keys
@@ -873,6 +886,12 @@ def _maintain_manifest(instance):
     from .ownership_planner import maintain_manifest
 
     maintain_manifest(instance)
+
+
+def _retire_overlay_manifest(instance):
+    from .ownership_planner import retire_overlay_manifest
+
+    retire_overlay_manifest(instance)
 
 
 class RendererWriter:
@@ -1121,7 +1140,7 @@ class RendererWriter:
         current = type(instance)._default_manager.filter(pk=instance.pk).first()
         if current is None or not self._fields_match(root_write.before_values, current):
             raise IntentPlanStaleError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
-        closure, _footprint, _changed_keys = _collector_writes(current)
+        closure, deleted_overlays, _footprint, _changed_keys = _collector_closure(current)
         matched = []
         available = [candidate for candidate in range(len(self.plan.write_set)) if candidate not in self._consumed]
         for expected in closure:
@@ -1135,8 +1154,12 @@ class RendererWriter:
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
             raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
+        for overlay in deleted_overlays:
+            _retire_overlay_manifest(overlay)
         with self._operation(index):
             result = instance.delete()
+        if current._meta.label_lower not in OVERLAY_MODEL_RANKS:
+            _retire_overlay_manifest(current)
         self._consumed.update(matched)
         return result
 
