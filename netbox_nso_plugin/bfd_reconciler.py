@@ -160,7 +160,8 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
         if owned:
             matches = all(entry.get(field) == getattr(state, field) for field in ("min_tx", "min_rx", "multiplier"))
             matches = matches and state.micro_bfd == bool(entry.get("micro_bfd", False))
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            # A matching read is not apply evidence: only a correlated apply result settles deploying.
+            state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             state.min_tx = entry.get("min_tx")
             state.min_rx = entry.get("min_rx")
