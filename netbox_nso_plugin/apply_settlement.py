@@ -408,7 +408,12 @@ def _record_replay_answer(attempt, result=None, error=None) -> None:
     if isinstance(result, dict):
         status = 200 if result.get("outcome") == "no_op" else 202
         response = result
-    elif error is not None and type(error.status_code) is int and isinstance(error.response, dict):
+    elif (
+        error is not None
+        and error.definitely_not_enqueued
+        and type(error.status_code) is int
+        and isinstance(error.response, dict)
+    ):
         status = error.status_code
         response = error.response
     else:

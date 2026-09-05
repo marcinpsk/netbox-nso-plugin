@@ -442,6 +442,93 @@ class TestAttemptSettlement(TestCase):
         self.assertIsNone(local.response)
         self.assertTrue(any("job 900" in message for message in logs.output))
 
+    def test_an_ambiguous_replay_failure_leaves_the_attempt_answerable(self):
+        """A 503 replay may still have enqueued the Apply, so it may not become the stored answer.
+
+        The stored response is immutable and settlement rejects later evidence that differs from
+        it, so recording an ambiguous failure would block that attempt's rows forever.
+        """
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence, settle_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOInterfaceMtuState
+
+        attempt_id = uuid4()
+        selected = {"interface_mtu": 505}
+        interface = Interface.objects.create(device=self.device, name="Port-channel1642", type="lag")
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=interface,
+            l2_mtu=9000,
+            status="deploying",
+            last_apply_at=timezone.now(),
+            apply_attempt_id=attempt_id,
+        )
+        local = NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            management=self.management,
+            adapter_device_id=self.adapter_device_id,
+            selected=selected,
+            scope_revisions={"interface_mtu": 1},
+        )
+        unknown = _payload(self.adapter_device_id, [])
+        unknown["unknown_apply_attempt_ids"] = [str(attempt_id)]
+        admitted = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            76,
+            selected,
+            "settled",
+            result={"interface_mtu_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        )
+        applies = []
+        answered = False
+
+        class FlappingSession:
+            def request(_self, method, url, **kwargs):
+                nonlocal answered
+                if url.endswith("/deployment-evidence"):
+                    known = _payload(self.adapter_device_id, [admitted]) if answered else unknown
+                    return make_response(200, known)
+                applies.append(kwargs["json"])
+                if len(applies) == 1:
+                    # Copied from ../nso-adapter/tests/api/openapi_snapshot.json ErrorEnvelope,
+                    # with the nso_unreachable code the adapter answers 503 with.
+                    return make_response(
+                        503,
+                        {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}},
+                    )
+                answered = True
+                return make_response(202, admitted["response"])
+
+        session = FlappingSession()
+
+        def load():
+            with (
+                patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+                patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+            ):
+                return load_deployment_evidence(self.management)
+
+        ambiguous = load()
+
+        self.assertEqual(ambiguous["unknown_apply_attempt_ids"], [str(attempt_id)])
+        local.refresh_from_db()
+        self.assertIsNone(local.http_status)
+        self.assertIsNone(local.response)
+
+        evidence = load()
+
+        local.refresh_from_db()
+        self.assertEqual(local.http_status, 202)
+        self.assertEqual(local.response, admitted["response"])
+        self.assertEqual(applies, [{"apply_attempt_id": str(attempt_id), "selected": selected}] * 2)
+
+        settle_apply_attempts(self.management, evidence, static_route_feed_drained=True)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+
     def test_unknown_generation_status_is_a_non_actionable_contract_error(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
 

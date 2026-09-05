@@ -3119,10 +3119,15 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
     def _adapter_error(self, request, mgmt, exc, prepared, *, action, label, is_ajax):
         """Roll back a definitely rejected Apply and surface the adapter's failure."""
-        definitely_not_enqueued = exc.code == "configuration_error" or (
-            type(exc.status_code) is int and 400 <= exc.status_code < 500
-        )
-        if prepared is not None and type(exc.status_code) is int and isinstance(exc.response, dict):
+        definitely_not_enqueued = exc.definitely_not_enqueued
+        # An ambiguous failure may still have enqueued the Apply, and the stored response is the
+        # attempt's immutable answer, so only a deterministic rejection may become it.
+        if (
+            prepared is not None
+            and definitely_not_enqueued
+            and type(exc.status_code) is int
+            and isinstance(exc.response, dict)
+        ):
             _record_apply_response(prepared, http_status=exc.status_code, response=exc.response)
         if prepared is not None and definitely_not_enqueued:
             _rollback_prepare_apply(prepared)

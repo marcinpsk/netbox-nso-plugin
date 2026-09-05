@@ -6905,3 +6905,106 @@ class TestNSOVLANRescopeView(ViewTestBase):
         self.assertEqual(state.vlan_id, source_vlan.pk)
         self.assertEqual(NSOVLANState.objects.get(pk=late_state_pk).vlan_id, source_vlan.pk)
         self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), revisions_after_attach)
+
+
+class _ApplyBoundaryAdapter(ReceiptAdapter):
+    """A ReceiptAdapter whose Apply and deployment-evidence answers the test supplies.
+
+    ReceiptAdapter models the intent-push boundary only. These two endpoints carry the
+    attempt's admission and the evidence that later settles it, which is what this pin needs.
+    """
+
+    def __init__(self, apply_response, evidence=None):
+        super().__init__()
+        self.apply_response = apply_response
+        self.evidence = evidence
+        self.apply_requests: list[dict] = []
+
+    def _handle(self, method, url, **kwargs):
+        if url.endswith("/deployment-evidence"):
+            assert self.evidence is not None, "this test arranged no deployment evidence"
+            return make_response(200, self.evidence())
+        if method == "POST" and url.endswith("/actions/apply"):
+            self.apply_requests.append(kwargs.get("json"))
+            return make_response(*self.apply_response())
+        return super()._handle(method, url, **kwargs)
+
+
+class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """An ambiguous 5xx may still have enqueued the Apply, so it may not answer the attempt.
+
+    Replay writes only an unanswered attempt and settlement rejects evidence that disagrees
+    with the stored response, so a recorded 503 would strand that attempt's rows forever.
+    """
+
+    reset_sequences = True
+
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        self.user = User.objects.create_superuser(
+            username="applyambiguousadmin", password=TEST_PASSWORD, email="applyambiguous@test.example"
+        )
+        self.client.force_login(self.user)
+        self.device, self.mgmt = make_managed("apambig", 7791)
+        with without_commit_drain(), transaction.atomic():
+            interface = Interface.objects.create(device=self.device, name="Port-channel7791", type="lag")
+            self.mtu_state = NSOInterfaceMtuState.objects.create(
+                management=self.mgmt, interface=interface, l2_mtu=9000, status="accepted"
+            )
+
+    def _apply(self, adapter):
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
+        config, session = adapter.patches()
+        with config, session:
+            return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+    def test_an_ambiguous_apply_failure_leaves_the_attempt_recoverable(self):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from .test_apply_settlement import _attempt, _payload
+
+        # Copied from ../nso-adapter/tests/api/openapi_snapshot.json ErrorEnvelope, with the
+        # nso_unreachable code the adapter answers 503 with.
+        unavailable = {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}}
+
+        response = self._apply(_ApplyBoundaryAdapter(lambda: (503, unavailable)))
+
+        self.assertEqual(response.status_code, 502)
+        attempt = NSOApplyAttempt.objects.get(management=self.mgmt)
+        self.assertIsNone(attempt.http_status)
+        self.assertIsNone(attempt.response)
+        self.mtu_state.refresh_from_db()
+        self.assertEqual(self.mtu_state.status, "deploying")
+
+        adapter_device_id = self.mgmt.adapter_device_id
+        admitted = _attempt(
+            attempt.pk,
+            adapter_device_id,
+            91,
+            dict(attempt.selected),
+            "settled",
+            result={"interface_mtu_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        )
+        unknown = _payload(adapter_device_id, [])
+        unknown["unknown_apply_attempt_ids"] = [str(attempt.pk)]
+        known = _payload(adapter_device_id, [admitted])
+        replayed = []
+
+        def replay():
+            replayed.append(True)
+            return 202, admitted["response"]
+
+        recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown)
+        config, session = recovery.patches()
+        with config, session:
+            settle_device_apply_attempts(self.mgmt, static_route_feed_drained=True)
+
+        self.assertEqual(len(recovery.apply_requests), 1)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.http_status, 202)
+        self.assertEqual(attempt.response, admitted["response"])
+        self.mtu_state.refresh_from_db()
+        self.assertEqual(self.mtu_state.status, "in_sync")

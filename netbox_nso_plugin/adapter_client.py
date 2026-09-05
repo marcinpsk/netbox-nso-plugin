@@ -319,6 +319,11 @@ class AdapterError(Exception):
         self.status_code = status_code
         self.response = response
 
+    @property
+    def definitely_not_enqueued(self) -> bool:
+        """Whether this failure is a deterministic rejection, so no work can have been enqueued."""
+        return self.code == "configuration_error" or (type(self.status_code) is int and 400 <= self.status_code < 500)
+
 
 _PUBLIC_ERROR_MESSAGES = {
     "configuration_error": "The NSO adapter is not configured. See the server log.",
