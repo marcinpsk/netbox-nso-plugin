@@ -219,7 +219,7 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         row = NSOSnmpCommunityState.objects.get(community_hash="abcd1234abcd1234")
         self.assertEqual(row.status, "accepted")
 
-    def test_matching_read_does_not_settle_generation_correlated_deploying_rows(self):
+    def test_matching_read_does_not_settle_deploying_rows(self):
         from netbox_nso_plugin.models import (
             NSOSnmpCommunityState,
             NSOSnmpHostState,

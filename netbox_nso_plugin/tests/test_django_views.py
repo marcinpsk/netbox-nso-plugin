@@ -5191,7 +5191,11 @@ class TestOverlayFieldEditView(ViewTestBase):
             _save_route_map_name_edit(state, route_map.name)
 
         fallback.refresh_from_db()
+        state.refresh_from_db()
+        route_map.refresh_from_db()
         self.assertEqual(fallback.route_map, "RM-RACE-OTHER")
+        self.assertEqual(state.object_name, "RM-RACE-NEW")
+        self.assertEqual(route_map.name, "RM-RACE-NEW")
 
     def test_edit_route_map_name_rejects_native_name_collision_without_writing(self):
         from django.contrib.contenttypes.models import ContentType

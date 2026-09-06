@@ -344,6 +344,8 @@ class TestUntrackedNativeDeletesSerializeWithSaves(_ConcurrencyCase):
             saving = threading.Thread(target=save_native)
             saving.start()
             self.addCleanup(saving.join, 30)
+            # LIFO cleanups: release the barrier before joining the blocked saver.
+            self.addCleanup(release.set)
             assert save_connected.wait(timeout=30), "the concurrent save never opened its database connection"
             try:
                 wait_until_postgres_blocks(save_pid[0], "the concurrent native save", locktype="transactionid")
