@@ -2650,3 +2650,23 @@ class TestOwnedRemovalIsDerivedUnderTheLocks(_CascadeFlushMixin, IntentPushReset
             accepted_revision,
             "the concurrently accepted overlay was removed without invalidating its scope",
         )
+
+
+class TestOSPFInstanceIsRegisteredWithoutARenderTrace(unittest.TestCase):
+    """netbox_routing.ospfinstance is registered for its permits, not for a render trace."""
+
+    def test_ospfinstance_declares_no_trace_fixture_and_every_other_input_declares_one(self):
+        from netbox_nso_plugin.intent_state import renderer_input_specs
+
+        specs = renderer_input_specs()
+        spec = specs["netbox_routing.ospfinstance"]
+        self.assertEqual(spec.scopes, ("ospf",))
+        self.assertEqual(spec.required_trace_fixtures, ())
+        self.assertEqual(
+            sorted(
+                label
+                for label, other in specs.items()
+                if label != "netbox_routing.ospfinstance" and not other.required_trace_fixtures
+            ),
+            [],
+        )

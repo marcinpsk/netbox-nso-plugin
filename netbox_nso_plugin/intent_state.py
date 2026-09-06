@@ -2720,7 +2720,7 @@ def _register(
             content_fields=content,
             lifecycle_fields=lifecycle,
             resolver=_generic_keys,
-            required_trace_fixtures=tuple(fixtures or scopes),
+            required_trace_fixtures=tuple(scopes if fixtures is None else fixtures),
             fragment=_declared_fields_fragment,
             shared_kind=shared_kind,
         ),
@@ -2745,6 +2745,15 @@ def _register_auto_through(model, scopes, *, shared_kind=None, field_names=None,
                 content_fields=content_fields,
                 connect_ends=connect_ends,
             )
+
+
+def _register_ospf_instance(*, connect_ends: bool) -> None:
+    # Protocol-only input: no renderer reads it; registered so its saves acquire the device and its deletes carry the collector plan.
+    try:
+        model = apps.get_model("netbox_routing.ospfinstance")
+    except LookupError:
+        return
+    _register("netbox_routing.ospfinstance", ("ospf",), fixtures=(), model=model, connect_ends=connect_ends)
 
 
 def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
@@ -2911,7 +2920,6 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         "netbox_routing.staticroute": ("static_route",),
         "netbox_routing.isisinstance": ("isis",),
         "netbox_routing.isislevel": ("isis",),
-        "netbox_routing.ospfinstance": ("ospf",),
         "netbox_routing.bgprouter": ("bgp",),
         "netbox_routing.bgpscope": ("bgp",),
         "netbox_routing.bgppeer": ("bgp",),
@@ -2928,6 +2936,8 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         if label == "netbox_routing.staticroute":
             content_fields = {"vrf", "prefix", "next_hop", "permanent", "tag", "metric"}
         _register(label, scopes, model=model, content_fields=content_fields, connect_ends=connect_ends)
+
+    _register_ospf_instance(connect_ends=connect_ends)
 
     if "netbox_routing.staticroute" in _REGISTRY:
         _REGISTRY["netbox_routing.staticroute"] = replace(
