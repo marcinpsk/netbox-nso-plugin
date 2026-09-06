@@ -5726,7 +5726,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         from django.core.exceptions import ValidationError
         from django.db import IntegrityError
 
-        from .intent_state import intent_transaction
+        from .intent_state import RendererTargetsChanged, intent_transaction
         from .models import NSODeviceManagement, NSOInterfaceIPState
         from .signals import _schedule_intent_push, suppress_intent_push
 
@@ -5779,6 +5779,11 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                 ):
                     device_id = mgmt.device_id
                     _schedule_intent_push((device_id, "ip"))
+        except RendererTargetsChanged:
+            return JsonResponse(
+                {"status": "error", "errors": {"address": ["The address assignment changed. Refresh and retry."]}},
+                status=400,
+            )
         except (ValidationError, IntegrityError) as exc:
             messages_list = getattr(exc, "messages", None) or ["The address conflicts with an existing object."]
             return JsonResponse(

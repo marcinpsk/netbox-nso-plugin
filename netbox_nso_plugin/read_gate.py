@@ -908,6 +908,8 @@ def gated_family_run(
         return GateResult(decision.disposition)
     if not _publication_identity_current(mgmt, family, decision, epoch):
         return GateResult(SKIPPED_STALE_ATTEMPT)
+    from django.db import OperationalError
+
     from .intent_state import RendererTargetsChanged
     from .models import NSODeviceManagement, NSOFamilyReadState
 
@@ -945,6 +947,8 @@ def gated_family_run(
     except (RendererTargetsChanged, _SupersededPublication):
         return GateResult(SKIPPED_STALE_ATTEMPT)
     except Exception as exc:
+        if isinstance(exc, OperationalError) and getattr(exc.__cause__, "sqlstate", None) in {"40P01", "40001"}:
+            return GateResult(SKIPPED_STALE_ATTEMPT)
         # The body transaction is already rolled back. Only the still-current
         # admission may surface/mark its failure; never mark a successor's rows.
         if not _publication_identity_current(mgmt, family, decision, epoch):

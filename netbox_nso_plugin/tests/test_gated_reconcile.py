@@ -113,6 +113,33 @@ class _L2Base(TestCase):
 
 
 class TestGatedReconcileBehavior(_L2Base):
+    def test_retryable_database_failure_skips_publication(self):
+        from django.db import connection, transaction
+
+        from netbox_nso_plugin.models import NSOFamilyReadState
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
+
+        for attempt_id, sqlstate in enumerate(("40P01", "40001"), start=1):
+            with self.subTest(sqlstate=sqlstate):
+
+                def fail_acquisition():
+                    with transaction.atomic(), connection.cursor() as cursor:
+                        cursor.execute(
+                            f"DO $$ BEGIN RAISE EXCEPTION 'test contention' USING ERRCODE = '{sqlstate}'; END $$"
+                        )
+
+                result = gated_family_run(
+                    self.mgmt,
+                    "l2_service",
+                    _rs(attempt_id=attempt_id),
+                    lambda: self.fail("a failed acquisition must not publish"),
+                    epoch=self.mgmt.adapter_device_id,
+                    pre_body=fail_acquisition,
+                )
+                self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+                row = NSOFamilyReadState.objects.get(management=self.mgmt, family="l2_service")
+                self.assertIsNone(row.applied_attempt_id)
+
     def test_unavailable_keeps_rows(self):
         self._prime()
         ctx = self._reconcile(

@@ -191,20 +191,20 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(state.management, mgmt)
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())
 
-    def test_plan_reuses_routes_resolved_for_its_footprint(self):
+    def test_plan_locks_the_native_route_resolved_from_the_payload(self):
         self._make_mgmt(self.device, nso_device_name="sr-plan-dependencies")
+        from netbox_nso_plugin.intent_state import SourceRow
         from netbox_nso_plugin.template_content import _reconcile_static_routes, _static_route_reconcile_plan
 
         payload = self._route_payload(self._route_entry("198.18.42.0/24", "198.18.0.42"))
         with self._auto_create_ctx(True):
-            _reconcile_static_routes(self.device, payload)
+            rows = _reconcile_static_routes(self.device, payload)
+        route_id = rows[0].static_route_id
+        rows[0].delete()
 
-        with patch(
-            "netbox_nso_plugin.template_content._resolve_static_route",
-            side_effect=AssertionError("the plan resolved one route twice"),
-        ):
-            plan = _static_route_reconcile_plan(self.device, payload)
+        plan = _static_route_reconcile_plan(self.device, payload)
 
+        self.assertIn(SourceRow("netbox_routing.staticroute", route_id), plan.footprint.source_rows)
         self.assertFalse(plan.changes_content)
 
     def test_plan_matches_only_the_duplicate_route_selected_by_the_body(self):

@@ -331,38 +331,39 @@ class NSOInstance(NetBoxModel):
         """
         from django.db import transaction
 
-        from .intent_state import MutationFootprint, SourceRow, intent_transaction
+        from .intent_state import IntentMutationProtocolError, MutationFootprint, SourceRow, intent_transaction
 
-        with transaction.atomic():
-            default_ids = frozenset(
-                NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
-            )
-            footprint = MutationFootprint.for_keys(
-                (),
-                shared_keys=(("nso-instance-default", "singleton"),),
-                source_rows=(
-                    SourceRow(self._meta.label_lower, self.pk),
-                    *(SourceRow(self._meta.label_lower, pk) for pk in default_ids),
-                ),
-            )
-            with intent_transaction(footprint):
-                current_default_ids = frozenset(
+        for _ in range(3):
+            with transaction.atomic():
+                default_ids = frozenset(
                     NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
                 )
-                if current_default_ids != default_ids:
-                    from .intent_state import IntentMutationProtocolError
-
-                    raise IntentMutationProtocolError("the NSO instance default set changed during acquisition")
-                # The shared key serializes the default check. The source rows lock the
-                # existing default instances before the write.
-                other_defaults = NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk)
-                # If no other default exists (e.g. this is the first instance), force this one to be
-                # the default so onboarding always has something to pre-select.
-                if not other_defaults.exists():
-                    self.is_default = True
-                super().save(*args, **kwargs)
-                if self.is_default:
-                    NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
+                footprint = MutationFootprint.for_keys(
+                    (),
+                    shared_keys=(("nso-instance-default", "singleton"),),
+                    source_rows=(
+                        SourceRow(self._meta.label_lower, self.pk),
+                        *(SourceRow(self._meta.label_lower, pk) for pk in default_ids),
+                    ),
+                )
+                with intent_transaction(footprint):
+                    current_default_ids = frozenset(
+                        NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).values_list("pk", flat=True)
+                    )
+                    if current_default_ids != default_ids:
+                        continue
+                    # The shared key serializes the default check. The source rows lock the
+                    # existing default instances before the write.
+                    other_defaults = NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk)
+                    # If no other default exists (e.g. this is the first instance), force this one to be
+                    # the default so onboarding always has something to pre-select.
+                    if not other_defaults.exists():
+                        self.is_default = True
+                    super().save(*args, **kwargs)
+                    if self.is_default:
+                        NSOInstance.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
+                    return
+        raise IntentMutationProtocolError("the NSO instance default set changed during acquisition")
 
 
 class NSOPlatformNedMapping(NetBoxModel):
