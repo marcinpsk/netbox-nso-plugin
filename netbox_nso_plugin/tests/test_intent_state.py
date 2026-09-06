@@ -674,7 +674,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "ipam.vlangroup",
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
-                "netbox_routing.ospfinstance",
                 "netbox_routing.staticroute_devices",
             },
         )
@@ -822,10 +821,12 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             scope = BGPScope.objects.create(router=router)
             address_family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
             peer_group = BGPPeerTemplate.objects.create(name="TRACE-PEERS", remote_as=remote_as)
+            peer_source = IPAddress.objects.create(address="198.18.0.1/32")
+            peer_source.refresh_from_db()  # .address must be a netaddr IPNetwork, as on a loaded row
             peer = BGPPeer.objects.create(
                 scope=scope,
                 peer=IPAddress.objects.create(address="198.18.0.2/32"),
-                source=IPAddress.objects.create(address="198.18.0.1/32"),
+                source=peer_source,
                 remote_as=remote_as,
                 local_as=local_as,
                 peer_group=peer_group,
