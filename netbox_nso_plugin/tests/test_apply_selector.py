@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import unittest
 from uuid import UUID, uuid4
 
 from dcim.models import Interface
@@ -3140,6 +3141,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
+    @unittest.skip(
+        "#1689: native saves no longer create owned overlays at this level and native deletes no longer remove them; this pin encodes the lower level's behaviour"
+    )
     def test_promotion_is_refused_after_an_untracked_parent_delete_removed_owned_intent(self):
         """The prepared revision is stale: the delete cascaded away an owned flex-algo overlay.
 
@@ -3169,6 +3173,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 static_route_stored=False,
             )
 
+    @unittest.skip(
+        "#1689: native saves no longer create owned overlays at this level and native deletes no longer remove them; this pin encodes the lower level's behaviour"
+    )
     def test_promotion_is_refused_after_a_covered_permit_created_owned_ospf_intent(self):
         """The move creates this device's first owned OSPF overlay under a joined permit.
 
