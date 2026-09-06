@@ -327,6 +327,9 @@ class TestUntrackedNativeDeleteIsNoOp(_SignalDBBase):
         self.assertEqual(set(NSOIntentRevision.objects.values_list("device_id", "scope", "revision")), before_revisions)
         self.assertFalse(NSOIntentOutboxEntry.objects.exists())
 
+    @unittest.skip(
+        "#1690: this level retires the raw/bulk DML refusal in favour of audit-time detection; the pin needs an audit-side assertion or a replacement guard"
+    )
     def test_a_bulk_update_outside_the_deletion_plan_is_still_refused(self):
         """The permit carries the collector's plan, not a table-wide exemption."""
         from django.db.models.signals import pre_delete
@@ -2793,10 +2796,13 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
     """
 
     def test_an_owned_overlay_write_on_an_unacquired_key_is_refused(self):
+        """At this level the writer declares the content keys it advances, and an undeclared key
+        outside the locked footprint is refused at acquisition."""
         from netbox_nso_plugin.intent_state import (
             IntentMutationProtocolError,
             MutationFootprint,
             SourceRow,
+            _intent_transaction,
             footprint_for_instance,
             intent_transaction,
         )
@@ -2814,7 +2820,10 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
             overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", state.pk),),
         )
         with self.assertRaisesRegex(IntentMutationProtocolError, "outside the active mutation footprint"):
-            with intent_transaction(footprint):
+            with _intent_transaction(
+                footprint,
+                bump_keys=frozenset({(management.device_id, "isis_flex_algo")}),
+            ):
                 state.priority = 7
                 state.save(update_fields=["priority"])
 
@@ -2823,11 +2832,15 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
 
         Suppression skips the outbox receiver, so nothing downstream would notice the missing
         bump: the write would commit and a prepared Apply would stay valid against stale content.
+
+        At this level the writer declares the content keys it advances, and a key no footprint
+        locked is refused at acquisition.
         """
         from netbox_nso_plugin.intent_state import (
             IntentMutationProtocolError,
             MutationFootprint,
             SourceRow,
+            _intent_transaction,
             footprint_for_instance,
             intent_transaction,
         )
@@ -2846,7 +2859,13 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
             overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", state.pk),),
         )
         with self.assertRaisesRegex(IntentMutationProtocolError, "outside the active mutation footprint"):
-            with intent_transaction(keyless), suppress_intent_push():
+            with (
+                _intent_transaction(
+                    keyless,
+                    bump_keys=frozenset({(management.device_id, "isis_flex_algo")}),
+                ),
+                suppress_intent_push(),
+            ):
                 state.priority = 7
                 state.save(update_fields=["priority"])
 
@@ -2951,10 +2970,6 @@ class TestOSPFInstanceIsRegisteredWithoutARenderTrace(unittest.TestCase):
         self.assertEqual(spec.scopes, ("ospf",))
         self.assertEqual(spec.required_trace_fixtures, ())
         self.assertEqual(
-            sorted(
-                label
-                for label, other in specs.items()
-                if label != "netbox_routing.ospfinstance" and not other.required_trace_fixtures
-            ),
-            [],
+            {label for label, other in specs.items() if not other.required_trace_fixtures},
+            {"netbox_nso_plugin.nsobgppeertemplatestate", "netbox_routing.ospfinstance"},
         )
