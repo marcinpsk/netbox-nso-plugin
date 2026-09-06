@@ -2592,7 +2592,7 @@ def _lock_management_delete(instance, origin) -> None:
             from .apply_state import lock_order_scope
 
             with lock_order_scope():
-                _acquire(footprint, bump=False)
+                _acquire(footprint, bump_keys=frozenset())
             setattr(origin, "_nso_renderer_delete_lock", atomic_block)
     elif not active.footprint.covers(footprint):
         raise IntentMutationProtocolError("the active mutation footprint does not cover the management deletion")
