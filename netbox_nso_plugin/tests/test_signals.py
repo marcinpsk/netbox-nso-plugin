@@ -412,6 +412,90 @@ class TestRekeyedNativeDelete(_SignalDBBase):
 
         self.assertFalse(NSOISISInterfaceState.objects.filter(management=management).exists())
 
+    def test_deleting_the_interface_cascades_through_the_isis_interface_handler(self):
+        """Deleting the parent dcim Interface drives _on_routing_isis_interface_post_delete.
+
+        The overlay left on the OLD interface is linked to the ISISInterface only through the
+        SET_NULL isis_interface FK, so the Interface cascade cannot reach it; only the
+        handler's pre_delete capture removes it. The collector deletes ISISInterface and
+        sends its post_delete before it deletes the referenced Interface, so the handler
+        reads a live interface and device.
+        """
+        from dcim.models import Interface
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        management = self._make_mgmt(adapter_device_id=42)
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        other_iface = Interface.objects.create(device=self.device, name="GigabitEthernet0/1", type="1000base-t")
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                isis_interface = ISISInterface.objects.create(
+                    interface=self.iface,
+                    address_family="ipv4",
+                    instance=instance,
+                )
+                isis_interface.interface = other_iface
+                isis_interface.save(update_fields=["interface"])
+        old_overlay = NSOISISInterfaceState.objects.get(management=management, interface=self.iface)
+        self.assertEqual(NSOISISInterfaceState.objects.filter(management=management).count(), 2)
+
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as push:
+            with self.captureOnCommitCallbacks(execute=True):
+                other_iface.delete()
+
+        self.assertFalse(ISISInterface.objects.filter(pk=isis_interface.pk).exists())
+        self.assertFalse(NSOISISInterfaceState.objects.filter(pk=old_overlay.pk).exists())
+        self.assertFalse(NSOISISInterfaceState.objects.filter(management=management).exists())
+        push.assert_called_once()
+        self.assertEqual(push.call_args[0][1], [], "the cascade must push the reduced snapshot")
+
+    def test_deleting_the_isis_instance_pushes_the_reduced_flex_algo_snapshot(self):
+        """The root's own fragment is absent, but its cascade still removes flex-algo intent.
+
+        The deletion permit therefore has to carry both the collector's tables and the
+        child scope the flex-algo handler acquires, and it has to ADVANCE that scope: an
+        Apply prepared before the delete would otherwise still select the old snapshot.
+        The root's own isis scope loses no owned content, so it stays where it was.
+        """
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOISISFlexAlgoState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        # Created before the device is managed, so the accept handler leaves no overlay of its own.
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        management = self._make_mgmt(adapter_device_id=42)
+        state = NSOISISFlexAlgoState(
+            management=management,
+            process_tag="CORE",
+            algo_id=130,
+            isis_flex_algo=flex_algo,
+            status="accepted",
+        )
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+        flex_algo_revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis_flex_algo")
+        isis_revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
+        before_flex_algo, before_isis = flex_algo_revision.revision, isis_revision.revision
+
+        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as push:
+            with self.captureOnCommitCallbacks(execute=True):
+                instance.delete()
+
+        self.assertFalse(ISISInstance.objects.filter(pk=instance.pk).exists())
+        self.assertFalse(ISISFlexAlgo.objects.filter(pk=flex_algo.pk).exists())
+        self.assertFalse(NSOISISFlexAlgoState.objects.filter(management=management).exists())
+        push.assert_called_once()
+        self.assertEqual(push.call_args[0][1], [], "the cascade must push the reduced snapshot")
+        flex_algo_revision.refresh_from_db()
+        isis_revision.refresh_from_db()
+        self.assertGreater(flex_algo_revision.revision, before_flex_algo, "the removed owned intent must invalidate")
+        self.assertEqual(isis_revision.revision, before_isis, "the root's own scope removed no owned intent")
+
 
 class TestSyncScopeToAdapter(_SignalDBBase):
     """Tests for the sync_scope_to_adapter signal handler (real NSODeviceManagement row)."""
