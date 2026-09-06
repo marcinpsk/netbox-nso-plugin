@@ -704,6 +704,67 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert row.intent_generation == snapshots[0]["armed_generation"]
         assert revision.revision == before, "a skipped restore committed an intent revision"
 
+    def test_a_concurrent_promotion_before_restore_is_not_demoted_away(self):
+        """Acquisition must not manufacture the match the restore is conditional on."""
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_drift import (
+            _backfill_static_route_generations,
+            _restore_static_route_generations,
+        )
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision, NSOStaticRouteState
+
+        _, mgmt = self._managed_device("restore-promotion-race", 8113)
+        row = self._own_route(mgmt, "198.18.36.0/24", "198.18.36.1")
+        attempt = NSOApplyAttempt.objects.create(management=mgmt, adapter_device_id=mgmt.adapter_device_id)
+        snapshots = _backfill_static_route_generations(mgmt)
+        revision_keys = intent_state.footprint_for_instance(row).revision_keys
+        self.assertEqual(revision_keys, ((mgmt.device_id, "static_route"),))
+        revision_key = revision_keys[0]
+        revision = NSOIntentRevision.objects.get(device_id=revision_key[0], scope=revision_key[1])
+        before = revision.revision
+        candidate_loaded = threading.Barrier(2, timeout=30)
+        row_changed = threading.Barrier(2, timeout=30)
+        errors: list[BaseException] = []
+        candidate_query_seen = False
+
+        def wait_after_candidate_query(execute, sql, params, many, context):
+            nonlocal candidate_query_seen
+            result = execute(sql, params, many, context)
+            if not candidate_query_seen and NSOStaticRouteState._meta.db_table in sql:
+                candidate_query_seen = True
+                candidate_loaded.wait()
+                row_changed.wait()
+            return result
+
+        def promote_row():
+            try:
+                candidate_loaded.wait()
+                current = NSOStaticRouteState.objects.get(pk=row.pk)
+                intent_state.update_mirror_fields(current, status="deploying", apply_attempt_id=attempt.pk)
+                row_changed.wait()
+            except BaseException as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+                row_changed.abort()
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=promote_row)
+        worker.start()
+        with connection.execute_wrapper(wait_after_candidate_query):
+            restored = _restore_static_route_generations(snapshots)
+        worker.join(timeout=60)
+
+        assert not worker.is_alive(), "concurrent promotion did not finish"
+        assert errors == []
+        assert candidate_query_seen
+        assert restored == 0, "the restore overwrote a concurrent promotion"
+        row.refresh_from_db()
+        revision.refresh_from_db()
+        assert row.status == "deploying", "acquisition demoted the competing promotion"
+        assert row.apply_attempt_id == attempt.pk, "acquisition cleared the competing attempt identity"
+        assert row.intent_generation == snapshots[0]["armed_generation"]
+        assert revision.revision == before, "a skipped restore committed an intent revision"
+
     def test_a_concurrent_delete_does_not_stop_later_snapshot_restores(self):
         """A deleted candidate is a no-op, so later snapshots still restore."""
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations, _safe_restore

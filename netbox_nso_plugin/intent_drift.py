@@ -437,7 +437,8 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         if state is None:
             continue
         try:
-            with intent_transaction(footprint_for_instance(state)):
+            # A conditional restore must not manufacture its own match: no demotion here.
+            with intent_transaction(footprint_for_instance(state), settles_deploying=False):
                 state.refresh_from_db()
                 if state.intent_generation != armed_generation or state.status != armed_status:
                     raise _RestoreNoOp
