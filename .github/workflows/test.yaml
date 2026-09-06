@@ -28,9 +28,9 @@ jobs:
       matrix:
         include:
           - python-version: "3.12"
-            netbox-version: "v4.6.1"
+            netbox-version: "v4.6.10"
           - python-version: "3.13"
-            netbox-version: "v4.6.7"
+            netbox-version: "v4.7.0"
 
     services:
       redis:
