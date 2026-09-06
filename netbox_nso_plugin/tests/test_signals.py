@@ -15,7 +15,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from django.db import connections
+from django.db import connections, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -141,6 +141,34 @@ class _SignalDBBase(IntentPushDeliveryMixin, TestCase):
         )
         return NSODeviceManagement.objects.get(device=self.device)
 
+    def _second_managed_device(self):
+        from dcim.models import Device
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        other = Device.objects.create(
+            name="core-rtr-02",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        _bulk_create_management_without_signals(
+            [
+                NSODeviceManagement(
+                    device=other,
+                    nso_instance=self.nso_instance,
+                    nso_device_name="core-rtr-02",
+                    adapter_device_id=43,
+                    manage_description=True,
+                    manage_enabled=False,
+                    auto_apply=False,
+                    sync_before_apply=True,
+                    custom_field_data={},
+                )
+            ]
+        )
+        return other
+
     def _accepted_state(self, interface, attribute, *, nso_value=""):
         """Create an OWNED (accepted_at-set) NSOInterfaceState without firing the push signal.
 
@@ -224,6 +252,123 @@ class TestUntrackedNativeDeleteIsNoOp(_SignalDBBase):
             before_outbox,
         )
         push.assert_not_called()
+
+    def test_untracked_isis_instance_delete_changes_nothing(self):
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        self._make_mgmt(adapter_device_id=42)
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
+        before_revision = revision.revision
+        before_outbox = list(
+            NSOIntentOutboxEntry.objects.filter(device=self.device, scope="isis").values_list("pk", flat=True)
+        )
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            instance.delete()
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before_revision)
+        self.assertEqual(
+            list(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="isis").values_list("pk", flat=True)),
+            before_outbox,
+        )
+        push.assert_not_called()
+
+    def test_untracked_vlan_delete_changes_nothing(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+
+        group = VLANGroup.objects.create(name="Untracked", slug="untracked")
+        vlan = VLAN.objects.create(group=group, vid=311, name="untracked-311")
+        self._make_mgmt(adapter_device_id=42)
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="vlan")
+        before_revision = revision.revision
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            vlan.delete()
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before_revision)
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
+        push.assert_not_called()
+
+    def test_untracked_ospf_instance_delete_on_an_unmanaged_device_changes_nothing(self):
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+
+        ospf = OSPFInstance.objects.create(device=self.device, process_id=7, router_id="192.0.2.7")
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_ospf_intent") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            ospf.delete()
+
+        self.assertFalse(OSPFInstance.objects.filter(pk=ospf.pk).exists())
+        self.assertFalse(NSOIntentRevision.objects.filter(device=self.device).exists())
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device).exists())
+        push.assert_not_called()
+
+    def test_untracked_device_delete_with_a_bare_isis_instance_changes_nothing(self):
+        """A Device root's secondary footprint must not drop the collector's deletion plan."""
+        from dcim.models import Device, Interface
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+
+        device = Device.objects.create(
+            name="unmanaged-rtr-01",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        Interface.objects.create(device=device, name="GigabitEthernet0/1", type="1000base-t")
+        ISISInstance.objects.create(device=device, process_tag="EDGE")
+        before_revisions = set(NSOIntentRevision.objects.values_list("device_id", "scope", "revision"))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            device.delete()
+
+        self.assertFalse(Device.objects.filter(pk=device.pk).exists())
+        self.assertEqual(set(NSOIntentRevision.objects.values_list("device_id", "scope", "revision")), before_revisions)
+        self.assertFalse(NSOIntentOutboxEntry.objects.exists())
+
+    def test_a_bulk_update_outside_the_deletion_plan_is_still_refused(self):
+        """The permit carries the collector's plan, not a table-wide exemption."""
+        from django.db.models.signals import pre_delete
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        self._make_mgmt(adapter_device_id=42)
+
+        def unrelated_bulk_update(sender, instance, **kwargs):
+            NSOBGPPeerState.objects.filter(management__device=self.device).update(remote_as_str="65001")
+
+        pre_delete.connect(
+            unrelated_bulk_update,
+            sender=ISISInstance,
+            dispatch_uid="nso_test_unrelated_bulk_update",
+            weak=False,
+        )
+        try:
+            with self.assertRaises(IntentMutationProtocolError):
+                instance.delete()
+        finally:
+            pre_delete.disconnect(sender=ISISInstance, dispatch_uid="nso_test_unrelated_bulk_update")
 
 
 class TestRekeyedNativeDelete(_SignalDBBase):
@@ -2184,3 +2329,240 @@ class TestSourceRekeyLocksOnlyItsManagementRow(_CascadeFlushMixin, IntentPushRes
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.adapter_source_epoch, 9)
         self.assertFalse(self.mgmt.source_rekey_pending)
+
+
+class TestNativeDeviceReassignment(_SignalDBBase):
+    """Re-homing a native routing process to another managed device is a valid edit.
+
+    The footprint acquires the device the row leaves as well as the one it joins, so
+    source revalidation sees the persisted device inside the expected set.
+    """
+
+    def test_an_isis_instance_moves_between_managed_devices(self):
+        from netbox_routing.models import ISISInstance
+
+        self._make_mgmt(adapter_device_id=42)
+        other = self._second_managed_device()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+
+        instance.device = other
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            instance.save(update_fields=["device"])
+
+        instance.refresh_from_db()
+        self.assertEqual(instance.device_id, other.pk)
+
+    def test_deleting_a_rehomed_isis_instance_invalidates_the_device_it_left(self):
+        """The moved instance leaves its accepted flex-algo overlay on the device it left.
+
+        The deletion plan collects that overlay, so the plan has to carry the overlay's OWN
+        device revision key: the cascade removes owned intent there, and the removal push
+        refuses a key the transaction never acquired.
+        """
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOISISFlexAlgoState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        # Created before the device is managed, so the accept handler leaves no overlay of its own.
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=132)
+        management = self._make_mgmt(adapter_device_id=42)
+        other = self._second_managed_device()
+        state = NSOISISFlexAlgoState(
+            management=management,
+            process_tag="CORE",
+            algo_id=132,
+            isis_flex_algo=flex_algo,
+            status="accepted",
+        )
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"):
+            instance.device = other
+            instance.save(update_fields=["device"])
+        left, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis_flex_algo")
+        joined, _ = NSOIntentRevision.objects.get_or_create(device=other, scope="isis_flex_algo")
+        before_left, before_joined = left.revision, joined.revision
+
+        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as push:
+            with self.captureOnCommitCallbacks(execute=True):
+                instance.delete()
+
+        self.assertFalse(NSOISISFlexAlgoState.objects.filter(pk=state.pk).exists())
+        left.refresh_from_db()
+        joined.refresh_from_db()
+        self.assertGreater(left.revision, before_left, "the device it left lost owned flex-algo intent")
+        self.assertEqual(joined.revision, before_joined, "the device it joined owned no flex-algo intent")
+        self.assertIn(
+            (42, []),
+            [(call.args[0], call.args[1]) for call in push.call_args_list],
+            "the device it left must receive the reduced snapshot",
+        )
+
+    def test_an_ospf_instance_moves_between_managed_devices(self):
+        from netbox_routing.models import OSPFInstance
+
+        self._make_mgmt(adapter_device_id=42)
+        other = self._second_managed_device()
+        with patch("netbox_nso_plugin.adapter_client.put_ospf_intent"):
+            instance = OSPFInstance.objects.create(device=self.device, process_id=7, router_id="192.0.2.7")
+
+            instance.device = other
+            instance.save(update_fields=["device"])
+
+        instance.refresh_from_db()
+        self.assertEqual(instance.device_id, other.pk)
+
+
+class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
+    """A permit authorises the overlay rows it names, but it can only bump what it locked.
+
+    A named row whose own revision key is outside the footprint is an incomplete plan, so the
+    write is refused; advancing that key here would take a revision lock out of order.
+    """
+
+    def test_an_owned_overlay_write_on_an_unacquired_key_is_refused(self):
+        from netbox_nso_plugin.intent_state import (
+            IntentMutationProtocolError,
+            MutationFootprint,
+            SourceRow,
+            footprint_for_instance,
+            intent_transaction,
+        )
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        management = self._make_mgmt(adapter_device_id=42)
+        other = self._second_managed_device()
+        state = NSOISISFlexAlgoState(management=management, process_tag="CORE", algo_id=133, status="accepted")
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+
+        footprint = MutationFootprint.for_keys(
+            {(other.pk, "isis_flex_algo")},
+            overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", state.pk),),
+        )
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the active mutation footprint"):
+            with intent_transaction(footprint):
+                state.priority = 7
+                state.save(update_fields=["priority"])
+
+    def test_an_owned_overlay_write_under_a_keyless_permit_is_refused(self):
+        """A permit holding no revision key can bump nothing, so it cannot carry owned content.
+
+        Suppression skips the outbox receiver, so nothing downstream would notice the missing
+        bump: the write would commit and a prepared Apply would stay valid against stale content.
+        """
+        from netbox_nso_plugin.intent_state import (
+            IntentMutationProtocolError,
+            MutationFootprint,
+            SourceRow,
+            footprint_for_instance,
+            intent_transaction,
+        )
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOISISFlexAlgoState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        management = self._make_mgmt(adapter_device_id=42)
+        state = NSOISISFlexAlgoState(management=management, process_tag="CORE", algo_id=134, status="accepted")
+        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis_flex_algo")
+        before = revision.revision
+
+        keyless = MutationFootprint.for_keys(
+            (),
+            overlay_rows=(SourceRow("netbox_nso_plugin.nsoisisflexalgostate", state.pk),),
+        )
+        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the active mutation footprint"):
+            with intent_transaction(keyless), suppress_intent_push():
+                state.priority = 7
+                state.save(update_fields=["priority"])
+
+        revision.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(revision.revision, before, "the refused write advances no revision")
+        self.assertIsNone(state.priority, "the refused write leaves no content behind")
+
+
+class TestOwnedRemovalIsDerivedUnderTheLocks(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """An accept committed while a delete acquires still invalidates the scope it removes.
+
+    The deletion plan is collected before any lock, so ownership read from it can be stale
+    by the time the cascade removes the overlay row.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+
+        from ._outbox_case import content_bulk_update, make_managed, without_commit_drain
+
+        self.device, self.mgmt = make_managed("ownedlock", 8802)
+        with without_commit_drain(), transaction.atomic():
+            self.instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+            self.flex_algo = ISISFlexAlgo.objects.create(instance=self.instance, algo_id=130)
+        self.state = NSOISISFlexAlgoState.objects.get(isis_flex_algo=self.flex_algo)
+        # The overlay starts unowned, so the plan-time ownership query finds nothing to bump.
+        content_bulk_update(self.state, status="imported", accepted_at=None)
+
+    def test_an_accept_committed_during_acquisition_still_invalidates_the_scope(self):
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOISISFlexAlgoState
+
+        from ._outbox_case import without_commit_drain
+
+        held = threading.Event()
+        release = threading.Event()
+        failures: list[BaseException] = []
+
+        def hold_before_the_deployment_gate(execute, sql, params, many, context):
+            # The gate's shared advisory lock is the first statement acquisition issues.
+            if held.is_set() or "pg_try_advisory_xact_lock_shared" not in sql:
+                return execute(sql, params, many, context)
+            held.set()
+            assert release.wait(timeout=30), "the delete hold was never released"
+            return execute(sql, params, many, context)
+
+        def delete_the_untracked_root():
+            try:
+                with (
+                    without_commit_drain(),
+                    connections["default"].execute_wrapper(hold_before_the_deployment_gate),
+                ):
+                    self.instance.delete()
+            except BaseException as exc:  # noqa: BLE001 (re-raised on the caller's thread)
+                failures.append(exc)
+            finally:
+                held.set()
+                connections.close_all()
+
+        with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"):
+            worker = threading.Thread(target=delete_the_untracked_root, name="untracked-delete")
+            worker.start()
+            self.addCleanup(worker.join, 30)
+            self.addCleanup(release.set)
+            assert held.wait(timeout=30), failures
+            try:
+                state = NSOISISFlexAlgoState.objects.get(pk=self.state.pk)
+                state.status = "accepted"
+                state.accepted_at = timezone.now()
+                with without_commit_drain(), transaction.atomic():
+                    state.save(update_fields=["status", "accepted_at"])
+                revision = NSOIntentRevision.objects.get(device=self.device, scope="isis_flex_algo")
+                accepted_revision = revision.revision
+            finally:
+                release.set()
+            worker.join(timeout=30)
+
+        assert not worker.is_alive(), "the delete never finished"
+        assert not failures, failures
+        self.assertFalse(NSOISISFlexAlgoState.objects.filter(pk=self.state.pk).exists())
+        self.assertGreater(
+            NSOIntentRevision.objects.get(device=self.device, scope="isis_flex_algo").revision,
+            accepted_revision,
+            "the concurrently accepted overlay was removed without invalidating its scope",
+        )

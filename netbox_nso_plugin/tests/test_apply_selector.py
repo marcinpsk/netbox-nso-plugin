@@ -2820,6 +2820,69 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
+    def test_promotion_is_refused_after_an_untracked_parent_delete_removed_owned_intent(self):
+        """The prepared revision is stale: the delete cascaded away an owned flex-algo overlay.
+
+        The ISISInstance itself is untracked, so only its cascade removes rendered content.
+        """
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+
+        with without_commit_drain(), transaction.atomic():
+            instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+            flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        self.assertTrue(NSOISISFlexAlgoState.objects.filter(management=self.mgmt, isis_flex_algo=flex_algo).exists())
+        registry, pushed = self._promotion_snapshot()
+
+        with without_commit_drain(), transaction.atomic():
+            instance.delete()
+
+        self.assertFalse(NSOISISFlexAlgoState.objects.filter(management=self.mgmt).exists())
+        with self.assertRaises(apply_state.IntentChangedDuringPreparation):
+            apply_state.promote_current_intent(
+                self.mgmt,
+                registry,
+                pushed,
+                apply_attempt_id=uuid4(),
+                static_route_stored=False,
+            )
+
+    def test_promotion_is_refused_after_a_covered_permit_created_owned_ospf_intent(self):
+        """The move creates this device's first owned OSPF overlay under a joined permit.
+
+        Neither native fragment changes, so acquisition bumps nothing; the accept handler
+        then adds owned intent the prepared snapshot never carried.
+        """
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        from ._outbox_case import make_device, make_mgmt
+
+        with without_commit_drain(), transaction.atomic():
+            other = make_device("ospfmove", 2)
+            instance = OSPFInstance.objects.create(device=other, process_id=7, router_id="192.0.2.7")
+            make_mgmt(other, "ospfmove", 1559)
+        self.assertFalse(NSOOSPFInstanceState.objects.filter(management__device=other).exists())
+        registry, pushed = self._promotion_snapshot()
+
+        with without_commit_drain(), transaction.atomic():
+            instance.device = self.device
+            instance.save(update_fields=["device"])
+
+        self.assertTrue(NSOOSPFInstanceState.objects.filter(management=self.mgmt, status="accepted").exists())
+        with self.assertRaises(apply_state.IntentChangedDuringPreparation):
+            apply_state.promote_current_intent(
+                self.mgmt,
+                registry,
+                pushed,
+                apply_attempt_id=uuid4(),
+                static_route_stored=False,
+            )
+
     def test_promotion_stamps_the_apply_start_time(self):
         from django.utils import timezone
 

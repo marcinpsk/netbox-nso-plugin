@@ -494,7 +494,12 @@ class RendererInputSpec:
 class _Permit:
     footprint: MutationFootprint
     dml_kind: str
-    bump_revisions: bool = True
+    # The revision keys this permit advances; None advances every key in the footprint.
+    bump_keys: frozenset[tuple[int, str]] | None = None
+    # Read the advanced keys from the plan's OWNED overlay rows once those rows are locked.
+    bump_owned_plan_rows: bool = False
+    # The revision keys this permit has already advanced.
+    bumped: set[tuple[int, str]] = field(default_factory=set)
     join_deployment_gate: bool = True
     mirror_table: str | None = None
     mirror_pk: Any = None
@@ -1382,6 +1387,7 @@ def _regular_instance_footprint(instance, spec) -> MutationFootprint:
     keys = spec.resolver(instance, spec)
     prior_ip_keys, prior_ip_overlays = _previous_ip_address_targets(instance, spec)
     keys.update(prior_ip_keys)
+    keys.update(_previous_device_targets(instance, spec))
     shared_keys = ()
     if spec.shared_kind == "vlan":
         shared_keys = [("vlan-slot", f"{getattr(instance, 'group_id', None)}:{getattr(instance, 'vid', None)}")]
@@ -1412,7 +1418,6 @@ def _regular_instance_footprint(instance, spec) -> MutationFootprint:
     future_overlays = {
         "netbox_routing.bgppeer": (SourceRow("netbox_nso_plugin.nsobgppeerstate", None),),
         "netbox_routing.ospfinstance": (SourceRow("netbox_nso_plugin.nsoospfinstancestate", None),),
-        "netbox_routing.ospfinterface": (SourceRow("netbox_nso_plugin.nsoospfinterfacestate", None),),
         "netbox_routing.redistribution": (SourceRow("netbox_nso_plugin.nsoredistributionstate", None),),
         "ipam.ipaddress": (SourceRow("netbox_nso_plugin.nsointerfaceipstate", None),),
     }.get(instance._meta.label_lower, ())
@@ -1509,6 +1514,16 @@ def _regular_instance_footprint(instance, spec) -> MutationFootprint:
     )
 
 
+def _previous_device_targets(instance, spec) -> set[tuple[int, str]]:
+    """Acquire the device a re-homed native routing row leaves, not only the one it joins."""
+    if instance._meta.app_label != "netbox_routing" or instance.pk is None or not hasattr(instance, "device_id"):
+        return set()
+    current = type(instance).objects.filter(pk=instance.pk).first()
+    if current is None or current.device_id == instance.device_id:
+        return set()
+    return spec.resolver(current, spec)
+
+
 def _previous_ip_address_targets(instance, spec):
     """Resolve the old device and overlay before a GenericForeignKey reassignment."""
     if instance._meta.label_lower != "ipam.ipaddress" or instance.pk is None:
@@ -1533,6 +1548,11 @@ def _previous_ip_address_targets(instance, spec):
     return keys, overlays
 
 
+def _resolved_row_keys(spec: RendererInputSpec, rows) -> set[tuple[int, str]]:
+    """Resolve concrete rows to the revision keys they themselves render."""
+    return {key for row in rows for key in spec.resolver(row, spec)}
+
+
 def deletion_footprint_for_instance(instance) -> MutationFootprint:
     """Add Django's exact registered cascade closure to a row's footprint."""
     from django.db.models.deletion import Collector
@@ -1542,35 +1562,62 @@ def deletion_footprint_for_instance(instance) -> MutationFootprint:
     collector.collect([instance])
     source_rows = []
     overlay_rows = []
+    cascade_scopes = set()
+    planned_keys: set[tuple[int, str]] = set()
 
-    def add(model, pks, *, future=False):
+    def add(model, rows, *, future=False):
         label = model._meta.label_lower
         if label not in _REGISTRY or label == "netbox_nso_plugin.nsodevicemanagement":
             return
+        spec = _REGISTRY[label]
         target = overlay_rows if label in OVERLAY_MODEL_RANKS else source_rows
         if future:
             target.append(SourceRow(label, None))
-        target.extend(SourceRow(label, pk) for pk in pks)
+        rows = tuple(rows)
+        target.extend(SourceRow(label, row.pk) for row in rows)
+        # The plan's keys come from the planned rows, so a row re-homed away from the root is held too.
+        planned_keys.update(_resolved_row_keys(spec, rows))
+        # A cascade handler renders the descendant's own scope on the root device, which owns no such row.
+        cascade_scopes.update(spec.scopes)
 
     for model, instances in collector.data.items():
-        add(model, (row.pk for row in instances))
+        add(model, instances)
     for querysets in collector.field_updates.values():
         for rows in querysets:
             if hasattr(rows, "model"):
-                add(rows.model, rows.values_list("pk", flat=True), future=True)
+                add(rows.model, rows, future=True)
             elif rows:
                 model = next(iter(rows)).__class__
-                add(model, (row.pk for row in rows), future=True)
+                add(model, rows, future=True)
     for rows in collector.fast_deletes:
-        add(rows.model, rows.values_list("pk", flat=True), future=True)
+        add(rows.model, rows, future=True)
 
     cascade = MutationFootprint.for_keys(
-        base.revision_keys,
+        {
+            *base.revision_keys,
+            *planned_keys,
+            *((device_id, scope) for device_id in base.device_ids for scope in cascade_scopes),
+        },
         shared_keys=base.shared_keys,
         source_rows=source_rows,
         overlay_rows=overlay_rows,
     )
     return MutationFootprint.merge(base, cascade)
+
+
+def _owned_removal_keys(plan: MutationFootprint) -> frozenset[tuple[int, str]]:
+    """Revision keys whose OWNED overlay rows a deletion plan takes away."""
+    from .status_machine import OWNED_STATES
+
+    pks_by_label: dict[str, list] = {}
+    for row in plan.overlay_rows:
+        if row.pk is not None:
+            pks_by_label.setdefault(row.model_label, []).append(row.pk)
+    keys: set[tuple[int, str]] = set()
+    for label, pks in pks_by_label.items():
+        spec = _REGISTRY[label]
+        keys.update(_resolved_row_keys(spec, spec.model.objects.filter(pk__in=pks, status__in=OWNED_STATES)))
+    return frozenset(keys)
 
 
 def route_policy_footprint(groups, *, device_ids=()) -> MutationFootprint:
@@ -1694,13 +1741,25 @@ def _revalidate_sources(footprint: MutationFootprint) -> None:
             )
 
 
+def _refuse_unacquired_keys(keys, footprint: MutationFootprint, what: str) -> frozenset[tuple[int, str]]:
+    """Refuse a revision key the permit never locked: bumping one here would break the lock order."""
+    unacquired = sorted(set(keys) - set(footprint.revision_keys))
+    if unacquired:
+        raise IntentMutationProtocolError(
+            f"{what} advances revision keys {unacquired} outside the active mutation footprint "
+            f"{sorted(footprint.revision_keys)}"
+        )
+    return frozenset(keys)
+
+
 def _acquire(
     footprint: MutationFootprint,
     *,
-    bump: bool = True,
+    bump_keys: frozenset[tuple[int, str]] | None = None,
+    bump_owned_plan_rows: bool = False,
     join_deployment_gate: bool = True,
     settles_deploying: bool = True,
-) -> None:
+) -> frozenset[tuple[int, str]]:
     from .apply_state import (
         _enter_level,
         lock_device_intent_transaction,
@@ -1748,13 +1807,18 @@ def _acquire(
         scopes_by_device.setdefault(device_id, []).append(scope)
     for device_id, scopes in sorted(scopes_by_device.items()):
         lock_intent_revisions(device_id, scopes)
-    if bump:
-        for device_id, scope in footprint.revision_keys:
-            bump_intent_revision(device_id, scope)
     locked_overlay_rows = tuple(set(footprint.overlay_rows))
     _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
-    if not bump:
-        return
+    if bump_owned_plan_rows:
+        # Ownership is read from the locked rows, never predicted before the locks.
+        bump_keys = _refuse_unacquired_keys(
+            _owned_removal_keys(footprint), footprint, "the plan's owned overlay removal"
+        )
+    bumped = [key for key in footprint.revision_keys if bump_keys is None or key in bump_keys]
+    for device_id, scope in bumped:
+        bump_intent_revision(device_id, scope)
+    if not bumped:
+        return frozenset()
     with suppress_intent_push():
         for row_ref in locked_overlay_rows:
             if row_ref.pk is None:
@@ -1767,6 +1831,7 @@ def _acquire(
                     row.apply_attempt_id = None
                     update_fields.append("apply_attempt_id")
                 row.save(update_fields=update_fields)
+    return frozenset(bumped)
 
 
 @contextlib.contextmanager
@@ -1785,7 +1850,7 @@ def intent_transaction(footprint: MutationFootprint, *, settles_deploying: bool 
         permit = _Permit(footprint=footprint, dml_kind="content")
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint, settles_deploying=settles_deploying)
+            permit.bumped.update(_acquire(footprint, settles_deploying=settles_deploying))
             yield permit
         finally:
             _ACTIVE_PERMIT.reset(token)
@@ -1807,7 +1872,7 @@ def mirror_transaction(footprint: MutationFootprint):
         permit = _Permit(footprint=footprint, dml_kind="reconcile")
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            _acquire(footprint, bump=False)
+            _acquire(footprint, bump_keys=frozenset())
             yield permit
         finally:
             _ACTIVE_PERMIT.reset(token)
@@ -2066,7 +2131,7 @@ def _suppressed_permit(instance, spec, before, after, update_fields, footprint_o
         return _Permit(
             footprint=footprint,
             dml_kind="content",
-            bump_revisions=False,
+            bump_keys=frozenset(),
             implicit=True,
         )
     return _Permit(
@@ -2115,6 +2180,28 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
             _authorize_dml(active, apps.get_model("dcim.device")._meta.db_table)
 
 
+def _bump_covered_owned_write(permit: _Permit, instance, spec, *, deleting, update_fields) -> None:
+    """Advance the scopes an owned overlay write changes under a permit that has not bumped them."""
+    if permit.dml_kind != "content" or instance._meta.label_lower not in OVERLAY_MODEL_RANKS:
+        return
+    before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
+    after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
+    if before == after:
+        return
+    from .outbox import bump_intent_revision
+
+    resolved = _refuse_unacquired_keys(
+        spec.resolver(instance, spec),
+        permit.footprint,
+        f"the owned {instance._meta.label_lower} write",
+    )
+    # Every key is inside the permit's footprint, so their revision rows are already locked.
+    keys = resolved - permit.bumped
+    for device_id, scope in sorted(keys):
+        bump_intent_revision(device_id, scope)
+    permit.bumped.update(keys)
+
+
 def _begin_implicit(
     sender,
     instance,
@@ -2138,6 +2225,7 @@ def _begin_implicit(
             deleting=deleting,
             update_fields=update_fields,
         )
+        _bump_covered_owned_write(active, instance, spec, deleting=deleting, update_fields=update_fields)
         return
     from .signals import _is_intent_push_suppressed
 
@@ -2156,7 +2244,8 @@ def _begin_implicit(
             footprint_override,
         )
     else:
-        proposed_footprint = footprint_for_instance(instance, spec)
+        # A delete keeps its complete collector plan here: the unlink it cascades is guarded DML.
+        proposed_footprint = footprint_override or footprint_for_instance(instance, spec)
         benign_insert = _benign_unrendered_insert(instance, before, after)
     if (
         not _is_intent_push_suppressed()
@@ -2167,9 +2256,16 @@ def _begin_implicit(
         secondary_footprint = None if benign_insert else _secondary_dml_footprint(instance, spec)
         if secondary_footprint is not None or benign_footprint.shared_keys or benign_footprint.overlay_rows:
             permit = _Permit(
-                footprint=secondary_footprint or benign_footprint,
+                # Secondary DML widens the plan the collector handed us; it never replaces it.
+                footprint=(
+                    MutationFootprint.merge(secondary_footprint, benign_footprint)
+                    if secondary_footprint is not None
+                    else benign_footprint
+                ),
                 dml_kind="content",
-                bump_revisions=False,
+                bump_keys=frozenset(),
+                # An untracked root still removes owned descendant intent: advance exactly those scopes.
+                bump_owned_plan_rows=bool(deleting and footprint_override),
                 join_deployment_gate=not (
                     before == ABSENT
                     and after == ABSENT
@@ -2208,10 +2304,13 @@ def _begin_implicit(
                 or permit.footprint.source_rows
                 or permit.footprint.overlay_rows
             ):
-                _acquire(
-                    permit.footprint,
-                    bump=permit.bump_revisions,
-                    join_deployment_gate=permit.join_deployment_gate,
+                permit.bumped.update(
+                    _acquire(
+                        permit.footprint,
+                        bump_keys=permit.bump_keys,
+                        bump_owned_plan_rows=permit.bump_owned_plan_rows,
+                        join_deployment_gate=permit.join_deployment_gate,
+                    )
                 )
         except Exception:
             _ACTIVE_PERMIT.reset(token)
@@ -2344,7 +2443,7 @@ def _begin_m2m_implicit(sender, instance, action, **kwargs):
     permit.tokens.append(token)
     try:
         if keys:
-            _acquire(footprint)
+            permit.bumped.update(_acquire(footprint))
     except Exception:
         _ACTIVE_PERMIT.reset(token)
         raise
@@ -2812,6 +2911,7 @@ def register_builtin_renderer_inputs(*, connect_ends: bool = True) -> None:
         "netbox_routing.staticroute": ("static_route",),
         "netbox_routing.isisinstance": ("isis",),
         "netbox_routing.isislevel": ("isis",),
+        "netbox_routing.ospfinstance": ("ospf",),
         "netbox_routing.bgprouter": ("bgp",),
         "netbox_routing.bgpscope": ("bgp",),
         "netbox_routing.bgppeer": ("bgp",),
