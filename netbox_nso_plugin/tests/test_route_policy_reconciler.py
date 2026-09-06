@@ -49,6 +49,58 @@ class TestReconcileRoutePolicy(TestCase):
 
         self.assertEqual(reconcile_route_policy(self.device, self._payload()), [])
 
+    def test_reconcile_plan_marks_only_materialized_content_changes(self):
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        payload = {
+            "prefix_lists": [
+                {"name": "PL-PLAN", "family": 4, "entries": [{"action": "permit", "prefix": "198.18.0.0/15"}]}
+            ]
+        }
+
+        self.assertTrue(route_policy_reconcile_plan(self.device, payload).changes_content)
+        reconcile_route_policy(self.device, payload)
+        self.assertFalse(route_policy_reconcile_plan(self.device, payload).changes_content)
+
+        changed = {
+            "prefix_lists": [
+                {
+                    "name": "PL-PLAN",
+                    "family": 4,
+                    "entries": [
+                        {"action": "permit", "prefix": "198.18.0.0/15"},
+                        {"action": "permit", "prefix": "198.20.0.0/15"},
+                    ],
+                }
+            ]
+        }
+        self.assertTrue(route_policy_reconcile_plan(self.device, changed).changes_content)
+
+    def test_reconcile_plan_marks_empty_shell_fills_as_content_changes(self):
+        from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        cases = (
+            ("prefix_lists", PrefixList.objects.create(name="PL-EMPTY"), {"name": "PL-EMPTY", "family": 4}),
+            ("community_lists", CommunityList.objects.create(name="CL-EMPTY"), {"name": "CL-EMPTY"}),
+            ("as_paths", ASPath.objects.create(name="AP-EMPTY"), {"name": "AP-EMPTY"}),
+            ("route_maps", RouteMap.objects.create(name="RM-EMPTY"), {"name": "RM-EMPTY"}),
+        )
+
+        for payload_key, _empty_shell, captured in cases:
+            with self.subTest(payload_key=payload_key):
+                payload = {
+                    "prefix_lists": [],
+                    "community_lists": [],
+                    "as_paths": [],
+                    "route_maps": [],
+                    payload_key: [{**captured, "entries": []}],
+                }
+                self.assertTrue(route_policy_reconcile_plan(self.device, payload).changes_content)
+
     def test_case_insensitive_name_adopts_existing_object(self):
         """A device object whose name differs only in CASE from an existing netbox_routing
         object must ADOPT it, not crash on the Lower(name) unique constraint.
@@ -82,23 +134,337 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertNotEqual(st.status, "error")
         self.assertEqual(st.object_id, existing.pk)
 
-    def test_deploying_row_settles_in_sync_when_present(self):
-        """A route-policy row marked 'deploying' at Apply settles to in_sync once the
-        device re-reports the object — the accepted→deploying→in_sync apply lifecycle."""
+    def test_deploying_row_waits_for_correlated_apply_evidence(self):
+        """An ordinary device read cannot identify the Apply attempt that it reflects."""
+        from uuid import uuid4
+
         self._make_mgmt(self.device)
+        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        payload = {"community_lists": [{"name": "CL-EMPTY", "entries": []}]}
+        reconcile_route_policy(self.device, payload)
+        st = NSORoutePolicyState.objects.get(
+            management__device=self.device, family="community_list", object_name="CL-EMPTY"
+        )
+        attempt_id = uuid4()
+        st.status = "deploying"
+        st.apply_attempt_id = attempt_id
+        st.save(update_fields=["status", "apply_attempt_id"])
+
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, payload)):
+            reconcile_route_policy(self.device, payload)
+        st.refresh_from_db()
+        self.assertEqual(st.status, "deploying")
+        self.assertEqual(st.apply_attempt_id, attempt_id)
+
+    def test_local_deploying_row_waits_for_correlated_apply_evidence(self):
+        """A LOCAL row is not rendered, so a device read cannot settle its Apply attempt."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
-        reconcile_route_policy(self.device, self._payload())  # first read → imported rows
-        st = NSORoutePolicyState.objects.get(
-            management__device=self.device, family="community_list", object_name="CL-LOCAL"
+        self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-LOCAL",
+            mode="local",
         )
-        st.status = "deploying"  # Apply marked it deploying
-        st.save(update_fields=["status"])
+        payload = {"community_lists": [{"name": "CL-LOCAL", "entries": []}]}
+        reconcile_route_policy(self.device, payload)
+        state = NSORoutePolicyState.objects.get(
+            management__device=self.device,
+            family="community_list",
+            object_name="CL-LOCAL",
+        )
+        attempt_id = uuid4()
+        state.status = "deploying"
+        state.apply_attempt_id = attempt_id
+        state.save(update_fields=["status", "apply_attempt_id"])
 
-        reconcile_route_policy(self.device, self._payload())  # object still present → settle
-        st.refresh_from_db()
-        self.assertEqual(st.status, "in_sync")
+        reconcile_route_policy(self.device, payload)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
+
+    def test_apply_promotes_only_rows_in_the_rendered_route_policy_snapshot(self):
+        """Apply must not bind an omitted LOCAL row to the MASTER carrier evidence."""
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state, delivery
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-LOCAL",
+            mode="local",
+        )
+        payload = {
+            "community_lists": [
+                {"name": "CL-MASTER", "entries": []},
+                {"name": "cl-local", "entries": []},
+                {"name": "CL-ATTACHED", "entries": []},
+            ]
+        }
+        reconcile_route_policy(self.device, payload)
+        master = NSORoutePolicyState.objects.get(management=management, object_name="CL-MASTER")
+        local = NSORoutePolicyState.objects.get(management=management, object_name="cl-local")
+        attached_local = NSORoutePolicyState.objects.get(management=management, object_name="CL-ATTACHED")
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-ATTACHED",
+            mode="local",
+        )
+        for row in (master, local, attached_local):
+            with intent_transaction(footprint_for_instance(row)):
+                row.status = "accepted"
+                row.save(update_fields=["status"])
+
+        registry = delivery.delivery_keys()
+        pushed = {}
+        for push_seq, entry in enumerate(
+            (candidate for candidate in registry.values() if candidate.in_protocol),
+            start=1,
+        ):
+            revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope=entry.key)
+            pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
+        attempt_id = uuid4()
+
+        apply_state.promote_current_intent(
+            management,
+            registry,
+            pushed,
+            apply_attempt_id=attempt_id,
+            static_route_stored=False,
+        )
+
+        master.refresh_from_db()
+        local.refresh_from_db()
+        attached_local.refresh_from_db()
+        self.assertEqual(master.status, "deploying")
+        self.assertEqual(master.apply_attempt_id, attempt_id)
+        self.assertEqual(attached_local.status, "deploying")
+        self.assertEqual(attached_local.apply_attempt_id, attempt_id)
+        self.assertEqual(local.status, "accepted")
+        self.assertIsNone(local.apply_attempt_id)
+
+    def _accepted_local_candidates(self, device, names, *, materialized: bool):
+        """Accept one LOCAL route-policy row per name and return the promotion inputs."""
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        management = self._make_mgmt(device)
+
+        def classify():
+            for name in names:
+                NSORoutePolicyObjectClass.objects.get_or_create(
+                    family="community_list", object_name=name, defaults={"mode": "local"}
+                )
+
+        # Classifying before the reconcile leaves the row unmaterialized; after it keeps the GFK.
+        if not materialized:
+            classify()
+        reconcile_route_policy(device, {"community_lists": [{"name": name, "entries": []} for name in names]})
+        if materialized:
+            classify()
+        rows = list(NSORoutePolicyState.objects.filter(management=management).order_by("pk"))
+        self.assertEqual(len(rows), len(names))
+        for row in rows:
+            self.assertEqual(row.object_id is not None, materialized)
+            with intent_transaction(footprint_for_instance(row)):
+                row.status = "accepted"
+                row.save(update_fields=["status"])
+        prepared = SimpleNamespace(management=management, rows=rows)
+        self._refresh_pushed_snapshot(prepared, device)
+        return prepared
+
+    def _refresh_pushed_snapshot(self, prepared, device):
+        """Re-read the current intent revisions so promotion sees an unchanged receipt."""
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        prepared.registry = delivery.delivery_keys()
+        prepared.pushed = {}
+        for push_seq, entry in enumerate(
+            (candidate for candidate in prepared.registry.values() if candidate.in_protocol),
+            start=1,
+        ):
+            revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope=entry.key)
+            prepared.pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
+
+    def _promotion_queries(self, prepared):
+        """Run promote_current_intent for one prepared device and return the SQL it issued."""
+        from uuid import uuid4
+
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin import apply_state
+
+        with CaptureQueriesContext(connection) as captured:
+            apply_state.promote_current_intent(
+                prepared.management,
+                prepared.registry,
+                prepared.pushed,
+                apply_attempt_id=uuid4(),
+                static_route_stored=False,
+            )
+        return [query["sql"] for query in captured.captured_queries]
+
+    def test_promotion_classifies_route_policy_candidates_in_one_query(self):
+        """Excluding unmaterialized LOCAL rows must not cost one classification query per row."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
+
+        one = self._accepted_local_candidates(self.device, ["CL-SOLO"], materialized=False)
+        many = self._accepted_local_candidates(
+            self.device2, [f"CL-BULK-{index}" for index in range(6)], materialized=False
+        )
+
+        one_sql = self._promotion_queries(one)
+        many_sql = self._promotion_queries(many)
+
+        table = NSORoutePolicyObjectClass._meta.db_table
+        classifications = (
+            sum(table in sql for sql in one_sql),
+            sum(table in sql for sql in many_sql),
+        )
+        self.assertEqual(
+            classifications[0],
+            classifications[1],
+            f"classification queries grew with the candidate count: {classifications}",
+        )
+        self.assertEqual(
+            len(one_sql),
+            len(many_sql),
+            f"promotion queries grew with the candidate count: {len(one_sql)} -> {len(many_sql)}",
+        )
+        for prepared in (one, many):
+            for row in prepared.rows:
+                row.refresh_from_db()
+                self.assertEqual(row.status, "accepted")
+                self.assertIsNone(row.apply_attempt_id)
+
+    def test_promotion_resolves_linked_route_policy_targets_without_per_row_queries(self):
+        """Linked LOCAL rows are promoted, and their target check stays one query per content type."""
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyObjectClass
+
+        one = self._accepted_local_candidates(self.device, ["CL-LINKED-SOLO"], materialized=True)
+        many = self._accepted_local_candidates(
+            self.device2, [f"CL-LINKED-{index}" for index in range(6)], materialized=True
+        )
+
+        one_sql = self._promotion_queries(one)
+        many_sql = self._promotion_queries(many)
+
+        attempt_table = NSOApplyAttempt._meta.db_table
+        class_table = NSORoutePolicyObjectClass._meta.db_table
+        target_table = CommunityList._meta.db_table
+        counts = []
+        for sqls in (one_sql, many_sql):
+            insert_at = next(index for index, sql in enumerate(sqls) if attempt_table in sql)
+            before_insert = sqls[:insert_at]
+            counts.append(
+                (
+                    sum(class_table in sql for sql in before_insert),
+                    sum(target_table in sql for sql in before_insert),
+                )
+            )
+        self.assertEqual(counts[0], counts[1], f"exclusion queries grew with the candidate count: {counts}")
+        for prepared in (one, many):
+            for row in prepared.rows:
+                row.refresh_from_db()
+                self.assertEqual(row.status, "deploying")
+                self.assertIsNotNone(row.apply_attempt_id)
+
+    def test_promotion_excludes_a_local_row_whose_materialized_target_is_gone(self):
+        """A LOCAL row with both GFK ids set but no target row stays excluded, as it does today."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state
+
+        from ._outbox_case import content_bulk_update
+
+        prepared = self._accepted_local_candidates(self.device, ["CL-DANGLING"], materialized=True)
+        row = prepared.rows[0]
+        content_bulk_update(row, object_id=row.object_id + 10_000)
+        self._refresh_pushed_snapshot(prepared, self.device)
+
+        apply_state.promote_current_intent(
+            prepared.management,
+            prepared.registry,
+            prepared.pushed,
+            apply_attempt_id=uuid4(),
+            static_route_stored=False,
+        )
+
+        row.refresh_from_db()
+        self.assertIsNotNone(row.content_type_id)
+        self.assertIsNotNone(row.object_id)
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+
+    def test_classification_mode_agrees_with_apply_on_a_mixed_case_name(self):
+        """The NSO tab badge and Apply must read one classification, case-insensitively."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-LOCAL", mode="local")
+        reconcile_route_policy(self.device, {"community_lists": [{"name": "cl-local", "entries": []}]})
+        state = NSORoutePolicyState.objects.get(management=management, object_name="cl-local")
+
+        self.assertEqual(_group_mode(state.family, state.object_name), "local")
+        self.assertEqual(state.classification_mode, "local")
+
+    def test_promotion_excludes_a_local_row_that_only_postgres_case_folds_onto_its_class(self):
+        """UPPER() folds the greek final sigma onto sigma; python str.lower()/upper() does not."""
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-\u03c3", mode="local")
+        reconcile_route_policy(self.device, {"community_lists": [{"name": "CL-\u03c2", "entries": []}]})
+        row = NSORoutePolicyState.objects.get(management=management, object_name="CL-\u03c2")
+        self.assertNotEqual("CL-\u03c2".lower(), "CL-\u03c3".lower())
+        self.assertEqual(_group_mode(row.family, row.object_name), "local")
+        self.assertEqual(row.classification_mode, "local")
+        self.assertIsNone(row.object_id)
+        with intent_transaction(footprint_for_instance(row)):
+            row.status = "accepted"
+            row.save(update_fields=["status"])
+        prepared = SimpleNamespace(management=management, rows=[row])
+        self._refresh_pushed_snapshot(prepared, self.device)
+
+        apply_state.promote_current_intent(
+            prepared.management,
+            prepared.registry,
+            prepared.pushed,
+            apply_attempt_id=uuid4(),
+            static_route_stored=False,
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
 
     def test_reconciles_all_families(self):
         """One object per family → created in netbox_routing + a state row each."""
@@ -918,6 +1284,127 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertIn(st.status, ("accepted", "deploying", "in_sync", "apply_failed"))
         self.assertTrue(RouteMap.objects.filter(name="RM-KEEP").exists())  # kept (operator owns)
 
+    def _rp_revision(self, device=None):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        row = NSOIntentRevision.objects.filter(device=device or self.device, scope="route_policy").first()
+        return row.revision if row else 0
+
+    def test_omitted_unowned_group_removal_runs_under_the_gate(self):
+        """The plan must predict the stale-row cascade: the gate refuses it under a mirror permit."""
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        seeded = {"route_maps": [{"name": "RM-OMIT", "entries": [{"sequence": 10, "action": "permit"}]}]}
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        before = self._rp_revision()
+
+        empty = {"route_maps": []}
+        plan = route_policy_reconcile_plan(self.device, empty)
+        self.assertTrue(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, empty)
+
+        self.assertFalse(NSORoutePolicyState.objects.filter(family="route_map", object_name="RM-OMIT").exists())
+        self.assertFalse(RouteMap.objects.filter(name="RM-OMIT").exists())
+        self.assertGreater(self._rp_revision(), before)
+
+    def test_omitted_in_sync_owner_flag_runs_under_the_gate(self):
+        """in_sync -> changed drops the owned group from the wire, so the plan must bump."""
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        seeded = {"route_maps": [{"name": "RM-SYNCED", "entries": [{"sequence": 10, "action": "permit"}]}]}
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-SYNCED")
+        with intent_transaction(footprint_for_instance(state)):
+            state.status = "in_sync"
+            state.save(update_fields=["status"])
+        before = self._rp_revision()
+
+        empty = {"route_maps": []}
+        plan = route_policy_reconcile_plan(self.device, empty)
+        self.assertTrue(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, empty)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertFalse(state.device_present)
+        self.assertTrue(RouteMap.objects.filter(name="RM-SYNCED").exists())
+        self.assertGreater(self._rp_revision(), before)
+
+    def test_omitted_accepted_owner_is_a_lifecycle_only_read(self):
+        """An accepted row keeps its status on absence: flags only, no bump."""
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        seeded = {"route_maps": [{"name": "RM-ACCEPTED", "entries": [{"sequence": 10, "action": "permit"}]}]}
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-ACCEPTED")
+        with intent_transaction(footprint_for_instance(state)):
+            state.status = "accepted"
+            state.save(update_fields=["status"])
+        before = self._rp_revision()
+
+        empty = {"route_maps": []}
+        plan = route_policy_reconcile_plan(self.device, empty)
+        self.assertFalse(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, empty)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertFalse(state.device_present)
+        self.assertTrue(RouteMap.objects.filter(name="RM-ACCEPTED").exists())
+        self.assertEqual(self._rp_revision(), before)
+
+    def test_omitted_referenced_unowned_group_is_a_lifecycle_only_read(self):
+        """A still-referenced object is kept and flagged, so absence writes no content."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        rmaps = [
+            {"name": "RM-REF", "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": ["PL-KEPT"]}]}
+        ]
+        seeded = {
+            "prefix_lists": [{"name": "PL-KEPT", "entries": [{"sequence": 10, "prefix": "10.0.0.0/8"}]}],
+            "route_maps": rmaps,
+        }
+        with reconcile_transaction(route_policy_reconcile_plan(self.device, seeded)):
+            reconcile_route_policy(self.device, seeded)
+        before = self._rp_revision()
+
+        dropped = {"route_maps": rmaps}
+        plan = route_policy_reconcile_plan(self.device, dropped)
+        self.assertFalse(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.device, dropped)
+
+        state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-KEPT")
+        self.assertFalse(state.device_present)
+        self.assertTrue(PrefixList.objects.filter(name="PL-KEPT").exists())
+        self.assertEqual(self._rp_revision(), before)
+
     def test_route_map_expands_matched_community_list_into_match_community(self):
         """A route-map matching a community-list also links that list's member
         Communities into match_community (devices never match communities directly)."""
@@ -1299,7 +1786,8 @@ class TestSharedObjectOwnership(TestCase):
         sib = NSORoutePolicyState.objects.get(management__device=self.d1, object_name="PL-RS")
         other = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-RS")
         old = timezone.now() - timezone.timedelta(days=1)
-        NSORoutePolicyState.objects.filter(pk=sib.pk).update(last_sync_at=old)  # backdate to prove the bump
+        sib.last_sync_at = old
+        sib.save(update_fields=["last_sync_at"])  # backdate to prove the bump
 
         ownership.rematerialize(other)  # re-point to d2 → resettles the d1 sibling
 
@@ -1420,6 +1908,68 @@ class TestSharedObjectOwnership(TestCase):
         pl_state = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-REF")
         self.assertFalse(pl_state.device_present)  # flagged removed
         self.assertTrue(PrefixList.objects.filter(name="PL-REF").exists())  # kept — still referenced
+
+    def _rp_revision(self, device):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        row = NSOIntentRevision.objects.filter(device=device, scope="route_policy").first()
+        return row.revision if row else 0
+
+    def test_non_owner_drop_of_a_shared_object_is_a_lifecycle_only_read(self):
+        """Dropping a non-materialized row leaves the shared object untouched: no bump."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        for device in (self.d1, self.d2):
+            payload = self._pl("PL-DROP", ["10.0.0.0/8"])
+            with reconcile_transaction(route_policy_reconcile_plan(device, payload)):
+                reconcile_route_policy(device, payload)
+        before = (self._rp_revision(self.d1), self._rp_revision(self.d2))
+
+        empty = {"prefix_lists": []}
+        plan = route_policy_reconcile_plan(self.d2, empty)
+        self.assertFalse(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.d2, empty)
+
+        self.assertFalse(NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-DROP").exists())
+        self.assertTrue(PrefixList.objects.filter(name="PL-DROP").exists())
+        self.assertEqual((self._rp_revision(self.d1), self._rp_revision(self.d2)), before)
+
+    def test_owner_drop_of_a_shared_object_rematerializes_under_the_gate(self):
+        """Re-pointing refills the shared object from the sibling, so the plan must bump."""
+        from netbox_routing.models import PrefixList
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        for device in (self.d1, self.d2):
+            payload = self._pl("PL-HANDOVER", ["10.0.0.0/8"])
+            with reconcile_transaction(route_policy_reconcile_plan(device, payload)):
+                reconcile_route_policy(device, payload)
+        before = self._rp_revision(self.d1)
+
+        empty = {"prefix_lists": []}
+        plan = route_policy_reconcile_plan(self.d1, empty)
+        self.assertTrue(plan.changes_content)
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.d1, empty)
+
+        self.assertFalse(
+            NSORoutePolicyState.objects.filter(management__device=self.d1, object_name="PL-HANDOVER").exists()
+        )
+        s2 = NSORoutePolicyState.objects.get(management__device=self.d2, object_name="PL-HANDOVER")
+        self.assertTrue(s2.is_materialized)
+        self.assertTrue(PrefixList.objects.filter(name="PL-HANDOVER").exists())
+        self.assertGreater(self._rp_revision(self.d1), before)
 
     def test_rematerialize_repoints_ownership(self):
         """Operator picks the second device's version → the shared object is refilled from

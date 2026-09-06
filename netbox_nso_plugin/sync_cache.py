@@ -19,8 +19,6 @@ from datetime import UTC, datetime
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from .models import NSODeviceManagement
-
 logger = logging.getLogger(__name__)
 
 # Sort key for a row the link repair has never tried, so it goes to the front of the queue.
@@ -38,6 +36,17 @@ _MOVED = "moved"  # our device is there under a different id — adopt it
 _MISSING = "missing"  # our device is not in the adapter at all — re-link it
 
 _BROKEN_LINK_MESSAGE = "This device's adapter mapping is broken; the next sync-cache sweep will repair it."
+
+
+class _LinkReconcileNoOp(Exception):
+    """Roll back a repair whose authoritative source identity changed."""
+
+
+def _mirror_management(mgmt, **values) -> None:
+    """Persist lifecycle-only adapter observations with one locked instance save."""
+    from .intent_state import update_mirror_fields
+
+    update_mirror_fields(mgmt, **values)
 
 
 def parse_adapter_timestamp(value, field="timestamp"):
@@ -99,7 +108,7 @@ def refresh_sync_cache(mgmt, adapter_device):
     # the failure would retire a banner whose scope never landed. It is cleared by the successful
     # push (signals.sync_scope_to_adapter) or the banner's own "Retry adapter link" action.
     if update_fields:
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(**{f: getattr(mgmt, f) for f in update_fields})
+        _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
     return update_fields
 
 
@@ -195,8 +204,7 @@ def refresh_sync_caches(rows, snapshot=None) -> tuple[int, int]:
 def _flag_link_error(mgmt, message) -> None:
     """Record an operator-visible link error without firing the post_save adapter push."""
     if mgmt.adapter_link_error != message:
-        mgmt.adapter_link_error = message
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_link_error=message)
+        _mirror_management(mgmt, adapter_link_error=message)
 
 
 def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
@@ -253,33 +261,41 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         if attempted >= MAX_RELINKS_PER_RUN:
             _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
-        # Stamp for being TRIED, not for succeeding, and before the try: whether the
-        # re-onboard worked is not observable here (it happens in an on_commit callback that
-        # logs and returns), so a stamp conditional on success would never move a
-        # permanently broken row to the back of the queue. Through .update(), which does not
-        # re-fire the row's push handler.
-        attempted += 1
-        mgmt.adapter_link_attempted_at = now
-        NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_link_attempted_at=now)
+        expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
         try:
-            if state is _MOVED:
-                logger.warning(
-                    "Adapter device for %s moved from id %s to %s — adopting",
-                    mgmt.nso_device_name,
-                    mgmt.adapter_device_id,
-                    adapter_device["id"],
-                )
-                mgmt.adapter_device_id = adapter_device["id"]
-                NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=adapter_device["id"])
-            elif state is _REUSED:
-                logger.warning(
-                    "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
-                    mgmt.adapter_device_id,
-                    mgmt.nso_device_name,
-                )
-                mgmt.adapter_device_id = None
-                NSODeviceManagement.objects.filter(pk=mgmt.pk).update(adapter_device_id=None)
-            mgmt.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+            from .intent_state import footprint_for_instance, intent_transaction
+
+            with intent_transaction(footprint_for_instance(mgmt)):
+                current = type(mgmt).objects.get(pk=mgmt.pk)
+                if (
+                    current.source_rekey_pending
+                    or (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
+                ):
+                    raise _LinkReconcileNoOp
+                # Stamp for being TRIED, not for succeeding, and before the try: whether the
+                # re-onboard worked is not observable here (it happens in an on_commit callback
+                # that logs and returns), so a stamp conditional on success would never move a
+                # permanently broken row to the back of the queue.
+                attempted += 1
+                _mirror_management(current, adapter_link_attempted_at=now)
+                if state is _MOVED:
+                    logger.warning(
+                        "Adapter device for %s moved from id %s to %s — adopting",
+                        current.nso_device_name,
+                        current.adapter_device_id,
+                        adapter_device["id"],
+                    )
+                    _mirror_management(current, adapter_device_id=adapter_device["id"])
+                elif state is _REUSED:
+                    logger.warning(
+                        "Adapter device id %s no longer belongs to %s — dropping the stale pointer",
+                        current.adapter_device_id,
+                        current.nso_device_name,
+                    )
+                    _mirror_management(current, adapter_device_id=None)
+                current.save()  # re-fires sync_scope_to_adapter → onboard / not-found recovery → scope
+        except _LinkReconcileNoOp:
+            continue
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue

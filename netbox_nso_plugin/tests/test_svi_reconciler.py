@@ -47,6 +47,21 @@ class TestSviReconciler(TestCase):
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
         self.assertEqual(rows[0].status, "imported")
 
+    def test_direct_reconcile_does_not_advance_intent_revision(self):
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="svi")
+        before = revision.revision
+
+        reconcile_svi(
+            self.device,
+            {"interfaces": [{"interface_name": "Vlan1623", "vlan_id": 1623, "type": "svi"}]},
+        )
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
+
     def test_vlan_linked_when_present(self):
         from ipam.models import VLAN
 
@@ -66,6 +81,30 @@ class TestSviReconciler(TestCase):
         Interface.objects.create(device=self.device, name="Vlan200", type="virtual")
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan200", "vlan_id": 200, "type": "svi"}]})
         self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan200").count(), 1)
+
+    def test_a_concurrently_created_interface_is_reused(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.svi_reconciler import _reconcile_svi, svi_reconcile_plan
+
+        payload = {"interfaces": [{"interface_name": "Vlan201", "vlan_id": 201, "type": "svi"}]}
+        plan = svi_reconcile_plan(self.device, payload)
+        inserted = None
+
+        def insert_after_interface_read(execute, sql, params, many, context):
+            nonlocal inserted
+            result = execute(sql, params, many, context)
+            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                inserted = Interface.objects.create(device=self.device, name="Vlan201", type="virtual")
+            return result
+
+        with reconcile_transaction(plan), connection.execute_wrapper(insert_after_interface_read):
+            rows = _reconcile_svi(self.device, payload)
+
+        self.assertIsNotNone(inserted, "the wrapper never reached the interface read seam")
+        self.assertEqual(rows[0].interface_id, inserted.pk)
+        self.assertEqual(Interface.objects.filter(device=self.device, name="Vlan201").count(), 1)
 
     def test_irb_type_preserved(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
@@ -96,6 +135,8 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         )
 
     def _state(self, name="Vlan100", vid=100, status="imported"):
+        from uuid import uuid4
+
         from dcim.models import Interface
         from ipam.models import VLAN
 
@@ -105,7 +146,13 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         iface = Interface.objects.create(device=self.device, name=name, type="virtual")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
         return NSOSVIState.objects.create(
-            management=self.management, interface=iface, vlan=vlan, svi_type="svi", vrf="MGMT", status=status
+            management=self.management,
+            interface=iface,
+            vlan=vlan,
+            svi_type="svi",
+            vrf="MGMT",
+            status=status,
+            apply_attempt_id=uuid4() if status == "deploying" else None,
         )
 
     def test_reconcile_preserves_owned_status(self):
@@ -142,38 +189,51 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.vrf, "CUSTOMER")
         self.assertEqual(state.status, "in_sync")
 
-    def test_deploying_waits_for_matching_device_values_before_settling(self):
-        """Reappearance alone must not confirm an Apply while the device still has old values."""
+    def test_deploying_waits_for_correlated_apply_evidence(self):
+        """An ordinary device read cannot identify the Apply attempt that it reflects."""
         from netbox_nso_plugin.models import NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
-        self._state(name="Vlan100", vid=100, status="deploying")
+        state = self._state(name="Vlan100", vid=100, status="deploying")
+        self._state(name="Vlan200", vid=200, status="in_sync")
+        attempt_id = state.apply_attempt_id
         reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi"}]})
-        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "deploying")
+        state = NSOSVIState.objects.get(interface__name="Vlan100")
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
 
         reconcile_svi(
             self.device,
             {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100, "type": "svi", "vrf": "MGMT"}]},
         )
-        self.assertEqual(NSOSVIState.objects.get(interface__name="Vlan100").status, "in_sync")
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+        self.assertEqual(state.apply_attempt_id, attempt_id)
 
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned SVI overlay must NOT be hard-deleted when the device stops reporting it.
 
         NSOSVIState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows destroys
-        the in-flight Apply marker + ownership. Intent-pending rows (deploying) are kept; a
-        confirmed row (in_sync) that vanishes surfaces as drift (``changed``), never data-loss.
+        ownership. A deploying row retains its correlated Apply attempt. A confirmed row
+        that vanishes surfaces as ``changed`` and advances the scope revision.
         """
-        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSVIState
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
         deploying = self._state(name="Vlan100", vid=100, status="deploying")
+        attempt_id = deploying.apply_attempt_id
         confirmed = self._state(name="Vlan200", vid=200, status="in_sync")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="svi")
+        before = revision.revision
         reconcile_svi(self.device, {"interfaces": []})  # device stops reporting all SVIs
         assert NSOSVIState.objects.filter(pk=deploying.pk).exists(), "deploying (apply-in-flight) overlay deleted"
         assert NSOSVIState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
-        assert NSOSVIState.objects.get(pk=deploying.pk).status == "deploying"
+        deploying.refresh_from_db()
+        revision.refresh_from_db()
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt_id
         assert NSOSVIState.objects.get(pk=confirmed.pk).status == "changed"
+        assert revision.revision == before + 1  # the vanished confirmed SVI is a content change
 
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch

@@ -16,8 +16,423 @@ import hashlib
 import ipaddress
 import json
 import logging
+from dataclasses import replace
+
+from .intent_state import mirror_reconciler
 
 logger = logging.getLogger(__name__)
+
+
+def _reported_template_values(payload):
+    """Select peer-group values in the same deterministic order as reconciliation."""
+    remote_as = {}
+    address_families = {}
+    routers = [row for row in payload.get("routers", []) or [] if isinstance(row, dict)]
+    for router in sorted(routers, key=lambda row: str(row.get("asn") or "")):
+        scopes = [row for row in router.get("scopes", []) or [] if isinstance(row, dict)]
+        for scope in sorted(scopes, key=lambda row: row.get("vrf") or ""):
+            peers = [row for row in scope.get("peers", []) or [] if isinstance(row, dict)]
+            for peer in sorted(peers, key=lambda row: row.get("peer_address") or ""):
+                try:
+                    ipaddress.ip_address(peer.get("peer_address") or "")
+                except ValueError:
+                    continue
+                if peer.get("peer_group"):
+                    remote_as[peer["peer_group"]] = peer.get("remote_as")
+            groups = [row for row in scope.get("peer_groups", []) or [] if isinstance(row, dict)]
+            for group in sorted(groups, key=lambda row: (row.get("name") or "").casefold()):
+                if group.get("name"):
+                    remote_as[group["name"]] = group.get("remote_as")
+                    address_families[group["name"]] = group.get("address_families") or []
+    return remote_as, address_families
+
+
+def _validate_bgp_policy_resolutions(expected):
+    """Reject a named policy lookup that changed after discovery."""
+    from netbox_routing.models import PrefixList, RouteMap
+
+    from .intent_state import RendererTargetsChanged
+
+    expected = tuple(expected)
+    names_by_family = {
+        family: {name for expected_family, name, _pk in expected if expected_family == family}
+        for family in ("route_map", "prefix_list")
+    }
+    models = {"route_map": RouteMap, "prefix_list": PrefixList}
+    current = []
+    for family, names in names_by_family.items():
+        rows_by_name = {row.name: row.pk for row in models[family].objects.filter(name__in=names)}
+        current.extend((family, name, rows_by_name.get(name)) for name in names)
+    if tuple(sorted(current)) != expected:
+        raise RendererTargetsChanged("BGP route-policy resolutions changed during acquisition")
+
+
+def _validate_bgp_source_resolutions(device_id, expected):
+    """Reject a source-interface lookup that changed after discovery."""
+    from dcim.models import Interface
+
+    from .intent_state import RendererTargetsChanged
+
+    expected = tuple(expected)
+    names = {name for name, _pk in expected}
+    rows_by_name = {row.name: row.pk for row in Interface.objects.filter(device_id=device_id, name__in=names)}
+    current = tuple(sorted((name, rows_by_name.get(name)) for name in names))
+    if current != expected:
+        raise RendererTargetsChanged("BGP source-interface resolutions changed during acquisition")
+
+
+def _bgp_plan_peer_dependencies(device, states, reported, payload):
+    """Load the peer dependencies used by the BGP content predictor in fixed queries."""
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.models import Q
+    from ipam.models import ASN, IPAddress
+    from netbox_routing.models import BGPPeer, BGPPeerAddressFamily, BGPPeerTemplate, PrefixList, RouteMap
+
+    from .intent_state import route_policy_footprint
+
+    peer_entries = tuple(reported.values())
+    peer_group_entries = tuple(
+        group
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for scope in router.get("scopes", []) or []
+        if isinstance(scope, dict)
+        for group in scope.get("peer_groups", []) or []
+        if isinstance(group, dict)
+    )
+    af_entries = tuple(
+        af
+        for owner in (*peer_entries, *peer_group_entries)
+        for af in owner.get("address_families", []) or []
+        if isinstance(af, dict)
+    )
+    policy_groups = {
+        (family, af.get(field))
+        for af in af_entries
+        for family, fields in (
+            ("route_map", ("routemap_in", "routemap_out")),
+            ("prefix_list", ("prefixlist_in", "prefixlist_out")),
+        )
+        for field in fields
+        if af.get(field)
+    }
+    route_map_names = {name for family, name in policy_groups if family == "route_map"}
+    prefix_list_names = {name for family, name in policy_groups if family == "prefix_list"}
+    route_maps_by_name = {row.name: row for row in RouteMap.objects.filter(name__in=route_map_names)}
+    prefix_lists_by_name = {row.name: row for row in PrefixList.objects.filter(name__in=prefix_list_names)}
+    policy_resolutions = tuple(
+        sorted(
+            (family, name, objects_by_name.get(name).pk if name in objects_by_name else None)
+            for family, names, objects_by_name in (
+                ("route_map", route_map_names, route_maps_by_name),
+                ("prefix_list", prefix_list_names, prefix_lists_by_name),
+            )
+            for name in names
+        )
+    )
+    policy_footprint = route_policy_footprint(policy_groups)
+    dependency_asns = {
+        int(value)
+        for peer in peer_entries
+        for value in (peer.get("remote_as"), peer.get("local_as"))
+        if value not in (None, "") and str(value).isdigit()
+    }
+    asns_by_number = {row.asn: row for row in ASN.objects.filter(asn__in=dependency_asns)}
+    peer_group_names = {peer.get("peer_group") for peer in peer_entries if peer.get("peer_group")}
+    templates_by_name = {row.name: row for row in BGPPeerTemplate.objects.filter(name__in=peer_group_names)}
+    source_ips = set()
+    source_interfaces = set()
+    for peer in peer_entries:
+        source = peer.get("source") or ""
+        if not source:
+            continue
+        try:
+            parsed_source = ipaddress.ip_address(source)
+        except ValueError:
+            source_interfaces.add(source)
+        else:
+            source_ips.add(str(parsed_source))
+    address_filter = Q(pk__in=[])
+    for source in source_ips:
+        address_filter |= Q(address__net_host=source)
+    addresses_by_host = {str(row.address.ip): row for row in IPAddress.objects.filter(address_filter)}
+    interfaces_by_name = {row.name: row for row in Interface.objects.filter(device=device, name__in=source_interfaces)}
+    source_interface_resolutions = tuple(
+        sorted(
+            (name, interfaces_by_name[name].pk if name in interfaces_by_name else None) for name in source_interfaces
+        )
+    )
+    peer_type = ContentType.objects.get_for_model(BGPPeer)
+    peer_address_families_by_peer = {}
+    for row in BGPPeerAddressFamily.objects.filter(
+        assigned_object_type=peer_type,
+        assigned_object_id__in={state.bgp_peer_id for state in states if state.bgp_peer_id is not None},
+    ).select_related("address_family"):
+        peer_address_families_by_peer.setdefault(row.assigned_object_id, []).append(row)
+    return (
+        asns_by_number,
+        templates_by_name,
+        addresses_by_host,
+        interfaces_by_name,
+        peer_address_families_by_peer,
+        route_maps_by_name,
+        prefix_lists_by_name,
+        policy_footprint,
+        policy_resolutions,
+        source_interface_resolutions,
+    )
+
+
+def bgp_reconcile_plan(device, payload: dict):
+    """Declare the BGP graph and predict changes to owned peer fragments."""
+    from django.contrib.contenttypes.models import ContentType
+    from django.db.models import Q
+    from ipam.models import ASN, IPAddress
+
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSOBGPPeerState, NSODeviceManagement
+
+    try:
+        from netbox_routing.models import (
+            BGPAddressFamily,
+            BGPPeer,
+            BGPPeerAddressFamily,
+            BGPPeerTemplate,
+            BGPRouter,
+            BGPScope,
+        )
+    except ImportError:
+        return ReconcileMutationPlan(MutationFootprint())
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    states = tuple(NSOBGPPeerState.objects.filter(management=management).select_related("bgp_peer").order_by("pk"))
+    reported = {
+        (str(router.get("asn") or ""), scope.get("vrf") or "", peer.get("peer_address") or ""): peer
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for scope in router.get("scopes", []) or []
+        if isinstance(scope, dict)
+        for peer in scope.get("peers", []) or []
+        if isinstance(peer, dict) and peer.get("peer_address")
+    }
+    (
+        asns_by_number,
+        templates_by_name,
+        addresses_by_host,
+        interfaces_by_name,
+        peer_address_families_by_peer,
+        route_maps_by_name,
+        prefix_lists_by_name,
+        policy_footprint,
+        policy_resolutions,
+        source_interface_resolutions,
+    ) = _bgp_plan_peer_dependencies(device, states, reported, payload)
+    changes_content = False
+    for state in states:
+        peer = reported.get((state.asn_str, state.vrf_name, state.peer_address_str))
+        if peer is None:
+            if sm.is_owned(state.status) != sm.is_owned(sm.on_reconcile(state.status, present=False)):
+                changes_content = True
+                break
+        elif sm.is_owned(state.status):
+            reported_remote_as = str(peer.get("remote_as") or "") or None
+            reported_enabled = peer.get("enabled") if peer.get("enabled") is not None else True
+            current_enabled = state.enabled if state.enabled is not None else True
+            if (state.remote_as_str or None) != reported_remote_as or current_enabled != reported_enabled:
+                changes_content = True
+                break
+        if peer is not None and _peer_plan_changes_native_content(
+            state,
+            peer,
+            asns_by_number=asns_by_number,
+            templates_by_name=templates_by_name,
+            addresses_by_host=addresses_by_host,
+            interfaces_by_name=interfaces_by_name,
+            peer_address_families=peer_address_families_by_peer.get(state.bgp_peer_id, ()),
+            route_maps_by_name=route_maps_by_name,
+            prefix_lists_by_name=prefix_lists_by_name,
+        ):
+            changes_content = True
+            break
+
+    device_type = ContentType.objects.get_for_model(type(device))
+    routers = tuple(
+        BGPRouter.objects.filter(assigned_object_type=device_type, assigned_object_id=device.pk)
+        .select_related("asn")
+        .order_by("pk")
+    )
+    scopes = tuple(BGPScope.objects.filter(router__in=routers).order_by("pk"))
+    peers = tuple(BGPPeer.objects.filter(scope__in=scopes).order_by("pk"))
+    template_remote_as, reported_template_afs = _reported_template_values(payload)
+    templates = tuple(
+        BGPPeerTemplate.objects.filter(
+            Q(pk__in={peer.peer_group_id for peer in peers if peer.peer_group_id is not None})
+            | Q(name__in=template_remote_as)
+        ).order_by("pk")
+    )
+    address_families = tuple(BGPAddressFamily.objects.filter(scope__in=scopes).order_by("pk"))
+    peer_type = ContentType.objects.get_for_model(BGPPeer)
+    template_type = ContentType.objects.get_for_model(BGPPeerTemplate)
+    peer_address_families = tuple(
+        BGPPeerAddressFamily.objects.filter(
+            Q(assigned_object_type=peer_type, assigned_object_id__in={peer.pk for peer in peers})
+            | Q(assigned_object_type=template_type, assigned_object_id__in={template.pk for template in templates})
+        )
+        .select_related("address_family")
+        .order_by("pk")
+    )
+    if not changes_content:
+        changes_content = _bgp_shared_graph_changes_content(
+            routers,
+            templates,
+            template_remote_as,
+            template_type,
+            peer_address_families,
+            reported_template_afs,
+            payload,
+            route_maps_by_name,
+            prefix_lists_by_name,
+        )
+    asn_values = {
+        int(value)
+        for router in payload.get("routers", []) or []
+        if isinstance(router, dict)
+        for value in (
+            [router.get("asn")]
+            + [
+                peer.get(field)
+                for scope in router.get("scopes", []) or []
+                if isinstance(scope, dict)
+                for peer in scope.get("peers", []) or []
+                if isinstance(peer, dict)
+                for field in ("remote_as", "local_as")
+            ]
+            + [
+                group.get("remote_as")
+                for scope in router.get("scopes", []) or []
+                if isinstance(scope, dict)
+                for group in scope.get("peer_groups", []) or []
+                if isinstance(group, dict)
+            ]
+        )
+        if value not in (None, "") and str(value).isdigit()
+    }
+    asns = tuple(ASN.objects.filter(asn__in=asn_values).order_by("pk"))
+    addresses = tuple(
+        IPAddress.objects.filter(
+            pk__in={value for peer in peers for value in (peer.peer_id, peer.source_id) if value is not None}
+        ).order_by("pk")
+    )
+    source_models = {
+        "ipam.asn": asns,
+        "dcim.interface": tuple(interfaces_by_name.values()),
+        "ipam.ipaddress": addresses,
+        "netbox_routing.bgprouter": routers,
+        "netbox_routing.bgpscope": scopes,
+        "netbox_routing.bgppeer": peers,
+        "netbox_routing.bgppeertemplate": templates,
+        "netbox_routing.bgpaddressfamily": address_families,
+        "netbox_routing.bgppeeraddressfamily": peer_address_families,
+    }
+    bgp_footprint = MutationFootprint.for_keys(
+        {(device.pk, "bgp")},
+        source_rows=(
+            SourceRow("dcim.device", device.pk),
+            *(SourceRow(label, None) for label in source_models),
+            *(SourceRow(label, row.pk) for label, rows in source_models.items() for row in rows),
+        ),
+        overlay_rows=(
+            SourceRow("netbox_nso_plugin.nsobgppeerstate", None),
+            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+        ),
+    )
+    policy_dependencies = MutationFootprint.for_keys(
+        (),
+        shared_keys=policy_footprint.shared_keys,
+        source_rows=policy_footprint.source_rows,
+        overlay_rows=policy_footprint.overlay_rows,
+    )
+    footprint = MutationFootprint.merge(bgp_footprint, policy_dependencies)
+    footprint = replace(
+        footprint,
+        device_ids=tuple(sorted({*footprint.device_ids, *policy_footprint.device_ids})),
+    )
+
+    def validate_after_acquire():
+        _validate_bgp_source_resolutions(device.pk, source_interface_resolutions)
+        _validate_bgp_policy_resolutions(policy_resolutions)
+
+    return ReconcileMutationPlan(
+        footprint,
+        changes_content=changes_content,
+        validate_after_acquire=validate_after_acquire,
+    )
+
+
+def _bgp_shared_graph_changes_content(
+    routers,
+    templates,
+    template_remote_as,
+    template_type,
+    peer_address_families,
+    reported_template_afs,
+    payload,
+    route_maps_by_name,
+    prefix_lists_by_name,
+) -> bool:
+    """Predict router-id and shared-template changes visible to owned peers."""
+    import copy
+
+    from ipam.models import ASN
+
+    from .intent_state import ABSENT, canonical_fragment
+
+    reported_routers = {
+        str(item.get("asn") or ""): item
+        for item in payload.get("routers", []) or []
+        if isinstance(item, dict) and item.get("asn") not in (None, "")
+    }
+    stored_template_afs = {}
+    for row in peer_address_families:
+        if row.assigned_object_type_id == template_type.pk:
+            stored_template_afs.setdefault(row.assigned_object_id, []).append(row)
+    for router in routers:
+        reported_router_id = reported_routers.get(str(router.asn.asn), {}).get("router_id")
+        if reported_router_id and not router.router_id:
+            candidate = copy.copy(router)
+            candidate.router_id = reported_router_id
+            if canonical_fragment(router) != canonical_fragment(candidate):
+                return True
+    for template in templates:
+        reported_afs = reported_template_afs.get(template.name)
+        if reported_afs is not None:
+            stored_afs = _af_rows_content(stored_template_afs.get(template.pk, ()))
+            if stored_afs != _af_device_content(
+                reported_afs,
+                route_maps_by_name=route_maps_by_name,
+                prefix_lists_by_name=prefix_lists_by_name,
+            ):
+                return True
+        remote_as = template_remote_as.get(template.name)
+        if remote_as in (None, ""):
+            continue
+        try:
+            remote_asn = ASN.objects.filter(asn=int(remote_as)).first()
+        except (TypeError, ValueError):
+            continue
+        if remote_asn is None:
+            if canonical_fragment(template) != ABSENT:
+                return True
+            continue
+        candidate = copy.copy(template)
+        candidate.remote_as = remote_asn
+        if canonical_fragment(template) != canonical_fragment(candidate):
+            return True
+    return False
 
 
 def _pk(obj):
@@ -234,13 +649,103 @@ def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, sour
     }
 
 
-def _af_device_content(af_list: list) -> list:
+def _peer_plan_changes_native_content(
+    state,
+    peer_entry: dict,
+    *,
+    asns_by_number,
+    templates_by_name,
+    addresses_by_host,
+    interfaces_by_name,
+    peer_address_families,
+    route_maps_by_name,
+    prefix_lists_by_name,
+) -> bool:
+    """Predict the existing-peer auto-mirror branch without creating dependencies."""
+    from . import status_machine as sm
+
+    bgp_peer = state.bgp_peer
+    if not sm.is_owned(state.status) or bgp_peer is None or not state.device_base_hash:
+        return False
+    current = {
+        field: (getattr(bgp_peer, f"{field}_id") if field in _PEER_FK_FIELDS else getattr(bgp_peer, field))
+        for field in _PEER_FIELDS
+    }
+    _drop_unset_update_source(current)
+    current["afs"] = _af_rows_content(peer_address_families)
+    if _content_hash(current) != state.device_base_hash:
+        return False
+
+    unresolved = False
+
+    def existing_asn(value):
+        nonlocal unresolved
+        if value in (None, ""):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        result = asns_by_number.get(number)
+        unresolved = unresolved or result is None
+        return result
+
+    remote_asn = existing_asn(peer_entry.get("remote_as"))
+    local_asn = existing_asn(peer_entry.get("local_as"))
+    peer_group_name = peer_entry.get("peer_group") or ""
+    peer_group = templates_by_name.get(peer_group_name) if peer_group_name else None
+    unresolved = unresolved or bool(peer_group_name and peer_group is None)
+    source = peer_entry.get("source") or ""
+    source_ip = update_source = None
+    if source:
+        try:
+            parsed_source = ipaddress.ip_address(source)
+        except ValueError:
+            update_source = interfaces_by_name.get(source)
+        else:
+            source_ip = addresses_by_host.get(str(parsed_source))
+            unresolved = unresolved or source_ip is None
+    desired = _peer_desired(
+        peer_entry,
+        remote_asn,
+        local_asn,
+        peer_group,
+        source_ip,
+        update_source,
+    )
+    if unresolved:
+        return True
+    desired_hash = _content_hash(
+        _peer_device_content(
+            desired,
+            peer_entry.get("address_families") or [],
+            route_maps_by_name=route_maps_by_name,
+            prefix_lists_by_name=prefix_lists_by_name,
+        )
+    )
+    return desired_hash != state.device_base_hash
+
+
+def _af_device_content(
+    af_list: list,
+    *,
+    route_maps_by_name=None,
+    prefix_lists_by_name=None,
+) -> list:
     """Canonical per-AF policy content from the device payload (FKs resolved to pks).
 
     Shared by the BGP peer and the peer-group TEMPLATE 3-way merges — both carry the
     same per-AF route-map / prefix-list policy shape.
     """
     afs = []
+
+    def resolve(name, objects_by_name, resolver):
+        if not name:
+            return None
+        if objects_by_name is not None:
+            return objects_by_name.get(name)
+        return resolver(name)
+
     for paf in af_list or []:
         af_str = paf.get("af") or ""
         if not af_str:
@@ -249,25 +754,19 @@ def _af_device_content(af_list: list) -> list:
             {
                 "af": af_str,
                 "enabled": bool(paf.get("enabled", True)),
-                "routemap_in": _pk(_resolve_routemap(paf.get("routemap_in"))),
-                "routemap_out": _pk(_resolve_routemap(paf.get("routemap_out"))),
-                "prefixlist_in": _pk(_resolve_prefixlist(paf.get("prefixlist_in"))),
-                "prefixlist_out": _pk(_resolve_prefixlist(paf.get("prefixlist_out"))),
+                "routemap_in": _pk(resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)),
+                "routemap_out": _pk(resolve(paf.get("routemap_out"), route_maps_by_name, _resolve_routemap)),
+                "prefixlist_in": _pk(resolve(paf.get("prefixlist_in"), prefix_lists_by_name, _resolve_prefixlist)),
+                "prefixlist_out": _pk(resolve(paf.get("prefixlist_out"), prefix_lists_by_name, _resolve_prefixlist)),
             }
         )
     return sorted(afs, key=lambda a: a["af"])
 
 
-def _af_object_content(owner_obj) -> list:
-    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
-    from django.contrib.contenttypes.models import ContentType
-    from netbox_routing.models import BGPPeerAddressFamily
-
-    ct = ContentType.objects.get_for_model(owner_obj.__class__)
+def _af_rows_content(rows) -> list:
+    """Canonical per-AF policy content from preloaded peer address-family rows."""
     afs = []
-    for paf in BGPPeerAddressFamily.objects.filter(
-        assigned_object_type=ct, assigned_object_id=owner_obj.pk
-    ).select_related("address_family"):
+    for paf in rows:
         afs.append(
             {
                 "af": paf.address_family.address_family,
@@ -279,6 +778,20 @@ def _af_object_content(owner_obj) -> list:
             }
         )
     return sorted(afs, key=lambda a: a["af"])
+
+
+def _af_object_content(owner_obj) -> list:
+    """Canonical per-AF policy content read back from a BGPPeer / BGPPeerTemplate object."""
+    from django.contrib.contenttypes.models import ContentType
+    from netbox_routing.models import BGPPeerAddressFamily
+
+    ct = ContentType.objects.get_for_model(owner_obj.__class__)
+    return _af_rows_content(
+        BGPPeerAddressFamily.objects.filter(
+            assigned_object_type=ct,
+            assigned_object_id=owner_obj.pk,
+        ).select_related("address_family")
+    )
 
 
 def _drop_unset_update_source(content: dict) -> None:
@@ -296,11 +809,21 @@ def _drop_unset_update_source(content: dict) -> None:
         content.pop("update_source", None)
 
 
-def _peer_device_content(desired: dict, af_list: list) -> dict:
+def _peer_device_content(
+    desired: dict,
+    af_list: list,
+    *,
+    route_maps_by_name=None,
+    prefix_lists_by_name=None,
+) -> dict:
     """Build canonical device-desired content (peer fields + AF policies), FKs as pks."""
     content = {f: (_pk(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
     _drop_unset_update_source(content)
-    content["afs"] = _af_device_content(af_list)
+    content["afs"] = _af_device_content(
+        af_list,
+        route_maps_by_name=route_maps_by_name,
+        prefix_lists_by_name=prefix_lists_by_name,
+    )
     return content
 
 
@@ -626,6 +1149,7 @@ def _reconcile_scope(
         seen_template_names.add((mgmt.pk, pg_name))
 
 
+@mirror_reconciler
 def _reconcile_bgp_config(device, payload: dict) -> list:
     """Reconcile BGP config from adapter payload into NetBox netbox-routing BGP models.
 

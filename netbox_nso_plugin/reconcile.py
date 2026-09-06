@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 
-from .apply_state import APPLY_DEPLOYING_MODEL_NAMES
 from .deployment import guarded as _deployment_guarded
 
 logger = logging.getLogger(__name__)
@@ -208,23 +207,30 @@ def _gated(
     return result
 
 
-def _lock_native_vlan_dependencies(device, payload, family: str) -> None:
-    """Take shared native-object fences before one device publication lock."""
+def _switchport_attempt_slot(device, payload):
+    """Share ONE frozen switchport resolution between the gate's plan and its body."""
+    from .vlan_reconciler import prepare_switchport_reconcile
+
+    slot = []
+
+    def plan():
+        slot.clear()
+        slot.append(prepare_switchport_reconcile(device, payload))
+        return slot[0].plan
+
+    return slot, plan
+
+
+def _native_vlan_footprint(device, payload, family: str):
+    """Resolve the complete native VLAN footprint before taking its first lock."""
     if family == "vlan":
-        from .vlan_reconciler import lock_vlan_reconcile_dependencies
+        from .vlan_reconciler import vlan_reconcile_plan
 
-        lock_vlan_reconcile_dependencies(device, payload)
-        return
-    if family == "switchport":
-        from .vlan_reconciler import lock_switchport_reconcile_dependencies
-
-        lock_switchport_reconcile_dependencies(device, payload)
-        return
+        return vlan_reconcile_plan(device, payload)
     if family == "svi":
-        from .svi_reconciler import lock_svi_reconcile_dependencies
+        from .svi_reconciler import svi_reconcile_plan
 
-        lock_svi_reconcile_dependencies(device, payload)
-        return
+        return svi_reconcile_plan(device, payload)
     raise ValueError(f"unknown native VLAN dependency family: {family}")
 
 
@@ -296,13 +302,16 @@ _CATEGORY_RECONCILE_FAMILIES: dict[str, tuple[str, ...]] = {
     "l2_services": ("l2_service",),
 }
 
+_ROUTE_POLICY_ATTEMPT_IDS = "_route_policy_attempt_ids"
+_ROUTE_POLICY_ADAPTER_DEVICE_ID = "_route_policy_adapter_device_id"
+
 
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
-    from .bfd_reconciler import reconcile_bfd
-    from .bgp_reconciler import _reconcile_bgp_config
-    from .redistribution_reconciler import reconcile_redistribution
-    from .route_policy_reconciler import reconcile_route_policy
+    from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
+    from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .template_content import (
         _reconcile_isis_interfaces,
         _reconcile_isis_process,
@@ -353,16 +362,31 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
 
         _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
     if mgmt.manage_route_policy:
+        from .apply_settlement import route_policy_deploying_attempt_ids
+
         rp_doc = client.get_route_policy(dev_id)
+
+        def _route_policy_body():
+            ctx[_ROUTE_POLICY_ATTEMPT_IDS] = route_policy_deploying_attempt_ids(mgmt)
+            ctx[_ROUTE_POLICY_ADAPTER_DEVICE_ID] = mgmt.adapter_device_id
+            return _safe_reconcile(
+                ctx,
+                "route_policy_states",
+                mgmt,
+                ("NSORoutePolicyState",),
+                reconcile_route_policy,
+                device,
+                rp_doc,
+            )
+
         _gated(
             ctx,
             mgmt,
             "route_policy",
             rp_doc,
-            lambda: _safe_reconcile(
-                ctx, "route_policy_states", mgmt, ("NSORoutePolicyState",), reconcile_route_policy, device, rp_doc
-            ),
+            _route_policy_body,
             epoch=dev_id,
+            pre_body=lambda: route_policy_reconcile_plan(device, rp_doc),
         )
     if mgmt.manage_ospf:
         ospf_doc = client.get_ospf(dev_id)
@@ -393,6 +417,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ctx, "bgp_peers", mgmt, ("NSOBGPPeerState",), _reconcile_bgp_config, device, bgp_doc
             ),
             epoch=dev_id,
+            pre_body=lambda: bgp_reconcile_plan(device, bgp_doc),
         )
     # BFD is interface-level + protocol-agnostic; reconcile it whenever any of the
     # protocols that ride it (BGP/IS-IS/OSPF) are managed.
@@ -413,6 +438,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 bfd_doc.get("interfaces", []),
             ),
             epoch=dev_id,
+            pre_body=lambda: bfd_reconcile_plan(device, bfd_doc.get("interfaces", [])),
         )
         from .models import NSOBFDInterfaceState
 
@@ -439,6 +465,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 redist_doc,
             ),
             epoch=dev_id,
+            pre_body=lambda: redistribution_reconcile_plan(device, redist_doc),
         )
 
 
@@ -458,6 +485,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
         _reconcile_logging_config,
         _reconcile_snmp_config,
         _upsert_interface_states,
+        logging_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -532,11 +560,11 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 svi_doc,
                 lambda: _safe_reconcile(ctx, "svi_states", mgmt, ("NSOSVIState",), reconcile_svi, device, svi_doc),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             # materialise dot1q subinterfaces (virtual interface + Interface.parent
             # link) BEFORE the IP reconcile, for the same ordering reason as SVIs.
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
 
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -548,9 +576,10 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "subinterface_states", mgmt, ("NSOSubinterfaceState",), reconcile_subinterface, device, sub_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             # Phase 2b: per-interface MTU read mirror (read-only display).
-            from .interface_mtu_reconciler import reconcile_interface_mtu
+            from .interface_mtu_reconciler import interface_mtu_reconcile_plan, reconcile_interface_mtu
 
             mtu_doc = client.get_interface_mtu(dev_id)
             _gated(
@@ -568,6 +597,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     mtu_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: interface_mtu_reconcile_plan(device, mtu_doc),
             )
             # Import interface IP addresses onto their (now first-class, logical-named)
             # NetBox interfaces. Runs AFTER the adapter sync created the interfaces;
@@ -584,7 +614,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 epoch=dev_id,
             )
             # LACP/LAG bundle + member overlay states (interface-level).
-            from .lacp_reconciler import reconcile_lag_config
+            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -602,6 +632,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     lag_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
             )
             # VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -616,19 +647,27 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "vlan_states", mgmt, ("NSOVLANState",), reconcile_vlan_database, device, vlan_doc
                 ),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
+            sw_slot, sw_plan = _switchport_attempt_slot(device, sw_doc)
             _gated(
                 ctx,
                 mgmt,
                 "switchport",
                 sw_doc,
                 lambda: _safe_reconcile(
-                    ctx, "switchport_states", mgmt, ("NSOSwitchportState",), reconcile_switchport, device, sw_doc
+                    ctx,
+                    "switchport_states",
+                    mgmt,
+                    ("NSOSwitchportState",),
+                    reconcile_switchport,
+                    device,
+                    sw_doc,
+                    sw_slot[0],
                 ),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
+                pre_body=sw_plan,
             )
         if mgmt.manage_snmp:
             snmp_doc = client.get_snmp_config(dev_id)
@@ -665,12 +704,13 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     log_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: logging_reconcile_plan(device, log_doc),
             )
         if getattr(mgmt, "manage_l2", False):
             # Nokia L2 SAP overlays. Kept in the full reconcile (not just
             # on-expand) so the periodic sync-complete refresh keeps them current —
             # the tab reads these persisted rows without reconciling on expand.
-            from .l2_service_reconciler import reconcile_l2_services
+            from .l2_service_reconciler import l2_service_reconcile_plan, reconcile_l2_services
 
             l2_doc = client.get_l2_services(dev_id)
             _gated(
@@ -682,6 +722,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "l2_sap_states", mgmt, ("NSOL2SapState",), reconcile_l2_services, device, l2_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: l2_service_reconcile_plan(device, l2_doc),
             )
         _reconcile_routing(device, mgmt, client, ctx)
     return ctx
@@ -697,9 +738,9 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     adapter failure — the caller renders a per-category error.
     """
     from . import adapter_client as client
-    from .bgp_reconciler import _reconcile_bgp_config
-    from .redistribution_reconciler import reconcile_redistribution
-    from .route_policy_reconciler import reconcile_route_policy
+    from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+    from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
     from .template_content import (
         _reconcile_interface_ips,
@@ -744,8 +785,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             # Merged "Interfaces" card: refresh all four per-interface scalar
             # overlays (enabled/description, IPs, MTU, switchport) so the
             # consolidated row-per-interface table reflects the latest device read.
-            from .interface_mtu_reconciler import reconcile_interface_mtu
-            from .subinterface_reconciler import reconcile_subinterface
+            from .interface_mtu_reconciler import interface_mtu_reconcile_plan, reconcile_interface_mtu
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
 
@@ -773,7 +814,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -784,6 +825,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             ip_doc = client.get_interface_ips(dev_id)
             _gated(
@@ -804,6 +846,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_interface_mtu(device, mtu_doc),
                 epoch=dev_id,
                 ctx_key="interface_mtu_states",
+                pre_body=lambda: interface_mtu_reconcile_plan(device, mtu_doc),
             )
             # VLAN DB first so switchport vid lookups resolve in the per-device group.
             vlan_doc = client.get_vlan_database(dev_id)
@@ -814,21 +857,22 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 vlan_doc,
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
+            sw_slot, sw_plan = _switchport_attempt_slot(device, sw_doc)
             _gated(
                 ctx,
                 mgmt,
                 "switchport",
                 sw_doc,
-                lambda: reconcile_switchport(device, sw_doc),
+                lambda: reconcile_switchport(device, sw_doc, sw_slot[0]),
                 epoch=dev_id,
                 ctx_key="switchport_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
+                pre_body=sw_plan,
             )
         elif key == "interfaces":
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
 
             interfaces_doc = client.get_interfaces_doc(dev_id)
@@ -855,7 +899,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -866,6 +910,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             ip_doc = client.get_interface_ips(dev_id)
             _gated(
@@ -878,7 +923,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="interface_ips",
             )
         elif key == "interface_ips":
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
             from .svi_reconciler import reconcile_svi
 
             svi_doc = client.get_svi(dev_id)  # SVIs exist before IPs
@@ -890,7 +935,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -901,6 +946,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
             ip_doc = client.get_interface_ips(dev_id)
             _gated(
@@ -913,7 +959,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="interface_ips",
             )
         elif key == "lacp":
-            from .lacp_reconciler import reconcile_lag_config
+            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -924,6 +970,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_lag_config(device, lag_doc),
                 epoch=dev_id,
                 ctx_key="lacp_bundle_states",
+                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
             )
         elif key == "vlan":
             from .vlan_reconciler import reconcile_vlan_database
@@ -937,7 +984,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
                 ctx_key="vlan_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
         elif key == "switchport":
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -951,18 +998,19 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 vlan_doc,
                 lambda: reconcile_vlan_database(device, vlan_doc),
                 epoch=dev_id,
-                pre_body=lambda: _lock_native_vlan_dependencies(device, vlan_doc, "vlan"),
+                pre_body=lambda: _native_vlan_footprint(device, vlan_doc, "vlan"),
             )
             sw_doc = client.get_switchport(dev_id)
+            sw_slot, sw_plan = _switchport_attempt_slot(device, sw_doc)
             _gated(
                 ctx,
                 mgmt,
                 "switchport",
                 sw_doc,
-                lambda: reconcile_switchport(device, sw_doc),
+                lambda: reconcile_switchport(device, sw_doc, sw_slot[0]),
                 epoch=dev_id,
                 ctx_key="switchport_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, sw_doc, "switchport"),
+                pre_body=sw_plan,
             )
         elif key == "svi":
             from .svi_reconciler import reconcile_svi
@@ -976,10 +1024,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_svi(device, svi_doc),
                 epoch=dev_id,
                 ctx_key="svi_states",
-                pre_body=lambda: _lock_native_vlan_dependencies(device, svi_doc, "svi"),
+                pre_body=lambda: _native_vlan_footprint(device, svi_doc, "svi"),
             )
         elif key == "subinterface":
-            from .subinterface_reconciler import reconcile_subinterface
+            from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
 
             sub_doc = client.get_subinterface(dev_id)
             _gated(
@@ -990,9 +1038,10 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_subinterface(device, sub_doc),
                 epoch=dev_id,
                 ctx_key="subinterface_states",
+                pre_body=lambda: subinterface_reconcile_plan(device, sub_doc),
             )
         elif key == "interface_mtu":
-            from .interface_mtu_reconciler import reconcile_interface_mtu
+            from .interface_mtu_reconciler import interface_mtu_reconcile_plan, reconcile_interface_mtu
 
             mtu_doc = client.get_interface_mtu(dev_id)
             _gated(
@@ -1003,6 +1052,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_interface_mtu(device, mtu_doc),
                 epoch=dev_id,
                 ctx_key="interface_mtu_states",
+                pre_body=lambda: interface_mtu_reconcile_plan(device, mtu_doc),
             )
         elif key == "snmp":
             snmp_doc = client.get_snmp_config(dev_id)
@@ -1016,6 +1066,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="snmp_data",
             )
         elif key == "logging":
+            from .template_content import logging_reconcile_plan
+
             log_doc = client.get_logging_config(dev_id)
             _gated(
                 ctx,
@@ -1025,6 +1077,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_logging_config(device, log_doc),
                 epoch=dev_id,
                 ctx_key="logging_data",
+                pre_body=lambda: logging_reconcile_plan(device, log_doc),
             )
         elif key == "static":
             static_doc = client.get_static_routes(dev_id)
@@ -1069,12 +1122,13 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_bgp_config(device, bgp_doc),
                 epoch=dev_id,
                 ctx_key="bgp_peers",
+                pre_body=lambda: bgp_reconcile_plan(device, bgp_doc),
             )
             ctx["bgp_peer_templates"] = list(
                 NSOBGPPeerTemplateState.objects.filter(management=mgmt).select_related("template")
             )
         elif key == "bfd":
-            from .bfd_reconciler import reconcile_bfd
+            from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
             from .models import NSOBFDInterfaceState
 
             bfd_doc = client.get_bfd(dev_id)
@@ -1086,6 +1140,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_bfd(device, bfd_doc.get("interfaces", [])),
                 epoch=dev_id,
                 ctx_key="bfd_interfaces",
+                pre_body=lambda: bfd_reconcile_plan(device, bfd_doc.get("interfaces", [])),
             )
             ctx["bfd_states"] = list(
                 NSOBFDInterfaceState.objects.filter(management__device=device).select_related("interface")
@@ -1100,6 +1155,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_route_policy(device, rp_doc),
                 epoch=dev_id,
                 ctx_key="route_policy_states",
+                pre_body=lambda: route_policy_reconcile_plan(device, rp_doc),
             )
         elif key == "redistribution":
             redist_doc = client.get_redistribution(dev_id)
@@ -1111,11 +1167,12 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_redistribution(device, redist_doc),
                 epoch=dev_id,
                 ctx_key="redistribution_states",
+                pre_body=lambda: redistribution_reconcile_plan(device, redist_doc),
             )
         elif key == "l2_services":
             # reconcile into native vpn.L2VPN + L2VPNTermination + NSOL2SapState
             # (value-aware drift/accept). The dot1q tag stays per-SAP interface-local encap.
-            from .l2_service_reconciler import reconcile_l2_services
+            from .l2_service_reconciler import l2_service_reconcile_plan, reconcile_l2_services
 
             l2_doc = client.get_l2_services(dev_id)
             _gated(
@@ -1126,6 +1183,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_l2_services(device, l2_doc),
                 epoch=dev_id,
                 ctx_key="l2_sap_states",
+                pre_body=lambda: l2_service_reconcile_plan(device, l2_doc),
             )
     return ctx
 
@@ -1133,18 +1191,6 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
 # ── Off-request reconcile: RQ job fired by the adapter's sync-complete callback ──
 
 _RECONCILE_QUEUE = "default"
-
-# Coarse settlement applies to the shared Apply-in-flight registry except static routes.
-_APPLY_DEPLOYING_SCOPES = {
-    scope: model_name for scope, model_name in APPLY_DEPLOYING_MODEL_NAMES.items() if scope != "static_route"
-}
-
-# Static routes deliberately stay outside the coarse map (#1502 Appendix S). Their
-# generation-correlated consumer knows which intent a result describes. A scope counter
-# says only that an Apply succeeded, not that it carried this row's generation.
-
-
-_GENERIC_APPLY_ERROR = "Apply reported a failure for this scope (see the adapter apply job)."
 
 
 def _counts_for(result: dict | None, scope: str) -> dict:
@@ -1193,54 +1239,6 @@ def _scope_failure_messages(job: dict | None, scope: str) -> str:
     return "; ".join(msgs)
 
 
-def _settle_apply_failures(mgmt, apply_result: dict | None, job: dict | None = None) -> None:
-    """Mark rows still 'deploying' in a scope whose apply reported failures → apply_failed.
-
-    Called AFTER the post-sync reconcile, so rows whose apply succeeded have already
-    settled deploying→in_sync (the device reflects them). Any row still 'deploying' in a
-    scope the apply job counted as failed is therefore a genuine failure — convert it via
-    on_apply_result so it's no longer stuck, with last_apply_error for the operator. The
-    next reconcile recovers it to in_sync (device caught up) or re-pends to accepted.
-
-    ``job`` (the full apply job, optional) carries the per-item commit errors under
-    ``job.error.detail.items``; when present, last_apply_error records the REAL device
-    rejection reason instead of a generic pointer.
-    """
-    if not apply_result:
-        return
-    from django.utils import timezone
-
-    from . import models
-    from . import status_machine as sm
-
-    for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
-        counts = _counts_for(apply_result, scope)
-        if _count_of(counts, "apply_failed") <= 0:
-            continue
-        detail = _scope_failure_messages(job, scope) or _GENERIC_APPLY_ERROR
-        model = getattr(models, model_name)
-        for row in model.objects.filter(management=mgmt, status="deploying"):
-            new_status = sm.on_apply_result(row.status, ok=False)
-            if new_status != row.status:
-                # Compare-and-set: the value-match settle writes these rows from another
-                # reconcile, and a job counter must not overrule the device truth a row
-                # reached between this read and this write.
-                model.objects.filter(pk=row.pk, status=row.status).update(
-                    status=new_status,
-                    last_apply_error=detail,
-                    # A queryset update skips auto_now, and the REST serializers expose it.
-                    last_updated=timezone.now(),
-                )
-
-
-_STUCK_DEPLOYING_ERROR = (
-    "Apply job #{job_id} reported success, but the device never showed this value on any "
-    "later sync — the NED or service writer most likely dropped it silently (the adapter's "
-    "post-apply verify diffs against NSO's CDB, which a silent drop leaves clean). Check "
-    "device/NED support for this construct, then re-apply; the value is still safe in NetBox."
-)
-
-
 def _stuck_deploying_grace():
     """How long a 'deploying' row may outlive a SUCCEEDED apply before it's a silent drop.
 
@@ -1256,248 +1254,6 @@ def _stuck_deploying_grace():
     return timedelta(minutes=cfg.get("stuck_deploying_grace_minutes", 10))
 
 
-def _parse_adapter_ts(value):
-    """Parse an adapter job timestamp — canonical UTC isoformat + 'Z', optional fraction."""
-    from datetime import UTC, datetime
-
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
-
-
-def _escalate_stuck_deploying(mgmt, job: dict | None) -> None:
-    """Rows still 'deploying' long after a SUCCEEDED apply → apply_failed (silent drop, #26).
-
-    The adapter's post-apply verify re-issues the committed payload as a native dry-run,
-    which diffs against NSO's CDB — a writer/NED that silently dropped a value leaves the
-    CDB service tree matching the payload, so that verify passes and the job counts the
-    item in_sync (proven live on rg03: static route absent from the device, job succeeded).
-    The device-truth check is the reconcile value-match settle, which runs right before
-    this in run_device_reconcile: a row the device really reflects has already settled
-    deploying→in_sync. A row STILL deploying once the grace has elapsed therefore never
-    landed — surface it as apply_failed instead of letting it spin forever while the job
-    history claims success. Callers must skip this while an apply is queued/running (its
-    _prepare_apply just re-marked rows deploying; judging those by the OLD job's age
-    would misfire).
-
-    Only scopes THIS job actually applied are judged. The job's result carries a
-    ``<scope>_count_by_outcome`` per scope it carried; a scope missing from it (or carrying
-    zero items) was never in this apply, so the job's success says nothing about that scope's
-    rows. Judging them anyway fabricated a failure — flipping, say, an in-flight route-policy
-    row to apply_failed with a "the NED dropped it silently" message about a job that had
-    only ever applied VLANs.
-    """
-    from django.utils import timezone
-
-    from . import models
-    from . import status_machine as sm
-
-    if not job or job.get("status") != "succeeded":
-        return  # failed applies are the failure-settle's job; no job → nothing to judge
-    finished = _parse_adapter_ts(job.get("updated_at"))
-    if finished is None or timezone.now() - finished < _stuck_deploying_grace():
-        return
-    result = job.get("result") or {}
-    detail = _STUCK_DEPLOYING_ERROR.format(job_id=job.get("id"))
-    for scope, model_name in _APPLY_DEPLOYING_SCOPES.items():
-        counts = _counts_for(result, scope)
-        if sum(_count_of(counts, outcome) for outcome in counts) <= 0:
-            continue  # this job never applied this scope — it cannot testify about its rows
-        model = getattr(models, model_name)
-        for row in model.objects.filter(management=mgmt, status="deploying"):
-            new_status = sm.on_apply_result(row.status, ok=False)
-            if new_status == row.status:
-                continue
-            # Compare-and-set: this judges a row for never landing, so a row the
-            # value-match settle proved in_sync in the write window has already
-            # answered it.
-            matched = model.objects.filter(pk=row.pk, status=row.status).update(
-                status=new_status,
-                last_apply_error=detail,
-                # A queryset update skips auto_now, and the REST serializers expose it.
-                last_updated=timezone.now(),
-            )
-            if matched:
-                logger.warning(
-                    "nso reconcile: %s %s stuck deploying after successful apply #%s — "
-                    "escalated to apply_failed (silent drop)",
-                    model_name,
-                    row.pk,
-                    job.get("id"),
-                )
-
-
-_STUCK_STATIC_ROUTE_ERROR = (
-    "This route's intent was pushed as generation {generation} and the adapter has still "
-    "reported no result naming that generation. The apply either never carried this route "
-    "or its result never correlated — re-apply; the value is still safe in NetBox."
-)
-
-_UNCLOCKED_STATIC_ROUTE_ERROR = (
-    "This route is applying with no generation clock, which is the state an upgrade leaves "
-    "a row in that was already applying before generation-correlated settlement existed. No "
-    "apply result can ever name its generation, so it can never settle — re-apply; the value "
-    "is still safe in NetBox. (Running the static-route intent re-sync arms every such row.)"
-)
-
-
-def _escalate_stuck_static_routes(mgmt, *, adapter_device_id, apply_active: bool | None = None) -> None:
-    """Static-route rows left 'deploying' past the grace with no correlated result → apply_failed.
-
-    Static routes left :data:`_APPLY_DEPLOYING_SCOPES`, so :func:`_escalate_stuck_deploying`
-    no longer judges them; this is that half's replacement. It is anchored on
-    ``generation_started_at`` — the moment the generation this row is waiting for was armed
-    — because every other overlay timestamp is rewritten by reconcile and so cannot date a
-    generation.
-
-    **Never call this directly.** :func:`~netbox_nso_plugin.settlement.settle_static_routes`
-    owns the precondition — a feed walked to its end with nothing stalled — and a row judged
-    on an unwalked page is a false red on a device the adapter already reported ``in_sync``.
-
-    One row is excluded even then: a row carrying a ``last_result_advisory``, which means a
-    result **did** correlate to this generation and deliberately did not settle it
-    (``unproven``, or a fingerprint the row is not waiting for). The clock says nothing there
-    that the advisory has not said better, and an edit clears the advisory with the
-    generation, so it can never go stale.
-
-    A ``deploying`` row whose ``generation_started_at`` is NULL escalates with a **distinct**
-    reason rather than waiting on a clock it has not got. It is an impossible state once the
-    rollout backfill has run, and the timestamp comparison is NULL-false — so skipping it is
-    how a pre-upgrade row stays ``deploying`` forever, which is exactly what #1502 exists to
-    end. Fail loudly on the state the backfill did not reach.
-
-    And nothing is judged at all while an apply is in flight: ``_prepare_apply`` re-marks
-    rows ``deploying`` without re-stamping the generation clock, so a route staged long
-    before its Apply looks stuck the moment that Apply starts. Failing it there is
-    unrecoverable — the apply's own ``in_sync`` cannot lift a row out of ``apply_failed``.
-    A caller that already fetched the job state **for this adapter device** passes it as
-    *apply_active*; otherwise the lookup is made here, and only when there is something to
-    escalate, so a quiet device on the maintenance tick costs no adapter call.
-    """
-    from django.db.models import Q
-    from django.utils import timezone
-
-    from . import models
-    from . import status_machine as sm
-
-    cutoff = timezone.now() - _stuck_deploying_grace()
-    rows = list(
-        models.NSOStaticRouteState.objects.filter(
-            Q(generation_started_at__lt=cutoff) | Q(generation_started_at__isnull=True),
-            management=mgmt,
-            status="deploying",
-            last_result_advisory="",
-        )
-    )
-    if not rows:
-        return
-    if apply_active is None:
-        _job, apply_active = _apply_job_state(adapter_device_id)
-    if apply_active:
-        logger.debug(
-            "nso reconcile: static-route escalation stands down for adapter device %s — an apply is in flight",
-            adapter_device_id,
-        )
-        return
-    for row in rows:
-        new_status = sm.on_apply_result(row.status, ok=False)
-        if new_status == row.status:
-            continue
-        # Compare-and-set through .update(): the status is shared with the operator Apply
-        # flow and with the settlement consumer, and a save() here would fire the row's
-        # intent push on an RQ worker with a cold cache — a full static-route PUT that, under
-        # adapter auto-apply, starts another apply for the row just declared failed.
-        unclocked = row.generation_started_at is None
-        matched = models.NSOStaticRouteState.objects.filter(pk=row.pk, status=row.status).update(
-            status=new_status,
-            last_apply_error=(
-                _UNCLOCKED_STATIC_ROUTE_ERROR
-                if unclocked
-                else _STUCK_STATIC_ROUTE_ERROR.format(generation=row.intent_generation)
-            ),
-        )
-        if not matched:
-            continue
-        if unclocked:
-            logger.error(
-                "nso reconcile: NSOStaticRouteState %s is deploying with no generation clock — "
-                "an upgrade left it uncorrelatable and the rollout backfill did not reach it; "
-                "escalated to apply_failed",
-                row.pk,
-            )
-            continue
-        logger.warning(
-            "nso reconcile: NSOStaticRouteState %s stuck deploying at generation %s past the "
-            "grace with no correlated settlement — escalated to apply_failed",
-            row.pk,
-            row.intent_generation,
-        )
-
-
-_TERMINAL_GENERATION_STATUSES = frozenset({"settled", "failed", "outcome_unknown", "abandoned"})
-
-
-def _apply_job_state(adapter_device_id) -> tuple[dict | None, bool]:
-    """Best-effort: (most recent terminal apply job, may its generation chain be active).
-
-    The jobs surface supplies the last apply result and visible queued or running work.
-    The generations surface covers the barrier interval after a head job finishes and
-    before its pending successor gets a job.
-
-    A failed or malformed probe answers the second question with **True**, because it did
-    not answer it at all. Its only consumer is a fail-closed gate. Standing down costs one
-    tick, while escalating a row whose Apply is running is unrecoverable.
-    """
-    from . import adapter_client as client
-
-    try:
-        jobs = client.list_jobs(adapter_device_id)  # most-recent-first
-    except Exception as exc:  # noqa: BLE001 — adapter transient; settling is best-effort
-        logger.warning(
-            "nso reconcile: could not read adapter device %s's jobs (%s) — treating apply activity as unknown",
-            adapter_device_id,
-            exc,
-        )
-        return None, True
-    last, active = None, False
-    for job in jobs or []:
-        job_type = job.get("type")
-        if job.get("status") in ("queued", "running"):
-            if job_type in ("apply", "removal"):
-                active = True
-        elif job_type == "apply" and last is None and job.get("status") in ("succeeded", "failed"):
-            last = job
-    try:
-        generations = client.list_device_generations(adapter_device_id)
-    except Exception as exc:  # noqa: BLE001 (adapter transient; the gate fails closed)
-        logger.warning(
-            "nso reconcile: could not read adapter device %s's generations (%s), treating apply activity as unknown",
-            adapter_device_id,
-            exc,
-        )
-        return last, True
-    current_chain = []
-    if generations:
-        latest = generations[-1]
-        cohort = latest.get("settlement_cohort")
-        current_chain = (
-            [latest]
-            if cohort is None
-            else [generation for generation in generations if generation.get("settlement_cohort") == cohort]
-        )
-    for generation in current_chain:
-        if generation.get("status") not in _TERMINAL_GENERATION_STATUSES:
-            active = True
-            break
-    return last, active
-
-
 def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     """Write a coarse per-object JournalEntry recording this device's route-policy apply.
 
@@ -1511,6 +1267,46 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     """
     if not job:
         return
+    from . import status_machine as sm
+    from .intent_state import MutationFootprint, SourceRow, mirror_transaction
+    from .models import NSORoutePolicyState
+
+    rows = list(
+        NSORoutePolicyState.objects.filter(
+            management=mgmt,
+            content_type__isnull=False,
+            object_id__isnull=False,
+            status__in=sm.OWNED_STATES,
+        )
+    )
+    footprint = MutationFootprint.for_keys(
+        {(mgmt.device_id, "route_policy")},
+        overlay_rows=tuple(SourceRow(row._meta.label_lower, row.pk) for row in rows),
+    )
+    with mirror_transaction(footprint):
+        _journal_route_policy_apply_locked(type(mgmt).objects.get(pk=mgmt.pk), job)
+
+
+def _journal_route_policy_apply_locked(mgmt, job: dict) -> None:
+    """Journal one carrier while its device revision and owned policy rows are locked."""
+    apply_attempt_id = job.get("apply_attempt_id")
+    if apply_attempt_id is not None:
+        from django.core.exceptions import ValidationError
+
+        from .models import NSOApplyAttempt, NSOIntentRevision
+
+        try:
+            attempt = NSOApplyAttempt.objects.filter(pk=apply_attempt_id, management=mgmt).first()
+        except (TypeError, ValueError, ValidationError):
+            return
+        expected_revision = None if attempt is None else attempt.scope_revisions.get("route_policy")
+        current_revision = (
+            NSOIntentRevision.objects.filter(device_id=mgmt.device_id, scope="route_policy")
+            .values_list("revision", flat=True)
+            .first()
+        )
+        if type(expected_revision) is not int or current_revision != expected_revision:
+            return
     job_id = str(job.get("id") or "")
     if not job_id or job_id == (mgmt.last_journaled_apply_job or ""):
         return
@@ -1519,7 +1315,7 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
     failed = _count_of(counts, "apply_failed")
     # Mark the job seen FIRST so a failure mid-write can't double-post next reconcile.
     mgmt.last_journaled_apply_job = job_id
-    mgmt.save(update_fields=["last_journaled_apply_job"])
+    type(mgmt).objects.filter(pk=mgmt.pk).update(last_journaled_apply_job=job_id)
     if applied == 0 and failed == 0:
         return  # this apply committed no route-policy scope → nothing to journal
 
@@ -1596,7 +1392,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     from dcim.models import Device
 
     from .adapter_client import AdapterError
-    from .deployment import DeploymentQuiesced
+    from .deployment import DeploymentQuiesced, operation
     from .models import NSODeviceManagement
     from .settlement import settle_static_routes
     from .signals import suppress_intent_push
@@ -1625,6 +1421,39 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     if ctx.get("_lock_unavailable"):
         return {"device_id": device_id, "skipped": "lock_unavailable"}
 
+    route_policy_attempt_ids = ctx.pop(_ROUTE_POLICY_ATTEMPT_IDS, ())
+    route_policy_adapter_device_id = ctx.pop(_ROUTE_POLICY_ADAPTER_DEVICE_ID, None)
+    route_policy_evidence = None
+    if route_policy_adapter_device_id is not None and route_policy_attempt_ids:
+        from .apply_settlement import deploying_attempt_ids, load_deployment_evidence
+
+        evidence_management = NSODeviceManagement.objects.filter(
+            device=device,
+            adapter_device_id=route_policy_adapter_device_id,
+        ).first()
+        if evidence_management is not None:
+            requested_attempt_ids = tuple(
+                sorted(
+                    set(route_policy_attempt_ids) | set(deploying_attempt_ids(evidence_management)),
+                    key=str,
+                )
+            )
+            try:
+                with operation("reconcile"):
+                    route_policy_evidence = load_deployment_evidence(
+                        evidence_management,
+                        attempt_ids=requested_attempt_ids,
+                    )
+            except AdapterError as exc:
+                logger.warning(
+                    "nso reconcile: route-policy evidence failed for device %s: %s",
+                    device.pk,
+                    exc,
+                )
+            except DeploymentQuiesced as exc:
+                logger.warning("nso reconcile deferred for device %s: %s", device_id, exc)
+                return {"device_id": device_id, "error": str(exc)}
+
     # Step 4: after the post-sync reconcile, walk this device's settlement feed (the
     # production carrier for #1502's consumer), settle any rows left 'deploying' whose
     # scope's last apply reported a failure → apply_failed (no longer stuck), escalate
@@ -1634,18 +1463,11 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         # Reverse one-to-one: a plain attribute read raises for an unmanaged device.
         mgmt = getattr(device, "nso_management", None)
         if mgmt is not None and mgmt.adapter_device_id is not None:
-            adapter_device_id = mgmt.adapter_device_id
-            job, apply_active = _apply_job_state(adapter_device_id)
-            # BEFORE the coarse settle and both backstops, in the same invocation.
-            # `_escalate_stuck_deploying`'s own justification is that the settling step "runs
-            # right before this"; static routes no longer settle by reconcile, so without
-            # this walk the static backstop would fail rows the adapter reported in_sync.
-            # `settle_static_routes` owns the escalation and every precondition it needs,
-            # including the apply-in-flight check — an error here therefore stands the static
-            # backstop down and touches nothing else.
+            static_route_feed_drained = False
+            # Drain exact route results before attempt evidence. A settled generation may
+            # judge a route only after this walk proves that no precise verdict remains.
             try:
-                # The pair names the device the state was read for; the consumer locks its own.
-                settle_static_routes(mgmt, apply_state=(adapter_device_id, apply_active))
+                static_route_feed_drained = settle_static_routes(mgmt).drained
             except Exception as exc:  # noqa: BLE001 — narrow: only the static backstop stands down
                 logger.warning(
                     "nso reconcile: static-route settlement failed for device %s: %s — "
@@ -1658,15 +1480,40 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
             # A fresh fetch, not refresh_from_db: an unmanaged device must skip here, not raise.
             mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
             if mgmt is not None and mgmt.adapter_device_id is not None:
-                job, apply_active = _apply_job_state(mgmt.adapter_device_id)
                 # These are mirror writes, not operator intent: without the suppression the
                 # first status flip's push-on-save signal refuses (no writer transaction) and
                 # takes the rest of Step 4 with it.
                 with suppress_intent_push():
-                    _settle_apply_failures(mgmt, job.get("result") if job else None, job)
-                    if not apply_active:
-                        _escalate_stuck_deploying(mgmt, job)
-                    _journal_route_policy_apply(mgmt, job)
+                    from .apply_settlement import (
+                        latest_route_policy_carrier,
+                        settle_apply_attempts,
+                        settle_device_apply_attempts,
+                    )
+
+                    with operation("reconcile"):
+                        if (
+                            isinstance(route_policy_evidence, dict)
+                            and route_policy_evidence.get("device_id") == mgmt.adapter_device_id
+                        ):
+                            evidence = route_policy_evidence
+                            settle_apply_attempts(
+                                mgmt,
+                                evidence,
+                                static_route_feed_drained=static_route_feed_drained,
+                                required_attempt_ids=route_policy_attempt_ids,
+                            )
+                        else:
+                            evidence = settle_device_apply_attempts(
+                                mgmt,
+                                static_route_feed_drained=static_route_feed_drained,
+                            )
+                    _journal_route_policy_apply(
+                        mgmt,
+                        latest_route_policy_carrier(
+                            evidence,
+                            attempt_ids=route_policy_attempt_ids or None,
+                        ),
+                    )
     except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

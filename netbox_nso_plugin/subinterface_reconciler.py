@@ -16,12 +16,62 @@ from __future__ import annotations
 
 import logging
 
+from .intent_state import mirror_reconciler, reconcile_transaction
+
 logger = logging.getLogger(__name__)
 
 
+def subinterface_reconcile_plan(device, payload: dict):
+    """Declare one subinterface refresh and whether it changes rendered membership."""
+    from dcim.models import Interface
+
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSODeviceManagement, NSOSubinterfaceState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
+    items = raw_items if isinstance(raw_items, list) else []
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    states = tuple(
+        NSOSubinterfaceState.objects.filter(management=management).select_related("interface").order_by("pk")
+    )
+    reported = {item.get("interface_name") for item in items if isinstance(item, dict) and item.get("interface_name")}
+    changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "subinterface")},
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                SourceRow("dcim.interface", None),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+            ),
+            overlay_rows=(
+                SourceRow("netbox_nso_plugin.nsosubinterfacestate", None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            ),
+        ),
+        changes_content=changes_content,
+    )
+
+
+def subinterface_reconcile_footprint(device, payload: dict):
+    """Return the immutable footprint for callers that only need lock discovery."""
+    return subinterface_reconcile_plan(device, payload).footprint
+
+
+@mirror_reconciler
 def reconcile_subinterface(device, payload: dict) -> list:
     """Create/update virtual subinterfaces + NSOSubinterfaceState from the payload."""
+    with reconcile_transaction(subinterface_reconcile_plan(device, payload)):
+        return _reconcile_subinterface(device, payload)
+
+
+def _reconcile_subinterface(device, payload: dict) -> list:
+    """Apply a subinterface mirror after its complete footprint is locked."""
     from dcim.models import Interface
+    from django.db import IntegrityError, transaction
     from django.utils import timezone
 
     from . import status_machine as sm
@@ -45,7 +95,14 @@ def reconcile_subinterface(device, payload: dict) -> list:
             continue
         iface = iface_map.get(name)
         if iface is None:
-            iface = Interface.objects.create(device=device, name=name, type="virtual")
+            iface = Interface(device=device, name=name, type="virtual")
+            try:
+                with transaction.atomic():
+                    iface.save(force_insert=True)
+            except IntegrityError:
+                iface = Interface.objects.filter(device=device, name=name).first()
+                if iface is None:
+                    raise
             iface_map[name] = iface
 
         # Resolve the physical parent from the map; never create it (device sync owns it).
@@ -63,7 +120,7 @@ def reconcile_subinterface(device, payload: dict) -> list:
                 and state.dot1q_vlan == device_dot1q
                 and state.vrf == device_vrf
             )
-            state.status = sm.on_reconcile(state.status, matches=matches)
+            state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             if parent and iface.parent_id != parent.id:
                 iface.parent = parent
@@ -78,8 +135,7 @@ def reconcile_subinterface(device, payload: dict) -> list:
         rows.append(state)
 
     # Overlay rows the device no longer reports (keep the dcim.Interface): NEVER hard-delete an
-    # owned row (operator intent / in-flight Apply marker — NSOSubinterfaceState is in
-    # _APPLY_DEPLOYING_SCOPES). An unowned subinterface overlay is a pure device mirror with no
+    # owned row (operator intent or an in-flight Apply marker). An unowned subinterface overlay is a pure device mirror with no
     # separate native config object, so a stale unowned row is a vestigial husk → drop it; owned
     # rows surface as drift (``changed``) instead of data-loss.
     reported = {item.get("interface_name") for item in payload.get("interfaces", [])}

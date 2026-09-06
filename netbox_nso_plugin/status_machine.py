@@ -12,8 +12,8 @@ and ``tests/test_status_machine.py`` asserts two invariants:
   1. every overlay's ``status`` choices stay within :data:`STATES`, and
   2. every declared state is *reachable* through real (``implemented=True``) transitions.
 
-Both ``apply_failed`` (a failed apply, wired in step 4 via :func:`on_apply_result` +
-``reconcile._settle_apply_failures``) and ``error`` (an unexpected exception during a
+Both ``apply_failed`` (a failed attempt, wired in step 4 through exact deployment evidence)
+and ``error`` (an unexpected exception during a
 reconcile, wired via :func:`on_reconcile_error` + ``reconcile._safe_reconcile``) are
 now reachable through real code — there are no ``implemented=False`` gaps left, so the
 reachability guard is fully green.
@@ -38,7 +38,10 @@ Write side (operator-driven):
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
+
+logger = logging.getLogger(__name__)
 
 # --- States -----------------------------------------------------------------
 
@@ -451,6 +454,10 @@ def on_reconcile_error(current: str) -> str:
     return advance(current, RECONCILE_ERROR, to=ERROR)
 
 
+class _StaleOverlayStatusChanged(RuntimeError):
+    """The status used to choose a stale-row permit changed before its row lock."""
+
+
 def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
     """Shared tail for every reconciler's stale loop: prune vestigial rows, else mark ``changed``.
 
@@ -467,15 +474,51 @@ def finalise_stale_overlay(stale, *, vestigial: bool, now=None) -> None:
 
     ``now`` (optional) bumps ``last_sync_at`` alongside ``status`` when the row is kept.
     """
-    if not is_owned(stale.status) and vestigial:
-        stale.delete()
+
+    def finalise_locked():
+        if not is_owned(stale.status) and vestigial:
+            stale.delete()
+            return
+        new_status = on_reconcile(stale.status, present=False)
+        if new_status == stale.status:
+            return
+        stale.status = new_status
+        fields = ["status"]
+        if now is not None:
+            stale.last_sync_at = now
+            fields.append("last_sync_at")
+        stale.save(update_fields=fields)
+
+    if hasattr(stale, "_meta"):
+        from .intent_state import (
+            ReconcileMutationPlan,
+            footprint_for_instance,
+            reconcile_transaction,
+        )
+
+        for _attempt in range(2):
+            expected_status = stale.status
+            plan = ReconcileMutationPlan(
+                footprint_for_instance(stale),
+                changes_content=expected_status == IN_SYNC,
+            )
+            try:
+                with reconcile_transaction(plan):
+                    stale.refresh_from_db()
+                    if stale.status != expected_status:
+                        raise _StaleOverlayStatusChanged
+                    finalise_locked()
+                return
+            except stale._meta.model.DoesNotExist:
+                return
+            except _StaleOverlayStatusChanged:
+                try:
+                    stale.refresh_from_db()
+                except stale._meta.model.DoesNotExist:
+                    return
+        logger.warning(
+            "Stale overlay %s changed status twice during finalization. The next reconcile will retry it.",
+            stale.pk,
+        )
         return
-    new_status = on_reconcile(stale.status, present=False)
-    if new_status == stale.status:
-        return
-    stale.status = new_status
-    fields = ["status"]
-    if now is not None:
-        stale.last_sync_at = now
-        fields.append("last_sync_at")
-    stale.save(update_fields=fields)
+    finalise_locked()

@@ -7,6 +7,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from ._outbox_case import content_bulk_update
 from .mixins import IntentPushResetMixin
 
 
@@ -102,6 +103,22 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(row.port, 514)
         self.assertEqual(row.status, "in_sync")
 
+    def test_matching_read_does_not_settle_generation_correlated_deploying_host(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
+
+        mgmt = self._mgmt()
+        row = NSOLoggingHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.19",
+            status="deploying",
+        )
+
+        _reconcile_logging_config(self.device, self._payload({"address": row.address}))
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
     def test_omitted_provenance_explicit_facility_does_not_false_settle(self):
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOPlatformNedMapping
         from netbox_nso_plugin.template_content import _reconcile_logging_config
@@ -186,7 +203,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOLoggingHostState.objects.filter(pk=instance.pk).update(severity="error")
+            content_bulk_update(instance, severity="error")
+            instance.severity = "warning"
 
         post_init.connect(_concurrent_editor, sender=NSOLoggingHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_editor, sender=NSOLoggingHostState)
@@ -227,7 +245,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
             if fired or instance.pk != row.pk:
                 return
             fired.append(True)
-            NSOLoggingHostState.objects.filter(pk=instance.pk).update(address="198.18.0.98")
+            content_bulk_update(instance, address="198.18.0.98")
+            instance.address = "198.18.0.26"
 
         post_init.connect(_concurrent_renamer, sender=NSOLoggingHostState, weak=False)
         self.addCleanup(post_init.disconnect, _concurrent_renamer, sender=NSOLoggingHostState)

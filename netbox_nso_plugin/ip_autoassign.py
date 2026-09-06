@@ -275,76 +275,63 @@ def carve_p2p_child(pool, family: str, override_mask: int | None = None):
 # ── Rollback ──────────────────────────────────────────────────────────────────
 
 
-def rollback_auto_assigned(state, _cascade: bool = True) -> None:
+def rollback_auto_assigned(state) -> None:
     """Unassign and delete an auto-assigned IP address from *state*.
 
     Clears the IPAddress assignment from the interface, deletes the IPAddress
     object, then deletes the ``NSOInterfaceIPState`` row.  Used on
     ``apply_failed`` or explicit operator de-allocation.
 
-    For P2P states (``state.peer_state`` is set), when called as the primary
-    end (``_cascade=True``), also rolls back the peer state and deletes the
-    shared carved child prefix (``source_pool``).
-
-    Swallows exceptions so callers can call this in a cleanup path.
+    For P2P states, one immutable footprint covers both ends and the shared
+    carved child prefix. A failure rolls the complete cleanup back.
     """
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
     from ipam.models import IPAddress
+
+    from .intent_state import (
+        MutationFootprint,
+        deletion_footprint_for_instance,
+        intent_transaction,
+    )
 
     if not state.auto_assigned:
         return
 
-    # Capture P2P references before any deletions (objects may be nulled).
-    # Only follow peer_state on the primary (cascading) call: in the cascaded
-    # (peer) call the sibling has already been deleted, and peer_state is
-    # SET_NULL, so re-reading the FK here would raise DoesNotExist against the
-    # stale in-memory id.
-    peer_state = state.peer_state if _cascade else None
+    states = [state]
     source_pool = state.source_pool
-
-    try:
+    is_p2p = state.allocation_kind == state.ALLOCATION_KIND_P2P
+    if is_p2p:
+        peer = type(state).objects.filter(pk=state.peer_state_id).first()
+        if peer is not None:
+            states.append(peer)
+    interface_type = ContentType.objects.get_for_model(Interface)
+    ip_addresses = []
+    for candidate in states:
         vrf_obj = None
-        if state.vrf:
-            try:
-                from ipam.models import VRF
+        if candidate.vrf:
+            from ipam.models import VRF
 
-                vrf_obj = VRF.objects.get(name=state.vrf)
-            except Exception:
-                pass
-        # Scope by BOTH the content type and the id: assigned_object_id is a bare
-        # GenericForeignKey pk shared across content types, so filtering on the id
-        # alone could match (and delete) an IPAddress at the same address+VRF that
-        # is assigned to a non-Interface object whose pk collides with ours.
-        from dcim.models import Interface as _Interface
-        from django.contrib.contenttypes.models import ContentType
-
-        ip_obj = IPAddress.objects.filter(
-            address=state.address,
+            vrf_obj = VRF.objects.filter(name=candidate.vrf).first()
+        ip_address = IPAddress.objects.filter(
+            address=candidate.address,
             vrf=vrf_obj,
-            assigned_object_type=ContentType.objects.get_for_model(_Interface),
-            assigned_object_id=state.interface_id,
+            assigned_object_type=interface_type,
+            assigned_object_id=candidate.interface_id,
         ).first()
-        if ip_obj is not None:
-            ip_obj.delete()
-    except Exception as exc:
-        logger.warning("ip_autoassign.rollback: failed to delete IPAddress for %s: %s", state, exc)
-    try:
-        state.delete()
-    except Exception as exc:
-        logger.warning("ip_autoassign.rollback: failed to delete NSOInterfaceIPState %s: %s", state, exc)
+        if ip_address is not None:
+            ip_addresses.append(ip_address)
 
-    if _cascade and peer_state is not None:
-        rollback_auto_assigned(peer_state, _cascade=False)
-        # Delete the carved child prefix (shared by both ends) only once.
-        if source_pool is not None:
-            try:
-                source_pool.refresh_from_db()
-                source_pool.delete()
-            except Exception as exc:
-                logger.warning(
-                    "ip_autoassign.rollback: failed to delete carved child prefix %s: %s",
-                    source_pool,
-                    exc,
-                )
+    footprint = MutationFootprint.merge(
+        *(deletion_footprint_for_instance(candidate) for candidate in (*states, *ip_addresses))
+    )
+    with intent_transaction(footprint):
+        for ip_address in ip_addresses:
+            ip_address.delete()
+        for candidate in states:
+            candidate.delete()
+        if is_p2p and source_pool is not None:
+            source_pool.delete()
 
 
 # ── P2P allocation helper ─────────────────────────────────────────────────────
@@ -370,6 +357,26 @@ def _suppress_ip_intent_push():
             _p2p_allocation_active.active = prev
 
     return _ctx()
+
+
+def _ip_allocation_footprint(*managements):
+    """Declare every new renderer row before reserving an address."""
+    from .intent_state import MutationFootprint, SourceRow
+
+    return MutationFootprint.for_keys(
+        {(management.device_id, "ip") for management in managements},
+        source_rows=(SourceRow("ipam.ipaddress", None),),
+        overlay_rows=(SourceRow("netbox_nso_plugin.nsointerfaceipstate", None),),
+    )
+
+
+class _AllocationNoOp(Exception):
+    """Exit an allocation transaction before recording its non-write result."""
+
+    def __init__(self, result_key, entry):
+        super().__init__(entry["reason"])
+        self.result_key = result_key
+        self.entry = entry
 
 
 def _assign_one_p2p_family(
@@ -400,6 +407,7 @@ def _assign_one_p2p_family(
     from django.utils import timezone
     from ipam.models import IPAddress, Prefix
 
+    from .intent_state import intent_transaction
     from .models import NSOInterfaceIPState
     from .signals import _schedule_intent_push
 
@@ -418,78 +426,84 @@ def _assign_one_p2p_family(
         with transaction.atomic():
             pool = pool_finder(family, site)
             if pool is None:
-                result["errors"].append(
-                    {"interface": str(interface), "family": family, "reason": no_pool_reason(family)}
+                raise _AllocationNoOp(
+                    "errors",
+                    {"interface": str(interface), "family": family, "reason": no_pool_reason(family)},
                 )
-                return
             # Row-level lock on the pool prefix: serializes concurrent carves for the same
             # pool without blocking unrelated allocations.
             pool = Prefix.objects.select_for_update().get(pk=pool.pk)
-            if NSOInterfaceIPState.objects.filter(
-                Q(interface=interface) | Q(interface=peer_iface),
-                family=family,
-                status__in=_OCCUPIED,
-            ).exists():
-                result["skipped"].append(
-                    {
-                        "interface": str(interface),
+            with intent_transaction(_ip_allocation_footprint(mgmt, peer_mgmt)):
+                if NSOInterfaceIPState.objects.filter(
+                    Q(interface=interface) | Q(interface=peer_iface),
+                    family=family,
+                    status__in=_OCCUPIED,
+                ).exists():
+                    raise _AllocationNoOp(
+                        "skipped",
+                        {
+                            "interface": str(interface),
+                            "family": family,
+                            "reason": f"One or both P2P ends already have a managed {family} IP",
+                        },
+                    )
+                carved = carve_p2p_child(pool, family, override_mask)
+                if carved is None:
+                    raise _AllocationNoOp(
+                        "errors",
+                        {
+                            "interface": str(interface),
+                            "family": family,
+                            "reason": f"P2P pool {pool} has no available space for a child prefix",
+                        },
+                    )
+                child_prefix, host_a_str, host_b_str = carved
+                vrf_name = pool.vrf.name if pool.vrf else ""
+                with _suppress_ip_intent_push():
+                    ip_a = IPAddress(address=host_a_str, vrf=pool.vrf, status="reserved")
+                    ip_a.assigned_object = interface
+                    ip_a.save()
+                    ip_b = IPAddress(address=host_b_str, vrf=pool.vrf, status="reserved")
+                    ip_b.assigned_object = peer_iface
+                    ip_b.save()
+                state_a, _ = NSOInterfaceIPState.objects.update_or_create(
+                    interface=interface,
+                    address=host_a_str,
+                    vrf=vrf_name,
+                    defaults={
                         "family": family,
-                        "reason": f"One or both P2P ends already have a managed {family} IP",
-                    }
+                        "status": "accepted",
+                        "auto_assigned": True,
+                        "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_P2P,
+                        "source_pool": child_prefix,
+                        "accepted_at": now,
+                    },
                 )
-                return
-            carved = carve_p2p_child(pool, family, override_mask)
-            if carved is None:
-                result["errors"].append(
-                    {
-                        "interface": str(interface),
+                state_b, _ = NSOInterfaceIPState.objects.update_or_create(
+                    interface=peer_iface,
+                    address=host_b_str,
+                    vrf=vrf_name,
+                    defaults={
                         "family": family,
-                        "reason": f"P2P pool {pool} has no available space for a child prefix",
-                    }
+                        "status": "accepted",
+                        "auto_assigned": True,
+                        "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_P2P,
+                        "source_pool": child_prefix,
+                        "accepted_at": now,
+                    },
                 )
-                return
-            child_prefix, host_a_str, host_b_str = carved
-            vrf_name = pool.vrf.name if pool.vrf else ""
-            with _suppress_ip_intent_push():
-                ip_a = IPAddress(address=host_a_str, vrf=pool.vrf, status="reserved")
-                ip_a.assigned_object = interface
-                ip_a.save()
-                ip_b = IPAddress(address=host_b_str, vrf=pool.vrf, status="reserved")
-                ip_b.assigned_object = peer_iface
-                ip_b.save()
-            state_a, _ = NSOInterfaceIPState.objects.update_or_create(
-                interface=interface,
-                address=host_a_str,
-                vrf=vrf_name,
-                defaults={
-                    "family": family,
-                    "status": "accepted",
-                    "auto_assigned": True,
-                    "source_pool": child_prefix,
-                    "accepted_at": now,
-                },
-            )
-            state_b, _ = NSOInterfaceIPState.objects.update_or_create(
-                interface=peer_iface,
-                address=host_b_str,
-                vrf=vrf_name,
-                defaults={
-                    "family": family,
-                    "status": "accepted",
-                    "auto_assigned": True,
-                    "source_pool": child_prefix,
-                    "accepted_at": now,
-                },
-            )
-            state_a.peer_state = state_b
-            state_a.save(update_fields=["peer_state"])
-            state_b.peer_state = state_a
-            state_b.save(update_fields=["peer_state"])
-            if push:
-                # Appended inside the allocation's own transaction: an in-protocol send is
-                # a claimed, sequenced operation, and the drain runs on this commit.
-                for dev_id in (mgmt.device_id, peer_mgmt.device_id):
-                    _schedule_intent_push((dev_id, "ip"))
+                state_a.peer_state = state_b
+                state_a.save(update_fields=["peer_state"])
+                state_b.peer_state = state_a
+                state_b.save(update_fields=["peer_state"])
+                if push:
+                    # Appended inside the allocation's own transaction: an in-protocol send is
+                    # a claimed, sequenced operation, and the drain runs on this commit.
+                    for dev_id in (mgmt.device_id, peer_mgmt.device_id):
+                        _schedule_intent_push((dev_id, "ip"))
+    except _AllocationNoOp as exc:
+        result[exc.result_key].append(exc.entry)
+        return
     except Exception as exc:
         result["errors"].append(
             {"interface": str(interface), "family": family, "reason": f"P2P allocation failed: {exc}"}
@@ -566,36 +580,50 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
     """
     from django.db import transaction
     from django.utils import timezone
-    from ipam.models import IPAddress
+    from ipam.models import IPAddress, Prefix
 
+    from .intent_state import intent_transaction
     from .models import NSOInterfaceIPState
     from .signals import _schedule_intent_push
 
-    available_str = pool.get_first_available_ip()
-    if available_str is None:
-        result["errors"].append(
-            {
-                "interface": str(interface),
-                "family": family,
-                "reason": f"Pool {pool} is exhausted (no available IPs)",
-            }
-        )
-        return
-
     # One transaction, so the reservation, the overlay and the outbox entry they schedule
     # commit together. The link-role orchestrator's own atomic block nests as a savepoint.
+    failed_step = "lock the pool and check the fill-empty guard"
     try:
         with transaction.atomic():
-            failed_step = "IPAddress"
-            try:
+            pool = Prefix.objects.select_for_update().get(pk=pool.pk)
+            with intent_transaction(_ip_allocation_footprint(mgmt)):
+                if _single_family_occupied(interface, family):
+                    raise _AllocationNoOp(
+                        "skipped",
+                        {
+                            "interface": str(interface),
+                            "family": family,
+                            "reason": "Already has a managed IP in this family",
+                        },
+                    )
+
+                failed_step = "select an available address"
+                available_str = pool.get_first_available_ip()
+                if available_str is None:
+                    raise _AllocationNoOp(
+                        "errors",
+                        {
+                            "interface": str(interface),
+                            "family": family,
+                            "reason": f"Pool {pool} is exhausted (no available IPs)",
+                        },
+                    )
+
                 with transaction.atomic():
                     # Reserve the IPAddress so concurrent allocations do not collide.
+                    failed_step = "create IPAddress"
                     ip_obj = IPAddress(address=available_str, vrf=pool.vrf, status="reserved")
                     ip_obj.assigned_object = interface
                     ip_obj.save()
 
                     vrf_name = pool.vrf.name if pool.vrf else ""
-                    failed_step = "NSOInterfaceIPState"
+                    failed_step = "create NSOInterfaceIPState"
                     state, _ = NSOInterfaceIPState.objects.update_or_create(
                         interface=interface,
                         address=available_str,
@@ -604,28 +632,24 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                             "family": family,
                             "status": "accepted",
                             "auto_assigned": True,
+                            "allocation_kind": NSOInterfaceIPState.ALLOCATION_KIND_SINGLE,
                             "source_pool": pool,
                             "accepted_at": timezone.now(),
                         },
                     )
-            except Exception as exc:
-                result["errors"].append(
-                    {
-                        "interface": str(interface),
-                        "family": family,
-                        "reason": f"Failed to create {failed_step}: {exc}",
-                    }
-                )
-                return
 
-            if push:
-                _schedule_intent_push((mgmt.device_id, "ip"))
+                failed_step = "schedule the IP intent push"
+                if push:
+                    _schedule_intent_push((mgmt.device_id, "ip"))
+    except _AllocationNoOp as exc:
+        result[exc.result_key].append(exc.entry)
+        return
     except Exception as exc:
         result["errors"].append(
             {
                 "interface": str(interface),
                 "family": family,
-                "reason": f"Failed to schedule the IP intent push: {exc}",
+                "reason": f"Failed to {failed_step}: {exc}",
             }
         )
         return
@@ -747,7 +771,16 @@ def auto_assign_ip(interface, families: tuple[str, ...] = ("ipv4", "ipv6")) -> d
 # ── Link-role entry point ───────────────────────────────────────────────────────
 
 
-def assign_ips_for_role(interface, role, other_end=None, push=True, *, mgmt=None, peer_mgmt=None) -> dict:
+def assign_ips_for_role(
+    interface,
+    role,
+    other_end=None,
+    push=True,
+    *,
+    mgmt=None,
+    peer_mgmt=None,
+    resolved_pools=None,
+) -> dict:
     """Allocate IPs for *interface* from an ``NSOLinkRole``'s configured pools + mask.
 
     The link-role counterpart to :func:`auto_assign_ip`: the pool (explicit Prefix
@@ -761,6 +794,7 @@ def assign_ips_for_role(interface, role, other_end=None, push=True, *, mgmt=None
     Fill-empty-only. *push* False skips the immediate adapter push (the orchestrator
     defers pushes to after an atomic commit). Returns the ``{allocated, skipped,
     errors}`` dict. A role that manages no IP family is a no-op (empty result).
+    *resolved_pools* supplies pool rows that the orchestrator already locked.
     """
     from .link_role import intent_bundle
 
@@ -798,7 +832,13 @@ def assign_ips_for_role(interface, role, other_end=None, push=True, *, mgmt=None
                 spec.family,
                 site,
                 result,
-                pool_finder=(lambda fam, s, _spec=spec: _resolve_role_pool(_spec, None, s)),
+                pool_finder=(
+                    lambda fam, s, _spec=spec: (
+                        resolved_pools.get(_spec.family)
+                        if resolved_pools is not None
+                        else _resolve_role_pool(_spec, None, s)
+                    )
+                ),
                 no_pool_reason=(lambda fam, _slug=role.slug: f"No {fam} pool found for role '{_slug}'"),
                 override_mask=spec.mask,
                 push=push,
@@ -816,7 +856,7 @@ def assign_ips_for_role(interface, role, other_end=None, push=True, *, mgmt=None
                 }
             )
             continue
-        pool = _resolve_role_pool(spec, None, site)
+        pool = resolved_pools.get(spec.family) if resolved_pools is not None else _resolve_role_pool(spec, None, site)
         if pool is None:
             result["errors"].append(
                 {

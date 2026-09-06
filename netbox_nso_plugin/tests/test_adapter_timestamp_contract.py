@@ -4,8 +4,8 @@
 
 Every timestamp in every adapter API response matches ``^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$``
 — strict UTC, trailing ``Z``, optional fractional seconds. Four plugin sites turn those strings
-back into datetimes, and each one silently degrades rather than failing loudly when the parse
-misses: the job clock (``reconcile._parse_adapter_ts``) stops the stuck-deploying escalation,
+back into datetimes, and each one validates or degrades according to its consumer. The Apply
+settlement clock (``apply_settlement._parse_time``) stops the stuck-deploying escalation,
 the interface tab (``template_content``) blanks ``last_apply_at``, the read gate
 (``read_gate._parse_dt``) nulls ``incarnation_born`` — which is never-null on the wire and is
 what orders incarnation adoption, so a null fails the gate closed — and the sync mirror
@@ -23,6 +23,8 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+
+from ._outbox_case import mirror_update
 
 #: The two shapes the adapter is allowed to emit, and the instant each denotes.
 _WHOLE = ("2026-06-01T10:00:00Z", datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC))
@@ -58,46 +60,6 @@ class _AwareUTCMixin:
         self.assertEqual(str(value.tzinfo), "UTC", f"{wire!r} must carry UTC, not a host-local zone")
         self.assertEqual(value, expected)
         self.assertEqual(value.microsecond, expected.microsecond)
-
-
-class TestJobTimestampParser(_AwareUTCMixin, TestCase):
-    """``reconcile._parse_adapter_ts`` — the clock the stuck-deploying escalation runs on."""
-
-    def test_both_shapes_parse_aware_utc(self):
-        from netbox_nso_plugin.reconcile import _parse_adapter_ts
-
-        for wire, expected in _SHAPES:
-            with self.subTest(wire=wire):
-                self.assertAwareUTC(_parse_adapter_ts(wire), expected, wire)
-
-    def test_escalation_fires_on_a_whole_second_job_timestamp(self):
-        """The grace comparison is ``timezone.now() - finished``; a None here silently
-        disables the escalation, so drive it through the real function end to end."""
-        from django.utils import timezone
-        from ipam.models import VLAN
-
-        from netbox_nso_plugin.models import NSOVLANState
-        from netbox_nso_plugin.reconcile import _escalate_stuck_deploying
-        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
-
-        mgmt = _make_mgmt(_make_device("ts-escalate"))
-        vlan = VLAN.objects.create(group=_device_vlan_group(mgmt.device), vid=131, name="V131")
-        row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V131", status="deploying")
-        finished = (timezone.now() - timedelta(minutes=30)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        _escalate_stuck_deploying(
-            mgmt,
-            {
-                "id": 931,
-                "type": "apply",
-                "status": "succeeded",
-                "updated_at": finished,
-                "result": {"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
-            },
-        )
-
-        row.refresh_from_db()
-        self.assertEqual(row.status, "apply_failed")
 
 
 class TestInterfaceStateTimestamp(_AwareUTCMixin, TestCase):
@@ -209,7 +171,7 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
         for wire, expected in _SHAPES:
             with self.subTest(wire=wire):
                 self.mgmt.last_sync_at = None
-                NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_at=None)
+                mirror_update(self.mgmt, last_sync_at=None)
                 changed = refresh_sync_cache(self.mgmt, self._adapter_row(wire))
                 self.assertIn("last_sync_at", changed)
                 # In memory first: this is the parser's OWN tzinfo, before the DB round-trip
@@ -252,7 +214,7 @@ class TestSyncCacheTimestamp(_AwareUTCMixin, TestCase):
 
         previous = datetime(2026, 5, 31, 9, 0, tzinfo=UTC)
         self.mgmt.last_sync_at = previous
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(last_sync_at=previous)
+        mirror_update(self.mgmt, last_sync_at=previous)
         for value in (1717236000, {"at": "2026-06-01T10:00:00Z"}, ["2026-06-01T10:00:00Z"]):
             with self.subTest(value=value):
                 with self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING"):
