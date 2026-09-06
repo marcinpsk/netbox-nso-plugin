@@ -274,45 +274,62 @@ def _teardown_marks() -> dict:
     return marks
 
 
+def _store_teardown_marks(device_id, marks: list) -> None:
+    held = _teardown_marks()
+    if marks:
+        held[device_id] = marks
+    else:
+        held.pop(device_id, None)
+
+
+def _teardown_owner():
+    """Return the atomic block a mark belongs to; Django pops it on commit and rollback alike."""
+    from django.db import connection
+
+    blocks = connection.atomic_blocks
+    return blocks[-1] if blocks else None
+
+
+def _live_teardown_marks(device_id, txid: int) -> list:
+    """Sweep every device's stale marks, then return the live ones for *device_id*.
+
+    Visibility is the transaction; ownership is the block that took the mark. A descendant
+    atomic or savepoint sees its ancestor's mark, and only the owner leaving the stack
+    expires it. An aborted teardown never clears its own mark and holds its Atomic object,
+    so the sweep covers the whole (tiny) thread-local, not just the device being asked about.
+    """
+    from django.db import connection
+
+    blocks = connection.atomic_blocks
+    marks = _teardown_marks()
+    for held_device_id, held in list(marks.items()):
+        live = [mark for mark in held if mark[0] == txid and any(block is mark[1] for block in blocks)]
+        if len(live) != len(held):
+            _store_teardown_marks(held_device_id, live)
+    return marks.get(device_id, [])
+
+
 def mark_device_teardown(device_id, txid: int) -> None:
     """Count one in-progress deletion of *device_id* (or of its management row)."""
-    marks = _teardown_marks()
-    scope = _teardown_scope(txid)
-    held_scope, count = marks.get(device_id, (scope, 0))
-    marks[device_id] = (scope, count + 1) if held_scope == scope else (scope, 1)
+    live = _live_teardown_marks(device_id, txid)
+    _store_teardown_marks(device_id, [*live, (txid, _teardown_owner())])
 
 
 def clear_device_teardown(device_id, txid: int) -> None:
-    """Release one mark in the transaction scope that created it."""
-    marks = _teardown_marks()
-    scope = _teardown_scope(txid)
-    held_scope, count = marks.get(device_id, (None, 0))
-    if held_scope != scope or count <= 1:
-        marks.pop(device_id, None)
-    else:
-        marks[device_id] = (held_scope, count - 1)
+    """Release the mark this block took; a live mark another block owns is left standing."""
+    live = _live_teardown_marks(device_id, txid)
+    owner = _teardown_owner()
+    for index in reversed(range(len(live))):
+        if live[index][1] is owner:
+            del live[index]
+            break
+    _store_teardown_marks(device_id, live)
 
 
 def _device_is_tearing_down(device_id, txid: int) -> bool:
-    marks = getattr(_teardown, "marks", None)
-    if not marks or device_id not in marks:
+    if not getattr(_teardown, "marks", None):
         return False
-    if marks[device_id][0] == _teardown_scope(txid):
-        return True
-    # The scope that took the mark is gone (a rolled-back deletion never cleared it).
-    marks.pop(device_id, None)
-    return False
-
-
-def _teardown_scope(txid: int) -> tuple:
-    """Identify the atomic scope whose rollback must expire a teardown mark."""
-    from django.db import connection
-
-    return (
-        txid,
-        tuple(id(block) for block in connection.atomic_blocks),
-        tuple(connection.savepoint_ids),
-    )
+    return bool(_live_teardown_marks(device_id, txid))
 
 
 def current_txid() -> int:

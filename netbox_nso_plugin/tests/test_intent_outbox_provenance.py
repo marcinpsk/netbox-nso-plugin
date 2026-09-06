@@ -490,3 +490,99 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             assert self.device.pk not in outbox._teardown_marks(), (
                 "the mark of a scope that is gone stays for the life of the worker thread"
             )
+
+    def test_an_aborted_teardown_is_swept_when_another_device_is_visited(self):
+        """A mark its owner never cleared holds an Atomic object, so every visit sweeps all devices."""
+        from django.db.models.signals import pre_delete
+
+        from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.intent_state import content_mutation
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        other = _make_device("td", 2)
+
+        def abort_after_mark(sender, instance, **kwargs):
+            raise _Abort
+
+        pre_delete.connect(abort_after_mark, sender=NSODeviceManagement, weak=False)
+        self.addCleanup(pre_delete.disconnect, abort_after_mark, sender=NSODeviceManagement)
+
+        with transaction.atomic():
+            try:
+                with transaction.atomic():
+                    self.mgmt.delete()
+            except _Abort:
+                pass
+            assert self.device.pk in outbox._teardown_marks(), "the aborted deletion never marked the device"
+
+            with content_mutation({(other.pk, "vlan")}):
+                outbox.enqueue(other.pk, "vlan")
+
+            assert self.device.pk not in outbox._teardown_marks(), (
+                "the abandoned mark survives until its own device is revisited"
+            )
+
+    def test_deleting_a_device_with_isis_flex_algos_commits(self):
+        """The genuine-commit twin: a TestCase's manual callback run cannot prove COMMIT."""
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOISISFlexAlgoState
+
+        with without_commit_drain(), transaction.atomic():
+            instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+            ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        assert NSOISISFlexAlgoState.objects.filter(management=self.mgmt, algo_id=130).exists()
+        device_id = self.device.pk
+
+        with patch("netbox_nso_plugin.adapter_client.delete_device"):
+            self.device.delete()
+
+        assert not Device.objects.filter(pk=device_id).exists()
+        assert not NSOISISFlexAlgoState.objects.filter(management_id=self.mgmt.pk).exists()
+        assert not NSOIntentOutboxEntry.objects.filter(device_id=device_id).exists()
+
+    def test_a_mark_is_visible_from_every_descendant_block(self):
+        """A mark belongs to the block that took it, so every deeper scope must still see it."""
+        from netbox_nso_plugin import outbox
+
+        with transaction.atomic():
+            txid = outbox.current_txid()
+            outbox.mark_device_teardown(self.device.pk, txid)
+            with transaction.atomic():
+                assert outbox._device_is_tearing_down(self.device.pk, outbox.current_txid())
+            with transaction.atomic(savepoint=False):
+                assert outbox._device_is_tearing_down(self.device.pk, outbox.current_txid())
+            assert outbox._device_is_tearing_down(self.device.pk, txid)
+            outbox.clear_device_teardown(self.device.pk, txid)
+            assert not outbox._device_is_tearing_down(self.device.pk, txid)
+
+    def test_a_rolled_back_nested_mark_expires_without_touching_the_outer_one(self):
+        from netbox_nso_plugin import outbox
+
+        other = _make_device("td", 2)
+        with transaction.atomic():
+            txid = outbox.current_txid()
+            outbox.mark_device_teardown(self.device.pk, txid)
+            try:
+                with transaction.atomic():
+                    outbox.mark_device_teardown(other.pk, outbox.current_txid())
+                    raise _Abort
+            except _Abort:
+                pass
+
+            assert not outbox._device_is_tearing_down(other.pk, outbox.current_txid())
+            assert outbox._device_is_tearing_down(self.device.pk, outbox.current_txid())
+
+    def test_clearing_the_management_mark_leaves_the_device_mark_standing(self):
+        """Both pre_deletes mark in the collector's block; each post_delete clears one."""
+        from netbox_nso_plugin import outbox
+
+        with transaction.atomic():
+            txid = outbox.current_txid()
+            outbox.mark_device_teardown(self.device.pk, txid)
+            outbox.mark_device_teardown(self.device.pk, txid)
+
+            outbox.clear_device_teardown(self.device.pk, txid)
+            assert outbox._device_is_tearing_down(self.device.pk, txid)
+            outbox.clear_device_teardown(self.device.pk, txid)
+            assert not outbox._device_is_tearing_down(self.device.pk, txid)

@@ -2069,6 +2069,38 @@ class TestDeleteOriginMarking(_SignalDBBase):
         self.assertEqual(origins, [self.device])
         self._assert_teardown_touched_only_the_offboard(calls)
 
+    def test_deleting_a_device_with_isis_flex_algos_pushes_no_intent(self):
+        """The flex-algo cascade handler appends from its own nested atomic block.
+
+        The teardown mark is taken in the collector's block; an append from a descendant
+        scope must still see it, or the row is inserted for a device the collector is
+        deleting and the deferred foreign key fails at COMMIT.
+        """
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOISISFlexAlgoState
+
+        # Created before the device is managed, so the accept handler leaves no overlay of its own.
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        mgmt = self._mgmt()
+        state = NSOISISFlexAlgoState(
+            management=mgmt,
+            process_tag="CORE",
+            algo_id=130,
+            isis_flex_algo=flex_algo,
+            status="accepted",
+        )
+        with self._arranged(), intent_transaction(footprint_for_instance(state)):
+            state.save()
+        device_id = self.device.pk
+
+        calls = self._recorded_calls(self.device.delete)
+
+        self._assert_teardown_touched_only_the_offboard(calls)
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device_id=device_id).exists())
+
 
 class TestSourceRekeyLocksOnlyItsManagementRow(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """The rekey's first locking read joins NSOInstance, and a bare FOR UPDATE locks every
