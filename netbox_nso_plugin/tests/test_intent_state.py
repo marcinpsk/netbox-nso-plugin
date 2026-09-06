@@ -677,7 +677,11 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "netbox_routing.staticroute_devices",
             },
         )
-        self.assertTrue(all(spec.required_trace_fixtures for spec in renderer_input_specs().values()))
+        # A protocol-only input declares no render-trace fixture: nothing renders from it.
+        self.assertEqual(
+            {label for label, spec in renderer_input_specs().items() if not spec.required_trace_fixtures},
+            {"netbox_routing.ospfinstance"},
+        )
 
     def test_reconcile_footprint_rejects_a_registered_model_without_a_lock_rank(self):
         from netbox_nso_plugin import intent_state
@@ -900,6 +904,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         observed = set().union(*observed_by_fixture.values())
         self.assertEqual(observed - declared, set(), f"undeclared renderer sources: {sorted(observed - declared)}")
         for label, spec in renderer_input_specs().items():
+            # A protocol-only input declares no fixture, so no trace reads it.
+            if not spec.required_trace_fixtures:
+                continue
             with self.subTest(label=label):
                 exercised = {
                     fixture
