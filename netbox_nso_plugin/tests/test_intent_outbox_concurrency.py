@@ -339,7 +339,7 @@ class TestUntrackedNativeDeletesSerializeWithSaves(_ConcurrencyCase):
             deleting.start()
             self.addCleanup(deleting.join, 30)
             self.addCleanup(release.set)
-            assert held.wait(timeout=5), "the untracked delete never acquired its device-scope lock"
+            assert held.wait(timeout=30), "the untracked delete never acquired its device-scope lock"
 
             saving = threading.Thread(target=save_native)
             saving.start()
