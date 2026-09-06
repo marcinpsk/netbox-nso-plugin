@@ -66,6 +66,104 @@ class _ConcurrencyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTest
         NSOIntentOutboxEntry.objects.all().delete()
 
 
+class TestL2NativeRowsAreLocked(_ConcurrencyCase):
+    def test_reconcile_locks_native_rows_before_creating_the_first_overlay(self):
+        from dcim.models import Interface
+        from django.db import connections
+        from vpn.models import L2VPN, L2VPNTermination
+
+        from netbox_nso_plugin import l2_service_reconciler
+
+        iface = Interface.objects.create(device=self.device, name="lag-60", type="lag")
+        vpn = L2VPN.objects.create(name="test-vpn", slug=f"nso-{self.device.pk}-test-vpn", type="vpws")
+        termination = L2VPNTermination.objects.create(l2vpn=vpn, assigned_object=iface)
+        payload = {
+            "services": [
+                {
+                    "service_name": "test-vpn",
+                    "service_type": "epipe",
+                    "saps": [
+                        {"sap_id": "lag-60:100", "port": "lag-60", "outer_tag": 100},
+                    ],
+                }
+            ]
+        }
+        outcomes = []
+        original_body = l2_service_reconciler._reconcile_l2_services
+
+        def contend():
+            try:
+                for obj in (vpn, termination):
+                    try:
+                        with transaction.atomic():
+                            type(obj).objects.select_for_update(nowait=True).get(pk=obj.pk)
+                    except OperationalError as exc:
+                        outcomes.append(getattr(exc.__cause__, "sqlstate", None))
+                    else:
+                        outcomes.append("unlocked")
+            finally:
+                connections.close_all()
+
+        def check_locks_then_reconcile(*args):
+            contender = threading.Thread(target=contend)
+            contender.start()
+            self.addCleanup(contender.join, 30)
+            contender.join(timeout=30)
+            self.assertFalse(contender.is_alive())
+            self.assertEqual(outcomes, ["55P03", "55P03"])
+            return original_body(*args)
+
+        with patch.object(l2_service_reconciler, "_reconcile_l2_services", new=check_locks_then_reconcile):
+            rows = l2_service_reconciler.reconcile_l2_services(self.device, payload)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].l2vpn_id, vpn.pk)
+        self.assertEqual(rows[0].termination_id, termination.pk)
+
+
+class TestInstanceDefaultContention(_ConcurrencyCase):
+    def test_save_retries_a_default_changed_before_acquisition(self):
+        from django.db import connections
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSOInstance
+
+        competitor = NSOInstance.objects.create(name="competing-default", adapter_instance_id="competing-default")
+        target = NSOInstance(name="requested-default", adapter_instance_id="requested-default", is_default=True)
+        original_transaction = intent_state.intent_transaction
+        changed = False
+        failures = []
+
+        def replace_default():
+            try:
+                other = NSOInstance.objects.get(pk=competitor.pk)
+                other.is_default = True
+                other.save()
+            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
+                failures.append(exc)
+            finally:
+                connections.close_all()
+
+        @contextmanager
+        def acquire_after_competing_default(footprint, **kwargs):
+            nonlocal changed
+            if not changed:
+                changed = True
+                contender = threading.Thread(target=replace_default)
+                contender.start()
+                self.addCleanup(contender.join, 30)
+                contender.join(timeout=30)
+                self.assertFalse(contender.is_alive())
+                self.assertEqual(failures, [])
+            with original_transaction(footprint, **kwargs) as permit:
+                yield permit
+
+        with patch.object(intent_state, "intent_transaction", new=acquire_after_competing_default):
+            target.save()
+
+        self.assertEqual(list(NSOInstance.objects.filter(is_default=True).values_list("pk", flat=True)), [target.pk])
+        self.assertTrue(NSOInstance.objects.filter(pk=competitor.pk).exists())
+
+
 class TestTheLockProbeReadsTheLockClassItIsGiven(_CascadeFlushMixin, TransactionTestCase):
     """``wait_until_postgres_blocks`` must answer for the lock class it is named, not for any block.
 

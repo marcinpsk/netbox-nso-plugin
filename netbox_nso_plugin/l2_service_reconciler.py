@@ -25,6 +25,10 @@ def l2_service_reconcile_plan(device, payload: dict):
     """Declare one L2 SAP refresh and its predicted renderer-fragment delta."""
     import copy
 
+    from dcim.models import Interface
+    from django.contrib.contenttypes.models import ContentType
+    from vpn.models import L2VPN, L2VPNTermination
+
     from . import status_machine as sm
     from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow, canonical_fragment
     from .models import NSODeviceManagement, NSOL2SapState
@@ -56,8 +60,28 @@ def l2_service_reconcile_plan(device, payload: dict):
         if canonical_fragment(state) != canonical_fragment(candidate):
             changes_content = True
             break
+    service_names = {
+        service["service_name"]
+        for service in payload.get("services", []) or []
+        if isinstance(service, dict) and service.get("service_name")
+    }
+    vpn_ids = L2VPN.objects.filter(slug__in=[f"nso-{device.pk}-{name}" for name in service_names]).values_list(
+        "pk", flat=True
+    )
+    ports = {sap.get("port", "") for _service, sap in reported.values()}
+    interface_ids = Interface.objects.filter(device=device, name__in=ports).values_list("pk", flat=True)
+    termination_ids = L2VPNTermination.objects.filter(
+        assigned_object_type=ContentType.objects.get_for_model(Interface),
+        assigned_object_id__in=interface_ids,
+    ).values_list("pk", flat=True)
     footprint = MutationFootprint.for_keys(
         {(device.pk, "l2_sap")},
+        source_rows=(
+            SourceRow("vpn.l2vpn", None),
+            *(SourceRow("vpn.l2vpn", pk) for pk in vpn_ids),
+            SourceRow("vpn.l2vpntermination", None),
+            *(SourceRow("vpn.l2vpntermination", pk) for pk in termination_ids),
+        ),
         overlay_rows=(
             SourceRow("netbox_nso_plugin.nsol2sapstate", None),
             *(SourceRow(state._meta.label_lower, state.pk) for state in states),

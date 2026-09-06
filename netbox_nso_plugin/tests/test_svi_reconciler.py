@@ -47,6 +47,26 @@ class TestSviReconciler(TestCase):
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
         self.assertEqual(rows[0].status, "imported")
 
+    def test_refresh_resolves_reported_interfaces_in_one_batch(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        payload = {"interfaces": [{"interface_name": f"Vlan{vid}", "vlan_id": vid} for vid in (100, 200, 300)]}
+        reconcile_svi(self.device, payload)
+
+        with CaptureQueriesContext(connection) as queries:
+            rows = reconcile_svi(self.device, payload)
+
+        self.assertEqual(len(rows), 3)
+        per_name_lookups = [
+            query["sql"]
+            for query in queries
+            if 'FROM "dcim_interface"' in query["sql"] and '"dcim_interface"."name" =' in query["sql"]
+        ]
+        self.assertEqual(per_name_lookups, [])
+
     def test_direct_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.svi_reconciler import reconcile_svi

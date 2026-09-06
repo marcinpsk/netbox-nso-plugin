@@ -38,6 +38,8 @@ SOURCE_MODEL_RANKS = (
     "dcim.interface",
     "dcim.interface_tagged_vlans",
     "ipam.ipaddress",
+    "vpn.l2vpn",
+    "vpn.l2vpntermination",
     "netbox_routing.prefixlist",
     "netbox_routing.customprefix",
     "netbox_routing.prefixlistentry",

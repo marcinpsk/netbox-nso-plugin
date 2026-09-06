@@ -1284,10 +1284,10 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
         overlay_rows=tuple(SourceRow(row._meta.label_lower, row.pk) for row in rows),
     )
     with mirror_transaction(footprint):
-        _journal_route_policy_apply_locked(type(mgmt).objects.get(pk=mgmt.pk), job)
+        _journal_route_policy_apply_locked(type(mgmt).objects.get(pk=mgmt.pk), job, [row.pk for row in rows])
 
 
-def _journal_route_policy_apply_locked(mgmt, job: dict) -> None:
+def _journal_route_policy_apply_locked(mgmt, job: dict, row_ids) -> None:
     """Journal one carrier while its device revision and owned policy rows are locked."""
     apply_attempt_id = job.get("apply_attempt_id")
     if apply_attempt_id is not None:
@@ -1331,6 +1331,7 @@ def _journal_route_policy_apply_locked(mgmt, job: dict) -> None:
     # shows on the "Applied to devices" panel, which lists every device).
     rows = list(
         models.NSORoutePolicyState.objects.filter(
+            pk__in=row_ids,
             management=mgmt,
             content_type__isnull=False,
             object_id__isnull=False,

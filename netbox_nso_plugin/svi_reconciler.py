@@ -89,13 +89,14 @@ def _reconcile_svi(device, payload: dict) -> list:
         return []
 
     group = _device_vlan_group(device)
+    iface_map = {iface.name: iface for iface in Interface.objects.filter(device=device)}
     now = timezone.now()
     rows: list = []
     for item in payload.get("interfaces", []):
         name = item.get("interface_name")
         if not name:
             continue
-        iface = Interface.objects.filter(device=device, name=name).first()
+        iface = iface_map.get(name)
         if iface is None:
             iface = Interface(device=device, name=name, type="virtual")
             try:
@@ -105,6 +106,7 @@ def _reconcile_svi(device, payload: dict) -> list:
                 iface = Interface.objects.filter(device=device, name=name).first()
                 if iface is None:
                     raise
+            iface_map[name] = iface
         vid = item.get("vlan_id")
         vlan = VLAN.objects.filter(group=group, vid=vid).first() if vid else None
         device_type = item.get("type") or "svi"

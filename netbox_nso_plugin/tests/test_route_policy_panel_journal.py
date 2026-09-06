@@ -152,6 +152,34 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         obj = model.objects.get(name=name)
         return JournalEntry.objects.filter(assigned_object_type=ct, assigned_object_id=obj.pk)
 
+    def test_journal_excludes_a_policy_owned_after_footprint_discovery(self):
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        mgmt = self._make_mgmt()
+        self._reconcile()
+        late = NSORoutePolicyState.objects.get(management=mgmt, family="community_list")
+        original_transaction = intent_state.mirror_transaction
+
+        @contextmanager
+        def acquire_after_acceptance(footprint):
+            with intent_state.intent_transaction(intent_state.footprint_for_instance(late)):
+                late.status = "accepted"
+                late.save(update_fields=["status"])
+            with original_transaction(footprint) as permit:
+                yield permit
+
+        with patch.object(intent_state, "mirror_transaction", new=acquire_after_acceptance):
+            _journal_route_policy_apply(mgmt, _job("before-acceptance", in_sync=1))
+
+        late.refresh_from_db()
+        self.assertEqual(late.status, "accepted")
+        self.assertIsNone(late.last_apply_at)
+        self.assertFalse(self._entries_for("CLJ", CommunityList).exists())
+
     def test_success_writes_journal_on_each_owned_object(self):
         from netbox_routing.models import ASPath, CommunityList, PrefixList, RouteMap
 
