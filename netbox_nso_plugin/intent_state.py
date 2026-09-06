@@ -2050,9 +2050,9 @@ def _intent_transaction(
 
 
 @contextlib.contextmanager
-def intent_transaction(footprint: MutationFootprint):
+def intent_transaction(footprint: MutationFootprint, *, settles_deploying: bool = True):
     """Acquire L2-L8, bump at L7, then grant the immutable L9 write permit."""
-    with _intent_transaction(footprint) as permit:
+    with _intent_transaction(footprint, settles_deploying=settles_deploying) as permit:
         yield permit
 
 
