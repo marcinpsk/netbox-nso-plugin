@@ -158,6 +158,19 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 [self.state.vlan_id, self.state.pk],
             )
 
+    def test_database_qualified_raw_dml_requires_a_content_permit(self):
+        table = NSOVLANState._meta.db_table
+        database = connection.settings_dict["NAME"]
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'UPDATE "{database}"."public"."{table}" SET device_name = %s WHERE id = %s',
+                ["database-qualified", self.state.pk],
+            )
+
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.device_name, "")
+
     def test_unquoted_uppercase_raw_dml_requires_a_content_permit(self):
         table = NSOVLANState._meta.db_table.upper()
 

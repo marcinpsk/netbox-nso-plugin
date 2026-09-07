@@ -20,7 +20,9 @@ WORKFLOW = ROOT / ".github" / "workflows" / "lint-format.yaml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 UV_LOCK = ROOT / "uv.lock"
-SQLPARSE_MINIMUM = Version("0.5.0")
+# 0.6.0 is the first release whose Identifier.get_real_name() reads the last dotted part,
+# so a database-qualified target cannot be misclassified as its schema.
+SQLPARSE_MINIMUM = Version("0.6.0")
 
 
 def _has_supported_sqlparse_floor(dependency: str) -> bool:
@@ -48,7 +50,7 @@ def test_sqlparse_is_a_runtime_dependency():
     assert any(_has_supported_sqlparse_floor(dependency) for dependency in dependencies)
 
 
-@pytest.mark.parametrize("dependency", ["sqlparse>=0.5.0", "sqlparse>0.5.0"])
+@pytest.mark.parametrize("dependency", ["sqlparse>=0.6.0", "sqlparse>0.6.0"])
 def test_sqlparse_dependency_accepts_a_supported_floor(dependency):
     assert _has_supported_sqlparse_floor(dependency)
 
@@ -59,7 +61,7 @@ def test_packaging_is_a_direct_test_dependency():
     assert any(Requirement(dependency).name == "packaging" for dependency in dependencies)
 
 
-@pytest.mark.parametrize("dependency", ["sqlparse", "sqlparse>=0.4.4"])
+@pytest.mark.parametrize("dependency", ["sqlparse", "sqlparse>=0.5.0"])
 def test_sqlparse_dependency_rejects_an_unsupported_floor(dependency):
     assert not _has_supported_sqlparse_floor(dependency)
 

@@ -547,7 +547,7 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "requests", specifier = ">=2.34.2" },
-    { name = "sqlparse", specifier = ">=0.5.0" },
+    { name = "sqlparse", specifier = ">=0.6.0" },
 ]
 
 [package.metadata.requires-dev]
