@@ -2266,7 +2266,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         with patch("netbox_nso_plugin.bgp_reconciler._bgp_reconcile_operations", side_effect=observe_writer):
             _reconcile_bgp_config(self.device, {"routers": []})
 
-        self.assertEqual(writer_states, [False, True])
+        # The middle build is the replan under the lock.
+        self.assertEqual(writer_states, [False, True, True])
 
     def test_plan_locks_all_devices_that_share_a_route_map_without_expanding_revisions(self):
         from django.contrib.contenttypes.models import ContentType

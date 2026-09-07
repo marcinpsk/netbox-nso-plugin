@@ -779,17 +779,20 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
         self.state = NSOBGPPeerTemplateState.objects.get(management=self.management)
         self.assertEqual(self.state.status, "imported")
 
-    def _race_accept(self, payload):
+    def _race_accept(self, payload, expected_status):
+        """The Accept commits while the planner is paused; the reconciler replans under the lock.
+
+        L3 plans lock-free, so the Accept never waits behind the reconcile: the write pass runs
+        on the fresh post-Accept row and the acceptance survives.
+        """
         from netbox_nso_plugin import status_machine
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.views import NSOBGPPeerTemplateStateAcceptView
 
         read_done = threading.Event()
         release = threading.Event()
-        accept_started = threading.Event()
         accept_done = threading.Event()
         errors = []
-        accept_pids = []
         responses = []
         on_reconcile = status_machine.on_reconcile
 
@@ -810,14 +813,10 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
 
         def accept():
             try:
-                with connections["default"].cursor() as cursor:
-                    cursor.execute("SELECT pg_backend_pid()")
-                    accept_pids.append(cursor.fetchone()[0])
                 request = RequestFactory().post("/")
                 request.user = self.user
                 request.session = {}
                 request._messages = FallbackStorage(request)
-                accept_started.set()
                 responses.append(NSOBGPPeerTemplateStateAcceptView.as_view()(request, pk=self.state.pk))
             except Exception as exc:  # noqa: BLE001 (re-raised on the test thread)
                 errors.append(exc)
@@ -825,7 +824,6 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
                 connections.close_all()
                 accept_done.set()
 
-        blocked = False
         reader = threading.Thread(target=reconcile)
         writer = threading.Thread(target=accept)
         with patch("netbox_nso_plugin.status_machine.on_reconcile", pause_after_read), without_commit_drain():
@@ -835,15 +833,7 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
                 if errors:
                     raise errors[0]
                 writer.start()
-                self.assertTrue(accept_started.wait(15), "Accept did not start")
-                deadline = time.monotonic() + 10
-                while not accept_done.is_set() and time.monotonic() < deadline:
-                    with connection.cursor() as cursor:
-                        cursor.execute("SELECT cardinality(pg_blocking_pids(%s)) > 0", [accept_pids[0]])
-                        blocked = cursor.fetchone()[0]
-                    if blocked:
-                        break
-                    time.sleep(0.01)
+                self.assertTrue(accept_done.wait(15), "Accept did not commit while the planner was paused")
             finally:
                 release.set()
                 reader.join(15)
@@ -855,12 +845,84 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
             raise errors[0]
         self.assertEqual(responses[0].status_code, 302)
         self.state.refresh_from_db()
-        self.assertEqual(self.state.status, "in_sync")
+        self.assertEqual(self.state.status, expected_status)
         self.assertIsNotNone(self.state.accepted_at)
-        self.assertTrue(blocked, "Accept did not wait for reconciliation to release the template")
 
     def test_accept_survives_reported_template_reconciliation(self):
-        self._race_accept(self.payload)
+        self._race_accept(self.payload, "in_sync")
 
     def test_accept_survives_stale_template_reconciliation(self):
-        self._race_accept({"routers": []})
+        # The payload stops reporting the template, so the fresh owned row drifts to changed.
+        self._race_accept({"routers": []}, "changed")
+
+    def test_accept_between_planning_and_acquisition_is_replanned_once(self):
+        """An Accept that commits after the plan is built makes the reconciler replan once."""
+        from netbox_nso_plugin import bgp_reconciler, renderer_writer
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.views import NSOBGPPeerTemplateStateAcceptView
+
+        planned = threading.Event()
+        release = threading.Event()
+        errors = []
+        mutations = []
+        real_plan = bgp_reconciler.bgp_reconcile_plan
+
+        def pause_after_planning(device, payload):
+            plan = real_plan(device, payload)
+            if not planned.is_set():
+                planned.set()
+                if not release.wait(30):
+                    raise AssertionError("the reconciler was not released")
+            return plan
+
+        def counted(real):
+            def enter(plan):
+                if threading.current_thread() is reader:
+                    mutations.append(plan)
+                return real(plan)
+
+            return enter
+
+        def reconcile():
+            try:
+                _reconcile_bgp_config(self.device, self.payload)
+            except Exception as exc:  # noqa: BLE001 (re-raised on the test thread)
+                errors.append(exc)
+            finally:
+                connections.close_all()
+                planned.set()
+
+        reader = threading.Thread(target=reconcile)
+        with (
+            patch("netbox_nso_plugin.bgp_reconciler.bgp_reconcile_plan", side_effect=pause_after_planning),
+            patch(
+                "netbox_nso_plugin.renderer_writer.renderer_writes",
+                side_effect=counted(renderer_writer.renderer_writes),
+            ),
+            patch(
+                "netbox_nso_plugin.renderer_writer.renderer_mirror_writes",
+                side_effect=counted(renderer_writer.renderer_mirror_writes),
+            ),
+            without_commit_drain(),
+        ):
+            reader.start()
+            try:
+                self.assertTrue(planned.wait(15), "the reconciler did not finish planning")
+                if errors:
+                    raise errors[0]
+                request = RequestFactory().post("/")
+                request.user = self.user
+                request.session = {}
+                request._messages = FallbackStorage(request)
+                response = NSOBGPPeerTemplateStateAcceptView.as_view()(request, pk=self.state.pk)
+            finally:
+                release.set()
+                reader.join(15)
+        self.assertFalse(reader.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(response.status_code, 302)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.status, "in_sync")
+        self.assertIsNotNone(self.state.accepted_at)
+        self.assertEqual(len(mutations), 2, "the stale acquisition was not retried under a fresh plan")

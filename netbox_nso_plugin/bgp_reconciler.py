@@ -1271,8 +1271,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
     from .models import NSOBGPPeerState, NSODeviceManagement
     from .renderer_writer import (
         active_renderer_writer,
-        renderer_mirror_writes,
-        renderer_writes,
+        renderer_writes_replanning_once,
         replay_creation_references,
     )
     from .signals import suppress_intent_push
@@ -1280,17 +1279,24 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return []
-    active = active_renderer_writer()
-    plan = active.plan if active is not None else bgp_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
-        operations = _bgp_reconcile_operations(device, payload, plan.planned_at)
+
+    def apply_operations(writer, planned_at):
+        operations = _bgp_reconcile_operations(device, payload, planned_at)
         for operation, instance, update_fields, force_insert, references in operations.operations:
             if operation == "delete":
                 writer.delete(instance)
                 continue
             replay_creation_references(instance, references)
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+
+    def plan_fn():
+        return bgp_reconcile_plan(device, payload)
+
+    active = active_renderer_writer()
+    if active is not None:
+        with contextlib.nullcontext(active) as writer, suppress_intent_push():
+            apply_operations(writer, active.plan.planned_at)
+    else:
+        with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
+            apply_operations(writer, plan.planned_at)
     return list(NSOBGPPeerState.objects.filter(management=management).select_related("bgp_peer"))
