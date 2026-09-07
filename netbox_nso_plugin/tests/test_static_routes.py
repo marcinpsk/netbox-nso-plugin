@@ -205,7 +205,7 @@ class TestReconcileStaticRoutes(TestCase):
             plan = static_route_reconcile_plan(self.device, payload)
 
         self.assertIn(SourceRow("netbox_routing.staticroute", route.pk), plan.lock_footprint.source_rows)
-        assignments = [write for write in plan.writes if write.operation == "m2m_add"]
+        assignments = [write for write in plan.write_set if write.operation == "m2m_add"]
         self.assertEqual(len(assignments), 1)
         self.assertEqual(assignments[0].model_label, "netbox_routing.staticroute")
         self.assertEqual(assignments[0].pk, route.pk)
