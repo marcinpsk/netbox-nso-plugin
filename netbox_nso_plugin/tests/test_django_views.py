@@ -5402,6 +5402,111 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(r.status_code, 400)
 
 
+class TestOverlayFieldEditStalePlan(ViewTestBase):
+    """A write committed between planning and execution must refuse the inline edit.
+
+    The converted SVI/LACP/VLAN save paths execute a frozen renderer plan, so a competing
+    lifecycle write moves a preimage and the writer raises IntentPlanStaleError. The
+    endpoint must answer with its field-error JSON instead of a 500, and write nothing.
+    """
+
+    def _url(self, key, pk):
+        return reverse("plugins:netbox_nso_plugin:overlay_field_edit", kwargs={"key": key, "pk": pk})
+
+    @staticmethod
+    def _race_after_planning(competing):
+        """Freeze the real plan, then commit the competing write the writer must refuse."""
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        real_build = RendererMutationPlan.build
+        fired = []
+
+        def build(*args, **kwargs):
+            plan = real_build(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                competing()
+            return plan
+
+        return patch.object(RendererMutationPlan, "build", build)
+
+    def _assert_refused(self, response, field):
+        self.assertEqual(response.status_code, 400, response.content)
+        body = response.json()
+        self.assertEqual(body["status"], "error")
+        self.assertIn(field, body["errors"])
+
+    def test_svi_edit_refuses_a_plan_staled_after_planning(self):
+        from netbox_nso_plugin.models import NSOSVIState
+
+        interface = Interface.objects.create(device=self.device, name="Vlan841", type="virtual")
+        state = NSOSVIState.objects.create(
+            management=self.mgmt, interface=interface, svi_type="svi", vrf="", status="imported"
+        )
+
+        def competing():
+            mirror_update(state, last_apply_error="the device refused the last apply")
+
+        with self._race_after_planning(competing):
+            response = self.client.post(self._url("svi", state.pk), {"vrf": "BLUE"})
+
+        self._assert_refused(response, "vrf")
+        state.refresh_from_db()
+        self.assertEqual(state.vrf, "")
+        self.assertEqual(state.status, "imported")
+        self.assertIsNone(state.accepted_at)
+        self.assertEqual(state.last_apply_error, "the device refused the last apply")
+
+    def test_lacp_edit_refuses_a_plan_staled_after_planning(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        lag = Interface.objects.create(device=self.device, name="Port-channel84", type="lag")
+        member_interface = Interface.objects.create(device=self.device, name="GigabitEthernet0/84", type="1000base-t")
+        bundle = NSOLACPBundleState.objects.create(
+            management=self.mgmt, interface=lag, lag_id=84, min_links=1, status="imported"
+        )
+        member = NSOLACPMemberState.objects.create(
+            management=self.mgmt, interface=member_interface, lag_bundle=lag, mode="active", status="imported"
+        )
+
+        def competing():
+            mirror_update(bundle, last_apply_error="the device refused the last apply")
+
+        with self._race_after_planning(competing):
+            response = self.client.post(self._url("lacp_bundle", bundle.pk), {"min_links": "2"})
+
+        self._assert_refused(response, "min_links")
+        bundle.refresh_from_db()
+        member.refresh_from_db()
+        self.assertEqual(bundle.min_links, 1)
+        self.assertEqual(bundle.status, "imported")
+        self.assertEqual(member.status, "imported")  # the sibling save rolled back with it
+        self.assertIsNone(member.accepted_at)
+        self.assertEqual(bundle.last_apply_error, "the device refused the last apply")
+
+    def test_vlan_name_edit_refuses_a_plan_staled_after_planning(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOVLANState
+
+        vlan = VLAN.objects.create(vid=841, name="VLAN-841")
+        state = NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="imported")
+
+        def competing():
+            mirror_update(state, last_apply_error="the device refused the last apply")
+
+        with self._race_after_planning(competing):
+            response = self.client.post(self._url("vlan_name", state.pk), {"name": "RENAMED-841"})
+
+        self._assert_refused(response, "name")
+        vlan.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(vlan.name, "VLAN-841")  # the native rename rolled back
+        self.assertEqual(state.status, "imported")
+        self.assertIsNone(state.accepted_at)
+        self.assertEqual(state.last_apply_error, "the device refused the last apply")
+
+
 class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()

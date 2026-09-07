@@ -4982,6 +4982,9 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         from django.apps import apps
         from django.core.exceptions import ValidationError
 
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import IntentPlanStaleError
+
         spec = self._FAMILIES.get(key)
         if spec is None:
             return JsonResponse({"status": "error", "message": f"unknown overlay family: {key}"}, status=400)
@@ -5041,7 +5044,12 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
-            errors = _save_overlay_edit(obj, key, old_values)
+            try:
+                errors = _save_overlay_edit(obj, key, old_values)
+            except (IntentPlanStaleError, RendererTargetsChanged):
+                # A competing write moved a frozen preimage; the plan rolled back whole.
+                message = "This row changed. Refresh the page and try again."
+                errors = {field: [message] for field in changed}
             if errors:
                 return JsonResponse({"status": "error", "errors": errors}, status=400)
         return JsonResponse({"status": "ok", "changed": changed})
