@@ -697,6 +697,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "deploying")
         self.assertEqual(self.state.apply_attempt_id, attempt_id)
+
     def test_writerless_save_preserves_a_cached_foreign_key_created_later(self):
         from ipam.models import VLAN
 
