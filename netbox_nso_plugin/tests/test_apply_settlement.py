@@ -277,8 +277,6 @@ class TestAttemptSettlement(TestCase):
         attempt_id = uuid4()
         selected = {"svi": 1, "logging": 2}
         self._local_attempt(attempt_id, 75, selected)
-        for row in rows:
-            mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
         evidence = _attempt(attempt_id, self.adapter_device_id, 75, selected, "settled", result={})
         generation = evidence["generations"][0]
 
@@ -292,15 +290,21 @@ class TestAttemptSettlement(TestCase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=EvidenceSession()),
         ):
-            for age, expected_status in (
-                (timedelta(0), "deploying"),
-                (_stuck_deploying_grace() + timedelta(seconds=1), "apply_failed"),
-            ):
-                generation["updated_at"] = (timezone.now() - age).isoformat()
-                settle_device_apply_attempts(self.management, static_route_feed_drained=True)
-                for row in rows:
-                    row.refresh_from_db()
-                    self.assertEqual(row.status, expected_status)
+            for timespec in ("microseconds", "seconds"):
+                with self.subTest(timespec=timespec):
+                    for row in rows:
+                        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
+                    for age, expected_status in (
+                        (timedelta(0), "deploying"),
+                        (_stuck_deploying_grace() + timedelta(seconds=1), "apply_failed"),
+                    ):
+                        generation["updated_at"] = (
+                            (timezone.now() - age).isoformat(timespec=timespec).replace("+00:00", "Z")
+                        )
+                        settle_device_apply_attempts(self.management, static_route_feed_drained=True)
+                        for row in rows:
+                            row.refresh_from_db()
+                            self.assertEqual(row.status, expected_status)
 
     def test_generation_timestamps_accept_whole_and_fractional_seconds(self):
         from netbox_nso_plugin.apply_settlement import _parse_time
