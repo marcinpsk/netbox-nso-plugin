@@ -675,6 +675,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "netbox_nso_plugin.nsoinstance",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.staticroute_devices",
+                "vpn.l2vpn",
+                "vpn.l2vpntermination",
             },
         )
         # A protocol-only input declares no render-trace fixture: nothing renders from it.
