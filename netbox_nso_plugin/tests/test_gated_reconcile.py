@@ -644,18 +644,18 @@ class TestRoutingFamilyGateFootprints(TestCase):
         revision = self._revision("ospf")
         before = revision.revision
 
-        # areas is rendered intent the read mirrors onto owned rows too.
+        # areas is operator intent on an owned row, so the read never mirrors the device value.
         areas = [{"area-id": "0.0.0.1", "area-type": "stub"}]
         ctx = self._ospf(self._ospf_doc(instances=[dict(self._ospf_instance(), areas=areas)], attempt_id=2))
 
         self.assertEqual(ctx["_gate"]["ospf"], "ran")
         state.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(state.areas, areas)
+        self.assertEqual(state.areas, [])
         self.assertEqual(state.status, "in_sync")
-        self.assertEqual(revision.revision, before + 1)
+        self.assertEqual(revision.revision, before)
 
-    def test_isis_gate_covers_an_owned_process_relinked_after_a_native_rename(self):
+    def test_isis_gate_covers_an_owned_process_left_unlinked_after_a_native_rename(self):
         from netbox_routing.models import ISISInstance, ISISLevel
 
         from netbox_nso_plugin.models import NSOISISInstanceState
@@ -665,7 +665,7 @@ class TestRoutingFamilyGateFootprints(TestCase):
         native = ISISInstance.objects.get(pk=state.isis_instance_id)
         ISISLevel.objects.create(instance=native, level=2, wide_metrics_only=True)
         content_update(state, status="in_sync")
-        # A native tag rename makes the next read relink the owned overlay to a fresh level-less instance.
+        # A read never materializes or re-anchors a native for an owned overlay, so the rename unlinks it.
         content_update(native, process_tag="renamed")
         revision = self._revision("isis")
         before = revision.revision
@@ -675,8 +675,10 @@ class TestRoutingFamilyGateFootprints(TestCase):
         self.assertEqual(ctx["_gate"]["isis"], "ran")
         state.refresh_from_db()
         revision.refresh_from_db()
-        self.assertNotEqual(state.isis_instance_id, native.pk)
-        self.assertEqual(ISISInstance.objects.get(pk=state.isis_instance_id).process_tag, "1")
+        self.assertIsNone(state.isis_instance_id)
+        self.assertEqual(state.status, "accepted")  # owned intent no longer materialized, not device drift
+        self.assertEqual(ISISInstance.objects.get(pk=native.pk).process_tag, "renamed")
+        self.assertFalse(ISISInstance.objects.filter(device=self.device, process_tag="1").exists())
         self.assertEqual(revision.revision, before + 1)
 
     def test_isis_gate_keeps_an_owned_process_fragment_when_the_device_moves(self):
