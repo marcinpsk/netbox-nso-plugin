@@ -14,15 +14,20 @@ redis-down fail-closed dispositions, the interfaces fetch moving to the S4
 
 from __future__ import annotations
 
+import sys
 import uuid
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
+
+from ._outbox_case import content_update, mirror_update
 
 User = get_user_model()
 
@@ -108,6 +113,33 @@ class _L2Base(TestCase):
 
 
 class TestGatedReconcileBehavior(_L2Base):
+    def test_retryable_database_failure_skips_publication(self):
+        from django.db import connection, transaction
+
+        from netbox_nso_plugin.models import NSOFamilyReadState
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
+
+        for attempt_id, sqlstate in enumerate(("40P01", "40001"), start=1):
+            with self.subTest(sqlstate=sqlstate):
+
+                def fail_acquisition():
+                    with transaction.atomic(), connection.cursor() as cursor:
+                        cursor.execute(
+                            f"DO $$ BEGIN RAISE EXCEPTION 'test contention' USING ERRCODE = '{sqlstate}'; END $$"
+                        )
+
+                result = gated_family_run(
+                    self.mgmt,
+                    "l2_service",
+                    _rs(attempt_id=attempt_id),
+                    lambda: self.fail("a failed acquisition must not publish"),
+                    epoch=self.mgmt.adapter_device_id,
+                    pre_body=fail_acquisition,
+                )
+                self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
+                row = NSOFamilyReadState.objects.get(management=self.mgmt, family="l2_service")
+                self.assertIsNone(row.applied_attempt_id)
+
     def test_unavailable_keeps_rows(self):
         self._prime()
         ctx = self._reconcile(
@@ -148,6 +180,46 @@ class TestGatedReconcileBehavior(_L2Base):
         ctx = self._reconcile(_l2_payload(("NEW",), read_state=_rs(freshness="stale", attempt_id=2)))
         self.assertIn("NEW", _sap_names(self.mgmt))  # degraded-success still replaces
         self.assertEqual(ctx["_gate"]["l2_service"], "ran")
+
+    def test_matching_read_does_not_settle_a_deploying_sap(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        self._prime()
+        row = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
+        content_update(row, status="deploying", apply_attempt_id=attempt.pk)
+
+        self._reconcile(_l2_payload(("TL",), read_state=_rs(attempt_id=2)))
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
+    def test_a_vanished_confirmed_sap_repends_a_deploying_sibling(self):
+        """A vanished confirmed SAP bears content, so every deploying row in the scope is stale."""
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision
+
+        self._reconcile(_l2_payload(("TL", "TL2"), read_state=_rs(attempt_id=1)))
+        deploying = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL")
+        confirmed = NSOL2SapState.objects.get(management=self.mgmt, service_name="TL2")
+        content_update(deploying, status="accepted")
+        content_update(confirmed, status="in_sync")
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
+        # Marked LAST, and lifecycle-only: a sibling content write re-pends a deploying row.
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt.pk)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="l2_sap")
+        before = revision.revision
+        deploying.refresh_from_db()
+        self.assertEqual((deploying.status, deploying.apply_attempt_id), ("deploying", attempt.pk))
+
+        self._reconcile(_l2_payload(("TL",), read_state=_rs(attempt_id=2)))  # TL2 vanishes
+
+        deploying.refresh_from_db()
+        confirmed.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(deploying.status, "accepted")
+        self.assertIsNone(deploying.apply_attempt_id)
+        self.assertEqual(confirmed.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
 
     def test_missing_read_state_key_is_legacy_and_runs(self):
         self._prime()
@@ -207,6 +279,461 @@ class TestIsisCompoundGate(TestCase):
         self.assertEqual(m_if.call_count, 0)
         self.assertEqual(m_proc.call_count, 0)
         self.assertEqual(ctx["_gate"]["isis"], "skipped_unavailable")
+
+
+class TestRealReconcilerGateFootprints(TestCase):
+    """Run registered overlay writers through their production read gates."""
+
+    def setUp(self):
+        self.device, self.mgmt = _make(
+            f"gf{uuid.uuid4().hex[:6]}",
+            manage_interfaces=True,
+            manage_routing=True,
+            manage_bgp=True,
+        )
+
+    def test_lacp_gate_covers_bundle_and_member_rows(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        lag = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
+        member_iface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+        payload = {
+            "bundles": [
+                {
+                    "name": "Port-channel1",
+                    "lag_id": 1,
+                    "members": [{"interface_name": "Ethernet1", "mode": "active"}],
+                }
+            ],
+            "read_state": _rs(),
+        }
+
+        with patch("netbox_nso_plugin.adapter_client.get_lag_config", return_value=payload):
+            ctx = reconcile_category(self.device, self.mgmt, "lacp")
+
+        self.assertEqual(ctx["_gate"]["lag_config"], "ran")
+        bundle = NSOLACPBundleState.objects.get(management=self.mgmt, interface=lag)
+        self.assertEqual(bundle.lag_id, 1)
+        member = NSOLACPMemberState.objects.get(management=self.mgmt, interface=member_iface)
+        self.assertEqual(member.lag_bundle_id, lag.pk)  # the LAG Interface, not the bundle overlay
+        self.assertEqual(member.mode, "active")
+
+    def test_bgp_gate_covers_the_materialized_graph_and_overlay(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        payload = self._bgp_payload()
+
+        with patch("netbox_nso_plugin.adapter_client.get_bgp_config", return_value=payload):
+            ctx = reconcile_category(self.device, self.mgmt, "bgp")
+
+        self.assertEqual(ctx["_gate"]["bgp"], "ran")
+        router = BGPRouter.objects.get(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=self.device.pk,
+        )
+        self.assertEqual(router.assigned_object, self.device)  # both halves of the generic FK
+        self.assertEqual(router.asn.asn, 64512)
+        scope = BGPScope.objects.get(router=router)
+        self.assertIsNone(scope.vrf_id)  # the default VRF
+        peer = BGPPeer.objects.get(scope=scope)
+        self.assertEqual(str(peer.peer.address.ip), "198.18.0.1")
+        self.assertEqual(peer.remote_as.asn, 64513)
+        state = NSOBGPPeerState.objects.get(management=self.mgmt)
+        self.assertEqual(state.bgp_peer_id, peer.pk)
+
+    def test_bfd_gate_covers_native_and_overlay_creations(self):
+        from netbox_routing.models import BFDInterface
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        interface = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": interface.name,
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+            "read_state": _rs(),
+        }
+
+        with patch("netbox_nso_plugin.adapter_client.get_bfd", return_value=payload):
+            ctx = reconcile_category(self.device, self.mgmt, "bfd")
+
+        self.assertEqual(ctx["_gate"]["bfd"], "ran")
+        native = BFDInterface.objects.get(interface=interface)
+        self.assertTrue(native.micro_bfd)
+        self.assertTrue(native.enabled)
+        profile = native.bfd_profile
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.name, "bfd-300-300-x3")  # shared, deduped by its timer-set
+        self.assertEqual((profile.min_tx_int, profile.min_rx_int, profile.multiplier), (300, 300, 3))
+        state = NSOBFDInterfaceState.objects.get(management=self.mgmt, interface=interface)
+        self.assertEqual(state.status, "imported")
+
+    def test_bgp_gate_predicts_an_owned_native_peer_change(self):
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentRevision
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        from ._outbox_case import content_update
+
+        with patch("netbox_nso_plugin.adapter_client.get_bgp_config", return_value=self._bgp_payload()):
+            reconcile_category(self.device, self.mgmt, "bgp")
+        state = NSOBGPPeerState.objects.get(management=self.mgmt)
+        content_update(state, status="accepted")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bgp")
+        before = revision.revision
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_bgp_config",
+            return_value=self._bgp_payload(ttl=2, attempt_id=2),
+        ):
+            reconcile_category(self.device, self.mgmt, "bgp")
+
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.bgp_peer.ttl, 2)
+        self.assertEqual(revision.revision, before + 1)
+
+    @staticmethod
+    def _bgp_payload(*, ttl=None, attempt_id=1):
+        peer = {
+            "peer_address": "198.18.0.1",
+            "remote_as": "64513",
+            "enabled": True,
+            "address_families": [{"af": "ipv4-unicast", "enabled": True}],
+        }
+        if ttl is not None:
+            peer["ttl"] = ttl
+        return {
+            "routers": [
+                {
+                    "asn": "64512",
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [peer],
+                        }
+                    ],
+                }
+            ],
+            "read_state": _rs(attempt_id=attempt_id),
+        }
+
+
+class TestRoutingFamilyGateFootprints(TestCase):
+    """IS-IS and OSPF reads must plan every row their bodies and stale loops write."""
+
+    def setUp(self):
+        self.device, self.mgmt = _make(
+            f"gp{uuid.uuid4().hex[:6]}",
+            manage_routing=True,
+            manage_isis=True,
+            manage_ospf=True,
+        )
+        self.iface = Interface.objects.create(device=self.device, name="GigabitEthernet0/0", type="1000base-t")
+
+    def _isis(self, doc):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch("netbox_nso_plugin.adapter_client.get_isis_interfaces", return_value=doc):
+            return reconcile_category(self.device, self.mgmt, "isis")
+
+    def _ospf(self, doc):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch("netbox_nso_plugin.adapter_client.get_ospf", return_value=doc):
+            return reconcile_category(self.device, self.mgmt, "ospf")
+
+    def _revision(self, scope):
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        return NSOIntentRevision.objects.get(device=self.device, scope=scope)
+
+    def _isis_doc(self, *, interfaces=(), processes=(), attempt_id=1):
+        return {
+            "interfaces": list(interfaces),
+            "processes": list(processes),
+            "read_state": _rs(attempt_id=attempt_id),
+        }
+
+    def _isis_entry(self):
+        return {
+            "interface_name": self.iface.name,
+            "af": "ipv4",
+            "process_tag": "1",
+            "circuit_type": "level-2",
+            "network_type": "point-to-point",
+            "metric": 10,
+            "passive": False,
+        }
+
+    @staticmethod
+    def _isis_process():
+        return {"process_tag": "1", "net": "49.0001.0000.0000.0001.00", "is_type": "level-2"}
+
+    def _ospf_doc(self, *, instances=(), interfaces=(), attempt_id=1):
+        return {
+            "instances": list(instances),
+            "interfaces": list(interfaces),
+            "read_state": _rs(attempt_id=attempt_id),
+        }
+
+    @staticmethod
+    def _ospf_instance():
+        return {"process_id": 10, "router_id": "10.0.0.1", "vrf": "", "areas": []}
+
+    def _ospf_iface(self):
+        return {"interface_name": self.iface.name, "process_id": 10, "area_id": "0.0.0.0"}
+
+    def test_isis_gate_drifts_a_dropped_in_sync_interface(self):
+        from netbox_routing.models import ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        primed = self._isis(self._isis_doc(interfaces=[self._isis_entry()]))
+        self.assertEqual(primed["_gate"]["isis"], "ran")
+        state = NSOISISInterfaceState.objects.get(management=self.mgmt, interface=self.iface)
+        self.assertIsNotNone(state.isis_interface_id)
+        content_update(state, status="in_sync")
+        revision = self._revision("isis")
+        before = revision.revision
+
+        ctx = self._isis(self._isis_doc(attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["isis"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertTrue(ISISInterface.objects.filter(pk=state.isis_interface_id).exists())
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_isis_gate_drifts_a_dropped_in_sync_process(self):
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        primed = self._isis(self._isis_doc(processes=[self._isis_process()]))
+        self.assertEqual(primed["_gate"]["isis"], "ran")
+        state = NSOISISInstanceState.objects.get(management=self.mgmt, process_tag="1")
+        self.assertIsNotNone(state.isis_instance_id)
+        content_update(state, status="in_sync")
+        revision = self._revision("isis")
+        before = revision.revision
+
+        ctx = self._isis(self._isis_doc(attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["isis"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertTrue(ISISInstance.objects.filter(pk=state.isis_instance_id).exists())
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_ospf_gate_drifts_a_dropped_in_sync_instance(self):
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        primed = self._ospf(self._ospf_doc(instances=[self._ospf_instance()]))
+        self.assertEqual(primed["_gate"]["ospf"], "ran")
+        state = NSOOSPFInstanceState.objects.get(management=self.mgmt, process_id="10")
+        self.assertIsNotNone(state.ospf_instance_id)
+        content_update(state, status="in_sync")
+        revision = self._revision("ospf")
+        before = revision.revision
+
+        ctx = self._ospf(self._ospf_doc(attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["ospf"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertTrue(OSPFInstance.objects.filter(pk=state.ospf_instance_id).exists())
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_ospf_gate_drifts_a_dropped_in_sync_interface(self):
+        from netbox_routing.models import OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+
+        primed = self._ospf(
+            self._ospf_doc(instances=[self._ospf_instance()], interfaces=[self._ospf_iface()]),
+        )
+        self.assertEqual(primed["_gate"]["ospf"], "ran")
+        state = NSOOSPFInterfaceState.objects.get(management=self.mgmt, interface=self.iface)
+        self.assertTrue(OSPFInterface.objects.filter(interface=self.iface).exists())
+        content_update(state, status="in_sync")
+        revision = self._revision("ospf")
+        before = revision.revision
+
+        ctx = self._ospf(self._ospf_doc(instances=[self._ospf_instance()], attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["ospf"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.assertTrue(OSPFInterface.objects.filter(interface=self.iface).exists())
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_ospf_gate_covers_a_native_mirror_under_an_owned_instance(self):
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        self._ospf(self._ospf_doc(instances=[self._ospf_instance()]))
+        state = NSOOSPFInstanceState.objects.get(management=self.mgmt, process_id="10")
+        content_update(state, status="in_sync")
+        revision = self._revision("ospf")
+        before = revision.revision
+
+        moved = dict(self._ospf_instance(), router_id="10.0.0.2")
+        ctx = self._ospf(self._ospf_doc(instances=[moved], attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["ospf"], "ran")
+        instance = OSPFInstance.objects.get(device=self.device, process_id="10")
+        self.assertEqual(str(instance.router_id), "10.0.0.2")  # the 3-way mirrored the device
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_ospf_gate_covers_an_owned_instance_areas_change(self):
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        self._ospf(self._ospf_doc(instances=[self._ospf_instance()]))
+        state = NSOOSPFInstanceState.objects.get(management=self.mgmt, process_id="10")
+        content_update(state, status="in_sync")
+        revision = self._revision("ospf")
+        before = revision.revision
+
+        # areas is rendered intent the read mirrors onto owned rows too.
+        areas = [{"area-id": "0.0.0.1", "area-type": "stub"}]
+        ctx = self._ospf(self._ospf_doc(instances=[dict(self._ospf_instance(), areas=areas)], attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["ospf"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.areas, areas)
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_isis_gate_covers_an_owned_process_relinked_after_a_native_rename(self):
+        from netbox_routing.models import ISISInstance, ISISLevel
+
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        self._isis(self._isis_doc(processes=[self._isis_process()]))
+        state = NSOISISInstanceState.objects.get(management=self.mgmt, process_tag="1")
+        native = ISISInstance.objects.get(pk=state.isis_instance_id)
+        ISISLevel.objects.create(instance=native, level=2, wide_metrics_only=True)
+        content_update(state, status="in_sync")
+        # A native tag rename makes the next read relink the owned overlay to a fresh level-less instance.
+        content_update(native, process_tag="renamed")
+        revision = self._revision("isis")
+        before = revision.revision
+
+        ctx = self._isis(self._isis_doc(processes=[self._isis_process()], attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["isis"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertNotEqual(state.isis_instance_id, native.pk)
+        self.assertEqual(ISISInstance.objects.get(pk=state.isis_instance_id).process_tag, "1")
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_isis_gate_keeps_an_owned_process_fragment_when_the_device_moves(self):
+        """IS-IS mirrors every rendered column only into unowned rows, so no bump is due."""
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        self._isis(self._isis_doc(processes=[self._isis_process()]))
+        state = NSOISISInstanceState.objects.get(management=self.mgmt, process_tag="1")
+        content_update(state, status="in_sync")
+        revision = self._revision("isis")
+        before = revision.revision
+
+        moved = dict(self._isis_process(), net="49.0009.0000.0000.0009.00", is_type="level-1")
+        ctx = self._isis(self._isis_doc(processes=[moved], attempt_id=2))
+
+        self.assertEqual(ctx["_gate"]["isis"], "ran")
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.net, "49.0001.0000.0000.0001.00")  # owned intent survives the read
+        self.assertEqual(state.is_type, "level-2")
+        self.assertTrue(state.status in ("accepted", "in_sync"))
+        self.assertEqual(revision.revision, before)
+
+    def test_isis_gate_prunes_an_unowned_ghost_overlay(self):
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        NSOISISInstanceState.objects.create(management=self.mgmt, process_tag="ghost", status="imported")
+
+        ctx = self._isis(self._isis_doc())
+
+        self.assertEqual(ctx["_gate"]["isis"], "ran")
+        self.assertFalse(NSOISISInstanceState.objects.filter(management=self.mgmt, process_tag="ghost").exists())
+
+    def test_ospf_gate_prunes_an_unowned_ghost_overlay(self):
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        NSOOSPFInstanceState.objects.create(management=self.mgmt, process_id="999", status="imported")
+
+        ctx = self._ospf(self._ospf_doc())
+
+        self.assertEqual(ctx["_gate"]["ospf"], "ran")
+        self.assertFalse(NSOOSPFInstanceState.objects.filter(management=self.mgmt, process_id="999").exists())
+
+
+class TestOptionalRoutingDependencyPlans(TestCase):
+    """Preflight keeps the reconcilers' optional dependency boundary."""
+
+    def test_missing_netbox_routing_returns_empty_plans(self):
+        from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
+        from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+        from netbox_nso_plugin.template_content import _static_route_reconcile_plan
+
+        device, _management = _make("missing-routing")
+        empty_plan = ReconcileMutationPlan(MutationFootprint())
+        bgp_payload = {
+            "routers": [
+                {
+                    "asn": "64512",
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "peers": [{"peer_address": "198.18.0.1", "remote_as": "64513"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        planners = (
+            (bgp_reconcile_plan, bgp_payload),
+            (route_policy_reconcile_plan, {"prefix_lists": [{"name": "PL", "entries": []}]}),
+            (
+                _static_route_reconcile_plan,
+                {"routes": [{"prefix": "198.18.0.0/15", "next_hop": "198.18.0.1", "metric": 1}]},
+            ),
+        )
+
+        for planner, payload in planners:
+            with self.subTest(control=planner.__name__):
+                self.assertNotEqual(planner(device, payload), empty_plan)
+
+        with patch.dict(sys.modules, {"netbox_routing.models": None}):
+            for planner, payload in planners:
+                with self.subTest(planner=planner.__name__):
+                    self.assertEqual(planner(device, payload), empty_plan)
 
 
 #: every family fetcher reconcile_device consumes, with a minimal doc shape.
@@ -380,6 +907,55 @@ class TestContentionDispositions(TestCase):
         self.assertNotEqual(row.status, "error")
 
 
+class _ContendedStaleRow:
+    """A persisted-shaped row whose status changes before each attempted row lock."""
+
+    class DoesNotExist(Exception):
+        pass
+
+    pk = 37
+
+    def __init__(self):
+        self.status = "imported"
+        self.last_sync_at = None
+        self.deleted = False
+        self.saved_fields = None
+        self._statuses = iter(("accepted", "deploying", "in_sync", "apply_failed"))
+
+    def refresh_from_db(self):
+        self.status = next(self._statuses)
+
+    def delete(self):
+        self.deleted = True
+
+    def save(self, update_fields=None):
+        self.saved_fields = list(update_fields) if update_fields else None
+
+
+_ContendedStaleRow._meta = SimpleNamespace(
+    label_lower="netbox_nso_plugin.teststate",
+    model=_ContendedStaleRow,
+)
+
+
+class TestStaleOverlayContention(SimpleTestCase):
+    def test_repeated_contention_is_left_for_the_next_reconcile(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        row = _ContendedStaleRow()
+        with (
+            patch("netbox_nso_plugin.intent_state.footprint_for_instance", return_value=object()),
+            patch("netbox_nso_plugin.intent_state.reconcile_transaction", side_effect=lambda _plan: nullcontext()),
+            self.assertLogs("netbox_nso_plugin.status_machine", level="WARNING") as logs,
+        ):
+            sm.finalise_stale_overlay(row, vestigial=False)
+
+        self.assertEqual(row.status, sm.APPLY_FAILED)
+        self.assertFalse(row.deleted)
+        self.assertIsNone(row.saved_fields)
+        self.assertIn("next reconcile will retry", logs.output[0])
+
+
 class TestCategoryViewSkipFallback(TestCase):
     """D9: on a skip disposition the small-category view must render the PERSISTED
     rows (never an empty panel, never rows marked error)."""
@@ -388,6 +964,44 @@ class TestCategoryViewSkipFallback(TestCase):
         self.device, self.mgmt = _make(f"gv{uuid.uuid4().hex[:6]}", manage_l2=True)
         self.user = User.objects.create_superuser(username=f"gv-{uuid.uuid4().hex[:6]}")
         self.client.force_login(self.user)
+
+    def test_a_vlan_planner_failure_keeps_the_category_available(self):
+        from ._outbox_case import own_vlan
+
+        row = own_vlan(self.mgmt, 220, "retained-vlan")
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "vlan"},
+        )
+        payload = {"vlans": [{"vlan_id": "invalid"}], "read_state": _rs()}
+        with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload):
+            response = self.client.get(url, {"refresh": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "retained-vlan")
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+
+    def test_a_vlan_planner_failure_does_not_abort_later_logging_reconcile(self):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        content_update(self.mgmt, manage_interfaces=True, manage_logging=True)
+        with ExitStack() as stack:
+            for fetcher, shape in _DEVICE_FETCHERS.items():
+                doc = dict(shape, read_state=_rs())
+                if fetcher == "get_vlan_database":
+                    doc["vlans"] = [{"vlan_id": "invalid"}]
+                elif fetcher == "get_logging_config":
+                    doc["local_levels"] = {"console_severity": "WARNING"}
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            context = reconcile_device(self.device, self.mgmt)
+
+        self.assertEqual(context["_gate"]["vlan"], "skipped_unavailable")
+        self.assertEqual(context["_gate"]["logging"], "ran")
+        self.assertEqual(NSOLoggingLevelState.objects.get(management=self.mgmt).console_severity, "WARNING")
 
     def test_skip_renders_last_known_rows(self):
         from netbox_nso_plugin.reconcile import reconcile_category

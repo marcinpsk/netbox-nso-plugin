@@ -5,6 +5,7 @@
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from ._outbox_case import content_update
 from .mixins import IntentPushResetMixin
 
 
@@ -141,6 +142,30 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         assert NSOBFDInterfaceState.objects.get(interface=self.iface).status == "accepted"
 
+    def test_empty_interface_name_does_not_use_bound_port_only_in_the_plan(self):
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        full = {
+            "interface_name": "Port-channel1",
+            "bound_port": "Port-channel1",
+            "micro_bfd": True,
+            "min_tx": 300,
+            "min_rx": 300,
+            "multiplier": 3,
+        }
+        reconcile_bfd(self.device, [full])
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        state.status = "in_sync"
+        state.save(update_fields=["status"])
+
+        empty_name = [{**full, "interface_name": ""}]
+        self.assertTrue(bfd_reconcile_plan(self.device, empty_name).changes_content)
+        reconcile_bfd(self.device, empty_name)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+
     def test_nokia_default_timer_omission_preserves_owned_profile_without_false_settle(self):
         """Omission preserves intent but cannot prove an explicit-default push landed."""
         from netbox_routing.models import BFDInterface
@@ -247,12 +272,14 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         native.enabled = True
         native.save(update_fields=["bfd_profile", "micro_bfd", "enabled"])
         state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
-        state.min_tx = 100
-        state.min_rx = 100
-        state.multiplier = 5
-        state.micro_bfd = True
-        state.status = "accepted"
-        state.save()
+        state = content_update(
+            state,
+            min_tx=100,
+            min_rx=100,
+            multiplier=5,
+            micro_bfd=True,
+            status="accepted",
+        )
 
         reconcile_bfd(
             self.device,
@@ -283,11 +310,19 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         rows (deploying) are kept; a confirmed row (in_sync) that vanishes surfaces as drift
         (``changed``), never data-loss.
         """
+        from uuid import uuid4
+
         from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
         deploying = NSOBFDInterfaceState.objects.create(
-            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="deploying"
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="deploying",
+            apply_attempt_id=uuid4(),
         )
         ge = Interface.objects.create(device=self.device, name="Gi7/7", type="1000base-t")
         confirmed = NSOBFDInterfaceState.objects.create(
@@ -300,6 +335,43 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert NSOBFDInterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         assert NSOBFDInterfaceState.objects.get(pk=deploying.pk).status == "deploying"
         assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+
+    def test_matching_timers_keep_a_deploying_row_in_flight(self):
+        """Re-reading the intended timers is not apply evidence for an in-flight BFD row."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        attempt = uuid4()
+        deploying = NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            micro_bfd=True,
+            status="deploying",
+            apply_attempt_id=attempt,
+        )
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        deploying.refresh_from_db()
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == attempt
 
     def test_push_builds_owned_snapshot(self):
         from unittest.mock import patch

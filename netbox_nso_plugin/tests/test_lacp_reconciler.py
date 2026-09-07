@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
 from netbox_nso_plugin.models import (
@@ -14,6 +16,8 @@ from netbox_nso_plugin.models import (
     NSOLACPBundleState,
     NSOLACPMemberState,
 )
+
+from ._outbox_case import content_update
 
 
 def _payload(bundles):
@@ -92,6 +96,38 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, data)
         assert NSOLACPBundleState.objects.filter(interface=self.lag).count() == 1
 
+    def test_plan_query_count_does_not_grow_with_overlay_rows(self):
+        from netbox_nso_plugin.lacp_reconciler import lag_config_reconcile_plan
+
+        one_member = _payload(
+            [
+                self._bundle(
+                    members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}],
+                )
+            ]
+        )
+        two_members = _payload(
+            [
+                self._bundle(
+                    members=[
+                        {"interface_name": "GigabitEthernet0/1", "mode": "active"},
+                        {"interface_name": "GigabitEthernet0/2", "mode": "active"},
+                    ]
+                )
+            ]
+        )
+        reconcile_lag_config(self.device, one_member)
+
+        with CaptureQueriesContext(connection) as one_member_queries:
+            one_member_plan = lag_config_reconcile_plan(self.device, one_member)
+        reconcile_lag_config(self.device, two_members)
+        with CaptureQueriesContext(connection) as two_member_queries:
+            plan = lag_config_reconcile_plan(self.device, two_members)
+
+        self.assertEqual(len(two_member_queries), len(one_member_queries))
+        self.assertFalse(one_member_plan.changes_content)
+        self.assertFalse(plan.changes_content)
+
     def test_missing_interface_skipped(self):
         reconcile_lag_config(self.device, _payload([{"name": "Port-channel99", "lag_id": 99, "members": []}]))
         assert NSOLACPBundleState.objects.count() == 0
@@ -138,6 +174,75 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([]))
         state.refresh_from_db()
         assert state.status == "accepted"
+
+    def test_stale_finalization_reloads_ownership_before_transition(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        content_update(NSOLACPBundleState.objects.get(pk=stale.pk), status="accepted")
+
+        sm.finalise_stale_overlay(stale, vestigial=False)
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, "accepted")
+
+    def test_stale_finalization_retries_when_ownership_changes_rendered_content(self):
+        from netbox_nso_plugin import status_machine as sm
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        content_update(NSOLACPBundleState.objects.get(pk=stale.pk), status="in_sync")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
+        before = revision.revision
+
+        sm.finalise_stale_overlay(stale, vestigial=False)
+
+        stale.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(stale.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_stale_finalization_ignores_deletion_before_first_refresh(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        NSOLACPBundleState.objects.filter(pk=stale.pk).delete()
+
+        sm.finalise_stale_overlay(stale, vestigial=False)
+
+        self.assertFalse(NSOLACPBundleState.objects.filter(pk=stale.pk).exists())
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.assertTrue(NSOLACPBundleState.objects.filter(interface=self.lag).exists())
+
+    def test_stale_finalization_ignores_deletion_before_retry_refresh(self):
+        from netbox_nso_plugin import status_machine as sm
+
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        stale = NSOLACPBundleState.objects.get(interface=self.lag)
+        content_update(NSOLACPBundleState.objects.get(pk=stale.pk), status="in_sync")
+        refreshes = 0
+        deleting = False
+        table = NSOLACPBundleState._meta.db_table
+
+        def delete_before_retry_refresh(execute, sql, params, many, context):
+            nonlocal deleting, refreshes
+            if not deleting and f'FROM "{table}"' in sql and "LIMIT 21" in sql and "FOR UPDATE" not in sql:
+                refreshes += 1
+                if refreshes == 2:
+                    deleting = True
+                    NSOLACPBundleState.objects.filter(pk=stale.pk).delete()
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(delete_before_retry_refresh):
+            sm.finalise_stale_overlay(stale, vestigial=False)
+
+        self.assertEqual(refreshes, 2)
+        self.assertFalse(NSOLACPBundleState.objects.filter(pk=stale.pk).exists())
+        reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
+        self.assertTrue(NSOLACPBundleState.objects.filter(interface=self.lag).exists())
 
     def test_stale_member_unbundled_pruned(self):
         # A dropped member whose interface is no longer assigned to any LAG is vestigial.

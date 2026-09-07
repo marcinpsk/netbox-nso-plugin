@@ -70,8 +70,9 @@ class _CompactionCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestC
     def append(self, *transitions, scope="static_route", delete_origin=False):
         """One operator transaction's contribution, appended the way the choke point does."""
         from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.intent_state import content_mutation
 
-        with transaction.atomic():
+        with content_mutation({(self.device.pk, scope)}):
             outbox.enqueue(self.device.pk, scope, transitions=list(transitions), delete_origin=delete_origin)
 
     def delete_of(self, route_id, *, last_acked=TRIPLE_A, current=TRIPLE_C):
@@ -408,7 +409,9 @@ class TestACompactedRowSendsWhatItsContributorsAuthorized(_CompactionCase):
 
         assert self.drain() == drain.SUCCEEDED
 
-        [request] = [r for r in self.adapter.requests if f"/devices/{self.adapter_device_id}/" in r["url"]]
+        [request] = [
+            r for r in self.adapter.requests if r["url"].endswith(f"/devices/{self.adapter_device_id}/vlan-intent")
+        ]
         assert request["params"].get("delete_origin") is None, "the compacted row sent marked"
         assert self.adapter.on_device[self.adapter_device_id] == {("vlan_id", 880), ("vlan_id", 881)}
         recorded = state_of(self.device, "vlan").degraded_deletions

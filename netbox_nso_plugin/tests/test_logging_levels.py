@@ -12,6 +12,7 @@ category/summary wiring.
 """
 
 from unittest.mock import patch
+from uuid import uuid4
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
@@ -21,7 +22,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from ._adapter_http import make_session
-from ._outbox_case import without_commit_drain
+from ._outbox_case import content_bulk_update, mirror_update, without_commit_drain
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 User = get_user_model()
@@ -94,6 +95,20 @@ class TestReconcileLoggingLevels(LevelsTestBase):
         self.assertEqual(row.module_severity, "NOTICE")
         self.assertEqual(row.status, "imported")
         self.assertIsNotNone(row.last_sync_at)
+
+    def test_full_device_reconcile_uses_the_logging_mutation_plan(self):
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_device
+
+        payload = self._payload(local_levels=_LEVELS_PAYLOAD)
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_logging_config", return_value=payload),
+        ):
+            result = reconcile_device(self.device, self.mgmt)
+
+        row = result["logging_data"]["local_levels"]
+        self.assertEqual(row.console_severity, "CRITICAL")
+        self.assertEqual(row.status, "imported")
 
     def test_partial_payload_leaves_other_destinations_blank(self):
         res = self._reconcile(self._payload(local_levels={"console_severity": "ERROR"}))
@@ -184,6 +199,31 @@ class TestReconcileLoggingLevels(LevelsTestBase):
 
         self.assertEqual(deleted, [True])
         self.assertIsNone(res["local_levels"])
+
+    def test_owned_singleton_concurrent_edit_returns_the_persisted_row(self):
+        from django.db.models.signals import post_init
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        row = self._row(console_severity="WARNING", status="accepted", accepted_at=timezone.now())
+        edited = []
+
+        def edit_after_load(sender, instance, **kwargs):
+            if edited or instance.pk != row.pk:
+                return
+            edited.append(True)
+            content_bulk_update(instance, console_severity="ERROR")
+            instance.console_severity = "WARNING"
+
+        post_init.connect(edit_after_load, sender=NSOLoggingLevelState, weak=False)
+        self.addCleanup(post_init.disconnect, edit_after_load, sender=NSOLoggingLevelState)
+
+        res = self._reconcile(self._payload(local_levels={"console_severity": "WARNING"}))
+
+        self.assertEqual(edited, [True])
+        self.assertIsNotNone(res["local_levels"])
+        self.assertEqual(res["local_levels"].console_severity, "ERROR")
+        self.assertEqual(res["local_levels"].status, "accepted")
 
     def test_no_mgmt_returns_none(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
@@ -339,7 +379,13 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertEqual(row.status, "imported")
 
     def test_unaccept_deploying_row_is_refused(self):
-        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
+        attempt_id = uuid4()
+        row = self._row(
+            console_severity="CRITICAL",
+            status="accepted",
+            accepted_at=timezone.now(),
+        )
+        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
         self._unaccept(row)
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying", "an in-flight Apply must settle before ownership is released")
@@ -429,31 +475,93 @@ class TestLoggingLevelsViews(LevelsTestBase):
 
 
 class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
-    """codex P4b triage: the levels singleton must ride the device Apply lifecycle.
+    """The levels singleton rides the device Apply lifecycle.
 
     Without these, an accepted levels intent whose accept-time PUT was swallowed
-    (adapter down) is silently skipped by Apply forever, and a gate-off apply
-    failure (`logging_count_by_outcome.apply_failed`) never reaches the row.
+    (adapter down) is silently skipped by Apply forever. Generic attempt settlement
+    covers gate-off failures for every deploying overlay.
     """
 
-    def test_settle_apply_failures_marks_levels_apply_failed(self):
-        from netbox_nso_plugin.reconcile import _settle_apply_failures
-
-        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
-        _settle_apply_failures(self.mgmt, {"logging_count_by_outcome": {"in_sync": 0, "apply_failed": 1}})
-        row.refresh_from_db()
-        self.assertEqual(row.status, "apply_failed")
-        self.assertTrue(row.last_apply_error)
-
-    def test_deploying_row_settles_in_sync_when_device_matches(self):
+    def test_deploying_row_waits_for_attempt_evidence_when_device_matches(self):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
-        row = self._row(console_severity="CRITICAL", status="deploying", accepted_at=timezone.now())
+        attempt_id = uuid4()
+        row = self._row(
+            console_severity="CRITICAL",
+            status="deploying",
+            accepted_at=timezone.now(),
+            apply_attempt_id=attempt_id,
+        )
         _reconcile_logging_config(
             self.device, {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
         )
         row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
+
+    def test_a_vanished_confirmed_host_repends_a_deploying_levels_row(self):
+        """A vanished confirmed host bears content, so every deploying row in the scope is stale.
+
+        The device still reports the pre-apply severity, so only the acquisition re-pend can
+        move the levels row off ``deploying``.
+        """
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
+        from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
+
+        host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.9", status="in_sync")
+        row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
+        attempt_id = uuid4()
+        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="logging")
+        before = revision.revision
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.apply_attempt_id), ("deploying", attempt_id))
+        payload = {"hosts": [], "local_levels": {"console_severity": "WARNING"}, "refresh_source": "test"}
+
+        plan = logging_reconcile_plan(self.device, payload)
+        self.assertTrue(plan.changes_content)  # the vanished confirmed host bears the content
+        with reconcile_transaction(plan):
+            _reconcile_logging_config(self.device, payload)
+
+        row.refresh_from_db()
+        host.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(host.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
+
+    def test_a_vanished_confirmed_host_repends_then_settles_a_matching_levels_row(self):
+        """The re-pend discards the stale attempt, and a matching device entry settles the accepted row."""
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
+        from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
+
+        host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.10", status="in_sync")
+        row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
+        attempt_id = uuid4()
+        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="logging")
+        before = revision.revision
+        row.refresh_from_db()
+        self.assertEqual((row.status, row.apply_attempt_id), ("deploying", attempt_id))
+        payload = {"hosts": [], "local_levels": {"console_severity": "CRITICAL"}, "refresh_source": "test"}
+
+        plan = logging_reconcile_plan(self.device, payload)
+        self.assertTrue(plan.changes_content)  # the vanished confirmed host bears the content
+        with reconcile_transaction(plan):
+            _reconcile_logging_config(self.device, payload)
+
+        row.refresh_from_db()
+        host.refresh_from_db()
+        revision.refresh_from_db()
         self.assertEqual(row.status, "in_sync")
+        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(host.status, "changed")
+        self.assertEqual(revision.revision, before + 1)
 
 
 class TestLoggingLevelsInlineClearGuard(LevelsTestBase):
@@ -542,34 +650,45 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 manage_logging=True,
             )
             self.row = NSOLoggingLevelState.objects.create(
-                management=self.mgmt, console_severity="CRITICAL", status="accepted", accepted_at=timezone.now()
+                management=self.mgmt, status="accepted", accepted_at=timezone.now()
             )
 
-    def test_prepare_apply_force_pushes_logging_and_marks_deploying(self):
-        from netbox_nso_plugin import drain, outbox
+    def test_apply_sends_an_owned_logging_retraction_and_the_read_keeps_it_deploying(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.template_content import _reconcile_logging_config
         from netbox_nso_plugin.views import _prepare_apply
 
         # The acknowledged baseline an accept-time push leaves behind, which the Apply overrides.
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}):
             drain.drain_key(self.device.pk, "logging")
         with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as unforced:
-            with transaction.atomic():
-                outbox.enqueue(self.device.pk, "logging")
-            drain.drain_key(self.device.pk, "logging")
+            drain.push_now(self.device.pk, "logging")
         unforced.assert_not_called()
 
         with isolate_other_scopes("logging") as stack:
             mock_put = stack.enter_context(
                 patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={})
             )
-            moved, selected = _prepare_apply(self.mgmt)
+            prepared, selected = _prepare_apply(self.mgmt)
 
         mock_put.assert_called_once()
-        self.assertEqual(mock_put.call_args.args[2], {"console_severity": "CRITICAL"})
+        self.assertIsNone(mock_put.call_args.args[2])
         self.row.refresh_from_db()
         self.assertEqual(self.row.status, "deploying")
-        moved_pks = [pk for stream, _model, pks, _previous in moved for pk in pks if stream == "logging"]
+        attempt_id = self.row.apply_attempt_id
+        self.assertIsNotNone(attempt_id)
+        moved_pks = [pk for stream, _model, pks, _previous in prepared.moved for pk in pks if stream == "logging"]
         self.assertIn(self.row.pk, moved_pks)
         self.assertIn("logging", selected)
         with self.assertRaises(TypeError):
             selected["logging"] = 0
+
+        # Removal-generation settlement is tracked by board card #1656.
+        _reconcile_logging_config(
+            self.device,
+            {"hosts": [], "last_refreshed_at": None, "refresh_source": "test"},
+        )
+
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.status, "deploying")
+        self.assertEqual(self.row.apply_attempt_id, attempt_id)

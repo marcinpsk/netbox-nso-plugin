@@ -19,16 +19,35 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 from . import shared_object_ownership as ownership
+from .intent_state import mirror_reconciler
 from .route_policy_structure import canonical_route_map, prefix_list_entry_unit
 
 logger = logging.getLogger(__name__)
 
+# One route-policy family → the document key that carries it.
+_FAMILY_PAYLOAD_KEYS = {
+    "prefix_list": "prefix_lists",
+    "community_list": "community_lists",
+    "as_path": "as_paths",
+    "route_map": "route_maps",
+}
+
 # name → tuple of prefix-list units, memoized for one reconcile pass (cleared at its start).
 # Lets canonical_route_map expand prefix-list refs to content without re-querying per call.
 _PL_UNIT_CACHE: ContextVar[dict[str, tuple] | None] = ContextVar("route_policy_prefix_units", default=None)
+
+
+@contextmanager
+def _group_content_mutation(family: str, object_name: str):
+    """Hold the complete shared-group footprint while materialized content changes."""
+    from .intent_state import intent_transaction, route_policy_footprint
+
+    with intent_transaction(route_policy_footprint({(family, object_name)})):
+        yield
 
 
 def _resolve_prefix_list_units(name: str) -> tuple:
@@ -484,15 +503,37 @@ def _register_specs() -> None:
     Spec = ownership.SharedObjectSpec
     ownership.register(
         "prefix_list",
-        Spec(fill=_fill_prefix_list, hash_captured=lambda c: _hash(_entries(c)), extract=_extract_prefix_list),
+        Spec(
+            fill=_fill_prefix_list,
+            hash_captured=lambda c: _hash(_entries(c)),
+            extract=_extract_prefix_list,
+            renderer_models=(
+                "netbox_routing.prefixlist",
+                "netbox_routing.prefixlistentry",
+                "netbox_routing.customprefix",
+            ),
+        ),
     )
-    ownership.register("community_list", Spec(fill=_cl_fill, hash_captured=_cl_hash, extract=_extract_community_list))
+    ownership.register(
+        "community_list",
+        Spec(
+            fill=_cl_fill,
+            hash_captured=_cl_hash,
+            extract=_extract_community_list,
+            renderer_models=(
+                "netbox_routing.communitylist",
+                "netbox_routing.communitylistentry",
+                "netbox_routing.community",
+            ),
+        ),
+    )
     ownership.register(
         "as_path",
         Spec(
             fill=lambda o, c: _fill_as_path_entries(o, _entries(c)),
             hash_captured=lambda c: _hash(_entries(c)),
             extract=_extract_as_path,
+            renderer_models=("netbox_routing.aspath", "netbox_routing.aspathentry"),
         ),
     )
     # Route-maps dedup on a VENDOR-NEUTRAL SEMANTIC digest (not the raw entries): the same
@@ -508,6 +549,11 @@ def _register_specs() -> None:
             fill=_rm_fill,
             hash_captured=lambda c: _hash(canonical_route_map(c, _resolve_prefix_list_units)),
             extract=_extract_route_map,
+            renderer_models=(
+                "netbox_routing.routemap",
+                "netbox_routing.routemapentry",
+                "netbox_routing.routemapentrysetcommunity",
+            ),
         ),
     )
 
@@ -520,20 +566,6 @@ _register_specs()
 # ---------------------------------------------------------------------------
 
 _FILL_STATUSES = ("imported", "in_sync")  # safe to (re)fill entries in these states
-
-
-def _lock_policy_groups(groups: set[tuple[str, str]]) -> None:
-    """Take deterministic transaction locks for shared route-policy namespaces."""
-    from django.db import connection
-
-    if connection.vendor != "postgresql":
-        return
-    normalized = {(family, object_name.casefold()) for family, object_name in groups}
-    with connection.cursor() as cursor:
-        for family, object_name in sorted(normalized):
-            digest = hashlib.sha256(f"nso-route-policy:{family}:{object_name}".encode()).digest()[:8]
-            lock_id = int.from_bytes(digest, byteorder="big", signed=True)
-            cursor.execute("SELECT pg_advisory_xact_lock(%s)", [lock_id])
 
 
 def _row_diverged(state, entries_hash, family, name) -> bool:
@@ -586,29 +618,30 @@ def _refresh_owner(state, family, obj, ct, captured, entries_hash, now) -> None:
     """
     from . import status_machine as sm
 
-    spec = ownership.get_spec(family)
-    if spec is not None:
-        spec.fill(obj, captured)
-    state.status = sm.IMPORTED
-    state.content_hash = entries_hash
-    state.captured = captured
-    state.last_sync_at = now
-    state.content_type = ct
-    state.object_id = obj.pk
-    state.is_materialized = True
-    state.device_present = True
-    state.save(
-        update_fields=[
-            "status",
-            "content_hash",
-            "captured",
-            "last_sync_at",
-            "content_type",
-            "object_id",
-            "is_materialized",
-            "device_present",
-        ]
-    )
+    with _group_content_mutation(family, state.object_name):
+        spec = ownership.get_spec(family)
+        if spec is not None:
+            spec.fill(obj, captured)
+        state.status = sm.IMPORTED
+        state.content_hash = entries_hash
+        state.captured = captured
+        state.last_sync_at = now
+        state.content_type = ct
+        state.object_id = obj.pk
+        state.is_materialized = True
+        state.device_present = True
+        state.save(
+            update_fields=[
+                "status",
+                "content_hash",
+                "captured",
+                "last_sync_at",
+                "content_type",
+                "object_id",
+                "is_materialized",
+                "device_present",
+            ]
+        )
 
 
 def _upsert_state(mgmt, family, name, obj, ct, captured, now):
@@ -658,7 +691,8 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
 
     # #93 — device-caught-up settle for OWNED rows: the operator's intent IS the current
     # NetBox object; when THIS device's capture equals it, the device has caught up —
-    # genuine confirmation, so it may settle accepted/deploying/apply_failed → in_sync.
+    # genuine confirmation, so it may settle accepted/apply_failed to in_sync. A deploying
+    # row needs correlated Apply evidence.
     # (The materialized-content 'matches' below can never see this: settles_owned=False
     # kept staged intent pending forever — example-comm sat 26 days already satisfied.)
     # route_map has no extractor yet (push shape ≠ capture shape) → None → no settle.
@@ -668,7 +702,12 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
         obj,
         exclude_members=(list(state.unsupported_members or []) or None) if family == "community_list" else None,
     ):
-        state.status = sm.on_reconcile(state.status, matches=True, settles_owned=True)
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=True,
+            settles_owned=True,
+            settles_deploying=False,
+        )
 
     # FK/content overlay: 'matches' = materialized (content recorded & unchanged), not
     # device confirmation, so it must not settle an owned row (settles_owned=False).
@@ -679,7 +718,13 @@ def _upsert_state(mgmt, family, name, obj, ct, captured, now):
     if diverged and _owner_can_refresh(state):
         _refresh_owner(state, family, obj, ct, captured, entries_hash, now)
         return state, False
-    state.status = sm.on_reconcile(state.status, matches=not diverged, conflict=diverged, settles_owned=False)
+    state.status = sm.on_reconcile(
+        state.status,
+        matches=not diverged,
+        conflict=diverged,
+        settles_owned=False,
+        settles_deploying=False,
+    )
     should_fill = state.status != sm.CONFLICT
     if should_fill:
         state.content_hash = entries_hash
@@ -798,33 +843,36 @@ def set_classification(family: str, object_name: str, mode: str):
     """
     from django.utils import timezone
 
+    from .intent_state import intent_transaction, route_policy_footprint
     from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
     from .signals import suppress_intent_push
 
     if mode not in ("master", "local"):
         raise ValueError(f"invalid mode {mode!r}")
-    obj = NSORoutePolicyObjectClass.objects.filter(family=family, object_name__iexact=object_name).first()
-    if obj is None:
-        obj = NSORoutePolicyObjectClass.objects.create(
-            family=family,
-            object_name=object_name,
-            mode=mode,
-            source="operator",
-        )
-    else:
-        obj.mode = mode
-        obj.source = "operator"
-        obj.save(update_fields=["mode", "source"])
-    now = timezone.now()
-    with suppress_intent_push():
-        if mode == "local":
-            rows = NSORoutePolicyState.objects.filter(family=family, object_name__iexact=object_name).select_related(
-                "management"
+    footprint = route_policy_footprint({(family, object_name)})
+    with intent_transaction(footprint):
+        obj = NSORoutePolicyObjectClass.objects.filter(family=family, object_name__iexact=object_name).first()
+        if obj is None:
+            obj = NSORoutePolicyObjectClass.objects.create(
+                family=family,
+                object_name=object_name,
+                mode=mode,
+                source="operator",
             )
-            for r in rows:
-                _upsert_local_state(r.management, family, object_name, r.captured or {}, now)
         else:
-            _promote_group_to_master(family, object_name, now)
+            obj.mode = mode
+            obj.source = "operator"
+            obj.save(update_fields=["mode", "source"])
+        now = timezone.now()
+        with suppress_intent_push():
+            if mode == "local":
+                rows = NSORoutePolicyState.objects.filter(
+                    family=family, object_name__iexact=object_name
+                ).select_related("management")
+                for r in rows:
+                    _upsert_local_state(r.management, family, object_name, r.captured or {}, now)
+            else:
+                _promote_group_to_master(family, object_name, now)
     return obj
 
 
@@ -836,9 +884,8 @@ def resettle_false_conflicts(groups: set[tuple[str, str]] | None = None) -> int:
     re-read, the status stays conflict. This recompute settles any such row whose hash now
     matches the canonical owner — without a device round-trip. Returns the count cleared.
     """
-    from django.db import transaction
-
     from . import status_machine as sm
+    from .intent_state import intent_transaction, route_policy_footprint
     from .models import NSORoutePolicyState
 
     cleared = 0
@@ -852,8 +899,15 @@ def resettle_false_conflicts(groups: set[tuple[str, str]] | None = None) -> int:
             )
         )
     for family, object_name in sorted(groups):
-        with transaction.atomic():
-            _lock_policy_groups({(family, object_name)})
+        candidates = NSORoutePolicyState.objects.filter(
+            family=family,
+            object_name__iexact=object_name,
+            status=sm.CONFLICT,
+            is_materialized=False,
+        )
+        if not candidates.exists():
+            continue
+        with intent_transaction(route_policy_footprint({(family, object_name)})):
             states = NSORoutePolicyState.objects.select_for_update().filter(
                 family=family,
                 object_name__iexact=object_name,
@@ -898,7 +952,13 @@ def _upsert_local_state(mgmt, family, name, captured, now):
         )
     if not new_row:
         changed = state.content_hash != entries_hash
-        state.status = sm.on_reconcile(state.status, matches=not changed, conflict=False, settles_owned=False)
+        state.status = sm.on_reconcile(
+            state.status,
+            matches=not changed,
+            conflict=False,
+            settles_owned=False,
+            settles_deploying=False,
+        )
         state.content_hash = entries_hash
     # LOCAL is never materialized; drop any object link left from a prior MASTER classification.
     state.captured = captured
@@ -937,11 +997,14 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         # on a v6 list. (A conflicting read leaves should_fill False → an owned/diverged row is
         # untouched; the owner-content-changed path sets it via _fill_prefix_list.) Mirrors the
         # community_list invert_match refresh below.
-        if should_fill:
-            _set_prefix_list_family(pl_obj, pl_data)
-        if _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj):
-            _fill_prefix_list_entries(pl_obj, entries)
-            ownership.mark_materialized(state)
+        needs_fill = _needs_fill(PrefixListEntry, created, should_fill, prefix_list=pl_obj)
+        family_changed = should_fill and pl_data.get("family") in (4, 6) and pl_obj.family != pl_data["family"]
+        if needs_fill or family_changed:
+            with _group_content_mutation("prefix_list", name):
+                _set_prefix_list_family(pl_obj, pl_data)
+                if needs_fill:
+                    _fill_prefix_list_entries(pl_obj, entries)
+                    ownership.mark_materialized(state)
         seen_keys.add(("prefix_list", name.casefold()))
 
 
@@ -966,12 +1029,16 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
         state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, cl_data, now)
         # invert_match is device-sourced config — refresh it on any non-conflicting read
         # (a conflicting read leaves should_fill False, so an owned/diverged row is untouched).
-        if should_fill and cl_obj.invert_match != invert_match:
-            cl_obj.invert_match = invert_match
-            cl_obj.save(update_fields=["invert_match"])
-        if _needs_fill(CommunityListEntry, created, should_fill, community_list=cl_obj):
-            _fill_community_list_entries(cl_obj, entries)
-            ownership.mark_materialized(state)
+        needs_fill = _needs_fill(CommunityListEntry, created, should_fill, community_list=cl_obj)
+        invert_changed = should_fill and cl_obj.invert_match != invert_match
+        if needs_fill or invert_changed:
+            with _group_content_mutation("community_list", name):
+                if invert_changed:
+                    cl_obj.invert_match = invert_match
+                    cl_obj.save(update_fields=["invert_match"])
+                if needs_fill:
+                    _fill_community_list_entries(cl_obj, entries)
+                    ownership.mark_materialized(state)
         seen_keys.add(("community_list", name.casefold()))
 
 
@@ -992,8 +1059,9 @@ def _reconcile_as_paths(mgmt, device, ap_list, ASPath, ContentType, now, seen_ke
         name_map[name] = ap_obj
         state, should_fill = _upsert_state(mgmt, "as_path", name, ap_obj, ct, ap_data, now)
         if _needs_fill(ASPathEntry, created, should_fill, aspath=ap_obj):
-            _fill_as_path_entries(ap_obj, entries)
-            ownership.mark_materialized(state)
+            with _group_content_mutation("as_path", name):
+                _fill_as_path_entries(ap_obj, entries)
+                ownership.mark_materialized(state)
         seen_keys.add(("as_path", name.casefold()))
 
 
@@ -1013,8 +1081,9 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
         rm_obj, created = _get_or_create_named(RouteMap, name)
         state, should_fill = _upsert_state(mgmt, "route_map", name, rm_obj, ct, rm_data, now)
         if _needs_fill(RouteMapEntry, created, should_fill, route_map=rm_obj):
-            _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
-            ownership.mark_materialized(state)
+            with _group_content_mutation("route_map", name):
+                _fill_route_map_entries(rm_obj, entries, pl_map, cl_map, ap_map)
+                ownership.mark_materialized(state)
         seen_keys.add(("route_map", name.casefold()))
 
 
@@ -1023,6 +1092,7 @@ def _reconcile_route_maps(mgmt, device, rm_list, RouteMap, ContentType, now, see
 # ---------------------------------------------------------------------------
 
 
+@mirror_reconciler
 def reconcile_route_policy(device, payload: dict) -> list:
     """Reconcile route-policy data (objects + entries) from the adapter into NetBox.
 
@@ -1038,6 +1108,127 @@ def reconcile_route_policy(device, payload: dict) -> list:
 
     with suppress_intent_push(), transaction.atomic():
         return _reconcile_route_policy(device, payload)
+
+
+def route_policy_reconcile_footprint(device, payload: dict):
+    """Resolve every shared group that one route-policy document can mutate."""
+    from .intent_state import route_policy_footprint
+    from .models import NSORoutePolicyState
+
+    groups = {
+        (family, row.get("name", ""))
+        for family, key in _FAMILY_PAYLOAD_KEYS.items()
+        for row in payload.get(key) or []
+        if row.get("name")
+    }
+    groups.update(NSORoutePolicyState.objects.filter(management__device=device).values_list("family", "object_name"))
+    return route_policy_footprint(groups, device_ids=(device.pk,))
+
+
+def _route_policy_group_changes_content(management, family: str, name: str, captured: dict) -> bool:
+    """Predict whether one MASTER group will write materialized policy content."""
+    from netbox_routing.models import ASPathEntry, CommunityListEntry, PrefixListEntry, RouteMapEntry
+
+    from .models import NSORoutePolicyState
+
+    if _group_mode(family, name) == "local":
+        return False
+    model = _family_model(family)
+    obj = model.objects.filter(name__iexact=name).first()
+    if obj is None:
+        return True
+
+    entries_hash = ownership.hash_captured(family, captured)
+    state = NSORoutePolicyState.objects.filter(
+        management=management,
+        family=family,
+        object_name__iexact=name,
+    ).first()
+    if state is None:
+        canonical = ownership.canonical_hash(NSORoutePolicyState, family, name)
+        can_fill = canonical is None or canonical == entries_hash
+    else:
+        diverged = _row_diverged(state, entries_hash, family, name)
+        if diverged and _owner_can_refresh(state):
+            return True
+        can_fill = not diverged
+    if not can_fill:
+        return False
+
+    if family == "prefix_list":
+        family_changed = captured.get("family") in (4, 6) and obj.family != captured["family"]
+        return family_changed or not PrefixListEntry.objects.filter(prefix_list=obj).exists()
+    if family == "community_list":
+        invert_changed = obj.invert_match != bool(captured.get("invert_match", False))
+        return invert_changed or not CommunityListEntry.objects.filter(community_list=obj).exists()
+    if family == "as_path":
+        return not ASPathEntry.objects.filter(aspath=obj).exists()
+    if family == "route_map":
+        return not RouteMapEntry.objects.filter(route_map=obj).exists()
+    return False
+
+
+def _route_policy_omitted_group_changes_content(state) -> bool:
+    """Predict whether removing one group the payload OMITS writes materialized content.
+
+    Mirrors the decision order of the stale-row loop in :func:`_reconcile_route_policy`
+    (``_flag_removed`` / :func:`_track_unowned_removal`). The reported-group predictor
+    above never sees these groups: the payload does not carry them.
+    """
+    from . import status_machine as sm
+
+    if sm.is_owned(state.status):
+        # in_sync → changed drops the row from the wire; the other owned states are kept as is.
+        return state.status == sm.IN_SYNC
+    group = list(ownership.group_rows(state))
+    if any(sm.is_owned(s.status) for s in group):
+        return False
+    if any(s.pk != state.pk and s.device_present and s.captured for s in group):
+        return bool(state.is_materialized)  # re-pointing refills the shared object
+    obj = state.assigned_object
+    if obj is None:
+        return False
+    return not _object_referenced(obj, state.family)  # unreferenced → object + entries deleted
+
+
+def _route_policy_omitted_group_predictions(management, payload: dict) -> list[tuple[str, str, bool]]:
+    """``(family, name, changes_content)`` for every persisted group the payload omits."""
+    from .models import NSORoutePolicyState
+
+    reported = {
+        (family, (row.get("name") or "").casefold())
+        for family, key in _FAMILY_PAYLOAD_KEYS.items()
+        for row in payload.get(key) or []
+        if isinstance(row, dict) and row.get("name")
+    }
+    return [
+        (state.family, state.object_name, _route_policy_omitted_group_changes_content(state))
+        for state in NSORoutePolicyState.objects.filter(management=management)
+        if (state.family, state.object_name.casefold()) not in reported
+    ]
+
+
+def route_policy_reconcile_plan(device, payload: dict):
+    """Declare the route-policy footprint and any materialized-content write."""
+    from .intent_state import MutationFootprint, ReconcileMutationPlan
+    from .models import NSODeviceManagement
+
+    footprint = route_policy_reconcile_footprint(device, payload)
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(footprint)
+    try:
+        changes_content = any(
+            _route_policy_group_changes_content(management, family, row["name"], row)
+            for family, key in _FAMILY_PAYLOAD_KEYS.items()
+            for row in payload.get(key) or []
+            if isinstance(row, dict) and row.get("name")
+        ) or any(
+            prediction for _family, _name, prediction in _route_policy_omitted_group_predictions(management, payload)
+        )
+    except ImportError:
+        return ReconcileMutationPlan(MutationFootprint())
+    return ReconcileMutationPlan(footprint, changes_content=changes_content, settles_deploying=False)
 
 
 def _reconcile_route_policy(device, payload: dict) -> list:
@@ -1056,21 +1247,6 @@ def _reconcile_route_policy(device, payload: dict) -> list:
         mgmt = NSODeviceManagement.objects.get(device=device)
     except NSODeviceManagement.DoesNotExist:
         return []
-
-    family_payload_keys = {
-        "prefix_list": "prefix_lists",
-        "community_list": "community_lists",
-        "as_path": "as_paths",
-        "route_map": "route_maps",
-    }
-    touched_groups = {
-        (family, row.get("name", ""))
-        for family, key in family_payload_keys.items()
-        for row in payload.get(key) or []
-        if row.get("name")
-    }
-    touched_groups.update(NSORoutePolicyState.objects.filter(management=mgmt).values_list("family", "object_name"))
-    _lock_policy_groups(touched_groups)
 
     now = timezone.now()
     _PL_UNIT_CACHE.set({})  # context-local: concurrent device reconciles cannot cross-contaminate
@@ -1204,18 +1380,20 @@ def _track_unowned_removal(state) -> None:
     family = state.family
     if live:
         # Some device still reports it → drop this device's row; re-point if we were the owner.
-        was_owner = state.is_materialized
-        state.delete()
-        if was_owner:
-            ownership.rematerialize(live[0])
+        with _group_content_mutation(family, state.object_name):
+            was_owner = state.is_materialized
+            state.delete()
+            if was_owner:
+                ownership.rematerialize(live[0])
         return
     # No device reports this object anymore.
     if obj is not None and _object_referenced(obj, family):
         for s in group:
             _flag_removed(s)  # still referenced elsewhere → keep the object, flag the rows
         return
-    for s in siblings:
-        s.delete()
-    state.delete()
-    if obj is not None:
-        obj.delete()
+    with _group_content_mutation(family, state.object_name):
+        for s in siblings:
+            s.delete()
+        state.delete()
+        if obj is not None:
+            obj.delete()

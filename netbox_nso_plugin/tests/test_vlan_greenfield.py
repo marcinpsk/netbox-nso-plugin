@@ -63,18 +63,49 @@ class TestVlanAttachView(_VlanGreenfieldBase):
         assert state.vlan.group.slug == "shared"
         mock_put.assert_called()
 
+    def test_unavailable_vlan_does_not_advance_the_intent_revision(self):
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        mgmt = self._mgmt(self.sw3, 196)
+        vlan = self._shared_vlan()
+        self.client.force_login(__import__("users").models.User.objects.create_user("vgmissing", is_superuser=True))
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=mgmt.device, scope="vlan")
+        before = revision.revision
+        original_footprint = intent_state.vlan_footprint
+
+        def resolve_then_delete(vlan_id, scopes, **kwargs):
+            footprint = original_footprint(vlan_id, scopes, **kwargs)
+            doomed = type(vlan).objects.get(pk=vlan_id)
+            with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
+                doomed.delete()
+            return footprint
+
+        url = reverse("plugins:netbox_nso_plugin:vlan_attach", kwargs={"device_pk": self.sw3.pk})
+        with patch("netbox_nso_plugin.intent_state.vlan_footprint", side_effect=resolve_then_delete):
+            response = self.client.post(url, {"vlan": vlan.pk})
+
+        assert response.status_code == 302
+        assert not type(vlan).objects.filter(pk=vlan.pk).exists()
+        revision.refresh_from_db()
+        assert revision.revision == before, "an unavailable VLAN committed an intent revision"
+
 
 class TestVlanDeletePropagation(_VlanGreenfieldBase):
     def test_delete_vlan_pushes_reduced_intent_to_all_attached(self):
         from ipam.models import VLAN
 
+        from netbox_nso_plugin.intent_state import intent_transaction, vlan_footprint
         from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         m3 = self._mgmt(self.sw3, 196)
         m4 = self._mgmt(self.sw4, 197)
         vlan = self._shared_vlan()
-        with suppress_intent_push():
+        footprint = vlan_footprint(vlan.pk, ("vlan",), extra_device_ids=(self.sw3.pk, self.sw4.pk))
+        with suppress_intent_push(), intent_transaction(footprint):
             NSOVLANState.objects.create(management=m3, vlan=vlan, status="in_sync")
             NSOVLANState.objects.create(management=m4, vlan=vlan, status="in_sync")
 

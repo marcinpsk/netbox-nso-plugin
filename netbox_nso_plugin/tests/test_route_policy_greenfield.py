@@ -10,10 +10,20 @@ greenfield attach + delete signals.
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
+from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 
-from ._outbox_case import make_managed, without_commit_drain
+from ._outbox_case import content_update, make_managed, without_commit_drain
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
+
+
+def _save_without_push(instance):
+    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    from netbox_nso_plugin.signals import suppress_intent_push
+
+    with suppress_intent_push(), intent_transaction(footprint_for_instance(instance)):
+        instance.save()
+    return instance
 
 
 class _RPBase(IntentPushDeliveryMixin, TestCase):
@@ -59,50 +69,49 @@ class TestRoutePolicyNativeSaveTransactions(_CascadeFlushMixin, IntentPushResetM
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
-        prefix_list = PrefixList.objects.create(name="TESTNSO-PL-SAVE")
-        with suppress_intent_push():
-            state = NSORoutePolicyState.objects.create(
-                management=self.management,
-                family="prefix_list",
-                object_name=prefix_list.name,
-                content_type=ContentType.objects.get_for_model(PrefixList),
-                object_id=prefix_list.pk,
-                status="imported",
+        with without_commit_drain(), transaction.atomic():
+            prefix_list = PrefixList.objects.create(name="TESTNSO-PL-SAVE")
+            state = _save_without_push(
+                NSORoutePolicyState(
+                    management=self.management,
+                    family="prefix_list",
+                    object_name=prefix_list.name,
+                    content_type=ContentType.objects.get_for_model(PrefixList),
+                    object_id=prefix_list.pk,
+                    status="imported",
+                )
             )
-        NSORoutePolicyState.objects.filter(pk=state.pk).update(status="in_sync")
+        content_update(state, status="in_sync")
         return prefix_list, state
 
-    def test_an_owned_policy_object_save_reaccepts_the_overlay_in_autocommit(self):
+    def test_an_owned_policy_object_save_reaccepts_the_overlay_in_a_renderer_transaction(self):
         prefix_list, state = self._owned_prefix_list()
 
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
             prefix_list.description = "changed"
             prefix_list.save(update_fields=["description"])
 
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
 
-    def test_an_owned_policy_entry_save_reaccepts_the_overlay_in_autocommit(self):
+    def test_an_owned_policy_entry_save_reaccepts_the_overlay_in_a_renderer_transaction(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import CustomPrefix, PrefixListEntry
 
-        from netbox_nso_plugin.signals import suppress_intent_push
-
         prefix_list, state = self._owned_prefix_list()
-        custom_prefix = CustomPrefix.objects.create(prefix="198.18.64.0/24")
-        entry = PrefixListEntry.objects.create(
-            prefix_list=prefix_list,
-            assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
-            assigned_prefix_id=custom_prefix.pk,
-            sequence=10,
-            action="permit",
-        )
-        with suppress_intent_push():
-            type(state).objects.filter(pk=state.pk).update(status="in_sync")
+        with without_commit_drain(), transaction.atomic():
+            custom_prefix = CustomPrefix.objects.create(prefix="198.18.64.0/24")
+            entry = PrefixListEntry.objects.create(
+                prefix_list=prefix_list,
+                assigned_prefix_type=ContentType.objects.get_for_model(CustomPrefix),
+                assigned_prefix_id=custom_prefix.pk,
+                sequence=10,
+                action="permit",
+            )
+        content_update(state, status="in_sync")
 
-        with without_commit_drain():
+        with without_commit_drain(), transaction.atomic():
             entry.action = "deny"
             entry.save(update_fields=["action"])
 
@@ -121,20 +130,22 @@ class TestRoutePolicyIntentAcceptedFlag(_RPBase):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import PrefixList
 
-        from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyState
 
         mgmt = self._mgmt()
         pl = self._prefix_list()
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
+        attempt = NSOApplyAttempt.objects.create(management=mgmt) if status == "deploying" else None
+        _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="prefix_list",
                 object_name=pl.name,
                 content_type=ContentType.objects.get_for_model(PrefixList),
                 object_id=pl.pk,
                 status=status,
+                apply_attempt_id=attempt.pk if attempt is not None else None,
             )
+        )
         return mgmt
 
     def _push_and_capture(self, mgmt):
@@ -473,12 +484,11 @@ class TestRoutePolicyDeletePropagation(_RPBase):
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         pl = self._prefix_list()
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
+        _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="prefix_list",
                 object_name=pl.name,
@@ -486,6 +496,7 @@ class TestRoutePolicyDeletePropagation(_RPBase):
                 object_id=pl.pk,
                 status="in_sync",
             )
+        )
 
         pushed = []
         with patch(
@@ -510,12 +521,11 @@ class TestRoutePolicyEditOwnsAndPushes(_RPBase):
         from netbox_routing.models import CommunityList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         cl = CommunityList.objects.create(name="TESTNSO-CL-EDIT")
-        with suppress_intent_push():
-            state = NSORoutePolicyState.objects.create(
+        state = _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="community_list",
                 object_name=cl.name,
@@ -523,6 +533,7 @@ class TestRoutePolicyEditOwnsAndPushes(_RPBase):
                 object_id=cl.pk,
                 status=status,
             )
+        )
         return cl, state
 
     def test_adding_member_to_owned_list_owns_and_pushes(self):
@@ -605,12 +616,12 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import ASPath
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm, ap, _cl, _pl = self._route_map_with_refs()
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
+        _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="as_path",
                 object_name="50",
@@ -618,6 +629,7 @@ class TestOwnershipCascade(_RPBase):
                 object_id=ap.pk,
                 status="in_sync",
             )
+        )
         _own_route_map_contributors(mgmt, rm)
         st = NSORoutePolicyState.objects.get(management=mgmt, family="as_path", object_name="50")
         assert st.status == "in_sync"  # an already-owned contributor is left untouched
@@ -631,12 +643,12 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm, _ap, _cl, pl = self._route_map_with_refs()
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
+        _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="prefix_list",
                 object_name=pl.name,
@@ -644,6 +656,7 @@ class TestOwnershipCascade(_RPBase):
                 object_id=pl.pk,
                 status="conflict",
             )
+        )
         cascade = _own_route_map_contributors(mgmt, rm)
 
         st = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name=pl.name)
@@ -659,14 +672,13 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import CommunityList, RouteMap, RouteMapEntry, RouteMapEntrySetCommunity
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()
         rm = RouteMap.objects.create(name="RM-SET-COMM")
         e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit")
         cl = CommunityList.objects.create(name="CL-SET-DELETE")
-        with suppress_intent_push():
-            RouteMapEntrySetCommunity.objects.create(route_map_entry=e, operation="delete", community_list=cl)
+        _save_without_push(RouteMapEntrySetCommunity(route_map_entry=e, operation="delete", community_list=cl))
 
         _own_route_map_contributors(mgmt, rm)
 
@@ -682,7 +694,7 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORoutePolicyState
-        from netbox_nso_plugin.signals import _own_route_map_contributors, suppress_intent_push
+        from netbox_nso_plugin.signals import _own_route_map_contributors
 
         mgmt = self._mgmt()  # owning onto self.device
         rm, _ap, _cl, pl = self._route_map_with_refs()
@@ -698,8 +710,8 @@ class TestOwnershipCascade(_RPBase):
         other_mgmt = NSODeviceManagement.objects.create(
             device=other_dev, nso_instance=inst, nso_device_name="nso-rp-2", adapter_device_id=297
         )
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
+        _save_without_push(
+            NSORoutePolicyState(
                 management=other_mgmt,
                 family="prefix_list",
                 object_name=pl.name,
@@ -708,6 +720,7 @@ class TestOwnershipCascade(_RPBase):
                 status="in_sync",
                 is_materialized=True,
             )
+        )
 
         cascade = _own_route_map_contributors(mgmt, rm)
 
@@ -724,13 +737,12 @@ class TestOwnershipCascade(_RPBase):
         from netbox_routing.models import ASPath, RouteMap, RouteMapEntry
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         rm = RouteMap.objects.create(name="RM-EDIT-CASCADE")
         e = RouteMapEntry.objects.create(route_map=rm, sequence=10, action="permit")
-        with suppress_intent_push():
-            NSORoutePolicyState.objects.create(
+        _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="route_map",
                 object_name="RM-EDIT-CASCADE",
@@ -738,6 +750,7 @@ class TestOwnershipCascade(_RPBase):
                 object_id=rm.pk,
                 status="in_sync",
             )
+        )
         ap = ASPath.objects.create(name="50")
 
         with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent", side_effect=lambda a, o: None):
@@ -760,7 +773,6 @@ class TestUnsupportedMembersStorage(_RPBase):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._mgmt()
         cl = CommunityList.objects.create(name=name)
@@ -768,8 +780,8 @@ class TestUnsupportedMembersStorage(_RPBase):
             CommunityListEntry.objects.create(
                 community_list=cl, action="permit", community=Community.objects.create(community=value)
             )
-        with suppress_intent_push():
-            state = NSORoutePolicyState.objects.create(
+        state = _save_without_push(
+            NSORoutePolicyState(
                 management=mgmt,
                 family="community_list",
                 object_name=name,
@@ -777,6 +789,7 @@ class TestUnsupportedMembersStorage(_RPBase):
                 object_id=cl.pk,
                 status="accepted",
             )
+        )
         return mgmt, state
 
     def _push(self, mgmt, resp):

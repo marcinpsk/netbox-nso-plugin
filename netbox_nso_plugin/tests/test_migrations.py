@@ -14,7 +14,7 @@ import importlib
 from io import StringIO
 
 from django.core.management import call_command
-from django.db import connection
+from django.db import connection, transaction
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
@@ -24,6 +24,7 @@ APP = "netbox_nso_plugin"
 OUTBOX = "0018_intent_outbox"
 PRE_OUTBOX = "0017_settlement_cursor_epoch"
 DEPLOYMENT_CONTROL = "0019_intent_deployment_control"
+APPLY_IDENTITY = "0020_nsoapplyattempt_nsointentrevision_and_more"
 
 
 class TestMigrationGraph(SimpleTestCase):
@@ -157,3 +158,95 @@ class TestThePushSequenceOutlivesARollback(_CascadeFlushMixin, TransactionTestCa
         self._migrate(OUTBOX)
 
         assert self._nextval() > burnt, "the re-applied sequence re-issues values the adapter already admitted"
+
+
+class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
+    def _migrate(self, target):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate([(APP, target)])
+
+    def _migrate_to_leaves(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes(APP))
+
+    def test_unattributed_deploying_rows_return_to_operator_pending(self):
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        from ._outbox_case import make_managed, without_commit_drain
+
+        _device, management = make_managed("apply-migration", 1625)
+        with without_commit_drain(), transaction.atomic():
+            row = NSOLoggingLevelState.objects.create(
+                management=management,
+                console_severity="WARNING",
+                status="accepted",
+                last_apply_error="stale result",
+            )
+        self.addCleanup(self._migrate_to_leaves)
+        self._migrate(DEPLOYMENT_CONTROL)
+        with transaction.atomic(), offline_mutation():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE netbox_nso_plugin_nsologginglevelstate SET status = %s WHERE id = %s",
+                    ["deploying", row.pk],
+                )
+
+        self._migrate(APPLY_IDENTITY)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(row.last_apply_error, "")
+
+    def test_auto_assigned_rows_keep_their_cleanup_shape(self):
+        from dcim.models import Interface
+        from ipam.models import Prefix
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._outbox_case import make_managed
+
+        device, _management = make_managed("allocation-kind-migration", 1627)
+        interface = Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
+        pool = Prefix.objects.create(prefix="198.18.96.0/24")
+        with transaction.atomic(), offline_mutation():
+            single = NSOInterfaceIPState.objects.create(
+                interface=interface,
+                address="198.18.96.1/32",
+                auto_assigned=True,
+                source_pool=pool,
+            )
+            peer = NSOInterfaceIPState.objects.create(
+                interface=interface,
+                address="198.18.96.2/31",
+                auto_assigned=True,
+                source_pool=pool,
+            )
+            point_to_point = NSOInterfaceIPState.objects.create(
+                interface=interface,
+                address="198.18.96.3/31",
+                auto_assigned=True,
+                source_pool=pool,
+                peer_state=peer,
+            )
+            peer.peer_state = point_to_point
+            peer.save(update_fields=["peer_state"])
+        self.addCleanup(self._migrate_to_leaves)
+
+        self._migrate(DEPLOYMENT_CONTROL)
+        self._migrate(APPLY_IDENTITY)
+
+        single.refresh_from_db()
+        peer.refresh_from_db()
+        point_to_point.refresh_from_db()
+        self.assertEqual(single.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
+        self.assertEqual(peer.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
+        self.assertEqual(point_to_point.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)

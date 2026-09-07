@@ -60,10 +60,10 @@ class _LineageCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
             route.devices.remove(self.device)
 
     def reown(self, route):
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
+        from ._static_route_case import _accept_with_permit
 
         with without_commit_drain(), transaction.atomic():
-            _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
 
     def retriple(self, route, prefix, next_hop):
         """Move the route's own content, which is what makes a re-own a DIFFERENT triple."""
@@ -248,14 +248,14 @@ class TestTheLineageTransfersAcrossReOwnership(_LineageCase):
     def test_accepting_an_existing_overlay_does_not_scan_the_outbox_carry(self):
         from unittest.mock import patch
 
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
+        from ._static_route_case import _accept_with_permit
 
         route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
         self.clear_entries()
 
         with patch("netbox_nso_plugin.signals._carried_last_acked") as carried:
             with without_commit_drain(), transaction.atomic():
-                _accept_static_route_for_device(route, self.device)
+                _accept_with_permit(route, self.device)
 
         carried.assert_not_called()
 

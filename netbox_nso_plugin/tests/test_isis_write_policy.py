@@ -54,6 +54,7 @@ class TestRegistryMatchesRealPush(_IsisPolicyBase):
 
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.intent_state import SourceRow, content_mutation
         from netbox_nso_plugin.models import NSOISISInstanceState, NSOISISInterfaceState
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -71,7 +72,16 @@ class TestRegistryMatchesRealPush(_IsisPolicyBase):
             reference_bandwidth=100000,
         )
         ISISLevel.objects.create(instance=fork, level=2, wide_metrics_only=True, default_metric=10, preference=18)
-        with suppress_intent_push():
+        with (
+            content_mutation(
+                {(self.device.pk, "isis")},
+                overlay_rows=(
+                    SourceRow(NSOISISInstanceState._meta.label_lower, None),
+                    SourceRow(NSOISISInterfaceState._meta.label_lower, None),
+                ),
+            ),
+            suppress_intent_push(),
+        ):
             NSOISISInstanceState.objects.update_or_create(
                 management=mgmt,
                 process_tag="",
