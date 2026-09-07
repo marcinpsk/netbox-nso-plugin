@@ -6088,8 +6088,10 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
     """A write committed between planning and execution must refuse the inline edit.
 
     The converted SVI/LACP/VLAN save paths execute a frozen renderer plan, so a competing
-    lifecycle write moves a preimage and the writer raises IntentPlanStaleError. The
-    endpoint must answer with its field-error JSON instead of a 500, and write nothing.
+    lifecycle write moves a preimage and the writer raises IntentPlanStaleError. These
+    families do not replan, so the endpoint answers the conflict response it gives after an
+    exhausted replan ("fix(protocol): resolve current integration review findings") instead
+    of a 500, and writes nothing.
     """
 
     def _url(self, key, pk):
@@ -6112,11 +6114,12 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
 
         return patch.object(RendererMutationPlan, "build", build)
 
-    def _assert_refused(self, response, field):
-        self.assertEqual(response.status_code, 400, response.content)
-        body = response.json()
-        self.assertEqual(body["status"], "error")
-        self.assertIn(field, body["errors"])
+    def _assert_refused(self, response):
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(
+            response.json(),
+            {"status": "error", "message": "Routing state changed. Refresh the page and try again."},
+        )
 
     def test_svi_edit_refuses_a_plan_staled_after_planning(self):
         from netbox_nso_plugin.models import NSOSVIState
@@ -6132,7 +6135,7 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         with self._race_after_planning(competing):
             response = self.client.post(self._url("svi", state.pk), {"vrf": "BLUE"})
 
-        self._assert_refused(response, "vrf")
+        self._assert_refused(response)
         state.refresh_from_db()
         self.assertEqual(state.vrf, "")
         self.assertEqual(state.status, "imported")
@@ -6157,7 +6160,7 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         with self._race_after_planning(competing):
             response = self.client.post(self._url("lacp_bundle", bundle.pk), {"min_links": "2"})
 
-        self._assert_refused(response, "min_links")
+        self._assert_refused(response)
         bundle.refresh_from_db()
         member.refresh_from_db()
         self.assertEqual(bundle.min_links, 1)
@@ -6180,7 +6183,7 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         with self._race_after_planning(competing):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "RENAMED-841"})
 
-        self._assert_refused(response, "name")
+        self._assert_refused(response)
         vlan.refresh_from_db()
         state.refresh_from_db()
         self.assertEqual(vlan.name, "VLAN-841")  # the native rename rolled back
