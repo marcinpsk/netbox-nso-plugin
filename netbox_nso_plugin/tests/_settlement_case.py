@@ -121,11 +121,22 @@ def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT,
     }
 
 
-def _pending_attempt_evidence(adapter_device_id, requested_ids):
-    """Build the adapter's pending evidence shape for real local attempt records."""
+def _pending_attempt_evidence(adapter_device_id, requested_ids, settled_scopes=()):
+    """Build the adapter's evidence shape for real local attempt records.
+
+    *settled_scopes* names the scopes the carrier proved in sync, turning the running
+    generation into the terminal snapshot the Apply settler needs.
+    """
+    from django.db import connections
+
     from netbox_nso_plugin.models import NSOApplyAttempt
 
-    local_attempts = NSOApplyAttempt.objects.in_bulk(requested_ids)
+    try:
+        local_attempts = NSOApplyAttempt.objects.in_bulk(requested_ids)
+    finally:
+        # Only this thread can close its own connection, and the worker outlives the request.
+        connections.close_all()
+    settled = bool(settled_scopes)
     attempts = []
     unknown = []
     for attempt_id in requested_ids:
@@ -149,12 +160,15 @@ def _pending_attempt_evidence(adapter_device_id, requested_ids):
                     {
                         "generation_id": generation_id,
                         "seq": generation_id,
-                        "status": "running",
+                        "status": "settled" if settled else "running",
                         "sections": sorted(attempt.selected),
                         "source_push_seq": attempt.selected,
                         "carrier_job_id": generation_id,
-                        "carrier_job_status": "running",
-                        "carrier_job_result": None,
+                        "carrier_job_status": "succeeded" if settled else "running",
+                        "carrier_job_result": {
+                            f"{scope}_count_by_outcome": {"in_sync": 1, "apply_failed": 0} for scope in settled_scopes
+                        }
+                        or None,
                         "carrier_job_error": None,
                         "updated_at": timezone.now().isoformat(),
                     }
@@ -188,6 +202,8 @@ class _AdapterDoubleMixin:
         super().setUp()
         from netbox_nso_plugin import adapter_client
 
+        #: delivery scopes the evidence endpoint reports as settled; empty = still running
+        self.settled_evidence_scopes = ()
         real_do_post = _Handler.do_POST
 
         def do_post(handler):
@@ -198,7 +214,7 @@ class _AdapterDoubleMixin:
                 body = handler._body()
                 requested_ids = [UUID(str(value)) for value in body.get("apply_attempt_ids", [])]
                 device_id = handler._device_id_from_path(parsed)
-                handler._send(200, _pending_attempt_evidence(device_id, requested_ids))
+                handler._send(200, _pending_attempt_evidence(device_id, requested_ids, self.settled_evidence_scopes))
                 return
             real_do_post(handler)
 

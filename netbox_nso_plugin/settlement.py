@@ -111,21 +111,30 @@ def sweep_static_route_settlements() -> tuple[int, int]:
     object holding ``None`` or a dead adapter id in two of its three branches, so a reused
     list would skip a repaired device or poll it on an id that no longer exists.
 
-    Bounded and isolated: a device with no owned static-route overlay still in flight is
-    never polled, and one device's settlement error aborts neither the rest of the sweep
-    nor anything that ran before it.
+    Bounded and isolated: a device with nothing in flight is never polled, and one device's
+    settlement error aborts neither the rest of the sweep nor anything that ran before it.
+
+    "In flight" is every delivery scope, because the pass this sweep drains into settles all
+    nine of them. The scopes come from the Apply registry, so a new one cannot be missed here.
     """
     from . import status_machine as sm
+    from .apply_state import deploying_models
     from .models import NSODeviceManagement
 
-    candidates = list(
+    candidate_pks = set(
         NSODeviceManagement.objects.filter(
             adapter_device_id__isnull=False,
             static_route_states__status__in=(sm.ACCEPTED, sm.DEPLOYING),
-        )
-        .distinct()
-        .values_list("pk", flat=True)
+        ).values_list("pk", flat=True)
     )
+    for model in deploying_models().values():
+        candidate_pks.update(
+            model.objects.filter(
+                status=sm.DEPLOYING,
+                management__adapter_device_id__isnull=False,
+            ).values_list("management_id", flat=True)
+        )
+    candidates = sorted(candidate_pks)
     polled = 0
     failed = 0
     for pk in candidates:

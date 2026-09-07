@@ -18,12 +18,13 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from ._outbox_case import mirror_update
+from ._outbox_case import mirror_update, own_vlan
 from ._settlement_case import (
     _CarrierCase,
     _make_device,
     _make_mgmt,
     _own,
+    _pending_attempt_evidence,
     _result,
     _route,
     _SettlementCase,
@@ -473,3 +474,196 @@ class TestADrainErrorCannotStopTheSweep(_SettlementCase):
             and str(record.exc_info[1]) == "compaction exploded"
             for record in logs.records
         ), "the compaction error was never reported"
+
+
+class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
+    """The sweep is the fleet's only plugin-to-adapter clock, so it must reach every scope.
+
+    Its candidate query asked for static-route overlays alone, so a device whose only
+    in-flight row was a VLAN, an SVI or an MTU had no tick at all: the adapter could finish
+    that Apply and, with the callback channel dead, the row stayed ``deploying`` forever.
+    """
+
+    def _deploying_vlan(self, tag, adapter_device_id, vid, generation_id, push_seq):
+        """One deploying VLAN overlay with the durable attempt the evidence is addressed to."""
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        self.adapter.store.add_device(
+            nso_instance=f"se-{tag}-inst",
+            nso_device_name=f"nso-se-{tag}",
+            netbox_device_id=device.pk,
+            device_id=adapter_device_id,
+        )
+        selected = {"vlan": push_seq}
+        attempt = NSOApplyAttempt.objects.create(
+            management=mgmt,
+            adapter_device_id=adapter_device_id,
+            scope_revisions=selected,
+            selected=selected,
+            http_status=202,
+            response={
+                "device_id": adapter_device_id,
+                "outcome": "promoted",
+                "selected": selected,
+                "skipped": {},
+                "generations": [{"generation_id": generation_id}],
+            },
+        )
+        state = mirror_update(own_vlan(mgmt, vid, tag), status="deploying", apply_attempt_id=attempt.pk)
+        return mgmt, state
+
+    def test_the_tick_settles_a_deploying_vlan_with_no_static_route_overlay(self):
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        mgmt, state = self._deploying_vlan("vlanonly", 60, 601, 310, 501)
+        assert not NSOStaticRouteState.objects.filter(management=mgmt).exists(), "the pin grew a static-route candidate"
+        self.settled_evidence_scopes = ("vlan",)
+
+        # No callback of any kind: the tick is the only clock running.
+        with patch(
+            "netbox_nso_plugin.reconcile.enqueue_device_reconcile",
+            side_effect=AssertionError("the pin fired a callback: the very channel this removes"),
+        ):
+            self._tick()
+
+        state.refresh_from_db()
+        assert state.status == "in_sync", "a device whose only in-flight row is a VLAN is never swept"
+
+    def test_a_still_running_apply_keeps_its_vlan_deploying(self):
+        """Control: the widened candidate set judges from evidence, not from being polled."""
+        _mgmt, state = self._deploying_vlan("vlanrunning", 61, 611, 311, 502)
+
+        self._tick()
+
+        state.refresh_from_db()
+        assert state.status == "deploying", "the sweep settled a VLAN whose Apply is still running"
+
+
+class TestTheEvidenceEndpointClosesItsWorkerConnection(_SettlementCase):
+    """The double's ORM-backed evidence endpoint runs on a keep-alive HTTP worker thread.
+
+    That thread opens its own Django connection and holds it while it waits for the next
+    request, so every completed request retains a PostgreSQL slot. Closing connections from
+    the test thread cannot close another thread's connection.
+    """
+
+    def _worker_backend_pids(self):
+        """Collect the backend pid of every connection opened outside the test thread."""
+        import threading
+
+        from django.db.backends.signals import connection_created
+
+        pids = []
+        test_thread = threading.get_ident()
+
+        def record(sender, connection, **kwargs):
+            if threading.get_ident() != test_thread:
+                pids.append(connection.connection.info.backend_pid)
+
+        connection_created.connect(record)
+        self.addCleanup(connection_created.disconnect, record)
+        return pids
+
+    def _wait_until_disconnected(self, pid, timeout=5.0):
+        """Poll ``pg_stat_activity`` from the test connection until *pid* has gone."""
+        import time
+
+        from django.db import connection
+
+        deadline = time.monotonic() + timeout
+        while True:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM pg_stat_activity WHERE pid = %s", [pid])
+                if cursor.fetchone() is None:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _attempt(self, tag, adapter_device_id):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        selected = {"static_route": 1}
+        return NSOApplyAttempt.objects.create(
+            management=mgmt,
+            adapter_device_id=adapter_device_id,
+            scope_revisions=selected,
+            selected=selected,
+            http_status=202,
+            response={
+                "device_id": adapter_device_id,
+                "outcome": "promoted",
+                "selected": selected,
+                "skipped": {},
+                "generations": [{"generation_id": 1}],
+            },
+        )
+
+    def test_an_answered_evidence_request_leaves_no_worker_backend_connected(self):
+        from netbox_nso_plugin.adapter_client import get_deployment_evidence
+
+        attempt = self._attempt("evidenceslot", 80)
+        pids = self._worker_backend_pids()
+
+        # Two requests over the client's ONE kept-alive connection, so one worker serves both.
+        get_deployment_evidence(80, [attempt.pk])
+        after_first = list(pids)
+        get_deployment_evidence(80, [attempt.pk])
+
+        assert len(after_first) == 1, f"the endpoint ran no real ORM query on the worker: {after_first}"
+        assert self._wait_until_disconnected(after_first[0]), (
+            "the worker held its PostgreSQL backend after answering, so every completed "
+            "request retains a connection slot for the life of the thread"
+        )
+        assert len(pids) == 2 and pids[0] != pids[1], f"the second request reused the retained backend: {pids}"
+
+    def test_a_failing_evidence_query_still_closes_the_worker_connection(self):
+        """The cleanup is a ``finally``: a query error must not retain the slot either."""
+        import threading
+
+        from django.db import connection
+        from psycopg import sql
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = self._attempt("evidenceerr", 81)
+        pids = self._worker_backend_pids()
+        answered = threading.Event()
+        release = threading.Event()
+        failures = []
+
+        def worker():
+            try:
+                _pending_attempt_evidence(81, [attempt.pk])
+            except Exception as exc:  # noqa: BLE001 (the query error is what this pins)
+                failures.append(exc)
+            answered.set()
+            # An HTTP worker outlives one request, so thread exit must not be the cleanup.
+            release.wait(30)
+
+        table = sql.Identifier(NSOApplyAttempt._meta.db_table)
+        hidden = sql.Identifier(f"{NSOApplyAttempt._meta.db_table}_hidden")
+        thread = threading.Thread(target=worker)
+        with connection.cursor() as cursor:
+            cursor.execute(sql.SQL("ALTER TABLE {} RENAME TO {}").format(table, hidden))
+        try:
+            try:
+                # Started inside the restore guard: no flush can undo a renamed table.
+                thread.start()
+                assert answered.wait(30), "the evidence query never returned"
+            finally:
+                with connection.cursor() as cursor:
+                    cursor.execute(sql.SQL("ALTER TABLE {} RENAME TO {}").format(hidden, table))
+            assert failures, "renaming the table away did not make the real query fail"
+            assert len(pids) == 1, f"the worker opened no connection of its own: {pids}"
+            assert self._wait_until_disconnected(pids[0]), (
+                "a failing evidence query retained the worker's PostgreSQL backend"
+            )
+        finally:
+            release.set()
+            if thread.ident is not None:
+                thread.join(timeout=30)
