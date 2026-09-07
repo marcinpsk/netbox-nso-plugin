@@ -3154,6 +3154,30 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertNotContains(response, "Name (NetBox)")
         self.assertNotContains(response, "<th>Device</th>", html=True)
 
+    def test_svi_refresh_preserves_rows_when_adapter_interfaces_are_malformed(self):
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        self.mgmt.adapter_device_id = 10
+        self.mgmt.save(update_fields=["adapter_device_id"])
+        reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan220", "vlan_id": 220}]})
+        states = NSOSVIState.objects.filter(management=self.mgmt).order_by("pk")
+        interfaces = Interface.objects.filter(device=self.device).order_by("pk")
+        original_states = list(states.values())
+        original_interfaces = list(interfaces.values())
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "svi"},
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.get_svi", return_value={"interfaces": None}):
+            response = self.client.get(url, {"refresh": "1"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertContains(response, "Vlan220")
+        self.assertContains(response, "The NSO adapter returned an invalid response.")
+        self.assertEqual(list(states.values()), original_states)
+        self.assertEqual(list(interfaces.values()), original_interfaces)
+
     def test_svi_category_renders_compact_inline_vrf_editor(self):
         from ipam.models import VLAN, VLANGroup
 

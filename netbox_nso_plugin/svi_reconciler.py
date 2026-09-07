@@ -38,6 +38,7 @@ def _svi_reconcile_operations(device, payload, planned_at):
     from ipam.models import VLAN
 
     from . import status_machine as sm
+    from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSOSVIState
     from .renderer_writer import planned_delete, planned_save
     from .vlan_reconciler import _device_vlan_group
@@ -45,8 +46,11 @@ def _svi_reconcile_operations(device, payload, planned_at):
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], [], []
-    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
-    items = raw_items if isinstance(raw_items, list) else []
+    if not isinstance(payload, dict):
+        raise AdapterError("SVI payload must be an object", code="invalid_response")
+    items = payload.get("interfaces", [])
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise AdapterError("SVI interfaces must be a list of objects", code="invalid_response")
     group = _device_vlan_group(device, create=False)
     interfaces = {row.name: row for row in Interface.objects.filter(device=device).order_by("pk")}
     states = {
@@ -61,8 +65,6 @@ def _svi_reconcile_operations(device, payload, planned_at):
     reported = set()
 
     for item in items:
-        if not isinstance(item, dict):
-            continue
         name = item.get("interface_name")
         if not name:
             continue

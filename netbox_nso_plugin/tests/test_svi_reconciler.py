@@ -206,6 +206,35 @@ class TestSviReconciler(TestCase):
         self.assertEqual(rows[0].svi_type, "irb")
         self.assertTrue(Interface.objects.filter(device=self.device, name="irb.100").exists())
 
+    def test_malformed_payload_preserves_existing_rows(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+
+        for payload in (
+            None,
+            {"interfaces": None},
+            {"interfaces": {}},
+            {"interfaces": [None]},
+            {"interfaces": [{"interface_name": "Vlan200", "vlan_id": 200}, None]},
+        ):
+            with self.subTest(payload=payload):
+                reconcile_svi(self.device, {"interfaces": [{"interface_name": "Vlan100", "vlan_id": 100}]})
+                states = NSOSVIState.objects.filter(management=self.management).order_by("pk")
+                interfaces = Interface.objects.filter(device=self.device).order_by("pk")
+                original_states = list(states.values())
+                original_interfaces = list(interfaces.values())
+                error = None
+
+                try:
+                    reconcile_svi(self.device, payload)
+                except AdapterError as exc:
+                    error = exc
+
+                self.assertEqual(list(states.values()), original_states)
+                self.assertEqual(list(interfaces.values()), original_interfaces)
+                self.assertIsNotNone(error)
+                self.assertEqual(error.code, "invalid_response")
+
     def test_stale_state_pruned(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 

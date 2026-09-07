@@ -1532,6 +1532,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(vlan.name, "attach-before-rename")
 
     def test_native_vlan_prelocks_leave_malformed_payloads_to_scope_isolation(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.intent_state import MutationFootprint
         from netbox_nso_plugin.models import NSOVLANState
         from netbox_nso_plugin.svi_reconciler import svi_reconcile_footprint
@@ -1547,18 +1548,17 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     self.device,
                     {"vlans": [{"vlan_id": "not-an-integer"}, None]},
                 ),
-                svi_reconcile_footprint(
-                    self.device,
-                    {"interfaces": [{"vlan_id": "not-an-integer"}, None]},
-                ),
                 switchport_reconcile_footprint(
                     self.device,
                     {"interfaces": [{"untagged_vlan": "bad", "tagged_vlans": 5}, None]},
                 ),
                 vlan_reconcile_footprint(self.device, {"vlans": 5}),
-                svi_reconcile_footprint(self.device, {"interfaces": 5}),
                 switchport_reconcile_footprint(self.device, {"interfaces": 5}),
             ]
+            for payload in ({"interfaces": [{"vlan_id": "not-an-integer"}, None]}, {"interfaces": 5}):
+                with self.assertRaises(AdapterError) as raised:
+                    svi_reconcile_footprint(self.device, payload)
+                self.assertEqual(raised.exception.code, "invalid_response")
 
         self.assertTrue(all(isinstance(result, MutationFootprint) for result in results))
         self.assertEqual(
