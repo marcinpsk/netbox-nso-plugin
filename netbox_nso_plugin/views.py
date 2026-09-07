@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+import contextlib
 import copy
 import logging
 import re
@@ -3539,10 +3540,8 @@ def _norm_ip_triple(t):
     import ipaddress
 
     iface, address, vrf = (tuple(t) + ("", "", ""))[:3]
-    try:
+    with contextlib.suppress(ValueError):
         address = str(ipaddress.ip_interface(address))
-    except ValueError:
-        pass
     return (iface, address, vrf)
 
 
