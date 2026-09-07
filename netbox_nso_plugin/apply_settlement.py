@@ -484,7 +484,11 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             code="invalid_response",
         ) from exc
     if unknown - set(attempt_ids):
-        raise EvidenceInvariantError("deployment evidence names an unrequested unknown Apply attempt")
+        # An adapter answer we did not ask for; the caller's adapter boundary handles it.
+        raise client.AdapterError(
+            "Adapter returned an unrequested unknown Apply attempt.",
+            code="invalid_response",
+        )
     replayed = False
     for attempt in NSOApplyAttempt.objects.filter(
         pk__in=unknown,

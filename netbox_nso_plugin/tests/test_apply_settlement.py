@@ -607,7 +607,8 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(row.status, "in_sync")
 
     def test_an_unrequested_unknown_attempt_is_not_replayed(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
 
         requested_id = uuid4()
         extra_id = uuid4()
@@ -620,9 +621,11 @@ class TestAttemptSettlement(TestCase):
         with (
             patch("netbox_nso_plugin.adapter_client.get_deployment_evidence", return_value=evidence),
             patch("netbox_nso_plugin.adapter_client.trigger_apply") as trigger_apply,
-            self.assertRaises(EvidenceInvariantError),
+            self.assertRaises(AdapterError) as raised,
         ):
             load_deployment_evidence(self.management)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
 
         trigger_apply.assert_not_called()
 
