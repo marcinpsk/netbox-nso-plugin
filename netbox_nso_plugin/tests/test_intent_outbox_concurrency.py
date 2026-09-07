@@ -69,16 +69,17 @@ class _ConcurrencyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTest
         NSOIntentOutboxEntry.objects.all().delete()
 
 
-class TestL2NativeRowsAreLocked(_ConcurrencyCase):
-    def test_reconcile_locks_native_rows_before_creating_the_first_overlay(self):
+class TestL2NativeWritesAreLocked(_ConcurrencyCase):
+    def test_reconcile_locks_the_native_vpn_before_updating_it(self):
         from dcim.models import Interface
         from django.db import connections
         from vpn.models import L2VPN, L2VPNTermination
 
         from netbox_nso_plugin import l2_service_reconciler
+        from netbox_nso_plugin.renderer_writer import RendererWriter
 
         iface = Interface.objects.create(device=self.device, name="lag-60", type="lag")
-        vpn = L2VPN.objects.create(name="test-vpn", slug=f"nso-{self.device.pk}-test-vpn", type="vpws")
+        vpn = L2VPN.objects.create(name="test-vpn", slug=f"nso-{self.device.pk}-test-vpn", type="vpls")
         termination = L2VPNTermination.objects.create(l2vpn=vpn, assigned_object=iface)
         payload = {
             "services": [
@@ -92,32 +93,35 @@ class TestL2NativeRowsAreLocked(_ConcurrencyCase):
             ]
         }
         outcomes = []
-        original_body = l2_service_reconciler._reconcile_l2_services
+        original_save = RendererWriter.save
 
         def contend():
             try:
-                for obj in (vpn, termination):
-                    try:
-                        with transaction.atomic():
-                            type(obj).objects.select_for_update(nowait=True).get(pk=obj.pk)
-                    except OperationalError as exc:
-                        outcomes.append(getattr(exc.__cause__, "sqlstate", None))
-                    else:
-                        outcomes.append("unlocked")
+                try:
+                    with transaction.atomic():
+                        L2VPN.objects.select_for_update(nowait=True).get(pk=vpn.pk)
+                except OperationalError as exc:
+                    outcomes.append(getattr(exc.__cause__, "sqlstate", None))
+                else:
+                    outcomes.append("unlocked")
             finally:
                 connections.close_all()
 
-        def check_locks_then_reconcile(*args):
-            contender = threading.Thread(target=contend)
-            contender.start()
-            self.addCleanup(contender.join, 30)
-            contender.join(timeout=30)
-            self.assertFalse(contender.is_alive())
-            self.assertEqual(outcomes, ["55P03", "55P03"])
-            return original_body(*args)
+        def check_locks_then_save(writer, instance, **kwargs):
+            if isinstance(instance, L2VPN) and instance.pk == vpn.pk:
+                contender = threading.Thread(target=contend)
+                contender.start()
+                self.addCleanup(contender.join, 30)
+                contender.join(timeout=30)
+                self.assertFalse(contender.is_alive())
+                self.assertEqual(outcomes, ["55P03"])
+            return original_save(writer, instance, **kwargs)
 
-        with patch.object(l2_service_reconciler, "_reconcile_l2_services", new=check_locks_then_reconcile):
+        with patch.object(RendererWriter, "save", new=check_locks_then_save):
             rows = l2_service_reconciler.reconcile_l2_services(self.device, payload)
+        self.assertEqual(outcomes, ["55P03"])
+        vpn.refresh_from_db()
+        self.assertEqual(vpn.type, "vpws")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].l2vpn_id, vpn.pk)
         self.assertEqual(rows[0].termination_id, termination.pk)

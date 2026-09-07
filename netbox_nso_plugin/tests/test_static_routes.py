@@ -192,19 +192,25 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertTrue(state.static_route.devices.filter(pk=self.device.pk).exists())
 
     def test_plan_locks_the_native_route_resolved_from_the_payload(self):
+        from netbox_routing.models import StaticRoute
+
         self._make_mgmt(self.device, nso_device_name="sr-plan-dependencies")
         from netbox_nso_plugin.intent_state import SourceRow
-        from netbox_nso_plugin.template_content import _reconcile_static_routes, static_route_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
+        route = StaticRoute.objects.create(prefix="198.18.42.0/24", next_hop="198.18.0.42", metric=1)
+        self.assertFalse(route.devices.exists())
         payload = self._route_payload(self._route_entry("198.18.42.0/24", "198.18.0.42"))
         with self._auto_create_ctx(True):
-            rows = _reconcile_static_routes(self.device, payload)
-        route_id = rows[0].static_route_id
-        rows[0].delete()
+            plan = static_route_reconcile_plan(self.device, payload)
 
-        plan = static_route_reconcile_plan(self.device, payload)
-
-        self.assertIn(SourceRow("netbox_routing.staticroute", route_id), plan.lock_footprint.source_rows)
+        self.assertIn(SourceRow("netbox_routing.staticroute", route.pk), plan.lock_footprint.source_rows)
+        assignments = [write for write in plan.writes if write.operation == "m2m_add"]
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].model_label, "netbox_routing.staticroute")
+        self.assertEqual(assignments[0].pk, route.pk)
+        self.assertEqual(assignments[0].natural_key, (("field_name", "devices"),))
+        self.assertEqual(assignments[0].selected_pks, (self.device.pk,))
         self.assertFalse(plan.changes_content)
 
     def test_plan_matches_only_the_duplicate_route_selected_by_the_body(self):
