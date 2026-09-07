@@ -2367,6 +2367,49 @@ class TestRoutingStateAcceptView(ViewTestBase):
         self.assertEqual(state.accepted_at, original)
 
 
+class TestSwitchportStateAcceptView(ViewTestBase):
+    """Per-row switchport accept: native L2 write plus the ownership marker."""
+
+    def _switchport(self, name, **values):
+        from netbox_nso_plugin.models import NSOSwitchportState
+
+        interface = Interface.objects.create(device=self.device, name=name, type="1000base-t")
+        return NSOSwitchportState.objects.create(management=self.mgmt, interface=interface, mode="access", **values)
+
+    def _preview_switchport_rows(self):
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        data = json.loads(self.client.get(url).content)
+        return [row for row in data["routing_changes"] if row["category"] == "Switchport"]
+
+    def test_accept_stamps_the_first_acceptance_time(self):
+        state = self._switchport("GigabitEthernet0/41", status="changed")
+
+        url = reverse("plugins:netbox_nso_plugin:switchport_accept", args=[state.pk])
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        state.interface.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertIsNotNone(state.accepted_at)
+        self.assertEqual(state.interface.mode, "access")
+
+    def test_reaccept_keeps_the_first_acceptance_time(self):
+        """staged_days measures the wait since FIRST acceptance; a re-accept must not reset it."""
+        from django.utils import timezone
+
+        original = timezone.now() - timedelta(days=12)
+        state = self._switchport("GigabitEthernet0/42", status="accepted", accepted_at=original)
+
+        url = reverse("plugins:netbox_nso_plugin:switchport_accept", args=[state.pk])
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.accepted_at, original)
+        self.assertEqual([row["staged_days"] for row in self._preview_switchport_rows()], [12])
+
+
 class TestNSOBulkAcceptView(ViewTestBase):
     """Tests for NSOBulkAcceptView."""
 

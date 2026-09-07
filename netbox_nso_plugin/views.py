@@ -5646,20 +5646,23 @@ def _switchport_accept_plan(state):
 
     from .renderer_writer import RendererMutationPlan, planned_m2m_set, planned_save
 
+    now = timezone.now()
     tagged = tuple(state.tagged_vlans.order_by("pk"))
     interface = copy.copy(state.interface)
     interface.mode = state.mode or ""
     interface.untagged_vlan = state.untagged_vlan
     candidate = copy.copy(state)
     candidate.status = _status_after_accept(state.status)
-    candidate.accepted_at = timezone.now()
+    # staged_days measures the wait since FIRST acceptance; a re-accept must not reset it.
+    if candidate.accepted_at is None:
+        candidate.accepted_at = now
     plan = RendererMutationPlan.build(
         saves=(
             planned_save(interface, update_fields=("mode", "untagged_vlan")),
             planned_save(candidate, update_fields=("status", "accepted_at")),
         ),
         m2m_writes=(planned_m2m_set(interface, "tagged_vlans", tagged),),
-        planned_at=candidate.accepted_at,
+        planned_at=now,
     )
     return plan, interface, candidate, tagged
 
