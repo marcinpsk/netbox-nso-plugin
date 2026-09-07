@@ -411,6 +411,31 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
 
         self.assertEqual(self._entries_for("CLJ", CommunityList).count(), 1)
 
+    def test_invalid_attempt_revision_shapes_do_not_journal_a_carrier(self):
+        from extras.models import JournalEntry
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        mgmt = self._make_mgmt()
+        self._owned_reconcile()
+        for revisions in ([], "invalid", 1, True):
+            with self.subTest(revisions=revisions):
+                attempt = NSOApplyAttempt.objects.create(
+                    management=mgmt,
+                    adapter_device_id=mgmt.adapter_device_id,
+                    selected={"route_policy": 41},
+                    scope_revisions=revisions,
+                )
+                carrier = _job(8528, in_sync=1)
+                carrier["apply_attempt_id"] = str(attempt.pk)
+
+                _journal_route_policy_apply(mgmt, carrier)
+
+                mgmt.refresh_from_db()
+                self.assertEqual(mgmt.last_journaled_apply_job, "")
+                self.assertFalse(JournalEntry.objects.exists())
+
     def test_newer_route_policy_revision_rejects_a_stale_carrier(self):
         from extras.models import JournalEntry
         from netbox_routing.models import CommunityList

@@ -262,6 +262,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
             _flag_link_error(mgmt, "Adapter mapping is broken; repair deferred to the next sweep.")
             continue
         expected_source = (mgmt.nso_instance_id, mgmt.nso_device_name, mgmt.adapter_device_id)
+        attempted_this_row = False
         try:
             from .intent_state import footprint_for_instance, intent_transaction
 
@@ -272,12 +273,8 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
                     or (current.nso_instance_id, current.nso_device_name, current.adapter_device_id) != expected_source
                 ):
                     raise _LinkReconcileNoOp
-                # Stamp for being TRIED, not for succeeding, and before the try: whether the
-                # re-onboard worked is not observable here (it happens in an on_commit callback
-                # that logs and returns), so a stamp conditional on success would never move a
-                # permanently broken row to the back of the queue.
                 attempted += 1
-                _mirror_management(current, adapter_link_attempted_at=now)
+                attempted_this_row = True
                 if state is _MOVED:
                     logger.warning(
                         "Adapter device for %s moved from id %s to %s — adopting",
@@ -299,5 +296,13 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:
         except Exception:  # noqa: BLE001 — one bad row must not abort the sweep
             logger.exception("Link reconcile failed for management row %s", mgmt.pk)
             continue
+        finally:
+            if attempted_this_row:
+                # Failed repairs still consume the cap. Keep their attempt stamp
+                # outside the repair transaction so rollback cannot starve the tail.
+                try:
+                    _mirror_management(mgmt, adapter_link_attempted_at=now)
+                except Exception:  # noqa: BLE001 — a stamp failure must not abort the sweep
+                    logger.exception("Link attempt stamp failed for management row %s", mgmt.pk)
     logger.info("Link reconcile: %d broken, %d repair attempted", len(broken), attempted)
     return len(broken), attempted

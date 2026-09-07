@@ -704,6 +704,44 @@ class TestCategoryViewSkipFallback(TestCase):
         self.user = User.objects.create_superuser(username=f"gv-{uuid.uuid4().hex[:6]}")
         self.client.force_login(self.user)
 
+    def test_a_vlan_planner_failure_keeps_the_category_available(self):
+        from ._outbox_case import own_vlan
+
+        row = own_vlan(self.mgmt, 220, "retained-vlan")
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "vlan"},
+        )
+        payload = {"vlans": [{"vlan_id": "invalid"}], "read_state": _rs()}
+        with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload):
+            response = self.client.get(url, {"refresh": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "retained-vlan")
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+
+    def test_a_vlan_planner_failure_does_not_abort_later_logging_reconcile(self):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        content_update(self.mgmt, manage_interfaces=True, manage_logging=True)
+        with ExitStack() as stack:
+            for fetcher, shape in _DEVICE_FETCHERS.items():
+                doc = dict(shape, read_state=_rs())
+                if fetcher == "get_vlan_database":
+                    doc["vlans"] = [{"vlan_id": "invalid"}]
+                elif fetcher == "get_logging_config":
+                    doc["local_levels"] = {"console_severity": "WARNING"}
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            context = reconcile_device(self.device, self.mgmt)
+
+        self.assertEqual(context["_gate"]["vlan"], "skipped_unavailable")
+        self.assertEqual(context["_gate"]["logging"], "ran")
+        self.assertEqual(NSOLoggingLevelState.objects.get(management=self.mgmt).console_severity, "WARNING")
+
     def test_skip_renders_last_known_rows(self):
         from netbox_nso_plugin.reconcile import reconcile_category
 

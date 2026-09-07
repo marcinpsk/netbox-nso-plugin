@@ -246,6 +246,10 @@ def carve_p2p_child(pool, family: str, override_mask: int | None = None):
     length = _get_p2p_child_length(pool, family, override_mask)
     pool.refresh_from_db()  # ensure pool.prefix is netaddr.IPNetwork, not a string
     available = pool.get_available_prefixes()
+    # Reserve a wholly unused child. Parent network and broadcast addresses can
+    # be hosts in a /31 or /127 child, so query the span as an address pool.
+    address_pool = Prefix(prefix=pool.prefix, vrf=pool.vrf, status="reserved", is_pool=True)
+    available &= address_pool.get_available_ips()
 
     child_network = None
     for cidr in available.iter_cidrs():

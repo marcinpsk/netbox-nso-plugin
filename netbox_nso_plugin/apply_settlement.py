@@ -202,6 +202,8 @@ def _failure_message(disposition, attempt_id, generation, scope):
 def _scope_result_is_success(generation, scope: str) -> bool:
     """Return whether the correlated carrier reports a successful scope snapshot."""
     result = generation.get("carrier_job_result")
+    if isinstance(result, dict) and f"{scope}_count_by_outcome" not in result:
+        return False
     counts = result.get(f"{scope}_count_by_outcome") if isinstance(result, dict) else None
     if (
         not isinstance(counts, dict)
@@ -406,6 +408,8 @@ def _record_replay_answer(attempt, result=None, error=None) -> None:
     from .models import NSOApplyAttempt
 
     if isinstance(result, dict):
+        if result.get("outcome") not in ("promoted", "no_op"):
+            return
         status = 200 if result.get("outcome") == "no_op" else 202
         response = result
     elif (

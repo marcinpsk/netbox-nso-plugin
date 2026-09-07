@@ -910,14 +910,19 @@ def gated_family_run(
         return GateResult(SKIPPED_STALE_ATTEMPT)
     from django.db import OperationalError
 
+    from .adapter_client import AdapterError
+    from .deployment import DeploymentQuiesced, DeploymentTransitionTimeout
     from .intent_state import RendererTargetsChanged
     from .models import NSODeviceManagement, NSOFamilyReadState
 
+    planning = False
     try:
         from .intent_state import MutationFootprint, ReconcileMutationPlan, reconcile_transaction
 
         scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
+        planning = pre_body is not None
         plan = pre_body() if pre_body is not None else None
+        planning = False
         if plan is None:
             plan = ReconcileMutationPlan(MutationFootprint.for_keys({(mgmt.device_id, scope) for scope in scopes}))
         elif isinstance(plan, MutationFootprint):
@@ -953,6 +958,13 @@ def gated_family_run(
         # admission may surface/mark its failure; never mark a successor's rows.
         if not _publication_identity_current(mgmt, family, decision, epoch):
             return GateResult(SKIPPED_STALE_ATTEMPT)
+        if planning and not isinstance(exc, (AdapterError, DeploymentQuiesced, DeploymentTransitionTimeout)):
+            from .reconcile import ReconcileScopeError
+
+            # A failed planner has no valid write footprint. Preserve its rows.
+            failure = ReconcileScopeError(mgmt, (), f"{family} planner")
+            failure._nso_publication_guard = (family, decision, epoch)
+            raise failure from exc
         exc._nso_publication_guard = (family, decision, epoch)
         raise
     return GateResult(decision.disposition, value)

@@ -3045,6 +3045,10 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 request, mgmt, "Adapter returned an invalid Apply response.", is_ajax=is_ajax
             )
         outcome = result.get("outcome")
+        if outcome not in ("promoted", "no_op"):
+            return self._apply_unreadable_response(
+                request, mgmt, "Adapter returned an invalid Apply outcome.", is_ajax=is_ajax
+            )
         _record_apply_response(prepared, http_status=200 if outcome == "no_op" else 202, response=result)
         expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
         if partition_error:
@@ -3071,10 +3075,6 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 )
             messages.info(request, msg)
             return redirect(_device_nso_tab_url(mgmt.device.pk))
-        if outcome != "promoted":
-            return self._apply_unreadable_response(
-                request, mgmt, "Adapter returned an invalid Apply outcome.", is_ajax=is_ajax
-            )
         generations = result.get("generations")
         if not isinstance(generations, list) or not generations:
             return self._apply_unreadable_response(

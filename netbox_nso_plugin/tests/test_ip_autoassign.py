@@ -693,7 +693,8 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
         assert not p2p.is_alive(), "the P2P allocation did not finish"
         assert not single.is_alive(), "the single allocation did not finish"
         assert not failures, failures
-        self.assertNotIn("deadlock", str(p2p_result["errors"]).lower())
+        self.assertEqual(p2p_result["errors"], [])
+        self.assertEqual(len(p2p_result["allocated"]), 2)
         self.assertEqual(single_result["errors"], [])
 
     def test_link_role_wrapper_locks_the_pool_before_intent(self):
@@ -1152,6 +1153,22 @@ class TestCarveP2PChild(TestCase):
         self.assertTrue(host_b.endswith("/31"))
         self.assertNotEqual(host_a, host_b)
 
+    def test_carve_skips_a_block_with_an_existing_host(self):
+        from netbox_nso_plugin.ip_autoassign import carve_p2p_child
+
+        for prefix, occupied, family, expected in (
+            ("198.18.96.0/29", "198.18.96.1/29", "ipv4", "198.18.96.2/31"),
+            ("2001:db8::/125", "2001:db8::1/125", "ipv6", "2001:db8::2/127"),
+        ):
+            with self.subTest(family=family):
+                pool = Prefix.objects.create(prefix=prefix)
+                IPAddress.objects.create(address=occupied)
+                result = carve_p2p_child(pool, family)
+                self.assertIsNotNone(result)
+                child, host_a, host_b = result
+                self.assertEqual(str(child.prefix), expected)
+                self.assertNotEqual(host_a, host_b)
+
     def test_carve_v6_returns_127_prefix(self):
         from netbox_nso_plugin.ip_autoassign import carve_p2p_child
 
@@ -1159,6 +1176,48 @@ class TestCarveP2PChild(TestCase):
         self.assertIsNotNone(result)
         child, host_a, host_b = result
         self.assertTrue(host_a.endswith("/127"))
+
+    def test_carve_keeps_parent_edge_hosts_in_an_empty_child(self):
+        from netbox_nso_plugin.ip_autoassign import carve_p2p_child
+
+        for prefix, family, expected_host in (
+            ("198.18.96.0/29", "ipv4", "198.18.96.0/31"),
+            ("2001:db8::/125", "ipv6", "2001:db8::/127"),
+        ):
+            with self.subTest(family=family):
+                pool = Prefix.objects.create(prefix=prefix)
+                _child, host_a, _host_b = carve_p2p_child(pool, family)
+                self.assertEqual(host_a, expected_host)
+
+    def test_global_container_carve_uses_the_child_vrf(self):
+        from ipam.models import VRF
+
+        from netbox_nso_plugin.ip_autoassign import carve_p2p_child
+
+        pool = Prefix.objects.create(prefix="198.18.96.0/29", status="container")
+        other_vrf = VRF.objects.create(name="separate-allocation")
+        IPAddress.objects.create(address="198.18.96.1/29", vrf=other_vrf)
+
+        child, _host_a, _host_b = carve_p2p_child(pool, "ipv4")
+
+        self.assertIsNone(child.vrf_id)
+        self.assertEqual(str(child.prefix), "198.18.96.0/31")
+
+    def test_carve_skips_a_populated_range(self):
+        import netaddr
+
+        from netbox_nso_plugin.ip_autoassign import carve_p2p_child
+
+        pool = Prefix.objects.create(prefix="198.18.96.0/29")
+        IPRange.objects.create(
+            start_address=netaddr.IPNetwork("198.18.96.0/29"),
+            end_address=netaddr.IPNetwork("198.18.96.3/29"),
+            mark_populated=True,
+        )
+
+        child, _host_a, _host_b = carve_p2p_child(pool, "ipv4")
+
+        self.assertEqual(str(child.prefix), "198.18.96.4/31")
 
     def test_carve_exhausted_pool_returns_none(self):
         from netbox_nso_plugin.ip_autoassign import carve_p2p_child

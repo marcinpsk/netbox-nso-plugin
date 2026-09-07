@@ -260,6 +260,48 @@ class TestAttemptSettlement(TestCase):
         self.assertIn("later device reads did not show this value", identified.last_apply_error)
         self.assertEqual(unidentified.status, "deploying")
 
+    def test_missing_carrier_counters_wait_then_fail_without_success_evidence(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+        from netbox_nso_plugin.models import NSOLoggingLevelState, NSOSVIState
+        from netbox_nso_plugin.reconcile import _stuck_deploying_grace
+
+        interface = Interface.objects.create(device=self.device, name="Vlan220", type="virtual")
+        rows = [
+            NSOSVIState.objects.create(management=self.management, interface=interface, status="accepted"),
+            NSOLoggingLevelState.objects.create(
+                management=self.management, console_severity="WARNING", status="accepted"
+            ),
+        ]
+        attempt_id = uuid4()
+        selected = {"svi": 1, "logging": 2}
+        self._local_attempt(attempt_id, 75, selected)
+        for row in rows:
+            mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
+        evidence = _attempt(attempt_id, self.adapter_device_id, 75, selected, "settled", result={})
+        generation = evidence["generations"][0]
+
+        class EvidenceSession:
+            def request(_self, method, url, **kwargs):
+                self.assertEqual(method, "POST")
+                self.assertTrue(url.endswith("/deployment-evidence"))
+                return make_response(200, _payload(self.adapter_device_id, [evidence]))
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=EvidenceSession()),
+        ):
+            for age, expected_status in (
+                (timedelta(0), "deploying"),
+                (_stuck_deploying_grace() + timedelta(seconds=1), "apply_failed"),
+            ):
+                generation["updated_at"] = (timezone.now() - age).isoformat()
+                settle_device_apply_attempts(self.management, static_route_feed_drained=True)
+                for row in rows:
+                    row.refresh_from_db()
+                    self.assertEqual(row.status, expected_status)
+
     def test_generation_timestamps_accept_whole_and_fractional_seconds(self):
         from netbox_nso_plugin.apply_settlement import _parse_time
 

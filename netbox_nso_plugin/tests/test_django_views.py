@@ -6966,16 +6966,23 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
             return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
     def test_an_ambiguous_apply_failure_leaves_the_attempt_recoverable(self):
+        unavailable = {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}}
+        self._assert_apply_response_is_recoverable((503, unavailable))
+
+    def test_an_unknown_apply_outcome_leaves_the_attempt_recoverable(self):
+        self._assert_apply_response_is_recoverable((202, {"outcome": "unrecognized"}))
+
+    def test_an_unknown_replay_outcome_leaves_the_attempt_recoverable(self):
+        unavailable = {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}}
+        self._assert_apply_response_is_recoverable((503, unavailable), malformed_replay=True)
+
+    def _assert_apply_response_is_recoverable(self, initial_response, *, malformed_replay=False):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         from .test_apply_settlement import _attempt, _payload
 
-        # Copied from ../nso-adapter/tests/api/openapi_snapshot.json ErrorEnvelope, with the
-        # nso_unreachable code the adapter answers 503 with.
-        unavailable = {"error": {"code": "nso_unreachable", "message": "NSO is not reachable", "detail": {}}}
-
-        response = self._apply(_ApplyBoundaryAdapter(lambda: (503, unavailable)))
+        response = self._apply(_ApplyBoundaryAdapter(lambda: initial_response))
 
         self.assertEqual(response.status_code, 502)
         attempt = NSOApplyAttempt.objects.get(management=self.mgmt)
@@ -6995,6 +7002,15 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         )
         unknown = _payload(adapter_device_id, [])
         unknown["unknown_apply_attempt_ids"] = [str(attempt.pk)]
+        if malformed_replay:
+            invalid_replay = _ApplyBoundaryAdapter(lambda: (202, {"outcome": "unrecognized"}), evidence=lambda: unknown)
+            config, session = invalid_replay.patches()
+            with config, session:
+                settle_device_apply_attempts(self.mgmt, static_route_feed_drained=True)
+            self.assertEqual(len(invalid_replay.apply_requests), 1)
+            attempt.refresh_from_db()
+            self.assertIsNone(attempt.http_status)
+            self.assertIsNone(attempt.response)
         known = _payload(adapter_device_id, [admitted])
         replayed = []
 

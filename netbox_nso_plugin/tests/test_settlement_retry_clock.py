@@ -204,6 +204,25 @@ class TestTheRepairCapRotates(_SettlementCase):
         device = _make_device(f"starve{index}")
         return device, _make_mgmt(device, f"starve{index}", 900 + index)
 
+    def test_incomplete_attempts_have_controlled_unknown_evidence(self):
+        from netbox_nso_plugin.adapter_client import get_deployment_evidence
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        _device, management = self._broken_row(0)
+        for response in (None, {}, {"generations": []}):
+            with self.subTest(response=response):
+                attempt = NSOApplyAttempt.objects.create(
+                    management=management,
+                    adapter_device_id=management.adapter_device_id,
+                    selected={"static_route": 1},
+                    response=response,
+                )
+
+                evidence = get_deployment_evidence(management.adapter_device_id, [attempt.pk])
+
+                self.assertEqual(evidence["attempts"], [])
+                self.assertEqual(evidence["unknown_apply_attempt_ids"], [str(attempt.pk)])
+
     def test_a_failing_head_cannot_starve_a_repairable_tail_row(self):
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.adapter_client import AdapterError
@@ -240,6 +259,54 @@ class TestTheRepairCapRotates(_SettlementCase):
         assert tail_mgmt.adapter_link_attempted_at is not None, "a permanently failing head held the cap forever"
         assert tail_mgmt.adapter_device_id == 1
         assert state.status == "in_sync", "the starved row's settlement never used a live id"
+
+    def test_a_repair_save_failure_rotates_without_committing_content_changes(self):
+        from django.db import connection
+        from psycopg import sql
+
+        from netbox_nso_plugin import sync_cache
+        from netbox_nso_plugin.models import NSOIntentRevision
+
+        head_device, head = self._broken_row(0)
+        _tail_device, tail = self._broken_row(1)
+        mirror_update(head, adapter_link_error="")
+        original_adapter_id = head.adapter_device_id
+        revisions = NSOIntentRevision.objects.filter(device=head_device).order_by("scope")
+        original_revisions = list(revisions.values_list("scope", "revision"))
+        table = sql.Identifier(head._meta.db_table)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "CREATE FUNCTION pg_temp.reject_link_repair() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                    "BEGIN IF NEW.id = {} THEN "
+                    "RAISE check_violation USING MESSAGE = 'Repair save rejected by the test'; "
+                    "END IF; RETURN NEW; END $$"
+                ).format(sql.Literal(head.pk))
+            )
+            cursor.execute(
+                sql.SQL(
+                    "CREATE TRIGGER reject_link_repair BEFORE UPDATE OF nso_device_name ON {} "
+                    "FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_link_repair()"
+                ).format(table)
+            )
+        try:
+            with patch.object(sync_cache, "MAX_RELINKS_PER_RUN", 1):
+                self._tick()
+                tail.refresh_from_db()
+                self.assertIsNone(tail.adapter_link_attempted_at)
+                self._tick()
+
+            head.refresh_from_db()
+            tail.refresh_from_db()
+            self.assertIsNotNone(head.adapter_link_attempted_at)
+            self.assertEqual(head.adapter_device_id, original_adapter_id)
+            self.assertEqual(list(revisions.values_list("scope", "revision")), original_revisions)
+            self.assertIsNotNone(tail.adapter_link_attempted_at)
+            self.assertEqual(tail.adapter_device_id, 1)
+        finally:
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL("DROP TRIGGER reject_link_repair ON {}").format(table))
+                cursor.execute("DROP FUNCTION pg_temp.reject_link_repair()")
 
     def test_repair_convergence_is_ceil_b_over_c_ticks(self):
         """The weaker case, which the fairness fix is NOT needed for — and so cannot prove."""

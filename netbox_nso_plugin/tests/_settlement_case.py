@@ -134,7 +134,11 @@ def _pending_attempt_evidence(adapter_device_id, requested_ids):
             unknown.append(str(attempt_id))
             continue
         response = attempt.response
-        generation_id = response["generations"][0]["generation_id"]
+        generations = response.get("generations") if isinstance(response, dict) else None
+        if not isinstance(generations, list) or not generations:
+            unknown.append(str(attempt_id))
+            continue
+        generation_id = generations[0]["generation_id"]
         attempts.append(
             {
                 "apply_attempt_id": str(attempt.pk),

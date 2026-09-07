@@ -189,12 +189,14 @@ def _gated(
             guard[2],
             lambda: _mark_scope_error(error_management, error_models),
         )
-        if marked:
+        if marked and error_models:
             logger.exception(
                 "nso reconcile: %s failed; marking %s rows error",
                 exc.fn_name,
                 ",".join(exc.model_names),
             )
+        elif marked:
+            logger.exception("nso reconcile: %s failed; preserving existing rows", exc.fn_name)
         result = GateResult(SKIPPED_UNAVAILABLE if marked else SKIPPED_STALE_ATTEMPT)
     if result.disposition not in (RAN, LEGACY):
         # A body can assign display context before the final publication fence
@@ -1299,7 +1301,9 @@ def _journal_route_policy_apply_locked(mgmt, job: dict, row_ids) -> None:
             attempt = NSOApplyAttempt.objects.filter(pk=apply_attempt_id, management=mgmt).first()
         except (TypeError, ValueError, ValidationError):
             return
-        expected_revision = None if attempt is None else attempt.scope_revisions.get("route_policy")
+        if attempt is None or not isinstance(attempt.scope_revisions, dict):
+            return
+        expected_revision = attempt.scope_revisions.get("route_policy")
         current_revision = (
             NSOIntentRevision.objects.filter(device_id=mgmt.device_id, scope="route_policy")
             .values_list("revision", flat=True)
