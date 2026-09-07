@@ -334,9 +334,10 @@ class TestGateTransitions(TestCase):
 
     def test_plan_failure_carries_the_publication_guard(self):
         from netbox_nso_plugin.read_gate import gated_family_run
+        from netbox_nso_plugin.reconcile import ReconcileScopeError
 
         boom = RuntimeError("plan failed")
-        with self.assertRaises(RuntimeError) as raised:
+        with self.assertRaises(ReconcileScopeError) as raised:
             gated_family_run(
                 self.mgmt,
                 "bfd",
@@ -347,6 +348,8 @@ class TestGateTransitions(TestCase):
             )
 
         self.assertEqual(raised.exception._nso_publication_guard[0], "bfd")
+        self.assertIs(raised.exception.__cause__, boom)
+        self.assertEqual(raised.exception.model_names, ())
 
     def test_changed_renderer_targets_skip_the_admitted_publication(self):
         from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan, RendererTargetsChanged
