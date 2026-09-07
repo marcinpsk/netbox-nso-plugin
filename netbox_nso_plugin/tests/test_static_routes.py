@@ -570,8 +570,13 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(revision.revision, before + 1)
         self.assertTrue(sr.devices.filter(pk=self.device.pk).exists())  # association kept
 
-    def test_a_vanished_confirmed_route_repends_a_deploying_sibling(self):
-        """A vanished confirmed route bears content, so every deploying row in the scope is stale."""
+    def test_a_vanished_confirmed_route_keeps_a_deploying_sibling_pending(self):
+        """A vanished confirmed route bears content, but content alone cannot end an Apply.
+
+        The scope revision still advances, so the next push carries the new content. The
+        sibling keeps its attempt identity because only a correlated apply result settles
+        this family (#1502 Appendix S), and voiding it here would strand the evidence.
+        """
         from uuid import uuid4
 
         from netbox_routing.models import StaticRoute
@@ -600,7 +605,7 @@ class TestReconcileStaticRoutes(TestCase):
         confirmed.status = "in_sync"
         confirmed.save(update_fields=["status"])
         attempt_id = uuid4()
-        # Marked LAST, and lifecycle-only: a sibling content write re-pends a deploying row.
+        # Marked LAST, and lifecycle-only: the Apply this row waits on is already in flight.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt_id)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
         before = revision.revision
@@ -614,10 +619,63 @@ class TestReconcileStaticRoutes(TestCase):
         deploying.refresh_from_db()
         confirmed.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(deploying.status, "accepted")
-        self.assertIsNone(deploying.apply_attempt_id)
+        self.assertEqual(deploying.status, "deploying")
+        self.assertEqual(deploying.apply_attempt_id, attempt_id)
         self.assertEqual(confirmed.status, "changed")
         self.assertEqual(revision.revision, before + 1)
+
+    def test_a_drifting_confirmed_route_keeps_a_deploying_sibling_pending(self):
+        """Reported value drift bears content for the scope, but it is not an operator edit.
+
+        The confirmed row's metric (then its tag) disagrees with the device, so the read is
+        content-bearing and bumps the static-route revision. The sibling's Apply is still in
+        flight, and only a correlated apply result may end it: voiding its attempt here
+        discards the identity the settlement evidence is addressed to.
+        """
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.template_content import _reconcile_static_routes
+
+        from ._outbox_case import mirror_update
+
+        mgmt = self._make_mgmt(self.device, nso_device_name="sr-drift-sibling")
+        confirmed = self._tagged_route("198.18.80.0/24", "198.18.2.1", tag=None)
+        pending = self._tagged_route("198.18.81.0/24", "198.18.2.2", tag=None)
+        confirmed_state = confirmed.nso_states.create(management=mgmt, status="in_sync")
+        attempt_id = uuid4()
+        pending_state = mirror_update(
+            pending.nso_states.create(management=mgmt, status="accepted"),
+            status="deploying",
+            apply_attempt_id=attempt_id,
+        )
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="static_route")
+
+        for drift in ({"metric": 99}, {"tag": 7}):
+            with self.subTest(**drift):
+                # Re-marked per case, so the tag case is not decided by the metric case.
+                mirror_update(pending_state, status="deploying", apply_attempt_id=attempt_id)
+                revision.refresh_from_db()
+                before = revision.revision
+
+                _reconcile_static_routes(
+                    self.device,
+                    self._route_payload(
+                        dict(self._route_entry(str(confirmed.prefix), str(confirmed.next_hop)), **drift),
+                        self._route_entry(str(pending.prefix), str(pending.next_hop)),
+                    ),
+                )
+
+                pending_state.refresh_from_db()
+                confirmed_state.refresh_from_db()
+                confirmed.refresh_from_db()
+                revision.refresh_from_db()
+                self.assertEqual(pending_state.status, "deploying")
+                self.assertEqual(pending_state.apply_attempt_id, attempt_id)
+                # Confirmed drift keeps its own effect: ownership, shared values, one bump.
+                self.assertEqual(confirmed_state.status, "in_sync")
+                self.assertEqual((confirmed.metric, confirmed.tag), (1, None))
+                self.assertEqual(revision.revision, before + 1)
 
     def test_stale_owned_interface_route_does_not_advance_revision(self):
         """Removing an already excluded interface route changes lifecycle only."""

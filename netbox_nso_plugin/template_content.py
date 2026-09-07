@@ -1211,7 +1211,8 @@ def _static_route_reconcile_plan(device, payload):
             static_route_id__in=reported_route_ids,
         ).values_list("static_route_id", flat=True)
         changes_content = StaticRoute.objects.filter(pk__in=owned_reported_route_ids).exclude(devices=device).exists()
-    return ReconcileMutationPlan(footprint, changes_content=changes_content)
+    # Only a correlated apply result may end an Apply, so acquiring this must not void one.
+    return ReconcileMutationPlan(footprint, changes_content=changes_content, settles_deploying=False)
 
 
 @mirror_reconciler
