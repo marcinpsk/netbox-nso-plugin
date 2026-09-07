@@ -480,9 +480,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         """An operator edit committed after the plan must not be clobbered from a stale copy.
 
         Only the standalone entry replans a stale pre-image, once. The gated read refuses it
-        (IntentPlanStaleError), and on the whole-device path that refusal becomes the
-        family's scope error: unowned rows go to ``error`` until the next read re-plans.
-        SVI behaves the same. Card #1659 tracks the gate-path race.
+        (IntentPlanStaleError), and on both the category and the whole-device path that refusal
+        is reported as a skipped stale attempt: no row is moved to ``error``, and the next read
+        re-plans. SVI behaves the same. Card #1659 tracks the gate-path race.
         """
         from netbox_nso_plugin.models import NSOSwitchportState
         from netbox_nso_plugin.vlan_reconciler import (

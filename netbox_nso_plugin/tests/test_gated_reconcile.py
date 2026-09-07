@@ -927,6 +927,104 @@ class TestDefaultPlanContentMutation(TestCase):
         self.assertIsNone(deploying.apply_attempt_id)
 
 
+class TestStalePlanRace(TestCase):
+    """A competing edit committed after planning is a stale attempt, not a scope fault."""
+
+    def setUp(self):
+        self.device, self.mgmt = _make(f"gz{uuid.uuid4().hex[:6]}", manage_interfaces=True)
+
+    @staticmethod
+    def _svi_doc(attempt_id=1):
+        return {
+            "interfaces": [{"interface_name": "Vlan10", "type": "svi", "vrf": ""}],
+            "read_state": _rs(attempt_id=attempt_id),
+        }
+
+    def _seed(self):
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch("netbox_nso_plugin.adapter_client.get_svi", return_value=self._svi_doc()):
+            ctx = reconcile_category(self.device, self.mgmt, "svi")
+        self.assertEqual(ctx["_gate"]["svi"], "ran")
+        return NSOSVIState.objects.get(management=self.mgmt, interface__name="Vlan10")
+
+    @staticmethod
+    def _planner_that_stales(state):
+        """Freeze the real SVI plan, then commit the lifecycle write that stales it."""
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+
+        def plan(device, payload):
+            frozen = svi_reconcile_plan(device, payload)
+            mirror_update(state, last_apply_error="the device refused the last apply")
+            return frozen
+
+        return plan
+
+    def _markers(self):
+        from netbox_nso_plugin.models import NSOFamilyReadState
+
+        row = NSOFamilyReadState.objects.get(management=self.mgmt, family="svi")
+        return (
+            row.applied_attempt_id,
+            row.applied_incarnation,
+            row.applied_source_epoch,
+            row.applied_payload_revision,
+            row.applied_publication_sequence,
+        )
+
+    def _assert_skipped_without_fault(self, ctx, state, status_before, markers_before):
+        self.assertEqual(ctx["_gate"]["svi"], "skipped_stale_attempt")
+        self.assertEqual(self._markers(), markers_before)
+        state.refresh_from_db()
+        self.assertEqual(state.status, status_before)
+        self.assertNotEqual(state.status, "error")
+        self.assertEqual(state.last_apply_error, "the device refused the last apply")
+
+    def test_category_svi_race_skips_without_faulting_the_scope(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        state = self._seed()
+        status_before = state.status
+        markers_before = self._markers()
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_svi", return_value=self._svi_doc(attempt_id=2)),
+            patch(
+                "netbox_nso_plugin.svi_reconciler.svi_reconcile_plan",
+                side_effect=self._planner_that_stales(state),
+            ),
+        ):
+            ctx = reconcile_category(self.device, self.mgmt, "svi")
+
+        self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
+
+    def test_device_svi_race_skips_without_faulting_the_scope(self):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        state = self._seed()
+        status_before = state.status
+        markers_before = self._markers()
+
+        with ExitStack() as stack:
+            for fetcher, shape in _DEVICE_FETCHERS.items():
+                doc = self._svi_doc(attempt_id=2) if fetcher == "get_svi" else dict(shape)
+                if fetcher != "get_state" and "read_state" not in doc:
+                    doc["read_state"] = _rs(attempt_id=2)
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            stack.enter_context(
+                patch(
+                    "netbox_nso_plugin.svi_reconciler.svi_reconcile_plan",
+                    side_effect=self._planner_that_stales(state),
+                )
+            )
+            ctx = reconcile_device(self.device, self.mgmt)
+
+        self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
+
+
 class TestContentionDispositions(TestCase):
     def setUp(self):
         self.device, self.mgmt = _make(f"gc{uuid.uuid4().hex[:6]}", manage_l2=True)

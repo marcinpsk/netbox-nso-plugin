@@ -930,6 +930,7 @@ def gated_family_run(
     from .deployment import DeploymentQuiesced, DeploymentTransitionTimeout
     from .intent_state import RendererTargetsChanged
     from .models import NSODeviceManagement, NSOFamilyReadState
+    from .renderer_writer import IntentPlanStaleError
 
     planning = False
     try:
@@ -978,7 +979,7 @@ def gated_family_run(
                     "last_updated",
                 ]
             )
-    except (RendererTargetsChanged, _SupersededPublication):
+    except (RendererTargetsChanged, IntentPlanStaleError, _SupersededPublication):
         return GateResult(SKIPPED_STALE_ATTEMPT)
     except Exception as exc:
         if isinstance(exc, OperationalError) and getattr(exc.__cause__, "sqlstate", None) in {"40P01", "40001"}:

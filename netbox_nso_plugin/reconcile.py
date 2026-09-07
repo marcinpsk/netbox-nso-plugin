@@ -77,17 +77,20 @@ def _safe_reconcile(ctx: dict, key: str, mgmt, model_names: tuple[str, ...], fn,
     """Run one reconciler, storing its result in ``ctx[key]``; isolate its failures.
 
     ``AdapterError`` is never caught here — it is raised while *fetching* the payload
-    (before ``fn`` runs) and is handled by the caller as a whole-device transient. Any
-    other exception is a genuine reconcile fault: the scope's rows are flipped to
+    (before ``fn`` runs) and is handled by the caller as a whole-device transient.
+    ``IntentPlanStaleError`` passes through too, so the read gate classifies the race as
+    a stale attempt on this path exactly as it does per category. Any other exception is
+    a genuine reconcile fault: the scope's rows are flipped to
     ``error`` (owned rows preserved) so the failure is visible, ``ctx[key]`` keeps its
     empty default, and the remaining scopes still reconcile instead of the whole device
     sync — and the worker — dying on one bad payload.
     """
     from .adapter_client import AdapterError
+    from .renderer_writer import IntentPlanStaleError
 
     try:
         ctx[key] = fn(*args)
-    except AdapterError:
+    except (AdapterError, IntentPlanStaleError):
         raise
     except Exception as exc:  # noqa: BLE001 — the gate rolls the scope transaction back
         raise ReconcileScopeError(mgmt, model_names, fn.__name__) from exc
