@@ -2034,6 +2034,122 @@ def _link_routing_isis_interface(device, iface, af, state, instances: dict, bfd_
     return ri, False, base
 
 
+def _drops_owned_fragment(states) -> bool:
+    """Say whether a read stops reporting a row whose owned fragment it would drop."""
+    return any(
+        sm.is_owned(state.status) and not sm.is_owned(sm.on_reconcile(state.status, present=False)) for state in states
+    )
+
+
+def _isis_native_source_rows(device):
+    """Return the netbox-routing IS-IS rows an IS-IS read locks or writes."""
+    from .intent_state import SourceRow
+
+    try:
+        from netbox_routing.models import ISISInstance, ISISLevel
+    except ImportError:
+        return ()
+    instances = tuple(ISISInstance.objects.filter(device=device).order_by("pk"))
+    levels = tuple(ISISLevel.objects.filter(instance__in=instances).order_by("pk"))
+    return (
+        SourceRow("netbox_routing.isisinstance", None),
+        *(SourceRow("netbox_routing.isisinstance", instance.pk) for instance in instances),
+        SourceRow("netbox_routing.isislevel", None),
+        *(SourceRow("netbox_routing.isislevel", level.pk) for level in levels),
+    )
+
+
+def _isis_overlay_relink_changes_content(device, instance_states, payload) -> bool:
+    """Predict the read repointing an owned process overlay at another ISISInstance."""
+    import copy
+
+    from .intent_state import canonical_fragment
+
+    try:
+        from netbox_routing.models import ISISInstance
+    except ImportError:
+        return False
+    reported_tags = {
+        entry.get("process_tag")
+        for entry in payload.get("processes") or []
+        if isinstance(entry, dict) and entry.get("process_tag") is not None
+    }
+    resolved_by_tag = {}
+    for instance in ISISInstance.objects.filter(device=device, process_tag__in=reported_tags).order_by("pk"):
+        resolved_by_tag.setdefault(instance.process_tag, instance)
+    for state in instance_states:
+        if not sm.is_owned(state.status) or state.process_tag not in reported_tags:
+            continue
+        # get_or_create runs before the ownership check: a native tag rename repoints the link.
+        resolved = resolved_by_tag.get(state.process_tag)
+        if (resolved.pk if resolved is not None else None) == state.isis_instance_id:
+            continue
+        candidate = copy.copy(state)
+        candidate.isis_instance = resolved
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            return True
+    return False
+
+
+def isis_reconcile_plan(device, payload: dict):
+    """Declare every row the compound IS-IS read (interfaces + processes) can mutate."""
+    from dcim.models import Interface
+
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    interface_by_name = {interface.name: interface for interface in interfaces}
+    interface_states = tuple(NSOISISInterfaceState.objects.filter(management=management).order_by("pk"))
+    instance_states = tuple(
+        NSOISISInstanceState.objects.filter(management=management)
+        .select_related("management", "isis_instance")
+        .order_by("pk")
+    )
+    reported_interfaces = set()
+    for entry in payload.get("interfaces") or []:
+        if not isinstance(entry, dict):
+            continue
+        af = entry.get("af") or ""
+        # bound_port carries the Nokia physical/LAG binding the reconciler falls back to.
+        interface = interface_by_name.get(entry.get("interface_name") or "") or interface_by_name.get(
+            entry.get("bound_port") or ""
+        )
+        if af and interface is not None:
+            reported_interfaces.add((interface.pk, af))
+    reported_tags = {
+        entry.get("process_tag")
+        for entry in payload.get("processes") or []
+        if isinstance(entry, dict) and entry.get("process_tag") is not None
+    }
+    dropped = (
+        *(state for state in interface_states if (state.interface_id, state.af) not in reported_interfaces),
+        *(state for state in instance_states if state.process_tag not in reported_tags),
+    )
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "isis")},
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                SourceRow("dcim.interface", None),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+                *_isis_native_source_rows(device),
+            ),
+            overlay_rows=(
+                SourceRow(NSOISISInterfaceState._meta.label_lower, None),
+                SourceRow(NSOISISInstanceState._meta.label_lower, None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in (*interface_states, *instance_states)),
+            ),
+        ),
+        changes_content=(
+            _drops_owned_fragment(dropped) or _isis_overlay_relink_changes_content(device, instance_states, payload)
+        ),
+    )
+
+
 @mirror_reconciler
 def _reconcile_isis_interfaces(device, interfaces: list) -> list:
     """Reconcile IS-IS interface data from the adapter into NSOISISInterfaceState rows.
@@ -2688,6 +2804,142 @@ def _fill_ospf_interface(entry, iface, inst_by_pid, OSPFArea, OSPFInterface, bas
     if action == "freeze":
         return False, False, base
     return False, True, base  # conflict
+
+
+def _ospf_overlay_changes_content(instance_states, payload) -> bool:
+    """Predict the read rewriting a rendered column of an owned OSPF process overlay."""
+    import copy
+
+    from .intent_state import canonical_fragment
+
+    reported = {
+        str(entry.get("process_id")): entry
+        for entry in payload.get("instances") or []
+        if isinstance(entry, dict) and entry.get("process_id") is not None
+    }
+    for state in instance_states:
+        entry = reported.get(str(state.process_id))
+        if entry is None or not sm.is_owned(state.status):
+            continue
+        # router_id/vrf/areas are mirrored onto owned rows too, unlike every other family.
+        candidate = copy.copy(state)
+        candidate.router_id = _clean_router_id(entry.get("router_id"))
+        candidate.vrf = entry.get("vrf") or ""
+        candidate.areas = entry.get("areas") or []
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            return True
+    return False
+
+
+def _ospf_native_mirror_changes_content(instance_states, payload) -> bool:
+    """Predict the 3-way merge rewriting an OSPFInstance that owned intent renders."""
+    from ipam.models import VRF
+
+    from . import merge_util
+
+    owned = {
+        str(state.process_id): state
+        for state in instance_states
+        if sm.is_owned(state.status) and state.ospf_instance_id is not None
+    }
+    if not owned:
+        return False
+    for entry in payload.get("instances") or []:
+        if not isinstance(entry, dict):
+            continue
+        state = owned.get(str(entry.get("process_id")))
+        router_id = _clean_router_id(entry.get("router_id"))
+        if state is None or not router_id:
+            continue
+        vrf_name = entry.get("vrf") or ""
+        vrf = VRF.objects.filter(name=vrf_name).first() if vrf_name else None
+        vrf_key = merge_util.pk(vrf)
+        if vrf_name and vrf is None and _adapter_setting("vrf_auto_create"):
+            # The read materializes the VRF, so its content is new whatever pk it takes.
+            vrf_key = "auto-create"
+        obj = state.ospf_instance
+        action = merge_util.three_way(
+            created=False,
+            base=state.device_base_hash,
+            obj_hash=merge_util.content_hash({"router_id": str(obj.router_id), "vrf": obj.vrf_id}),
+            dev_hash=merge_util.content_hash({"router_id": str(router_id), "vrf": vrf_key}),
+        )
+        if action == "mirror":
+            return True
+    return False
+
+
+def _ospf_native_source_rows(device):
+    """Return the netbox-routing OSPF rows an OSPF read locks or writes."""
+    from .intent_state import SourceRow
+
+    OSPFInstance, _OSPFArea, _OSPFInterface = _import_ospf_models()
+    if OSPFInstance is None:
+        return ()
+    instances = tuple(OSPFInstance.objects.filter(device=device).order_by("pk"))
+    return (
+        SourceRow("netbox_routing.ospfinstance", None),
+        *(SourceRow("netbox_routing.ospfinstance", instance.pk) for instance in instances),
+    )
+
+
+def ospf_reconcile_plan(device, payload: dict):
+    """Declare every row one OSPF read (instances + interfaces) can mutate."""
+    from dcim.models import Interface
+
+    from .intent_state import MutationFootprint, ReconcileMutationPlan, SourceRow
+    from .models import NSODeviceManagement, NSOOSPFInstanceState, NSOOSPFInterfaceState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(MutationFootprint())
+    interfaces = tuple(Interface.objects.filter(device=device).order_by("pk"))
+    interface_by_name = {interface.name: interface for interface in interfaces}
+    instance_states = tuple(
+        NSOOSPFInstanceState.objects.filter(management=management)
+        .select_related("management", "ospf_instance")
+        .order_by("pk")
+    )
+    interface_states = tuple(NSOOSPFInterfaceState.objects.filter(management=management).order_by("pk"))
+    reported_processes = {
+        str(entry.get("process_id"))
+        for entry in payload.get("instances") or []
+        if isinstance(entry, dict) and entry.get("process_id") is not None
+    }
+    reported_interfaces = {
+        interface.pk
+        for entry in payload.get("interfaces") or []
+        if isinstance(entry, dict)
+        for interface in (interface_by_name.get(entry.get("interface_name") or ""),)
+        if interface is not None
+    }
+    dropped = (
+        *(state for state in instance_states if state.process_id not in reported_processes),
+        *(state for state in interface_states if state.interface_id not in reported_interfaces),
+    )
+    return ReconcileMutationPlan(
+        MutationFootprint.for_keys(
+            {(device.pk, "ospf")},
+            source_rows=(
+                SourceRow("dcim.device", device.pk),
+                SourceRow("dcim.interface", None),
+                *(SourceRow("dcim.interface", interface.pk) for interface in interfaces),
+                # _resolve_ospf_vrf may materialize the instance's VRF under vrf_auto_create.
+                SourceRow("ipam.vrf", None),
+                *_ospf_native_source_rows(device),
+            ),
+            overlay_rows=(
+                SourceRow(NSOOSPFInstanceState._meta.label_lower, None),
+                SourceRow(NSOOSPFInterfaceState._meta.label_lower, None),
+                *(SourceRow(state._meta.label_lower, state.pk) for state in (*instance_states, *interface_states)),
+            ),
+        ),
+        changes_content=(
+            _drops_owned_fragment(dropped)
+            or _ospf_overlay_changes_content(instance_states, payload)
+            or _ospf_native_mirror_changes_content(instance_states, payload)
+        ),
+    )
 
 
 @mirror_reconciler

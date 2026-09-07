@@ -319,6 +319,8 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         _reconcile_isis_process,
         _reconcile_ospf,
         _reconcile_static_routes,
+        isis_reconcile_plan,
+        ospf_reconcile_plan,
     )
 
     if not mgmt.manage_routing:
@@ -362,7 +364,15 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 isis_payload.get("processes", []),
             )
 
-        _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
+        _gated(
+            ctx,
+            mgmt,
+            "isis",
+            isis_payload,
+            _isis_body,
+            epoch=dev_id,
+            pre_body=lambda: isis_reconcile_plan(device, isis_payload),
+        )
     if mgmt.manage_route_policy:
         from .apply_settlement import route_policy_deploying_attempt_ids
 
@@ -407,6 +417,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ospf_doc,
             ),
             epoch=dev_id,
+            pre_body=lambda: ospf_reconcile_plan(device, ospf_doc),
         )
     if mgmt.manage_bgp:
         bgp_doc = client.get_bgp_config(dev_id)
@@ -753,6 +764,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
         _reconcile_snmp_config,
         _reconcile_static_routes,
         _upsert_interface_states,
+        isis_reconcile_plan,
+        ospf_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -1100,7 +1113,15 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
                 ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
 
-            _gated(ctx, mgmt, "isis", isis_payload, _isis_body, epoch=dev_id)
+            _gated(
+                ctx,
+                mgmt,
+                "isis",
+                isis_payload,
+                _isis_body,
+                epoch=dev_id,
+                pre_body=lambda: isis_reconcile_plan(device, isis_payload),
+            )
         elif key == "ospf":
             ospf_doc = client.get_ospf(dev_id)
             _gated(
@@ -1111,6 +1132,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_ospf(device, ospf_doc),
                 epoch=dev_id,
                 ctx_key="ospf_data",
+                pre_body=lambda: ospf_reconcile_plan(device, ospf_doc),
             )
         elif key == "bgp":
             from .models import NSOBGPPeerTemplateState
