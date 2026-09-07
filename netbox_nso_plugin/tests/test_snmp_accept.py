@@ -317,6 +317,47 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         assert raised.exception.code == "validation_error"
         mock_put.assert_not_called()
 
+    def test_an_owned_v3_user_missing_its_protocols_blocks_the_snapshot(self):
+        """Delivery can run before reconciliation surfaces the row. While it is still owned,
+        leaving it out of the FULL-REPLACE snapshot detaches it on the adapter side, so the
+        push must be refused rather than shrunk."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(mgmt, status="accepted")  # Vault ref present, protocols never declared
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
+
+        assert raised.exception.code == "validation_error"
+        assert str(user) in str(raised.exception), "the refusal must name the blocked row"
+        assert "no auth protocol is set" in str(raised.exception)
+        mock_put.assert_not_called()
+        user.refresh_from_db()
+        assert user.status == "accepted", f"a refused push must not change ownership (status={user.status})"
+
+    def test_an_owned_v3_host_without_a_username_blocks_the_snapshot(self):
+        """The host blocker alone has to refuse the snapshot: with no blocked v3 user row,
+        nothing else stops the reduced payload from being delivered."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        mgmt = self._make_mgmt()
+        host = self._host(mgmt, status="accepted")  # a v3 host that carries no security user name
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
+
+        assert raised.exception.code == "validation_error"
+        assert str(host) in str(raised.exception), "the refusal must name the blocked row"
+        assert "no security user name" in str(raised.exception)
+        mock_put.assert_not_called()
+        host.refresh_from_db()
+        assert host.status == "accepted", f"a refused push must not change ownership (status={host.status})"
+
     def test_accepting_a_v3_trap_host_is_refused(self):
         """The host overlay has no v3 username source, so a v3 host can only ever be pushed
         keyed on an empty user. It used to accept, then be dropped with a server-side log
