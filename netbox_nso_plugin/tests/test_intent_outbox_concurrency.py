@@ -762,6 +762,7 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
             "routers": [
                 {
                     "asn": "65100",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
