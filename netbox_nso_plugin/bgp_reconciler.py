@@ -1023,7 +1023,7 @@ def _reconcile_one_template(mgmt, scope_obj, template_obj, pg_entry, remote_asn_
 
     af_list = pg_entry.get("address_families") or []
 
-    state, state_created = NSOBGPPeerTemplateState.objects.get_or_create(
+    state, state_created = NSOBGPPeerTemplateState.objects.select_for_update().get_or_create(
         management=mgmt, template_name=template_obj.name, defaults={"status": "unknown"}
     )
     state.template = template_obj
@@ -1282,7 +1282,7 @@ def _reconcile_bgp_config_impl(device, payload: dict) -> list:
                 stale.status = new_status
                 stale.save(update_fields=["status"])
 
-    for stale_t in NSOBGPPeerTemplateState.objects.filter(management=mgmt):
+    for stale_t in NSOBGPPeerTemplateState.objects.select_for_update().filter(management=mgmt):
         if (mgmt.pk, stale_t.template_name) not in seen_template_names:
             new_status = sm.on_reconcile(stale_t.status, present=False)
             if new_status != stale_t.status:
