@@ -87,16 +87,25 @@ class TestSnmpAcceptView(_SnmpBase):
         """Accepting a differing (conflict) row creates intent → 'accepted' (pending apply)."""
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
+        from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt()
-        c = self._community(mgmt, status="conflict", vault_ref="secret/snmp/community#community")
+        vault_ref = "secret/snmp/community#community"
+        c = self._community(mgmt, status="conflict", vault_ref=vault_ref)
         self.client.force_login(_superuser())
-        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent"):
-            resp = self.client.post(f"/plugins/nso/snmp/community-state/{c.pk}/accept/")
+        # clear the thread-local pending-key cell so the captured delivery can only be the POST's own
+        reset_intent_push_state()
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.captureOnCommitCallbacks(execute=True):
+                resp = self.client.post(f"/plugins/nso/snmp/community-state/{c.pk}/accept/")
         assert resp.status_code == 302
         c.refresh_from_db()
         assert c.status == "accepted"
         assert c.accepted_at is not None
+        mock_put.assert_called_once()
+        # the endpoint delivers the community under the Vault ref the operator accepted
+        communities = mock_put.call_args[0][1]
+        assert [row["vault_ref"] for row in communities] == [vault_ref]
         revision = NSOIntentRevision.objects.get(device=self.device, scope="snmp")
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == delivery.canonical_fingerprint(
