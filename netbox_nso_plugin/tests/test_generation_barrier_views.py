@@ -52,6 +52,14 @@ class TestGenerationBarrierViews(_CascadeFlushMixin, IntentPushResetMixin, Trans
             [call.kwargs["json"] for call in session.request.call_args_list],
             [{"generation_id": 73}, {"generation_id": 73}],
         )
+        device_actions = f"{CFG['url']}/api/v1/devices/{self.management.adapter_device_id}/actions"
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in session.request.call_args_list],
+            [
+                ("POST", f"{device_actions}/retry-generation"),
+                ("POST", f"{device_actions}/abandon-generation"),
+            ],
+        )
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
