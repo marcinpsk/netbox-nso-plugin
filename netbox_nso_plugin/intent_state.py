@@ -3074,6 +3074,9 @@ def _comparison_column(comparison) -> str | None:
     tokens = _sql_tokens(comparison)
     if len(tokens) < 3 or tokens[1].value != "=" or not isinstance(tokens[0], Identifier):
         return None
+    # A trailing dot ("foo.") parses as an Identifier whose name lookup finds nothing.
+    if not tokens[0].get_real_name():
+        return None
     return _postgres_identifier_name(tokens[0])
 
 

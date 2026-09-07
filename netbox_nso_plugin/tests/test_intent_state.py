@@ -126,6 +126,19 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 [self.management.pk, self.state.vlan_id, self.state.pk],
             )
 
+    def test_registered_raw_dml_with_a_nameless_assignment_target_fails_closed(self):
+        table = NSOVLANState._meta.db_table
+        vlan_id = self.state.vlan_id
+
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'UPDATE "{table}" SET foo. = %s WHERE id = %s',
+                [vlan_id, self.state.pk],
+            )
+
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.vlan_id, vlan_id)
+
     def test_cte_led_raw_dml_requires_a_content_permit(self):
         table = NSOVLANState._meta.db_table
 
