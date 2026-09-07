@@ -637,9 +637,8 @@ def _declared_fields_fragment(instance):
     spec = _REGISTRY[instance._meta.label_lower]
     if instance._meta.label_lower == "dcim.interface" and instance.pk is None:
         return ABSENT
-    if instance._meta.app_label in {"dcim", "ipam", "netbox_routing"}:
-        if not _native_source_is_rendered(instance):
-            return ABSENT
+    if instance._meta.app_label in {"dcim", "ipam", "netbox_routing"} and not _native_source_is_rendered(instance):
+        return ABSENT
     if instance._meta.label_lower in OVERLAY_MODEL_RANKS and hasattr(instance, "status"):
         from .status_machine import is_owned
 

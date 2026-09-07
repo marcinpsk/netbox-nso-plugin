@@ -17,6 +17,7 @@ suite): the CONFIGURED redis connection, but uuid-isolated keys/queues no worker
 consumes, cleaned up in tearDown.
 """
 
+import contextlib
 import os
 import threading
 import time
@@ -1411,10 +1412,8 @@ class TestQueuedCarrierArbiter(TestCase):
 
         write_defer_marker(self.conn, self.device_id)
         with patch.object(self.queue, "enqueue", side_effect=RuntimeError("enqueue boom")):
-            try:
+            with contextlib.suppress(RuntimeError):
                 consume_marker_and_enqueue_successor(self.conn, self.device_id, self.queue)
-            except RuntimeError:
-                pass  # the OLD code raises here (marker already GETDEL'd → the lost edge)
         edge_represented = bool(self.queue.get_job_ids()) or self.conn.get(marker_key(self.device_id)) is not None
         self.assertTrue(edge_represented, "handoff lost the edge: marker gone AND no successor")
 

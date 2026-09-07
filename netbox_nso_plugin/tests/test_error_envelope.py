@@ -187,10 +187,7 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
         for label, url, method, data in self._response_cases():
             with self.subTest(site=label):
                 with self.assertLogs(_ADAPTER_LOG, level="WARNING") as logs:
-                    if method == "get":
-                        resp = self.client.get(url, **_AJAX)
-                    else:
-                        resp = self.client.post(url, data, **_AJAX)
+                    resp = self.client.get(url, **_AJAX) if method == "get" else self.client.post(url, data, **_AJAX)
                 body = resp.content.decode()
                 self.assertNotIn(_LEAK, body)
                 self.assertNotIn("ConnectionError", body)

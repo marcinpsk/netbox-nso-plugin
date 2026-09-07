@@ -887,9 +887,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 return global_source, None
             logger.warning("BGP: device source IP address %r is unresolvable in the scope VRF", value)
             return None, None
-        if current_peer is not None and current_peer.source is not None:
-            if str(current_peer.source.address.ip) == address:
-                return current_peer.source, None
+        if (
+            current_peer is not None
+            and current_peer.source is not None
+            and str(current_peer.source.address.ip) == address
+        ):
+            return current_peer.source, None
         return self.peer_ip(value, vrf), None
 
     def router(self, asn, router_id):

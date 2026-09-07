@@ -682,9 +682,8 @@ def maintain_manifest(instance) -> None:
             .order_by("-pk")
             .first()
         )
-        if previous is not None:
-            if adopt_manifest(previous.pk, native_key=native_key):
-                return
+        if previous is not None and adopt_manifest(previous.pk, native_key=native_key):
+            return
         # The identity read above and this write are two statements, so a peer audit can land
         # the same row in between. get_or_create absorbs that conflict in its own savepoint
         # instead of aborting the enclosing mirror transaction.

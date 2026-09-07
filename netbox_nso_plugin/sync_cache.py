@@ -13,6 +13,7 @@ the bare number would mirror that device's sync status onto this row and, on the
 push this row's scope, failover addresses and auto-apply flag onto it.
 """
 
+import contextlib
 import logging
 from datetime import UTC, datetime
 
@@ -131,10 +132,8 @@ def refresh_sync_cache(mgmt, adapter_device):
     if update_fields:
         persisted = _mirror_management(mgmt, **{field_name: getattr(mgmt, field_name) for field_name in update_fields})
         if not persisted:
-            try:
+            with contextlib.suppress(NSODeviceManagement.DoesNotExist):
                 mgmt.refresh_from_db(fields=update_fields)
-            except NSODeviceManagement.DoesNotExist:
-                pass
             return []
     return update_fields
 

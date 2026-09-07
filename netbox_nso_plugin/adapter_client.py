@@ -14,7 +14,7 @@ import socket
 import threading
 import time
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 
 import requests
@@ -238,11 +238,9 @@ class AbortableTransport(requests.adapters.HTTPAdapter):
         sock = conn.sock
         if sock is None:
             return
-        try:
+        with suppress(OSError):
             # Shutdown only. The pool closes its connection after the owning thread returns.
             sock.shutdown(socket.SHUT_RDWR)
-        except OSError:  # already gone: the request finished or the far side closed first
-            pass
 
     def abort(self) -> None:
         """Shut down the socket of every request in flight, so its reader comes back."""
@@ -294,10 +292,8 @@ def reset_session():
     """Drop the pooled session (tests; or to force a re-read of proxy/env on next call)."""
     global _session, _session_cls
     if _session is not None:
-        try:
+        with suppress(Exception):
             _session.close()
-        except Exception:  # noqa: BLE001 — best-effort close; a half-built/mock session may not implement it
-            pass
     _session = None
     _session_cls = None
 
