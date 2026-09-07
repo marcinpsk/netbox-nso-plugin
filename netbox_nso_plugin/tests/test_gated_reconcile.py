@@ -1059,7 +1059,7 @@ class TestCategoryViewSkipFallback(TestCase):
             "plugins:netbox_nso_plugin:device_nso_category",
             kwargs={"pk": self.device.pk, "key": "vlan"},
         )
-        payload = {"vlans": [{"vlan_id": "invalid"}], "read_state": _rs()}
+        payload = {"vlans": 1, "read_state": _rs()}
         with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload):
             response = self.client.get(url, {"refresh": "1"})
 
@@ -1079,7 +1079,7 @@ class TestCategoryViewSkipFallback(TestCase):
             for fetcher, shape in _DEVICE_FETCHERS.items():
                 doc = dict(shape, read_state=_rs())
                 if fetcher == "get_vlan_database":
-                    doc["vlans"] = [{"vlan_id": "invalid"}]
+                    doc["vlans"] = 1
                 elif fetcher == "get_logging_config":
                     doc["local_levels"] = {"console_severity": "WARNING"}
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
