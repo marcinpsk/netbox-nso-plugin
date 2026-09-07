@@ -98,6 +98,58 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(NSORedistributionState.objects.filter(management=management).count(), 1)
         self.assertEqual(Redistribution.objects.filter(source_protocol="static").count(), 1)
 
+    def test_category_reconcile_acquires_shared_policy_devices(self):
+        from netbox_routing.models import ISISInstance, Redistribution, RouteMap
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSODeviceManagement, NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_category
+
+        management = self._make_mgmt()
+        other_device = Device.objects.create(
+            name="rd-policy-router",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        other_management = NSODeviceManagement.objects.create(
+            device=other_device,
+            nso_instance=management.nso_instance,
+            nso_device_name=other_device.name,
+        )
+        route_map = RouteMap.objects.create(name="RM-SHARED")
+        NSORoutePolicyState.objects.create(
+            management=other_management,
+            family="route_map",
+            object_name=route_map.name,
+            assigned_object=route_map,
+            status="imported",
+        )
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        payload = {"entries": [self._entry(route_map=route_map.name)]}
+        footprints = []
+        acquire = intent_state._acquire
+
+        def record_acquisition(footprint, *args, **kwargs):
+            footprints.append(footprint)
+            return acquire(footprint, *args, **kwargs)
+
+        with (
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
+            patch("netbox_nso_plugin.adapter_client.get_redistribution", return_value=payload),
+            patch("netbox_nso_plugin.intent_state._acquire", record_acquisition),
+        ):
+            result = reconcile_category(self.device, management, "redistribution")
+
+        self.assertIn(result["_gate"]["redistribution"], ("ran", "legacy"))
+        state = result["redistribution_states"][0]
+        self.assertEqual(state.status, "imported")
+        redistribution = Redistribution.objects.get(pk=state.redistribution_id)
+        self.assertEqual(redistribution.destination, destination)
+        self.assertEqual(redistribution.route_map_id, route_map.pk)
+        self.assertTrue(footprints)
+        self.assertTrue(any({self.device.pk, other_device.pk} <= set(fp.device_ids) for fp in footprints))
+
     def test_missing_destination_stays_imported(self):
         """No matching ISISInstance → no Redistribution created, status=imported."""
         self._make_mgmt()

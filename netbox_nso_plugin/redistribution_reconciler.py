@@ -9,6 +9,7 @@ NSORedistributionState overlay row to it.
 """
 
 import logging
+from dataclasses import replace
 from typing import NamedTuple
 
 from .intent_state import mirror_reconciler
@@ -144,6 +145,10 @@ def redistribution_reconcile_plan(device, payload: dict):
         overlay_rows=policy_footprint.overlay_rows,
     )
     footprint = MutationFootprint.merge(footprint, policy_dependencies)
+    footprint = replace(
+        footprint,
+        device_ids=tuple(sorted({*footprint.device_ids, *policy_footprint.device_ids})),
+    )
     return ReconcileMutationPlan(
         footprint,
         changes_content=changes_content,
