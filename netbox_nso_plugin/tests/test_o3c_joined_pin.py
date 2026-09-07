@@ -811,7 +811,7 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
             FailingJoinedCase.setUpClass()
 
         assert events == ["start", "stop", "class-cleanup"]
-        assert settings.EMAIL_SUBJECT_PREFIX == original_prefix
+        assert original_prefix == settings.EMAIL_SUBJECT_PREFIX
         assert raised.exception.__notes__ == [
             "O3C environment cleanup failed with RuntimeError",
             "Django class cleanups failed with LookupError",
