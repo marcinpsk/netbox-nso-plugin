@@ -6357,7 +6357,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
 
         from .intent_state import RendererTargetsChanged
         from .models import NSODeviceManagement, NSOInterfaceIPState
-        from .renderer_writer import renderer_mirror_writes, renderer_writes
+        from .renderer_writer import IntentPlanStaleError, renderer_mirror_writes, renderer_writes
         from .signals import _schedule_intent_push, suppress_intent_push
 
         state = get_object_or_404(
@@ -6410,7 +6410,7 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
                     adapter_device_id__isnull=False,
                 ):
                     _schedule_intent_push((mgmt.device_id, "ip"))
-        except RendererTargetsChanged:
+        except (IntentPlanStaleError, RendererTargetsChanged):
             return JsonResponse(
                 {"status": "error", "errors": {"address": ["The address assignment changed. Refresh and retry."]}},
                 status=400,

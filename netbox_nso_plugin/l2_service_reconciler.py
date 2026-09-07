@@ -39,10 +39,6 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
     from dcim.models import Interface
     from django.contrib.contenttypes.models import ContentType
 
-    from dcim.models import Interface
-    from django.contrib.contenttypes.models import ContentType
-    from vpn.models import L2VPN, L2VPNTermination
-
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOL2SapState
     from .renderer_writer import planned_save
