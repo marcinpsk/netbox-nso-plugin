@@ -1661,8 +1661,11 @@ class TestCategoryViewSkipFallback(TestCase):
             "plugins:netbox_nso_plugin:device_nso_category",
             kwargs={"pk": self.device.pk, "key": "vlan"},
         )
-        payload = {"vlans": [{"vlan_id": float("inf"), "name": "planner-failure"}], "read_state": _rs()}
-        with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload):
+        payload = {"vlans": [{"vlan_id": 220, "name": "retained-vlan"}], "read_state": _rs()}
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload),
+            patch("netbox_nso_plugin.vlan_reconciler.vlan_reconcile_plan", side_effect=RuntimeError("planner failed")),
+        ):
             response = self.client.get(url, {"refresh": "1"})
 
         self.assertEqual(response.status_code, 200)
@@ -1678,11 +1681,15 @@ class TestCategoryViewSkipFallback(TestCase):
 
         content_update(self.mgmt, manage_interfaces=True, manage_logging=True)
         with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "netbox_nso_plugin.vlan_reconciler.vlan_reconcile_plan", side_effect=RuntimeError("planner failed")
+                )
+            )
             for fetcher, shape in _DEVICE_FETCHERS.items():
                 doc = dict(shape, read_state=_rs())
                 if fetcher == "get_vlan_database":
-                    # The document shape is valid, but int(infinity) raises OverflowError in the planner.
-                    doc["vlans"] = [{"vlan_id": float("inf"), "name": "planner-failure"}]
+                    doc["vlans"] = [{"vlan_id": 220, "name": "observed-vlan"}]
                 elif fetcher == "get_logging_config":
                     doc["local_levels"] = {"console_severity": "WARNING"}
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
