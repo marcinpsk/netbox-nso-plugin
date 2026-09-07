@@ -2575,7 +2575,7 @@ def _begin_implicit(
                     ).bumped
                 )
         except Exception:
-            _ACTIVE_PERMIT.reset(token)
+            _reset_pending_permit_token(permit, token)
             raise
     _authorize_dml(permit, spec.table)
     permits = dict(_IMPLICIT_PERMITS.get())
@@ -2627,7 +2627,7 @@ def _end_implicit(sender, instance, **kwargs):
                 with suppress_intent_push():
                     instance.save(update_fields=fields)
         finally:
-            _ACTIVE_PERMIT.reset(token)
+            _reset_pending_permit_token(permit, token)
 
 
 def _static_route_devices_footprint(instance, action, pk_set, reverse):
@@ -2707,7 +2707,7 @@ def _begin_m2m_implicit(sender, instance, action, **kwargs):
         if keys:
             permit.bumped.update(_acquire(footprint).bumped)
     except Exception:
-        _ACTIVE_PERMIT.reset(token)
+        _reset_pending_permit_token(permit, token)
         raise
     if spec is not None:
         _authorize_dml(permit, spec.table)
@@ -2820,24 +2820,26 @@ def _permit_footprint_tables(permit) -> set[str]:
 
 def _dml_guard(execute, sql, params, many, context):
     statement = str(sql)
+    # Every branch runs through the wrapper: a rejected statement must retire its implicit
+    # permit, whichever admission let it reach the database.
+    permit = _ACTIVE_PERMIT.get()
     if _MIGRATIONS_ACTIVE.get():
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     lowered_statement = statement.lower()
     if not any(table in lowered_statement for table in _registered_table_names()):
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     first_keyword = _FIRST_SQL_KEYWORD.match(statement)
     if first_keyword is not None and first_keyword.group(1).upper() in _DML_PARSE_SKIP_KEYWORDS:
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     target, unparseable = _parse_dml_target(statement)
     if target is None:
         mentioned = _mentioned_registered_tables(statement)
         if unparseable and mentioned:
             raise IntentMutationProtocolError(f"unparseable SQL mentions renderer input tables {sorted(mentioned)!r}")
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     if target.table not in _TABLE_REGISTRY:
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     touched_columns = _dml_columns(statement, target.operation)
-    permit = _ACTIVE_PERMIT.get()
     if target.operation == "INSERT INTO" and touched_columns == frozenset():
         if permit is None:
             # drift signal: this creation skips the pre_save bookkeeping (revision bump, re-pend)
@@ -2848,13 +2850,13 @@ def _dml_guard(execute, sql, params, many, context):
     guarded_fields = spec.content_fields | _FRAGMENT_GATE_FIELDS.get(spec.model_label, set())
     content_columns = {spec.model._meta.get_field(field_name).column for field_name in guarded_fields}
     if touched_columns and touched_columns.isdisjoint(content_columns):
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     if permit is not None and permit.dml_kind == "offline":
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     # source_pool is a declared content field, so the column-aware admission cannot reach the
     # collector's SET_NULL update: the pool pointer is an audit trail, not pushed IP intent.
     if _is_pool_delete_cascade(spec, touched_columns, statement, params, context["connection"]):
-        return execute(sql, params, many, context)
+        return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
     remaining = 0 if permit is None else permit.authorized_dml.get(table, 0)
     footprint_tables = _permit_footprint_tables(permit)
     if remaining < 1 and table not in footprint_tables:
@@ -2868,6 +2870,15 @@ def _dml_guard(execute, sql, params, many, context):
     if remaining:
         permit.authorized_dml[table] = remaining - 1
     return _execute_with_permit_cleanup(execute, sql, params, many, context, permit)
+
+
+def _reset_pending_permit_token(permit, token) -> None:
+    """Reset a permit token unless the guard already retired it."""
+    if permit is not None:
+        if token not in permit.tokens:
+            return
+        permit.tokens.remove(token)
+    _ACTIVE_PERMIT.reset(token)
 
 
 def _clear_failed_implicit_permit(permit) -> None:

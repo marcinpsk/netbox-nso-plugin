@@ -430,6 +430,61 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertIsNone(_ACTIVE_PERMIT.get())
 
+    def test_rejected_non_content_update_closes_its_implicit_permit(self):
+        from django.db import IntegrityError
+
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS
+
+        table = NSOVLANState._meta.db_table
+        self.state.last_apply_error = None
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.state.save(update_fields=["last_apply_error"])
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+        self.assertEqual(_IMPLICIT_PERMITS.get(), {})
+        with self.assertRaises(IntentMutationProtocolError), connection.cursor() as cursor:
+            cursor.execute(
+                f'UPDATE "{table}" SET device_name = %s WHERE id = %s',
+                ["stale-permit", self.state.pk],
+            )
+
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.device_name, "")
+
+    def test_rejected_deferred_lifecycle_update_reports_the_database_error(self):
+        from django.db import IntegrityError
+
+        from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT, _IMPLICIT_PERMITS
+
+        table = NSOVLANState._meta.db_table
+        attempt_id = uuid4()
+        self.state.status = "deploying"
+        self.state.apply_attempt_id = attempt_id
+        with transaction.atomic(), suppress_intent_push(), mirror_refresh(self.state, {"status", "apply_attempt_id"}):
+            self.state.save(update_fields=["status", "apply_attempt_id"])
+
+        def drop_constraint():
+            with connection.cursor() as cursor:
+                cursor.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS nso_vlan_attempt_required')
+
+        # The accepted transition defers clearing apply_attempt_id; this makes that write fail.
+        self.addCleanup(drop_constraint)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f'ALTER TABLE "{table}" ADD CONSTRAINT nso_vlan_attempt_required '
+                "CHECK (apply_attempt_id IS NOT NULL) NOT VALID"
+            )
+
+        self.state.status = "accepted"
+        with self.assertRaisesRegex(IntegrityError, "nso_vlan_attempt_required"), transaction.atomic():
+            self.state.save(update_fields=["status"])
+
+        self.assertIsNone(_ACTIVE_PERMIT.get())
+        self.assertEqual(_IMPLICIT_PERMITS.get(), {})
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.status, "deploying")
+        self.assertEqual(self.state.apply_attempt_id, attempt_id)
+
     def test_content_permit_rejects_a_write_outside_its_footprint(self):
         other_device, other_management = make_managed("intent-other", 1624, index=2)
         other = own_vlan(other_management, 1624, "intent-other")
