@@ -209,9 +209,8 @@ class _ApplyContractAdapter(ReceiptAdapter):
                     }
                 },
             )
-        if method == "PUT":
-            if not url.endswith(self.accepted_intent_suffixes):
-                raise ConnectionError(f"this contract case does not serve {url}")
+        if method == "PUT" and not url.endswith(self.accepted_intent_suffixes):
+            raise ConnectionError(f"this contract case does not serve {url}")
         return super()._handle(method, url, **kwargs)
 
 
