@@ -884,6 +884,53 @@ class TestAttemptSettlement(TestCase):
                 row.refresh_from_db()
                 self.assertEqual(row.status, "deploying")
 
+    def test_settled_generation_rejects_a_failed_carrier_snapshot(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+
+        attempt_id = uuid4()
+        local = self._local_attempt(attempt_id, 84, {"vlan": 424}, answered=False)
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            84,
+            {"vlan": 424},
+            "settled",
+            result={"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        )
+        evidence["generations"][0]["carrier_job_status"] = "failed"
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid carrier snapshot"):
+            settle_apply_attempts(
+                self.management,
+                _payload(self.adapter_device_id, [evidence]),
+                static_route_feed_drained=True,
+            )
+
+        local.refresh_from_db()
+        self.assertIsNone(local.http_status)
+        self.assertIsNone(local.response)
+
+    def test_settled_generation_rejects_a_missing_carrier_result(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
+
+        attempt_id = uuid4()
+        local = self._local_attempt(attempt_id, 85, {"vlan": 425}, answered=False)
+        evidence = _attempt(attempt_id, self.adapter_device_id, 85, {"vlan": 425}, "settled")
+
+        self.assertEqual(evidence["generations"][0]["carrier_job_status"], "succeeded")
+        self.assertIsNone(evidence["generations"][0]["carrier_job_result"])
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid carrier snapshot"):
+            settle_apply_attempts(
+                self.management,
+                _payload(self.adapter_device_id, [evidence]),
+                static_route_feed_drained=True,
+            )
+
+        local.refresh_from_db()
+        self.assertIsNone(local.http_status)
+        self.assertIsNone(local.response)
+
     def test_an_aged_settled_attempt_without_device_readback_fails_its_row(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
