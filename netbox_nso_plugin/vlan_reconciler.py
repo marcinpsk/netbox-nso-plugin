@@ -944,6 +944,11 @@ def _ordered_tagged_vlans(instance) -> tuple:
     return tuple(instance.tagged_vlans.order_by("pk"))
 
 
+def _save_identity(instance):
+    """Stable write identity shared by the consume pass and the execution pass."""
+    return (type(instance)._meta.label, instance.pk)
+
+
 def _switchport_object_content(interface) -> dict:
     """Return the live NetBox interface's L2 content."""
     nb_untagged = interface.untagged_vlan.vid if interface.untagged_vlan else None
@@ -996,11 +1001,14 @@ def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_p
         interface_pks,
     )
     raced_rows = set()
+    consumed_saves = set()
     consumed_m2m = set()
     for row in rows:
         interface = row.interface
         state_tagged = () if row.pk is None else _ordered_tagged_vlans(row)
-        writer.consume_applied_save(interface)
+        if writer.consume_applied_save(interface):
+            # the native operation carries a copy of the interface, so match by identity
+            consumed_saves.add(_save_identity(interface))
         if writer.consume_applied_m2m_set(interface, "tagged_vlans"):
             consumed_m2m.add((id(interface), "tagged_vlans"))
         related_vlans = {
@@ -1023,7 +1031,7 @@ def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_p
             consumed_m2m.add((id(row), "tagged_vlans"))
     for operation, instance, update_fields, force_insert, field_name, related in operations:
         if operation == "save":
-            if id(instance) in raced_rows:
+            if id(instance) in raced_rows or _save_identity(instance) in consumed_saves:
                 continue
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
         elif operation == "delete":

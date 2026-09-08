@@ -1083,6 +1083,39 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(rows[0].status, "imported")
 
+    def test_switchport_tagged_only_change_mirrors_after_the_scalar_save_is_consumed(self):
+        """A tagged-only device change still mirrors when the planned scalar save is a no-op."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        def trunk(vid):
+            return {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [vid],
+                    }
+                ]
+            }
+
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        imported = reconcile_switchport(self.device, trunk(10))
+        self.assertEqual(imported[0].status, "imported")
+        base_before = imported[0].device_base_hash
+
+        reconcile_switchport(self.device, trunk(20))
+
+        self.interface.refresh_from_db()
+        self.assertEqual([vlan.vid for vlan in self.interface.tagged_vlans.all()], [20])
+        state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual([vlan.vid for vlan in state.tagged_vlans.all()], [20])
+        self.assertNotEqual(state.device_base_hash, base_before)
+        self.assertEqual(state.status, "imported")
+
     def test_switchport_plan_prefetches_native_tagged_vlans_once(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
