@@ -1421,37 +1421,6 @@ def snmp_host_push_blocker(row) -> str:
     return ""
 
 
-def _drop_unpushable_snmp_rows(rows, blocker):
-    """Split *rows* into (pushable, blocked) and surface each blocked row as an error.
-
-    The renderer already omits each blocked row. Its canonical fragment is therefore
-    ABSENT both before and after the error badge update.
-    """
-    from django.db import transaction
-
-    from .intent_state import mirror_refresh
-
-    pushable, blocked = [], []
-    for row in rows:
-        reason = blocker(row)
-        if reason:
-            blocked.append(row)
-            logger.warning("SNMP intent: %s excluded from the snapshot — %s", row, reason)
-        else:
-            pushable.append(row)
-    if blocked:
-        with transaction.atomic(), suppress_intent_push():
-            for row in blocked:
-                if row.status == "error":
-                    continue
-                with mirror_refresh(row, {"status"}) as locked:
-                    if locked is None:
-                        continue
-                    locked.status = "error"
-                    locked.save(update_fields=["status"])
-    return pushable
-
-
 def _snmp_push_blockers(rows, blocker):
     """Return the reasons that prevent a complete SNMP snapshot."""
     blocked = []
@@ -1524,15 +1493,16 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
             continue
         communities.append(snmp_community_intent_item(row))
 
-    v3_users = []
     owned_v3 = list(
         NSOSnmpV3UserState.objects.filter(
             management__device_id=device_id,
             status__in=_OWNED_PUSH_STATUSES,
         )
     )
+    blocked.extend(_snmp_push_blockers(owned_v3, snmp_v3_user_push_blocker))
     blocked.extend(_snmp_push_blockers(owned_v3, snmp_vault_ref_push_blocker))
-    for row in _drop_unpushable_snmp_rows(owned_v3, snmp_v3_user_push_blocker):
+    v3_users = []
+    for row in owned_v3:
         # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at
         # "#auth"/"#priv" by convention. A leg without its protocol is not
         # derivable on-device, so its ref is withheld (the reconciler would
@@ -1549,7 +1519,8 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
             status__in=_OWNED_PUSH_STATUSES,
         )
     )
-    for row in _drop_unpushable_snmp_rows(owned_hosts, snmp_host_push_blocker):
+    blocked.extend(_snmp_push_blockers(owned_hosts, snmp_host_push_blocker))
+    for row in owned_hosts:
         hosts.append(snmp_host_intent_item(row, ned_id))
 
     system_info = None

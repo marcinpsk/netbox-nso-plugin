@@ -104,6 +104,17 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
         row = NSOSnmpHostState.objects.create(
             management=self.mgmt, address="10.0.0.7", version="3", notify_type="trap", status="accepted"
         )
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [],
+                "hosts": [{"address": row.address, "version": "3", "notify_type": "trap"}],
+                "system_info": None,
+            },
+        )
         hosts = self._push()
 
         self.assertEqual(hosts, [])
