@@ -884,7 +884,7 @@ class RendererWriter:
             matched.append(candidate)
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
-            raise IntentMutationProtocolError("the planned Collector cascade changed before delete")
+            raise IntentPlanStaleError("the planned Collector cascade changed before delete")
         from django.db.models.deletion import Collector
 
         collector = Collector(using=instance._state.db or "default", origin=instance)
