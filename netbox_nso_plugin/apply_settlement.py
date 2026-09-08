@@ -460,6 +460,37 @@ def _record_replay_answer(attempt, result=None, error=None) -> None:
     )
 
 
+def _reject_unrequested_attempts(evidence, attempt_ids) -> None:
+    """Refuse an evidence snapshot whose attempt records are malformed or unrequested."""
+    from . import adapter_client as client
+
+    raw_attempts = evidence.get("attempts")
+    if not isinstance(raw_attempts, list):
+        raise client.AdapterError(
+            "Adapter returned an invalid Apply attempt collection.",
+            code="invalid_response",
+        )
+    requested = set(attempt_ids)
+    for raw in raw_attempts:
+        if not isinstance(raw, dict) or "apply_attempt_id" not in raw:
+            raise client.AdapterError(
+                "Adapter returned an invalid Apply attempt record.",
+                code="invalid_response",
+            )
+        try:
+            raw_id = UUID(str(raw["apply_attempt_id"]))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise client.AdapterError(
+                "Adapter returned an invalid Apply attempt UUID.",
+                code="invalid_response",
+            ) from exc
+        if raw_id not in requested:
+            raise client.AdapterError(
+                "Adapter returned an unrequested Apply attempt.",
+                code="invalid_response",
+            )
+
+
 def load_deployment_evidence(management, *, attempt_ids=None):
     """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
     from . import adapter_client as client
@@ -470,6 +501,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     if not attempt_ids:
         return None
     evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+    _reject_unrequested_attempts(evidence, attempt_ids)
     raw_unknown = evidence.get("unknown_apply_attempt_ids", [])
     if not isinstance(raw_unknown, list):
         raise client.AdapterError(
@@ -513,6 +545,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         replayed = True
     if replayed:
         evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+        _reject_unrequested_attempts(evidence, attempt_ids)
     return evidence
 
 
