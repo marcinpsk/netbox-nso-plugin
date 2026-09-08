@@ -1116,6 +1116,94 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertNotEqual(state.device_base_hash, base_before)
         self.assertEqual(state.status, "imported")
 
+    def test_switchport_completed_tagged_replacement_is_not_re_executed(self):
+        """Consume completed tagged replacements without executing them again."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.merge_util import content_hash
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_set,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+        from netbox_nso_plugin.vlan_reconciler import (
+            prepare_switchport_reconcile,
+            reconcile_switchport,
+            reconcile_vlan_database,
+            switchport_reconcile_plan,
+        )
+
+        def acquire(plan):
+            # read_gate.gated_family_run picks the mutation for a renderer plan exactly this way
+            return renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "trunk",
+                    "untagged_vlan": None,
+                    "tagged_vlans": [10],
+                }
+            ]
+        }
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        state = reconcile_switchport(self.device, payload)[0]
+        self.interface.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.device_base_hash, content_hash({"mode": "tagged", "untagged": None, "tagged": [10]}))
+        self.assertEqual(set(self.interface.tagged_vlans.values_list("vid", flat=True)), {10})
+        self.assertEqual(set(state.tagged_vlans.values_list("vid", flat=True)), {10})
+
+        payload["interfaces"][0]["tagged_vlans"] = [10, 20]
+        waiting = prepare_switchport_reconcile(self.device, payload)
+        owners = (self.interface, state)
+        self.assertEqual(
+            {(write.model_label, write.pk) for write in waiting.plan.write_set if write.operation == "m2m_set"},
+            {(owner._meta.label_lower, owner.pk) for owner in owners},
+        )
+        target = tuple(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid__in=(10, 20)).order_by("pk"))
+        competing = RendererMutationPlan.build(
+            m2m_writes=tuple(planned_m2m_set(owner, "tagged_vlans", target) for owner in owners)
+        )
+        # The last point production allows: the competing writer commits before the frozen plan acquires.
+        with acquire(competing) as writer:
+            for owner in owners:
+                writer.m2m_set(owner, "tagged_vlans", target)
+
+        # What the apply-time rebuild will see under the lock: neither replacement is queued any more.
+        replanned = switchport_reconcile_plan(self.device, payload, waiting.interface_pks)
+        self.assertEqual([write for write in replanned.write_set if write.operation == "m2m_set"], [])
+
+        through_tables = {owner._meta.get_field("tagged_vlans").remote_field.through._meta.db_table for owner in owners}
+        # The gated path calls the public reconciler with the frozen plan's writer already acquired.
+        with acquire(waiting.plan) as writer, CaptureQueriesContext(connection) as queries:
+            rows = reconcile_switchport(self.device, payload, attempt=waiting)
+            writer.assert_complete()
+            for owner in owners:
+                self.assertFalse(writer.consume_applied_m2m_set(owner, "tagged_vlans"))
+
+        self.assertEqual(
+            [
+                query["sql"]
+                for query in queries
+                if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+                and any(table in query["sql"] for table in through_tables)
+            ],
+            [],
+        )
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.interface.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(set(self.interface.tagged_vlans.values_list("vid", flat=True)), {10, 20})
+        self.assertEqual(set(state.tagged_vlans.values_list("vid", flat=True)), {10, 20})
+        self.assertEqual(state.device_base_hash, content_hash({"mode": "tagged", "untagged": None, "tagged": [10, 20]}))
+        self.assertEqual(state.status, "imported")
+
     def test_switchport_plan_prefetches_native_tagged_vlans_once(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
