@@ -14,18 +14,21 @@ matches by construction. Hand-written payloads with a fixed id and someone else'
 exactly the mismatch the production code now refuses to trust.
 """
 
+import threading
 import unittest
 from datetime import UTC, datetime
 from unittest.mock import patch
 
 from dcim.models import Device
-from django.test import TestCase
+from django.db import connection
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._adapter_http import make_session
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_django_views import ViewTestBase
 
 _BASE_CFG = {
@@ -605,6 +608,81 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual((broken, attempted), (0, 0))
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 196)
+
+
+class TestReconcileDeviceLinksConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, update_mirror_fields
+
+        from .test_onboarding import _device
+
+        self.instance = NSOInstance.objects.create(name="cache-race", adapter_instance_id="cache-race-nso")
+        management = NSODeviceManagement(
+            device=_device("cache-rekey-race"),
+            nso_instance=self.instance,
+            nso_device_name="cache-rekey-race",
+            adapter_device_id=196,
+            onboard_status="provisioning",
+        )
+        with intent_transaction(footprint_for_instance(management)):
+            management.save(force_insert=True)
+        update_mirror_fields(management, onboard_status="")
+        self.mgmt = management
+
+    def test_a_rekey_started_before_repair_does_not_advance_revision(self):
+        """A repair skipped after acquisition leaves the intent revision unchanged."""
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        revision = NSOIntentRevision.objects.get(device=self.mgmt.device, scope="static_route")
+        before = revision.revision
+        candidate_loaded = threading.Barrier(2, timeout=30)
+        row_changed = threading.Barrier(2, timeout=30)
+        errors: list[BaseException] = []
+        from dcim.models import Interface
+
+        candidate_query_seen = False
+
+        def wait_after_candidate_query(execute, sql, params, many, context):
+            nonlocal candidate_query_seen
+            result = execute(sql, params, many, context)
+            if not candidate_query_seen and Interface._meta.db_table in sql:
+                candidate_query_seen = True
+                candidate_loaded.wait()
+                row_changed.wait()
+            return result
+
+        def start_rekey():
+            try:
+                candidate_loaded.wait()
+                current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                intent_state.update_mirror_fields(current, source_rekey_pending=True)
+                row_changed.wait()
+            except BaseException as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+                row_changed.abort()
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=start_rekey)
+        worker.start()
+        snapshot = ([self.mgmt], {}, {})
+        with self.assertNoLogs("netbox_nso_plugin.sync_cache", level="ERROR"):
+            with connection.execute_wrapper(wait_after_candidate_query):
+                result = reconcile_device_links(NSODeviceManagement.objects.all(), snapshot=snapshot)
+        worker.join(timeout=60)
+
+        assert not worker.is_alive(), "concurrent rekey writer did not finish"
+        assert errors == []
+        assert candidate_query_seen
+        assert result == (1, 0)
+        self.mgmt.refresh_from_db()
+        revision.refresh_from_db()
+        assert self.mgmt.source_rekey_pending is True
+        assert self.mgmt.adapter_device_id == 196
+        assert revision.revision == before, "a skipped link repair committed an intent revision"
 
 
 class TestRefreshSyncCacheJob(_SyncCacheTestBase):

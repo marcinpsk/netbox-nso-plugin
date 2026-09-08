@@ -306,15 +306,19 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.
 
         The scope is in ``_prepare_apply``/`_APPLY_DEPLOYING_SCOPES``, so a bulk delete of
-        stale rows destroys the in-flight Apply marker + operator ownership. Intent-pending
-        rows (deploying) are kept; a confirmed row (in_sync) that vanishes surfaces as drift
-        (``changed``), never data-loss.
+        stale rows destroys operator ownership. A confirmed row (in_sync) that vanishes
+        surfaces as drift (``changed``), never data loss. That scope mutation also re-pends
+        its deploying sibling and clears the stale Apply attempt.
         """
         from uuid import uuid4
 
         from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
+        ge = Interface.objects.create(device=self.device, name="Gi7/7", type="1000base-t")
+        confirmed = NSOBFDInterfaceState.objects.create(
+            management=self.management, interface=ge, min_tx=300, min_rx=300, multiplier=3, status="in_sync"
+        )
         deploying = NSOBFDInterfaceState.objects.create(
             management=self.management,
             interface=self.iface,
@@ -324,16 +328,14 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
             status="deploying",
             apply_attempt_id=uuid4(),
         )
-        ge = Interface.objects.create(device=self.device, name="Gi7/7", type="1000base-t")
-        confirmed = NSOBFDInterfaceState.objects.create(
-            management=self.management, interface=ge, min_tx=300, min_rx=300, multiplier=3, status="in_sync"
-        )
         reconcile_bfd(self.device, [])  # device no longer reports BFD on any interface
         assert NSOBFDInterfaceState.objects.filter(pk=deploying.pk).exists(), (
             "deploying (apply-in-flight) overlay deleted"
         )
         assert NSOBFDInterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
-        assert NSOBFDInterfaceState.objects.get(pk=deploying.pk).status == "deploying"
+        deploying.refresh_from_db()
+        assert deploying.status == "accepted"
+        assert deploying.apply_attempt_id is None
         assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
 
     def test_matching_timers_keep_a_deploying_row_in_flight(self):

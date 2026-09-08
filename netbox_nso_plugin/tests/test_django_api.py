@@ -11,6 +11,8 @@ from utilities.testing import APITestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 
+from ._outbox_case import mirror_update
+
 
 class NSOInstanceAPITest(APITestCase):
     """Test CRUD operations on NSOInstance via REST API."""
@@ -206,11 +208,12 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
         device = self.state.interface.device
         instance = NSOInstance.objects.create(name="api-accept", adapter_instance_id="api-accept")
-        NSODeviceManagement.objects.filter(
-            pk=NSODeviceManagement.objects.create(
-                device=device, nso_instance=instance, nso_device_name="api-accept-rtr"
-            ).pk
-        ).update(adapter_device_id=7788)
+        management = NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=instance,
+            nso_device_name="api-accept-rtr",
+        )
+        mirror_update(management, adapter_device_id=7788)
         NSOIntentOutboxEntry.objects.filter(device=device).delete()
 
         response = self.client.patch(

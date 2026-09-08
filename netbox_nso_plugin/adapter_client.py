@@ -985,6 +985,69 @@ def trigger_force_removal(adapter_device_id, scope):
     return _request("POST", f"/api/v1/devices/{adapter_device_id}/actions/force-removal", json={"scope": scope})
 
 
+def retry_generation(adapter_device_id: int, generation_id: int) -> dict:
+    """Retry the exact blocked generation the operator inspected."""
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/actions/retry-generation",
+        json={"generation_id": generation_id},
+    )
+
+
+def abandon_generation(adapter_device_id: int, generation_id: int) -> dict:
+    """Abandon the exact blocked generation the operator inspected."""
+    return _request(
+        "POST",
+        f"/api/v1/devices/{adapter_device_id}/actions/abandon-generation",
+        json={"generation_id": generation_id},
+    )
+
+
+def get_device_apply_state(adapter_device_id: int) -> dict:
+    """Return the device-wide executable Apply head and barrier state."""
+    from .apply_settlement import GENERATION_DISPOSITIONS
+
+    state = _request("GET", f"/api/v1/devices/{adapter_device_id}/apply-state")
+    if not isinstance(state, dict):
+        raise AdapterError("Adapter returned a malformed Apply state.", code="invalid_response")
+    expected_types = {
+        "device_id": int,
+        "blocked": bool,
+        "write_work_pending": bool,
+        "held_jobs": list,
+        "pending_generations": int,
+    }
+    for field_name, expected_type in expected_types.items():
+        if type(state.get(field_name)) is not expected_type:
+            raise AdapterError(
+                f"Adapter returned a malformed Apply state: {field_name} has an invalid type.",
+                code="invalid_response",
+            )
+    if state["device_id"] != adapter_device_id:
+        raise AdapterError("Adapter returned Apply state for another device.", code="invalid_response")
+    if "head" not in state:
+        raise AdapterError("Adapter returned a malformed Apply state: head is missing.", code="invalid_response")
+    head = state["head"]
+    if head is not None and (
+        not isinstance(head, dict)
+        or type(head.get("generation_id")) is not int
+        or not isinstance(head.get("status"), str)
+        or not isinstance(head.get("sections"), list)
+        or any(not isinstance(section, str) for section in head["sections"])
+    ):
+        raise AdapterError("Adapter returned a malformed Apply state head.", code="invalid_response")
+    try:
+        disposition = None if head is None else GENERATION_DISPOSITIONS[head["status"]]
+    except KeyError:
+        raise AdapterError("Adapter returned an unknown Apply generation status.", code="invalid_response") from None
+    blocked = disposition == "blocked"
+    if state["blocked"] is not blocked:
+        raise AdapterError("Adapter returned an inconsistent blocked Apply state.", code="invalid_response")
+    if any(type(job_id) is not int for job_id in state["held_jobs"]) or state["pending_generations"] < 0:
+        raise AdapterError("Adapter returned malformed Apply state counters.", code="invalid_response")
+    return state
+
+
 def sync_notify(adapter_device_id):
     """POST /api/v1/devices/{id}/sync-notify — notify adapter of scope/intent change.
 
