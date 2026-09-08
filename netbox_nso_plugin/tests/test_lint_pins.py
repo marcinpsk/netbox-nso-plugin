@@ -138,6 +138,12 @@ def test_ruff_version_has_one_source():
     assert _declared_version() == _locked_version()
 
 
+def test_ruff_enforces_timezone_aware_datetimes():
+    lint = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["ruff"]["lint"]
+
+    assert "DTZ" in lint["select"]
+
+
 def test_workflow_zizmor_must_be_executed_via_uv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workflow = tmp_path / "lint-format.yaml"
     workflow.write_text(

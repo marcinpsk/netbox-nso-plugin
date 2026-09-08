@@ -77,17 +77,20 @@ def _safe_reconcile(ctx: dict, key: str, mgmt, model_names: tuple[str, ...], fn,
     """Run one reconciler, storing its result in ``ctx[key]``; isolate its failures.
 
     ``AdapterError`` is never caught here — it is raised while *fetching* the payload
-    (before ``fn`` runs) and is handled by the caller as a whole-device transient. Any
-    other exception is a genuine reconcile fault: the scope's rows are flipped to
+    (before ``fn`` runs) and is handled by the caller as a whole-device transient.
+    ``IntentPlanStaleError`` passes through too, so the read gate classifies the race as
+    a stale attempt on this path exactly as it does per category. Any other exception is
+    a genuine reconcile fault: the scope's rows are flipped to
     ``error`` (owned rows preserved) so the failure is visible, ``ctx[key]`` keeps its
     empty default, and the remaining scopes still reconcile instead of the whole device
     sync — and the worker — dying on one bad payload.
     """
     from .adapter_client import AdapterError
+    from .renderer_writer import IntentPlanStaleError
 
     try:
         ctx[key] = fn(*args)
-    except AdapterError:
+    except (AdapterError, IntentPlanStaleError):
         raise
     except Exception as exc:  # noqa: BLE001 — the gate rolls the scope transaction back
         raise ReconcileScopeError(mgmt, model_names, fn.__name__) from exc
@@ -627,7 +630,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                 epoch=dev_id,
             )
             # LACP/LAG bundle + member overlay states (interface-level).
-            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
+            from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -645,7 +648,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     lag_doc,
                 ),
                 epoch=dev_id,
-                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
+                pre_body=lambda: lacp_reconcile_plan(device, lag_doc),
             )
             # VLAN database + L2 switchport (VLAN DB first — switchport links to it).
             from .vlan_reconciler import reconcile_switchport, reconcile_vlan_database
@@ -974,7 +977,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 ctx_key="interface_ips",
             )
         elif key == "lacp":
-            from .lacp_reconciler import lag_config_reconcile_plan, reconcile_lag_config
+            from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
 
             lag_doc = client.get_lag_config(dev_id)
             _gated(
@@ -985,7 +988,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: reconcile_lag_config(device, lag_doc),
                 epoch=dev_id,
                 ctx_key="lacp_bundle_states",
-                pre_body=lambda: lag_config_reconcile_plan(device, lag_doc),
+                pre_body=lambda: lacp_reconcile_plan(device, lag_doc),
             )
         elif key == "vlan":
             from .vlan_reconciler import reconcile_vlan_database

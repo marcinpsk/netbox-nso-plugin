@@ -28,6 +28,7 @@ from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._adapter_http import make_session
+from ._outbox_case import in_thread
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_django_views import ViewTestBase
 
@@ -343,6 +344,101 @@ class TestRefreshSyncCaches(_SyncCacheTestBase):
         self.assertEqual((checked, updated), (5, 5))
 
 
+class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.instance = NSOInstance.objects.create(
+            name="cache-race",
+            adapter_instance_id="cache-race",
+        )
+
+    def _mgmt(self, name, adapter_device_id):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        from .test_onboarding import _device
+
+        row = NSODeviceManagement(
+            device=_device(name),
+            nso_instance=self.instance,
+            nso_device_name=name,
+            adapter_device_id=adapter_device_id,
+        )
+        with intent_transaction(footprint_for_instance(row)):
+            NSODeviceManagement.objects.bulk_create([row])
+        return NSODeviceManagement.objects.get(pk=row.pk)
+
+    def test_stale_error_mirror_does_not_abort_the_cache_sweep(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import refresh_sync_caches
+
+        first = self._mgmt("cache-race-first", 196)
+        second = self._mgmt("cache-race-second", 197)
+        original_build = RendererMutationPlan.build
+        plan_staled = False
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal plan_staled
+            plan = original_build(*args, **kwargs)
+            if not plan_staled:
+                plan_staled = True
+                in_thread(lambda: NSODeviceManagement.objects.filter(pk=first.pk).update(last_sync_status="concurrent"))
+            return plan
+
+        errors = []
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale),
+            self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as captured,
+        ):
+            try:
+                result = refresh_sync_caches(NSODeviceManagement.objects.all())
+            except Exception as exc:  # noqa: BLE001 (the assertion reports the aborted sweep)
+                errors.append(exc)
+                result = None
+
+        self.assertEqual(errors, [], f"the cache sweep raised {errors!r}")
+        self.assertEqual(result, (2, 0))
+        self.assertTrue(any(f"management row {first.pk}" in message for message in captured.output))
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.last_sync_status, "concurrent")
+        self.assertEqual(first.adapter_link_error, "")
+        self.assertTrue(second.adapter_link_error)
+
+    def test_stale_error_mirror_is_not_reported_as_updated(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import refresh_sync_cache, refresh_sync_caches
+
+        mgmt = self._mgmt("cache-race-skipped", 198)
+        adapter_device = _adapter_row(mgmt)
+        original_build = RendererMutationPlan.build
+        concurrent_updates = 0
+
+        def build_then_stale(*args, **kwargs):
+            nonlocal concurrent_updates
+            plan = original_build(*args, **kwargs)
+            concurrent_updates += 1
+            in_thread(
+                lambda: NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
+                    last_sync_status=f"concurrent-{concurrent_updates}"
+                )
+            )
+            return plan
+
+        identity = (mgmt.nso_instance.adapter_instance_id, mgmt.nso_device_name)
+        snapshot = ([mgmt], {mgmt.adapter_device_id: adapter_device}, {identity: [adapter_device]})
+        with patch.object(RendererMutationPlan, "build", side_effect=build_then_stale):
+            changed = refresh_sync_cache(mgmt, adapter_device)
+            self.assertEqual(mgmt.last_sync_status, "concurrent-1")
+            mgmt.refresh_from_db()
+            sweep_result = refresh_sync_caches([mgmt], snapshot=snapshot)
+
+        self.assertEqual(changed, [])
+        self.assertEqual(sweep_result, (1, 0))
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.last_sync_status, "concurrent-2")
+
+
 class TestReconcileDeviceLinks(_SyncCacheTestBase):
     """Repair rows whose adapter_device_id no longer resolves to their own adapter device.
 
@@ -375,6 +471,58 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual(mgmt.adapter_device_id, 700)  # re-onboarded
         self.assertEqual(mgmt.adapter_link_error, "")
         self.assertEqual(live.adapter_device_id, 619)  # the healthy row is untouched
+
+    def test_a_stale_attempt_stamp_does_not_abort_the_sweep(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        first = self._mgmt("cache-stale-first", 196)
+        second = self._mgmt("cache-stale-second", 197)
+        original_build = RendererMutationPlan.build
+        full_save_pks = []
+        stamp_plan_staled = False
+
+        def build_then_stale_first_stamp(*args, **kwargs):
+            nonlocal stamp_plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
+            if proposed_save is not None and proposed_save.update_fields is None:
+                full_save_pks.append(proposed_save.instance.pk)
+            plan = original_build(*args, **kwargs)
+            if (
+                proposed_save is not None
+                and proposed_save.update_fields == ("adapter_link_attempted_at",)
+                and proposed_save.instance.pk == first.pk
+                and not stamp_plan_staled
+            ):
+                stamp_plan_staled = True
+                concurrent = NSODeviceManagement.objects.get(pk=first.pk)
+                concurrent.last_sync_status = "concurrent"
+                save_management(concurrent, update_fields={"last_sync_status"})
+            return plan
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 700}) as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", side_effect=_scope_404_for(196, 197)) as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale_first_stamp),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        # A rejected stamp stops its own row only: nothing was persisted, so the row is not an
+        # attempt, keeps its mapping, and reaches neither the full save nor the adapter.
+        self.assertEqual((broken, attempted), (2, 1))
+        self.assertTrue(stamp_plan_staled)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertIsNone(first.adapter_link_attempted_at)
+        self.assertIsNotNone(second.adapter_link_attempted_at)
+        self.assertEqual((first.adapter_device_id, second.adapter_device_id), (196, 700))
+        self.assertNotIn(first.pk, full_save_pks)
+        self.assertNotIn(196, [call.args[0] for call in set_scope.call_args_list])
+        self.assertEqual(onboard.call_count, 1)
 
     def test_relink_pushes_scope_against_the_fresh_id(self):
         """The dead id is tried, then the whole link is redone against the new device row.
@@ -432,6 +580,63 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual(mgmt.adapter_device_id, 808)
         self.assertEqual(set_scope.call_args[0][0], 808)  # scope pushed to the adopted row
 
+    def test_failed_remap_adoption_skips_the_full_save(self):
+        """A rejected adoption keeps the old id out of the full save, so no push targets it."""
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        stale = self._mgmt("cache-moved-stale", 196)
+        healthy = self._mgmt("cache-moved-ok", 197)
+        moved_stale = _adapter_row(stale, id=806)
+        moved_healthy = _adapter_row(healthy, id=807)
+        original_build = RendererMutationPlan.build
+        full_save_pks = []
+        remap_plan_staled = False
+        scope_calls = []
+
+        def build_then_stale_first_remap(*args, **kwargs):
+            nonlocal remap_plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
+            if proposed_save is not None and proposed_save.update_fields is None:
+                full_save_pks.append(proposed_save.instance.pk)
+            plan = original_build(*args, **kwargs)
+            if (
+                proposed_save is not None
+                and proposed_save.update_fields == ("adapter_device_id",)
+                and proposed_save.instance.pk == stale.pk
+                and not remap_plan_staled
+            ):
+                remap_plan_staled = True
+                concurrent = NSODeviceManagement.objects.get(pk=stale.pk)
+                concurrent.last_sync_status = "concurrent"
+                save_management(concurrent, update_fields={"last_sync_status"})
+            return plan
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[moved_stale, moved_healthy]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch(
+                "netbox_nso_plugin.adapter_client.set_scope",
+                side_effect=lambda adapter_device_id, *a, **k: scope_calls.append(adapter_device_id),
+            ),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale_first_remap),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (2, 2))
+        self.assertTrue(remap_plan_staled)
+        self.assertEqual(full_save_pks, [healthy.pk])  # the rejected row never reached the full save
+        onboard.assert_not_called()
+        self.assertEqual(scope_calls, [807])  # nothing was pushed against the old id 196
+        stale.refresh_from_db()
+        healthy.refresh_from_db()
+        self.assertEqual(stale.adapter_device_id, 196)  # the original mapping is retained
+        self.assertEqual(stale.last_sync_status, "concurrent")
+        self.assertEqual(healthy.adapter_device_id, 807)  # the next row still proceeds
+
     def test_drops_a_reused_id_before_pushing_anything(self):
         """An id owned by another device is dropped FIRST, so no scope reaches that device.
 
@@ -462,6 +667,50 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual(scope_calls, [900])
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 900)
+
+    def test_failed_reused_id_clear_skips_the_full_save(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-reused-stale", 619)
+        stranger = _adapter_row(mgmt, nso_device_name="somebody-else", netbox_device_id=mgmt.device_id + 999)
+        original_build = RendererMutationPlan.build
+        full_save_ids = []
+        pointer_plan_staled = False
+
+        def build_then_stale_pointer_clear(*args, **kwargs):
+            nonlocal pointer_plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
+            if proposed_save is not None and proposed_save.update_fields is None:
+                full_save_ids.append(proposed_save.instance.adapter_device_id)
+            plan = original_build(*args, **kwargs)
+            if proposed_save is not None and proposed_save.update_fields == ("adapter_device_id",):
+                pointer_plan_staled = True
+                concurrent = NSODeviceManagement.objects.get(pk=mgmt.pk)
+                concurrent.last_sync_status = "concurrent"
+                save_management(concurrent, update_fields={"last_sync_status"})
+            return plan
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[stranger]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope") as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify") as sync_notify,
+            patch.object(RendererMutationPlan, "build", side_effect=build_then_stale_pointer_clear),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            broken, attempted = reconcile_device_links(NSODeviceManagement.objects.all())
+
+        self.assertEqual((broken, attempted), (1, 1))
+        self.assertTrue(pointer_plan_staled)
+        self.assertEqual(full_save_ids, [])
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        sync_notify.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 619)
+        self.assertEqual(mgmt.last_sync_status, "concurrent")
 
     def test_leaves_healthy_rows_alone(self):
         """Every mapping resolving to its own device → nothing to reconcile, no onboard call."""

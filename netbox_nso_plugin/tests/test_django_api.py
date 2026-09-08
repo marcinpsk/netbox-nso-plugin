@@ -9,7 +9,12 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from rest_framework import status
 from utilities.testing import APITestCase
 
-from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
+from netbox_nso_plugin.models import (
+    NSODeviceManagement,
+    NSOInstance,
+    NSOIntentRevision,
+    NSOInterfaceState,
+)
 
 from ._outbox_case import mirror_update
 
@@ -134,6 +139,32 @@ class NSODeviceManagementAPITest(APITestCase):
         self.assertIsNone(response.data["primary_ip"])
         self.assertIsNone(response.data["oob_ip"])
 
+    def test_create_finalizes_the_exact_renderer_fingerprint(self):
+        """The production API create uses the exact management-row writer."""
+        device = Device.objects.create(
+            name="api-mgmt-create",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+
+        response = self.client.post(
+            self._get_list_url(),
+            {
+                "device": device.pk,
+                "nso_instance": self.nso_instance.pk,
+                "nso_device_name": "api-mgmt-create",
+                "manage_description": True,
+            },
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        revision = NSOIntentRevision.objects.get(device=device, scope="interface")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertTrue(revision.verified_fingerprint)
+
     def test_adapter_owned_sync_fields_are_read_only(self):
         """A PATCH must not be able to forge adapter-owned bookkeeping — last_sync_status (a fake
         'no drift') or state_snapshot (wipe the compliance snapshot). The serializer marks them
@@ -149,6 +180,36 @@ class NSODeviceManagementAPITest(APITestCase):
         self.mgmt.refresh_from_db()
         self.assertNotEqual(self.mgmt.last_sync_status, "in_sync")
         self.assertNotEqual(self.mgmt.state_snapshot, {"forged": True})
+
+    def test_patch_finalizes_the_exact_renderer_fingerprint(self):
+        """The production API update uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+
+        response = self.client.patch(
+            self._get_detail_url(self.mgmt),
+            {"manage_enabled": True},
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="interface")
+        rendered = delivery.render("interface", self.device.pk, self.mgmt.adapter_device_id)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
+
+    def test_delete_finalizes_the_empty_renderer_fingerprint(self):
+        """The production API delete uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+
+        device_id = self.device.pk
+        response = self.client.delete(self._get_detail_url(self.mgmt), **self.header)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        revision = NSOIntentRevision.objects.get(device_id=device_id, scope="interface")
+        rendered = delivery.render("interface", device_id, None)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
 
 
 class NSOInterfaceStateAPITest(APITestCase):

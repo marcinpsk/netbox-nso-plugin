@@ -314,7 +314,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
             with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
                 deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
 
-        assert raised.exception.code == "validation_error"
+        self.assertEqual(raised.exception.code, "validation_error")
         mock_put.assert_not_called()
 
     def test_an_owned_v3_user_missing_its_protocols_blocks_the_snapshot(self):

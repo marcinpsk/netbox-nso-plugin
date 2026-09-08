@@ -41,7 +41,7 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
             mgmt.save(update_fields=["auto_apply"])
         return mgmt
 
-    def _bundle(self, mgmt, status="accepted"):
+    def _bundle(self, mgmt, status="accepted", **fields):
         from netbox_nso_plugin.models import NSOLACPBundleState
 
         return NSOLACPBundleState.objects.create(
@@ -52,9 +52,10 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
             system_priority=100,
             timer="fast",
             status=status,
+            **fields,
         )
 
-    def _member(self, mgmt, status="accepted"):
+    def _member(self, mgmt, status="accepted", **fields):
         from netbox_nso_plugin.models import NSOLACPMemberState
 
         return NSOLACPMemberState.objects.create(
@@ -64,6 +65,7 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
             mode="active",
             port_priority=128,
             status=status,
+            **fields,
         )
 
 
@@ -153,25 +155,46 @@ class TestPushLacpIntentForDevice(_LacpBase):
 
 
 class TestOnLacpStateSave(_LacpBase):
-    def test_save_triggers_intent_push_in_auto_apply(self):
+    def test_writer_save_triggers_intent_push_in_auto_apply(self):
         """In auto-apply mode, accept commits to the device immediately."""
         from netbox_nso_plugin.models import NSOLACPBundleState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         mgmt = self._make_mgmt(auto_apply=True)
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+        )
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
             with self.captureOnCommitCallbacks(execute=True):
-                bundle.save()
+                with renderer_writes(plan) as writer:
+                    writer.save(bundle, force_insert=True)
             mock_apply.assert_called_once()
             assert mock_apply.call_args[0][0] == mgmt.adapter_device_id
 
-    def test_save_no_push_without_auto_apply(self):
+    def test_writer_save_no_push_without_auto_apply(self):
         """Default (deferred) flow: accept marks owned but does NOT commit — the
         single device Apply commits later."""
         from netbox_nso_plugin.models import NSOLACPBundleState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         mgmt = self._make_mgmt(auto_apply=False)
+        bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
+            with self.captureOnCommitCallbacks(execute=True):
+                with renderer_writes(plan) as writer:
+                    writer.save(bundle, force_insert=True)
+            mock_apply.assert_not_called()
+
+    def test_foreign_save_does_not_trigger_lacp_behavior(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState
+
+        mgmt = self._make_mgmt(auto_apply=True)
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
@@ -181,6 +204,7 @@ class TestOnLacpStateSave(_LacpBase):
 
     def test_no_push_without_adapter_device_id(self):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOLACPBundleState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         inst, _ = NSOInstance.objects.get_or_create(
             name="lacp-noid-inst", defaults={"adapter_instance_id": "lacp-noid-inst"}
@@ -191,13 +215,21 @@ class TestOnLacpStateSave(_LacpBase):
         dev = Device.objects.create(name="lacp-noid-rtr", device_type=dt, role=role, site=site)
         lag = Interface.objects.create(device=dev, name="Port-channel1", type="lag")
         mgmt = NSODeviceManagement.objects.create(
-            device=dev, nso_instance=inst, nso_device_name="nso-lacp-noid", adapter_device_id=None
+            device=dev,
+            nso_instance=inst,
+            nso_device_name="nso-lacp-noid",
+            adapter_device_id=None,
+            auto_apply=True,
         )
         bundle = NSOLACPBundleState(management=mgmt, interface=lag, lag_id=1, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+        )
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
             with self.captureOnCommitCallbacks(execute=True):
-                bundle.save()
+                with renderer_writes(plan) as writer:
+                    writer.save(bundle, force_insert=True)
             mock_apply.assert_not_called()
 
 
@@ -220,6 +252,27 @@ class TestLacpAcceptView(_LacpBase):
         member = NSOLACPMemberState.objects.get(interface=self.m1)
         assert member.status == "accepted"
         assert member.accepted_at is not None
+
+    def test_reaccept_preserves_the_first_ownership_timestamp(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOLACPMemberState
+
+        accepted_at = timezone.now() - timedelta(days=3)
+        mgmt = self._make_mgmt()
+        bundle = self._bundle(mgmt, status="changed", accepted_at=accepted_at)
+        self._member(mgmt, status="changed", accepted_at=accepted_at)
+
+        self.client.force_login(_superuser())
+        response = self.client.post(f"/plugins/nso/lacp/bundle-state/{bundle.pk}/accept/")
+
+        self.assertEqual(response.status_code, 302)
+        bundle.refresh_from_db()
+        member = NSOLACPMemberState.objects.get(interface=self.m1)
+        self.assertEqual(bundle.accepted_at, accepted_at)
+        self.assertEqual(member.accepted_at, accepted_at)
 
 
 def _superuser():

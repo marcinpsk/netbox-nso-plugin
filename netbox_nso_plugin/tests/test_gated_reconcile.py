@@ -927,6 +927,226 @@ class TestDefaultPlanContentMutation(TestCase):
         self.assertIsNone(deploying.apply_attempt_id)
 
 
+class TestStalePlanRace(TestCase):
+    """A competing edit committed after planning is a stale attempt, not a scope fault."""
+
+    def setUp(self):
+        self.device, self.mgmt = _make(f"gz{uuid.uuid4().hex[:6]}", manage_interfaces=True)
+
+    @staticmethod
+    def _svi_doc(attempt_id=1):
+        return {
+            "interfaces": [{"interface_name": "Vlan10", "type": "svi", "vrf": ""}],
+            "read_state": _rs(attempt_id=attempt_id),
+        }
+
+    def _seed(self):
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with patch("netbox_nso_plugin.adapter_client.get_svi", return_value=self._svi_doc()):
+            ctx = reconcile_category(self.device, self.mgmt, "svi")
+        self.assertEqual(ctx["_gate"]["svi"], "ran")
+        return NSOSVIState.objects.get(management=self.mgmt, interface__name="Vlan10")
+
+    @staticmethod
+    def _planner_that_stales(state):
+        """Freeze the real SVI plan, then commit the lifecycle write that stales it."""
+        from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
+
+        def plan(device, payload):
+            frozen = svi_reconcile_plan(device, payload)
+            mirror_update(state, last_apply_error="the device refused the last apply")
+            return frozen
+
+        return plan
+
+    def _markers(self):
+        from netbox_nso_plugin.models import NSOFamilyReadState
+
+        row = NSOFamilyReadState.objects.get(management=self.mgmt, family="svi")
+        return (
+            row.applied_attempt_id,
+            row.applied_incarnation,
+            row.applied_source_epoch,
+            row.applied_payload_revision,
+            row.applied_publication_sequence,
+        )
+
+    def _assert_skipped_without_fault(self, ctx, state, status_before, markers_before):
+        self.assertEqual(ctx["_gate"]["svi"], "skipped_stale_attempt")
+        self.assertEqual(self._markers(), markers_before)
+        state.refresh_from_db()
+        self.assertEqual(state.status, status_before)
+        self.assertNotEqual(state.status, "error")
+        self.assertEqual(state.last_apply_error, "the device refused the last apply")
+
+    def test_category_svi_race_skips_without_faulting_the_scope(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        state = self._seed()
+        status_before = state.status
+        markers_before = self._markers()
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_svi", return_value=self._svi_doc(attempt_id=2)),
+            patch(
+                "netbox_nso_plugin.svi_reconciler.svi_reconcile_plan",
+                side_effect=self._planner_that_stales(state),
+            ),
+        ):
+            ctx = reconcile_category(self.device, self.mgmt, "svi")
+
+        self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
+
+    def test_device_svi_race_skips_without_faulting_the_scope(self):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        state = self._seed()
+        status_before = state.status
+        markers_before = self._markers()
+
+        with ExitStack() as stack:
+            for fetcher, shape in _DEVICE_FETCHERS.items():
+                doc = self._svi_doc(attempt_id=2) if fetcher == "get_svi" else dict(shape)
+                if fetcher != "get_state" and "read_state" not in doc:
+                    doc["read_state"] = _rs(attempt_id=2)
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            stack.enter_context(
+                patch(
+                    "netbox_nso_plugin.svi_reconciler.svi_reconcile_plan",
+                    side_effect=self._planner_that_stales(state),
+                )
+            )
+            ctx = reconcile_device(self.device, self.mgmt)
+
+        self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
+
+
+class TestSwitchportCascadeRace(TestCase):
+    """A Collector descendant inserted after planning is a stale attempt, not a scope fault."""
+
+    def setUp(self):
+        self.device, self.mgmt = _make(f"gk{uuid.uuid4().hex[:6]}", manage_interfaces=True)
+        self.interface = Interface.objects.create(device=self.device, name="GigabitEthernet0/9", type="1000base-t")
+
+    def _category(self, attempt_id, planner=None):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        with ExitStack() as stack:
+            for fetcher, shape in (("get_vlan_database", {"vlans": []}), ("get_switchport", {"interfaces": []})):
+                doc = dict(shape, read_state=_rs(attempt_id=attempt_id))
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            if planner is not None:
+                stack.enter_context(
+                    patch("netbox_nso_plugin.vlan_reconciler.switchport_reconcile_plan", side_effect=planner)
+                )
+            return reconcile_category(self.device, self.mgmt, "switchport")
+
+    def _device(self, attempt_id, planner):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        with ExitStack() as stack:
+            for fetcher, shape in _DEVICE_FETCHERS.items():
+                doc = dict(shape)
+                if fetcher != "get_state":
+                    doc["read_state"] = _rs(attempt_id=attempt_id)
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            stack.enter_context(
+                patch("netbox_nso_plugin.vlan_reconciler.switchport_reconcile_plan", side_effect=planner)
+            )
+            return reconcile_device(self.device, self.mgmt)
+
+    def _seed_vestigial_overlay(self):
+        """Record the family markers, then leave one imported overlay on a pristine interface."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+
+        ctx = self._category(attempt_id=1)
+        assert ctx["_gate"]["switchport"] == "ran", "the seeding read must be admitted"
+        return NSOSwitchportState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            mode="tagged-all",
+            status="imported",
+        )
+
+    def _unplanned_vlan(self):
+        from ipam.models import VLAN, VLANGroup
+
+        group = VLANGroup.objects.create(name=f"{self.device.name} race", slug=f"{self.device.name}-race")
+        return VLAN.objects.create(group=group, vid=910, name="RACE")
+
+    @staticmethod
+    def _link_tagged_vlan(state, vlan):
+        """Commit one competing tagged-VLAN link through the real writer path."""
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_set,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (vlan,)),))
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.m2m_set(state, "tagged_vlans", (vlan,))
+
+    @classmethod
+    def _planner_that_grows_the_cascade(cls, state, vlan):
+        """Freeze the real deletion plan, then commit the descendant its lock cannot cover."""
+        from netbox_nso_plugin.vlan_reconciler import switchport_reconcile_plan
+
+        def plan(device, payload, interface_pks=None):
+            frozen = switchport_reconcile_plan(device, payload, interface_pks)
+            cls._link_tagged_vlan(state, vlan)
+            return frozen
+
+        return plan
+
+    def _markers(self):
+        from netbox_nso_plugin.models import NSOFamilyReadState
+
+        row = NSOFamilyReadState.objects.get(management=self.mgmt, family="switchport")
+        return (
+            row.applied_attempt_id,
+            row.applied_incarnation,
+            row.applied_source_epoch,
+            row.applied_payload_revision,
+            row.applied_publication_sequence,
+        )
+
+    def _assert_skipped_without_fault(self, ctx, state, vlan, markers_before):
+        self.assertEqual(ctx["_gate"]["switchport"], "skipped_stale_attempt")
+        self.assertEqual(self._markers(), markers_before)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(list(state.tagged_vlans.values_list("pk", flat=True)), [vlan.pk])
+
+    def test_category_cascade_race_skips_without_faulting_the_scope(self):
+        state = self._seed_vestigial_overlay()
+        vlan = self._unplanned_vlan()
+        markers_before = self._markers()
+
+        ctx = self._category(attempt_id=2, planner=self._planner_that_grows_the_cascade(state, vlan))
+
+        self._assert_skipped_without_fault(ctx, state, vlan, markers_before)
+
+    def test_device_cascade_race_skips_without_faulting_the_scope(self):
+        state = self._seed_vestigial_overlay()
+        vlan = self._unplanned_vlan()
+        markers_before = self._markers()
+
+        ctx = self._device(attempt_id=2, planner=self._planner_that_grows_the_cascade(state, vlan))
+
+        self._assert_skipped_without_fault(ctx, state, vlan, markers_before)
+
+
 class TestContentionDispositions(TestCase):
     def setUp(self):
         self.device, self.mgmt = _make(f"gc{uuid.uuid4().hex[:6]}", manage_l2=True)
@@ -1059,7 +1279,7 @@ class TestCategoryViewSkipFallback(TestCase):
             "plugins:netbox_nso_plugin:device_nso_category",
             kwargs={"pk": self.device.pk, "key": "vlan"},
         )
-        payload = {"vlans": [{"vlan_id": "invalid"}], "read_state": _rs()}
+        payload = {"vlans": 1, "read_state": _rs()}
         with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload):
             response = self.client.get(url, {"refresh": "1"})
 
@@ -1079,7 +1299,7 @@ class TestCategoryViewSkipFallback(TestCase):
             for fetcher, shape in _DEVICE_FETCHERS.items():
                 doc = dict(shape, read_state=_rs())
                 if fetcher == "get_vlan_database":
-                    doc["vlans"] = [{"vlan_id": "invalid"}]
+                    doc["vlans"] = 1
                 elif fetcher == "get_logging_config":
                     doc["local_levels"] = {"console_severity": "WARNING"}
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
