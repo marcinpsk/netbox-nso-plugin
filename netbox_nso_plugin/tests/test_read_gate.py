@@ -1288,10 +1288,7 @@ class TestQueuedCarrierArbiter(TestCase):
                 first_wave = len(seen) < n
                 seen.append(1)
             if first_wave:
-                try:
-                    barrier.wait()
-                except threading.BrokenBarrierError:
-                    pass
+                barrier.wait()  # a broken/timed-out barrier must fail the test, never skip the race
             return real(queue, conn, job_id)
 
         results = []
