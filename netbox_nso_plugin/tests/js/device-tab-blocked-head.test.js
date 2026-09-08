@@ -99,7 +99,7 @@ describe("the device tab's blocked Apply head panel", () => {
     ]);
   });
 
-  it("stays hidden when the device has no blocked executable head", async () => {
+  it("hides a previously visible panel when the device has no blocked executable head", async () => {
     const panel = mountTab({
       device_id: 10,
       head: null,
@@ -109,9 +109,10 @@ describe("the device tab's blocked Apply head panel", () => {
       pending_generations: 0,
       last_apply_job: null,
     });
+    panel.classList.remove("d-none");
 
-    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
-    expect(panel.classList.contains("d-none")).toBe(true);
+    await vi.waitFor(() => expect(panel.classList.contains("d-none")).toBe(true));
+    expect(fetch).toHaveBeenCalledOnce();
   });
 
   it("shows an Apply-state polling failure without fabricating an unblocked state", async () => {
