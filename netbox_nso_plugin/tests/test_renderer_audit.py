@@ -444,21 +444,22 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         """
         from django.utils import timezone
 
-        from netbox_nso_plugin.intent_state import audit_scope_footprint
+        from netbox_nso_plugin.intent_state import mirror_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         state = own_vlan(self.management, 1636, "renderer-audit-race")
         mirror_update(state, status="in_sync")
         NSOIntentRevision.objects.filter(device=self.device, scope="vlan").update(verified_revision=None)
+        touched_at = timezone.now()
 
-        def _touch_then_delegate(device_id, scopes):
-            # Runs after the plan is frozen and before the repair takes its locks.
-            NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=timezone.now())
-            return audit_scope_footprint(device_id, scopes)
+        def _touch_then_delegate(footprint, **kwargs):
+            # Committed on a second connection after the plans are frozen, before the locks.
+            in_thread(lambda: NSOVLANState.objects.filter(pk=state.pk).update(last_sync_at=touched_at))
+            return mirror_transaction(footprint, **kwargs)
 
         with patch(
-            "netbox_nso_plugin.renderer_audit.audit_scope_footprint",
+            "netbox_nso_plugin.renderer_audit.mirror_transaction",
             side_effect=_touch_then_delegate,
         ):
             result = audit_renderer_scopes(
@@ -471,6 +472,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         state.refresh_from_db()
         self.assertEqual(result.repaired, ("vlan",))
         self.assertEqual(state.status, "accepted")
+        self.assertEqual(state.last_sync_at, touched_at)
 
     def test_lifecycle_only_foreign_change_does_not_repair(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
