@@ -2385,11 +2385,14 @@ class TestSharedObjectOwnership(TestCase):
         self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
 
     def test_reconcile_plan_predicts_from_the_current_prefix_list_capture(self):
+        from netbox_routing.models import PrefixListEntry, RouteMapEntry
+
         from netbox_nso_plugin import route_policy_reconciler
         from netbox_nso_plugin import shared_object_ownership as ownership
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.renderer_writer import renderer_writes
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+        from netbox_nso_plugin.route_policy_structure import canonical_route_map, prefix_list_entry_unit
 
         from ._outbox_case import content_update
 
@@ -2423,6 +2426,11 @@ class TestSharedObjectOwnership(TestCase):
         content_update(d1_route_map, status="accepted")
         # This reconcile leaves the prefix-list units of the OLD capture in the context cache.
         reconcile_route_policy(self.d2, payload)
+        d2_prefix = NSORoutePolicyState.objects.get(
+            management__device=self.d2,
+            family="prefix_list",
+            object_name=prefix_name,
+        )
         d2_route_map = NSORoutePolicyState.objects.get(
             management__device=self.d2,
             family="route_map",
@@ -2433,7 +2441,11 @@ class TestSharedObjectOwnership(TestCase):
         d2_route_map.refresh_from_db()
         self.assertEqual((d1_prefix.status, d1_prefix.is_materialized), ("accepted", True))
         self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
-        self.assertIn(prefix_name.lower(), route_policy_reconciler._PL_UNIT_CACHE.get() or {})
+        warm_cache = route_policy_reconciler._PL_UNIT_CACHE.get() or {}
+        self.assertIn(prefix_name.lower(), warm_cache)
+        stale_units = warm_cache[prefix_name.lower()]
+        stale_hash = route_policy_reconciler._hash(canonical_route_map(route_map_capture, lambda _name: stale_units))
+        self.assertEqual(d2_route_map.content_hash, stale_hash)
 
         changed_prefix_capture = {
             "name": prefix_name,
@@ -2444,13 +2456,35 @@ class TestSharedObjectOwnership(TestCase):
             captured=changed_prefix_capture,
             content_hash=ownership.hash_captured("prefix_list", changed_prefix_capture),
         )
+        current_units = tuple(prefix_list_entry_unit(entry) for entry in changed_prefix_capture["entries"])
+        current_hash = route_policy_reconciler._hash(
+            canonical_route_map(route_map_capture, lambda _name: current_units)
+        )
+        self.assertNotEqual(current_hash, stale_hash)
 
         plan = route_policy_reconcile_plan(self.d2, payload)
 
-        with reconcile_transaction(plan):
+        # The plan must hash the route map from the CURRENT prefix-list capture, not the warm cache.
+        self.assertTrue(plan.changes_content)
+        with renderer_writes(plan):
             reconcile_route_policy(self.d2, payload)
 
-        self.assertTrue(plan.changes_content)
+        d2_prefix.refresh_from_db()
+        d2_route_map.refresh_from_db()
+        self.assertEqual(d2_route_map.content_hash, current_hash)
+        self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
+        # The device's own prefix-list capture still diverges from the owner, so it conflicts.
+        self.assertEqual((d2_prefix.status, d2_prefix.is_materialized), ("conflict", False))
+        entries = RouteMapEntry.objects.filter(route_map__name=route_map_name)
+        self.assertEqual(
+            [sorted(entry.match_prefix_list.values_list("name", flat=True)) for entry in entries],
+            [[prefix_name]],
+        )
+        # No materialization ran, so the shared prefix list keeps the entries already in NetBox.
+        self.assertEqual(
+            {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list__name=prefix_name)},
+            {"198.18.2.0/24"},
+        )
 
     def test_first_prefix_list_capture_replaces_a_populated_unowned_root(self):
         from django.contrib.contenttypes.models import ContentType
