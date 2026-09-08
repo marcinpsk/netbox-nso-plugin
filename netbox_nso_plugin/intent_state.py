@@ -550,8 +550,7 @@ _DML_PARSE_SKIP_KEYWORDS = frozenset(
     {"SELECT", "SET", "SAVEPOINT", "RELEASE", "SHOW", "BEGIN", "COMMIT", "ROLLBACK", "DECLARE", "FETCH", "CLOSE"}
 )
 _FIRST_SQL_KEYWORD = re.compile(
-    r"\A(?:\s+|--[^\r\n]*(?:\r\n?|\n|\Z)|/\*.*?\*/)*([A-Za-z]+)",
-    re.DOTALL,
+    r"\A(?:\s|--[^\r\n]*+|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/)*([A-Za-z]+)",
 )
 
 

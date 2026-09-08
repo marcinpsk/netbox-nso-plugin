@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+import signal
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+import pytest
 import sqlparse
 from django.db import connection, transaction
 from django.db.models import F
@@ -15,6 +18,7 @@ from django.test import SimpleTestCase, TransactionTestCase
 
 from netbox_nso_plugin import delivery, outbox
 from netbox_nso_plugin.intent_state import (
+    _FIRST_SQL_KEYWORD,
     OVERLAY_MODEL_RANKS,
     SOURCE_MODEL_RANKS,
     IntentMutationProtocolError,
@@ -69,6 +73,33 @@ class TestDeleteCollectorContract(SimpleTestCase):
             self.assertRaisesRegex(RuntimeError, "CustomCollector.origin"),
         ):
             ensure_delete_signal_origin()
+
+
+@pytest.mark.parametrize(
+    ("statement", "keyword"),
+    [
+        pytest.param(" " * 40 + "!", None, id="whitespace"),
+        pytest.param("/*" + "*//*" * 40 + "!", None, id="block_comments"),
+        pytest.param("-- UPDATE", None, id="line_comment_only"),
+        pytest.param("/* x */ -- y\n  UPDATE t SET a = 1", "UPDATE", id="comment_prefixed_update"),
+    ],
+)
+def test_sql_prescan_completes_within_one_second(statement, keyword):
+    def timeout(signum, frame):
+        pytest.fail("SQL keyword prescan exceeded one second")
+
+    previous_handler = signal.signal(signal.SIGALRM, timeout)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 1)
+        started = time.perf_counter()
+        match = _FIRST_SQL_KEYWORD.match(statement)
+        elapsed = time.perf_counter() - started
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+    assert elapsed < 1
+    assert (match.group(1) if match else None) == keyword
 
 
 class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
