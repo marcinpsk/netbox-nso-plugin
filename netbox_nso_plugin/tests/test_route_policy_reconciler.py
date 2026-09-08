@@ -1901,6 +1901,74 @@ class TestSharedObjectOwnership(TestCase):
             with reconcile_transaction(plan):
                 reconcile_route_policy(self.d2, payload)
 
+    def test_reconcile_plan_predicts_from_the_current_prefix_list_capture(self):
+        from netbox_nso_plugin import route_policy_reconciler
+        from netbox_nso_plugin import shared_object_ownership as ownership
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        prefix_name = "PL-STALE-CACHE-PREDICTION"
+        route_map_name = "RM-STALE-CACHE-PREDICTION"
+        prefix_capture = {
+            "name": prefix_name,
+            "entries": [{"sequence": 10, "action": "permit", "prefix": "198.18.2.0/24"}],
+        }
+        route_map_capture = {
+            "name": route_map_name,
+            "entries": [
+                {"sequence": 10, "action": "permit", "match_prefix_lists": [prefix_name]},
+            ],
+        }
+        payload = {"prefix_lists": [prefix_capture], "route_maps": [route_map_capture]}
+        reconcile_route_policy(self.d1, payload)
+        d1_prefix = NSORoutePolicyState.objects.get(
+            management__device=self.d1,
+            family="prefix_list",
+            object_name=prefix_name,
+        )
+        d1_route_map = NSORoutePolicyState.objects.get(
+            management__device=self.d1,
+            family="route_map",
+            object_name=route_map_name,
+        )
+        content_update(d1_prefix, status="accepted")
+        content_update(d1_route_map, status="accepted")
+        # This reconcile leaves the prefix-list units of the OLD capture in the context cache.
+        reconcile_route_policy(self.d2, payload)
+        d2_route_map = NSORoutePolicyState.objects.get(
+            management__device=self.d2,
+            family="route_map",
+            object_name=route_map_name,
+        )
+        ownership.rematerialize(d2_route_map)
+        d1_prefix.refresh_from_db()
+        d2_route_map.refresh_from_db()
+        self.assertEqual((d1_prefix.status, d1_prefix.is_materialized), ("accepted", True))
+        self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
+        self.assertIn(prefix_name.lower(), route_policy_reconciler._PL_UNIT_CACHE.get() or {})
+
+        changed_prefix_capture = {
+            "name": prefix_name,
+            "entries": [{"sequence": 10, "action": "permit", "prefix": "198.18.3.0/24"}],
+        }
+        content_update(
+            d1_prefix,
+            captured=changed_prefix_capture,
+            content_hash=ownership.hash_captured("prefix_list", changed_prefix_capture),
+        )
+
+        plan = route_policy_reconcile_plan(self.d2, payload)
+
+        with reconcile_transaction(plan):
+            reconcile_route_policy(self.d2, payload)
+
+        self.assertTrue(plan.changes_content)
+
     def test_first_prefix_list_capture_replaces_a_populated_unowned_root(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry

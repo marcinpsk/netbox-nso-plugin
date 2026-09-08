@@ -1304,6 +1304,7 @@ def route_policy_reconcile_plan(device, payload: dict):
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return ReconcileMutationPlan(footprint)
+    _PL_UNIT_CACHE.set({})  # plan and post-acquisition validation must hash from the same start
     try:
         group_predictions = tuple(
             (family, row["name"], row, _route_policy_group_changes_content(management, family, row["name"], row))
