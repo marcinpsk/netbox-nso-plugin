@@ -9,12 +9,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const TEMPLATE = resolve(process.cwd(), "netbox_nso_plugin/templates/netbox_nso_plugin/device_nso_tab.html");
 
 function jobActivityScript() {
-  const blocks = readFileSync(TEMPLATE, "utf8").match(/<script>([\s\S]*?)<\/script>/g) || [];
-  const matching = blocks.filter((block) => block.includes("function renderApplyState("));
+  const template = new DOMParser().parseFromString(readFileSync(TEMPLATE, "utf8"), "text/html");
+  const matching = [...template.querySelectorAll("script")].filter((script) =>
+    script.textContent.includes("function renderApplyState("),
+  );
   if (matching.length !== 1) {
     throw new Error(`expected one blocked-head renderer in the tab template, found ${matching.length}`);
   }
-  const body = matching[0].replace(/^<script>/, "").replace(/<\/script>$/, "");
+  const body = matching[0].textContent;
   if (/\{[{%#]/.test(body)) {
     throw new Error("the inline job-activity block gained Django template syntax; this loader cannot run it");
   }
