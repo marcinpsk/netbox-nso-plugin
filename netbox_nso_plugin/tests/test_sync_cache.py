@@ -1343,7 +1343,7 @@ class TestReconcileDeviceLinksConcurrency(_CascadeFlushMixin, IntentPushResetMix
             )
 
         self.assertEqual(len(captured.output), 1, captured.output)
-        self.assertIn("adopting", captured.output[0])
+        self.assertIn("adopting", captured.output[0].lower())
         self.assertTrue(probe_started)
         self.assertEqual(row_locked, [True], "management row was not locked before the repair stamp")
         self.assertEqual(full_saves, [full_save_fields(self.mgmt)])
