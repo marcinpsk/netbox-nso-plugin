@@ -3165,6 +3165,52 @@ class TestDeviceNSOTabView(ViewTestBase):
 
         NSOVLANState.objects.filter(management=self.mgmt).delete()
 
+    def _assert_invalid_vlan_refresh_preserves_state(self, document):
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        mirror_update(self.mgmt, adapter_device_id=10)
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 120, "name": "DATA"}, {"vlan_id": 121, "name": "VOICE"}]}
+        )
+        states = NSOVLANState.objects.filter(management=self.mgmt).order_by("pk")
+        revisions = NSOIntentRevision.objects.filter(device=self.device).order_by("pk")
+        original_states = list(states.values())
+        original_revisions = list(revisions.values())
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "vlan"})
+        session = make_session(json_data=document)
+        config = {
+            "url": "http://adapter.example",
+            "token": "test-token",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=config),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            response = self.client.get(url, {"refresh": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(states.values()), original_states)
+        self.assertEqual(list(revisions.values()), original_revisions)
+        self.assertContains(response, "The NSO adapter returned an invalid response.")
+        self.assertTrue(any(call.args[1].endswith("/10/vlan-database") for call in session.request.call_args_list))
+
+    def test_vlan_refresh_rejects_string_container(self):
+        from .test_read_gate import _rs
+
+        self._assert_invalid_vlan_refresh_preserves_state({"vlans": "bad", "read_state": _rs()})
+
+    def test_vlan_refresh_rejects_integer_container(self):
+        from .test_read_gate import _rs
+
+        self._assert_invalid_vlan_refresh_preserves_state({"vlans": 7, "read_state": _rs()})
+
+    def test_vlan_refresh_rejects_non_object_document(self):
+        self._assert_invalid_vlan_refresh_preserves_state(["bad"])
+
     def test_vlan_category_renders_compact_inline_name_editor(self):
         from ipam.models import VLAN, VLANGroup
 

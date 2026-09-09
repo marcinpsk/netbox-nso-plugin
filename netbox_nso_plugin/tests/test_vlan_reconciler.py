@@ -136,6 +136,30 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             ],
         )
 
+    def test_vlan_plan_rejects_malformed_entries_for_unmanaged_device(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
+
+        device = _make_device("unmanaged-entries")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
+        with self.assertRaises(AdapterError) as raised:
+            vlan_reconcile_plan(device, {"vlans": 7})
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_vlan_plan_rejects_non_dict_document_for_unmanaged_device(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
+
+        device = _make_device("unmanaged-document")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
+        with self.assertRaises(AdapterError) as raised:
+            vlan_reconcile_plan(device, [])
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_vlan_reconcile_adopts_a_completed_creation_plan(self):
         from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
         from netbox_nso_plugin.vlan_reconciler import (

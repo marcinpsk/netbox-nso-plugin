@@ -163,8 +163,15 @@ def _vlan_reconcile_operations(device, payload, planned_at):
     from ipam.models import VLAN, VLANGroup
 
     from . import status_machine as sm
+    from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSOVLANState
     from .renderer_writer import planned_save
+
+    if not isinstance(payload, dict):
+        raise AdapterError("Adapter returned a malformed VLAN document.", code="invalid_response")
+    items = payload.get("vlans")
+    if items is not None and not isinstance(items, list):
+        raise AdapterError("Adapter returned malformed VLAN entries.", code="invalid_response")
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
@@ -191,7 +198,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         operations.append((group, None, True))
         return group
 
-    for item in payload.get("vlans", []) or []:
+    for item in items or []:
         if not isinstance(item, dict):
             logger.warning("VLAN reconcile for %s dropped a malformed entry: %r", device, item)
             continue
