@@ -316,7 +316,7 @@ class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 42})
 
-    def test_a_push_attempt_committed_during_planning_does_not_fail_the_full_save(self):
+    def test_a_push_attempt_allocated_during_planning_does_not_fail_the_full_save(self):
         from netbox_nso_plugin.signals import _allocate_push_attempt
         from netbox_nso_plugin.tests._outbox_case import mirror_update
 
