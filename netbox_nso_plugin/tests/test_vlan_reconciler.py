@@ -1391,6 +1391,72 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         relation_queries = [query for query in queries if through_table in query["sql"]]
         self.assertEqual(len(relation_queries), 1)
 
+    def test_switchport_plan_prefetches_stale_native_tagged_vlans_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, switchport_reconcile_plan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 47, "name": "MGMT"}]})
+        vlan = NSOVLANState.objects.get(management=self.management, vlan__vid=47).vlan
+        interfaces = [self.interface]
+        interfaces.extend(
+            Interface.objects.create(device=self.device, name=f"GigabitEthernet0/{index}", type="1000base-t")
+            for index in range(2, 5)
+        )
+        for interface in interfaces:
+            self.assertFalse(interface.mode)
+            self.assertIsNone(interface.untagged_vlan_id)
+            interface.tagged_vlans.add(vlan)
+            NSOSwitchportState.objects.create(
+                management=self.management, interface=interface, mode="tagged", status="imported"
+            )
+        through_table = Interface._meta.get_field("tagged_vlans").remote_field.through._meta.db_table
+
+        with CaptureQueriesContext(connection) as queries:
+            plan = switchport_reconcile_plan(self.device, {"interfaces": []})
+
+        relation_queries = [query for query in queries if through_table in query["sql"]]
+        self.assertEqual(len(relation_queries), 1)
+        self.assertEqual(
+            {write.pk for write in plan.write_set if write.model_label == NSOSwitchportState._meta.label_lower},
+            set(NSOSwitchportState.objects.filter(management=self.management).values_list("pk", flat=True)),
+        )
+
+    def test_vlan_operations_preload_reported_overlay_vlan_group(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.vlan_reconciler import _vlan_reconcile_operations, reconcile_vlan_database
+
+        payload = {"vlans": [{"vlan_id": 47, "name": "MGMT"}]}
+        state = reconcile_vlan_database(self.device, payload)[0]
+        group = state.vlan.group
+
+        _saves, _operations, rows = _vlan_reconcile_operations(self.device, payload, timezone.now())
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        with self.assertNumQueries(0):
+            self.assertEqual(rows[0].vlan.group, group)
+
+    def test_vlan_operations_preload_reported_group_only_vlan_group(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.vlan_reconciler import _vlan_reconcile_operations
+
+        group = _device_vlan_group(self.device)
+        vlan = VLAN.objects.create(group=group, vid=47, name="MGMT")
+        self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
+
+        _saves, _operations, rows = _vlan_reconcile_operations(
+            self.device, {"vlans": [{"vlan_id": 47, "name": "MGMT"}]}, timezone.now()
+        )
+
+        self.assertEqual([row.vlan_id for row in rows], [vlan.pk])
+        self.assertIsNone(rows[0].pk)
+        with self.assertNumQueries(0):
+            self.assertEqual(rows[0].vlan.group, group)
+
     def test_switchport_changed_when_netbox_has_divergent_value(self):
         """A non-pristine interface whose L2 differs from the device → changed, NOT clobbered."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
