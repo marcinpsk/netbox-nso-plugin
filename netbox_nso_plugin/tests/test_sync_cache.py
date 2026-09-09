@@ -836,7 +836,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
     def test_failed_rekey_fence_skips_the_full_save(self):
         """A rejected fence write must not let the re-save push under the old source identity."""
         from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.management_lifecycle import full_save_fields, save_management
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.sync_cache import reconcile_device_links
@@ -853,7 +853,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         def build_then_stale_fence(*args, **kwargs):
             nonlocal fence_plan_staled
             proposed_save = next(iter(kwargs.get("saves", ())), None)
-            if proposed_save is not None and proposed_save.update_fields is None:
+            if proposed_save is not None and proposed_save.update_fields == full_save_fields(proposed_save.instance):
                 full_save_pks.append(proposed_save.instance.pk)
             plan = original_build(*args, **kwargs)
             if (
@@ -887,6 +887,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual((broken, attempted), (2, 2))
         self.assertTrue(fence_plan_staled)
         self.assertNotIn(mgmt.pk, full_save_pks)  # the rejected row never reached the full save
+        self.assertEqual(full_save_pks, [second.pk])  # the next row did reach it
         self.assertEqual(scope_calls, [197, 700])  # nothing pushed under the old source identity
         rekey.assert_not_called()
         self.assertEqual(
@@ -932,7 +933,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         self.assertEqual(mgmt.adapter_device_id, 900)
 
     def test_failed_reused_id_clear_skips_the_full_save(self):
-        from netbox_nso_plugin.management_lifecycle import save_management
+        from netbox_nso_plugin.management_lifecycle import full_save_fields, save_management
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
         from netbox_nso_plugin.sync_cache import reconcile_device_links
 
@@ -945,7 +946,7 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         def build_then_stale_pointer_clear(*args, **kwargs):
             nonlocal pointer_plan_staled
             proposed_save = next(iter(kwargs.get("saves", ())), None)
-            if proposed_save is not None and proposed_save.update_fields is None:
+            if proposed_save is not None and proposed_save.update_fields == full_save_fields(proposed_save.instance):
                 full_save_ids.append(proposed_save.instance.adapter_device_id)
             plan = original_build(*args, **kwargs)
             if proposed_save is not None and proposed_save.update_fields == ("adapter_device_id",):
