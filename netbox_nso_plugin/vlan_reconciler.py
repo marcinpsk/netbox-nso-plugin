@@ -243,6 +243,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
     from .models import NSODeviceManagement, NSOVLANState
     from .renderer_writer import planned_save
 
+    items = _validated_vlan_items(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], []
@@ -271,7 +272,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         operations.append((group, None, True))
         return group
 
-    for item in _validated_vlan_items(payload):
+    for item in items:
         vid = item["vlan_id"]
         seen_vids.add(vid)
         name = item.get("name") or ""
