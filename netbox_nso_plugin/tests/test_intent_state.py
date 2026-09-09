@@ -809,6 +809,33 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertFalse(type(self.state).objects.filter(pk=self.state.pk).exists())
 
+    def test_detected_reconcile_bumps_a_later_owned_write_for_another_prelocked_key(self):
+        from netbox_nso_plugin.intent_state import footprint_for_instance
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        other_device, other_management = make_managed("intent-other", 1624, index=2)
+        other = own_vlan(other_management, 1624, "intent-other")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        other_revision = NSOIntentRevision.objects.get(device=other_device, scope="vlan")
+        before = revision.revision
+        other_before = other_revision.revision
+        self.state.status = "imported"
+        plan = RendererMutationPlan.build(saves=(planned_save(self.state, update_fields=("status",)),))
+        footprint = MutationFootprint.merge(plan.lock_footprint, footprint_for_instance(other))
+        self.assertEqual(set(plan.content_keys), {(self.device.pk, "vlan")})
+        self.assertEqual(set(footprint.revision_keys), {(self.device.pk, "vlan"), (other_device.pk, "vlan")})
+
+        with without_commit_drain(), mirror_transaction(footprint, detect_content_changes=True):
+            with renderer_writes(plan) as writer:
+                writer.save(self.state, update_fields=("status",))
+            other.status = "imported"
+            other.save(update_fields=["status"])
+
+        revision.refresh_from_db()
+        other_revision.refresh_from_db()
+        self.assertEqual(revision.revision, before + 1)
+        self.assertEqual(other_revision.revision, other_before + 1)
+
     def test_detected_reconcile_locks_deploying_rows_before_capture(self):
         """Apply settlement waits until a detected reconcile finishes its re-pend decision."""
         import threading

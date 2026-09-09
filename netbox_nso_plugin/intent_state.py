@@ -2281,7 +2281,7 @@ def _upgrade_detected_reconcile(
 
     for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
-    permit.bumped.update(permit.footprint.revision_keys)
+    permit.bumped.update(revision_keys)
     permit.deferred_repend_rows = permit.initial_deploying_rows
     permit.dml_kind = "content"
     permit.footprint_tables_cache = None
