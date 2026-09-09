@@ -1279,7 +1279,7 @@ class TestCategoryViewSkipFallback(TestCase):
             "plugins:netbox_nso_plugin:device_nso_category",
             kwargs={"pk": self.device.pk, "key": "vlan"},
         )
-        payload = {"vlans": 1, "read_state": _rs()}
+        payload = {"vlans": [{"vlan_id": float("inf"), "name": "planner-failure"}], "read_state": _rs()}
         with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=payload):
             response = self.client.get(url, {"refresh": "1"})
 
