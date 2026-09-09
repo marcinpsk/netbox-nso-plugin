@@ -1185,6 +1185,77 @@ class TestStalePlanRace(TestCase):
 
         self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
 
+    def _assert_l2_status_race(self, whole_device):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan
+        from netbox_nso_plugin.models import NSOFamilyReadState
+        from netbox_nso_plugin.reconcile import reconcile_category, reconcile_device
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        self.mgmt.manage_l2 = True
+        self.mgmt.save(update_fields=["manage_l2"])
+        with patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=_l2_payload(read_state=_rs())):
+            seeded = reconcile_category(self.device, self.mgmt, "l2_services")
+        self.assertEqual(seeded["_gate"]["l2_service"], "ran")
+        state = NSOL2SapState.objects.get(management=self.mgmt)
+
+        def markers():
+            row = NSOFamilyReadState.objects.get(management=self.mgmt, family="l2_service")
+            return (
+                row.applied_attempt_id,
+                row.applied_incarnation,
+                row.applied_source_epoch,
+                row.applied_payload_revision,
+                row.applied_publication_sequence,
+            )
+
+        before = markers()
+
+        def stale_plan(device, payload):
+            frozen = l2_service_reconcile_plan(device, payload)
+            state.status = "changed"
+            mutation = RendererMutationPlan.build(saves=(planned_save(state, update_fields=("status",)),))
+            with renderer_mirror_writes(mutation) as writer:
+                writer.save(state, update_fields=("status",))
+            return frozen
+
+        with ExitStack() as stack:
+            doc = _l2_payload(read_state=_rs(attempt_id=2))
+            stack.enter_context(patch("netbox_nso_plugin.adapter_client.get_l2_services", return_value=doc))
+            if whole_device:
+                for fetcher, shape in _DEVICE_FETCHERS.items():
+                    if fetcher == "get_l2_services":
+                        continue
+                    other_doc = dict(shape)
+                    if fetcher != "get_state":
+                        other_doc["read_state"] = _rs(attempt_id=2)
+                    stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=other_doc))
+
+            def refresh():
+                if whole_device:
+                    return reconcile_device(self.device, self.mgmt)
+                return reconcile_category(self.device, self.mgmt, "l2_services")
+
+            with patch("netbox_nso_plugin.l2_service_reconciler.l2_service_reconcile_plan", side_effect=stale_plan):
+                ctx = refresh()
+            self.assertEqual(ctx["_gate"]["l2_service"], "skipped_stale_attempt")
+            self.assertEqual(markers(), before)
+            state.refresh_from_db()
+            self.assertEqual(state.status, "changed")
+            self.assertEqual(state.last_apply_error, "")
+            replay = refresh()
+            self.assertEqual(replay["_gate"]["l2_service"], "ran")
+            self.assertEqual(markers()[0], 2)
+            state.refresh_from_db()
+            self.assertEqual(state.status, "imported")
+
+    def test_category_l2_status_race_skips_and_replays_publication(self):
+        self._assert_l2_status_race(whole_device=False)
+
+    def test_device_l2_status_race_skips_and_replays_publication(self):
+        self._assert_l2_status_race(whole_device=True)
+
     def test_device_svi_race_skips_without_faulting_the_scope(self):
         from contextlib import ExitStack
 
