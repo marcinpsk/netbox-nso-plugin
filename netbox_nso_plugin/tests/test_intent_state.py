@@ -396,7 +396,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             cursor.execute(statement, ["first", self.state.pk])
             cursor.execute(statement, ["second", self.state.pk])
 
-        self.assertLessEqual(parse_calls, 2)
+        # The _parse_dml_target and _dml_columns caches each parse the cold statement once.
+        self.assertEqual(parse_calls, 2)
 
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():
