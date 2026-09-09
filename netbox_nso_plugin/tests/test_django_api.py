@@ -141,6 +141,8 @@ class NSODeviceManagementAPITest(APITestCase):
 
     def test_create_finalizes_the_exact_renderer_fingerprint(self):
         """The production API create uses the exact management-row writer."""
+        from netbox_nso_plugin import delivery
+
         device = Device.objects.create(
             name="api-mgmt-create",
             device_type=self.device.device_type,
@@ -162,8 +164,10 @@ class NSODeviceManagementAPITest(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         revision = NSOIntentRevision.objects.get(device=device, scope="interface")
+        management = NSODeviceManagement.objects.get(device=device)
+        rendered = delivery.render("interface", device.pk, management.adapter_device_id)
         self.assertEqual(revision.verified_revision, revision.revision)
-        self.assertTrue(revision.verified_fingerprint)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(rendered.payload))
 
     def test_adapter_owned_sync_fields_are_read_only(self):
         """A PATCH must not be able to forge adapter-owned bookkeeping — last_sync_status (a fake
