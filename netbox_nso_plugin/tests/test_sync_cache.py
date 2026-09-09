@@ -879,6 +879,111 @@ class TestReconcileDeviceLinksConcurrency(_CascadeFlushMixin, IntentPushResetMix
         update_mirror_fields(management, onboard_status="")
         self.mgmt = management
 
+    def test_link_repair_locks_management_before_the_attempt_stamp(self):
+        from django.db import OperationalError, transaction
+
+        from netbox_nso_plugin.management_lifecycle import full_save_fields, save_management
+        from netbox_nso_plugin.models import NSOFamilyReadState, NSOIntentRevision
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        from ._outbox_case import without_commit_drain
+
+        revisions = NSOIntentRevision.objects.filter(device=self.mgmt.device).order_by("scope")
+        before = dict(revisions.values_list("scope", "revision"))
+        original_build = RendererMutationPlan.build
+        probe_started = False
+        row_locked = []
+        errors = []
+        full_saves = []
+        backend_ids = []
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            main_backend = cursor.fetchone()[0]
+
+        def compete():
+            try:
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute("SET LOCAL lock_timeout = '500ms'")
+                        cursor.execute("SELECT pg_backend_pid()")
+                        backend_ids.append(cursor.fetchone()[0])
+                    current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                    current.last_sync_status = "concurrent"
+                    save_management(current)
+            except OperationalError as exc:
+                errors.append(exc)
+            except Exception as exc:  # noqa: BLE001, the main thread reports worker failures
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        def build_with_competitor(*args, **kwargs):
+            plan = original_build(*args, **kwargs)
+            proposed = next(iter(kwargs.get("saves", ())), None)
+            if proposed is None or proposed.instance.pk != self.mgmt.pk:
+                return plan
+            if threading.current_thread() is not threading.main_thread():
+                full_saves.append(proposed.update_fields)
+                # Prove the management SELECT FOR UPDATE in intent_state.py _acquire before its advisory lock masks it.
+                try:
+                    NSODeviceManagement.objects.select_for_update(nowait=True).get(pk=self.mgmt.pk)
+                except OperationalError:
+                    row_locked.append(True)
+                    raise
+                row_locked.append(False)
+            return plan
+
+        def contend_after_management_lock(execute, sql, params, many, context):
+            nonlocal probe_started
+            if not probe_started and NSOFamilyReadState._meta.db_table in sql:
+                probe_started = True
+                worker = threading.Thread(target=compete)
+                worker.start()
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive(), "competing full save did not finish")
+            return execute(sql, params, many, context)
+
+        moved = _adapter_row(self.mgmt, id=700)
+        session = make_session(json_data={})
+        with (
+            patch.object(RendererMutationPlan, "build", new=build_with_competitor),
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+            without_commit_drain(),
+            connection.execute_wrapper(contend_after_management_lock),
+            self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as captured,
+        ):
+            result = reconcile_device_links(
+                NSODeviceManagement.objects.all(),
+                snapshot=(
+                    [self.mgmt],
+                    {700: moved},
+                    {(self.mgmt.nso_instance.adapter_instance_id, self.mgmt.nso_device_name): [moved]},
+                ),
+            )
+
+        self.assertEqual(len(captured.output), 1, captured.output)
+        self.assertIn("adopting", captured.output[0])
+        self.assertTrue(probe_started)
+        self.assertEqual(row_locked, [True], "management row was not locked before the repair stamp")
+        self.assertEqual(full_saves, [full_save_fields(self.mgmt)])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], OperationalError)
+        self.assertEqual(errors[0].__cause__.sqlstate, "55P03")
+        self.assertEqual(len(backend_ids), 1)
+        self.assertNotEqual(backend_ids[0], main_backend)
+        self.assertEqual(result, (1, 1))
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 700)
+        self.assertIsNotNone(self.mgmt.adapter_link_attempted_at)
+        self.assertNotEqual(self.mgmt.last_sync_status, "concurrent")
+        self.assertTrue(before)
+        self.assertEqual(
+            dict(revisions.values_list("scope", "revision")),
+            {scope: revision + 1 for scope, revision in before.items()},
+        )
+
     def test_a_rekey_started_before_repair_does_not_advance_revision(self):
         """A repair skipped after acquisition leaves the intent revision unchanged."""
         from netbox_nso_plugin import intent_state
