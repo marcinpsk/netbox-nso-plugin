@@ -163,6 +163,8 @@ def reconcile_subinterface(device, payload: dict) -> list:
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
+        if active is not None:
+            return _reconcile_frozen_subinterface(writer, payload)
         return _reconcile_subinterface(device, payload, writer, plan.planned_at)
 
 
@@ -176,4 +178,59 @@ def _reconcile_subinterface(device, payload: dict, writer, planned_at) -> list:
             writer.delete(instance)
         else:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+    return rows
+
+
+def _frozen_subinterface_operations(plan):
+    """Materialize native and overlay operations from the frozen write set."""
+    from dcim.models import Interface
+
+    from .models import NSOSubinterfaceState
+    from .renderer_writer import RendererCreationRef
+
+    models = {model._meta.label_lower: model for model in (Interface, NSOSubinterfaceState)}
+    creations = {}
+    for write in plan.write_set:
+        if write.model_label not in models or write.cascade:
+            continue
+        model = models[write.model_label]
+        values = {
+            name: creations[value].pk if isinstance(value, RendererCreationRef) else value
+            for name, value in write.values
+        }
+        current = model.objects.filter(pk=write.pk).first() if write.pk is not None else None
+        if write.force_insert:
+            natural_key = {
+                name: creations[value].pk if isinstance(value, RendererCreationRef) else value
+                for name, value in write.natural_key
+            }
+            current = model.objects.filter(**natural_key).first()
+        instance = copy.copy(current) if current is not None else model(pk=write.pk)
+        if not write.force_insert or current is None:
+            for field_name, value in values.items():
+                if model._meta.get_field(field_name).get_internal_type() == "JSONField":
+                    value = dict(value)
+                setattr(instance, field_name, value)
+        if write.force_insert:
+            reference = RendererCreationRef(model_label=write.model_label, natural_key=write.natural_key)
+            creations[reference] = instance
+        yield write.operation, instance, write.update_fields, write.force_insert
+
+
+def _reconcile_frozen_subinterface(writer, payload):
+    """Consume completed writes and execute the remaining frozen operations."""
+    from .models import NSOSubinterfaceState
+
+    raw_items = payload.get("interfaces", []) if isinstance(payload, dict) else []
+    items = raw_items if isinstance(raw_items, list) else []
+    reported = {item.get("interface_name") for item in items if isinstance(item, dict)}
+    rows = []
+    for operation, instance, update_fields, force_insert in _frozen_subinterface_operations(writer.plan):
+        if operation == "delete":
+            writer.delete(instance)
+            continue
+        if not (writer.consume_existing_creation(instance) or writer.consume_applied_save(instance)):
+            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        if isinstance(instance, NSOSubinterfaceState) and instance.interface.name in reported:
+            rows.append(instance)
     return rows
