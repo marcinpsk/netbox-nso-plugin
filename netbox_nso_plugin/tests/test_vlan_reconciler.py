@@ -268,6 +268,142 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_response")
 
+    def test_switchport_reconciler_accepts_the_unconfigured_mode_sentinel(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].mode, "")
+
+    def test_switchport_reconcile_unset_mode_clears_imported_trunk(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": 1648,
+                        "tagged_vlans": [1649],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+        state = rows[0]
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "tagged")
+        self.assertEqual(self.interface.untagged_vlan.vid, 1648)
+        self.assertEqual(list(self.interface.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.mode, "tagged")
+        self.assertEqual(state.untagged_vlan.vid, 1648)
+        self.assertEqual(list(state.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.status, "imported")
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(NSOSwitchportState.objects.filter(management=self.management).count(), 1)
+        state.refresh_from_db()
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "")
+        self.assertIsNone(self.interface.untagged_vlan_id)
+        self.assertFalse(self.interface.tagged_vlans.exists())
+        self.assertEqual(state.mode, "")
+        self.assertIsNone(state.untagged_vlan_id)
+        self.assertFalse(state.tagged_vlans.exists())
+        self.assertEqual(state.status, "imported")
+
+    def test_switchport_tagged_to_access_transition_clears_the_tagged_vlans(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": 1648,
+                        "tagged_vlans": [1649],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+        state = rows[0]
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "tagged")
+        self.assertEqual(self.interface.untagged_vlan.vid, 1648)
+        self.assertEqual(list(self.interface.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.mode, "tagged")
+        self.assertEqual(state.untagged_vlan.vid, 1648)
+        self.assertEqual(list(state.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.status, "imported")
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "access",
+                        "untagged_vlan": 1648,
+                        "tagged_vlans": [],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(NSOSwitchportState.objects.filter(management=self.management).count(), 1)
+        state.refresh_from_db()
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "access")
+        self.assertEqual(self.interface.untagged_vlan.vid, 1648)
+        self.assertFalse(self.interface.tagged_vlans.exists())
+        self.assertEqual(state.mode, "access")
+        self.assertEqual(state.untagged_vlan.vid, 1648)
+        self.assertFalse(state.tagged_vlans.exists())
+        self.assertEqual(state.status, "imported")
+
     def test_switchport_reconcile_rejects_an_unknown_mode(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport

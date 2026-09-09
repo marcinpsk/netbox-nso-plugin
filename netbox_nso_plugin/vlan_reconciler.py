@@ -58,7 +58,7 @@ def _validated_switchport_items(payload) -> list[dict]:
             isinstance(item, dict)
             and isinstance(item.get("interface_name"), str)
             and item["interface_name"]
-            and item.get("mode") in _NSO_TO_NETBOX_MODE
+            and (item.get("mode") in _NSO_TO_NETBOX_MODE or item.get("mode") == "")
             and valid_untagged
             and valid_tagged
         ):
@@ -1038,6 +1038,8 @@ def _reconcile_switchport(device, payload: dict, writer, planned_at, interface_p
             writer.delete(instance)
         else:
             if (id(instance), field_name) in consumed_m2m:
+                continue
+            if writer.consume_applied_m2m_set(instance, field_name):
                 continue
             writer.m2m_set(instance, field_name, related)
     return rows
