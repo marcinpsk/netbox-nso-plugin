@@ -1299,7 +1299,8 @@ class TestCategoryViewSkipFallback(TestCase):
             for fetcher, shape in _DEVICE_FETCHERS.items():
                 doc = dict(shape, read_state=_rs())
                 if fetcher == "get_vlan_database":
-                    doc["vlans"] = 1
+                    # The document shape is valid, but int(infinity) raises OverflowError in the planner.
+                    doc["vlans"] = [{"vlan_id": float("inf"), "name": "planner-failure"}]
                 elif fetcher == "get_logging_config":
                     doc["local_levels"] = {"console_severity": "WARNING"}
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
@@ -1308,6 +1309,32 @@ class TestCategoryViewSkipFallback(TestCase):
         self.assertEqual(context["_gate"]["vlan"], "skipped_unavailable")
         self.assertEqual(context["_gate"]["logging"], "ran")
         self.assertEqual(NSOLoggingLevelState.objects.get(management=self.mgmt).console_severity, "WARNING")
+
+    def test_a_malformed_vlan_document_is_an_adapter_error_not_a_planner_failure(self):
+        from contextlib import ExitStack
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        from ._outbox_case import own_vlan
+
+        content_update(self.mgmt, manage_interfaces=True, manage_logging=True)
+        own_vlan(self.mgmt, 220, "retained-vlan")
+        states = NSOVLANState.objects.filter(management=self.mgmt).order_by("pk")
+        before = list(states.values())
+        with ExitStack() as stack:
+            for fetcher, shape in _DEVICE_FETCHERS.items():
+                doc = dict(shape, read_state=_rs())
+                if fetcher == "get_vlan_database":
+                    doc["vlans"] = 1
+                stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
+            # The call raises instead of returning a context with a skipped VLAN gate entry.
+            with self.assertRaises(AdapterError) as raised:
+                reconcile_device(self.device, self.mgmt)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(list(states.values()), before)
 
     def test_skip_renders_last_known_rows(self):
         from netbox_nso_plugin.reconcile import reconcile_category
