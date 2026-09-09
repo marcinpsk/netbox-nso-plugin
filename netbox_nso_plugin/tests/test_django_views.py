@@ -3588,6 +3588,46 @@ class TestDeviceNSOTabView(ViewTestBase):
     def test_vlan_refresh_rejects_non_object_document(self):
         self._assert_invalid_vlan_refresh_preserves_state(["bad"])
 
+    def test_switchport_refresh_rejects_integer_container(self):
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSwitchportState
+
+        from .test_read_gate import _rs
+
+        mirror_update(self.mgmt, adapter_device_id=10)
+        NSOSwitchportState.objects.create(
+            management=self.mgmt, interface=self.interface, mode="access", status="imported"
+        )
+        states = NSOSwitchportState.objects.filter(management=self.mgmt).order_by("pk")
+        revisions = NSOIntentRevision.objects.filter(device=self.device).order_by("pk")
+        original_states = list(states.values())
+        original_revisions = list(revisions.values())
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "switchport"}
+        )
+        session = make_session()
+        session.request.side_effect = [
+            make_response(json_data={"vlans": []}),
+            make_response(json_data={"interfaces": 7, "read_state": _rs()}),
+        ]
+        config = {
+            "url": "http://adapter.example",
+            "token": "test-token",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=config),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            response = self.client.get(url, {"refresh": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(states.values()), original_states)
+        self.assertEqual(list(revisions.values()), original_revisions)
+        self.assertContains(response, "The NSO adapter returned an invalid response.")
+        self.assertTrue(any(call.args[1].endswith("/10/switchport") for call in session.request.call_args_list))
+
     def test_vlan_category_renders_compact_inline_name_editor(self):
         from ipam.models import VLAN, VLANGroup
 
