@@ -2394,6 +2394,36 @@ class TestSwitchportStateAcceptView(ViewTestBase):
         self.assertIsNotNone(state.accepted_at)
         self.assertEqual(state.interface.mode, "access")
 
+    def test_interface_reassignment_is_invalid_and_accept_refuses_a_forced_mismatch(self):
+        from django.contrib.messages import get_messages
+        from django.core.exceptions import ValidationError
+
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSwitchportState
+
+        state = self._switchport("GigabitEthernet0/43", status="changed")
+        other_device = Device.objects.create(
+            name="switchport-other", device_type=self.device.device_type, role=self.device.role, site=self.device.site
+        )
+        interface = state.interface
+        interface.device = other_device
+        with self.assertRaises(ValidationError) as error:
+            interface.full_clean()
+        self.assertIn("device", error.exception.message_dict)
+
+        content_bulk_update(interface, device=other_device)
+        states = NSOSwitchportState.objects.filter(pk=state.pk)
+        interfaces = Interface.objects.filter(pk=interface.pk)
+        revisions = NSOIntentRevision.objects.filter(device__in=(self.device, other_device)).order_by("pk")
+        before = (list(states.values()), list(interfaces.values()), list(revisions.values()))
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:switchport_accept", args=[state.pk]))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            "The switchport changed. Refresh the page and try again.",
+            [str(message) for message in get_messages(response.wsgi_request)],
+        )
+        self.assertEqual((list(states.values()), list(interfaces.values()), list(revisions.values())), before)
+
     def test_reaccept_keeps_the_first_acceptance_time(self):
         """staged_days measures the wait since FIRST acceptance; a re-accept must not reset it."""
         from django.utils import timezone
