@@ -681,6 +681,8 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                 dropped.append(interface_name)
                 continue
             identity = (interface.pk, address_family)
+            if identity in seen_interfaces:
+                continue
             seen_interfaces.add(identity)
             current_state = interface_states.get(identity)
             state, created_state = _copy_or_new(

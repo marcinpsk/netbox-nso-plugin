@@ -902,6 +902,61 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(result[0].interface_id, port.pk)
         self.assertEqual(result[0].status, "imported")  # unowned, materialized → imported (unified)
 
+    def test_resolved_aliases_keep_first_metric_on_first_import(self):
+        from netbox_routing.models import ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        self._make_mgmt()
+        port = Interface.objects.create(device=self.device, name="lag-99:10", type="lag")
+        result = _reconcile_isis_interfaces(
+            self.device,
+            self._payload(
+                self._entry(iface_name="LAG99:10", bound_port=port.name, metric=10),
+                self._entry(iface_name=port.name, metric=20),
+                self._entry(iface_name=port.name, af="ipv6", metric=30),
+            ),
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(ISISInterface.objects.filter(interface=port).count(), 2)
+        self.assertEqual(NSOISISInterfaceState.objects.filter(interface=port).count(), 2)
+        for af, metric in (("ipv4", 10), ("ipv6", 30)):
+            native = ISISInterface.objects.get(interface=port, address_family=af)
+            state = NSOISISInterfaceState.objects.get(interface=port, af=af)
+            self.assertEqual(state.isis_interface_id, native.pk)
+            self.assertEqual(native.metric, metric)
+            self.assertEqual(state.metric, metric)
+
+    def test_resolved_aliases_keep_first_metric_on_existing_rows(self):
+        from netbox_routing.models import ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+
+        self._make_mgmt()
+        port = Interface.objects.create(device=self.device, name="lag-99:10", type="lag")
+        _reconcile_isis_interfaces(self.device, self._payload(self._entry(iface_name=port.name, metric=5)))
+        result = _reconcile_isis_interfaces(
+            self.device,
+            self._payload(
+                self._entry(iface_name="LAG99:10", bound_port=port.name, metric=10),
+                self._entry(iface_name=port.name, metric=20),
+                self._entry(iface_name=port.name, af="ipv6", metric=30),
+            ),
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(ISISInterface.objects.filter(interface=port).count(), 2)
+        self.assertEqual(NSOISISInterfaceState.objects.filter(interface=port).count(), 2)
+        for af, metric in (("ipv4", 10), ("ipv6", 30)):
+            native = ISISInterface.objects.get(interface=port, address_family=af)
+            state = NSOISISInterfaceState.objects.get(interface=port, af=af)
+            self.assertEqual(state.isis_interface_id, native.pk)
+            self.assertEqual(native.metric, metric)
+            self.assertEqual(state.metric, metric)
+
     def test_nokia_bound_port_unmatched_is_dropped(self):
         """A logical name with a bound_port that still matches no dcim.Interface is dropped."""
         self._make_mgmt()
