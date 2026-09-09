@@ -17,8 +17,10 @@ import threading
 import time
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TestCase, TransactionTestCase
+from django.urls import reverse
 
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -313,6 +315,54 @@ class TestPushRecordSurvivesFullSaves(IntentPushResetMixin, TestCase):
         self.mgmt.save(update_fields=["intent_push_attempts"])
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.intent_push_attempts, {"static_route": 42})
+
+    def test_a_push_attempt_committed_during_planning_does_not_fail_the_full_save(self):
+        from netbox_nso_plugin.signals import _allocate_push_attempt
+        from netbox_nso_plugin.tests._outbox_case import mirror_update
+
+        mirror_update(self.mgmt, intent_push_attempts={"static_route": 1}, adapter_link_error="Previous link failed")
+        user = get_user_model().objects.create_superuser(
+            username="link-retry-admin", password="test-password", email="link-retry-admin@test.example"
+        )
+        self.client.force_login(user)
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_link_retry", args=[self.mgmt.pk])
+        table = connection.ops.quote_name(self.mgmt._meta.db_table)
+        allocations = []
+
+        def allocate_before_preimage(execute, sql, params, many, context):
+            # The planner uses first(); the view's initial get() uses LIMIT 21.
+            if (
+                not allocations
+                and sql.startswith("SELECT ")
+                and f"FROM {table}" in sql
+                and f'{table}."nso_device_name"' in sql
+                and f'{table}."intent_push_attempts"' in sql
+                and sql.endswith("LIMIT 1")
+                and "FOR UPDATE" not in sql
+            ):
+                allocations.append(True)
+                self.assertEqual(_allocate_push_attempt(self.device.pk, "static_route"), 2)
+            return execute(sql, params, many, context)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value={}) as sync_notify,
+            self.captureOnCommitCallbacks(execute=True),
+            connection.execute_wrapper(allocate_before_preimage),
+        ):
+            response = self.client.post(url)
+
+        self.assertRedirects(
+            response,
+            reverse("dcim:device_nso", args=[self.device.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(len(allocations), 1)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_attempts["static_route"], 2)
+        self.assertEqual(self.mgmt.adapter_link_error, "")
+        set_scope.assert_called_once()
+        sync_notify.assert_called_once_with(self.mgmt.adapter_device_id)
 
 
 class TestIntentPushRejectionConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

@@ -38,8 +38,9 @@ def management_crud_writes():
 
 def save_management(instance, *, update_fields=None, force_insert=False):
     """Save one management row with an exact precomputed mutation plan."""
-    _refresh_full_save_records(instance, update_fields)
     update_fields = _prepare_source_fence(instance, update_fields)
+    if update_fields is None and instance.pk is not None and not instance._state.adding:
+        update_fields = full_save_fields(instance)
     natural_key = ("device",) if instance.pk is None or instance._state.adding else ()
     plan = RendererMutationPlan.build(
         saves=(
@@ -57,16 +58,16 @@ def save_management(instance, *, update_fields=None, force_insert=False):
     return instance
 
 
-def _refresh_full_save_records(instance, update_fields):
-    """Carry every monotone record into a full save before its plan is frozen."""
-    if update_fields is not None or instance.pk is None or instance._state.adding:
-        return
+def full_save_fields(instance) -> tuple[str, ...]:
+    """Return full-save fields that exclude primary keys and monotone records."""
     protected = type(instance)._STALE_SAVE_PROTECTED_FIELDS
-    current = type(instance).objects.filter(pk=instance.pk).values(*protected).first()
-    if current is None:
-        return
-    for field_name in protected:
-        setattr(instance, field_name, current[field_name])
+    return tuple(
+        sorted(
+            field.name
+            for field in instance._meta.concrete_fields
+            if not field.primary_key and field.name not in protected
+        )
+    )
 
 
 def _prepare_source_fence(instance, update_fields):
