@@ -78,6 +78,8 @@ class ShardingContractTests(unittest.TestCase):
                 {"completed": []},
                 {"exitstatus": 1},
                 {"duration_input": "different-input"},
+                {"shard": 1},
+                {"full": original["full"][:1]},
             ):
                 with self.subTest(corruption=corruption):
                     report_path.write_text(json.dumps(dict(original, **corruption)))
