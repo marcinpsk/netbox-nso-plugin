@@ -2676,6 +2676,7 @@ class TestRoutePolicyVersionsStructuredUI(TestCase):
         self.assertIn("ipv4", html)  # match AFI chip
         self.assertIn("Default action", html)  # folded default-action surfaced, not an entry
         self.assertIn("local_preference=200", html)  # residual set knob
+        self.assertIn('data-bs-target="#rpv', html)  # route-map collapse target
 
     def test_versions_page_non_route_map_has_no_detail(self):
         # A community-list version page must not error and carries no route-map detail toggle.
@@ -2692,4 +2693,6 @@ class TestRoutePolicyVersionsStructuredUI(TestCase):
         url = reverse("plugins:netbox_nso_plugin:routing_route_policy_versions", kwargs={"pk": state.pk})
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
-        self.assertNotIn("rpv", resp.content.decode())  # no route-map collapse target
+        html = resp.content.decode()
+        self.assertNotIn('data-bs-target="#rpv', html)  # no route-map collapse target
+        self.assertNotIn('id="rpv', html)  # no route-map collapse detail
