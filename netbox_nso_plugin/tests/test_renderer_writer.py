@@ -284,13 +284,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             assigned_object_id=interface.pk,
         )
         state.vrf = vrf.name
-        binding = _manifest_binding(state)
+        binding = manifest_binding(state)
         self.assertIsNotNone(binding)
         _rule, _scope, _device_id, _native_label, native_key = binding
         self.assertEqual(native_key["vrf_id"], vrf.pk)
 
         state.vrf = "missing-vrf"
-        self.assertIsNone(_manifest_binding(state))
+        self.assertIsNone(manifest_binding(state))
 
     def test_renderer_writer_declares_one_reference_resolver(self):
         import ast
