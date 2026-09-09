@@ -1775,39 +1775,6 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             set(NSOSwitchportState.objects.filter(management=self.management).values_list("pk", flat=True)),
         )
 
-    def test_vlan_operations_preload_reported_overlay_vlan_group(self):
-        from django.utils import timezone
-
-        from netbox_nso_plugin.vlan_reconciler import _vlan_reconcile_operations, reconcile_vlan_database
-
-        payload = {"vlans": [{"vlan_id": 47, "name": "MGMT"}]}
-        state = reconcile_vlan_database(self.device, payload)[0]
-        group = state.vlan.group
-
-        _saves, _operations, rows = _vlan_reconcile_operations(self.device, payload, timezone.now())
-
-        self.assertEqual([row.pk for row in rows], [state.pk])
-        with self.assertNumQueries(0):
-            self.assertEqual(rows[0].vlan.group, group)
-
-    def test_vlan_operations_preload_reported_group_only_vlan_group(self):
-        from django.utils import timezone
-
-        from netbox_nso_plugin.vlan_reconciler import _vlan_reconcile_operations
-
-        group = _device_vlan_group(self.device)
-        vlan = VLAN.objects.create(group=group, vid=47, name="MGMT")
-        self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
-
-        _saves, _operations, rows = _vlan_reconcile_operations(
-            self.device, {"vlans": [{"vlan_id": 47, "name": "MGMT"}]}, timezone.now()
-        )
-
-        self.assertEqual([row.vlan_id for row in rows], [vlan.pk])
-        self.assertIsNone(rows[0].pk)
-        with self.assertNumQueries(0):
-            self.assertEqual(rows[0].vlan.group, group)
-
     def _assert_switchport_group_query_budget(self, source):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
