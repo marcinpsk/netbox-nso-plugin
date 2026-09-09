@@ -3368,6 +3368,11 @@ class _NSOGenerationActionView(NSOActionPermissionMixin, View):
 
         device = get_object_or_404(Device, pk=pk)
         mgmt = getattr(device, "nso_management", None)
+        if (
+            mgmt is not None
+            and not NSODeviceManagement.objects.restrict(request.user, "change").filter(pk=mgmt.pk).exists()
+        ):
+            raise PermissionDenied
         if mgmt is None or mgmt.adapter_device_id is None:
             messages.warning(request, "Device is not yet onboarded.")
             return redirect(_device_nso_tab_url(device.pk))
