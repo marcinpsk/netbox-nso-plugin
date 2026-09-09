@@ -144,7 +144,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
     def test_a_missing_named_vrf_does_not_bind_a_global_ip_address(self):
         from django.contrib.contenttypes.models import ContentType
-        from ipam.models import IPAddress
+        from ipam.models import VRF, IPAddress
 
         from netbox_nso_plugin.models import NSOInterfaceIPState
         from netbox_nso_plugin.renderer_writer import _manifest_binding
@@ -164,6 +164,22 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         state.management = management
 
+        self.assertIsNone(_manifest_binding(state))
+
+        vrf = VRF.objects.create(name="writer-vrf")
+        IPAddress.objects.create(
+            address=state.address,
+            vrf=vrf,
+            assigned_object_type=ContentType.objects.get_for_model(Interface),
+            assigned_object_id=interface.pk,
+        )
+        state.vrf = vrf.name
+        state.management = management
+        binding = _manifest_binding(state)
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding[4]["vrf_id"], vrf.pk)
+
+        state.vrf = "missing-vrf"
         self.assertIsNone(_manifest_binding(state))
 
     def test_renderer_writer_declares_one_reference_resolver(self):
