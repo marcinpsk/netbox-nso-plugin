@@ -838,11 +838,19 @@ class TestOptionalRoutingDependencyPlans(TestCase):
 
     def test_routing_plans_propagate_missing_internal_symbols(self):
         from netbox_nso_plugin import models
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
+        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan
         from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
         from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         device, _management = _make("internal-import-failure")
         for planner, symbol in (
+            (isis_reconcile_plan, "NSOISISInstanceState"),
+            (bfd_reconcile_plan, "NSOBFDInterfaceState"),
+            (route_policy_reconcile_plan, "NSORoutePolicyState"),
+            (static_route_reconcile_plan, "NSOStaticRouteState"),
             (ospf_reconcile_plan, "NSOOSPFInstanceState"),
             (redistribution_reconcile_plan, "NSORedistributionState"),
         ):
@@ -854,8 +862,12 @@ class TestOptionalRoutingDependencyPlans(TestCase):
     def test_routing_plans_propagate_unrelated_missing_modules(self):
         import builtins
 
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
+        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan
         from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
         from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         device, _management = _make("unrelated-import-failure")
         original_import = builtins.__import__
@@ -865,7 +877,14 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                 raise ModuleNotFoundError("No module named 'routing_dependency'", name="routing_dependency")
             return original_import(name, *args, **kwargs)
 
-        for planner in (ospf_reconcile_plan, redistribution_reconcile_plan):
+        for planner in (
+            isis_reconcile_plan,
+            bfd_reconcile_plan,
+            route_policy_reconcile_plan,
+            static_route_reconcile_plan,
+            ospf_reconcile_plan,
+            redistribution_reconcile_plan,
+        ):
             with (
                 self.subTest(planner=planner.__name__),
                 patch("builtins.__import__", side_effect=import_with_missing_dependency),
@@ -874,13 +893,24 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                 planner(device, {})
 
     def test_routing_plans_allow_only_missing_routing_packages(self):
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
         from netbox_nso_plugin.intent_state import MutationFootprint
+        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan
         from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
         from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
         device, _management = _make("missing-routing-packages")
         for missing in ("netbox_routing", "netbox_routing.models"):
-            for planner in (ospf_reconcile_plan, redistribution_reconcile_plan):
+            for planner in (
+                isis_reconcile_plan,
+                bfd_reconcile_plan,
+                route_policy_reconcile_plan,
+                static_route_reconcile_plan,
+                ospf_reconcile_plan,
+                redistribution_reconcile_plan,
+            ):
                 with self.subTest(missing=missing, planner=planner.__name__), patch.dict(sys.modules, {missing: None}):
                     plan = planner(device, {})
                     self.assertEqual(plan.write_set, ())

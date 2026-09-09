@@ -109,9 +109,12 @@ def _route_policy_reconcile_plan_and_operations(device, payload):
 
     planned_at = timezone.now()
     try:
-        operations = _route_policy_reconcile_operations(device, payload, planned_at)
-    except ImportError:
+        import netbox_routing.models  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         return RendererMutationPlan.build(planned_at=planned_at), _Operations()
+    operations = _route_policy_reconcile_operations(device, payload, planned_at)
     plan = _mutation_plan(operations, planned_at)
     return plan, operations
 

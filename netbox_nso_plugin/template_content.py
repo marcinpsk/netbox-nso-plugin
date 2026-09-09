@@ -1205,14 +1205,17 @@ def _static_route_plan_and_operations(device, payload, planned_at, *, resolve_st
     from .renderer_writer import RendererMutationPlan
 
     try:
-        saves, deletes, m2m_writes, operations, confirmed_drift = _static_route_reconcile_operations(
-            device,
-            payload,
-            planned_at,
-            resolve_status=resolve_status,
-        )
-    except ImportError:
+        import netbox_routing.models  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         return RendererMutationPlan.build(planned_at=planned_at), []
+    saves, deletes, m2m_writes, operations, confirmed_drift = _static_route_reconcile_operations(
+        device,
+        payload,
+        planned_at,
+        resolve_status=resolve_status,
+    )
     plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,

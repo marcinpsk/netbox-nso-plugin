@@ -29,9 +29,12 @@ def bfd_reconcile_plan(device, interfaces: list):
 
     planned_at = timezone.now()
     try:
-        saves, deletes, _operations = _bfd_reconcile_operations(device, interfaces, planned_at)
-    except ImportError:
+        import netbox_routing.models  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         return RendererMutationPlan.build(planned_at=planned_at)
+    saves, deletes, _operations = _bfd_reconcile_operations(device, interfaces, planned_at)
     return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
 
 

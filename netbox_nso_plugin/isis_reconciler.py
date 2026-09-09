@@ -62,9 +62,12 @@ def isis_reconcile_plan(device, payload):
 
     planned_at = timezone.now()
     try:
-        operations, _dropped = _isis_reconcile_operations(device, payload, planned_at)
-    except ImportError:
+        import netbox_routing.models  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         return RendererMutationPlan.build(planned_at=planned_at)
+    operations, _dropped = _isis_reconcile_operations(device, payload, planned_at)
     return RendererMutationPlan.build(
         saves=operations.saves,
         deletes=operations.deletes,
