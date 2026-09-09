@@ -350,6 +350,140 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(Redistribution.objects.get(source_protocol="static").metric, 20)
         self.assertEqual(states[0].status, "imported")
 
+    def test_direct_completed_native_update_completes_redistribution_plan(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin import merge_util
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        self._make_mgmt()
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        original_state = NSORedistributionState.objects.get()
+        payload = {"entries": [self._entry(metric=20)]}
+        waiting = None
+        native = None
+
+        def plan_then_compete(device, observed_payload):
+            nonlocal waiting, native
+
+            waiting = redistribution_reconcile_plan(device, observed_payload)
+            native = Redistribution.objects.get(source_protocol="static")
+            native.metric = 20
+            fields = ("route_map", "metric", "metric_type")
+            competing = RendererMutationPlan.build(saves=[planned_save(native, update_fields=fields)])
+            with renderer_mirror_writes(competing) as writer:
+                writer.save(native, update_fields=fields)
+            return waiting
+
+        with (
+            CaptureQueriesContext(connection) as captured,
+            patch("netbox_nso_plugin.redistribution_reconciler.redistribution_reconcile_plan", plan_then_compete),
+        ):
+            rows = reconcile_redistribution(self.device, payload)
+
+        native.refresh_from_db()
+        state = NSORedistributionState.objects.get()
+        self.assertEqual((native.route_map_id, native.metric, native.metric_type), (None, 20, ""))
+        self.assertEqual((state.route_map, state.metric, state.metric_type, state.status), ("", 20, "", "imported"))
+        self.assertEqual(state.pk, original_state.pk)
+        self.assertEqual(state.redistribution_id, native.pk)
+        self.assertEqual(
+            state.device_base_hash, merge_util.content_hash({"route_map": None, "metric": 20, "metric_type": ""})
+        )
+        self.assertEqual(state.last_sync_at, waiting.planned_at)
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(
+            sum(
+                query["sql"].lstrip().startswith(f'UPDATE "{Redistribution._meta.db_table}"')
+                for query in captured.captured_queries
+            ),
+            1,
+        )
+
+    def test_direct_existing_overlay_creation_completes_redistribution_plan(self):
+        from django.contrib.contenttypes.models import ContentType
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin import merge_util
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        management = self._make_mgmt()
+        destination = ISISInstance.objects.create(device=self.device, process_tag="")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(destination),
+            destination_id=destination.pk,
+            source_protocol="static",
+            source_ref="",
+            metric=20,
+            metric_type="",
+        )
+        payload = {"entries": [self._entry(metric=20)]}
+        waiting = None
+        state = None
+        base_hash = None
+
+        def plan_then_compete(device, observed_payload):
+            nonlocal waiting, state, base_hash
+
+            waiting = redistribution_reconcile_plan(device, observed_payload)
+            base_hash = merge_util.content_hash({"route_map": None, "metric": 20, "metric_type": ""})
+            state = NSORedistributionState(
+                management=management,
+                redistribution=native,
+                dest_protocol="isis",
+                dest_ref="",
+                source_protocol="static",
+                source_ref="",
+                route_map="",
+                metric=20,
+                metric_type="",
+                status="imported",
+                device_present=True,
+                device_base_hash=base_hash,
+                last_sync_at=waiting.planned_at,
+            )
+            competing = RendererMutationPlan.build(
+                saves=[
+                    planned_save(
+                        state,
+                        force_insert=True,
+                        natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
+                    )
+                ]
+            )
+            with renderer_mirror_writes(competing) as writer:
+                writer.save(state, force_insert=True)
+            return waiting
+
+        with (
+            CaptureQueriesContext(connection) as captured,
+            patch("netbox_nso_plugin.redistribution_reconciler.redistribution_reconcile_plan", plan_then_compete),
+        ):
+            rows = reconcile_redistribution(self.device, payload)
+
+        self.assertEqual(NSORedistributionState.objects.filter(management=management).count(), 1)
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        state.refresh_from_db()
+        self.assertEqual(state.redistribution_id, native.pk)
+        self.assertEqual((state.route_map, state.metric, state.metric_type, state.status), ("", 20, "", "imported"))
+        self.assertEqual(state.device_base_hash, base_hash)
+        self.assertEqual(state.last_sync_at, waiting.planned_at)
+        self.assertFalse(
+            any(
+                query["sql"].lstrip().startswith(f'UPDATE "{Redistribution._meta.db_table}"')
+                for query in captured.captured_queries
+            )
+        )
+
     def test_completed_native_update_completes_redistribution_plan(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

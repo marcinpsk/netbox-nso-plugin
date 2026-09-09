@@ -356,7 +356,6 @@ def reconcile_redistribution(device, payload: dict) -> list:
         active_renderer_writer,
         renderer_mirror_writes,
         renderer_writes,
-        replay_creation_references,
     )
     from .signals import suppress_intent_push
 
@@ -369,20 +368,7 @@ def reconcile_redistribution(device, payload: dict) -> list:
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
-        if active is not None:
-            _reconcile_frozen_redistribution(writer)
-        else:
-            _saves, _deletes, operations, _dependencies = _redistribution_reconcile_operations(
-                device,
-                payload,
-                plan.planned_at,
-            )
-            for operation, instance, update_fields, force_insert, references in operations:
-                if operation == "delete":
-                    writer.delete(instance)
-                else:
-                    replay_creation_references(instance, references)
-                    writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        _reconcile_frozen_redistribution(writer)
     return list(NSORedistributionState.objects.filter(management=management))
 
 
