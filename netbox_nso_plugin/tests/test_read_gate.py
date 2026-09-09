@@ -1516,7 +1516,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInterfaceMtuState
         from netbox_nso_plugin.read_gate import _gate_and_record, mark_publication_error_if_current
         from netbox_nso_plugin.reconcile import _mark_scope_error
-        from netbox_nso_plugin.tests._outbox_case import without_commit_drain
+        from netbox_nso_plugin.tests._outbox_case import wait_until_postgres_blocks, without_commit_drain
 
         with without_commit_drain(), transaction.atomic():
             interface = Interface.objects.create(
@@ -1539,6 +1539,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
 
         error_holds_level_five = threading.Event()
         release_error = threading.Event()
+        operator_requests_level_four = threading.Event()
         operator_holds_level_four = threading.Event()
         operator_waits_for_level_five = threading.Event()
         errors = []
@@ -1576,6 +1577,10 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
                 def observe_lock_order(execute, sql, params, many, context):
                     statement = str(sql)
                     if "pg_advisory_xact_lock" in statement:
+                        with connection.cursor() as cursor:
+                            cursor.execute("SELECT pg_backend_pid()")
+                            outcome["operator_pid"] = cursor.fetchone()[0]
+                        operator_requests_level_four.set()
                         result = execute(sql, params, many, context)
                         operator_holds_level_four.set()
                         return result
@@ -1601,11 +1606,10 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         operator_worker.start()
         try:
             self.assertTrue(error_holds_level_five.wait(10), "the publication error did not reach its callback")
-            if operator_holds_level_four.wait(2):
-                self.assertTrue(
-                    operator_waits_for_level_five.wait(5),
-                    "the operator did not reach the management-row lock",
-                )
+            self.assertTrue(operator_requests_level_four.wait(10), "the operator did not request the device lock")
+            wait_until_postgres_blocks(outcome["operator_pid"], "the operator device lock", locktype="advisory")
+            self.assertFalse(operator_holds_level_four.is_set())
+            self.assertFalse(operator_waits_for_level_five.is_set())
         finally:
             release_error.set()
             error_worker.join(20)
@@ -1615,6 +1619,8 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(operator_worker.is_alive())
         if errors:
             raise errors[0]
+        self.assertTrue(operator_holds_level_four.is_set())
+        self.assertTrue(operator_waits_for_level_five.is_set())
         self.assertTrue(outcome["marked"])
         state.refresh_from_db()
         self.assertEqual(state.l2_mtu, 1600)
