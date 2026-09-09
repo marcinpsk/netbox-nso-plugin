@@ -836,6 +836,57 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             ):
                 bgp_reconcile_plan(device, {"routers": []})
 
+    def test_routing_plans_propagate_missing_internal_symbols(self):
+        from netbox_nso_plugin import models
+        from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        device, _management = _make("internal-import-failure")
+        for planner, symbol in (
+            (ospf_reconcile_plan, "NSOOSPFInstanceState"),
+            (redistribution_reconcile_plan, "NSORedistributionState"),
+        ):
+            with self.subTest(planner=planner.__name__), patch.dict(vars(models)):
+                delattr(models, symbol)
+                with self.assertRaisesRegex(ImportError, symbol):
+                    planner(device, {})
+
+    def test_routing_plans_propagate_unrelated_missing_modules(self):
+        import builtins
+
+        from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        device, _management = _make("unrelated-import-failure")
+        original_import = builtins.__import__
+
+        def import_with_missing_dependency(name, *args, **kwargs):
+            if name == "netbox_routing.models":
+                raise ModuleNotFoundError("No module named 'routing_dependency'", name="routing_dependency")
+            return original_import(name, *args, **kwargs)
+
+        for planner in (ospf_reconcile_plan, redistribution_reconcile_plan):
+            with (
+                self.subTest(planner=planner.__name__),
+                patch("builtins.__import__", side_effect=import_with_missing_dependency),
+                self.assertRaisesRegex(ModuleNotFoundError, "routing_dependency"),
+            ):
+                planner(device, {})
+
+    def test_routing_plans_allow_only_missing_routing_packages(self):
+        from netbox_nso_plugin.intent_state import MutationFootprint
+        from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        device, _management = _make("missing-routing-packages")
+        for missing in ("netbox_routing", "netbox_routing.models"):
+            for planner in (ospf_reconcile_plan, redistribution_reconcile_plan):
+                with self.subTest(missing=missing, planner=planner.__name__), patch.dict(sys.modules, {missing: None}):
+                    plan = planner(device, {})
+                    self.assertEqual(plan.write_set, ())
+                    self.assertEqual(plan.lock_footprint, MutationFootprint())
+                    self.assertFalse(plan.changes_content)
+
     def test_missing_netbox_routing_skips_reconcile_entry_points(self):
         from netbox_nso_plugin.isis_reconciler import reconcile_isis
         from netbox_nso_plugin.ospf_reconciler import reconcile_ospf

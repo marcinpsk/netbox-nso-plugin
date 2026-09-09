@@ -19,9 +19,12 @@ def redistribution_reconcile_plan(device, payload):
 
     planned_at = timezone.now()
     try:
-        saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, payload, planned_at)
-    except ImportError:
+        import netbox_routing.models  # noqa: F401
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         return RendererMutationPlan.build(planned_at=planned_at)
+    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, payload, planned_at)
     plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
