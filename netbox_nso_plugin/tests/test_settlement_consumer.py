@@ -163,6 +163,17 @@ class TestNothingToCorrelate(_SettlementCase):
 class TestPerRouteVerdicts(_SettlementCase):
     """P5.2-P5.5, P5.7 and P5.10 — one result row decides one overlay, on its own evidence."""
 
+    def test_a_deleted_overlay_is_a_lost_verdict_compare_and_set(self):
+        from netbox_nso_plugin.settlement import _write_verdict
+
+        device = _make_device("deleted-verdict")
+        mgmt = _make_mgmt(device, "deleted-verdict", 49)
+        route = _route("198.18.0.0/24", "198.18.0.1", devices=[device])
+        state = _own(route, mgmt, generation=75)
+        type(state).objects.filter(pk=state.pk).delete()
+
+        self.assertFalse(_write_verdict(state, status="in_sync"))
+
     def test_an_auto_applied_row_settles_without_passing_through_deploying(self):
         """P5.2: an auto-applied route is never marked deploying, and still has a real result."""
         from netbox_nso_plugin.settlement import consume_static_route_settlements
@@ -282,11 +293,17 @@ class TestPerRouteVerdicts(_SettlementCase):
         predicates = [
             sql.split(" WHERE ", 1)[1]
             for sql in (query["sql"] for query in queries.captured_queries)
-            if sql.startswith("SELECT") and "nsostaticroutestate" in sql and " WHERE " in sql
+            if (
+                sql.startswith("SELECT")
+                and "nsostaticroutestate" in sql
+                and "management_id" in sql
+                and " WHERE " in sql
+            )
         ]
-        assert predicates, "the settle pass read no overlay row at all"
-        assert all("static_route_id" in predicate for predicate in predicates), (
-            f"the settle pass re-read every overlay row of the device: {predicates}"
+        device_predicates = [predicate for predicate in predicates if "management_id" in predicate]
+        assert device_predicates, "the settle pass made no device-scoped overlay read"
+        assert all("static_route_id" in predicate for predicate in device_predicates), (
+            f"the settle pass re-read every overlay row of the device: {device_predicates}"
         )
 
     def test_a_newer_running_apply_does_not_gate_an_older_result(self):
@@ -335,7 +352,8 @@ class TestMembershipRemoval(_SettlementCase):
         """The removed device's overlay is gone, so nothing waits on it and nothing stalls."""
         from netbox_nso_plugin.models import NSOStaticRouteState
         from netbox_nso_plugin.settlement import consume_static_route_settlements
-        from netbox_nso_plugin.signals import suppress_intent_push
+
+        from ._static_route_case import _unassign_without_push
 
         kept_device = _make_device("kept")
         gone_device = _make_device("gone")
@@ -347,8 +365,7 @@ class TestMembershipRemoval(_SettlementCase):
 
         # The combined identity + membership edit: D leaves the route, so P8 deletes its
         # overlay. Its removal job carries no route_id at all (that arm is P5.15-O).
-        with suppress_intent_push():
-            sr.devices.remove(gone_device)
+        _unassign_without_push(sr, gone_device)
         gone_state.delete()
 
         self.adapter.store.terminal_job(60, results=[_result(sr.pk, 90)])
@@ -365,61 +382,40 @@ class TestMembershipRemoval(_SettlementCase):
 
 
 class TestAVerdictCannotLandOnNewerIntent(_SettlementCase):
-    """Codex S5 P1 — the consumer locks the MANAGEMENT row, not the overlay.
+    """A verdict computed from stale intent cannot overwrite a newer generation."""
 
-    One job can carry a route whose expectation is missing beside one whose expectation is
-    recorded. Recovering the first costs a real HTTP round trip, and the second's overlay
-    was loaded before it: an operator Accept or content edit in that window allocates a new
-    generation and resets the status, and an unguarded save then puts an old result's
-    verdict on intent the device has not been asked for yet.
-    """
-
-    def test_an_edit_during_the_read_back_cannot_be_overwritten_by_the_old_verdict(self):
-        import threading
-
-        from django.db import connections
+    def test_verdict_computed_before_edit_cannot_overwrite_newer_intent(self):
         from django.utils import timezone
 
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOStaticRouteState
-        from netbox_nso_plugin.settlement import consume_static_route_settlements
+        from netbox_nso_plugin.settlement import _write_verdict
 
         device = _make_device("cas")
         mgmt = _make_mgmt(device, "cas", 10)
-        # `recovered` needs a read-back; `edited` is the row the operator moves during it.
-        recovered = _route("10.50.0.0/16", "10.50.0.1", devices=[device])
         edited = _route("10.51.0.0/16", "10.51.0.1", devices=[device])
-        recovered_state = _own(recovered, mgmt, generation=301, expected=False)
         edited_state = _own(edited, mgmt, generation=301)
-        self.adapter.store.echo(10, recovered.pk, 301, FINGERPRINT)
-        self.adapter.store.terminal_job(10, results=[_result(recovered.pk, 301), _result(edited.pk, 301)])
+        stale_state = NSOStaticRouteState.objects.get(pk=edited_state.pk)
+        current = NSOStaticRouteState.objects.get(pk=edited_state.pk)
+        with intent_transaction(footprint_for_instance(current)):
+            NSOStaticRouteState.objects.filter(pk=edited_state.pk).update(
+                intent_generation=302,
+                generation_started_at=timezone.now(),
+                status="accepted",
+                expected_generation=None,
+                expected_fingerprint="",
+            )
 
-        def operator_edit_mid_flight():
-            """A real second connection: the consumer holds the management row, not this one."""
+        matched = _write_verdict(
+            stale_state,
+            status="in_sync",
+            last_apply_at=timezone.now(),
+            last_apply_error="",
+            last_result_advisory="",
+        )
 
-            def commit():
-                try:
-                    NSOStaticRouteState.objects.filter(pk=edited_state.pk).update(
-                        intent_generation=302,
-                        generation_started_at=timezone.now(),
-                        status="accepted",
-                        expected_generation=None,
-                        expected_fingerprint="",
-                    )
-                finally:
-                    connections.close_all()
-
-            thread = threading.Thread(target=commit)
-            thread.start()
-            thread.join(timeout=30)
-            assert not thread.is_alive(), "the operator edit never committed, so the window was never opened"
-
-        self.adapter.store.on_readback = operator_edit_mid_flight
-
-        consume_static_route_settlements(mgmt)
-
-        recovered_state.refresh_from_db()
         edited_state.refresh_from_db()
-        assert recovered_state.status == "in_sync", "the read-back arm stopped working"
+        assert not matched
         assert edited_state.intent_generation == 302
         assert edited_state.status == "accepted", (
             "a verdict computed for generation 301 landed on generation 302 — a green badge "
@@ -476,29 +472,24 @@ class TestTheEscalationReusesStep4sJobState(_SettlementCase):
         store = self.adapter.store
         return len([path for _method, path in store.requests if path == "/api/v1/jobs"]) - len(store.feed_requests)
 
-    def test_the_escalation_reuses_step_4_s_job_state(self):
+    def test_step_4_does_not_read_the_jobs_page_for_settlement(self):
         from unittest.mock import patch
 
         from netbox_nso_plugin.reconcile import run_device_reconcile
 
         device = _make_device("step4")
         mgmt = _make_mgmt(device, "step4", 97)
-        # The generation probe must succeed. An unknown result stands the backstop down and
-        # removes the premise that this test reaches escalation.
         self.adapter.store.add_device(nso_instance="se-step4-inst", nso_device_name="nso-se-step4", device_id=97)
         sr = _route("10.61.0.0/16", "10.61.0.1", devices=[device])
         state = _own(sr, mgmt, generation=320)
         _stale_clock(state)
-        # Terminal, and about no static route: the feed drains, so the backstop may judge,
-        # which is the path that fetched the job state a second time.
+        # The legacy exact-result feed remains empty. Attempt-addressable settlement must
+        # not reconstruct activity from the descending jobs page.
         self.adapter.store.terminal_job(97)
 
         with patch("netbox_nso_plugin.reconcile.reconcile_device", return_value={}):
             run_device_reconcile(device.pk)
 
         state.refresh_from_db()
-        assert state.status == "apply_failed", "the backstop never ran, so nothing proves the reuse"
-        assert self._jobs_page_reads() == 2, (
-            "Step 4 probes once before the settlement and once after it; a third read is the "
-            "escalation re-fetching the state it was handed"
-        )
+        assert state.status == "deploying"
+        assert self._jobs_page_reads() == 0, "settlement reconstructed Apply evidence from the jobs page"

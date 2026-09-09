@@ -113,7 +113,7 @@ class TestABareEnqueueIsRefused(_DurabilityCase):
         views = (root / "netbox_nso_plugin" / "views.py").read_text(encoding="utf-8")
 
         assert "transaction.atomic()" in readme
-        assert "must hold a writer transaction" in views
+        assert "intent_transaction" in views
         assert "append refuses when no writer transaction" in signals
         assert "drain runs inline" not in signals + views
 

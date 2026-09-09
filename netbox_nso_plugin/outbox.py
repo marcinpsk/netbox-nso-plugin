@@ -274,45 +274,62 @@ def _teardown_marks() -> dict:
     return marks
 
 
+def _store_teardown_marks(device_id, marks: list) -> None:
+    held = _teardown_marks()
+    if marks:
+        held[device_id] = marks
+    else:
+        held.pop(device_id, None)
+
+
+def _teardown_owner():
+    """Return the atomic block a mark belongs to; Django pops it on commit and rollback alike."""
+    from django.db import connection
+
+    blocks = connection.atomic_blocks
+    return blocks[-1] if blocks else None
+
+
+def _live_teardown_marks(device_id, txid: int) -> list:
+    """Sweep every device's stale marks, then return the live ones for *device_id*.
+
+    Visibility is the transaction; ownership is the block that took the mark. A descendant
+    atomic or savepoint sees its ancestor's mark, and only the owner leaving the stack
+    expires it. An aborted teardown never clears its own mark and holds its Atomic object,
+    so the sweep covers the whole (tiny) thread-local, not just the device being asked about.
+    """
+    from django.db import connection
+
+    blocks = connection.atomic_blocks
+    marks = _teardown_marks()
+    for held_device_id, held in list(marks.items()):
+        live = [mark for mark in held if mark[0] == txid and any(block is mark[1] for block in blocks)]
+        if len(live) != len(held):
+            _store_teardown_marks(held_device_id, live)
+    return marks.get(device_id, [])
+
+
 def mark_device_teardown(device_id, txid: int) -> None:
     """Count one in-progress deletion of *device_id* (or of its management row)."""
-    marks = _teardown_marks()
-    scope = _teardown_scope(txid)
-    held_scope, count = marks.get(device_id, (scope, 0))
-    marks[device_id] = (scope, count + 1) if held_scope == scope else (scope, 1)
+    live = _live_teardown_marks(device_id, txid)
+    _store_teardown_marks(device_id, [*live, (txid, _teardown_owner())])
 
 
 def clear_device_teardown(device_id, txid: int) -> None:
-    """Release one mark in the transaction scope that created it."""
-    marks = _teardown_marks()
-    scope = _teardown_scope(txid)
-    held_scope, count = marks.get(device_id, (None, 0))
-    if held_scope != scope or count <= 1:
-        marks.pop(device_id, None)
-    else:
-        marks[device_id] = (held_scope, count - 1)
+    """Release the mark this block took; a live mark another block owns is left standing."""
+    live = _live_teardown_marks(device_id, txid)
+    owner = _teardown_owner()
+    for index in reversed(range(len(live))):
+        if live[index][1] is owner:
+            del live[index]
+            break
+    _store_teardown_marks(device_id, live)
 
 
 def _device_is_tearing_down(device_id, txid: int) -> bool:
-    marks = getattr(_teardown, "marks", None)
-    if not marks or device_id not in marks:
+    if not getattr(_teardown, "marks", None):
         return False
-    if marks[device_id][0] == _teardown_scope(txid):
-        return True
-    # The scope that took the mark is gone (a rolled-back deletion never cleared it).
-    marks.pop(device_id, None)
-    return False
-
-
-def _teardown_scope(txid: int) -> tuple:
-    """Identify the atomic scope whose rollback must expire a teardown mark."""
-    from django.db import connection
-
-    return (
-        txid,
-        tuple(id(block) for block in connection.atomic_blocks),
-        tuple(connection.savepoint_ids),
-    )
+    return bool(_live_teardown_marks(device_id, txid))
 
 
 def current_txid() -> int:
@@ -321,7 +338,7 @@ def current_txid() -> int:
 
     outer = connection.atomic_blocks[0] if connection.atomic_blocks else None
     hooks = connection.run_on_commit
-    cached = getattr(connection, "_nso_intent_txid", None)
+    cached = getattr(connection, "_nso_outbox_txid", None)
     # Django 6.1 rollback paths replace this private hook list. Its identity rejects
     # transaction IDs cached by a transaction or savepoint that rolled back.
     if outer is not None and cached is not None and cached[0] is outer and cached[1] is hooks:
@@ -331,12 +348,12 @@ def current_txid() -> int:
         cursor.execute("SELECT txid_current()")
         txid = int(cursor.fetchone()[0])
     if outer is not None:
-        connection._nso_intent_txid = (outer, hooks, txid)
+        connection._nso_outbox_txid = (outer, hooks, txid)
 
         def clear_cache():
-            cached = getattr(connection, "_nso_intent_txid", None)
+            cached = getattr(connection, "_nso_outbox_txid", None)
             if cached is not None and cached[0] is outer and cached[1] is hooks:
-                del connection._nso_intent_txid
+                del connection._nso_outbox_txid
 
         transaction.on_commit(clear_cache)
     return txid
@@ -355,6 +372,27 @@ def _refuse_outside_a_transaction() -> None:
 
     if not connection.in_atomic_block:
         raise RuntimeError("an intent outbox entry must be appended inside the writer's own transaction")
+
+
+def bump_intent_revision(device_id: int, scope: str) -> int:
+    """Advance one delivery scope's durable content revision."""
+    from django.db import connection
+
+    from .models import NSOIntentRevision
+
+    if not connection.in_atomic_block:
+        raise RuntimeError("an intent revision must be bumped inside the writer's own transaction")
+    table = connection.ops.quote_name(NSOIntentRevision._meta.db_table)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO {table} "  # noqa: S608 (quoted model metadata, not input)
+            "(device_id, scope, revision, updated_at) VALUES (%s, %s, 1, NOW()) "
+            "ON CONFLICT (device_id, scope) DO UPDATE SET "
+            f"revision = {table}.revision + 1, updated_at = NOW() "
+            "RETURNING revision",
+            [device_id, scope],
+        )
+        return int(cursor.fetchone()[0])
 
 
 def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = False) -> None:
@@ -382,6 +420,14 @@ def enqueue(device_id, scope: str, *, transitions=(), delete_origin: bool = Fals
     txid = current_txid()
     if _device_is_tearing_down(device_id, txid):
         return
+    from .intent_state import revision_was_acquired
+
+    if not revision_was_acquired(device_id, scope):
+        from .intent_state import IntentMutationProtocolError
+
+        raise IntentMutationProtocolError(
+            f"intent outbox key {(device_id, scope)!r} was not acquired before the source write"
+        )
     NSOIntentOutboxEntry.objects.create(
         device_id=device_id,
         scope=scope,

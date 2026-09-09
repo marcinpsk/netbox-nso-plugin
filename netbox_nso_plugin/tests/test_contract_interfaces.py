@@ -180,6 +180,14 @@ class TestInterfacesContractConsumer(TestCase):
             NSODerivedIntentTemplate(sentinel=item.sentinel, template=item.template) for item in templates
         )
 
+    def _set_description_without_signals(self, value):
+        """Change rendered content with an exact footprint but no model signals."""
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+
+        with intent_transaction(footprint_for_instance(self.iface)):
+            Interface.objects.filter(pk=self.iface.pk).update(description=value)
+        self.iface.description = value
+
     def test_derived_managed_description_is_owned_pending(self):
         """A derived-managed description is NetBox intent BY DEFINITION: the reconciler owns
         it even when the adapter reports 'imported', so it pushes instead of reading as drift
@@ -190,7 +198,7 @@ class TestInterfacesContractConsumer(TestCase):
         self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
         # Set via queryset update (no post_save) so the degenerate test template's recompute
         # doesn't rewrite the value — we isolate the reconciler's ownership logic here.
-        Interface.objects.filter(pk=self.iface.pk).update(description="[auto] prod - Core Link - unit")
+        self._set_description_without_signals("[auto] prod - Core Link - unit")
         payload = [
             {
                 "name": "GE0/0",
@@ -207,7 +215,7 @@ class TestInterfacesContractConsumer(TestCase):
         from netbox_nso_plugin.derived_intent import SentinelTemplate
 
         self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
-        Interface.objects.filter(pk=self.iface.pk).update(description="[auto] match")
+        self._set_description_without_signals("[auto] match")
         payload = [
             {
                 "name": "GE0/0",
@@ -223,7 +231,7 @@ class TestInterfacesContractConsumer(TestCase):
         from netbox_nso_plugin.derived_intent import SentinelTemplate
 
         self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
-        Interface.objects.filter(pk=self.iface.pk).update(description="hand-typed, not derived")
+        self._set_description_without_signals("hand-typed, not derived")
         payload = [
             {
                 "name": "GE0/0",

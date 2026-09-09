@@ -22,7 +22,7 @@ from netbox_nso_plugin.models import (
 )
 
 from ._adapter_http import make_session
-from ._outbox_case import without_commit_drain
+from ._outbox_case import content_bulk_update, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_CFG = {
@@ -126,9 +126,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         self.assertNotIn("interface", {d["key"] for d in drift})
         # Flip to an unowned status (with a STALE accepted_at) → owned count drops to 0 →
         # the adapter's 1 row is now orphaned → flagged.
-        state.status = "changed"
-        state.accepted_at = timezone.now()
-        state.save()
+        content_bulk_update(state, status="changed", accepted_at=timezone.now())
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertIn("interface", {d["key"] for d in drift})
 
@@ -256,13 +254,14 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         NOTHING while the view reported success, and the split-brain was never repaired.
         """
         from netbox_nso_plugin import outbox
+        from netbox_nso_plugin.intent_state import content_mutation
 
         # The control: an ordinary claim IS dropped once the baseline names its body.
-        with without_commit_drain(), transaction.atomic():
+        with without_commit_drain(), transaction.atomic(), content_mutation({(self.device.pk, "logging")}):
             outbox.enqueue(self.device.pk, "logging")
         primed = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(primed), 1)
-        with without_commit_drain(), transaction.atomic():
+        with without_commit_drain(), transaction.atomic(), content_mutation({(self.device.pk, "logging")}):
             outbox.enqueue(self.device.pk, "logging")
         again = self._recorded_requests(lambda: drain.drain_key(self.device.pk, "logging"))
         self.assertEqual(len(again), 0, "an unchanged ordinary claim is still dropped")

@@ -66,10 +66,10 @@ class _OutcomeCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
             route.devices.remove(self.device)
 
     def reown(self, route):
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
+        from ._static_route_case import _accept_with_permit
 
         with without_commit_drain(), transaction.atomic():
-            _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
 
 
 class TestTheSingleHomeInvariantHoldsAcrossAReplay(_OutcomeCase):
@@ -341,6 +341,7 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
 
     def test_a_late_acknowledgement_stamps_even_though_the_overlay_advanced(self):
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         self._touch()
@@ -348,7 +349,9 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
         # The generation moves on while the answer is in flight. Reusing the expectation
         # hook's CAS here would skip the stamp, and the acknowledged intermediate triple is
         # exactly the one the lineage exists to remember.
-        NSOStaticRouteState.objects.filter(management=self.mgmt).update(intent_generation=999_999)
+        state = NSOStaticRouteState.objects.get(management=self.mgmt)
+        with intent_transaction(footprint_for_instance(state)):
+            NSOStaticRouteState.objects.filter(pk=state.pk).update(intent_generation=999_999)
 
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
         assert last_acked(self.mgmt, self.route) == self.mirror
@@ -969,6 +972,19 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
         state = state_of(self.device, "vlan")
         assert state.push_seq is None, "the operation is resolved, so the key can allocate again"
         assert entries(self.device, "vlan") == []
+
+    def test_a_claim_without_a_revision_is_rejected_as_corrupt(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        own_vlan(self.mgmt, 915, self.tag)
+        claimed = self._lost_response()
+        receipt = self._receipt()
+        NSOIntentOutboxState.objects.filter(device=self.device, scope="vlan").update(claim_revision=None)
+
+        with self.assertRaisesRegex(drain.ProtocolViolation, "durable intent revision"):
+            drain.resolve_restored_claim(self.device.pk, "vlan", receipt)
+        self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
 
     def test_a_receipt_naming_another_body_still_fails_closed(self):
         """The arm is a real check: only the body the adapter accepted settles the claim."""

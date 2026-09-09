@@ -19,6 +19,7 @@ source of truth.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,11 @@ def is_placeholder_vlan_name(row) -> bool:
     return not row.device_name and row.vlan is not None and row.vlan.name == placeholder_vlan_name(row.vlan.vid)
 
 
+def vlan_name_matches(row) -> bool:
+    """Return whether the NetBox name matches this row's device observation."""
+    return row.vlan.name == row.device_name if row.device_name else is_placeholder_vlan_name(row)
+
+
 def rendered_vlan_name(row) -> str:
     """Return the VLAN name emitted by the owned-intent snapshot."""
     return "" if is_placeholder_vlan_name(row) else (row.vlan.name or "")
@@ -99,75 +105,218 @@ def _resolve_synced_vlan(management, group, vid, *, name=None, create=True):
     return VLAN.objects.filter(group=group, vid=vid).first()
 
 
-def _lock_reconcile_vlan_dependencies(
-    device,
-    payload: dict,
-    *,
-    payload_key: str,
-    vid_fields: tuple[str, ...],
-    collect_overlay_vlan_ids,
-) -> None:
-    """Lock one reconcile family's native VLAN dependencies after its membership fence."""
+def vlan_reconcile_footprint(device, payload: dict):
+    """Declare native VLAN rows read or written by one VLAN reconciliation."""
     from ipam.models import VLAN
 
-    from .apply_state import (
-        lock_native_vlan_dependency_rows,
-        vlan_ids_for_dependency_lock,
-    )
-    from .models import NSODeviceManagement
+    from .apply_state import vlan_ids_for_dependency_lock
+    from .intent_state import MutationFootprint, SourceRow
+    from .models import NSODeviceManagement, NSOVLANState
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
-        return
-    items = payload.get(payload_key, []) or [] if isinstance(payload, dict) else []
-    vids = vlan_ids_for_dependency_lock(items, *vid_fields)
+        return MutationFootprint()
+    items = payload.get("vlans", []) or [] if isinstance(payload, dict) else []
+    vids = vlan_ids_for_dependency_lock(items)
+    group = _device_vlan_group(device, create=False)
 
-    def collect_vlan_ids():
-        vlan_ids = set(collect_overlay_vlan_ids(management, vids))
-        group = _device_vlan_group(device, create=False)
-        if group is not None:
-            vlan_ids.update(VLAN.objects.filter(group=group, vid__in=vids).values_list("pk", flat=True))
-        return vlan_ids
-
-    lock_native_vlan_dependency_rows(device.pk, collect_vlan_ids)
-
-
-def lock_vlan_reconcile_dependencies(device, payload: dict) -> None:
-    """Lock native VLANs before the device lock and VLAN overlay writes."""
-    from .models import NSOVLANState
-
-    def collect_overlay_vlan_ids(management, _vids):
-        return NSOVLANState.objects.filter(management=management).values_list("vlan_id", flat=True)
-
-    _lock_reconcile_vlan_dependencies(
-        device,
-        payload,
-        payload_key="vlans",
-        vid_fields=("vlan_id",),
-        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
+    states = list(NSOVLANState.objects.filter(management=management))
+    vlan_ids = {state.vlan_id for state in states}
+    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+    slot_keys = () if group is None else (("vlan-slot", f"{group.pk}:{vid}") for vid in vids)
+    return MutationFootprint.for_keys(
+        {(device.pk, "vlan")},
+        shared_keys=(
+            *(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+            *slot_keys,
+        ),
+        source_rows=(
+            *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+            SourceRow("ipam.vlan", None),
+        ),
+        overlay_rows=(
+            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            SourceRow("netbox_nso_plugin.nsovlanstate", None),
+        ),
     )
 
 
-def lock_switchport_reconcile_dependencies(device, payload: dict) -> None:
-    """Lock native VLANs before the device lock and switchport overlay writes."""
-    from .models import NSOSwitchportState, NSOVLANState
+def vlan_reconcile_plan(device, payload: dict):
+    """Classify a VLAN refresh from its predicted canonical overlay fragments."""
+    import copy
 
-    def collect_overlay_vlan_ids(management, vids):
-        states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
-        vlan_ids = {state.untagged_vlan_id for state in states if state.untagged_vlan_id is not None}
-        vlan_ids.update(vlan.pk for state in states for vlan in state.tagged_vlans.all())
-        vlan_ids.update(
-            NSOVLANState.objects.filter(management=management, vlan__vid__in=vids).values_list("vlan_id", flat=True)
+    from . import status_machine as sm
+    from .intent_state import ReconcileMutationPlan, canonical_fragment
+    from .models import NSODeviceManagement, NSOVLANState
+
+    footprint = vlan_reconcile_footprint(device, payload)
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(footprint)
+    reported = {
+        int(item["vlan_id"]): item.get("name") or ""
+        for item in payload.get("vlans", []) or []
+        if isinstance(item, dict) and item.get("vlan_id") is not None
+    }
+    changes_content = False
+    for state in NSOVLANState.objects.filter(management=management).select_related("vlan"):
+        candidate = copy.copy(state)
+        if state.vlan.vid in reported:
+            name = reported[state.vlan.vid]
+            candidate.device_name = name
+            candidate.status = sm.on_reconcile(
+                state.status,
+                matches=vlan_name_matches(candidate),
+                settles_deploying=False,
+            )
+        else:
+            candidate.status = sm.on_reconcile(state.status, present=False)
+        if canonical_fragment(state) != canonical_fragment(candidate):
+            changes_content = True
+            break
+    return ReconcileMutationPlan(footprint, changes_content=changes_content)
+
+
+def _switchport_items(payload) -> list:
+    """Return the payload's interface entries as a list of dicts."""
+    items = payload.get("interfaces") or [] if isinstance(payload, dict) else []
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _switchport_interface_pks(device, payload: dict) -> dict:
+    """Resolve the payload's interface names to pks, ONCE, before any lock is taken."""
+    from dcim.models import Interface
+
+    names = {item.get("interface_name") for item in _switchport_items(payload)}
+    names = {name for name in names if isinstance(name, str)}
+    return dict(Interface.objects.filter(device=device, name__in=names).values_list("name", "pk"))
+
+
+@dataclass(frozen=True)
+class SwitchportReconcileAttempt:
+    """One switchport read: its plan, and the exact interface pks its body may write.
+
+    The names are resolved before acquisition, so an interface that appears between the
+    plan and the body is deferred to the next read instead of escaping the footprint.
+    Only pks are frozen: the body reloads the rows under the lock, so a field the
+    operator committed after the plan is never compared or saved from a stale copy.
+    """
+
+    plan: object
+    interface_pks: dict
+
+
+def prepare_switchport_reconcile(device, payload: dict) -> SwitchportReconcileAttempt:
+    """Freeze the payload's interface resolutions, then plan against exactly those."""
+    interface_pks = _switchport_interface_pks(device, payload)
+    return SwitchportReconcileAttempt(switchport_reconcile_plan(device, payload, interface_pks), interface_pks)
+
+
+def switchport_reconcile_footprint(device, payload: dict, interface_pks: dict | None = None):
+    """Declare native VLAN rows read or written by one switchport reconciliation."""
+    from dcim.models import Interface
+    from ipam.models import VLAN
+
+    from .apply_state import vlan_ids_for_dependency_lock
+    from .intent_state import MutationFootprint, SourceRow
+    from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
+
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return MutationFootprint()
+    items = _switchport_items(payload)
+    vids = vlan_ids_for_dependency_lock(items, "untagged_vlan", "tagged_vlans")
+    if interface_pks is None:
+        interface_pks = _switchport_interface_pks(device, payload)
+    group = _device_vlan_group(device, create=False)
+
+    states = list(NSOSwitchportState.objects.filter(management=management).prefetch_related("tagged_vlans"))
+    vlan_ids = {state.untagged_vlan_id for state in states if state.untagged_vlan_id is not None}
+    vlan_ids.update(vlan.pk for state in states for vlan in state.tagged_vlans.all())
+    vlan_ids.update(
+        NSOVLANState.objects.filter(management=management, vlan__vid__in=vids).values_list("vlan_id", flat=True)
+    )
+    vlan_ids.update(VLAN.objects.filter(group__slug=f"nso-{device.pk}", vid__in=vids).values_list("pk", flat=True))
+    slot_keys = () if group is None else (("vlan-slot", f"{group.pk}:{vid}") for vid in vids)
+    return MutationFootprint.for_keys(
+        {(device.pk, "switchport")},
+        shared_keys=(
+            *(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+            *slot_keys,
+        ),
+        source_rows=(
+            *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+            SourceRow("ipam.vlan", None),
+            *(SourceRow(Interface._meta.label_lower, interface_pk) for interface_pk in interface_pks.values()),
+            SourceRow(Interface._meta.get_field("tagged_vlans").remote_field.through._meta.label_lower, None),
+            SourceRow(
+                NSOSwitchportState._meta.get_field("tagged_vlans").remote_field.through._meta.label_lower,
+                None,
+            ),
+        ),
+        overlay_rows=(
+            *(SourceRow(state._meta.label_lower, state.pk) for state in states),
+            SourceRow(NSOSwitchportState._meta.label_lower, None),
+        ),
+    )
+
+
+def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None = None):
+    """Classify a switchport refresh from its predicted rendered membership."""
+    import copy
+
+    from ipam.models import VLAN
+
+    from .intent_state import ReconcileMutationPlan, canonical_fragment
+    from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
+    from .status_machine import is_owned
+
+    footprint = switchport_reconcile_footprint(device, payload, interface_pks)
+    management = NSODeviceManagement.objects.filter(device=device).first()
+    if management is None:
+        return ReconcileMutationPlan(footprint)
+    reported = {item.get("interface_name"): item for item in _switchport_items(payload) if item.get("interface_name")}
+    states = tuple(
+        NSOSwitchportState.objects.filter(management=management)
+        .select_related("interface", "untagged_vlan")
+        .prefetch_related("tagged_vlans")
+    )
+    changes_content = any(state.status == "in_sync" and state.interface.name not in reported for state in states)
+    group = _device_vlan_group(device, create=False)
+    synced_vlans = {
+        state.vlan.vid: state.vlan
+        for state in NSOVLANState.objects.filter(management=management).select_related("vlan").order_by("pk")
+    }
+    group_vlans = (
+        {vlan.vid: vlan for vlan in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
+    )
+    for state in states:
+        item = reported.get(state.interface.name)
+        if item is None or not is_owned(state.status):
+            continue
+        nso_untagged = item.get("untagged_vlan")
+        if nso_untagged == 1:
+            nso_untagged = None
+        untagged = (
+            (synced_vlans.get(nso_untagged) or group_vlans.get(nso_untagged)) if nso_untagged is not None else None
         )
-        return vlan_ids
-
-    _lock_reconcile_vlan_dependencies(
-        device,
-        payload,
-        payload_key="interfaces",
-        vid_fields=("untagged_vlan", "tagged_vlans"),
-        collect_overlay_vlan_ids=collect_overlay_vlan_ids,
-    )
+        tagged = tuple(
+            vlan
+            for vlan in (
+                synced_vlans.get(vid) or group_vlans.get(vid) for vid in sorted(item.get("tagged_vlans") or [])
+            )
+            if vlan is not None
+        )
+        before = canonical_fragment(state)
+        candidate = copy.copy(state)
+        candidate.mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
+        candidate.untagged_vlan = untagged
+        candidate._prefetched_objects_cache = dict(state._prefetched_objects_cache)
+        candidate._prefetched_objects_cache["tagged_vlans"] = tagged
+        if before != canonical_fragment(candidate):
+            changes_content = True
+            break
+    return ReconcileMutationPlan(footprint, changes_content=changes_content)
 
 
 def _rescope_managed_device_ids(old_vlan) -> set[int]:
@@ -209,19 +358,24 @@ def _merge_vlan_references(old_vlan, existing) -> set[tuple[int, str]]:
 
     push_targets = set()
     with suppress_intent_push():
-        Interface.objects.filter(untagged_vlan=old_vlan).update(untagged_vlan=existing)
+        untagged_interfaces = Interface.objects.filter(untagged_vlan=old_vlan)
+        if untagged_interfaces.exists():
+            untagged_interfaces.update(untagged_vlan=existing)
         for interface in Interface.objects.filter(tagged_vlans=old_vlan):
             interface.tagged_vlans.remove(old_vlan)
             interface.tagged_vlans.add(existing)
-        NSOSwitchportState.objects.filter(untagged_vlan=old_vlan).update(untagged_vlan=existing)
+        untagged_switchports = NSOSwitchportState.objects.filter(untagged_vlan=old_vlan)
+        if untagged_switchports.exists():
+            untagged_switchports.update(untagged_vlan=existing)
         for switchport in NSOSwitchportState.objects.filter(tagged_vlans=old_vlan):
             switchport.tagged_vlans.remove(old_vlan)
             switchport.tagged_vlans.add(existing)
-        NSOSVIState.objects.filter(vlan=old_vlan).update(vlan=existing)
+        svis = NSOSVIState.objects.filter(vlan=old_vlan)
+        if svis.exists():
+            svis.update(vlan=existing)
 
         locked_states = list(
-            NSOVLANState.objects.select_for_update(of=("self",))
-            .filter(vlan_id__in=(old_vlan.pk, existing.pk))
+            NSOVLANState.objects.filter(vlan_id__in=(old_vlan.pk, existing.pk))
             .select_related("management", "vlan")
             .order_by("pk")
         )
@@ -257,15 +411,6 @@ def _merge_vlan_references(old_vlan, existing) -> set[tuple[int, str]]:
     return push_targets
 
 
-def _lock_rescope_target_group(target_group):
-    from ipam.models import VLANGroup
-
-    locked_group = VLANGroup.objects.select_for_update(no_key=True, of=("self",)).filter(pk=target_group.pk).first()
-    if locked_group is None:
-        raise VLANRescopeConflict("the target VLAN group no longer exists")
-    return locked_group
-
-
 def _move_vlan_to_group(vlan, target_group):
     from django.db import IntegrityError, transaction
 
@@ -294,53 +439,71 @@ def rescope_vlan(state, target_group):
 
     Returns ``(action, surviving_vlan)`` where action is ``moved`` / ``merged`` / ``noop``.
     """
-    from django.db import transaction
+    from dcim.models import Interface
+    from django.db.models import Q
     from ipam.models import VLAN
 
-    from .apply_state import (
-        lock_device_intent_transaction,
-        lock_device_vlan_membership_transaction,
-        lock_vlan_intent_transaction,
-        lock_vlan_membership_transaction,
-        lock_vlan_rescope_transaction,
-    )
-    from .models import NSOVLANState
+    from .intent_state import MutationFootprint, SourceRow, intent_transaction, vlan_footprint
+    from .models import NSOSVIState, NSOSwitchportState, NSOVLANState
     from .signals import _schedule_intent_push
 
-    with transaction.atomic():
-        lock_vlan_rescope_transaction(state.pk)
-        state = NSOVLANState.objects.select_related("management", "vlan").filter(pk=state.pk).first()
-        if state is None:
-            raise VLANRescopeConflict("the VLAN attachment no longer exists")
-        old_vlan = state.vlan
-        vid = old_vlan.vid
-        if old_vlan.group_id == target_group.pk:
-            return "noop", old_vlan
+    state = NSOVLANState.objects.select_related("management", "vlan").filter(pk=state.pk).first()
+    if state is None:
+        raise VLANRescopeConflict("the VLAN attachment no longer exists")
+    old_vlan = state.vlan
+    vid = old_vlan.vid
+    if old_vlan.group_id == target_group.pk:
+        return "noop", old_vlan
+    existing = VLAN.objects.filter(group=target_group, vid=vid).exclude(pk=old_vlan.pk).first()
+    source_identity = (old_vlan.vid, old_vlan.group_id)
+    target_identity = (existing.vid, existing.group_id) if existing is not None else None
+    managed_device_ids = _rescope_managed_device_ids(old_vlan)
+    scopes = ("vlan", "svi", "switchport")
+    footprints = [
+        vlan_footprint(
+            old_vlan.pk,
+            scopes,
+            extra_device_ids=managed_device_ids,
+            shared_keys=(("vlan-slot", f"{target_group.pk}:{vid}"),),
+        )
+    ]
+    if existing is not None:
+        footprints.append(vlan_footprint(existing.pk, scopes, extra_device_ids=managed_device_ids))
+    interface_ids = Interface.objects.filter(Q(untagged_vlan=old_vlan) | Q(tagged_vlans=old_vlan)).values_list(
+        "pk", flat=True
+    )
+    dependencies = MutationFootprint.for_keys(
+        (),
+        source_rows=(
+            SourceRow("ipam.vlangroup", target_group.pk),
+            *(SourceRow("dcim.interface", pk) for pk in interface_ids),
+            SourceRow("dcim.interface", None),
+            SourceRow(Interface._meta.get_field("tagged_vlans").remote_field.through._meta.label_lower, None),
+            SourceRow(
+                NSOSwitchportState._meta.get_field("tagged_vlans").remote_field.through._meta.label_lower,
+                None,
+            ),
+        ),
+        overlay_rows=(
+            SourceRow(state._meta.label_lower, state.pk),
+            SourceRow(NSOSwitchportState._meta.label_lower, None),
+            SourceRow(NSOSVIState._meta.label_lower, None),
+        ),
+    )
+    footprint = MutationFootprint.merge(*footprints, dependencies)
 
-        target_group = _lock_rescope_target_group(target_group)
-        existing = VLAN.objects.filter(group=target_group, vid=vid).exclude(pk=old_vlan.pk).first()
-        source_identity = (old_vlan.vid, old_vlan.group_id)
-        target_identity = (existing.vid, existing.group_id) if existing is not None else None
+    with intent_transaction(footprint):
+        state = NSOVLANState.objects.select_related("management", "vlan").filter(pk=state.pk).first()
+        if state is None or state.vlan_id != old_vlan.pk:
+            raise VLANRescopeConflict("the VLAN attachment changed while the rescope request waited")
+        target_group = type(target_group).objects.filter(pk=target_group.pk).first()
+        if target_group is None:
+            raise VLANRescopeConflict("the target VLAN group no longer exists")
         vlan_ids = [old_vlan.pk]
         if existing is not None:
             vlan_ids.append(existing.pk)
-        vlan_ids.sort()
-        managed_device_ids = _rescope_managed_device_ids(old_vlan)
-        for device_id in sorted(managed_device_ids):
-            lock_device_vlan_membership_transaction(device_id)
-        for vlan_id in vlan_ids:
-            lock_vlan_membership_transaction(vlan_id)
         _validate_rescope_managed_device_ids(old_vlan, managed_device_ids)
-        current_vlan_id = NSOVLANState.objects.filter(pk=state.pk).values_list("vlan_id", flat=True).first()
-        if current_vlan_id != old_vlan.pk:
-            raise VLANRescopeConflict("the VLAN attachment changed while the rescope request waited")
-
-        for vlan_id in vlan_ids:
-            lock_vlan_intent_transaction(vlan_id)
-        locked_vlans = {
-            vlan.pk: vlan
-            for vlan in VLAN.objects.select_for_update(of=("self",)).filter(pk__in=vlan_ids).order_by("pk")
-        }
+        locked_vlans = {vlan.pk: vlan for vlan in VLAN.objects.filter(pk__in=vlan_ids).order_by("pk")}
         if old_vlan.pk not in locked_vlans or (existing is not None and existing.pk not in locked_vlans):
             raise VLANRescopeConflict("a VLAN changed while the rescope request waited")
         if (locked_vlans[old_vlan.pk].vid, locked_vlans[old_vlan.pk].group_id) != source_identity:
@@ -349,9 +512,6 @@ def rescope_vlan(state, target_group):
             locked_existing = locked_vlans[existing.pk]
             if (locked_existing.vid, locked_existing.group_id) != target_identity:
                 raise VLANRescopeConflict("the target VLAN changed while the rescope request waited")
-        for device_id in sorted(managed_device_ids):
-            lock_device_intent_transaction(device_id)
-
         old_vlan = locked_vlans[old_vlan.pk]
         existing = locked_vlans.get(existing.pk) if existing is not None else None
         # Re-scoping mirrors/moves objects; it is not operator intent to push back to NSO.
@@ -366,6 +526,15 @@ def rescope_vlan(state, target_group):
 
 
 def reconcile_vlan_database(device, payload: dict) -> list:
+    """Run VLAN reconciliation behind its complete mutation footprint."""
+    from .intent_state import reconcile_transaction
+    from .signals import suppress_intent_push
+
+    with reconcile_transaction(vlan_reconcile_plan(device, payload)), suppress_intent_push():
+        return _reconcile_vlan_database(device, payload)
+
+
+def _reconcile_vlan_database(device, payload: dict) -> list:
     """Upsert ipam.VLAN (per-device group) + NSOVLANState from the adapter payload."""
     from django.utils import timezone
 
@@ -393,12 +562,10 @@ def reconcile_vlan_database(device, payload: dict) -> list:
         state, _ = NSOVLANState.objects.get_or_create(management=management, vlan=vlan)
         state.last_sync_at = now
         state.device_name = name  # mirror the device value for drift display
-        # Value overlay: the editable value is the VLAN name. A device with no name
-        # has nothing to drift against, so treat that as a match. The unified machine
-        # then settles owned→in_sync (or re-pends to accepted) and rests unowned at
-        # imported (or changed on a real rename divergence).
-        matches = (not name) or vlan.name == name
-        state.status = sm.on_reconcile(state.status, matches=matches)
+        # Value overlay: the editable value is the VLAN name. A nameless device VLAN
+        # matches only its untouched placeholder. An operator rename remains pending.
+        matches = vlan_name_matches(state)
+        state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         state.save()
         rows.append(state)
 
@@ -448,7 +615,18 @@ def _write_switchport(management, interface, group, mode: str, untagged, tagged:
     interface.tagged_vlans.set(tagged_objs)
 
 
-def reconcile_switchport(device, payload: dict) -> list:
+def reconcile_switchport(device, payload: dict, attempt: SwitchportReconcileAttempt | None = None) -> list:
+    """Run switchport reconciliation behind its complete mutation footprint."""
+    from .intent_state import reconcile_transaction
+    from .signals import suppress_intent_push
+
+    if attempt is None:
+        attempt = prepare_switchport_reconcile(device, payload)
+    with reconcile_transaction(attempt.plan), suppress_intent_push():
+        return _reconcile_switchport(device, payload, attempt.interface_pks)
+
+
+def _reconcile_switchport(device, payload: dict, interface_pks: dict) -> list:
     """Reconcile L2 switchports: seed a pristine NetBox interface from the device, else 3-way.
 
     Brings switchport in line with every other overlay: when the NetBox interface has no
@@ -459,7 +637,12 @@ def reconcile_switchport(device, payload: dict) -> list:
     touched it, an operator edit is frozen (``changed``) and survives, both-moved →
     ``conflict``. Owned (accepted) rows keep the value-aware settle and are never
     auto-clobbered. IOS's implicit default native VLAN 1 is normalised to "no native".
+
+    *interface_pks* is the frozen name→pk map of :class:`SwitchportReconcileAttempt`; a
+    payload name missing from it is deferred to the next read. The rows are reloaded here,
+    under the acquired lock, so the compare and the write see committed operator edits.
     """
+    from dcim.models import Interface
     from django.utils import timezone
 
     from . import merge_util
@@ -475,11 +658,14 @@ def reconcile_switchport(device, payload: dict) -> list:
     now = timezone.now()
     rows: list = []
     seen: set[int] = set()
-    for item in payload.get("interfaces", []) or []:
-        try:
-            interface = device.interfaces.get(name=item["interface_name"])
-        except Exception:
-            continue
+    interfaces = {
+        interface.pk: interface
+        for interface in Interface.objects.filter(pk__in=set(interface_pks.values())).select_related("untagged_vlan")
+    }
+    for item in _switchport_items(payload):
+        interface = interfaces.get(interface_pks.get(item.get("interface_name")))
+        if interface is None:
+            continue  # not resolved before acquisition, or gone since; the next read picks it up
 
         nso_mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
         nso_untagged = item.get("untagged_vlan")

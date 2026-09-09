@@ -44,6 +44,7 @@ import hashlib
 import json
 
 import requests
+from django.db import transaction
 from django.test import LiveServerTestCase
 
 from ._settlement_adapter import FakeAdapter, SettlementStore
@@ -236,7 +237,8 @@ class TestTheIdentityEditSettlesEndToEnd(
 
         first_generation = self._state().intent_generation
         self.route.prefix = "10.9.0.0/24"  # A → B: the identity itself moves
-        self.route.save()
+        with transaction.atomic():
+            self.route.save()
         self._drain()
 
         state = self._state()
@@ -271,7 +273,8 @@ class TestTheIdentityEditSettlesEndToEnd(
         # The device kept the pre-edit content: the apply reports A's fingerprint for B.
         self.store.apply_fingerprint = stale
         self.route.prefix = "10.9.0.0/24"
-        self.route.save()
+        with transaction.atomic():
+            self.route.save()
         self._drain()
 
         state = self._state()
@@ -285,7 +288,8 @@ class TestTheIdentityEditSettlesEndToEnd(
 
         self.store.apply_generation_delta = -1  # the result names the generation before this one
         self.route.prefix = "10.9.0.0/24"
-        self.route.save()
+        with transaction.atomic():
+            self.route.save()
         self._drain()
 
         self.assertEqual(self._state().status, "accepted")
@@ -303,12 +307,14 @@ class TestTheIdentityEditSettlesEndToEnd(
         ``tests/api/test_static_route_pending_clear.py``.
         """
         self.route.metric = 3
-        self.route.save()
+        with transaction.atomic():
+            self.route.save()
         self._own()
         self._drain()
 
         self.route.metric = 5
-        self.route.save()
+        with transaction.atomic():
+            self.route.save()
         self._drain()
 
         entry = self.store.pushes[-1][1][0]

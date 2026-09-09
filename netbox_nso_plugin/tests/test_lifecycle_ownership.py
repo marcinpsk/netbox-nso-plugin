@@ -22,6 +22,8 @@ from netbox.context import current_request
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 from netbox_nso_plugin.summary import interface_row_state
 
+from ._outbox_case import mirror_update
+
 
 class TestInterfaceOwnershipLifecycle(TestCase):
     @classmethod
@@ -72,7 +74,8 @@ class TestInterfaceOwnershipLifecycle(TestCase):
 
     def _adapter_writes(self, attribute="description", **fields):
         """Simulate an adapter sync writing state (never touches accepted_at)."""
-        NSOInterfaceState.objects.filter(interface=self.iface, attribute=attribute).update(**fields)
+        state = NSOInterfaceState.objects.get(interface=self.iface, attribute=attribute)
+        mirror_update(state, **fields)
 
     # ── the arc ──────────────────────────────────────────────────────────────
     def test_description_arc_import_drift_own_applyfail_converge(self):
