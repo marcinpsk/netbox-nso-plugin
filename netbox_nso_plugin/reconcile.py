@@ -16,8 +16,14 @@ from __future__ import annotations
 import logging
 
 from .deployment import guarded as _deployment_guarded
+from .vlan_reconciler import _validated_switchport_items, _validated_vlan_items
 
 logger = logging.getLogger(__name__)
+
+_FAMILY_VALIDATORS = {
+    "vlan": _validated_vlan_items,
+    "switchport": _validated_switchport_items,
+}
 
 
 class ReconcileScopeError(Exception):
@@ -166,6 +172,9 @@ def _gated(
     """
     from .read_gate import LEGACY, RAN, gated_family_run
 
+    validator = _FAMILY_VALIDATORS.get(family)
+    if validator is not None:
+        validator(payload)
     read_state = payload.get("read_state") if isinstance(payload, dict) else None
     if read_state is None and isinstance(payload, dict) and "read_state" in payload:
         # explicit `"read_state": null` — a MALFORMED S4 block, not a pre-S4 adapter:
