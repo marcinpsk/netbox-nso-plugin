@@ -164,14 +164,23 @@ class TestReconcileLagConfig(TestCase):
             ),
         )
 
+        def is_lag_probe(sql):
+            return 'FROM "dcim_interface"' in sql and any(
+                predicate in sql for predicate in ('"lag_id" =', '"lag_id" IN (')
+            )
+
+        with CaptureQueriesContext(connection) as equality_queries:
+            Interface.objects.filter(device=self.device, lag=self.lag).first()
+        self.assertTrue(any(is_lag_probe(query["sql"]) for query in equality_queries))
+
+        with CaptureQueriesContext(connection) as in_queries:
+            Interface.objects.filter(device=self.device, lag_id__in=[self.lag.pk]).exists()
+        self.assertTrue(any(is_lag_probe(query["sql"]) for query in in_queries))
+
         with CaptureQueriesContext(connection) as queries:
             lacp_reconcile_plan(self.device, _payload([]))
 
-        lag_probes = [
-            query["sql"]
-            for query in queries
-            if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
-        ]
+        lag_probes = [query["sql"] for query in queries if is_lag_probe(query["sql"])]
         self.assertEqual(lag_probes, [])
 
     def test_stale_bundle_apply_does_not_probe_each_interface(self):
@@ -191,14 +200,23 @@ class TestReconcileLagConfig(TestCase):
             ),
         )
 
+        def is_lag_probe(sql):
+            return 'FROM "dcim_interface"' in sql and any(
+                predicate in sql for predicate in ('"lag_id" =', '"lag_id" IN (')
+            )
+
+        with CaptureQueriesContext(connection) as equality_queries:
+            Interface.objects.filter(device=self.device, lag=self.lag).first()
+        self.assertTrue(any(is_lag_probe(query["sql"]) for query in equality_queries))
+
+        with CaptureQueriesContext(connection) as in_queries:
+            Interface.objects.filter(device=self.device, lag_id__in=[self.lag.pk]).exists()
+        self.assertTrue(any(is_lag_probe(query["sql"]) for query in in_queries))
+
         with CaptureQueriesContext(connection) as queries:
             reconcile_lag_config(self.device, _payload([]))
 
-        lag_probes = [
-            query["sql"]
-            for query in queries
-            if 'FROM "dcim_interface"' in query["sql"] and '"lag_id" =' in query["sql"]
-        ]
+        lag_probes = [query["sql"] for query in queries if is_lag_probe(query["sql"])]
         self.assertEqual(lag_probes, [])
 
     def test_apply_does_not_probe_overlay_state_per_row(self):
