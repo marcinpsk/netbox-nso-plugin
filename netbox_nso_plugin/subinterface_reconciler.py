@@ -163,22 +163,7 @@ def reconcile_subinterface(device, payload: dict) -> list:
     if active is None:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
-        if active is not None:
-            return _reconcile_frozen_subinterface(writer, payload)
-        return _reconcile_subinterface(device, payload, writer, plan.planned_at)
-
-
-def _reconcile_subinterface(device, payload: dict, writer, planned_at) -> list:
-    """Apply a subinterface mirror after its complete footprint is locked."""
-    _saves, _deletes, operations, rows = _subinterface_reconcile_operations(device, payload, planned_at)
-    for row in rows:
-        writer.consume_existing_creation(row.interface)
-    for operation, instance, update_fields, force_insert in operations:
-        if operation == "delete":
-            writer.delete(instance)
-        else:
-            writer.save(instance, update_fields=update_fields, force_insert=force_insert)
-    return rows
+        return _reconcile_frozen_subinterface(writer, payload)
 
 
 def _frozen_subinterface_operations(plan):

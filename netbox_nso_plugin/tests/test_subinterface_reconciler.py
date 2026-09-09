@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 from ipam.models import VLAN
@@ -155,6 +157,118 @@ class TestSubinterfaceReconciler(TestCase):
 
         interface.refresh_from_db()
         self.assertEqual(interface.parent_id, new_parent.pk)
+
+    def test_direct_completed_native_parent_update_completes_subinterface_plan(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
+
+        new_parent = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
+        interface = Interface.objects.create(
+            device=self.device, name="GigabitEthernet0/1.200", type="virtual", parent=self.parent
+        )
+        state = NSOSubinterfaceState.objects.create(
+            management=self.management,
+            interface=interface,
+            parent_interface=self.parent,
+            dot1q_vlan=200,
+            status="imported",
+        )
+        payload = {
+            "interfaces": [{"interface_name": interface.name, "parent_interface": new_parent.name, "dot1q_vlan": 200}]
+        }
+        waiting = None
+
+        def plan_then_compete(device, observed_payload):
+            nonlocal waiting
+
+            waiting = subinterface_reconcile_plan(device, observed_payload)
+            candidate = Interface.objects.get(pk=interface.pk)
+            candidate.parent = new_parent
+            competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=("parent",))])
+            with renderer_mirror_writes(competing) as writer:
+                writer.save(candidate, update_fields=("parent",))
+            return waiting
+
+        with (
+            CaptureQueriesContext(connection) as captured,
+            patch("netbox_nso_plugin.subinterface_reconciler.subinterface_reconcile_plan", plan_then_compete),
+        ):
+            rows = reconcile_subinterface(self.device, payload)
+
+        interface.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(interface.parent_id, new_parent.pk)
+        self.assertEqual(state.parent_interface_id, new_parent.pk)
+        self.assertEqual((state.dot1q_vlan, state.vrf, state.status), (200, "", "imported"))
+        self.assertEqual(state.last_sync_at, waiting.planned_at)
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(
+            sum(
+                query["sql"].lstrip().startswith(f'UPDATE "{Interface._meta.db_table}"')
+                for query in captured.captured_queries
+            ),
+            1,
+        )
+
+    def test_direct_existing_overlay_creation_completes_subinterface_plan(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+        from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
+
+        interface = Interface.objects.create(
+            device=self.device, name="GigabitEthernet0/1.101", type="virtual", parent=self.parent
+        )
+        payload = {
+            "interfaces": [{"interface_name": interface.name, "parent_interface": self.parent.name, "dot1q_vlan": 101}]
+        }
+        waiting = None
+        state = None
+
+        def plan_then_compete(device, observed_payload):
+            nonlocal waiting, state
+
+            waiting = subinterface_reconcile_plan(device, observed_payload)
+            state = NSOSubinterfaceState(
+                management=self.management,
+                interface=interface,
+                parent_interface=self.parent,
+                dot1q_vlan=101,
+                vrf="",
+                status="imported",
+                last_sync_at=waiting.planned_at,
+            )
+            competing = RendererMutationPlan.build(
+                saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))]
+            )
+            with renderer_mirror_writes(competing) as writer:
+                writer.save(state, force_insert=True)
+            return waiting
+
+        with (
+            CaptureQueriesContext(connection) as captured,
+            patch("netbox_nso_plugin.subinterface_reconciler.subinterface_reconcile_plan", plan_then_compete),
+        ):
+            rows = reconcile_subinterface(self.device, payload)
+
+        self.assertEqual(NSOSubinterfaceState.objects.filter(interface=interface).count(), 1)
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        interface.refresh_from_db()
+        self.assertEqual(interface.parent_id, self.parent.pk)
+        state.refresh_from_db()
+        self.assertEqual(state.last_sync_at, waiting.planned_at)
+        self.assertEqual(state.parent_interface_id, self.parent.pk)
+        self.assertEqual((state.dot1q_vlan, state.vrf, state.status), (101, "", "imported"))
+        self.assertFalse(
+            any(
+                query["sql"].lstrip().startswith(f'UPDATE "{Interface._meta.db_table}"')
+                for query in captured.captured_queries
+            )
+        )
 
     def test_completed_native_parent_update_completes_subinterface_plan(self):
         from django.db import connection
