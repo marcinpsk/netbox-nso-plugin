@@ -2,6 +2,46 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-09-07)
+
+### Bug Fixes
+
+- Preserve review failure recovery and allocation progress
+  ([`f173b9d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f173b9dcaf9f65759b4921eb614b15444d322560))
+
+- **bgp**: Lock peer-template states before reading their transition inputs
+  ([`bc55b04`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bc55b043e0893f18ba14c94c6ecc58f1bb372f3c))
+
+- **reconcile**: Address locking and refresh review findings
+  ([`57826e7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/57826e79d383e0fecd02d652d168f2066c4762ed))
+
+- **reconcile**: Supply IS-IS and OSPF family plans to the read gates
+  ([`5357283`](https://github.com/marcinpsk/netbox-nso-plugin/commit/535728385ad55e323e0175ea1e4e22bc81bc8bc9))
+
+- **redistribution**: Keep the policy footprint's device ids after the merge
+  ([`eeb7eac`](https://github.com/marcinpsk/netbox-nso-plugin/commit/eeb7eac03ac9ed8721c3614eb5dcd173353ba22e))
+
+- **settlement**: Sweep every deploying scope and close the evidence worker's connection
+  ([`e658480`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e6584803a985fa70e1cbed36951f83a98dd174ae))
+
+- **static-route**: Keep deploying siblings pending on confirmed drift
+  ([`611cdcd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/611cdcd44795839051f48270f85db19d47b5ffd9))
+
+### Testing
+
+- **bgp**: Move the template Accept race into the outbox concurrency module
+  ([`f787e16`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f787e16dfd02834bd65922b3bc8d6f2bbf215900))
+
+- **outbox**: Give the delete-lock barrier the shared 30 s wait budget
+  ([`5c1729a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5c1729a4da9ccd2a62c8ad286ced4117b13d06b9))
+
+- **read-gate**: Assert scoped planner failure propagation
+  ([`e55f9cc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e55f9cca7e718608534601243f0203311931ec4a))
+
+- **settlement**: Cover whole-second apply evidence in the escalation timeout
+  ([`0a35208`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0a35208761fd9b0a6d21746465f80a3d2234d718))
+
+
 ## v1.1.0 (2026-09-01)
 
 ### Bug Fixes
