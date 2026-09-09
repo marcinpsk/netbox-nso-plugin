@@ -248,14 +248,12 @@ def _vlan_reconcile_operations(device, payload, planned_at):
     if management is None:
         return [], [], []
     group = _device_vlan_group(device, create=False)
-    states = list(NSOVLANState.objects.filter(management=management).select_related("vlan__group").order_by("pk"))
+    states = list(NSOVLANState.objects.filter(management=management).select_related("vlan").order_by("pk"))
     states_by_vid = {}
     for state in states:
         states_by_vid.setdefault(state.vlan.vid, state)
     group_vlans = (
-        {vlan.vid: vlan for vlan in VLAN.objects.filter(group=group).select_related("group").order_by("pk")}
-        if group is not None
-        else {}
+        {vlan.vid: vlan for vlan in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
     )
     saves = []
     operations = []
