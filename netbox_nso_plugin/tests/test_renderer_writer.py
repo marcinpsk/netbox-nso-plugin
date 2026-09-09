@@ -343,7 +343,16 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         state.vrf = vrf.name
         binding = manifest_binding(state)
         self.assertIsNotNone(binding)
-        _rule, _scope, _device_id, _native_label, native_key = binding
+        (
+            _rule,
+            _scope,
+            _device_id,
+            _native_label,
+            _native_id,
+            native_key,
+            _state_label,
+            _state_key,
+        ) = binding
         self.assertEqual(native_key["vrf_id"], vrf.pk)
 
         state.vrf = "missing-vrf"
