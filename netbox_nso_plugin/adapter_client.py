@@ -1031,6 +1031,7 @@ def get_device_apply_state(adapter_device_id: int) -> dict:
     if head is not None and (
         not isinstance(head, dict)
         or type(head.get("generation_id")) is not int
+        or head["generation_id"] <= 0
         or not isinstance(head.get("status"), str)
         or not isinstance(head.get("sections"), list)
         or any(not isinstance(section, str) for section in head["sections"])

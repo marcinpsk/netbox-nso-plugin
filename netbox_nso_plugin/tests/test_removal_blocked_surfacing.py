@@ -247,6 +247,47 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
         self.assertEqual(data["apply_state"], apply_state)
 
+    def test_nonpositive_apply_head_generation_preserves_the_job_strip(self):
+        running = _removal_job(49, "logging", "running")
+        blocked = _blocked_job()
+        residue = _residue_job()
+        jobs = [running, blocked, residue]
+        for generation_id in (0, -1):
+            with self.subTest(generation_id=generation_id):
+                apply_state = {
+                    "device_id": 10,
+                    "head": {
+                        "generation_id": generation_id,
+                        "seq": 11,
+                        "status": "failed",
+                        "job_id": 901,
+                        "mode": "networked",
+                        "settlement_cohort": 17,
+                        "sections": ["vlan"],
+                        "source_push_seq": {"vlan": 44},
+                        "created_at": "2026-08-25T12:00:00Z",
+                        "updated_at": "2026-08-25T12:01:00Z",
+                    },
+                    "blocked": True,
+                    "write_work_pending": False,
+                    "held_jobs": [902],
+                    "pending_generations": 2,
+                    "last_apply_job": None,
+                }
+
+                data = self._get_jobs(jobs, apply_state=apply_state)
+
+                self.assertIsNone(data["apply_state"])
+                self.assertEqual(
+                    data["apply_state_error"],
+                    "The NSO adapter returned an invalid response. See the server log.",
+                )
+                self.assertEqual(data["jobs"], jobs)
+                self.assertEqual(data["running"], running)
+                self.assertEqual(data["last"], blocked)
+                self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
+                self.assertEqual(data["residue_removals"][0]["job_id"], residue["id"])
+
     def test_apply_state_failure_preserves_the_job_strip(self):
         running = _removal_job(49, "logging", "running")
         blocked = _blocked_job()
