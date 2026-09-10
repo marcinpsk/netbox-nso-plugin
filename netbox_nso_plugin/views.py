@@ -2464,13 +2464,6 @@ class NSODeviceManagementBulkDeleteView(NSODevicesReturnMixin, generic.BulkDelet
     table = NSODeviceManagementTable
     filterset = NSODeviceManagementFilterSet
 
-    def post(self, request, **kwargs):
-        """Route every confirmed management deletion through the exact writer."""
-        from .management_lifecycle import management_crud_writes
-
-        with management_crud_writes():
-            return super().post(request, **kwargs)
-
 
 class NSODeviceManagementView(generic.ObjectView):
     """Detail view for an NSO device management record."""
@@ -2513,13 +2506,6 @@ class NSODeviceManagementEditView(NSODevicesReturnMixin, generic.ObjectEditView)
     form = NSODeviceManagementForm
     template_name = "netbox_nso_plugin/nsodevicemanagement_edit.html"
 
-    def post(self, request, *args, **kwargs):
-        """Route the validated management form save through the exact writer."""
-        from .management_lifecycle import management_crud_writes
-
-        with management_crud_writes():
-            return super().post(request, *args, **kwargs)
-
     def get_extra_context(self, request, instance):
         """Label the persistent return control for the actual originating surface."""
         context = super().get_extra_context(request, instance)
@@ -2536,13 +2522,6 @@ class NSODeviceManagementDeleteView(NSODevicesReturnMixin, generic.ObjectDeleteV
 
     template_name = "netbox_nso_plugin/nsodevicemanagement_delete.html"
     queryset = NSODeviceManagement.objects.all()
-
-    def post(self, request, *args, **kwargs):
-        """Route the confirmed management deletion through the exact writer."""
-        from .management_lifecycle import management_crud_writes
-
-        with management_crud_writes():
-            return super().post(request, *args, **kwargs)
 
 
 # ── Adapter actions ──────────────────────────────────────────────────────────

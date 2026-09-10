@@ -4,9 +4,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
-
 from .renderer_writer import (
     RendererMutationPlan,
     planned_delete,
@@ -14,26 +11,6 @@ from .renderer_writer import (
     renderer_mirror_writes,
     renderer_writes,
 )
-
-_MANAGEMENT_CRUD_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "nso_management_crud_active",
-    default=False,
-)
-
-
-def management_crud_is_active() -> bool:
-    """Return whether a production management CRUD surface entered its writer seam."""
-    return _MANAGEMENT_CRUD_ACTIVE.get()
-
-
-@contextlib.contextmanager
-def management_crud_writes():
-    """Route management model saves and deletes through the exact writer."""
-    token = _MANAGEMENT_CRUD_ACTIVE.set(True)
-    try:
-        yield
-    finally:
-        _MANAGEMENT_CRUD_ACTIVE.reset(token)
 
 
 def save_management(instance, *, update_fields=None, force_insert=False):
