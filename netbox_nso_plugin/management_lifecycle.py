@@ -92,7 +92,7 @@ def _prepare_source_fence(instance, update_fields):
         return update_fields
     instance.source_rekey_pending = True
     if selected is None:
-        return update_fields
+        selected = set(full_save_fields(instance))
     selected.add("source_rekey_pending")
     return tuple(sorted(selected))
 

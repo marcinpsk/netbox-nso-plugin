@@ -879,6 +879,99 @@ class TestReconcileDeviceLinksConcurrency(_CascadeFlushMixin, IntentPushResetMix
         update_mirror_fields(management, onboard_status="")
         self.mgmt = management
 
+    def test_full_save_preserves_fence_committed_before_preimage(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.management_lifecycle import save_management
+
+        from ._outbox_case import without_commit_drain
+
+        table = connection.ops.quote_name(self.mgmt._meta.db_table)
+        fence_read = threading.Event()
+        committed = threading.Event()
+        errors = []
+        backend_ids = []
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            main_backend = cursor.fetchone()[0]
+
+        def set_fence():
+            try:
+                self.assertTrue(fence_read.wait(timeout=10))
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute("SET LOCAL lock_timeout = '500ms'")
+                        cursor.execute("SELECT pg_backend_pid()")
+                        backend_ids.append(cursor.fetchone()[0])
+                    current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                    current.source_rekey_pending = True
+                    save_management(current, update_fields=("source_rekey_pending",))
+            except Exception as exc:  # noqa: BLE001, report worker failures in the main thread
+                errors.append(exc)
+            finally:
+                connection.close()
+                committed.set()
+
+        def wait_before_preimage(execute, sql, params, many, context):
+            if (
+                not fence_read.is_set()
+                and sql.startswith("SELECT ")
+                and f"FROM {table}" in sql
+                and f'{table}."nso_device_name"' in sql
+                and f'{table}."source_rekey_pending"' in sql
+                and f'{table}."intent_push_attempts"' in sql
+                and sql.endswith("LIMIT 1")
+                and "FOR UPDATE" not in sql
+            ):
+                self.assertFalse(self.mgmt.source_rekey_pending)
+                fence_read.set()
+                self.assertTrue(committed.wait(timeout=10))
+                self.assertEqual(errors, [])
+            return execute(sql, params, many, context)
+
+        self.mgmt.last_sync_status = "unrelated"
+        worker = threading.Thread(target=set_fence)
+        worker.start()
+        try:
+            with (
+                patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+                patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=make_session(json_data={})),
+                without_commit_drain(),
+                connection.execute_wrapper(wait_before_preimage),
+            ):
+                save_management(self.mgmt)
+        finally:
+            worker.join(timeout=15)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(fence_read.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(backend_ids), 1)
+        self.assertNotEqual(backend_ids[0], main_backend)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.last_sync_status, "unrelated")
+        self.assertTrue(self.mgmt.source_rekey_pending)
+
+    def test_full_source_change_sets_fence_and_named_save_clears_it(self):
+        from netbox_nso_plugin.management_lifecycle import save_management
+
+        from ._outbox_case import without_commit_drain
+
+        self.assertFalse(self.mgmt.source_rekey_pending)
+        self.mgmt.nso_device_name = "cache-new-source"
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=make_session(json_data={})),
+            without_commit_drain(),
+        ):
+            save_management(self.mgmt)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.nso_device_name, "cache-new-source")
+        self.assertTrue(self.mgmt.source_rekey_pending)
+        self.mgmt.source_rekey_pending = False
+        save_management(self.mgmt, update_fields=("source_rekey_pending",))
+        self.mgmt.refresh_from_db()
+        self.assertFalse(self.mgmt.source_rekey_pending)
+
     def test_link_repair_locks_management_before_the_attempt_stamp(self):
         from django.db import OperationalError, transaction
 

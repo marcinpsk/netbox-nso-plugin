@@ -649,7 +649,7 @@ class NSODeviceManagement(NetBoxModel):
         "adapter_link_attempted_at",
     )
     # One authority for the refresh, so a column protected in one group cannot be missed.
-    _STALE_SAVE_PROTECTED_FIELDS = _PUSH_RECORD_FIELDS + _SETTLEMENT_RECORD_FIELDS
+    _STALE_SAVE_PROTECTED_FIELDS = _PUSH_RECORD_FIELDS + _SETTLEMENT_RECORD_FIELDS + ("source_rekey_pending",)
 
     def __str__(self):
         return f"{self.device} → {self.nso_instance.name}/{self.nso_device_name}"
