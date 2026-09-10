@@ -174,7 +174,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         from ._adapter_http import make_response
         from .test_apply_settlement import _CLIENT_CONFIG
 
-        mgmt = self._provisioning("terminal-steps", "J-STEPS")
+        mgmt, tombstone = self._provisioning("terminal-steps", "J-STEPS")
         revisions = NSOIntentRevision.objects.filter(device=mgmt.device)
         self.assertTrue(revisions.exists())
         revisions.update(verified_revision=0, verified_fingerprint="a" * 64, verified_at=timezone.now())
@@ -186,7 +186,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         class ProvisionSession:
             def request(_self, method, url, **kwargs):
                 self.assertEqual(method, "GET")
-                self.assertTrue(url.endswith("/jobs/J-STEPS"))
+                self.assertTrue(url.endswith(f"/provision-attempts/{tombstone.provision_attempt_id}"))
                 return make_response(200, {"status": "succeeded", "result": {"ok": False, "steps": steps}})
 
         with (
