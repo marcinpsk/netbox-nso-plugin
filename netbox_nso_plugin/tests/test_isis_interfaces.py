@@ -399,6 +399,38 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             ).exists()
         )
 
+    def test_omitted_and_foreign_deleted_isis_interface_do_not_enqueue_intent(self):
+        from netbox_routing.models import ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOISISInterfaceState
+        from netbox_nso_plugin.renderer_writer import active_renderer_writer
+
+        self._make_mgmt()
+        reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+        state = NSOISISInterfaceState.objects.get(interface=self.iface_ge0)
+        native = ISISInterface.objects.get(pk=state.isis_interface_id)
+        native_pk = native.pk
+        self.assertEqual(state.status, "imported")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device).exists())
+
+        # Reconcile uses suppress_intent_push; foreign deletion has no active exact writer.
+        with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as push:
+            with self.captureOnCommitCallbacks(execute=True):
+                reconcile_isis_interfaces(self.device, self._payload())
+            self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device).exists())
+            push.assert_not_called()
+            state.refresh_from_db()
+            self.assertEqual(state.status, "changed")
+            self.assertTrue(ISISInterface.objects.filter(pk=native_pk).exists())
+
+            self.assertIsNone(active_renderer_writer())
+            with self.captureOnCommitCallbacks(execute=True):
+                native.delete()
+            self.assertFalse(ISISInterface.objects.filter(pk=native_pk).exists())
+            self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device).exists())
+            push.assert_not_called()
+
     def test_foreign_isis_interface_delete_does_not_retire_overlay_or_push(self):
         """A native delete without manifest authority leaves the overlay detached."""
         from unittest.mock import patch
