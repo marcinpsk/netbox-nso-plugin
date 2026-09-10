@@ -421,6 +421,23 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         assert (rows[0].mark_and, rows[0].mark_any) == (True, True)
         assert (rows[1].mark_and, rows[1].mark_any) == (False, False)
 
+    def test_bounded_compaction_skips_interleaved_keys(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4325))
+        self.append(self.revoke_of(4325), kind=outbox.CONTRIBUTION_KIND_REPAIR)
+        self.append(self.delete_of(4326))
+        interleaved = [(row.pk, row.kind, row.transitions) for row in self.rows()]
+        self.append(scope="vlan")
+        self.append(scope="vlan")
+        survivor = self.rows("vlan")[-1].pk
+
+        for _ in range(3):
+            drain.compact_intent_outbox(limit=1)
+
+        assert [row.pk for row in self.rows("vlan")] == [survivor]
+        assert [(row.pk, row.kind, row.transitions) for row in self.rows()] == interleaved
+
     def test_one_row_in_each_kind_is_not_a_compaction_candidate(self):
         from netbox_nso_plugin import drain, outbox
 
@@ -582,6 +599,28 @@ class TestCompactionRewritesInPlace(_CompactionCase):
         ]
         assert [sql for sql in inserts if "outboxentry" in sql.lower()] == [], inserts
         assert NSOIntentOutboxEntry.objects.order_by("-pk").first().pk == before
+
+    def test_bounded_compaction_keeps_held_rows_as_adjacency_barriers(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.18.0.0/28", "198.18.0.1")
+        with without_commit_drain():
+            route.devices.remove(self.device)
+        held = drain.claim(self.device.pk, "static_route")
+        assert [record["route_id"] for record in held.deletions] == [route.pk]
+        self.clear_entries()
+        self.append(self.delete_of(4422))
+        self.append(self.revoke_of(route.pk))
+        self.append(self.delete_of(4423))
+        blocked = [(row.pk, row.transitions) for row in self.rows()]
+        self.append(scope="vlan")
+        self.append(scope="vlan")
+        survivor = self.rows("vlan")[-1].pk
+
+        drain.compact_intent_outbox(limit=1)
+
+        assert [row.pk for row in self.rows("vlan")] == [survivor]
+        assert [(row.pk, row.transitions) for row in self.rows()] == blocked
 
     def test_a_route_the_active_claim_holds_is_excluded_from_the_pass(self):
         from netbox_nso_plugin import drain

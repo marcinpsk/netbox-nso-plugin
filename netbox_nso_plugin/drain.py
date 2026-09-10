@@ -772,24 +772,34 @@ def _compactable(row, held) -> bool:
 
 
 def compaction_candidates(limit=None) -> list[tuple[int, str]]:
-    """Return the keys carrying more than one unconsumed entry, which are the only merge-able ones."""
+    """Return keys with an eligible contiguous same-kind span."""
     from django.db.models import Count
 
-    from .models import NSOIntentOutboxEntry
+    from .models import NSOIntentOutboxEntry, NSOIntentOutboxState
 
     limit = DRAIN_BATCH if limit is None else limit
+    if limit == 0:
+        return []
     grouped = (
         NSOIntentOutboxEntry.objects.filter(consumed_by_push_seq__isnull=True)
-        .values_list("device_id", "scope", "kind")
+        .values_list("device_id", "scope")
         .annotate(rows=Count("id"))
         .filter(rows__gt=1)
-        .order_by("device_id", "scope", "kind")
+        .order_by("device_id", "scope")
     )
     candidates = []
-    for device_id, scope, _kind, _rows in grouped[: limit * 2]:
-        key = (device_id, scope)
-        if key not in candidates:
-            candidates.append(key)
+    for device_id, scope, _rows in grouped.iterator():
+        state = NSOIntentOutboxState.objects.filter(device_id=device_id, scope=scope).only("claim_deletions").first()
+        held = {int(record["route_id"]) for record in (state.claim_deletions or [])} if state is not None else set()
+        previous_kind = None
+        for row in _unconsumed(device_id, scope).only("kind", "transitions").order_by("id").iterator():
+            if not _compactable(row, held):
+                previous_kind = None
+            elif row.kind == previous_kind:
+                candidates.append((device_id, scope))
+                break
+            else:
+                previous_kind = row.kind
         if len(candidates) == limit:
             break
     return candidates
