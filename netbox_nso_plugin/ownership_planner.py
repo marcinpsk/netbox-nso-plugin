@@ -392,6 +392,9 @@ def plan_ownership(rule: ScopeOwnershipRule, signature: OwnershipSignature) -> O
             return OwnershipAction.DETACH
         return OwnershipAction.NONE
 
+    if signature.manifest_state == "retired":
+        return OwnershipAction.NONE
+
     if signature.overlay_owned:
         if signature.native_present and signature.native_qualifies:
             return OwnershipAction.RECORD_MANIFEST
