@@ -392,31 +392,39 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     group = _device_vlan_group(device, create=False)
     tagged_vlans = Prefetch(
         "tagged_vlans",
-        queryset=VLAN.objects.order_by("pk"),
+        queryset=VLAN.objects.select_related("group").order_by("pk"),
         to_attr="_intent_tagged_vlans",
     )
     interfaces = {
         row.pk: row
         for row in Interface.objects.filter(pk__in=set(interface_pks.values()))
-        .select_related("untagged_vlan")
+        .select_related("untagged_vlan__group")
         .prefetch_related(tagged_vlans)
         .order_by("pk")
     }
     states = {
         row.interface_id: row
         for row in NSOSwitchportState.objects.filter(management=management)
-        .select_related("interface", "untagged_vlan")
+        .select_related("interface__untagged_vlan__group", "untagged_vlan")
         .prefetch_related(
             tagged_vlans,
-            Prefetch("interface__tagged_vlans", queryset=VLAN.objects.order_by("pk"), to_attr="_intent_tagged_vlans"),
+            Prefetch(
+                "interface__tagged_vlans",
+                queryset=VLAN.objects.select_related("group").order_by("pk"),
+                to_attr="_intent_tagged_vlans",
+            ),
         )
         .order_by("pk")
     }
     synced_vlans = {
         row.vlan.vid: row.vlan
-        for row in NSOVLANState.objects.filter(management=management).select_related("vlan").order_by("pk")
+        for row in NSOVLANState.objects.filter(management=management).select_related("vlan__group").order_by("pk")
     }
-    group_vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
+    group_vlans = (
+        {row.vid: row for row in VLAN.objects.filter(group=group).select_related("group").order_by("pk")}
+        if group is not None
+        else {}
+    )
     group_saves = []
     vlan_saves = []
     native_saves = []
