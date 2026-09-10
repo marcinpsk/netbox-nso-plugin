@@ -533,12 +533,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             should_fill and (not has_materialized_owner or created_root or not self._root_has_entries(family, root))
         )
         changed_fields = []
-        if (
-            family == "prefix_list"
-            and fill
-            and captured.get("family") in (4, 6)
-            and root.family != captured["family"]
-        ):
+        if family == "prefix_list" and fill and captured.get("family") in (4, 6) and root.family != captured["family"]:
             root = copy.copy(root)
             root.family = captured["family"]
             self.roots[family][name.casefold()] = root
