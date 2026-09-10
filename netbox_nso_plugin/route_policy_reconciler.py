@@ -1001,11 +1001,7 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
         pl_obj, created = _get_or_create_named(PrefixList, name)
         name_map[name] = pl_obj
         state, should_fill = _upsert_state(mgmt, "prefix_list", name, pl_obj, ct, pl_data, now)
-        # family is device-sourced and entry-independent (not in the hash), so refresh it on any
-        # non-conflicting read — _needs_fill skips an already-populated list, leaving a stale v4
-        # on a v6 list. (A conflicting read leaves should_fill False → an owned/diverged row is
-        # untouched; the owner-content-changed path sets it via _fill_prefix_list.) Mirrors the
-        # community_list invert_match refresh below.
+        # Change root attributes only when this capture supplies the entries.
         needs_fill = _needs_fill(
             PrefixListEntry,
             created,
@@ -1013,8 +1009,7 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
             has_materialized_owner=(ownership.materialized_row(type(state), "prefix_list", name) is not None),
             prefix_list=pl_obj,
         )
-        family_changed = should_fill and pl_data.get("family") in (4, 6) and pl_obj.family != pl_data["family"]
-        if needs_fill or family_changed:
+        if needs_fill:
             with _group_content_mutation("prefix_list", name):
                 needs_fill = _needs_fill(
                     PrefixListEntry,
@@ -1023,10 +1018,8 @@ def _reconcile_prefix_lists(mgmt, device, pl_list, PrefixList, ContentType, now,
                     has_materialized_owner=(ownership.materialized_row(type(state), "prefix_list", name) is not None),
                     prefix_list=pl_obj,
                 )
-                family_changed = pl_data.get("family") in (4, 6) and pl_obj.family != pl_data["family"]
-                if family_changed:
-                    _set_prefix_list_family(pl_obj, pl_data)
                 if needs_fill:
+                    _set_prefix_list_family(pl_obj, pl_data)
                     _fill_prefix_list_entries(pl_obj, entries)
                     ownership.mark_materialized(state)
         seen_keys.add(("prefix_list", name.casefold()))
@@ -1051,8 +1044,6 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
         # Hash is invert_match-aware via the registered spec (_cl_hash); a non-inverted
         # list keeps the plain-entries hash so it doesn't false-drift, an invert flip drifts.
         state, should_fill = _upsert_state(mgmt, "community_list", name, cl_obj, ct, cl_data, now)
-        # invert_match is device-sourced config — refresh it on any non-conflicting read
-        # (a conflicting read leaves should_fill False, so an owned/diverged row is untouched).
         needs_fill = _needs_fill(
             CommunityListEntry,
             created,
@@ -1060,8 +1051,7 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
             has_materialized_owner=(ownership.materialized_row(type(state), "community_list", name) is not None),
             community_list=cl_obj,
         )
-        invert_changed = should_fill and cl_obj.invert_match != invert_match
-        if needs_fill or invert_changed:
+        if needs_fill:
             with _group_content_mutation("community_list", name):
                 needs_fill = _needs_fill(
                     CommunityListEntry,
@@ -1072,11 +1062,10 @@ def _reconcile_community_lists(mgmt, device, cl_list, CommunityList, ContentType
                     ),
                     community_list=cl_obj,
                 )
-                invert_changed = cl_obj.invert_match != invert_match
-                if invert_changed:
-                    cl_obj.invert_match = invert_match
-                    cl_obj.save(update_fields=["invert_match"])
                 if needs_fill:
+                    if cl_obj.invert_match != invert_match:
+                        cl_obj.invert_match = invert_match
+                        cl_obj.save(update_fields=["invert_match"])
                     _fill_community_list_entries(cl_obj, entries)
                     ownership.mark_materialized(state)
         seen_keys.add(("community_list", name.casefold()))

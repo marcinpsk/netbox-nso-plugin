@@ -1742,6 +1742,86 @@ class TestSharedObjectOwnership(TestCase):
         entries = [{"sequence": 10 * (i + 1), "action": "permit", "prefix": p} for i, p in enumerate(prefixes)]
         return {"prefix_lists": [{"name": name, "entries": entries}]}
 
+    def _accept_shared_capture(self, family, owner_payload, other_payload):
+        from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, owner_payload)
+        reconcile_route_policy(self.d2, other_payload)
+        state = NSORoutePolicyState.objects.get(management__device=self.d2, family=family)
+        self.assertEqual(state.status, "conflict")
+        user = get_user_model().objects.create_superuser(username="shared-owner-admin", password="test-password")
+        self.client.force_login(user)
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:routing_accept_route_policy", args=[state.pk]))
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        return state
+
+    def test_accepted_non_owner_preserves_shared_prefix_family_and_entries(self):
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        owner_payload = self._pl("PL-SHARED-FAMILY", ["198.18.0.0/24"])
+        owner_payload["prefix_lists"][0]["family"] = 4
+        other_payload = self._pl("PL-SHARED-FAMILY", ["2001:db8::/32"])
+        other_payload["prefix_lists"][0]["family"] = 6
+        state = self._accept_shared_capture("prefix_list", owner_payload, other_payload)
+        root = PrefixList.objects.get(name="PL-SHARED-FAMILY")
+        before = list(PrefixListEntry.objects.filter(prefix_list=root).order_by("pk").values())
+        self.assertEqual(root.family, 4)
+        self.assertTrue(before)
+
+        reconcile_route_policy(self.d2, other_payload)
+
+        root.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(root.family, 4)
+        self.assertEqual(list(PrefixListEntry.objects.filter(prefix_list=root).order_by("pk").values()), before)
+        self.assertFalse(state.is_materialized)
+        self.assertTrue(
+            NSORoutePolicyState.objects.get(management__device=self.d1, family="prefix_list").is_materialized
+        )
+
+    def test_accepted_non_owner_preserves_shared_community_inversion_and_entries(self):
+        from netbox_routing.models import CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        owner_payload = {
+            "community_lists": [
+                {"name": "CL-SHARED-INVERT", "invert_match": False, "entries": [{"community": "65000:1"}]}
+            ]
+        }
+        other_payload = {
+            "community_lists": [
+                {"name": "CL-SHARED-INVERT", "invert_match": True, "entries": [{"community": "65000:2"}]}
+            ]
+        }
+        state = self._accept_shared_capture("community_list", owner_payload, other_payload)
+        root = CommunityList.objects.get(name="CL-SHARED-INVERT")
+        before = list(CommunityListEntry.objects.filter(community_list=root).order_by("pk").values())
+        self.assertFalse(root.invert_match)
+        self.assertTrue(before)
+
+        reconcile_route_policy(self.d2, other_payload)
+
+        root.refresh_from_db()
+        state.refresh_from_db()
+        self.assertFalse(root.invert_match)
+        self.assertEqual(list(CommunityListEntry.objects.filter(community_list=root).order_by("pk").values()), before)
+        self.assertFalse(state.is_materialized)
+        self.assertTrue(
+            NSORoutePolicyState.objects.get(management__device=self.d1, family="community_list").is_materialized
+        )
+
     def test_registry_has_all_route_policy_families(self):
         from netbox_nso_plugin import route_policy_reconciler  # noqa: F401 — registers specs on import
         from netbox_nso_plugin import shared_object_ownership as ownership
