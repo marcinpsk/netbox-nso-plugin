@@ -47,6 +47,33 @@ class TestSviReconciler(TestCase):
         self.assertTrue(NSOSVIState.objects.filter(management=self.management, interface=iface).exists())
         self.assertEqual(rows[0].status, "imported")
 
+    def test_reconcile_uses_first_duplicate_interface(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        first = VLAN.objects.create(group=group, vid=150, name="FIRST")
+        VLAN.objects.create(group=group, vid=151, name="SECOND")
+
+        rows = reconcile_svi(
+            self.device,
+            {
+                "interfaces": [
+                    {"interface_name": "Vlan150", "vlan_id": 150, "type": "svi", "vrf": "FIRST"},
+                    {"interface_name": "Vlan150", "vlan_id": 151, "type": "irb", "vrf": "SECOND"},
+                ]
+            },
+        )
+
+        self.assertEqual(Interface.objects.filter(device=self.device).count(), 1)
+        state = NSOSVIState.objects.get(management=self.management)
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(state.vlan_id, first.pk)
+        self.assertEqual(state.svi_type, "svi")
+        self.assertEqual(state.vrf, "FIRST")
+
     def test_refresh_resolves_reported_interfaces_in_one_batch(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

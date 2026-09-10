@@ -66,7 +66,7 @@ def _svi_reconcile_operations(device, payload, planned_at):
 
     for item in items:
         name = item.get("interface_name")
-        if not name:
+        if not name or name in reported:
             continue
         reported.add(name)
         interface = interfaces.get(name)
