@@ -359,7 +359,7 @@ def audit_renderer_scopes(
     if management is None:
         return RendererAuditResult(selected, (), deferred)
 
-    if trigger == "cadence":
+    if trigger == "cadence" and not _budget_expired(deadline):
         from .management_lifecycle import reconcile_management_control
 
         reconcile_management_control(device_id)

@@ -285,6 +285,49 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         set_scope.assert_not_called()
 
+    def test_expired_cadence_defers_control_requests_and_leaves_rows_unchanged(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        from ._outbox_case import ReceiptAdapter
+
+        interface = Interface.objects.create(device=self.device, name="Loopback1627", type="virtual")
+        primary = IPAddress.objects.create(address="198.18.175.5/32", assigned_object=interface)
+        Device.objects.filter(pk=self.device.pk).update(primary_ip4=primary)
+        rows = (
+            NSODeviceManagement.objects.filter(pk=self.management.pk),
+            Device.objects.filter(pk=self.device.pk),
+            IPAddress.objects.filter(pk=primary.pk),
+        )
+        before = [row.values().get() for row in rows]
+        adapter = ReceiptAdapter(
+            respond=lambda body: {
+                "failover": None,
+                "attributes": [],
+                "auto_apply": False,
+                "sync_before_apply": True,
+            }
+        )
+        config, transport = adapter.patches()
+
+        with (
+            config,
+            transport,
+            patch("netbox_nso_plugin.renderer_audit._monotonic", return_value=101.0),
+            CaptureQueriesContext(connection) as queries,
+        ):
+            result = audit_renderer_scopes(self.device.pk, ("vlan", "ip"), trigger="cadence", deadline=100.0)
+
+        self.assertEqual(adapter.requests, [])
+        self.assertEqual(result.audited, ())
+        self.assertCountEqual(result.deferred, ("vlan", "ip"))
+        self.assertFalse(any("FOR UPDATE" in query["sql"] for query in queries))
+        self.assertEqual([row.values().get() for row in rows], before)
+        for row in rows:
+            self.assertIsNone(_probe_lock(row))
+
     def test_cadence_runs_control_reconciliation_before_renderer_comparison(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
