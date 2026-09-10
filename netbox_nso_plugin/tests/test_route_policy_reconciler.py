@@ -1822,6 +1822,106 @@ class TestSharedObjectOwnership(TestCase):
             NSORoutePolicyState.objects.get(management__device=self.d1, family="community_list").is_materialized
         )
 
+    def test_accepted_non_owner_prefix_reconcile_preserves_revisions(self):
+        from netbox_routing.models import PrefixList, PrefixListEntry
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        owner_payload = self._pl("PL-SHARED-FAMILY", ["198.18.0.0/24"])
+        owner_payload["prefix_lists"][0]["family"] = 4
+        other_payload = self._pl("PL-SHARED-FAMILY", ["2001:db8::/32"])
+        other_payload["prefix_lists"][0]["family"] = 6
+        state = self._accept_shared_capture("prefix_list", owner_payload, other_payload)
+        root = PrefixList.objects.get(name="PL-SHARED-FAMILY")
+        before = list(PrefixListEntry.objects.filter(prefix_list=root).order_by("pk").values())
+        self.assertEqual(root.family, 4)
+        self.assertTrue(before)
+
+        revisions = dict(
+            NSOIntentRevision.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).values_list("pk", "revision")
+        )
+        self.assertTrue(revisions)
+        for pass_number in range(2):
+            plan = route_policy_reconcile_plan(self.d2, other_payload)
+            with reconcile_transaction(plan):
+                reconcile_route_policy(self.d2, other_payload)
+            with self.subTest(pass_number=pass_number, invariant="prediction"):
+                self.assertFalse(plan.changes_content)
+            with self.subTest(pass_number=pass_number, invariant="revisions"):
+                self.assertEqual(
+                    dict(
+                        NSOIntentRevision.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).values_list(
+                            "pk", "revision"
+                        )
+                    ),
+                    revisions,
+                )
+
+            root.refresh_from_db()
+            state.refresh_from_db()
+            self.assertEqual(root.family, 4)
+            self.assertEqual(list(PrefixListEntry.objects.filter(prefix_list=root).order_by("pk").values()), before)
+            self.assertFalse(state.is_materialized)
+            self.assertTrue(
+                NSORoutePolicyState.objects.get(management__device=self.d1, family="prefix_list").is_materialized
+            )
+
+    def test_accepted_non_owner_community_reconcile_preserves_revisions(self):
+        from netbox_routing.models import CommunityList, CommunityListEntry
+
+        from netbox_nso_plugin.intent_state import reconcile_transaction
+        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        owner_payload = {
+            "community_lists": [
+                {"name": "CL-SHARED-INVERT", "invert_match": False, "entries": [{"community": "65000:1"}]}
+            ]
+        }
+        other_payload = {
+            "community_lists": [
+                {"name": "CL-SHARED-INVERT", "invert_match": True, "entries": [{"community": "65000:2"}]}
+            ]
+        }
+        state = self._accept_shared_capture("community_list", owner_payload, other_payload)
+        root = CommunityList.objects.get(name="CL-SHARED-INVERT")
+        before = list(CommunityListEntry.objects.filter(community_list=root).order_by("pk").values())
+        self.assertFalse(root.invert_match)
+        self.assertTrue(before)
+
+        revisions = dict(
+            NSOIntentRevision.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).values_list("pk", "revision")
+        )
+        self.assertTrue(revisions)
+        for pass_number in range(2):
+            plan = route_policy_reconcile_plan(self.d2, other_payload)
+            with reconcile_transaction(plan):
+                reconcile_route_policy(self.d2, other_payload)
+            with self.subTest(pass_number=pass_number, invariant="prediction"):
+                self.assertFalse(plan.changes_content)
+            with self.subTest(pass_number=pass_number, invariant="revisions"):
+                self.assertEqual(
+                    dict(
+                        NSOIntentRevision.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).values_list(
+                            "pk", "revision"
+                        )
+                    ),
+                    revisions,
+                )
+
+            root.refresh_from_db()
+            state.refresh_from_db()
+            self.assertFalse(root.invert_match)
+            self.assertEqual(
+                list(CommunityListEntry.objects.filter(community_list=root).order_by("pk").values()), before
+            )
+            self.assertFalse(state.is_materialized)
+            self.assertTrue(
+                NSORoutePolicyState.objects.get(management__device=self.d1, family="community_list").is_materialized
+            )
+
     def test_registry_has_all_route_policy_families(self):
         from netbox_nso_plugin import route_policy_reconciler  # noqa: F401 — registers specs on import
         from netbox_nso_plugin import shared_object_ownership as ownership

@@ -1216,11 +1216,9 @@ def _route_policy_group_changes_content(management, family: str, name: str, capt
         return True
 
     if family == "prefix_list":
-        family_changed = captured.get("family") in (4, 6) and obj.family != captured["family"]
-        return family_changed or not PrefixListEntry.objects.filter(prefix_list=obj).exists()
+        return not PrefixListEntry.objects.filter(prefix_list=obj).exists()
     if family == "community_list":
-        invert_changed = obj.invert_match != bool(captured.get("invert_match", False))
-        return invert_changed or not CommunityListEntry.objects.filter(community_list=obj).exists()
+        return not CommunityListEntry.objects.filter(community_list=obj).exists()
     if family == "as_path":
         return not ASPathEntry.objects.filter(aspath=obj).exists()
     if family == "route_map":
