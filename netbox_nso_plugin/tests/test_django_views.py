@@ -2142,10 +2142,16 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         self.assertIsNotNone(self.iface_state.accepted_at)
         mock_put.assert_called()
 
-    def test_derived_description_edit_rejects_an_unplanned_rendered_value(self):
+    def test_derived_description_edit_rejects_a_sentinel(self):
+        self._assert_derived_description_edit_rejected(" [auto] ")
+
+    def test_derived_description_edit_rejects_a_stale_rendered_value(self):
+        self._assert_derived_description_edit_rejected(" [auto] to old:peer ")
+
+    def _assert_derived_description_edit_rejected(self, value):
         from dcim.models import Cable, CableTermination
 
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         self._make_managed()
         interface = Interface.objects.create(
@@ -2179,11 +2185,29 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         )
         url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[state.pk])
 
-        with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
-            self.client.post(url, {"value": "[auto]"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        original_description = interface.description
+        original_status = state.status
+        original_accepted_at = state.accepted_at
+        original_outbox_ids = set(NSOIntentOutboxEntry.objects.values_list("pk", flat=True))
 
+        response = self.client.post(url, {"value": value}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "error",
+                "errors": {
+                    "description": ["Derived sentinel descriptions cannot be edited here. Enter a literal description."]
+                },
+            },
+        )
         interface.refresh_from_db()
-        self.assertEqual(interface.description, "")
+        state.refresh_from_db()
+        self.assertEqual(interface.description, original_description)
+        self.assertEqual(state.status, original_status)
+        self.assertEqual(state.accepted_at, original_accepted_at)
+        self.assertEqual(set(NSOIntentOutboxEntry.objects.values_list("pk", flat=True)), original_outbox_ids)
 
     def test_toggle_enabled_flips_and_owns(self):
         """Inline toggle of enabled flips the interface and owns the 'enabled' attribute."""

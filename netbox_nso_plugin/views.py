@@ -4092,6 +4092,7 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
         if attribute not in self._EDITABLE:
             return JsonResponse({"status": "error", "message": f"{attribute} is not editable here."}, status=400)
 
+        from .derived_intent import get_sentinel_templates, is_managed_description
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
         from .summary import matches_device_value
 
@@ -4100,6 +4101,18 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
         iface_candidate = copy.copy(iface)
         if attribute == "description":
             iface_candidate.description = raw.strip()
+            if is_managed_description(iface_candidate.description, get_sentinel_templates()):
+                return JsonResponse(
+                    {
+                        "status": "error",
+                        "errors": {
+                            "description": [
+                                "Derived sentinel descriptions cannot be edited here. Enter a literal description."
+                            ]
+                        },
+                    },
+                    status=400,
+                )
         else:  # enabled
             iface_candidate.enabled = raw.strip().lower() in self._TRUE
         state_candidate = copy.copy(state)
