@@ -123,16 +123,14 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.intent_push_errors["snmp"]["code"], "validation_error")
 
-    def test_a_v3_host_WITHOUT_a_user_name_is_still_refused(self):
-        """The half that must stay refused: with no user name there is nothing to key the receiver
-        on. IOS-XR cannot even form the key; IOS would write a host bound to no user at all. A push
-        is worse than a refusal here, so the row is surfaced as an error instead.
-        """
-        row = NSOSnmpHostState.objects.create(
-            management=self.mgmt, address="10.0.0.7", version="3", notify_type="trap", status="accepted"
-        )
+    def test_v3_host_without_username_blocks_delivery_after_reconciliation(self):
+        """A host without a security user keeps ownership and blocks the snapshot."""
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
+        row = NSOSnmpHostState.objects.create(
+            management=self.mgmt, address="198.18.0.7", version="3", notify_type="trap", status="accepted"
+        )
         _reconcile_snmp_config(
             self.device,
             {
@@ -142,12 +140,18 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
                 "system_info": None,
             },
         )
-        hosts = self._push()
 
-        self.assertEqual(hosts, [])
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", self.device.pk, self.mgmt.adapter_device_id)
+
+        self.assertEqual(raised.exception.code, "validation_error")
+        mock_put.assert_not_called()
         row.refresh_from_db()
-        self.assertEqual(row.status, "error")
+        self.assertEqual(row.status, "in_sync")
         self.assertIn("no security user name", snmp_host_push_blocker(row))
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.intent_push_errors["snmp"]["code"], "validation_error")
 
     def test_the_refusal_fires_for_the_grain_a_REAL_device_produces(self):
         """The quiet bug closing this one uncovered.

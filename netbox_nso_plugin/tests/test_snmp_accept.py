@@ -252,13 +252,13 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         ]
 
     def test_an_already_owned_v3_user_missing_protocols_is_never_pushed_degraded(self):
-        """Defence in depth for rows owned before the accept-time guard existed (or via the
-        API): reconciliation surfaces them and the pure renderer omits them."""
+        """Reconciliation preserves ownership so missing protocols block delivery."""
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
         mgmt = self._make_mgmt()
-        user = self._v3_user(mgmt, status="accepted")  # owned, protocols never declared
+        user = self._v3_user(mgmt, username="user-placeholder", status="accepted")
         _reconcile_snmp_config(
             self.device,
             {
@@ -276,12 +276,62 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
-            deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
 
-        mock_put.assert_called_once()
-        assert mock_put.call_args[0][2] == [], "a protocol-less v3 user must not reach the device"
+        assert raised.exception.code == "validation_error"
+        assert "no auth protocol is set" in str(raised.exception)
+        mock_put.assert_not_called()
         user.refresh_from_db()
-        assert user.status == "error", f"the dropped row must be surfaced, not left green (status={user.status})"
+        assert user.status == "accepted"
+        mgmt.refresh_from_db()
+        assert mgmt.intent_push_errors["snmp"]["code"] == "validation_error"
+
+    def test_clearing_owned_user_vault_reference_blocks_delivery_after_reconciliation(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.forms import NSOSnmpV3UserStateForm
+        from netbox_nso_plugin.template_content import _reconcile_snmp_config
+
+        mgmt = self._make_mgmt()
+        user = self._v3_user(
+            mgmt,
+            username="user-placeholder",
+            status="accepted",
+            auth_protocol="sha",
+            priv_protocol="aes-128",
+            vault_ref="secret/snmp/user-placeholder",
+        )
+        form = NSOSnmpV3UserStateForm(
+            data={"auth_protocol": "sha", "priv_protocol": "aes-128", "vault_ref": ""},
+            instance=user,
+        )
+        assert form.is_valid(), form.errors
+        form.save()
+        user.refresh_from_db()
+        assert user.vault_ref == ""
+        assert user.status == "accepted"
+
+        _reconcile_snmp_config(
+            self.device,
+            {
+                "communities": [],
+                "v3_users": [{"username": user.username, "has_auth_secret": True, "has_priv_secret": True}],
+                "hosts": [],
+                "system_info": None,
+            },
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+            with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
+                deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
+
+        assert raised.exception.code == "validation_error"
+        mock_put.assert_not_called()
+        user.refresh_from_db()
+        assert user.status == "accepted"
+        mgmt.refresh_from_db()
+        assert mgmt.intent_push_errors["snmp"]["code"] == "validation_error"
 
     def test_an_owned_community_without_a_vault_reference_blocks_the_snapshot(self):
         from netbox_nso_plugin.adapter_client import AdapterError
@@ -318,9 +368,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
         mock_put.assert_not_called()
 
     def test_an_owned_v3_user_missing_its_protocols_blocks_the_snapshot(self):
-        """Delivery can run before reconciliation surfaces the row. While it is still owned,
-        leaving it out of the FULL-REPLACE snapshot detaches it on the adapter side, so the
-        push must be refused rather than shrunk."""
+        """Missing protocols block the full snapshot even before reconciliation."""
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.delivery import deliver
 
