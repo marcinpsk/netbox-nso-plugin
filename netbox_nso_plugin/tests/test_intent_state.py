@@ -441,8 +441,14 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(updated, ("after",))
         self.assertEqual(parse_calls, 0)
 
-    def test_repeated_insert_shape_is_parsed_at_most_once(self):
-        statement = "INSERT INTO intent_guard_parse_cache (value) VALUES (%s)"
+    def test_repeated_registered_insert_shape_caches_parsing(self):
+        from netbox_nso_plugin.intent_state import _dml_columns, _parse_dml_target
+
+        table = NSOVLANState._meta.db_table
+        statement = (
+            f'INSERT INTO "{table}" SELECT * FROM "{table}" WHERE id = %s '
+            "ON CONFLICT (id) DO UPDATE SET last_apply_error = %s"
+        )
         real_parse = sqlparse.parse
         parse_calls = 0
 
@@ -451,13 +457,16 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             parse_calls += 1
             return real_parse(*args, **kwargs)
 
+        _parse_dml_target.cache_clear()
+        _dml_columns.cache_clear()
         with connection.cursor() as cursor:
-            cursor.execute("CREATE TEMP TABLE intent_guard_parse_cache (value integer)")
             with patch("netbox_nso_plugin.intent_state.sqlparse.parse", counting_parse):
-                cursor.execute(statement, [1])
-                cursor.execute(statement, [2])
+                cursor.execute(statement, [self.state.pk, "first"])
+                cursor.execute(statement, [self.state.pk, "second"])
 
-        self.assertLessEqual(parse_calls, 1)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.last_apply_error, "second")
+        self.assertEqual(parse_calls, 2)
 
     def test_repeated_registered_dml_shape_caches_column_classification(self):
         table = NSOVLANState._meta.db_table
