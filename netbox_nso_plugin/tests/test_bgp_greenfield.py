@@ -368,6 +368,7 @@ class TestBgpIncompleteSnapshotDrain(_CascadeFlushMixin, IntentPushResetMixin, T
             error = self.mgmt.intent_push_errors["bgp"]
             outbox_state = state_of(self.device, "bgp")
             attempted_at = outbox_state.last_drain_attempted_at
+            self.assertIsNotNone(attempted_at)
             self.assertEqual(entries(self.device, "bgp", unconsumed=True), [])
 
             drain.drain_intent_outbox()
