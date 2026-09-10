@@ -4351,6 +4351,55 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(row.port, 1514)
         self.assertEqual(row.status, "accepted")
 
+    def test_full_snmp_community_edit_repends_an_in_sync_row(self):
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+
+        row = NSOSnmpCommunityState.objects.create(
+            management=self.mgmt,
+            community_hash="1111222233334444",
+            access="RO",
+            status="in_sync",
+        )
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsosnmpcommunitystate_edit", kwargs={"pk": row.pk}),
+            {"access": "RW", "acl": "", "vault_ref": "", "secret_value": ""},
+        )
+
+        self.assertEqual(response.status_code, 302, response.content)
+        row.refresh_from_db()
+        self.assertEqual(row.access, "RW")
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+
+    def test_full_snmp_v3_user_edit_repends_an_in_sync_row(self):
+        from netbox_nso_plugin.models import NSOSnmpV3UserState
+
+        row = NSOSnmpV3UserState.objects.create(
+            management=self.mgmt,
+            username="monitor",
+            group_name="readers",
+            status="in_sync",
+        )
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsosnmpv3userstate_edit", kwargs={"pk": row.pk}),
+            {
+                "group_name": "operators",
+                "auth_protocol": "",
+                "priv_protocol": "",
+                "vault_ref": "",
+                "auth_secret_value": "",
+                "priv_secret_value": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302, response.content)
+        row.refresh_from_db()
+        self.assertEqual(row.group_name, "operators")
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNotNone(row.accepted_at)
+
     def test_full_logging_level_edit_repends_a_deploying_row(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 

@@ -368,22 +368,29 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
         import contextlib
         import copy
 
-        if self._secret_result:
-            from django.utils import timezone
+        from django.utils import timezone
 
+        from . import status_machine as sm
+
+        if self._secret_result:
             self.instance.community_hash = self._secret_result["hash"]
             self.instance.vault_secret_hash = self._secret_result["hash"]
             self.instance.vault_secret_version = self._secret_result["version"]
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
         obj = super().save(commit=False)
+        created = obj.pk is None or obj._state.adding
+        changed_content = bool(set(self.changed_data) - {"tags"})
+        if not created and changed_content:
+            obj.status = sm.on_operator_edit(obj.status)
+            if obj.accepted_at is None:
+                obj.accepted_at = timezone.now()
         if not commit:
             return obj
 
         from .intent_state import MutationFootprint, SourceRow, footprint_for_instance, intent_transaction
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        created = obj.pk is None or obj._state.adding
         rekeys_hosts = bool(self._old_hash and self._old_hash != obj.community_hash)
         lock_context = contextlib.nullcontext()
         if rekeys_hosts:
@@ -506,9 +513,11 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
         return cleaned
 
     def save(self, commit=True):
-        if self._secret_result:
-            from django.utils import timezone
+        from django.utils import timezone
 
+        from . import status_machine as sm
+
+        if self._secret_result:
             if "auth" in self._secret_result["fields"]:
                 self.instance.vault_has_auth = True
             if "priv" in self._secret_result["fields"]:
@@ -516,12 +525,17 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
         obj = super().save(commit=False)
+        created = obj.pk is None or obj._state.adding
+        changed_content = bool(set(self.changed_data) - {"tags"})
+        if not created and changed_content:
+            obj.status = sm.on_operator_edit(obj.status)
+            if obj.accepted_at is None:
+                obj.accepted_at = timezone.now()
         if not commit:
             return obj
 
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        created = obj.pk is None or obj._state.adding
         plan = RendererMutationPlan.build(
             saves=(
                 planned_save(
