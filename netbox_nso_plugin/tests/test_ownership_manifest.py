@@ -215,6 +215,31 @@ class TestOwnershipManifestMaintenance(TestCase):
         self.assertEqual(manifest.ownership_state, "retired")
         self.assertFalse(manifest.deletion_authority)
 
+    def test_repeated_audits_skip_retired_manifest_with_owned_vlan(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+        from netbox_nso_plugin.status_machine import is_owned
+
+        from ._outbox_case import own_vlan
+
+        state = own_vlan(self.management, 1701, "manifest-retired-audit")
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="vlan")
+        manifest.ownership_state = "retired"
+        manifest.deletion_authority = False
+        manifest.save(update_fields=("ownership_state", "deletion_authority"))
+
+        completed = tuple(reconcile_scope_ownership(self.device.pk, {"vlan"}) for _ in range(2))
+
+        self.assertEqual(completed, ((), ()))
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertFalse(manifest.deletion_authority)
+        state.refresh_from_db()
+        self.assertTrue(is_owned(state.status))
+        self.assertTrue(VLAN.objects.filter(pk=state.vlan_id).exists())
+
     def test_under_lock_manifest_recheck_runs_once_for_the_scope_set(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
