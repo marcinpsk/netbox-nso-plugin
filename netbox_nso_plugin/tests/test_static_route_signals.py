@@ -390,10 +390,14 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
         with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.devices.add(self.device)
 
+        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="imported")
+        state_pk = state.pk
+        self.assertTrue(NSOStaticRouteState.objects.filter(pk=state_pk).exists())
+
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
                 sr.delete()
-            self.assertFalse(NSOStaticRouteState.objects.filter(management=mgmt, static_route__isnull=False).exists())
+            self.assertFalse(NSOStaticRouteState.objects.filter(pk=state_pk).exists())
             mock_push.assert_not_called()
 
 
