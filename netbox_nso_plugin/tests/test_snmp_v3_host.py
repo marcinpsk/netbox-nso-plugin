@@ -140,6 +140,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
                 "system_info": None,
             },
         )
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
 
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
@@ -148,7 +150,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
         self.assertEqual(raised.exception.code, "validation_error")
         mock_put.assert_not_called()
         row.refresh_from_db()
-        self.assertEqual(row.status, "in_sync")
+        # Audit repair in renderer_audit.py restores accepted before delivery.
+        self.assertEqual(row.status, "accepted")
         self.assertIn("no security user name", snmp_host_push_blocker(row))
         self.mgmt.refresh_from_db()
         self.assertEqual(self.mgmt.intent_push_errors["snmp"]["code"], "validation_error")
