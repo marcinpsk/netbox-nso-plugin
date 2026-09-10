@@ -784,14 +784,13 @@ def _vlan_state_dependencies(before, after, spec):
 
 def _vlan_anchor_keys(vlan_ids, scopes):
     """Resolve the devices that already render a shared native VLAN anchor."""
-    Vlan = apps.get_model("ipam.vlan")
-    native_spec = _REGISTRY["ipam.vlan"]
-    device_ids = {
-        device_id
-        for vlan in Vlan.objects.filter(pk__in=vlan_ids).order_by("pk")
-        for device_id, _scope in native_spec.resolver(vlan, native_spec)
-    }
-    return {(device_id, scope) for device_id in device_ids for scope in scopes}
+    if not vlan_ids:
+        return set()
+    VlanState = apps.get_model("netbox_nso_plugin.nsovlanstate")
+    SviState = apps.get_model("netbox_nso_plugin.nsosvistate")
+    device_ids = set(VlanState.objects.filter(vlan_id__in=vlan_ids).values_list("management__device_id", flat=True))
+    device_ids.update(SviState.objects.filter(vlan_id__in=vlan_ids).values_list("management__device_id", flat=True))
+    return _management_keys(device_ids, scopes)
 
 
 def _svi_dependencies(before, after, spec):
@@ -1435,7 +1434,7 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
 def _generic_keys(instance, spec: RendererInputSpec) -> set[tuple[int, str]]:
     from dcim.models import Device, Interface
 
-    from .models import NSODeviceManagement, NSORoutePolicyState, NSOSVIState, NSOVLANState
+    from .models import NSODeviceManagement, NSORoutePolicyState
 
     if instance is None:
         return set()
@@ -1454,13 +1453,7 @@ def _generic_keys(instance, spec: RendererInputSpec) -> set[tuple[int, str]]:
     if isinstance(instance, Interface):
         return _management_keys({instance.device_id}, spec.scopes)
     if instance._meta.label_lower == "ipam.vlan":
-        device_ids = set(
-            NSOVLANState.objects.filter(vlan_id=instance.pk).values_list("management__device_id", flat=True)
-        )
-        device_ids.update(
-            NSOSVIState.objects.filter(vlan_id=instance.pk).values_list("management__device_id", flat=True)
-        )
-        return _management_keys(device_ids, spec.scopes)
+        return _vlan_anchor_keys({instance.pk}, spec.scopes)
     assigned = getattr(instance, "assigned_object", None)
     if isinstance(assigned, Interface):
         return _management_keys({assigned.device_id}, spec.scopes)

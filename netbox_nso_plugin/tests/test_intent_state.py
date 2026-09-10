@@ -112,6 +112,84 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.device, self.management = make_managed("intent-permit", 1623)
         self.state = own_vlan(self.management, 1623, "intent-permit")
 
+    def _assert_tagged_vlan_dependency_query_budget(self, family):
+        from dcim.models import Interface
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSOSVIState, NSOSwitchportState
+
+        other_device, other_management = make_managed("anchor-other", 1624)
+        overlapping_device, overlapping_management = make_managed("anchor-overlap", 1625)
+        counts = []
+        scopes = (
+            ("switchport",)
+            if family == "switchport"
+            else (
+                "interface",
+                "ip",
+                "svi",
+                "subinterface",
+                "interface_mtu",
+                "bfd",
+                "isis",
+                "bgp",
+                "ospf",
+                "lacp",
+                "switchport",
+            )
+        )
+        expected_keys = {
+            (device.pk, scope) for device in (self.device, other_device, overlapping_device) for scope in scopes
+        }
+        with without_commit_drain(), transaction.atomic():
+            for count in (1, 4):
+                interface = Interface.objects.create(
+                    device=self.device, name=f"Ethernet{count}", type="1000base-t", mode="tagged"
+                )
+                subject = interface
+                if family == "switchport":
+                    subject = NSOSwitchportState.objects.create(
+                        management=self.management, interface=interface, mode="tagged", status="imported"
+                    )
+                vlans = []
+                for index in range(count):
+                    vlan = VLAN.objects.create(vid=200 + count * 10 + index, name=f"anchor-{count}-{index}")
+                    vlans.append(vlan)
+                    for management in (self.management, overlapping_management):
+                        NSOVLANState.objects.create(management=management, vlan=vlan, status="imported")
+                    for management in (other_management, overlapping_management):
+                        svi = Interface.objects.create(device=management.device, name=f"Vlan{vlan.vid}", type="virtual")
+                        NSOSVIState.objects.create(management=management, interface=svi, vlan=vlan, status="imported")
+                subject.tagged_vlans.add(*vlans)
+                spec = intent_state._REGISTRY[subject._meta.label_lower]
+
+                with CaptureQueriesContext(connection) as queries:
+                    footprint, placement_changed = spec.dependency_resolver(None, subject, spec)
+
+                self.assertEqual(set(footprint.revision_keys), expected_keys)
+                self.assertEqual(set(footprint.shared_keys), {("vlan", str(vlan.pk)) for vlan in vlans})
+                self.assertFalse(placement_changed)
+                counts.append(len(queries))
+                native_spec = intent_state._REGISTRY["ipam.vlan"]
+                self.assertEqual(
+                    native_spec.resolver(vlans[0], native_spec),
+                    {
+                        (device.pk, scope)
+                        for device in (self.device, other_device, overlapping_device)
+                        for scope in ("vlan", "svi", "switchport")
+                    },
+                )
+        expected_count = 5 if family == "switchport" else 4
+        self.assertEqual(counts, [expected_count, expected_count], f"{family}: dependency query counts {counts}")
+
+    def test_interface_tagged_vlan_dependency_queries_are_constant(self):
+        self._assert_tagged_vlan_dependency_query_budget("interface")
+
+    def test_switchport_tagged_vlan_dependency_queries_are_constant(self):
+        self._assert_tagged_vlan_dependency_query_budget("switchport")
+
     def test_registered_bulk_dml_requires_a_content_permit(self):
         with self.assertRaises(IntentMutationProtocolError):
             NSOVLANState.objects.filter(pk=self.state.pk).update(vlan_id=self.state.vlan_id + 100000)
