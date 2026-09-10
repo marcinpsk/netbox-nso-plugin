@@ -606,7 +606,7 @@ class TestCompactionRewritesInPlace(_CompactionCase):
 
         route = own_route(self.mgmt, "198.18.0.0/28", "198.18.0.1")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         held = drain.claim(self.device.pk, "static_route")
         assert [record["route_id"] for record in held.deletions] == [route.pk]
         self.clear_entries()
