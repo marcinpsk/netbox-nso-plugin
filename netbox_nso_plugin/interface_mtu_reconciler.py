@@ -161,5 +161,5 @@ def _execute_interface_mtu_operations(writer, operations):
     for operation, instance, update_fields, force_insert in operations:
         if operation == "delete":
             writer.delete(instance)
-        else:
+        elif force_insert or not writer.consume_applied_save(instance):
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)

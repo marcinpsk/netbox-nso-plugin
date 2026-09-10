@@ -76,6 +76,68 @@ class TestInterfaceMtuReconciler(TestCase):
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).custom_field_data, {})
         self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
 
+    def test_direct_completed_update_completes_mtu_plan(self):
+        self._assert_completed_update_completes_plan(active_writer=False)
+
+    def test_active_writer_completed_update_completes_mtu_plan(self):
+        self._assert_completed_update_completes_plan(active_writer=True)
+
+    def _assert_completed_update_completes_plan(self, *, active_writer):
+        from netbox_nso_plugin.interface_mtu_reconciler import (
+            _interface_mtu_plan_and_operations,
+            reconcile_interface_mtu,
+        )
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=1500,
+            status="imported",
+            last_apply_error="Preserve prior evidence",
+        )
+        payload = {
+            "interfaces": [
+                {"interface_name": self.po1.name, "mtu": 9000},
+                {"interface_name": self.lag99.name, "ip_mtu": 9170},
+            ]
+        }
+        waiting = None
+
+        def plan_then_compete(device, observed_payload, planned_at):
+            nonlocal waiting
+
+            waiting, operations, rows = _interface_mtu_plan_and_operations(device, observed_payload, planned_at)
+            candidate = NSOInterfaceMtuState.objects.get(pk=state.pk)
+            candidate.l2_mtu = 9000
+            candidate.last_sync_at = waiting.planned_at
+            fields = ("l2_mtu", "last_sync_at")
+            competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=fields)])
+            with renderer_mirror_writes(competing) as writer:
+                writer.save(candidate, update_fields=fields)
+            self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
+            return waiting, operations, rows
+
+        if active_writer:
+            waiting, _operations, _rows = plan_then_compete(self.device, payload, timezone.now())
+            with renderer_mirror_writes(waiting):
+                rows = reconcile_interface_mtu(self.device, payload)
+        else:
+            with patch(
+                "netbox_nso_plugin.interface_mtu_reconciler._interface_mtu_plan_and_operations", plan_then_compete
+            ):
+                rows = reconcile_interface_mtu(self.device, payload)
+
+        state.refresh_from_db()
+        outstanding = NSOInterfaceMtuState.objects.get(interface=self.lag99)
+        self.assertEqual([row.pk for row in rows], [state.pk, outstanding.pk])
+        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=self.po1).pk, state.pk)
+        self.assertEqual((state.l2_mtu, state.status), (9000, "imported"))
+        self.assertEqual(state.last_sync_at, waiting.planned_at)
+        self.assertEqual(state.last_apply_error, "Preserve prior evidence")
+        self.assertEqual((outstanding.ip_mtu, outstanding.status), (9170, "imported"))
+        self.assertEqual(outstanding.last_sync_at, waiting.planned_at)
+
     def test_mirrors_l2_and_ip_mtu(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
