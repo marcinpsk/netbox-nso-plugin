@@ -454,6 +454,9 @@ def manifest_binding(instance):
         native_field = dict(rule.overlay_native_fields).get(label)
         if native_field is None:
             continue
+        management = getattr(instance, "management", None)
+        if management is None:
+            return None
         if native_field == "__self__":
             native = instance
         elif native_field == "__ip_address__":
@@ -482,9 +485,8 @@ def manifest_binding(instance):
             native = OSPFInterface.objects.filter(interface_id=instance.interface_id).first()
         else:
             native = getattr(instance, native_field, None)
-        management = getattr(instance, "management", None)
         native_fields = None if native is None else _validated_native_key_fields(native, rule)
-        if native_fields is None or management is None:
+        if native_fields is None:
             return None
         native_label, key_fields = native_fields
         if rule.scope == "route_policy" and ROUTE_POLICY_NATIVE_MODEL_LABELS.get(instance.family) != native_label:

@@ -95,6 +95,50 @@ class TestOwnershipManifestMaintenance(TestCase):
 
         self.device, self.management = make_managed("manifest-maintenance", 1627)
 
+    def test_ip_binding_without_management_skips_native_queries(self):
+        from dcim.models import Interface
+        from django.contrib.contenttypes.models import ContentType
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import manifest_binding
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+        ContentType.objects.get_for_model(Interface)
+        for vrf in (None, VRF.objects.create(name="manifest-vrf")):
+            with self.subTest(vrf=vrf):
+                address = IPAddress.objects.create(address="198.18.0.1/32", vrf=vrf, assigned_object=interface)
+                state = NSOInterfaceIPState.objects.create(
+                    interface=interface, address=str(address.address), vrf=vrf.name if vrf else ""
+                )
+                state = NSOInterfaceIPState.objects.get(pk=state.pk)
+
+                with CaptureQueriesContext(connection) as queries:
+                    binding = manifest_binding(state)
+
+                self.assertIsNone(binding)
+                self.assertEqual(len(queries), 0, [query["sql"] for query in queries])
+
+    def test_management_backed_vlan_binding_preserves_native_identity(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules, manifest_binding
+
+        from ._outbox_case import own_vlan
+
+        state = own_vlan(self.management, 1702, "manifest-binding")
+
+        self.assertEqual(
+            manifest_binding(state),
+            (
+                converted_scope_rules()["vlan"],
+                "vlan",
+                self.device.pk,
+                "ipam.vlan",
+                {"group_id": state.vlan.group_id, "vid": state.vlan.vid},
+            ),
+        )
+
     def test_route_policy_binding_rejects_an_invalid_generic_target(self):
         from django.contrib.contenttypes.models import ContentType
 
