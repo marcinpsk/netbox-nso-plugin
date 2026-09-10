@@ -118,7 +118,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
     def _assert_completed_update_completes_plan(self, *, active_writer):
         from netbox_nso_plugin.interface_mtu_reconciler import (
-            _interface_mtu_plan_and_operations,
+            interface_mtu_reconcile_plan,
             reconcile_interface_mtu,
         )
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
@@ -132,16 +132,16 @@ class TestInterfaceMtuReconciler(TestCase):
         )
         payload = {
             "interfaces": [
-                {"interface_name": self.po1.name, "mtu": 9000},
-                {"interface_name": self.lag99.name, "ip_mtu": 9170},
+                _mtu_entry(self.po1.name, mtu=9000),
+                _mtu_entry(self.lag99.name, ip_mtu=9170),
             ]
         }
         waiting = None
 
-        def plan_then_compete(device, observed_payload, planned_at):
+        def plan_then_compete(device, observed_payload):
             nonlocal waiting
 
-            waiting, operations, rows = _interface_mtu_plan_and_operations(device, observed_payload, planned_at)
+            waiting = interface_mtu_reconcile_plan(device, observed_payload)
             candidate = NSOInterfaceMtuState.objects.get(pk=state.pk)
             candidate.l2_mtu = 9000
             candidate.last_sync_at = waiting.planned_at
@@ -150,16 +150,14 @@ class TestInterfaceMtuReconciler(TestCase):
             with renderer_mirror_writes(competing) as writer:
                 writer.save(candidate, update_fields=fields)
             self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
-            return waiting, operations, rows
+            return waiting
 
         if active_writer:
-            waiting, _operations, _rows = plan_then_compete(self.device, payload, timezone.now())
+            waiting = plan_then_compete(self.device, payload)
             with renderer_mirror_writes(waiting):
                 rows = reconcile_interface_mtu(self.device, payload)
         else:
-            with patch(
-                "netbox_nso_plugin.interface_mtu_reconciler._interface_mtu_plan_and_operations", plan_then_compete
-            ):
+            with patch("netbox_nso_plugin.interface_mtu_reconciler.interface_mtu_reconcile_plan", plan_then_compete):
                 rows = reconcile_interface_mtu(self.device, payload)
 
         state.refresh_from_db()

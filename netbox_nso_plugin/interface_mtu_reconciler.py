@@ -196,6 +196,8 @@ def _reconcile_interface_mtu(payload: dict, writer, plan) -> list:
         raise ValueError("interface MTU reconciliation requires its frozen execution steps")
     for operation, instance, update_fields, force_insert in execution.operations:
         if operation == "save":
+            if not force_insert and writer.consume_applied_save(instance):
+                continue
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
         else:
             writer.delete(instance)
