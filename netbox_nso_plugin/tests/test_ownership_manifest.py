@@ -259,7 +259,7 @@ class TestOwnershipManifestMaintenance(TestCase):
         from django.test.utils import CaptureQueriesContext
 
         from netbox_nso_plugin.models import NSOOwnershipManifest
-        from netbox_nso_plugin.ownership_planner import _manifest_record_actions
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
 
         from ._outbox_case import own_vlan
 
@@ -271,7 +271,7 @@ class TestOwnershipManifestMaintenance(TestCase):
             NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
             with CaptureQueriesContext(connection) as queries:
                 actions = _manifest_record_actions(self.device.pk, frozenset({"vlan"}))
-            self.assertCountEqual(actions, [("vlan", state._meta.label_lower, state.pk) for state in states])
+            self.assertCountEqual(actions, [(OwnershipAction.RECORD_MANIFEST, "vlan", state._meta.label_lower, state.pk) for state in states])
             counts.append(len(queries))
         self.assertEqual(counts[0], counts[1])
 
@@ -370,7 +370,10 @@ class TestOwnershipManifestMaintenance(TestCase):
                 "vlan",
                 self.device.pk,
                 "ipam.vlan",
+                state.vlan.pk,
                 {"group_id": state.vlan.group_id, "vid": state.vlan.vid},
+                "netbox_nso_plugin.nsovlanstate",
+                {},
             ),
         )
 
