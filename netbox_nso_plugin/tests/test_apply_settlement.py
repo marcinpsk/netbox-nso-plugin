@@ -782,6 +782,46 @@ class TestAttemptSettlement(TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_response")
 
+    def test_invalid_unknown_attempt_in_replay_refetch_is_rejected(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        for unknown_id in ("not-a-uuid", str(uuid4())):
+            with self.subTest(unknown_id=unknown_id):
+                attempt_id = uuid4()
+                local = self._local_attempt(attempt_id, 87, {"vlan": 427}, answered=False)
+                answer = _attempt(attempt_id, self.adapter_device_id, 87, {"vlan": 427}, "pending")
+                requests = []
+
+                class ReplaySession:
+                    def request(_self, method, url, **kwargs):
+                        requests.append(url.rsplit("/", 1)[-1])
+                        if url.endswith("/deployment-evidence"):
+                            payload = _payload(self.adapter_device_id, [])
+                            payload["unknown_apply_attempt_ids"] = (
+                                [unknown_id] if len(requests) == 3 else [str(attempt_id)]
+                            )
+                            return make_response(200, payload)
+                        self.assertTrue(url.endswith("/actions/apply"))
+                        self.assertEqual(
+                            kwargs["json"],
+                            {"apply_attempt_id": str(attempt_id), "selected": {"vlan": 427}},
+                        )
+                        return make_response(202, answer["response"])
+
+                with (
+                    patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+                    patch("netbox_nso_plugin.adapter_client._get_session", return_value=ReplaySession()),
+                    self.assertRaises(AdapterError) as raised,
+                ):
+                    load_deployment_evidence(self.management, attempt_ids=[attempt_id])
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(requests, ["deployment-evidence", "apply", "deployment-evidence"])
+                local.refresh_from_db()
+                self.assertEqual(local.http_status, 202)
+                self.assertEqual(local.response, answer["response"])
+
     def test_a_rowless_lost_no_op_response_is_recovered_by_exact_replay(self):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 

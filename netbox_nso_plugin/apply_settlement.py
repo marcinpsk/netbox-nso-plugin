@@ -491,17 +491,10 @@ def _reject_unrequested_attempts(evidence, attempt_ids) -> None:
             )
 
 
-def load_deployment_evidence(management, *, attempt_ids=None):
-    """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
+def _validated_unknown_attempt_ids(evidence, attempt_ids) -> set[UUID]:
+    """Parse unknown attempt IDs and refuse IDs outside the request."""
     from . import adapter_client as client
-    from .models import NSOApplyAttempt
 
-    if attempt_ids is None:
-        attempt_ids = deployment_evidence_attempt_ids(management)
-    if not attempt_ids:
-        return None
-    evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
-    _reject_unrequested_attempts(evidence, attempt_ids)
     raw_unknown = evidence.get("unknown_apply_attempt_ids", [])
     if not isinstance(raw_unknown, list):
         raise client.AdapterError(
@@ -521,6 +514,21 @@ def load_deployment_evidence(management, *, attempt_ids=None):
             "Adapter returned an unrequested unknown Apply attempt.",
             code="invalid_response",
         )
+    return unknown
+
+
+def load_deployment_evidence(management, *, attempt_ids=None):
+    """Fetch attempt evidence and recover unknown UUIDs by replaying their exact request."""
+    from . import adapter_client as client
+    from .models import NSOApplyAttempt
+
+    if attempt_ids is None:
+        attempt_ids = deployment_evidence_attempt_ids(management)
+    if not attempt_ids:
+        return None
+    evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+    _reject_unrequested_attempts(evidence, attempt_ids)
+    unknown = _validated_unknown_attempt_ids(evidence, attempt_ids)
     replayed = False
     for attempt in NSOApplyAttempt.objects.filter(
         pk__in=unknown,
@@ -546,6 +554,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     if replayed:
         evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
         _reject_unrequested_attempts(evidence, attempt_ids)
+        _validated_unknown_attempt_ids(evidence, attempt_ids)
     return evidence
 
 
