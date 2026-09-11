@@ -76,8 +76,23 @@ class TestStaticRoutesContractConsumer(TestCase):
             self.assertIn(row.nso_prefix, {"10.0.0.0/8", "0.0.0.0/0"})
 
     def test_reconcile_preflight_is_an_exact_renderer_plan(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import AdapterConnection
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
 
-        plan = static_route_reconcile_plan(self.device, CONTRACT_PAYLOAD)
+        AdapterConnection.objects.create(url="http://adapter.example", enabled=True, static_route_auto_create=True)
+        payload = {"routes": [{"vrf": "", "prefix": "198.18.0.0/24", "next_hop": "192.0.2.1"}]}
+        self.assertFalse(StaticRoute.objects.filter(prefix="198.18.0.0/24").exists())
+
+        plan = static_route_reconcile_plan(self.device, payload)
 
         self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label, write.force_insert) for write in plan.write_set],
+            [
+                ("save", "netbox_routing.staticroute", True),
+                ("save", "netbox_nso_plugin.nsostaticroutestate", True),
+                ("m2m_add", "netbox_routing.staticroute", False),
+            ],
+        )
