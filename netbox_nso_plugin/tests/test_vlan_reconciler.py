@@ -271,6 +271,26 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertEqual([row.interface_id for row in rows], [self.interface.pk])
 
+    def test_switchport_plan_rejects_malformed_payloads_for_unmanaged_device(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile
+
+        device = _make_device("unmanaged-switchport")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
+        payloads = (
+            [],
+            {"interfaces": 7},
+            {"interfaces": [{"interface_name": "port1", "tagged_vlans": 7}]},
+            {"interfaces": [{"interface_name": [], "mode": "", "tagged_vlans": []}]},
+            {"interfaces": [{"interface_name": "port1", "mode": [], "tagged_vlans": []}]},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(AdapterError) as raised:
+                    prepare_switchport_reconcile(device, payload)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_switchport_reconcile_rejects_malformed_tagged_vlan_values(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport

@@ -58,6 +58,7 @@ def _validated_switchport_items(payload) -> list[dict]:
             isinstance(item, dict)
             and isinstance(item.get("interface_name"), str)
             and item["interface_name"]
+            and isinstance(item.get("mode"), str)
             and (item.get("mode") in _NSO_TO_NETBOX_MODE or item.get("mode") == "")
             and valid_untagged
             and valid_tagged
@@ -273,7 +274,7 @@ def _switchport_interface_pks(device, payload: dict) -> dict:
     """Resolve the payload's interface names to pks, ONCE, before any lock is taken."""
     from dcim.models import Interface
 
-    names = {item.get("interface_name") for item in _switchport_items(payload)}
+    names = (item.get("interface_name") for item in _switchport_items(payload))
     names = {name for name in names if isinstance(name, str)}
     return dict(Interface.objects.filter(device=device, name__in=names).values_list("name", "pk"))
 
@@ -385,10 +386,10 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
     from .renderer_writer import planned_delete, planned_m2m_set, planned_save
 
+    items = _validated_switchport_items(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], [], [], []
-    items = _validated_switchport_items(payload)
     group = _device_vlan_group(device, create=False)
     tagged_vlans = Prefetch(
         "tagged_vlans",
