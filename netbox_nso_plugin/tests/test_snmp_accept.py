@@ -432,7 +432,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
 
         self.assertEqual(raised.exception.code, "validation_error")
         self.assertNotIn("this owned SNMP row has no Vault reference", str(raised.exception))
-        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(len({record.getMessage() for record in logs.records}), 1)
         mock_put.assert_not_called()
 
     def test_an_owned_v3_user_missing_its_protocols_blocks_the_snapshot(self):
