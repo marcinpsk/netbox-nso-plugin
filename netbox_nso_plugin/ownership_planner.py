@@ -457,7 +457,7 @@ def manifest_binding(instance):
         native_field = dict(rule.overlay_native_fields).get(label)
         if native_field is None:
             continue
-        management = getattr(instance, "management", None)
+        management = _manifest_management(instance)
         if management is None:
             return None
         if native_field == "__self__":
@@ -508,6 +508,17 @@ def manifest_binding(instance):
         scope = getattr(instance, rule.manifest_scope_field) if rule.manifest_scope_field else rule.scope
         return rule, scope, management.device_id, native_label, native_key
     return None
+
+
+def _manifest_management(instance):
+    """Resolve management from the overlay's direct or interface-owned device."""
+    management = getattr(instance, "management", None)
+    if management is not None:
+        return management
+    interface = getattr(instance, "interface", None)
+    if interface is None:
+        return None
+    return getattr(interface.device, "nso_management", None)
 
 
 def maintain_manifest(instance) -> None:
@@ -573,7 +584,9 @@ def _manifest_record_actions(device_id, requested):
         if "management" in fields:
             rows = model.objects.filter(management__device_id=device_id).select_related("management")
         elif "interface" in fields:
-            rows = model.objects.filter(interface__device_id=device_id)
+            rows = model.objects.filter(interface__device_id=device_id).select_related(
+                "interface__device__nso_management"
+            )
         else:
             continue
         native_relations = {

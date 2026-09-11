@@ -116,31 +116,77 @@ class TestOwnershipManifestMaintenance(TestCase):
             counts.append(len(queries))
         self.assertEqual(counts[0], counts[1])
 
-    def test_ip_binding_without_management_skips_native_queries(self):
+    def test_owned_ip_writer_records_the_managed_interfaces_native_identity(self):
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
-        from django.db import connection
-        from django.test.utils import CaptureQueriesContext
         from ipam.models import VRF, IPAddress
 
-        from netbox_nso_plugin.models import NSOInterfaceIPState
-        from netbox_nso_plugin.ownership_planner import manifest_binding
+        from netbox_nso_plugin.models import NSOInterfaceIPState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules, maintain_manifest, manifest_binding
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        from ._outbox_case import without_commit_drain
 
         interface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
-        ContentType.objects.get_for_model(Interface)
+        interface_type = ContentType.objects.get_for_model(Interface)
         for vrf in (None, VRF.objects.create(name="manifest-vrf")):
             with self.subTest(vrf=vrf):
                 address = IPAddress.objects.create(address="198.18.0.1/32", vrf=vrf, assigned_object=interface)
-                state = NSOInterfaceIPState.objects.create(
-                    interface=interface, address=str(address.address), vrf=vrf.name if vrf else ""
+                state = NSOInterfaceIPState(
+                    interface=interface,
+                    address=str(address.address),
+                    vrf=vrf.name if vrf else "",
+                    status="accepted",
                 )
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(state, force_insert=True, natural_key=("interface", "address", "vrf")),)
+                )
+                with without_commit_drain(), renderer_writes(plan) as writer:
+                    writer.save(state, force_insert=True)
                 state = NSOInterfaceIPState.objects.get(pk=state.pk)
+                native_key = {
+                    "address": str(address.address),
+                    "vrf_id": address.vrf_id,
+                    "assigned_object_type_id": interface_type.pk,
+                    "assigned_object_id": interface.pk,
+                }
 
-                with CaptureQueriesContext(connection) as queries:
-                    binding = manifest_binding(state)
+                self.assertEqual(
+                    manifest_binding(state),
+                    (converted_scope_rules()["ip"], "ip", self.device.pk, "ipam.ipaddress", native_key),
+                )
+                manifests = NSOOwnershipManifest.objects.filter(
+                    device_id=self.device.pk, scope="ip", native_model_label="ipam.ipaddress", native_key=native_key
+                )
+                manifest = manifests.get()
+                self.assertEqual(manifest.ownership_state, "owned")
+                self.assertTrue(manifest.deletion_authority)
 
-                self.assertIsNone(binding)
-                self.assertEqual(len(queries), 0, [query["sql"] for query in queries])
+                manifest.delete()
+                maintain_manifest(state)
+                restored = manifests.get()
+                self.assertEqual(restored.ownership_state, "owned")
+                self.assertTrue(restored.deletion_authority)
+
+    def test_ip_binding_on_an_unmanaged_interface_creates_no_manifest(self):
+        from dcim.models import Interface
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInterfaceIPState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import maintain_manifest, manifest_binding
+
+        from ._outbox_case import make_device
+
+        device = make_device("manifest-unmanaged", 2)
+        interface = Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
+        address = IPAddress.objects.create(address="198.18.0.2/32", assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(interface=interface, address=str(address.address), status="accepted")
+        state = NSOInterfaceIPState.objects.get(pk=state.pk)
+
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+        self.assertIsNone(manifest_binding(state))
+        maintain_manifest(state)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk).exists())
 
     def test_management_backed_vlan_binding_preserves_native_identity(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules, manifest_binding
