@@ -95,6 +95,27 @@ class TestOwnershipManifestMaintenance(TestCase):
 
         self.device, self.management = make_managed("manifest-maintenance", 1627)
 
+    def test_manifest_scan_query_count_does_not_grow_with_vlan_rows(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import _manifest_record_actions
+
+        from ._outbox_case import own_vlan
+
+        counts = []
+        states = []
+        for count in (1, 4):
+            while len(states) < count:
+                states.append(own_vlan(self.management, 1800 + len(states), f"manifest-scan-{len(states)}"))
+            NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
+            with CaptureQueriesContext(connection) as queries:
+                actions = _manifest_record_actions(self.device.pk, frozenset({"vlan"}))
+            self.assertCountEqual(actions, [("vlan", state._meta.label_lower, state.pk) for state in states])
+            counts.append(len(queries))
+        self.assertEqual(counts[0], counts[1])
+
     def test_ip_binding_without_management_skips_native_queries(self):
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
