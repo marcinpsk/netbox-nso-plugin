@@ -1008,6 +1008,40 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count(), 1)
 
+    def test_unrendered_template_deletion_preserves_its_compliance_overlay(self):
+        from netbox_routing.models import BGPPeerTemplate
+
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        for queryset_delete in (False, True):
+            with self.subTest(queryset_delete=queryset_delete), without_commit_drain():
+                template = BGPPeerTemplate.objects.create(name=f"unrendered-template-{queryset_delete}")
+                state = NSOBGPPeerTemplateState.objects.create(
+                    management=self.management,
+                    template=template,
+                    template_name=template.name,
+                    status="imported",
+                )
+                template_pk = template.pk
+                revision = list(NSOIntentRevision.objects.filter(device=self.device, scope="bgp").values())
+                entries = list(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bgp").values())
+
+                if queryset_delete:
+                    BGPPeerTemplate.objects.filter(pk=template_pk).delete()
+                else:
+                    template.delete()
+
+                self.assertFalse(BGPPeerTemplate.objects.filter(pk=template_pk).exists())
+                state.refresh_from_db()
+                self.assertIsNone(state.template_id)
+                self.assertEqual(state.status, "imported")
+                self.assertEqual(
+                    list(NSOIntentRevision.objects.filter(device=self.device, scope="bgp").values()), revision
+                )
+                self.assertEqual(
+                    list(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bgp").values()), entries
+                )
+
     def test_registry_declares_all_renderer_overlay_tables(self):
         declared = set(renderer_input_specs())
         required = {

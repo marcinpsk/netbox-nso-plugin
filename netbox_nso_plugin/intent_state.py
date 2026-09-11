@@ -1950,7 +1950,8 @@ def _owned_removal_keys(plan: MutationFootprint) -> frozenset[tuple[int, str]]:
 
     pks_by_label: dict[str, list] = {}
     for row in plan.overlay_rows:
-        if row.pk is not None:
+        # Ranked support rows need locks but do not declare renderer content.
+        if row.pk is not None and row.model_label in _REGISTRY:
             pks_by_label.setdefault(row.model_label, []).append(row.pk)
     keys: set[tuple[int, str]] = set()
     for label, pks in pks_by_label.items():
