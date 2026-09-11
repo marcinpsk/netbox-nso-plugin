@@ -90,13 +90,11 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
         candidate = copy.copy(serializer.instance)
         if "status" in serializer.validated_data:
             candidate._nso_explicit_status_update = True
-        deferred_tag_fields = set()
         for field_name, value in serializer.validated_data.items():
             try:
                 field = candidate._meta.get_field(field_name)
             except FieldDoesNotExist:
                 if field_name in {"add_tags", "remove_tags"}:
-                    deferred_tag_fields.add(field_name)
                     continue
                 if field_name == "changelog_message":
                     continue
@@ -104,11 +102,8 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
             if field.many_to_many:
                 if field_name != "tags":
                     raise IntentMutationProtocolError(f"unsupported deferred M2M field {field_name!r}")
-                deferred_tag_fields.add(field_name)
                 continue
             setattr(candidate, field_name, value)
-        if deferred_tag_fields - {"tags", "add_tags", "remove_tags"}:
-            raise IntentMutationProtocolError("only tag operations may be deferred to the serializer")
 
         plan = RendererMutationPlan.build(saves=(planned_save(candidate),))
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)

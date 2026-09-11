@@ -251,6 +251,36 @@ class TestIsisCompoundGate(TestCase):
     def setUp(self):
         self.device, self.mgmt = _make(f"gi{uuid.uuid4().hex[:6]}", manage_routing=True, manage_isis=True)
 
+    def test_both_entry_points_publish_real_interface_and_process_rows(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSOISISInstanceState, NSOISISInterfaceState
+        from netbox_nso_plugin.reconcile import _empty_context, _reconcile_routing, reconcile_category
+
+        for entry_point in ("routing", "category"):
+            with self.subTest(entry_point=entry_point):
+                device, management = _make(f"isis-{entry_point}", manage_routing=True, manage_isis=True)
+                doc = {
+                    "interfaces": [{"interface_name": "lag-60", "process_tag": "1", "af": "ipv4", "metric": 10}],
+                    "processes": [{"process_tag": "1", "net": "49.0001.0000.0000.0001.00", "is_type": "level-2"}],
+                    "read_state": _rs(),
+                }
+                with (
+                    patch("netbox_nso_plugin.adapter_client.get_isis_interfaces", return_value=doc),
+                    patch("netbox_nso_plugin.adapter_client.get_bfd", return_value={"interfaces": []}),
+                ):
+                    if entry_point == "routing":
+                        ctx = _empty_context()
+                        _reconcile_routing(device, management, adapter_client, ctx)
+                    else:
+                        ctx = reconcile_category(device, management, "isis")
+
+                self.assertEqual(ctx["_gate"]["isis"], "ran")
+                self.assertEqual(len(ctx["isis_interfaces"]), 1)
+                self.assertEqual(len(ctx["isis_processes"]), 1)
+                self.assertNotIn("isis_data", ctx)
+                self.assertEqual(NSOISISInterfaceState.objects.filter(management=management).count(), 1)
+                self.assertEqual(NSOISISInstanceState.objects.filter(management=management).count(), 1)
+
     def _reconcile(self, doc):
         from netbox_nso_plugin.reconcile import reconcile_category
 

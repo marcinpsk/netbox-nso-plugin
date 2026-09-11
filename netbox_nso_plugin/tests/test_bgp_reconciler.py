@@ -2172,8 +2172,15 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         RouteMap.objects.create(name="RM-RACE")
 
         mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
-        with self.assertRaises(IntentMutationProtocolError), mutation(plan):
-            _reconcile_bgp_config(self.device, payload)
+        entered_writer = False
+        with self.assertRaisesMessage(
+            IntentMutationProtocolError,
+            "save of netbox_routing.bgppeeraddressfamily row None is outside the frozen write set",
+        ):
+            with mutation(plan):
+                entered_writer = True
+                _reconcile_bgp_config(self.device, payload)
+        self.assertTrue(entered_writer)
 
     def test_plan_revalidates_a_created_source_interface_after_lock_acquisition(self):
         from dcim.models import Interface

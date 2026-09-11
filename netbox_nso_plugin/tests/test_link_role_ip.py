@@ -5,10 +5,8 @@
 Exercises the real M13 carve/reserve engine parameterized by an NSOLinkRole:
 p2p both-ends from an explicit Prefix FK and from a role slug, role-driven child
 mask, dual-stack, single-ended loopback, fill-empty-only, unmanaged peer, no pool,
-and rollback. The only patch is the adapter HTTP push (a true external boundary).
+and rollback. These tests inspect persisted allocation state. Commit callbacks do not run.
 """
-
-from unittest.mock import patch
 
 from dcim.models import (
     Cable,
@@ -27,8 +25,6 @@ from netbox_nso_plugin.ip_autoassign import assign_ips_for_role, rollback_auto_a
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState, NSOLinkRole
 
 from .mixins import IntentPushResetMixin
-
-_PUSH = "netbox_nso_plugin.adapter_client.put_ip_intent"
 
 
 def _make_cable(iface_a, iface_b):
@@ -74,8 +70,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c1", slug="c1", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool, ipv4_mask=31
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["allocated"]), 2, result)
         self.assertTrue(all(a["address"].endswith("/31") for a in result["allocated"]))
         state_a = NSOInterfaceIPState.objects.get(interface=self.if_a, family="ipv4")
@@ -88,8 +83,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c2", slug="c2", link_type="p2p", assign_ipv4=True, ipv4_pool_role="core-links"
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["allocated"]), 2, result)
 
     def test_role_mask_override_reaches_carve(self):
@@ -97,8 +91,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c3", slug="c3", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool, ipv4_mask=30
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["allocated"]), 2, result)
         # The role's /30 mask must win over the built-in /31 default.
         self.assertTrue(all(a["address"].endswith("/30") for a in result["allocated"]))
@@ -115,8 +108,7 @@ class TestAssignP2PForRole(_Base):
             assign_ipv6=True,
             ipv6_pool_prefix=v6,
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["allocated"]), 4, result)
         fams = {a["family"] for a in result["allocated"]}
         self.assertEqual(fams, {"ipv4", "ipv6"})
@@ -129,8 +121,7 @@ class TestAssignP2PForRole(_Base):
         NSOInterfaceIPState.objects.create(
             interface=self.if_a, address="198.18.14.100/31", family="ipv4", status="accepted", auto_assigned=True
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["allocated"]), 0)
         self.assertEqual(len(result["skipped"]), 1)
 
@@ -138,8 +129,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c6", slug="c6", link_type="p2p", assign_ipv4=True, ipv4_pool_role="nonexistent"
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("No ipv4 pool found for role 'c6'", result["errors"][0]["reason"])
 
@@ -149,8 +139,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c7", slug="c7", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("peer device is not managed", result["errors"][0]["reason"])
 
@@ -159,8 +148,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c8", slug="c8", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=None)
+        result = assign_ips_for_role(self.if_a, role, other_end=None)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("no cable peer found", result["errors"][0]["reason"])
 
@@ -171,8 +159,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c10", slug="c10", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("peer device has no adapter_device_id", result["errors"][0]["reason"])
 
@@ -181,8 +168,7 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c9", slug="c9", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool, ipv4_mask=31
         )
-        with patch(_PUSH):
-            assign_ips_for_role(self.if_a, role, other_end=self.if_b)
+        assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         state_a = NSOInterfaceIPState.objects.get(interface=self.if_a, family="ipv4")
         child = state_a.source_pool
         rollback_auto_assigned(state_a)
@@ -204,8 +190,7 @@ class TestAssignSingleForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="s1", slug="s1", link_type="single", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["allocated"]), 1, result)
         self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.lo_a, family="ipv4").exists())
 
@@ -214,8 +199,7 @@ class TestAssignSingleForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="s2", slug="s2", link_type="single", assign_ipv4=True, ipv4_pool_role="loopbacks"
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["allocated"]), 1, result)
 
     def test_single_fill_empty_skips(self):
@@ -226,8 +210,7 @@ class TestAssignSingleForRole(_Base):
         NSOInterfaceIPState.objects.create(
             interface=self.lo_a, address="198.18.22.9/32", family="ipv4", status="accepted", auto_assigned=True
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["allocated"]), 0)
         self.assertEqual(len(result["skipped"]), 1)
 
@@ -235,8 +218,7 @@ class TestAssignSingleForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="s4", slug="s4", link_type="single", assign_ipv4=True, ipv4_pool_role="nope"
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("No ipv4 pool found for role 's4'", result["errors"][0]["reason"])
 
@@ -249,8 +231,7 @@ class TestAssignSingleForRole(_Base):
             assign_ipv6=False,
             description_template="to {peer_host}",
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(result, {"allocated": [], "skipped": [], "errors": []})
 
     def test_unmanaged_device_error(self):
@@ -259,8 +240,7 @@ class TestAssignSingleForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="s6", slug="s6", link_type="single", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("not managed", result["errors"][0]["reason"])
 
@@ -271,7 +251,6 @@ class TestAssignSingleForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="s7", slug="s7", link_type="single", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        with patch(_PUSH):
-            result = assign_ips_for_role(self.lo_a, role)
+        result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["errors"]), 1)
         self.assertIn("no adapter_device_id", result["errors"][0]["reason"])

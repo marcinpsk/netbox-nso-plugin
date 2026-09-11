@@ -174,10 +174,10 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             assigned_object_id=interface.pk,
         )
         state.vrf = vrf.name
-        state.management = management
         binding = _manifest_binding(state)
         self.assertIsNotNone(binding)
-        self.assertEqual(binding[4]["vrf_id"], vrf.pk)
+        _rule, _scope, _device_id, _native_label, native_key = binding
+        self.assertEqual(native_key["vrf_id"], vrf.pk)
 
         state.vrf = "missing-vrf"
         self.assertIsNone(_manifest_binding(state))
@@ -620,7 +620,6 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         before = revision.revision
 
         with self.assertRaises(IntentPlanStaleError), renderer_writes(plan) as writer:
-            writer.validate_dependencies()
             writer.m2m_add(state, "tagged_vlans", (vlan,))
 
         revision.refresh_from_db()

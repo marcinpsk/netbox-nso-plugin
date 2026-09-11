@@ -311,11 +311,29 @@ _ROUTE_POLICY_ATTEMPT_IDS = "_route_policy_attempt_ids"
 _ROUTE_POLICY_ADAPTER_DEVICE_ID = "_route_policy_adapter_device_id"
 
 
+def _isis_gated_body(ctx, mgmt, device, payload):
+    """Publish both IS-IS result sets through one guarded reconciliation body."""
+    from .isis_reconciler import reconcile_isis
+
+    _safe_reconcile(
+        ctx,
+        "isis_data",
+        mgmt,
+        ("NSOISISInstanceState", "NSOISISInterfaceState"),
+        reconcile_isis,
+        device,
+        payload,
+    )
+    result = ctx.pop("isis_data")
+    ctx["isis_interfaces"] = result["interfaces"]
+    ctx["isis_processes"] = result["processes"]
+
+
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
-    from .isis_reconciler import isis_reconcile_plan, reconcile_isis
+    from .isis_reconciler import isis_reconcile_plan
     from .ospf_reconciler import ospf_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
@@ -347,26 +365,12 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
         # both reconcilers (never two gate calls abusing the equality rerun rule).
         isis_payload = client.get_isis_interfaces(dev_id)
 
-        def _isis_body():
-            _safe_reconcile(
-                ctx,
-                "isis_data",
-                mgmt,
-                ("NSOISISInstanceState", "NSOISISInterfaceState"),
-                reconcile_isis,
-                device,
-                isis_payload,
-            )
-            result = ctx.pop("isis_data")
-            ctx["isis_interfaces"] = result["interfaces"]
-            ctx["isis_processes"] = result["processes"]
-
         _gated(
             ctx,
             mgmt,
             "isis",
             isis_payload,
-            _isis_body,
+            lambda: _isis_gated_body(ctx, mgmt, device, isis_payload),
             epoch=dev_id,
             pre_body=lambda: isis_reconcile_plan(device, isis_payload),
         )
@@ -755,7 +759,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
-    from .isis_reconciler import isis_reconcile_plan, reconcile_isis
+    from .isis_reconciler import isis_reconcile_plan
     from .ospf_reconciler import ospf_reconcile_plan
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
@@ -1122,26 +1126,12 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
             # R3-6: ONE document → ONE gate decision → ONE compound body.
             isis_payload = client.get_isis_interfaces(dev_id)
 
-            def _isis_body():
-                _safe_reconcile(
-                    ctx,
-                    "isis_data",
-                    mgmt,
-                    ("NSOISISInstanceState", "NSOISISInterfaceState"),
-                    reconcile_isis,
-                    device,
-                    isis_payload,
-                )
-                result = ctx.pop("isis_data")
-                ctx["isis_interfaces"] = result["interfaces"]
-                ctx["isis_processes"] = result["processes"]
-
             _gated(
                 ctx,
                 mgmt,
                 "isis",
                 isis_payload,
-                _isis_body,
+                lambda: _isis_gated_body(ctx, mgmt, device, isis_payload),
                 epoch=dev_id,
                 pre_body=lambda: isis_reconcile_plan(device, isis_payload),
             )

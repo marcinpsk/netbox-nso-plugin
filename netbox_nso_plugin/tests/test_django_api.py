@@ -319,6 +319,15 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.assertEqual(list(self.state.tags.values_list("slug", flat=True)), [tag.slug])
         self.assertEqual(self.state.custom_field_data[custom_field.name], "preserved")
 
+        for tag_update in ({"remove_tags": [{"name": tag.name, "slug": tag.slug}]}, {"tags": [tag.pk]}):
+            with self.subTest(tag_update=tag_update):
+                response = self.client.patch(self._get_detail_url(self.state), tag_update, format="json", **self.header)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.state.refresh_from_db()
+                expected = [tag.slug] if "tags" in tag_update else []
+                self.assertEqual(list(self.state.tags.values_list("slug", flat=True)), expected)
+                self.assertEqual(self.state.custom_field_data[custom_field.name], "preserved")
+
 
 class OnboardAPIPermissionTest(APITestCase):
     """The onboard API action provisions a device into NSO (create node → host-keys → unlock →
