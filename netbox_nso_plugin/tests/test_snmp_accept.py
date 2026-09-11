@@ -360,11 +360,16 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
             vault_ref="",
         )
 
-        with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put,
+            self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as logs,
+        ):
             with self.assertRaisesRegex(AdapterError, "SNMP snapshot is blocked") as raised:
                 deliver("snmp", mgmt.device_id, mgmt.adapter_device_id)
 
         self.assertEqual(raised.exception.code, "validation_error")
+        self.assertNotIn("this owned SNMP row has no Vault reference", str(raised.exception))
+        self.assertEqual(len(logs.records), 1)
         mock_put.assert_not_called()
 
     def test_an_owned_v3_user_missing_its_protocols_blocks_the_snapshot(self):

@@ -1530,7 +1530,6 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
         )
     )
     blocked.extend(_snmp_push_blockers(owned_v3, snmp_v3_user_push_blocker))
-    blocked.extend(_snmp_push_blockers(owned_v3, snmp_vault_ref_push_blocker))
     v3_users = []
     for row in owned_v3:
         # vault_ref is a PATH ref ("mount/path"); the auth/priv fields live at

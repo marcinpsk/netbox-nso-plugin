@@ -98,8 +98,8 @@ def _local_hook(hook_id: str, tool: str) -> dict[str, object]:
     assert len(hooks) == 1, f"pre-commit must define one local {hook_id} hook"
     hook = hooks[0]
     command = shlex.split(hook["entry"])
-    assert command[:4] == ["uv", "run", "--native-tls", tool], (
-        f"the local {hook_id} hook must run {tool} via uv run --native-tls"
+    assert command[:5] == ["uv", "run", "--frozen", "--native-tls", tool], (
+        f"the local {hook_id} hook must run {tool} via uv run --frozen --native-tls"
     )
     assert hook["language"] == "system"
     return hook
@@ -126,13 +126,13 @@ def test_ruff_version_has_one_source():
     assert all(repository["repo"] != "https://github.com/astral-sh/ruff-pre-commit" for repository in config["repos"])
     check_hook = _local_hook("ruff-check", "ruff")
     format_hook = _local_hook("ruff-format", "ruff")
-    assert shlex.split(check_hook["entry"])[4:] == [
+    assert shlex.split(check_hook["entry"])[5:] == [
         "check",
         "--force-exclude",
         "--fix",
         "--exit-non-zero-on-fix",
     ]
-    assert shlex.split(format_hook["entry"])[4:] == ["format", "--force-exclude"]
+    assert shlex.split(format_hook["entry"])[5:] == ["format", "--force-exclude"]
     assert check_hook["types_or"] == format_hook["types_or"] == ["python", "pyi"]
     assert check_hook["require_serial"] is format_hook["require_serial"] is True
     assert _declared_version() == _locked_version()

@@ -1823,6 +1823,185 @@ class TestNSORefreshStateView(ViewTestBase):
         mgmt.save(update_fields=["adapter_device_id"])
 
 
+class TestNSORefreshStateRace(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = User.objects.create_superuser(
+            username="refresh-race-admin", password=TEST_PASSWORD, email="refresh-race@test.example"
+        )
+        with without_commit_drain(), transaction.atomic():
+            self.device, self.mgmt = make_managed("refresh-race", 16291)
+            mirror_update(self.mgmt, state_snapshot={"interfaces": [{"name": "lag-0"}]})
+        self.client.force_login(self.user)
+        self.client.raise_request_exception = False
+
+    def _post_with_competing_snapshots(self, count, *, before_planning=False):
+        from django.db import connection
+
+        changes = iter(range(1, count + 1))
+        table = connection.ops.quote_name(NSODeviceManagement._meta.db_table)
+        committed = []
+
+        read_finished = False
+
+        def write_competing_state(sequence):
+            current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+            mirror_update(
+                current,
+                adapter_device_id=16291 + sequence,
+                state_snapshot={"interfaces": [{"name": f"lag-{sequence}"}]},
+            )
+
+        def get_interfaces_doc(_adapter_device_id):
+            nonlocal read_finished
+            read_finished = True
+            return {"interfaces": [], "read_state": None}
+
+        def interleave(execute, sql, params, many, context):
+            nonlocal read_finished
+            management_read = sql.lstrip().upper().startswith("SELECT") and table in sql
+            unlocked_read = before_planning and read_finished and management_read and "FOR UPDATE" not in sql
+            acquisition = not before_planning and management_read and "FOR UPDATE" in sql and " IN " in sql
+            if unlocked_read or acquisition:
+                read_finished = False
+                sequence = next(changes, None)
+                if sequence is not None:
+                    result = execute(sql, params, many, context) if unlocked_read else None
+                    in_thread(lambda: write_competing_state(sequence))
+                    committed.append(sequence)
+                    if unlocked_read:
+                        return result
+            return execute(sql, params, many, context)
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_refresh", args=[self.mgmt.pk])
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_state", return_value={"compliant": True}) as get_state,
+            patch("netbox_nso_plugin.adapter_client.get_interfaces_doc", side_effect=get_interfaces_doc),
+            connection.execute_wrapper(interleave),
+        ):
+            response = self.client.post(url)
+        self.assertEqual(committed, list(range(1, count + 1)))
+        return response, get_state.call_count
+
+    def test_refresh_retries_with_the_latest_snapshot_after_one_competing_write(self):
+        from django.contrib.messages import get_messages
+
+        response, calls = self._post_with_competing_snapshots(1)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(calls, 2)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.state_snapshot["interfaces"], [{"name": "lag-1"}])
+        self.assertEqual(self.mgmt.state_snapshot["compliance"], {"compliant": True})
+        self.assertIn("Compliance data refreshed.", [str(message) for message in get_messages(response.wsgi_request)])
+
+    def test_refresh_retries_when_its_inputs_change_before_the_plan_read(self):
+        response, calls = self._post_with_competing_snapshots(1, before_planning=True)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(calls, 2)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 16292)
+        self.assertEqual(self.mgmt.state_snapshot["interfaces"], [{"name": "lag-1"}])
+
+    def test_refresh_warns_after_two_competing_writes_without_overwriting_them(self):
+        from django.contrib.messages import get_messages
+
+        response, calls = self._post_with_competing_snapshots(2)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(calls, 2)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.state_snapshot, {"interfaces": [{"name": "lag-2"}]})
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            ["Device state changed during refresh. Try again."],
+        )
+
+    def test_refresh_retries_when_an_interface_disappears_before_acquisition(self):
+        from django.contrib.messages import get_messages
+        from django.db import connection
+
+        with without_commit_drain(), transaction.atomic():
+            interface = Interface.objects.create(device=self.device, name="lag-refresh", type="lag")
+        interface_pk = interface.pk
+        table = connection.ops.quote_name(Interface._meta.db_table)
+        read_finished = False
+        deleted = []
+
+        def get_interfaces_doc(_adapter_device_id):
+            nonlocal read_finished
+            read_finished = True
+            return {"interfaces": [], "read_state": None}
+
+        def delete_interface():
+            with without_commit_drain(), transaction.atomic():
+                Interface.objects.get(pk=interface_pk).delete()
+
+        def interleave(execute, sql, params, many, context):
+            nonlocal read_finished
+            if (
+                read_finished
+                and not deleted
+                and sql.lstrip().upper().startswith("SELECT")
+                and f"FROM {table}" in sql
+                and "FOR UPDATE" not in sql
+            ):
+                read_finished = False
+                result = execute(sql, params, many, context)
+                in_thread(delete_interface)
+                deleted.append(interface_pk)
+                return result
+            return execute(sql, params, many, context)
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_refresh", args=[self.mgmt.pk])
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_state", return_value={"compliant": True}) as get_state,
+            patch("netbox_nso_plugin.adapter_client.get_interfaces_doc", side_effect=get_interfaces_doc),
+            connection.execute_wrapper(interleave),
+        ):
+            response = self.client.post(url)
+
+        self.assertEqual(deleted, [interface_pk])
+        self.assertFalse(Interface.objects.filter(pk=interface_pk).exists())
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(get_state.call_count, 2)
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.state_snapshot["interfaces"], [{"name": "lag-0"}])
+        self.assertEqual(self.mgmt.state_snapshot["compliance"], {"compliant": True})
+        self.assertIn("Compliance data refreshed.", [str(message) for message in get_messages(response.wsgi_request)])
+
+    def test_refresh_refetches_the_adapter_after_its_mapping_changes(self):
+        requested = []
+
+        def get_state(adapter_device_id):
+            requested.append(adapter_device_id)
+            return {"compliant": adapter_device_id == 16292}
+
+        def get_interfaces_doc(_adapter_device_id):
+            if len(requested) == 1:
+
+                def remap():
+                    current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                    mirror_update(current, adapter_device_id=16292)
+
+                in_thread(remap)
+            return {"interfaces": [{"name": "lag-current"}]}
+
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_refresh", args=[self.mgmt.pk])
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_state", side_effect=get_state),
+            patch("netbox_nso_plugin.adapter_client.get_interfaces_doc", side_effect=get_interfaces_doc),
+        ):
+            response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(requested, [16291, 16292])
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.adapter_device_id, 16292)
+        self.assertEqual(self.mgmt.state_snapshot["compliance"], {"compliant": True})
+
+
 # ── Accept / Bulk Accept views ────────────────────────────────────────────────────
 
 

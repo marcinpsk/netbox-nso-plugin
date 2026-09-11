@@ -3732,47 +3732,60 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
         )
 
 
+def _refresh_state_snapshot(mgmt):
+    """Fetch and save one snapshot for the current adapter mapping."""
+    from . import adapter_client as client
+    from .intent_state import footprint_for_instance, mirror_transaction
+    from .management_lifecycle import save_management
+    from .read_gate import _is_authoritative
+    from .renderer_writer import IntentPlanStaleError
+
+    compliance = client.get_state(mgmt.adapter_device_id)
+    doc = client.get_interfaces_doc(mgmt.adapter_device_id)
+    with mirror_transaction(footprint_for_instance(mgmt)):
+        current = get_object_or_404(NSODeviceManagement, pk=mgmt.pk)
+        if current.adapter_device_id != mgmt.adapter_device_id:
+            raise IntentPlanStaleError("the adapter mapping changed during refresh")
+        read_state = doc.get("read_state")
+        authoritative = "read_state" not in doc or (isinstance(read_state, dict) and _is_authoritative(read_state))
+        interfaces = (
+            doc.get("interfaces", []) if authoritative else (current.state_snapshot or {}).get("interfaces", [])
+        )
+        current.state_snapshot = {
+            "compliance": compliance,
+            "interfaces": interfaces,
+            "refreshed_at": timezone.now().isoformat(),
+        }
+        save_management(current, update_fields={"state_snapshot"})
+    return authoritative
+
+
 class NSORefreshStateView(NSOActionPermissionMixin, View):
     """Fetch live compliance + interface data from the adapter and cache it."""
 
     def post(self, request, pk):
-        """Call the adapter and update state_snapshot on the management record."""
-        from . import adapter_client as client
+        """Retry one stale refresh before asking the operator to try again."""
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import IntentPlanStaleError
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
-
-        if mgmt.adapter_device_id is None:
-            messages.warning(request, "Device is not yet onboarded to the adapter.")
-            return redirect(_device_nso_tab_url(mgmt.device.pk))
-
-        try:
-            compliance = client.get_state(mgmt.adapter_device_id)
-            from .read_gate import _is_authoritative
-
-            doc = client.get_interfaces_doc(mgmt.adapter_device_id)
-            interfaces = doc.get("interfaces", [])
-            # The FULL gate tuple decides authoritativeness (codex B5-R2-4) — an
-            # outcome=present with succeeded=false/result=error is a failed read.
-            # Key absent = pre-S4 adapter (legacy, replace); explicit null = malformed.
-            read_state = doc.get("read_state")
-            authoritative = "read_state" not in doc or (isinstance(read_state, dict) and _is_authoritative(read_state))
+        for attempt in range(2):
+            mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+            if mgmt.adapter_device_id is None:
+                messages.warning(request, "Device is not yet onboarded to the adapter.")
+                break
+            try:
+                authoritative = _refresh_state_snapshot(mgmt)
+            except (IntentPlanStaleError, RendererTargetsChanged):
+                if attempt:
+                    messages.warning(request, "Device state changed during refresh. Try again.")
+                continue
+            except AdapterError as exc:
+                messages.error(request, f"Could not reach adapter: {public_error_message(exc)}")
+                break
             if not authoritative:
-                # a non-authoritative doc (e.g. not_ready after a store reset) serves a
-                # legitimately EMPTY list — keep the last-known interfaces (codex B5-F5)
-                interfaces = (mgmt.state_snapshot or {}).get("interfaces", [])
-                messages.warning(request, "Interface read unavailable — kept last-known interface data.")
-            from .management_lifecycle import save_management
-
-            mgmt = NSODeviceManagement.objects.get(pk=mgmt.pk)
-            mgmt.state_snapshot = {
-                "compliance": compliance,
-                "interfaces": interfaces,
-                "refreshed_at": timezone.now().isoformat(),
-            }
-            save_management(mgmt, update_fields={"state_snapshot"})
+                messages.warning(request, "Interface read unavailable. Kept last-known interface data.")
             messages.success(request, "Compliance data refreshed.")
-        except AdapterError as exc:
-            messages.error(request, f"Could not reach adapter: {public_error_message(exc)}")
+            break
 
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
