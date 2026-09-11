@@ -271,7 +271,10 @@ class TestOwnershipManifestMaintenance(TestCase):
             NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
             with CaptureQueriesContext(connection) as queries:
                 actions = _manifest_record_actions(self.device.pk, frozenset({"vlan"}))
-            self.assertCountEqual(actions, [(OwnershipAction.RECORD_MANIFEST, "vlan", state._meta.label_lower, state.pk) for state in states])
+            self.assertCountEqual(
+                actions,
+                [(OwnershipAction.RECORD_MANIFEST, "vlan", state._meta.label_lower, state.pk) for state in states],
+            )
             counts.append(len(queries))
         self.assertEqual(counts[0], counts[1])
 
