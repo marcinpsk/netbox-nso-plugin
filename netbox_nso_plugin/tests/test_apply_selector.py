@@ -2745,10 +2745,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         rendered = delivery.render("vlan", self.device.pk, self.mgmt.adapter_device_id)
         self.assertEqual(rendered.payload, [{"vlan_id": old_vid + 1, "name": ""}])
 
-    def test_a_vlan_id_change_keeps_the_old_placeholder_when_the_new_name_is_taken(self):
+    def test_a_vlan_id_change_rejects_a_conflicting_placeholder_name(self):
         from ipam.models import VLAN
 
         from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
             _device_vlan_group,
             placeholder_vlan_name,
             save_vlan_content,
@@ -2770,10 +2771,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with without_commit_drain(), transaction.atomic():
             vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)
             vlan.vid = new_vid
-            save_vlan_content(vlan, update_fields=("vid",))
+            with self.assertRaisesMessage(VLANRescopeConflict, "placeholder name"):
+                save_vlan_content(vlan, update_fields=("vid",))
 
         vlan.refresh_from_db()
-        self.assertEqual((vlan.vid, vlan.name), (new_vid, old_placeholder))
+        self.assertEqual((vlan.vid, vlan.name), (old_vid, old_placeholder))
 
     def test_a_vlan_id_change_keeps_the_old_placeholder_when_a_qinq_sibling_has_the_new_name(self):
         from ipam.models import VLAN

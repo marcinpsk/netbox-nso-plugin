@@ -521,6 +521,7 @@ class _Permit:
     mirror_instance: Any = None
     mirror_update_fields: frozenset[str] | None = None
     authorized_dml: dict[str, int] = field(default_factory=dict)
+    footprint_tables_cache: set[str] | None = None
     tokens: list = field(default_factory=list)
     implicit: bool = False
     deferred_update: dict[str, Any] = field(default_factory=dict)
@@ -2139,6 +2140,7 @@ def _upgrade_detected_reconcile(permit: _Permit, requested: MutationFootprint) -
     permit.bumped.update(permit.footprint.revision_keys)
     permit.deferred_repend_rows = permit.initial_deploying_rows
     permit.dml_kind = "content"
+    permit.footprint_tables_cache = None
     permit.bump_keys = None
     permit.detect_reconcile_content = False
 
@@ -2992,12 +2994,15 @@ def _permit_footprint_tables(permit) -> set[str]:
     """Tables a content permit already authorizes through its footprint."""
     if permit is None or permit.dml_kind != "content":
         return set()
+    if permit.footprint_tables_cache is not None:
+        return permit.footprint_tables_cache
     tables = {
         apps.get_model(row.model_label)._meta.db_table
         for row in (*permit.footprint.source_rows, *permit.footprint.overlay_rows)
     }
     if permit.footprint.device_ids:
         tables.add(apps.get_model("netbox_nso_plugin.nsodevicemanagement")._meta.db_table)
+    permit.footprint_tables_cache = tables
     return tables
 
 

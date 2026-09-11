@@ -345,6 +345,34 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         with self.assertRaisesRegex(IntentMutationProtocolError, "unregistered.*related"):
             RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tags", (tag,)),))
 
+    def test_m2m_add_rejects_an_edge_added_after_planning(self):
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_m2m_add,
+            renderer_writes,
+        )
+
+        device, management = make_managed("writer-m2m-race", 16289)
+        interface = Interface.objects.create(device=device, name="Ethernet1/9", type="1000base-t")
+        state = NSOSwitchportState.objects.create(
+            management=management, interface=interface, mode="tagged", status="accepted"
+        )
+        vlan = VLAN.objects.create(vid=1637, name="writer-m2m-race")
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),))
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            writer.m2m_add(state, "tagged_vlans", (vlan,))
+        revision = NSOIntentRevision.objects.get(device=device, scope="switchport")
+        before = revision.revision
+
+        with self.assertRaises(IntentPlanStaleError), renderer_writes(plan) as writer:
+            writer.assert_preimages_current()
+            writer.m2m_add(state, "tagged_vlans", (vlan,))
+
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before)
+        self.assertEqual(list(state.tagged_vlans.values_list("pk", flat=True)), [vlan.pk])
+
     def test_m2m_set_refuses_a_previously_attached_unregistered_related_model(self):
         from extras.models import Tag
 

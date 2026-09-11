@@ -155,7 +155,7 @@ def vlan_reconcile_plan(device, payload: dict):
 
     planned_at = timezone.now()
     saves, _operations, _reported_rows = _vlan_reconcile_operations(device, payload, planned_at)
-    return RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    return RendererMutationPlan.build(saves=saves, planned_at=planned_at, settles_deploying=False)
 
 
 def _vlan_reconcile_operations(device, payload, planned_at):
@@ -914,9 +914,10 @@ def save_vlan_content(vlan, *, update_fields):
             .exclude(pk=stored.pk)
             .exists()
         )
-        if not name_taken:
-            candidate.name = derived_name
-            changed_fields.add("name")
+        if name_taken:
+            raise VLANRescopeConflict("the placeholder name for the new VLAN ID is already in use")
+        candidate.name = derived_name
+        changed_fields.add("name")
     state_candidates = []
     vid_changed = "vid" in changed_fields
     for scope, states in rows.items():

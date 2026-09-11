@@ -695,6 +695,12 @@ class RendererWriter:
                     or tuple(sorted(getattr(current, field_name).values_list("pk", flat=True))) != before_pks
                 ):
                     raise IntentPlanStaleError("the M2M edge set changed after planning")
+            elif write.operation == "m2m_add" and not isinstance(write.pk, RendererCreationRef):
+                current = model._default_manager.filter(pk=write.pk).first()
+                field_name = dict(write.natural_key)["field_name"]
+                planned = tuple(pk for pk in write.selected_pks if not isinstance(pk, RendererCreationRef))
+                if current is None or getattr(current, field_name).filter(pk__in=planned).exists():
+                    raise IntentPlanStaleError("the planned M2M additions changed after planning")
 
     def _identity_matches(self, write, instance):
         if write.pk is not None:

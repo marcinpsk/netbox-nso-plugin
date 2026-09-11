@@ -469,6 +469,10 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(parse_calls, 2)
 
     def test_repeated_registered_dml_shape_caches_column_classification(self):
+        from netbox_nso_plugin.intent_state import _dml_columns, _parse_dml_target
+
+        _parse_dml_target.cache_clear()
+        _dml_columns.cache_clear()
         table = NSOVLANState._meta.db_table
         statement = f'UPDATE "{table}" SET last_apply_error = %s WHERE id = %s /* intent guard column cache */'
         real_parse = sqlparse.parse
@@ -485,6 +489,31 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         # The _parse_dml_target and _dml_columns caches each parse the cold statement once.
         self.assertEqual(parse_calls, 2)
+
+    def test_registered_dml_cache_test_can_repeat_in_one_process(self):
+        self.test_repeated_registered_dml_shape_caches_column_classification()
+        self.test_repeated_registered_dml_shape_caches_column_classification()
+
+    def test_content_permit_reuses_footprint_table_resolution(self):
+        import cProfile
+        import pstats
+
+        from django.apps import apps
+
+        from netbox_nso_plugin.intent_state import _permit_footprint_tables
+
+        footprint = deletion_footprint_for_instance(self.device)
+        with without_commit_drain(), intent_transaction(footprint) as permit:
+            profile = cProfile.Profile()
+            with profile:
+                first = _permit_footprint_tables(permit)
+                self.assertIn(self.state._meta.db_table, first)
+                for _ in range(10):
+                    self.assertEqual(_permit_footprint_tables(permit), first)
+            stats = pstats.Stats(profile)
+        code = apps.get_model.__code__
+        calls = stats.stats.get((code.co_filename, code.co_firstlineno, code.co_name), (0, 0))[1]
+        self.assertLessEqual(calls, len(footprint.source_rows) + len(footprint.overlay_rows) + 1)
 
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():

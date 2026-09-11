@@ -924,6 +924,45 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "deploying")
         self.assertEqual(state.apply_attempt_id, attempt)
 
+    def test_content_changing_read_preserves_other_deploying_vlans(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        from ._outbox_case import content_update
+
+        first, second = reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}, {"vlan_id": 34, "name": "DATA"}]}
+        )
+        content_update(second, status="in_sync")
+        attempt = uuid4()
+        content_update(first, status="deploying", apply_attempt_id=attempt)
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
+
+        first.refresh_from_db()
+        self.assertEqual(first.status, "deploying")
+        self.assertEqual(first.apply_attempt_id, attempt)
+
+    def test_vid_edit_rejects_a_taken_placeholder_name(self):
+        from netbox_nso_plugin.signals import vlan_intent_item
+        from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
+            reconcile_vlan_database,
+            save_vlan_content,
+        )
+
+        from ._outbox_case import content_update
+
+        (state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
+        content_update(state, status="accepted")
+        VLAN.objects.create(group=state.vlan.group, vid=7, name="VLAN 6")
+        state.vlan.vid = 6
+
+        with self.assertRaises(VLANRescopeConflict):
+            save_vlan_content(state.vlan, update_fields=("vid",))
+
+        state.refresh_from_db()
+        self.assertEqual(vlan_intent_item(state), {"vlan_id": 5, "name": ""})
+
     def test_rescope_move_to_empty_group(self):
         """Re-scoping into a group with no collision just moves the VLAN (stays synced)."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
