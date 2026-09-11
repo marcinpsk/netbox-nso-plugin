@@ -167,6 +167,12 @@ def _budget_expired(deadline: float) -> bool:
     return _monotonic() >= deadline
 
 
+def _defer_expired_audit(selected, deferred, *, pre_capture):
+    if pre_capture:
+        raise RendererAuditBudgetExceeded("pre-capture audit exhausted its time budget")
+    return RendererAuditResult((), (), (*selected, *deferred))
+
+
 def _default_scope_batch_cap() -> int:
     """Admit the whole registry, which is the most any audit can legitimately request.
 
@@ -360,17 +366,19 @@ def audit_renderer_scopes(
         return RendererAuditResult(selected, (), deferred)
 
     if trigger == "cadence" and not _budget_expired(deadline):
+        from .delivery import SendDeadlineExceeded
         from .management_lifecycle import reconcile_management_control
 
-        reconcile_management_control(device_id)
+        try:
+            reconcile_management_control(device_id, deadline=deadline)
+        except SendDeadlineExceeded:
+            return _defer_expired_audit(selected, deferred, pre_capture=pre_capture)
 
     from .ownership_planner import reconcile_scope_ownership
 
     # The planner's pass is not inside the render budget, so it is not started without one.
     if _budget_expired(deadline):
-        if pre_capture:
-            raise RendererAuditBudgetExceeded("pre-capture audit exhausted its time budget")
-        return RendererAuditResult((), (), (*selected, *deferred))
+        return _defer_expired_audit(selected, deferred, pre_capture=pre_capture)
     reconcile_scope_ownership(device_id, selected)
 
     candidates, timed_out = _optimistic_candidates(
