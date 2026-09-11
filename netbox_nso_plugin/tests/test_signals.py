@@ -1007,6 +1007,117 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         _bulk_create_management_without_signals([row])
         self.mgmt = NSODeviceManagement.objects.get(pk=row.pk)
 
+    def test_onboarding_rejects_a_stale_source_before_registering(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _onboard_into_adapter
+
+        current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        content_bulk_update(
+            current,
+            nso_device_name="signal-race-new-source",
+            source_rekey_pending=True,
+        )
+        with patch(f"{_MOD}.onboard_device", return_value={"id": 71, "source_epoch": 5}) as onboard:
+            registered = _onboard_into_adapter(self.mgmt, adapter_client)
+
+        self.assertFalse(registered)
+        onboard.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.nso_device_name, "signal-race-new-source")
+        self.assertTrue(self.mgmt.source_rekey_pending)
+        self.assertEqual(self.mgmt.adapter_device_id, 7)
+        self.assertIsNone(self.mgmt.adapter_source_epoch)
+        self.assertFalse(self.mgmt.source_epoch_aware)
+
+    def test_onboarding_rejects_a_stale_mapping_before_registering(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _onboard_into_adapter
+
+        requested_source = self.mgmt.nso_device_name
+
+        current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+        mirror_update(current, adapter_device_id=72, adapter_source_epoch=6, source_epoch_aware=True)
+        with patch(f"{_MOD}.onboard_device", return_value={"id": 71, "source_epoch": 5}) as onboard:
+            registered = _onboard_into_adapter(self.mgmt, adapter_client)
+
+        self.assertFalse(registered)
+        onboard.assert_not_called()
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.nso_device_name, requested_source)
+        self.assertEqual(self.mgmt.adapter_device_id, 72)
+        self.assertEqual(self.mgmt.adapter_source_epoch, 6)
+        self.assertTrue(self.mgmt.source_epoch_aware)
+
+    def test_initial_onboarding_holds_the_source_until_the_mapping_is_recorded(self):
+        from django.db import connection
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+        from netbox_nso_plugin.signals import _onboard_into_adapter
+
+        mirror_update(self.mgmt, adapter_device_id=None)
+        requested_source = self.mgmt.nso_device_name
+        writer_started = threading.Event()
+        committed = threading.Event()
+        worker_pid = []
+        errors = []
+
+        def change_source():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_backend_pid()")
+                    worker_pid.append(cursor.fetchone()[0])
+                writer_started.set()
+                for attempt in range(2):
+                    current = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+                    try:
+                        content_bulk_update(
+                            current, nso_device_name="signal-race-new-source", source_rekey_pending=True
+                        )
+                    except IntentPlanStaleError:
+                        if attempt:
+                            raise
+                        continue
+                    committed.set()
+                    break
+            except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=change_source)
+
+        def onboard_while_source_is_locked(**kwargs):
+            self.assertEqual(kwargs["nso_device_name"], requested_source)
+            worker.start()
+            self.assertTrue(writer_started.wait(10), "the competing source writer did not start")
+            wait_until_postgres_blocks(worker_pid[0], "the competing source writer", timeout=3)
+            self.assertFalse(committed.is_set())
+            return {"id": 71, "source_epoch": 5}
+
+        try:
+            with patch(f"{_MOD}.onboard_device", side_effect=onboard_while_source_is_locked) as onboard:
+                registered = _onboard_into_adapter(self.mgmt, adapter_client)
+        finally:
+            if worker.ident is not None:
+                worker.join(10)
+                self.assertFalse(worker.is_alive(), "the competing source writer did not finish")
+        if errors:
+            raise errors[0]
+
+        self.assertTrue(registered)
+        onboard.assert_called_once()
+        self.assertTrue(committed.is_set())
+        self.mgmt.refresh_from_db()
+        self.assertEqual(self.mgmt.nso_device_name, "signal-race-new-source")
+        self.assertTrue(self.mgmt.source_rekey_pending)
+        self.assertEqual(self.mgmt.adapter_device_id, 71)
+        self.assertEqual(self.mgmt.adapter_source_epoch, 5)
+        self.assertTrue(self.mgmt.source_epoch_aware)
+
     def test_adapter_failure_survives_a_stale_error_mirror_plan(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.models import NSODeviceManagement

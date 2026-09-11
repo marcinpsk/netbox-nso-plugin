@@ -1128,6 +1128,62 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(list(self.interface.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
         self.assertEqual(list(switchport.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
 
+    def test_merge_plan_batches_tagged_vlan_loads_for_native_and_overlay_owners(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import _vlan_repoint_plan, reconcile_vlan_database, rescope_vlan
+
+        (source_state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 48, "name": "MGMT"}]})
+        source_vlan = source_state.vlan
+        target_group = VLANGroup.objects.create(name="Batched Merge Target", slug="batched-merge-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=48, name="MGMT")
+        owners = []
+        for index in range(4):
+            interface = Interface.objects.create(
+                device=self.device, name=f"GigabitEthernet1/{index}", type="1000base-t", mode="tagged"
+            )
+            switchport = NSOSwitchportState.objects.create(
+                management=self.management, interface=interface, mode="tagged", status="imported"
+            )
+            for owner in (interface, switchport):
+                owner.tagged_vlans.set((source_vlan, target_vlan))
+                owners.append(owner)
+        through_tables = {
+            connection.ops.quote_name(model._meta.get_field("tagged_vlans").remote_field.through._meta.db_table)
+            for model in (Interface, NSOSwitchportState)
+        }
+        vlan_table = connection.ops.quote_name(VLAN._meta.db_table)
+
+        with CaptureQueriesContext(connection) as queries:
+            _plan, _saves, m2m_sets, _deletes, _push_targets, _device_ids = _vlan_repoint_plan(source_vlan, target_vlan)
+
+        self.assertCountEqual(
+            [
+                (owner._meta.label_lower, owner.pk, field_name, tuple(vlan.pk for vlan in tagged))
+                for owner, field_name, tagged in m2m_sets
+            ],
+            [(owner._meta.label_lower, owner.pk, "tagged_vlans", (target_vlan.pk,)) for owner in owners],
+        )
+        tagged_queries = [
+            query["sql"]
+            for query in queries
+            if f"FROM {vlan_table}" in query["sql"] and any(table in query["sql"] for table in through_tables)
+        ]
+        self.assertFalse([sql for sql in tagged_queries if sql.lstrip().upper().startswith("SELECT 1 AS")])
+        # Exact writer identity probes remain separate from loading the related VLAN rows.
+        row_loads = [sql for sql in tagged_queries if f'{vlan_table}."name"' in sql.split(" FROM ", 1)[0]]
+        self.assertEqual(len(row_loads), 2)
+        for table in through_tables:
+            self.assertEqual(sum(table in sql for sql in row_loads), 1)
+
+        action, surviving = rescope_vlan(source_state, target_group)
+
+        self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
+        for owner in owners:
+            self.assertEqual(list(owner.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
+
     def test_rescope_retries_a_merge_after_source_identity_changes_while_waiting(self):
         from unittest.mock import patch
 

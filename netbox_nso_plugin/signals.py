@@ -741,7 +741,8 @@ def _sync_source_change(instance, client) -> bool:
             current.adapter_device_id,
             current.device_id,
         )
-        _onboard_into_adapter(current, client)
+        if not _onboard_into_adapter(current, client):
+            return False
         instance.adapter_device_id = current.adapter_device_id
         result = {"source_epoch": current.adapter_source_epoch}
     if result.get("source_epoch") is None:
@@ -784,29 +785,45 @@ def _sync_source_change(instance, client) -> bool:
     return True
 
 
-def _onboard_into_adapter(instance, client):
+def _onboard_into_adapter(instance, client) -> bool:
     """Register the device with the adapter and store the returned mapping on the row.
 
     The adapter identity fields are admission metadata, not renderer content.
     """
-    result = client.onboard_device(
-        nso_instance=instance.nso_instance.adapter_instance_id,
-        nso_device_name=instance.nso_device_name,
-        netbox_device_id=instance.device_id,
-    )
+    from .intent_state import footprint_for_instance, mirror_transaction
     from .management_lifecycle import save_management
 
-    current = type(instance).objects.get(pk=instance.pk)
-    current.adapter_device_id = result["id"]
-    current.adapter_source_epoch = result.get("source_epoch")
-    current.source_epoch_aware = result.get("source_epoch") is not None
-    save_management(
-        current,
-        update_fields=["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"],
+    identity_fields = (
+        "device_id",
+        "nso_instance_id",
+        "nso_device_name",
+        "adapter_device_id",
+        "adapter_source_epoch",
+        "source_epoch_aware",
+        "source_rekey_pending",
     )
+    expected = tuple(getattr(instance, field) for field in identity_fields)
+    with mirror_transaction(footprint_for_instance(instance)):
+        current = type(instance).objects.select_related("nso_instance").get(pk=instance.pk)
+        if tuple(getattr(current, field) for field in identity_fields) != expected:
+            return False
+        # Hold the source through registration so a concurrent rekey receives the new mapping.
+        result = client.onboard_device(
+            nso_instance=current.nso_instance.adapter_instance_id,
+            nso_device_name=current.nso_device_name,
+            netbox_device_id=current.device_id,
+        )
+        current.adapter_device_id = result["id"]
+        current.adapter_source_epoch = result.get("source_epoch")
+        current.source_epoch_aware = result.get("source_epoch") is not None
+        save_management(
+            current,
+            update_fields=["adapter_device_id", "adapter_source_epoch", "source_epoch_aware"],
+        )
     instance.adapter_device_id = current.adapter_device_id
     instance.adapter_source_epoch = current.adapter_source_epoch
     instance.source_epoch_aware = current.source_epoch_aware
+    return True
 
 
 @receiver(post_save, sender="netbox_nso_plugin.NSODeviceManagement")
@@ -868,11 +885,14 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
 
     try:
         if created or instance.adapter_device_id is None:
-            _onboard_into_adapter(instance, client)
+            linked = _onboard_into_adapter(instance, client)
         elif instance.source_rekey_pending:
             # _sync_source_change recovers a dead mapping itself — it owns the fencing state.
-            if not _sync_source_change(instance, client):
-                return
+            linked = _sync_source_change(instance, client)
+        else:
+            linked = True
+        if not linked:
+            return
 
         # Carry the device's management addresses so the adapter's failover loop can probe
         # primary and fall back to OOB. Resolved by the SAME helper onboarding uses, so the
@@ -908,7 +928,8 @@ def _sync_committed_scope_to_adapter(sender, instance_pk, created):
                 instance.adapter_device_id,
                 instance.device_id,
             )
-            _onboard_into_adapter(instance, client)
+            if not _onboard_into_adapter(instance, client):
+                return
             push_scope()
 
         notify_result = client.sync_notify(instance.adapter_device_id)

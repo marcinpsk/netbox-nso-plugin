@@ -58,7 +58,7 @@ def test_sqlparse_dependency_accepts_a_supported_floor(dependency):
 def test_packaging_is_a_direct_test_dependency():
     dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
 
-    assert any(Requirement(dependency).name == "packaging" for dependency in dependencies)
+    assert any(Requirement(dependency).name.casefold() == "packaging" for dependency in dependencies)
 
 
 @pytest.mark.parametrize("dependency", ["sqlparse", "sqlparse>=0.5.0"])
@@ -188,3 +188,18 @@ def test_zizmor_version_has_one_source():
     assert hook["files"] == r"^\.github/workflows/"
     assert hook["pass_filenames"] is True
     assert _declared_zizmor_version() == _locked_zizmor_version()
+
+
+def test_netbox_checkouts_use_immutable_commits():
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "test.yaml").read_text())
+    checkouts = 0
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            checkout = step.get("with", {})
+            if checkout.get("repository") != "netbox-community/netbox":
+                continue
+            checkouts += 1
+            assert checkout["ref"] == "${{ matrix.environment.netbox-ref }}"
+            for environment in job["strategy"]["matrix"]["environment"]:
+                assert re.fullmatch(r"[0-9a-f]{40}", environment["netbox-ref"])
+    assert checkouts

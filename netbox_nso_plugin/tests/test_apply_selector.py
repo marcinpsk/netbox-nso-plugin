@@ -637,6 +637,39 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
+    def test_accepting_a_shared_vlan_preserves_the_other_devices_deploying_attempt(self):
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
+
+        content_update(self.vlan_state, status="imported")
+        other_device, other_management = make_managed("shared-vlan-accept", 2556)
+        with without_commit_drain(), transaction.atomic():
+            other_state = NSOVLANState.objects.create(
+                management=other_management,
+                vlan=self.vlan_state.vlan,
+                status="accepted",
+            )
+        attempt_id = uuid4()
+        mirror_update(other_state, status="deploying", apply_attempt_id=attempt_id)
+        accepted_revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        other_revision = NSOIntentRevision.objects.get(device=other_device, scope="vlan")
+        before_accepted = accepted_revision.revision
+        before_other = other_revision.revision
+
+        url = reverse("plugins:netbox_nso_plugin:vlan_accept", args=[self.vlan_state.pk])
+        with without_commit_drain():
+            response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 302)
+        self.vlan_state.refresh_from_db()
+        other_state.refresh_from_db()
+        accepted_revision.refresh_from_db()
+        other_revision.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "in_sync")
+        self.assertEqual(accepted_revision.revision, before_accepted + 1)
+        self.assertEqual(other_revision.revision, before_other)
+        self.assertEqual(other_state.status, "deploying")
+        self.assertEqual(other_state.apply_attempt_id, attempt_id)
+
     def test_rollback_cannot_release_a_row_repromoted_by_a_later_attempt(self):
         from uuid import uuid4
 

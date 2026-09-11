@@ -112,6 +112,14 @@ class TestOutboxSchema(TestCase):
 
         assert field.get_default() == "ordinary"
         assert {value for value, _label in field.choices} == {"ordinary", "repair"}
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT character_maximum_length, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                [ENTRY_TABLE, field.column],
+            )
+            assert cur.fetchone() == (field.max_length, "NO", None)
 
     def test_the_state_row_is_unique_per_device_and_scope(self):
         from netbox_nso_plugin.models import NSOIntentOutboxState

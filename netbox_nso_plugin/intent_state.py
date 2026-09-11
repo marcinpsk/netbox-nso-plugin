@@ -2030,6 +2030,9 @@ def _bump_and_lock_deploying(
     bumped = tuple(key for key in footprint.revision_keys if bump_keys is None or key in bump_keys)
     for device_id, scope in bumped:
         bump_intent_revision(device_id, scope)
+    if set(bumped) != set(footprint.revision_keys):
+        changed_rows = set(_deploying_scope_rows(replace(footprint, revision_keys=bumped)))
+        deploying_rows = tuple(row for row in deploying_rows if row in changed_rows)
     return frozenset(bumped), _still_deploying_rows(deploying_rows)
 
 

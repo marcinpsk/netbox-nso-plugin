@@ -34,8 +34,10 @@ jobs:
         environment: &netbox-environments
           - python-version: "3.12"
             netbox-version: "v4.6.10"
+            netbox-ref: "560da79ea1213a0b8bbc9ecf4ac03714fa2071d7"
           - python-version: "3.13"
             netbox-version: "v4.7.0"
+            netbox-ref: "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
         shard: [1, 2]
 
     services:
@@ -74,7 +76,7 @@ jobs:
         with:
           repository: netbox-community/netbox
           path: netbox
-          ref: ${{ matrix.environment.netbox-version }}
+          ref: ${{ matrix.environment.netbox-ref }}
           persist-credentials: false
 
       # The joined pin boots the real adapter from this exact commit. It verifies

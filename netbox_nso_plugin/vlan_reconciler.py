@@ -613,7 +613,8 @@ def _validate_rescope_managed_device_ids(old_vlan, locked_device_ids) -> None:
 def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
     """Freeze all native and overlay references moved by one VLAN merge."""
     from dcim.models import Interface
-    from django.db.models import Q
+    from django.db.models import Prefetch, Q
+    from ipam.models import VLAN
 
     from . import status_machine as sm
     from .models import NSOSVIState, NSOSwitchportState, NSOVLANState
@@ -627,9 +628,13 @@ def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
     delete_operations = []
     push_targets = set()
     device_ids = set()
+    tagged_vlans = Prefetch("tagged_vlans", queryset=VLAN.objects.order_by("pk"), to_attr="_intent_tagged_vlans")
 
     for interface in (
-        Interface.objects.filter(Q(untagged_vlan=old_vlan) | Q(tagged_vlans=old_vlan)).distinct().order_by("pk")
+        Interface.objects.filter(Q(untagged_vlan=old_vlan) | Q(tagged_vlans=old_vlan))
+        .prefetch_related(tagged_vlans)
+        .distinct()
+        .order_by("pk")
     ):
         device_ids.add(interface.device_id)
         if interface.untagged_vlan_id == old_vlan.pk:
@@ -638,19 +643,16 @@ def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
             fields = ("untagged_vlan",)
             saves.append(planned_save(candidate, update_fields=fields))
             save_operations.append((candidate, fields))
-        if interface.tagged_vlans.filter(pk=old_vlan.pk).exists():
-            tagged = tuple(
-                dict.fromkeys(
-                    target_vlan if row.pk == old_vlan.pk else row for row in interface.tagged_vlans.order_by("pk")
-                )
-            )
+        current_tagged = _ordered_tagged_vlans(interface)
+        if any(row.pk == old_vlan.pk for row in current_tagged):
+            tagged = tuple(dict.fromkeys(target_vlan if row.pk == old_vlan.pk else row for row in current_tagged))
             m2m_writes.append(planned_m2m_set(interface, "tagged_vlans", tagged))
             m2m_operations.append((interface, "tagged_vlans", tagged))
 
     switchports = (
         NSOSwitchportState.objects.filter(Q(untagged_vlan=old_vlan) | Q(tagged_vlans=old_vlan))
         .select_related("management", "interface")
-        .prefetch_related("tagged_vlans")
+        .prefetch_related(tagged_vlans)
         .distinct()
         .order_by("pk")
     )
@@ -662,12 +664,9 @@ def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
             fields = ("untagged_vlan",)
             saves.append(planned_save(candidate, update_fields=fields))
             save_operations.append((candidate, fields))
-        if switchport.tagged_vlans.filter(pk=old_vlan.pk).exists():
-            tagged = tuple(
-                dict.fromkeys(
-                    target_vlan if row.pk == old_vlan.pk else row for row in switchport.tagged_vlans.order_by("pk")
-                )
-            )
+        current_tagged = _ordered_tagged_vlans(switchport)
+        if any(row.pk == old_vlan.pk for row in current_tagged):
+            tagged = tuple(dict.fromkeys(target_vlan if row.pk == old_vlan.pk else row for row in current_tagged))
             m2m_writes.append(planned_m2m_set(switchport, "tagged_vlans", tagged))
             m2m_operations.append((switchport, "tagged_vlans", tagged))
 
