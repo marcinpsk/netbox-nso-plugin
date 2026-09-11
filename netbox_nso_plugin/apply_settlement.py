@@ -444,14 +444,9 @@ def _record_replay_answer(attempt, result=None, error=None) -> None:
             return
         status = 200 if result.get("outcome") == "no_op" else 202
         response = result
-    elif (
-        error is not None
-        and error.definitely_not_enqueued
-        and type(error.status_code) is int
-        and isinstance(error.response, dict)
-    ):
+    elif error is not None and error.definitely_not_enqueued:
         status = error.status_code
-        response = error.response
+        response = error.rejection_response
     else:
         return
     NSOApplyAttempt.objects.filter(pk=attempt.pk, response__isnull=True).update(
@@ -535,6 +530,9 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         management=management,
         adapter_device_id=management.adapter_device_id,
     ):
+        # A retained overlay reference or explicit selection cannot reopen a refusal.
+        if attempt.response is not None and attempt.http_status not in (200, 202):
+            continue
         try:
             result = client.trigger_apply(management.adapter_device_id, attempt.pk, attempt.selected)
         except client.AdapterError as exc:

@@ -499,6 +499,70 @@ class TestAttemptSettlement(TestCase):
         self.assertTrue(any("job 900" in message for message in logs.output))
         self.assertTrue(any("device 1626" in message for message in logs.output))
 
+    def test_a_replay_refusal_with_malformed_body_is_not_retried(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        for payload in (None, [], "rejected"):
+            with self.subTest(payload=payload):
+                attempt_id = uuid4()
+                local = self._local_attempt(attempt_id, 66, {"vlan": 406}, answered=False)
+                unknown = _payload(self.adapter_device_id, [])
+                unknown["unknown_apply_attempt_ids"] = [str(attempt_id)]
+                calls = []
+
+                class RefusingSession:
+                    def request(_self, method, url, **kwargs):
+                        calls.append(url.rsplit("/", 1)[-1])
+                        if url.endswith("/deployment-evidence"):
+                            return make_response(200, unknown)
+                        self.assertTrue(url.endswith("/actions/apply"))
+                        return make_response(400, payload)
+
+                with (
+                    patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+                    patch("netbox_nso_plugin.adapter_client._get_session", return_value=RefusingSession()),
+                ):
+                    load_deployment_evidence(self.management)
+                    self.assertIsNone(load_deployment_evidence(self.management))
+
+                local.refresh_from_db()
+                self.assertEqual(local.http_status, 400)
+                self.assertIsNotNone(local.response)
+                self.assertEqual(calls, ["deployment-evidence", "apply", "deployment-evidence"])
+
+    def test_a_rejected_replay_stays_terminal_when_an_overlay_references_it(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        attempt_id = uuid4()
+        self._vlan_row(1646, attempt_id)
+        local = self._local_attempt(attempt_id, 66, {"vlan": 406}, answered=False)
+        unknown = _payload(self.adapter_device_id, [])
+        unknown["unknown_apply_attempt_ids"] = [str(attempt_id)]
+        calls = []
+
+        class RefusingSession:
+            def request(_self, method, url, **kwargs):
+                calls.append(url.rsplit("/", 1)[-1])
+                if url.endswith("/deployment-evidence"):
+                    return make_response(200, unknown)
+                self.assertTrue(url.endswith("/actions/apply"))
+                return make_response(400, content=b"invalid JSON")
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=RefusingSession()),
+        ):
+            load_deployment_evidence(self.management)
+            load_deployment_evidence(self.management)
+            load_deployment_evidence(self.management, attempt_ids=(attempt_id,))
+
+        local.refresh_from_db()
+        self.assertEqual(local.http_status, 400)
+        self.assertEqual(
+            calls,
+            ["deployment-evidence", "apply", "deployment-evidence", "deployment-evidence", "deployment-evidence"],
+        )
+
     def test_rowless_lost_responses_expire_from_evidence_replay(self):
         from netbox_nso_plugin.apply_settlement import (
             LOST_RESPONSE_REPLAY_WINDOW,

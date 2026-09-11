@@ -3122,14 +3122,8 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         definitely_not_enqueued = exc.definitely_not_enqueued
         # An ambiguous failure may still have enqueued the Apply, and the stored response is the
         # attempt's immutable answer, so only a deterministic rejection may become it.
-        if (
-            prepared is not None
-            and definitely_not_enqueued
-            and type(exc.status_code) is int
-            and isinstance(exc.response, dict)
-        ):
-            _record_apply_response(prepared, http_status=exc.status_code, response=exc.response)
         if prepared is not None and definitely_not_enqueued:
+            _record_apply_response(prepared, http_status=exc.status_code, response=exc.rejection_response)
             _rollback_prepare_apply(prepared)
         if exc.code == "conflict":
             return self._incumbent_job(request, mgmt, exc, action=action, is_ajax=is_ajax)

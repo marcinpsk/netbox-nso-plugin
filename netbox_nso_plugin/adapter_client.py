@@ -324,6 +324,15 @@ class AdapterError(Exception):
         """Whether this failure is a deterministic rejection, so no work can have been enqueued."""
         return self.code == "configuration_error" or (type(self.status_code) is int and 400 <= self.status_code < 500)
 
+    @property
+    def rejection_response(self) -> dict:
+        """Preserve an error envelope or mark a definite refusal without a valid body."""
+        if not self.definitely_not_enqueued:
+            raise ValueError("An ambiguous adapter failure is not a refusal")
+        if isinstance(self.response, dict):
+            return self.response
+        return {"error": {"code": self.code, "message": public_error_message(self)}}
+
 
 _PUBLIC_ERROR_MESSAGES = {
     "configuration_error": "The NSO adapter is not configured. See the server log.",

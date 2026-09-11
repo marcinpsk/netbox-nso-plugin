@@ -329,6 +329,35 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.vlan_state.status, "deploying")
         self.assertEqual(self.vlan_state.apply_attempt_id, attempt.pk)
 
+    def test_rejected_apply_with_malformed_body_is_not_replayed(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        for status, payload in ((400, None), (400, []), (400, "rejected"), (None, None)):
+            with self.subTest(status=status, payload=payload):
+
+                def refuse(_selected):
+                    if status is None:
+                        raise AdapterError("Adapter configuration unavailable", code="configuration_error")
+                    return status, payload
+
+                adapter = _ApplyContractAdapter(refuse)
+
+                response = self._post(adapter)
+
+                self.assertEqual(response.status_code, 502)
+                self.vlan_state.refresh_from_db()
+                self.assertEqual(self.vlan_state.status, "accepted")
+                self.assertIsNone(self.vlan_state.apply_attempt_id)
+                attempt = NSOApplyAttempt.objects.get(pk=adapter.apply_requests[0]["apply_attempt_id"])
+                self.assertEqual(attempt.http_status, status)
+                self.assertIsNotNone(attempt.response)
+                config, session = adapter.patches()
+                with config, session:
+                    self.assertIsNone(load_deployment_evidence(self.mgmt))
+                self.assertEqual(len(adapter.apply_requests), 1)
+
     def test_no_op_retry_restores_apply_failed_intent(self):
         mirror_update(
             type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
