@@ -4698,9 +4698,10 @@ class TestOverlayFieldEditView(ViewTestBase):
         with patch(
             "netbox_nso_plugin.views._write_owned_interface_mtu",
             side_effect=IntentPlanStaleError("changed after planning"),
-        ):
+        ) as write_mtu:
             response = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "9100"})
 
+        self.assertEqual(write_mtu.call_count, 2)
         self.assertEqual(response.status_code, 409)
         self.assertEqual(
             response.json(),
@@ -4718,9 +4719,10 @@ class TestOverlayFieldEditView(ViewTestBase):
         with patch(
             "netbox_nso_plugin.views._write_owned_interface_mtu",
             side_effect=IntentPlanStaleError("changed after planning"),
-        ):
+        ) as write_mtu:
             response = self.client.post(url, follow=True)
 
+        self.assertEqual(write_mtu.call_count, 2)
         self.assertEqual(response.redirect_chain[0][1], 302)
         self.assertContains(response, "Routing state changed. Refresh the page and try again.")
 
