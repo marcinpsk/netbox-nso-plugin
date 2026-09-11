@@ -65,6 +65,28 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(rows[0].device_name, "FIRST")
         self.assertEqual(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).count(), 1)
 
+    def test_same_vid_states_do_not_hide_an_unreported_attachment(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        first, second = (
+            NSOVLANState.objects.create(
+                management=self.management,
+                vlan=VLAN.objects.create(vid=1627, name=name),
+                status="imported",
+            )
+            for name in ("REPORTED", "UNREPORTED")
+        )
+
+        rows = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 1627, "name": "REPORTED"}]})
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual([row.pk for row in rows], [first.pk])
+        self.assertEqual(first.device_name, "REPORTED")
+        self.assertIsNotNone(first.last_sync_at)
+        self.assertEqual(second.status, "changed")
+        self.assertIsNone(second.last_sync_at)
+
     def test_vlan_footprint_does_not_create_the_device_group(self):
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_footprint
 

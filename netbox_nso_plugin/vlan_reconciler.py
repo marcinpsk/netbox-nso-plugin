@@ -191,6 +191,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
     operations = []
     reported_rows = []
     seen_vids = set()
+    seen_state_pks = set()
 
     def ensure_group():
         nonlocal group
@@ -248,9 +249,10 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         saves.append(proposal)
         operations.append((state, None, created))
         reported_rows.append(state)
+        seen_state_pks.add(state.pk)
 
     for stale in states:
-        if stale.vlan.vid in seen_vids:
+        if stale.pk in seen_state_pks:
             continue
         new_status = sm.on_reconcile(stale.status, present=False)
         if new_status == stale.status:
