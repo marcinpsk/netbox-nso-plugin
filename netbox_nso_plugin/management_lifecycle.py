@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import time
+
 from .renderer_writer import (
     RendererMutationPlan,
     planned_delete,
@@ -109,7 +111,7 @@ def _control_footprint(device_id):
     )
 
 
-def _update_management_control(device_id: int, *, compare_adapter: bool) -> bool:
+def _update_management_control(device_id: int, *, compare_adapter: bool, deadline: float | None = None) -> bool:
     """Write adapter control fields while their owners stay locked."""
     from . import adapter_client
     from .intent_state import mirror_transaction
@@ -151,15 +153,28 @@ def _update_management_control(device_id: int, *, compare_adapter: bool) -> bool
             primary_ip=primary_ip,
             oob_ip=oob_ip,
         )
-        if compare_adapter and adapter_client.get_control_state(management.adapter_device_id) == desired:
-            return False
-        adapter_client.set_control_state(management.adapter_device_id, desired)
-        return True
+
+        def update_control(_body):
+            if compare_adapter and adapter_client.get_control_state(management.adapter_device_id) == desired:
+                return False
+            adapter_client.set_control_state(management.adapter_device_id, desired)
+            return True
+
+        if deadline is None:
+            return update_control(None)
+
+        from .delivery import SendDeadlineExceeded, _under_deadline
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SendDeadlineExceeded("management reconciliation exhausted the audit budget")
+        # One abortable session bounds both reads and the write while this thread owns the locks.
+        return _under_deadline(update_control, remaining)(None)
 
 
-def reconcile_management_control(device_id: int) -> bool:
+def reconcile_management_control(device_id: int, *, deadline: float | None = None) -> bool:
     """Update divergent adapter control fields while their owners stay locked."""
-    return _update_management_control(device_id, compare_adapter=True)
+    return _update_management_control(device_id, compare_adapter=True, deadline=deadline)
 
 
 def push_management_control(device_id: int) -> bool:

@@ -555,6 +555,7 @@ def _manifest_record_actions(device_id, requested):
 
     planned = []
     seen = set()
+    rules = converted_scope_rules().values()
     manifest_states = {
         (scope, native_model_label, json.dumps(native_key, sort_keys=True)): ownership_state
         for scope, native_model_label, native_key, ownership_state in NSOOwnershipManifest.objects.filter(
@@ -570,11 +571,19 @@ def _manifest_record_actions(device_id, requested):
         if "status" not in fields:
             continue
         if "management" in fields:
-            rows = model.objects.filter(management__device_id=device_id)
+            rows = model.objects.filter(management__device_id=device_id).select_related("management")
         elif "interface" in fields:
             rows = model.objects.filter(interface__device_id=device_id)
         else:
             continue
+        native_relations = {
+            field_name
+            for rule in rules
+            for label, field_name in rule.overlay_native_fields
+            if label == spec.model_label and field_name in fields and model._meta.get_field(field_name).is_relation
+        }
+        if native_relations:
+            rows = rows.select_related(*sorted(native_relations))
         for instance in rows.order_by("pk"):
             identity = (instance._meta.label_lower, instance.pk)
             if identity in seen:

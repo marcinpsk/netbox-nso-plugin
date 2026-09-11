@@ -340,3 +340,69 @@ class TestTheExpiredDeadlineAbortsTheRequest(_DripCase):
             raise AssertionError("the deadline let a late answer through")
 
         assert answered.wait(10), "the late worker ran to completion, as this pin needs"
+
+
+class _ControlDrip(_Drip):
+    def do_GET(self):  # noqa: N802
+        self.server.request_count += 1
+        if self.server.request_count == self.server.drip_request:
+            try:
+                return super().do_PUT()
+            finally:
+                self.close_connection = True
+        body = b'{"failover":null,"attributes":["description"],"auto_apply":false,"sync_before_apply":true}'
+        time.sleep(0.5)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        return None
+
+    do_PUT = do_GET
+
+
+class TestManagementControlDeadline(_DripCase):
+    tag = "control-deadline"
+    adapter_device_id = 7812
+
+    def _assert_control_request_is_bounded(self, request_number):
+        from dcim.models import Device
+
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        from .test_management_control_audit import _probe_lock
+
+        self.server.RequestHandlerClass = _ControlDrip
+        self.server.request_count = 0
+        self.server.drip_request = request_number
+        watchdog = threading.Timer(4, self.server.stop.set)
+        watchdog.start()
+        running = _senders()
+        try:
+            with self.pointed_at_the_drip():
+                started = time.monotonic()
+                result = audit_renderer_scopes(self.device.pk, ("vlan",), trigger="cadence", deadline=started + 1.5)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 2.1)
+            self.assertEqual(result.deferred, ("vlan",))
+            self.assertEqual(self.server.request_count, request_number)
+            self.assertTrue(self.server.streaming.is_set())
+            self.assertTrue(_senders_ended(running, 2))
+            self.assertTrue(self.far_side_lost_the_socket(2))
+            self.assertIsNone(_probe_lock(Device.objects.filter(pk=self.device.pk)))
+            self.assertIsNone(_probe_lock(NSODeviceManagement.objects.filter(pk=self.mgmt.pk)))
+        finally:
+            watchdog.cancel()
+            self.server.stop.set()
+
+    def test_control_device_read_obeys_the_audit_deadline(self):
+        self._assert_control_request_is_bounded(1)
+
+    def test_control_scope_read_obeys_the_shared_audit_deadline(self):
+        self._assert_control_request_is_bounded(2)
+
+    def test_control_scope_write_obeys_the_shared_audit_deadline(self):
+        self._assert_control_request_is_bounded(3)
