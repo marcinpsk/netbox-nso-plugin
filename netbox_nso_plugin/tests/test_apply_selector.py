@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import unittest
 from uuid import UUID, uuid4
 
 from dcim.models import Interface
@@ -3141,74 +3140,69 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
-    @unittest.skip(
-        "#1689: native saves no longer create owned overlays at this level and native deletes no longer remove them; this pin encodes the lower level's behaviour"
-    )
-    def test_promotion_is_refused_after_an_untracked_parent_delete_removed_owned_intent(self):
-        """The prepared revision is stale: the delete cascaded away an owned flex-algo overlay.
-
-        The ISISInstance itself is untracked, so only its cascade removes rendered content.
-        """
-        from netbox_routing.models import ISISFlexAlgo, ISISInstance
-
+    def test_promotion_is_refused_after_a_planned_delete_removes_owned_intent(self):
         from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
-        with without_commit_drain(), transaction.atomic():
-            instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
-            flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
-        self.assertTrue(NSOISISFlexAlgoState.objects.filter(management=self.mgmt, isis_flex_algo=flex_algo).exists())
+        state_pk = self.vlan_state.pk
+        self.assertEqual(self.vlan_state.status, "accepted")
         registry, pushed = self._promotion_snapshot()
+        plan = RendererMutationPlan.build(deletes=(planned_delete(self.vlan_state),))
 
-        with without_commit_drain(), transaction.atomic():
-            instance.delete()
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            writer.delete(self.vlan_state)
 
-        self.assertFalse(NSOISISFlexAlgoState.objects.filter(management=self.mgmt).exists())
+        self.assertFalse(NSOVLANState.objects.filter(pk=state_pk).exists())
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        self.assertGreater(revision.revision, pushed["vlan"].revision)
+        attempt_id = uuid4()
         with self.assertRaises(apply_state.IntentChangedDuringPreparation):
             apply_state.promote_current_intent(
                 self.mgmt,
                 registry,
                 pushed,
-                apply_attempt_id=uuid4(),
+                apply_attempt_id=attempt_id,
                 static_route_stored=False,
             )
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
 
-    @unittest.skip(
-        "#1689: native saves no longer create owned overlays at this level and native deletes no longer remove them; this pin encodes the lower level's behaviour"
-    )
-    def test_promotion_is_refused_after_a_covered_permit_created_owned_ospf_intent(self):
-        """The move creates this device's first owned OSPF overlay under a joined permit.
-
-        Neither native fragment changes, so acquisition bumps nothing; the accept handler
-        then adds owned intent the prepared snapshot never carried.
-        """
-        from netbox_routing.models import OSPFInstance
+    def test_promotion_is_refused_after_a_planned_save_creates_owned_intent(self):
+        from ipam.models import VLAN
 
         from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.models import NSOOSPFInstanceState
-
-        from ._outbox_case import make_device, make_mgmt
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision, NSOVLANState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         with without_commit_drain(), transaction.atomic():
-            other = make_device("ospfmove", 2)
-            instance = OSPFInstance.objects.create(device=other, process_id=7, router_id="192.0.2.7")
-            make_mgmt(other, "ospfmove", 1559)
-        self.assertFalse(NSOOSPFInstanceState.objects.filter(management__device=other).exists())
+            vlan = VLAN.objects.create(vid=1559, name="promotion-new-owned-vlan")
+        self.assertFalse(NSOVLANState.objects.filter(management=self.mgmt, vlan=vlan).exists())
         registry, pushed = self._promotion_snapshot()
+        state = NSOVLANState(management=self.mgmt, vlan=vlan, status="accepted")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),)
+        )
 
-        with without_commit_drain(), transaction.atomic():
-            instance.device = self.device
-            instance.save(update_fields=["device"])
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            writer.save(state, force_insert=True)
 
-        self.assertTrue(NSOOSPFInstanceState.objects.filter(management=self.mgmt, status="accepted").exists())
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        self.assertGreater(revision.revision, pushed["vlan"].revision)
+        attempt_id = uuid4()
         with self.assertRaises(apply_state.IntentChangedDuringPreparation):
             apply_state.promote_current_intent(
                 self.mgmt,
                 registry,
                 pushed,
-                apply_attempt_id=uuid4(),
+                apply_attempt_id=attempt_id,
                 static_route_stored=False,
             )
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertIsNone(state.apply_attempt_id)
 
     def test_promotion_stamps_the_apply_start_time(self):
         from django.utils import timezone
