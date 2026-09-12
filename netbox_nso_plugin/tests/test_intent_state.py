@@ -533,6 +533,28 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         calls = stats.stats.get((code.co_filename, code.co_firstlineno, code.co_name), (0, 0))[1]
         self.assertLessEqual(calls, len(footprint.source_rows) + len(footprint.overlay_rows) + 1)
 
+    def test_planned_save_reads_the_stored_overlay_once(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        candidate = type(self.state).objects.get(pk=self.state.pk)
+        candidate.status = "imported"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            with CaptureQueriesContext(connection) as queries:
+                writer.save(candidate, update_fields=("status",))
+
+        table = self.state._meta.db_table
+        stored_reads = [
+            query["sql"]
+            for query in queries
+            if query["sql"].lstrip().upper().startswith("SELECT") and f'FROM "{table}"' in query["sql"]
+        ]
+        # The writer validates its frozen preimage once. The permit then reads once for both fragments.
+        self.assertEqual(len(stored_reads), 2, stored_reads)
+
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():
             locked = NSOVLANState.objects.select_for_update(of=("self",)).get(pk=self.state.pk)

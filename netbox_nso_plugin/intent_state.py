@@ -1407,13 +1407,6 @@ def _native_vlan_fragment(instance):
     return (("name", instance.name), ("vid", instance.vid))
 
 
-def _database_fragment(instance, spec):
-    if instance.pk is None or instance._state.adding:
-        return ABSENT
-    current = type(instance).objects.filter(pk=instance.pk).first()
-    return ABSENT if current is None else canonical_fragment(current, spec)
-
-
 def _effective_after(instance, before, update_fields):
     """Apply the fields saved by this write to the stored instance shape."""
     if before is None or update_fields is None:
@@ -1430,12 +1423,16 @@ def _effective_after(instance, before, update_fields):
     return effective
 
 
-def _effective_after_fragment(instance, spec, update_fields):
-    """Serialize only values this save will persist, not unrelated stale attributes."""
+def _mutation_fragments(instance, spec, *, deleting, update_fields):
+    """Return the stored and persisted fragments for one write."""
+    if deleting:
+        return canonical_fragment(instance, spec), ABSENT
     current = (
         None if instance.pk is None or instance._state.adding else type(instance).objects.filter(pk=instance.pk).first()
     )
-    return canonical_fragment(_effective_after(instance, current, update_fields), spec)
+    before = ABSENT if current is None else canonical_fragment(current, spec)
+    after = canonical_fragment(_effective_after(instance, current, update_fields), spec)
+    return before, after
 
 
 def _management_keys(device_ids, scopes):
@@ -2700,8 +2697,12 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
             raise IntentMutationProtocolError(
                 f"{sender._meta.label_lower} row {instance.pk!r} is outside the active mirror footprint"
             )
-        before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-        after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
+        before, after = _mutation_fragments(
+            instance,
+            spec,
+            deleting=deleting,
+            update_fields=update_fields,
+        )
         if before != after:
             if active.detect_reconcile_content and sender._meta.label_lower in OVERLAY_MODEL_RANKS:
                 requested = MutationFootprint.for_keys(
@@ -2714,8 +2715,12 @@ def _authorize_active_write(active, sender, instance, spec, *, deleting, update_
                     f"read-side {sender._meta.label_lower} write changes rendered content"
                 )
     elif writer is None and not _footprint_covers_row(instance, active):
-        before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-        after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
+        before, after = _mutation_fragments(
+            instance,
+            spec,
+            deleting=deleting,
+            update_fields=update_fields,
+        )
         if before != after:
             raise IntentMutationProtocolError(
                 f"{sender._meta.label_lower} row {instance.pk!r} is outside the active mutation footprint"
@@ -2731,8 +2736,12 @@ def _bump_covered_owned_write(permit: _Permit, instance, spec, *, deleting, upda
     """Advance the scopes an owned overlay write changes under a permit that has not bumped them."""
     if permit.dml_kind != "content" or instance._meta.label_lower not in OVERLAY_MODEL_RANKS:
         return
-    before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-    after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
+    before, after = _mutation_fragments(
+        instance,
+        spec,
+        deleting=deleting,
+        update_fields=update_fields,
+    )
     if before == after:
         return
     from .outbox import bump_intent_revision
@@ -2782,8 +2791,12 @@ def _begin_implicit(
     deferred = {}
     if not deleting and not _is_intent_push_suppressed():
         deferred = _normalize_overlay_lifecycle(instance, spec, update_fields)
-    before = canonical_fragment(instance, spec) if deleting else _database_fragment(instance, spec)
-    after = ABSENT if deleting else _effective_after_fragment(instance, spec, update_fields)
+    before, after = _mutation_fragments(
+        instance,
+        spec,
+        deleting=deleting,
+        update_fields=update_fields,
+    )
     if _is_intent_push_suppressed():
         permit = _suppressed_permit(
             instance,
