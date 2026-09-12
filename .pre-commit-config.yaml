@@ -49,6 +49,19 @@ repos:
         files: ^\.github/workflows/
         pass_filenames: true
 
+      - id: review-patterns
+        name: custom review patterns (OpenGrep)
+        entry: scripts/check-review-patterns scan
+        language: system
+        pass_filenames: false
+        files: ^(netbox_nso_plugin/.*\.py|\.opengrep/|scripts/check-review-patterns$)
+      - id: review-pattern-tests
+        name: custom review pattern fixtures (OpenGrep)
+        entry: scripts/check-review-patterns test
+        language: system
+        pass_filenames: false
+        files: ^(\.opengrep/|scripts/check-review-patterns$)
+
       # REUSE/SPDX compliance
       - id: reuse-lint
         name: REUSE Compliance (SPDX headers)
