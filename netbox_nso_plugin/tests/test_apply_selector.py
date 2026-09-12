@@ -2075,6 +2075,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
     def test_an_interface_rename_repends_every_deploying_scope_that_renders_its_name(self):
         from django.contrib.contenttypes.models import ContentType
+        from django.db.models.signals import pre_save
+        from django.db.utils import OperationalError
         from ipam.models import ASN, RIR, IPAddress
         from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 
@@ -2092,6 +2094,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             NSOSwitchportState,
         )
         from netbox_nso_plugin.views import _prepare_apply
+
+        from .test_management_control_audit import _probe_lock
 
         with without_commit_drain(), transaction.atomic():
             shared = self._create_interface(device=self.device, name="Ethernet9.40", type="1000base-t")
@@ -2201,9 +2205,19 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             [type(state).objects.get(pk=state.pk).status for state in states],
             ["deploying"] * 4 + ["accepted"] * 7,
         )
+        indirect_locks = []
+
+        def observe_indirect_lock(sender, instance, update_fields=None, **kwargs):
+            if instance.pk == shared.pk and update_fields is not None and "name" in update_fields:
+                indirect_locks.append(_probe_lock(NSOBGPPeerState.objects.filter(pk=bgp_state.pk)))
+
+        pre_save.connect(observe_indirect_lock, sender=Interface, weak=False)
+        self.addCleanup(pre_save.disconnect, observe_indirect_lock, sender=Interface)
         with without_commit_drain(), transaction.atomic():
             self._rename_interface(shared, "Ethernet9.41")
 
+        self.assertEqual(len(indirect_locks), 1)
+        self.assertIsInstance(indirect_locks[0], OperationalError)
         self.assertEqual(
             [type(state).objects.get(pk=state.pk).status for state in states],
             ["accepted"] * 11,

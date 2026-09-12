@@ -19,6 +19,7 @@ from ._outbox_case import (
     own_route,
     own_vlan,
     reset_renderer_audit_rotation,
+    without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -45,7 +46,7 @@ def own_redistribution(management, dest_protocol, source_protocol):
             ),
         )
     )
-    with renderer_writes(plan) as writer:
+    with without_commit_drain(), renderer_writes(plan) as writer:
         writer.save(state, force_insert=True)
     return state
 
@@ -405,6 +406,22 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         state.refresh_from_db()
         self.assertEqual(repaired, ("static_route",))
         self.assertEqual((state.status, state.apply_attempt_id), ("accepted", None))
+
+    def test_redistribution_fixture_leaves_delivery_unclaimed(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentOutboxState
+
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            own_redistribution(self.management, "bgp", "connected")
+
+        self.assertTrue(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device, scope="bgp", consumed_by_push_seq__isnull=True
+            ).exists()
+        )
+        self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, scope="bgp").exists())
+        self.assertEqual(adapter.requests, [])
 
     def test_a_repair_demotes_only_the_redistribution_rows_of_the_repaired_scope(self):
         """One spec covers bgp/isis/ospf; the row's ``dest_protocol`` is its scope."""

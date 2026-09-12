@@ -626,6 +626,15 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         if stale.interface_id in seen:
             continue
         if not sm.is_owned(stale.status) and _switchport_is_pristine(stale.interface):
+            native_reads.append(
+                (
+                    stale.interface.pk,
+                    stale.interface.device_id,
+                    stale.interface.name,
+                    merge_util.content_hash(_switchport_object_content(stale.interface)),
+                    None,
+                )
+            )
             deletes.append(planned_delete(stale))
             delete_operations.append(("delete", stale, None, False, None, ()))
             continue
