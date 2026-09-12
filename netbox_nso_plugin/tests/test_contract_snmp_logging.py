@@ -106,12 +106,12 @@ class TestSnmpLoggingContractConsumer(TestCase):
 
         self.assertIsInstance(plan, RendererMutationPlan)
         self.assertEqual(
-            [(write.operation, write.model_label) for write in plan.write_set],
+            [(write.operation, write.model_label, write.force_insert) for write in plan.write_set],
             [
-                ("save", "netbox_nso_plugin.nsosnmpcommunitystate"),
-                ("save", "netbox_nso_plugin.nsosnmpv3userstate"),
-                ("save", "netbox_nso_plugin.nsosnmphoststate"),
-                ("save", "netbox_nso_plugin.nsosnmpsysteminfostate"),
+                ("save", "netbox_nso_plugin.nsosnmpcommunitystate", True),
+                ("save", "netbox_nso_plugin.nsosnmpv3userstate", True),
+                ("save", "netbox_nso_plugin.nsosnmphoststate", True),
+                ("save", "netbox_nso_plugin.nsosnmpsysteminfostate", True),
             ],
         )
 

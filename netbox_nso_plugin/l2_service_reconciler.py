@@ -38,15 +38,11 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
     """Build the deterministic L2-service write sequence for preflight and apply."""
     from dcim.models import Interface
     from django.contrib.contenttypes.models import ContentType
+    from vpn.models import L2VPN, L2VPNTermination
 
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOL2SapState
     from .renderer_writer import planned_save
-
-    try:
-        from vpn.models import L2VPN, L2VPNTermination
-    except ImportError:
-        return [], [], []
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
@@ -212,11 +208,6 @@ def reconcile_l2_services(device, payload: dict) -> list:
     """Apply one frozen L2-service reconciliation through the renderer writer."""
     from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
-
-    try:
-        from vpn.models import L2VPN  # noqa: F401
-    except ImportError:
-        return []
 
     active = active_renderer_writer()
     plan = active.plan if active is not None else l2_service_reconcile_plan(device, payload)

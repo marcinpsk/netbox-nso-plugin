@@ -838,7 +838,9 @@ def reconcile_isis(device, payload):
     """Apply one preflighted IS-IS graph reconciliation."""
     try:
         from netbox_routing.models import ISISInstance  # noqa: F401
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         logger.warning("netbox_routing not installed; skipping IS-IS reconcile")
         return {"processes": [], "interfaces": []}
 

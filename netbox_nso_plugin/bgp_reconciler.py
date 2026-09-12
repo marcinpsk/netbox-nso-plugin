@@ -1264,7 +1264,9 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
     """
     try:
         from netbox_routing.models import BGPRouter  # noqa: F401
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         logger.warning("netbox_routing not installed; skipping BGP reconcile")
         return []
 

@@ -422,7 +422,9 @@ def reconcile_ospf(device, payload):
     """Apply one frozen OSPF reconciliation through the renderer writer."""
     try:
         from netbox_routing.models import OSPFInstance  # noqa: F401
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         logger.warning("netbox_routing not installed; skipping OSPF reconcile")
         return {"instances": [], "interfaces": []}
 

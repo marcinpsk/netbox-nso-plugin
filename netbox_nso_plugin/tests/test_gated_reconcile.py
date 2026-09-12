@@ -846,6 +846,64 @@ class TestOptionalRoutingDependencyPlans(TestCase):
 
         self.assertEqual(result, [])
 
+    def test_routing_entry_points_propagate_missing_models(self):
+        from netbox_routing import models
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        device, _management = _make("routing-missing-model")
+        for reconcile, symbol in (
+            (reconcile_bfd, "BFDInterface"),
+            (_reconcile_bgp_config, "BGPRouter"),
+            (reconcile_isis, "ISISInstance"),
+            (reconcile_ospf, "OSPFInstance"),
+            (reconcile_redistribution, "Redistribution"),
+        ):
+            with self.subTest(reconcile=reconcile.__name__), patch.dict(vars(models)):
+                delattr(models, symbol)
+                with self.assertRaisesRegex(ImportError, symbol):
+                    reconcile(device, {})
+
+    def test_redistribution_plan_propagates_missing_destination_models(self):
+        from netbox_routing import models
+
+        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+
+        device, _management = _make("redistribution-missing-destination")
+        payload = {"entries": [{"dest_protocol": "ospf", "dest_ref": "1", "source_protocol": "connected"}]}
+        with patch.dict(vars(models)):
+            del models.BGPRouter
+            with self.assertRaisesRegex(ImportError, "BGPRouter"):
+                redistribution_reconcile_plan(device, payload)
+
+    def test_interface_ip_plan_propagates_a_missing_vrf_model(self):
+        from ipam import models
+
+        from netbox_nso_plugin.template_content import interface_ip_reconcile_plan
+
+        device, _management = _make("interface-ip-missing-vrf")
+        with patch.dict(vars(models)):
+            del models.VRF
+            with self.assertRaisesRegex(ImportError, "VRF"):
+                interface_ip_reconcile_plan(device, {"interfaces": []})
+
+    def test_l2_reconciliation_propagates_missing_native_models(self):
+        from vpn import models
+
+        from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan, reconcile_l2_services
+
+        device, _management = _make("l2-missing-model")
+        for reconcile in (l2_service_reconcile_plan, reconcile_l2_services):
+            for symbol in ("L2VPN", "L2VPNTermination"):
+                with self.subTest(reconcile=reconcile.__name__, symbol=symbol), patch.dict(vars(models)):
+                    delattr(models, symbol)
+                    with self.assertRaisesRegex(ImportError, symbol):
+                        reconcile(device, {})
+
     def test_bgp_plan_propagates_unrelated_import_failures(self):
         from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
 
@@ -892,10 +950,11 @@ class TestOptionalRoutingDependencyPlans(TestCase):
     def test_routing_plans_propagate_unrelated_missing_modules(self):
         import builtins
 
-        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
-        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan
-        from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
-        from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+        from netbox_nso_plugin.isis_reconciler import isis_reconcile_plan, reconcile_isis
+        from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
         from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
         from netbox_nso_plugin.template_content import static_route_reconcile_plan
 
@@ -908,12 +967,18 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             return original_import(name, *args, **kwargs)
 
         for planner in (
+            reconcile_bfd,
+            bgp_reconcile_plan,
+            _reconcile_bgp_config,
             isis_reconcile_plan,
             bfd_reconcile_plan,
             route_policy_reconcile_plan,
             static_route_reconcile_plan,
             ospf_reconcile_plan,
             redistribution_reconcile_plan,
+            reconcile_isis,
+            reconcile_ospf,
+            reconcile_redistribution,
         ):
             with (
                 self.subTest(planner=planner.__name__),

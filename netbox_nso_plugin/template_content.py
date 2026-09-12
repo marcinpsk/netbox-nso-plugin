@@ -324,7 +324,7 @@ def _build_payload_index(payload: dict) -> tuple[set, dict, dict]:
 
 def _interface_ip_vrf(VRF, name):
     """Return the named VRF, or the global table when it is absent or unknown."""
-    if not name or VRF is None:
+    if not name:
         return None
     return VRF.objects.filter(name=name).first()
 
@@ -344,12 +344,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
     from dcim.models import Interface
     from django.contrib.contenttypes.models import ContentType
     from django.core.exceptions import ValidationError
-    from ipam.models import IPAddress
-
-    try:
-        from ipam.models import VRF
-    except ImportError:
-        VRF = None
+    from ipam.models import VRF, IPAddress
 
     from .models import NSOInterfaceIPState
     from .renderer_writer import planned_delete, planned_save

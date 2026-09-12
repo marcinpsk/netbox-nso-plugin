@@ -56,10 +56,7 @@ def redistribution_reconcile_footprint(device, payload=None):
 
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     """Resolve the native destination object for one redistribution entry."""
-    try:
-        from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, ISISInstance, OSPFInstance
-    except ImportError:
-        return None
+    from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, ISISInstance, OSPFInstance
 
     if dest_protocol == "ospf":
         try:
@@ -347,7 +344,9 @@ def reconcile_redistribution(device, payload: dict) -> list:
     """Apply one frozen redistribution reconciliation through the renderer writer."""
     try:
         from netbox_routing.models import Redistribution  # noqa: F401
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         logger.warning("netbox_routing not installed; skipping redistribution reconcile")
         return []
 

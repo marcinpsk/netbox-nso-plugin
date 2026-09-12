@@ -223,7 +223,9 @@ def reconcile_bfd(device, interfaces: list) -> list:
     """Apply one frozen BFD reconciliation through the renderer writer."""
     try:
         from netbox_routing.models import BFDInterface  # noqa: F401
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
         logger.warning("netbox_routing not installed; skipping BFD reconcile")
         return []
 
