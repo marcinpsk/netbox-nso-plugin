@@ -205,6 +205,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
         matches = None
         conflict = False
 
+        state.redistribution = None
         destination = _resolve_redist_destination(device, destination_protocol, destination_ref)
         if destination is not None:
             dependencies[(destination._meta.label_lower, destination.pk)] = destination

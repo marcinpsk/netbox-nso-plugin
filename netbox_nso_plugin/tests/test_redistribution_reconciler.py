@@ -104,6 +104,37 @@ class TestReconcileRedistribution(TestCase):
         self.assertIsNone(state.redistribution_id)
         self.assertFalse(Redistribution.objects.exists())
 
+    def test_missing_named_vrf_clears_a_previous_redistribution_link(self):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, VRF
+        from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, Redistribution
+
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        rir = RIR.objects.create(name="Transition private ASNs", slug="transition-private-asns")
+        asn = ASN.objects.create(asn=64512, rir=rir)
+        vrf = VRF.objects.create(name="CUST-A")
+        router = BGPRouter.objects.create(
+            name="64512",
+            assigned_object_type=ContentType.objects.get_for_model(type(self.device)),
+            assigned_object_id=self.device.pk,
+            asn=asn,
+        )
+        scope = BGPScope.objects.create(router=router, vrf=vrf)
+        BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+        entry = self._entry(dest_protocol="bgp", dest_ref="64512/CUST-A/ipv4-unicast")
+
+        initial = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+        self.assertIsNotNone(initial.redistribution_id)
+
+        vrf.name = "CUST-B"
+        vrf.save(update_fields=("name",))
+        reconciled = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+
+        self.assertIsNone(reconciled.redistribution_id)
+        self.assertEqual(Redistribution.objects.count(), 1)
+
     def test_owned_state_recreates_a_missing_native_redistribution(self):
         from django.db import transaction
         from django.utils import timezone
