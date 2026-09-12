@@ -979,11 +979,17 @@ class RendererWriter:
         )
 
     def _creation_matches(self, write, instance):
-        from django.db.models import Field
+        from django.db.models import DateField, Field, TimeField
 
         fields = {field.attname: field for field in instance._meta.concrete_fields}
         expected = tuple(
-            (attname, value) for attname, value in write.values if type(fields[attname]).pre_save is Field.pre_save
+            (attname, value)
+            for attname, value in write.values
+            if type(fields[attname]).pre_save is Field.pre_save
+            or (
+                isinstance(fields[attname], (DateField, TimeField))
+                and not (fields[attname].auto_now or fields[attname].auto_now_add)
+            )
         )
         return self._fields_match(expected, instance)
 

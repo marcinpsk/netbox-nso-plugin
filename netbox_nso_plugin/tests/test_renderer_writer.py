@@ -155,6 +155,37 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="vlan").exists())
 
+    def test_raced_overlay_creation_rejects_different_explicit_timestamps(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-raced-timestamps", 16276)
+        planned_at = timezone.now()
+        for index, field_name in enumerate(("last_sync_at", "accepted_at")):
+            with self.subTest(field=field_name):
+                vlan = VLAN.objects.create(vid=1627 + index, name=f"Writer timestamp {index}")
+                values = {"management": management, "vlan": vlan, "status": "imported"}
+                planned = NSOVLANState(**values, **{field_name: planned_at})
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),)
+                )
+                winner = NSOVLANState.objects.create(**values)
+                mirror_update(winner, **{field_name: planned_at + timedelta(seconds=1)})
+
+                with self.assertRaises(IntentPlanStaleError), renderer_mirror_writes(plan) as writer:
+                    writer.save(planned, force_insert=True)
+
+                winner.refresh_from_db()
+                self.assertEqual(getattr(winner, field_name), planned_at + timedelta(seconds=1))
+
     def test_forward_creation_reference_is_rejected_during_planning(self):
         from ipam.models import VLANGroup
 
