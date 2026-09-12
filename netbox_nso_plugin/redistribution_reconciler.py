@@ -92,6 +92,8 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     if router is None:
         return None
     vrf = VRF.objects.filter(name=vrf_name).first() if vrf_name else None
+    if vrf_name and vrf is None:
+        return None
     scope = BGPScope.objects.filter(router=router, vrf=vrf).first()
     if scope is None:
         return None
