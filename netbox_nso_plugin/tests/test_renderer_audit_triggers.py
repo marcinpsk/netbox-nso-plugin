@@ -62,14 +62,19 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
         self.assertEqual(audits[0][1]["deadline"], 12.5 + drain.SEND_DEADLINE.total_seconds())
 
     def test_drain_includes_the_audit_in_the_caller_deadline(self):
+        import time
+
         from netbox_nso_plugin import delivery, drain
+
+        real_clock = time.monotonic
+        started_at = real_clock()
 
         with (
             patch("netbox_nso_plugin.drain._send_clock", return_value=12.5),
-            patch("netbox_nso_plugin.drain.time.monotonic", return_value=20.0),
             patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes") as audit,
             patch("netbox_nso_plugin.drain._claim_or_compact", return_value=(None, False)),
         ):
+            self.assertIs(time.monotonic, real_clock)
             outcome, answer = drain._drain_once(
                 self.device.pk,
                 "vlan",
@@ -79,7 +84,8 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
             )
 
         self.assertEqual((outcome, answer), (drain.NOTHING, None))
-        self.assertEqual(audit.call_args.kwargs["deadline"], 27.0)
+        self.assertGreaterEqual(audit.call_args.kwargs["deadline"], started_at + 7.0)
+        self.assertLessEqual(audit.call_args.kwargs["deadline"], real_clock() + 7.0)
 
     def test_delivery_translates_audit_refusals_to_adapter_errors(self):
         from netbox_nso_plugin import delivery

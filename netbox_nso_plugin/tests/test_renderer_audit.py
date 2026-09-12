@@ -111,6 +111,56 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
             [{"kind": "repair", "mark_and": False, "mark_any": False, "transitions": []}],
         )
 
+    def test_raw_sql_drift_repairs_the_fingerprint_revision_and_lifecycle_once(self):
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
+        state = own_vlan(self.management, 1642, "renderer-audit-raw-sql")
+        mirror_update(state, status="in_sync", apply_attempt_id=uuid4())
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        baseline = (revision.revision, revision.verified_revision, revision.verified_fingerprint)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertIsNotNone(revision.verified_fingerprint)
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+
+        table = connection.ops.quote_name(VLAN._meta.db_table)
+        with connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {table} SET name = %s WHERE id = %s", ["raw-sql-renamed", state.vlan_id])
+            self.assertEqual(cursor.rowcount, 1)
+
+        revision.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual((revision.revision, revision.verified_revision, revision.verified_fingerprint), baseline)
+        self.assertEqual(state.status, "in_sync")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
+        payload = delivery.render("vlan", self.device.pk, self.management.adapter_device_id).payload
+        self.assertEqual([item["name"] for item in payload], ["raw-sql-renamed"])
+        self.assertNotEqual(delivery.canonical_fingerprint(payload), baseline[2])
+
+        result = audit_renderer_scopes(self.device.pk, ("vlan",), trigger="test", pre_capture=True)
+
+        revision.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual((result.repaired, result.deferred, result.unknown), (("vlan",), (), ()))
+        self.assertEqual(revision.revision, baseline[0] + 1)
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(revision.verified_fingerprint, delivery.canonical_fingerprint(payload))
+        self.assertEqual((state.status, state.apply_attempt_id), ("accepted", None))
+        self.assertEqual(
+            list(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").values_list("kind", flat=True)),
+            ["repair"],
+        )
+
+        repeated = audit_renderer_scopes(self.device.pk, ("vlan",), trigger="test", pre_capture=True)
+
+        revision.refresh_from_db()
+        self.assertEqual(repeated.repaired, ())
+        self.assertEqual(revision.revision, baseline[0] + 1)
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").count(), 1)
+
     def test_an_unlinked_management_row_is_not_audited(self):
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes

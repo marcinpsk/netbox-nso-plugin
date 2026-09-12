@@ -41,11 +41,22 @@ class _VlanGreenfieldBase(IntentPushDeliveryMixin, TestCase):
     def _shared_vlan(self, vid=3366, name="testnso"):
         from ipam.models import VLAN, VLANGroup
 
-        group, _ = VLANGroup.objects.get_or_create(name="shared", slug="shared")
+        group, _ = VLANGroup.objects.get_or_create(slug="shared", defaults={"name": "shared"})
         return VLAN.objects.create(group=group, vid=vid, name=name)
 
 
 class TestVlanAttachView(_VlanGreenfieldBase):
+    def test_shared_vlan_reuses_a_group_with_a_different_display_name(self):
+        from ipam.models import VLANGroup
+
+        group = VLANGroup.objects.create(slug="shared", name="operator display name")
+
+        vlan = self._shared_vlan()
+
+        self.assertEqual(vlan.group_id, group.pk)
+        group.refresh_from_db()
+        self.assertEqual(group.name, "operator display name")
+
     def test_attach_creates_accepted_overlay_and_pushes(self):
         from netbox_nso_plugin.models import NSOVLANState
 
