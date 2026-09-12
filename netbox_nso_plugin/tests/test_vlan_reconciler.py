@@ -253,6 +253,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_vlan_reconcile_adopts_a_completed_creation_plan(self):
+        from unittest.mock import patch
+
+        from django.utils import timezone
+
         from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
         from netbox_nso_plugin.vlan_reconciler import (
             _reconcile_vlan_database,
@@ -260,8 +264,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         )
 
         payload = {"vlans": [{"vlan_id": 1645, "name": "RACE"}]}
-        waiting_plan = vlan_reconcile_plan(self.device, payload)
-        winner_plan = vlan_reconcile_plan(self.device, payload)
+        with patch("django.utils.timezone.now", return_value=timezone.now()):
+            waiting_plan = vlan_reconcile_plan(self.device, payload)
+            winner_plan = vlan_reconcile_plan(self.device, payload)
         with renderer_mirror_writes(winner_plan) as writer:
             _reconcile_vlan_database(self.device, payload, writer, winner_plan)
 
@@ -396,6 +401,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual([row.pk for row in rows], [state.pk])
 
     def test_switchport_reconcile_adopts_a_completed_creation_plan(self):
+        from unittest.mock import patch
+
+        from django.utils import timezone
+
         from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
         from netbox_nso_plugin.vlan_reconciler import (
             _reconcile_switchport,
@@ -412,8 +421,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 }
             ]
         }
-        waiting = prepare_switchport_reconcile(self.device, payload)
-        winner = prepare_switchport_reconcile(self.device, payload)
+        with patch("django.utils.timezone.now", return_value=timezone.now()):
+            waiting = prepare_switchport_reconcile(self.device, payload)
+            winner = prepare_switchport_reconcile(self.device, payload)
         with renderer_mirror_writes(winner.plan) as writer:
             _reconcile_switchport(self.device, payload, writer, winner.plan)
 
@@ -882,6 +892,49 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with self.assertRaises(IntentPlanStaleError), mutation:
             reconcile_switchport(self.device, payload, attempt)
+
+    def test_gated_switchport_replay_refuses_an_interface_rename(self):
+        payload, state = self._seed_owned_in_sync_switchport()
+
+        def rename(interface):
+            Interface.objects.filter(pk=interface.pk).update(name="Ethernet-renamed")
+
+        self._refuse_gated_replay_after(payload, rename)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
+    def test_gated_switchport_replay_refuses_an_interface_device_move(self):
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile, reconcile_switchport
+
+        from ._outbox_case import make_managed
+
+        payload, state = self._seed_owned_in_sync_switchport()
+        other_device, _management = make_managed("switchport-moved", 16279)
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        Interface.objects.filter(pk=self.interface.pk).update(device=other_device)
+
+        with self.assertRaises(RendererTargetsChanged), renderer_mirror_writes(attempt.plan):
+            reconcile_switchport(self.device, payload, attempt)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
+    def test_standalone_switchport_replan_refuses_an_interface_rename(self):
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile, reconcile_switchport
+
+        payload, state = self._seed_owned_in_sync_switchport()
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        Interface.objects.filter(pk=self.interface.pk).update(name="Ethernet-renamed")
+
+        with self.assertRaises(IntentPlanStaleError):
+            reconcile_switchport(self.device, payload, attempt)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
 
     def test_gated_switchport_replay_refuses_a_foreign_native_vlan_move(self):
         """An owned row must never keep in_sync when the native VLAN moved before the lock.

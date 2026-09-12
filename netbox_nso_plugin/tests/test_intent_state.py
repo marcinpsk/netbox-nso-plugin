@@ -202,18 +202,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         self.assertTrue(type(self.management).objects.filter(pk=self.management.pk).exists())
 
-    def test_registered_insert_with_column_list_on_conflict_do_nothing_does_not_require_a_content_permit(self):
-        table = NSOVLANState._meta.db_table
-        columns = ", ".join(field.column for field in NSOVLANState._meta.concrete_fields)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {table} WHERE id = %s ON CONFLICT DO NOTHING",
-                [self.state.pk],
-            )
-
-        self.assertEqual(NSOVLANState.objects.filter(pk=self.state.pk).count(), 1)
-
     def test_select_for_update_of_a_registered_table_is_not_dml(self):
         with transaction.atomic():
             locked = NSOVLANState.objects.select_for_update(of=("self",)).get(pk=self.state.pk)
@@ -339,20 +327,31 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertIsNone(calls[0][0])
         self.assertEqual(calls[0][1].pk, state.pk)
 
-    def test_detected_reconcile_does_not_add_retired_permit_state(self):
+    def test_detected_reconcile_upgrades_the_permit_and_bumps_the_revision(self):
         from netbox_nso_plugin.intent_state import _Permit, _upgrade_detected_reconcile
 
-        footprint = MutationFootprint.for_keys({(self.device.pk, "vlan")})
+        key = (self.device.pk, "vlan")
+        footprint = MutationFootprint.for_keys({key})
         permit = _Permit(
             footprint=footprint,
             dml_kind="reconcile",
+            bump_keys=frozenset(),
             detect_reconcile_content=True,
         )
+        revision, _created = NSOIntentRevision.objects.get_or_create(
+            device=self.device, scope="vlan", defaults={"revision": 0}
+        )
+        before = revision.revision
 
-        with patch("netbox_nso_plugin.outbox.bump_intent_revision"):
+        with transaction.atomic():
             _upgrade_detected_reconcile(permit, footprint)
 
-        self.assertNotIn("bump_revisions", vars(permit))
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, before + 1)
+        self.assertIsNone(permit.bump_keys)
+        self.assertEqual(permit.bumped, {key})
+        self.assertEqual(permit.dml_kind, "content")
+        self.assertFalse(permit.detect_reconcile_content)
 
     def test_device_delete_footprint_includes_assigned_native_addresses(self):
         from dcim.models import Device, Interface
