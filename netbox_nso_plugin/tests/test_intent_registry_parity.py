@@ -37,8 +37,13 @@ class TestOverlayRankRegistryParity(SimpleTestCase):
         self.assertEqual(sorted(unranked), [])
 
     def test_peer_template_compliance_is_registered_as_lifecycle_only(self):
+        from netbox_nso_plugin.intent_state import ABSENT, canonical_fragment
+
         spec = renderer_input_specs()["netbox_nso_plugin.nsobgppeertemplatestate"]
 
         self.assertEqual(spec.scopes, ("bgp",))
         self.assertEqual(spec.content_fields, frozenset())
         self.assertEqual(spec.required_trace_fixtures, ())
+        for status in ("imported", "accepted", "deploying", "in_sync"):
+            with self.subTest(status=status):
+                self.assertIs(canonical_fragment(spec.model(status=status)), ABSENT)

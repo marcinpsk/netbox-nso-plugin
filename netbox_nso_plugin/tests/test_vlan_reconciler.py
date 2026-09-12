@@ -1853,6 +1853,42 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.untagged_vlan.vid, 20)  # operator value NOT clobbered
 
+    def test_active_switchport_plan_refuses_stale_native_deletion(self):
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError, renderer_mirror_writes, renderer_writes
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile, reconcile_switchport
+
+        state = NSOSwitchportState.objects.create(
+            management=self.management, interface=self.interface, status="imported"
+        )
+        payload = {"interfaces": []}
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        self.assertTrue(any(write.operation == "delete" and write.pk == state.pk for write in attempt.plan.write_set))
+        Interface.objects.filter(pk=self.interface.pk).update(mode="tagged-all")
+
+        mutation = renderer_writes if attempt.plan.changes_content else renderer_mirror_writes
+        with self.assertRaisesRegex(IntentPlanStaleError, "changed after planning"), mutation(attempt.plan):
+            reconcile_switchport(self.device, payload, attempt)
+
+        self.assertTrue(NSOSwitchportState.objects.filter(pk=state.pk).exists())
+
+    def test_stale_switchport_replan_preserves_a_new_native_value(self):
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile, reconcile_switchport
+
+        state = NSOSwitchportState.objects.create(
+            management=self.management, interface=self.interface, status="imported"
+        )
+        payload = {"interfaces": []}
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        self.assertTrue(any(write.operation == "delete" and write.pk == state.pk for write in attempt.plan.write_set))
+
+        Interface.objects.filter(pk=self.interface.pk).update(mode="tagged-all")
+        reconcile_switchport(self.device, payload, attempt)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "changed")
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "tagged-all")
+
     def test_switchport_stale_vestigial_row_pruned(self):
         """A stale row whose interface carries no L2 config is vestigial → pruned, not drift.
 

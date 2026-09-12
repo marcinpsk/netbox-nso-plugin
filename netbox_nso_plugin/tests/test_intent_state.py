@@ -8,8 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+import sqlparse
 from django.db import connection, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from sqlparse.sql import Identifier, IdentifierList, Where
 
 from netbox_nso_plugin import delivery, outbox
 from netbox_nso_plugin.intent_state import (
@@ -32,6 +34,82 @@ from netbox_nso_plugin.signals import suppress_intent_push
 
 from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+def _qualified_table_aliases(token):
+    if isinstance(token, Identifier) and token.get_parent_name() is not None:
+        return {token.get_parent_name()}
+    if token.is_group:
+        return {alias for child in token.tokens for alias in _qualified_table_aliases(child)}
+    return set()
+
+
+def _unfiltered_renderer_tables(sql, tables):
+    """Follow device predicates through the joins in a captured Django query."""
+    relations = {}
+    constrained = set()
+    joins = []
+    relation_follows = False
+    in_join_constraint = False
+    for token in sqlparse.parse(sql)[0].tokens:
+        if token.is_whitespace:
+            continue
+        if isinstance(token, Where):
+            constrained.update(_qualified_table_aliases(token))
+            in_join_constraint = False
+        elif token.is_keyword and (token.normalized == "FROM" or token.normalized.endswith("JOIN")):
+            relation_follows = True
+            in_join_constraint = False
+        elif relation_follows:
+            identifiers = token.get_identifiers() if isinstance(token, IdentifierList) else (token,)
+            for identifier in identifiers:
+                if not isinstance(identifier, Identifier):
+                    raise AssertionError(f"Unexpected query relation: {identifier}")
+                relations[identifier.get_alias() or identifier.get_real_name()] = identifier.get_real_name()
+            relation_follows = False
+        elif token.is_keyword and token.normalized == "ON":
+            in_join_constraint = True
+        elif in_join_constraint:
+            aliases = _qualified_table_aliases(token)
+            if len(aliases) == 1:
+                constrained.update(aliases)
+            elif aliases:
+                joins.append(aliases)
+    previous = None
+    while constrained != previous:
+        previous = set(constrained)
+        for aliases in joins:
+            if aliases & constrained:
+                constrained.update(aliases)
+    return {table for alias, table in relations.items() if table in tables and alias not in constrained}
+
+
+class TestRendererQueryScopeCheck(SimpleTestCase):
+    def test_a_predicate_on_an_unrelated_join_does_not_bound_the_base_table(self):
+        sql = 'SELECT "overlay"."id" FROM "overlay" CROSS JOIN "management" WHERE "management"."device_id" = 1'
+
+        self.assertEqual(_unfiltered_renderer_tables(sql, {"overlay", "management"}), {"overlay"})
+
+    def test_a_joined_device_predicate_bounds_the_related_base_table(self):
+        sql = (
+            'SELECT "overlay"."id" FROM "overlay" INNER JOIN "management" '
+            'ON ("overlay"."management_id" = "management"."id") WHERE "management"."device_id" = 1'
+        )
+
+        self.assertEqual(_unfiltered_renderer_tables(sql, {"overlay", "management"}), set())
+
+    def test_a_table_alias_preserves_a_joined_device_constraint(self):
+        sql = (
+            'SELECT O."id" FROM "overlay" O INNER JOIN "management" M '
+            'ON (O."management_id" = M."id") WHERE M."device_id" = 1'
+        )
+
+        self.assertEqual(_unfiltered_renderer_tables(sql, {"overlay", "management"}), set())
+
+    def test_an_unfiltered_join_is_reported(self):
+        sql = 'SELECT "overlay"."id" FROM "overlay" CROSS JOIN "management" WHERE "overlay"."id" = 1'
+
+        self.assertEqual(_unfiltered_renderer_tables(sql, {"overlay", "management"}), {"management"})
 
 
 class TestDeleteCollectorContract(SimpleTestCase):
@@ -231,8 +309,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             {
                 table
                 for query in captured.captured_queries
-                for table in tables
-                if f'FROM "{table}"' in query["sql"] and " WHERE " not in query["sql"]
+                for table in _unfiltered_renderer_tables(query["sql"], tables)
             }
         )
         self.assertTrue(scanned)

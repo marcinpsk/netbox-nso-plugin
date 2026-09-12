@@ -415,6 +415,7 @@ def claim(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False) -> Claim 
         (scope,),
         trigger="drain.claim",
         pre_capture=True,
+        deadline=_send_clock() + SEND_DEADLINE.total_seconds(),
     )
     return _claim_after_audit(device_id, scope, mode=mode, force=force)
 
@@ -1465,8 +1466,8 @@ def _drain_once(
     from .renderer_audit import audit_renderer_scopes
 
     audit_deadline = None
-    if deadline is not None and _deadline_at is None:
-        _deadline_at = _send_clock() + deadline
+    if _deadline_at is None:
+        _deadline_at = _send_clock() + (SEND_DEADLINE.total_seconds() if deadline is None else deadline)
     if _audit and _deadline_at is not None:
         audit_started_at = time.monotonic()
         audit_deadline = audit_started_at + _remaining_send_deadline(_deadline_at)

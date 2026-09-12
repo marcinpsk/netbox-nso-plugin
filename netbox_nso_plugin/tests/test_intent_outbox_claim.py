@@ -14,6 +14,7 @@ has moved past, and O1.13 parks an unmanaged claim rather than abandoning it.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import patch
 
 import requests
@@ -58,6 +59,37 @@ class _ClaimCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         NSOIntentOutboxEntry.objects.all().delete()
+
+
+class TestPreCaptureDeadline(_ClaimCase):
+    def _assert_expired_audit_refuses_capture(self, capture):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+        from netbox_nso_plugin.renderer_audit import RendererAuditBudgetExceeded
+
+        own_vlan(self.mgmt, 810, "audit-budget")
+        audit_time = time.monotonic() + drain.SEND_DEADLINE.total_seconds() + 1
+        config, session = self.adapter.patches()
+        with (
+            config,
+            session,
+            patch("netbox_nso_plugin.renderer_audit._monotonic", return_value=audit_time),
+            self.assertRaises(RendererAuditBudgetExceeded),
+        ):
+            capture(self.device.pk, "vlan")
+
+        self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
+        self.assertEqual(self.adapter.requests, [])
+
+    def test_claim_bounds_its_audit_to_the_send_budget(self):
+        from netbox_nso_plugin import drain
+
+        self._assert_expired_audit_refuses_capture(drain.claim)
+
+    def test_drain_bounds_its_default_audit_to_the_send_budget(self):
+        from netbox_nso_plugin import drain
+
+        self._assert_expired_audit_refuses_capture(drain.drain_key)
 
 
 class TestClaimFoldsEveryEntryOnce(_ClaimCase):

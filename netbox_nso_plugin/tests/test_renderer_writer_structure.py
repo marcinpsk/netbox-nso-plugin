@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import re
+import tempfile
 from pathlib import Path
 
 from django.test import SimpleTestCase
@@ -44,10 +45,6 @@ _MUTATION_METHODS = frozenset(
 _COPY_HELPERS = frozenset({"copy", "deepcopy"})
 _FUNCTION_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _DML_TARGET = re.compile(r"\b(?:insert\s+into|update|delete\s+from)\s+\"?([a-z0-9_]+)\"?", re.IGNORECASE)
-#: A binding may name a later one (``rows = Model.objects…`` then ``row = rows[0]``), and the
-#: scan is flow-insensitive, so the scope is re-read until those chains have settled.
-_BINDING_PASSES = 3
-
 #: Every statically resolvable mutation of a registered renderer-input model, reviewed for
 #: #1627 P4. Keyed by (module, enclosing qualified name, mutation expression): a NEW write in
 #: an already-listed module is a new key and fails the guard until it is reviewed and added.
@@ -165,6 +162,8 @@ def _collect(names, node, registry):
     elif isinstance(node, ast.Assign):
         for target in node.targets:
             _bind(names, target, node.value)
+    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+        _bind(names, node.target, node.value)
     elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
         _bind(names, node.target, node.iter)
     elif isinstance(node, ast.withitem) and node.optional_vars is not None:
@@ -174,7 +173,14 @@ def _collect(names, node, registry):
 def _scope_names(scope, inherited, registry):
     names = dict(inherited)
     own = list(_own_nodes(scope))
-    for _ in range(_BINDING_PASSES):
+    previous = None
+    seen = set()
+    while names != previous:
+        bindings = tuple(sorted(names.items()))
+        if bindings in seen:
+            raise ValueError("model bindings do not converge")
+        seen.add(bindings)
+        previous = dict(names)
         for node in own:
             _collect(names, node, registry)
     return names, own
@@ -265,6 +271,51 @@ def _production_modules():
         if relative.startswith(("migrations/", "tests/")):
             continue
         yield path, relative
+
+
+class TestRendererBindingCollector(SimpleTestCase):
+    def test_assignment_forms_preserve_model_bindings(self):
+        sources = (
+            "row: VLAN = VLAN.objects.first()\nrow.save()",
+            "if (row := VLAN.objects.first()):\n    row.save()",
+            "a = b\nb = c\nc = d\nd = e\ne = VLAN\na.objects.update(name='changed')",
+        )
+        registry = _registry()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.py"
+            for source in sources:
+                with self.subTest(source=source):
+                    path.write_text("from ipam.models import VLAN\n" + source + "\n")
+                    sites = _module_sites(path, path.name, registry)
+                    self.assertEqual([site.label for site in sites], ["ipam.vlan"])
+
+    def test_creation_tuple_does_not_bind_the_boolean_as_a_model(self):
+        registry = _registry()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.py"
+            for method in ("get_or_create", "update_or_create"):
+                with self.subTest(method=method):
+                    path.write_text(
+                        "from ipam.models import VLAN\n"
+                        f"row, created = VLAN.objects.{method}(vid=100)\n"
+                        "row.save()\ncreated.save()\n"
+                    )
+                    sites = _module_sites(path, path.name, registry)
+                    self.assertEqual([site.expression for site in sites], [f"VLAN.objects.{method}", "row.save"])
+
+    def test_conflicting_cyclic_aliases_fail_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bindings.py"
+            path.write_text(
+                "from ipam.models import VLAN, IPAddress\n"
+                "from dcim.models import Interface\n"
+                "a = VLAN\nb = Interface\nc = IPAddress\n"
+                "def mutate():\n"
+                "    global a, b, c\n"
+                "    a = b\n    b = c\n    c = a\n    a.objects.update()\n"
+            )
+            with self.assertRaisesRegex(ValueError, "model bindings do not converge"):
+                _module_sites(path, path.name, _registry())
 
 
 class TestRendererWriterStructure(SimpleTestCase):
