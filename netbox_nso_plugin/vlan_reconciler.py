@@ -447,7 +447,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
     from . import merge_util
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
-    from .renderer_writer import planned_delete, planned_m2m_set, planned_save
+    from .renderer_writer import IntentPlanStaleError, planned_delete, planned_m2m_set, planned_save
 
     items = _validated_switchport_items(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
@@ -520,6 +520,8 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         interface = interfaces.get(interface_pks.get(item.get("interface_name")))
         if interface is None:
             continue  # not resolved before acquisition, or gone since; the next read picks it up
+        if interface.device_id != device.pk or interface.name != item["interface_name"]:
+            raise IntentPlanStaleError(f"dcim.interface row {interface.pk!r} changed identity after resolution")
         nso_mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
         nso_untagged = item.get("untagged_vlan")
         if nso_untagged == 1:
@@ -577,7 +579,15 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
 
         # The comparison consumed this native content; a mirror also intends to write dev_hash.
-        native_reads.append((interface.pk, obj_hash, dev_hash if native_candidate is not None else None))
+        native_reads.append(
+            (
+                interface.pk,
+                interface.device_id,
+                interface.name,
+                obj_hash,
+                dev_hash if native_candidate is not None else None,
+            )
+        )
         state.untagged_vlan = resolve_vlan(nso_untagged, create=False) if nso_untagged is not None else None
         state_tagged = tuple(
             vlan for vlan in (resolve_vlan(vid, create=False) for vid in nso_tagged) if vlan is not None
@@ -1111,14 +1121,16 @@ def _refuse_moved_switchport_reads(execution) -> None:
         to_attr="_intent_tagged_vlans",
     )
     current = {
-        row.pk: merge_util.content_hash(_switchport_object_content(row))
-        for row in Interface.objects.filter(pk__in={interface_pk for interface_pk, _read, _intent in reads})
+        row.pk: (row.device_id, row.name, merge_util.content_hash(_switchport_object_content(row)))
+        for row in Interface.objects.filter(
+            pk__in={interface_pk for interface_pk, _device, _name, _read, _intent in reads}
+        )
         .select_related("untagged_vlan")
         .prefetch_related(tagged_vlans)
     }
-    for interface_pk, read_hash, intended_hash in reads:
-        content = current.get(interface_pk)
-        if content is None or (content != read_hash and content != intended_hash):
+    for interface_pk, device_id, name, read_hash, intended_hash in reads:
+        snapshot = current.get(interface_pk)
+        if snapshot not in ((device_id, name, read_hash), (device_id, name, intended_hash)):
             raise IntentPlanStaleError(f"dcim.interface row {interface_pk!r} changed after planning")
 
 
