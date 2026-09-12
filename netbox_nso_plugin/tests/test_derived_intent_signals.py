@@ -347,12 +347,16 @@ class TestInterfaceSaveHandler(TestCase):
         plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("enabled",)),))
 
         with (
-            self.assertLogs("netbox_nso_plugin.signals", level=logging.WARNING),
+            self.assertLogs("netbox_nso_plugin.signals", level=logging.WARNING) as logs,
             without_commit_drain(),
             renderer_writes(plan) as writer,
         ):
             writer.save(candidate, update_fields=("enabled",))
 
+        self.assertIn(
+            f"derived_intent.unplanned_write field=description interface_id={iface1.pk}",
+            [record.getMessage() for record in logs.records],
+        )
         iface1.refresh_from_db()
         self.assertFalse(iface1.enabled)
         self.assertEqual(iface1.description, "[auto]")

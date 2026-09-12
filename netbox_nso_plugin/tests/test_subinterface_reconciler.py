@@ -320,11 +320,13 @@ class TestSubinterfaceReconciler(TestCase):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
         inserted = None
+        seam_taken = False
 
         def insert_after_interface_read(execute, sql, params, many, context):
-            nonlocal inserted
+            nonlocal inserted, seam_taken
             result = execute(sql, params, many, context)
-            if inserted is None and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+            if not seam_taken and sql.lstrip().upper().startswith("SELECT") and Interface._meta.db_table in sql:
+                seam_taken = True
                 inserted = Interface.objects.create(
                     device=self.device,
                     name="GigabitEthernet0/1.101",

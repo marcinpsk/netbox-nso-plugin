@@ -1572,6 +1572,8 @@ try:
             from dcim.models import Interface
             from ipam.models import IPAddress
 
+            from netbox_nso_plugin.models import NSOInterfaceIPState
+
             lag = Interface.objects.create(device=self.device, name="lag-99", type="lag")
             sub = Interface.objects.create(device=self.device, name="LAG99:99", type="virtual", parent=lag)
 
@@ -1580,6 +1582,7 @@ try:
                     address="198.18.249.160/31", assigned_object_type=self._ct(), assigned_object_id=sub.pk
                 )
 
+            self.assertFalse(NSOInterfaceIPState.objects.filter(interface=sub, address="198.18.249.160/31").exists())
             mock_put.assert_not_called()
 
         def test_nokia_routed_binding_helper(self):
