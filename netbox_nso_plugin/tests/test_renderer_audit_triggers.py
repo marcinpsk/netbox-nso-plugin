@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Every document capture repairs renderer drift before it freezes content."""
 
+import time
 from unittest.mock import patch
 
 from django.test import TransactionTestCase
@@ -127,7 +128,7 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
             return real_respond(body)
 
         def audit(device_id, scopes, trigger, **kwargs):
-            calls.append((device_id, tuple(scopes), trigger, kwargs))
+            calls.append((device_id, tuple(scopes), trigger, kwargs, time.monotonic()))
             return real_audit(device_id, scopes, trigger, **kwargs)
 
         adapter._respond = respond
@@ -143,8 +144,11 @@ class TestRendererAuditCaptureOrder(_CascadeFlushMixin, IntentPushResetMixin, Tr
         self.assertEqual(len(calls), 1)
         self.assertEqual(appended, [1])
         self.assertEqual(entries(self.device, "vlan", unconsumed=True), [])
-        self.assertTrue(all(call[3] == {"pre_capture": True, "deadline": None} for call in calls))
-        self.assertTrue(all(call[:3] == (self.device.pk, ("vlan",), "drain._drain_once") for call in calls))
+        self.assertIs(calls[0][3]["pre_capture"], True)
+        remaining = calls[0][3]["deadline"] - calls[0][4]
+        self.assertGreater(remaining, 0)
+        self.assertLessEqual(remaining, drain.SEND_DEADLINE.total_seconds())
+        self.assertEqual(calls[0][:3], (self.device.pk, ("vlan",), "drain._drain_once"))
 
     def test_a_tail_does_not_run_a_second_failing_audit(self):
         from netbox_nso_plugin import drain
