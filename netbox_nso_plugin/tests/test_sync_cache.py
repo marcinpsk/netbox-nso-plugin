@@ -378,8 +378,9 @@ class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
 
         def build_then_stale(*args, **kwargs):
             nonlocal plan_staled
+            proposed_save = next(iter(kwargs.get("saves", ())), None)
             plan = original_build(*args, **kwargs)
-            if not plan_staled:
+            if not plan_staled and proposed_save is not None and proposed_save.instance.pk == first.pk:
                 plan_staled = True
                 in_thread(lambda: NSODeviceManagement.objects.filter(pk=first.pk).update(last_sync_status="concurrent"))
             return plan
@@ -391,7 +392,7 @@ class TestRefreshSyncCacheConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
             self.assertLogs("netbox_nso_plugin.sync_cache", level="WARNING") as captured,
         ):
             try:
-                result = refresh_sync_caches(NSODeviceManagement.objects.all())
+                result = refresh_sync_caches(NSODeviceManagement.objects.order_by("-pk"))
             except Exception as exc:  # noqa: BLE001 (the assertion reports the aborted sweep)
                 errors.append(exc)
                 result = None
