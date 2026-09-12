@@ -21,7 +21,7 @@ from django.db import connections
 from django.test import TestCase, TransactionTestCase
 from ipam.models import IPAddress, IPRange, Prefix, Role
 
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestClassifyInterface(TestCase):
@@ -901,7 +901,7 @@ class TestSingleAllocationPoolLock(_CascadeFlushMixin, IntentPushResetMixin, Tra
         assert not NSOInterfaceIPState.objects.filter(interface=self.interface_a).exists()
 
 
-class TestRollbackAutoAssigned(TestCase):
+class TestRollbackAutoAssigned(IntentPushDeliveryMixin, TestCase):
     """rollback_auto_assigned: deletes IPAddress and NSOInterfaceIPState."""
 
     @classmethod
@@ -965,11 +965,16 @@ class TestRollbackAutoAssigned(TestCase):
             source_pool=pool,
         )
 
-        rollback_auto_assigned(state)
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent") as put_ip_intent,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            rollback_auto_assigned(state)
 
         self.assertFalse(IPAddress.objects.filter(pk=ip.pk).exists())
         self.assertFalse(NSOInterfaceIPState.objects.filter(pk=state.pk).exists())
         self.assertTrue(Prefix.objects.filter(pk=pool.pk).exists())
+        put_ip_intent.assert_called_once_with(1, [])
 
     def test_rollback_noop_for_non_auto_assigned(self):
         from netbox_nso_plugin.ip_autoassign import rollback_auto_assigned
