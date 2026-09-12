@@ -512,7 +512,9 @@ def _ensure_interface_ip_prefixes(prefixes):
 
     for address, vrf_obj in prefixes:
         address_interface = ip_interface(address)
-        containing = Prefix.objects.filter(prefix__net_contains=str(address_interface.ip), vrf=vrf_obj).first()
+        containing = Prefix.objects.filter(
+            prefix__net_contains_or_equals=str(address_interface.ip), vrf=vrf_obj
+        ).first()
         if containing is None:
             with transaction.atomic():
                 Prefix(prefix=str(address_interface.network), vrf=vrf_obj).save()

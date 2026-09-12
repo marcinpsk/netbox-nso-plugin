@@ -170,6 +170,23 @@ class TestReconcileInterfaceIps(TestCase):
         self.assertTrue(ip_exists)
         self.assertTrue(Prefix.objects.filter(prefix="10.10.0.0/30").exists())
 
+    def test_auto_create_reuses_an_equal_host_prefix(self):
+        from ipam.models import Prefix
+
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        prefix = "198.18.252.1/32"
+        Prefix.objects.create(prefix=prefix)
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": prefix, "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+
+        with self._auto_create_ctx(True):
+            _reconcile_interface_ips(self.device, payload)
+
+        self.assertEqual(Prefix.objects.filter(prefix=prefix).count(), 1)
+
     def test_unexpected_prefix_database_failure_aborts_reconcile(self):
         from django.db import OperationalError, connection
         from ipam.models import IPAddress, Prefix
