@@ -850,6 +850,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         return None
 
     def plan_prefix_entries(self, root, entries):
+        from django.core.exceptions import ValidationError
+
         values = {
             entry.get("prefix").strip()
             for entry in entries
@@ -867,7 +869,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 custom_prefix = self.CustomPrefix(prefix=prefix)
                 try:
                     custom_prefix.full_clean(validate_unique=False, validate_constraints=False)
-                except Exception as exc:  # noqa: BLE001
+                except ValidationError as exc:
                     logger.warning("route-policy: bad prefix %r in %s: %s", prefix, root.name, exc)
                     continue
                 self.prefixes[prefix] = custom_prefix

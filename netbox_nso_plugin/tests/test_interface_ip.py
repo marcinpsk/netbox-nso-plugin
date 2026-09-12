@@ -149,7 +149,7 @@ class TestReconcileInterfaceIps(TestCase):
 
     def test_auto_create_creates_ipaddress_and_sets_in_sync(self):
         """With auto_create=True, a new address is created in IPAM and state=in_sync."""
-        from ipam.models import IPAddress
+        from ipam.models import IPAddress, Prefix
 
         from netbox_nso_plugin.template_content import _reconcile_interface_ips
 
@@ -168,6 +168,34 @@ class TestReconcileInterfaceIps(TestCase):
         self.assertEqual(states["10.10.0.1/30"].status, "imported")  # unowned materialized → imported (unified)
         ip_exists = IPAddress.objects.filter(address="10.10.0.1/30").exists()
         self.assertTrue(ip_exists)
+        self.assertTrue(Prefix.objects.filter(prefix="10.10.0.0/30").exists())
+
+    def test_unexpected_prefix_database_failure_aborts_reconcile(self):
+        from django.db import OperationalError, connection
+        from ipam.models import IPAddress, Prefix
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": "198.18.251.1/32", "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+
+        def fail_prefix_insert(execute, sql, params, many, context):
+            if sql.lstrip().upper().startswith("INSERT") and f'"{Prefix._meta.db_table}"' in sql:
+                raise OperationalError("unexpected prefix database failure")
+            return execute(sql, params, many, context)
+
+        with (
+            self._auto_create_ctx(True),
+            connection.execute_wrapper(fail_prefix_insert),
+            self.assertRaisesRegex(OperationalError, "unexpected prefix database failure"),
+        ):
+            _reconcile_interface_ips(self.device, payload)
+
+        self.assertFalse(IPAddress.objects.filter(address="198.18.251.1/32").exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(address="198.18.251.1/32").exists())
 
     def test_existing_ip_on_correct_interface_is_in_sync(self):
         """Address already in IPAM assigned to this interface → in_sync."""

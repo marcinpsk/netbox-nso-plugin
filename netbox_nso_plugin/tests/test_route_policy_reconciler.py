@@ -716,6 +716,22 @@ class TestReconcileRoutePolicy(TestCase):
             "route_maps": [],
         }
 
+    def test_unexpected_prefix_validation_failure_aborts_preflight(self):
+        from netbox_routing.models import CustomPrefix
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        def fail_validation(_value):
+            raise RuntimeError("unexpected prefix validation failure")
+
+        self._make_mgmt(self.device)
+        field = CustomPrefix._meta.get_field("prefix")
+        field.validators.append(fail_validation)
+        self.addCleanup(field.validators.remove, fail_validation)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected prefix validation failure"):
+            route_policy_reconcile_plan(self.device, self._pl_payload("FAIL-FAST-PL", "198.18.250.0/24"))
+
     def test_master_default_conflicts_on_cross_device_divergence(self):
         """Control: with no classification (implicit MASTER), a second device whose version
         diverges is real drift — the existing dedup behavior."""

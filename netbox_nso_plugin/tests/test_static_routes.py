@@ -213,6 +213,26 @@ class TestReconcileStaticRoutes(TestCase):
         self.assertEqual(assignments[0].selected_pks, (self.device.pk,))
         self.assertFalse(plan.changes_content)
 
+    def test_unexpected_route_validation_failure_aborts_preflight(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
+
+        def fail_validation(_value):
+            raise RuntimeError("unexpected route validation failure")
+
+        self._make_mgmt(self.device, nso_device_name="sr-fail-fast")
+        field = StaticRoute._meta.get_field("prefix")
+        field.validators.append(fail_validation)
+        self.addCleanup(field.validators.remove, fail_validation)
+        payload = self._route_payload(self._route_entry("198.18.252.0/24", "198.18.0.252"))
+
+        with (
+            self._auto_create_ctx(True),
+            self.assertRaisesRegex(RuntimeError, "unexpected route validation failure"),
+        ):
+            static_route_reconcile_plan(self.device, payload)
+
     def test_plan_matches_only_the_duplicate_route_selected_by_the_body(self):
         from netbox_routing.models import StaticRoute
 

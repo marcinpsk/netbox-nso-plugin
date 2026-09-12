@@ -7,6 +7,7 @@ import copy
 import logging
 from dataclasses import replace
 from datetime import datetime
+from ipaddress import ip_interface
 
 from django.apps import apps
 from django.utils import timezone
@@ -510,13 +511,11 @@ def _ensure_interface_ip_prefixes(prefixes):
     from ipam.models import Prefix
 
     for address, vrf_obj in prefixes:
-        try:
-            containing = Prefix.objects.filter(prefix__net_contains=address.split("/")[0], vrf=vrf_obj).first()
-            if containing is None:
-                with transaction.atomic():
-                    Prefix(prefix=address, vrf=vrf_obj).save()
-        except Exception as exc:  # pragma: no cover
-            logger.warning("nso_ip.prefix_link_failed addr=%s: %s", address, repr(exc))
+        address_interface = ip_interface(address)
+        containing = Prefix.objects.filter(prefix__net_contains=str(address_interface.ip), vrf=vrf_obj).first()
+        if containing is None:
+            with transaction.atomic():
+                Prefix(prefix=str(address_interface.network), vrf=vrf_obj).save()
 
 
 def _reconcile_interface_ips(device, payload: dict) -> list:
@@ -1223,6 +1222,7 @@ def _static_route_plan_and_operations(device, payload, planned_at, *, resolve_st
 
 def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_status=True):  # noqa: C901
     """Build the deterministic static-route write sequence for preflight and apply."""
+    from django.core.exceptions import ValidationError
     from ipam.models import VRF
     from netbox_routing.models import StaticRoute
 
@@ -1312,7 +1312,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             )
             try:
                 route.full_clean(exclude=("vrf",) if vrf is not None and vrf.pk is None else ())
-            except Exception as exc:
+            except ValidationError as exc:
                 logger.warning("Could not create StaticRoute %s: %s", prefix, exc)
                 continue
             save(
