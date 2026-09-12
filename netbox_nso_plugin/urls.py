@@ -251,6 +251,16 @@ urlpatterns = [
     path("jobs/<int:job_id>/status/", views.NSOJobStatusView.as_view(), name="nsojob_status"),
     # Device job-activity summary (JSON: running + last finished) for the tab status strip
     path("devices/<int:pk>/jobs/", views.NSODeviceJobsView.as_view(), name="device_nso_jobs"),
+    path(
+        "devices/<int:pk>/actions/retry-generation/",
+        views.NSOGenerationRetryView.as_view(),
+        name="generation_retry",
+    ),
+    path(
+        "devices/<int:pk>/actions/abandon-generation/",
+        views.NSOGenerationAbandonView.as_view(),
+        name="generation_abandon",
+    ),
     # Interface State CRUD (read-only list + detail; delete allowed for cleanup)
     path("interface-state/", views.NSOInterfaceStateListView.as_view(), name="nsointerfacestate_list"),
     path(

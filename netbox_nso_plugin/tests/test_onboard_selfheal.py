@@ -158,6 +158,43 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
         self.assertEqual(good.onboard_status, "")
         self.assertEqual(bad.onboard_status, "provisioning")  # untouched by its own error
 
+    def test_terminal_steps_preserve_intent_revision_snapshots(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        from ._adapter_http import make_response
+        from .test_apply_settlement import _CLIENT_CONFIG
+
+        mgmt = self._provisioning("terminal-steps", "J-STEPS")
+        revisions = NSOIntentRevision.objects.filter(device=mgmt.device)
+        self.assertTrue(revisions.exists())
+        revisions.update(verified_revision=0, verified_fingerprint="a" * 64, verified_at=timezone.now())
+        fields = ("scope", "revision", "verified_revision", "verified_fingerprint", "verified_at")
+        before = list(revisions.order_by("scope").values_list(*fields))
+        steps = [{"step": "sync_from", "status": "failed"}]
+        self.assertNotEqual(mgmt.onboard_steps, steps)
+
+        class ProvisionSession:
+            def request(_self, method, url, **kwargs):
+                self.assertEqual(method, "GET")
+                self.assertTrue(url.endswith("/jobs/J-STEPS"))
+                return make_response(200, {"status": "succeeded", "result": {"ok": False, "steps": steps}})
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=ProvisionSession()),
+        ):
+            result = advance_provisioning(mgmt)
+
+        mgmt.refresh_from_db()
+        self.assertEqual(result["status"], "provision_failed")
+        self.assertEqual(mgmt.onboard_status, "provision_failed")
+        self.assertEqual(mgmt.onboard_steps, steps)
+        self.assertEqual(mgmt.onboard_error, result["error"])
+        self.assertEqual(list(revisions.order_by("scope").values_list(*fields)), before)
+
     def test_a_free_form_steps_member_still_records_the_failure(self):
         """``result`` is an object by contract; ``steps`` inside it is free-form JSON.
 

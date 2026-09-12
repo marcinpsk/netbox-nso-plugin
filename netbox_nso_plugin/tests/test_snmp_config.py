@@ -240,6 +240,9 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             username="nms-user",
             has_auth_secret=True,
             has_priv_secret=True,
+            auth_protocol="sha",
+            priv_protocol="aes-128",
+            vault_ref="network/netbox/snmp/v3/nms-user",
             status="deploying",
         )
         NSOSnmpHostState.objects.create(
@@ -263,7 +266,12 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             NSOSnmpCommunityState.objects.get(management=mgmt, community_hash="abcd1234abcd1234").status,
             "deploying",
         )
-        self.assertEqual(NSOSnmpV3UserState.objects.get(management=mgmt, username="nms-user").status, "deploying")
+        user = NSOSnmpV3UserState.objects.get(management=mgmt, username="nms-user")
+        self.assertEqual(user.status, "deploying")
+        self.assertEqual(
+            (user.auth_protocol, user.priv_protocol, user.vault_ref),
+            ("sha", "aes-128", "network/netbox/snmp/v3/nms-user"),
+        )
         self.assertEqual(NSOSnmpHostState.objects.get(management=mgmt, address="10.0.0.100").status, "deploying")
         self.assertEqual(NSOSnmpSystemInfoState.objects.get(management=mgmt).status, "deploying")
 

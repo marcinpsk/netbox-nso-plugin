@@ -105,6 +105,22 @@ class TestOutboxSchema(TestCase):
         # The primary key is the only uniqueness the entry table may carry.
         assert self._unique_constraints(ENTRY_TABLE) == [f"{ENTRY_TABLE}_pkey"]
 
+    def test_each_entry_declares_its_contribution_kind(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        field = NSOIntentOutboxEntry._meta.get_field("kind")
+
+        assert field.get_default() == "ordinary"
+        assert {value for value, _label in field.choices} == {"ordinary", "repair"}
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT character_maximum_length, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                [ENTRY_TABLE, field.column],
+            )
+            assert cur.fetchone() == (field.max_length, "NO", None)
+
     def test_the_state_row_is_unique_per_device_and_scope(self):
         from netbox_nso_plugin.models import NSOIntentOutboxState
 

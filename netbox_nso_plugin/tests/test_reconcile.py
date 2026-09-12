@@ -159,6 +159,66 @@ class TestRunDeviceReconcile(APITestCase):
         ):
             reconcile.run_device_reconcile(device.pk)
 
+    def test_unrequested_evidence_uuid_does_not_stop_reconcile(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin import reconcile
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from ._adapter_http import make_session
+        from ._outbox_case import CFG
+
+        device = _make_device("rec-evidence-extra")
+        instance = NSOInstance.objects.create(
+            name="rec-evidence-extra",
+            adapter_instance_id="rec-evidence-extra",
+        )
+        mgmt = NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=instance,
+            nso_device_name="rec-evidence-extra",
+            adapter_device_id=24,
+            manage_route_policy=True,
+        )
+        requested_id, extra_id = uuid4(), uuid4()
+        for attempt_id in (requested_id, extra_id):
+            NSOApplyAttempt.objects.create(
+                id=attempt_id,
+                management=mgmt,
+                adapter_device_id=mgmt.adapter_device_id,
+                selected={"route_policy": 1},
+                scope_revisions={"route_policy": 1},
+                http_status=202,
+                response={"device_id": mgmt.adapter_device_id, "outcome": "promoted"},
+            )
+        evidence = {
+            "device_id": mgmt.adapter_device_id,
+            "head": None,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "attempts": [],
+            "unknown_apply_attempt_ids": [str(extra_id)],
+        }
+        reconcile_context = {
+            reconcile._ROUTE_POLICY_ATTEMPT_IDS: (requested_id,),
+            reconcile._ROUTE_POLICY_ADAPTER_DEVICE_ID: mgmt.adapter_device_id,
+        }
+
+        with (
+            patch.object(reconcile, "reconcile_device", return_value=reconcile_context),
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=make_session(200, evidence)),
+            patch("netbox_nso_plugin.adapter_client.trigger_apply") as trigger_apply,
+            self.assertLogs("netbox_nso_plugin.reconcile", level="WARNING") as logs,
+        ):
+            result = reconcile.run_device_reconcile(device.pk)
+
+        self.assertEqual(result, {"device_id": device.pk, "interface_states": 0})
+        trigger_apply.assert_not_called()
+        self.assertTrue(any("route-policy evidence failed" in line for line in logs.output))
+
     def test_missing_device_is_skipped(self):
         from netbox_nso_plugin.reconcile import run_device_reconcile
 

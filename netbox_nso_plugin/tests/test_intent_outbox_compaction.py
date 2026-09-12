@@ -28,6 +28,7 @@ from django.test.utils import CaptureQueriesContext
 from ._outbox_case import (
     ReceiptAdapter,
     as_per_object,
+    delete_vlan_state,
     entries,
     in_thread,
     make_managed,
@@ -35,6 +36,7 @@ from ._outbox_case import (
     own_vlan,
     state_of,
     without_commit_drain,
+    write_vlan_state,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -67,13 +69,19 @@ class _CompactionCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestC
 
         NSOIntentOutboxEntry.objects.all().delete()
 
-    def append(self, *transitions, scope="static_route", delete_origin=False):
+    def append(self, *transitions, scope="static_route", delete_origin=False, kind="ordinary"):
         """One operator transaction's contribution, appended the way the choke point does."""
         from netbox_nso_plugin import outbox
         from netbox_nso_plugin.intent_state import content_mutation
 
         with content_mutation({(self.device.pk, scope)}):
-            outbox.enqueue(self.device.pk, scope, transitions=list(transitions), delete_origin=delete_origin)
+            outbox.enqueue(
+                self.device.pk,
+                scope,
+                transitions=list(transitions),
+                delete_origin=delete_origin,
+                kind=kind,
+            )
 
     def delete_of(self, route_id, *, last_acked=TRIPLE_A, current=TRIPLE_C):
         from netbox_nso_plugin import outbox
@@ -341,6 +349,21 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         assert folded.queued == {}
         assert folded.lineage_carry == {4300: TRIPLE_A}, "O1.30(b)'s [A, C] lineage can no longer form"
 
+    def test_compaction_preserves_lineage_across_an_interleaved_repair(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4301, last_acked=TRIPLE_A, current=TRIPLE_A))
+        self.append(self.revoke_of(4301), kind=outbox.CONTRIBUTION_KIND_REPAIR)
+        self.append(self.delete_of(4301, last_acked=None, current=TRIPLE_C))
+        self.append(self.delete_of(4301, last_acked=None, current=TRIPLE_C))
+
+        retired = drain.compact(self.device.pk, "static_route")
+
+        assert retired == 1, "the test did not exercise compaction"
+        folded = outbox.fold_transitions(self.transitions())
+        assert folded.lineage_carry == {4301: TRIPLE_A}
+        assert folded.queued[4301]["triples"] == [TRIPLE_C]
+
     def test_a_string_route_id_reuses_the_integer_route_lineage_when_reducing(self):
         from netbox_nso_plugin import drain, outbox
 
@@ -380,6 +403,49 @@ class TestTheReductionAppliesTheAlgebra(_CompactionCase):
         assert survivor.mark_and is False
         assert survivor.mark_any is True, "the evidence a marked contributor was downgraded is gone"
 
+    def test_compaction_preserves_kind_partitions_and_neutralizes_repair_marks(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4322), delete_origin=True)
+        self.append(self.delete_of(4323), delete_origin=True)
+        self.append(kind=outbox.CONTRIBUTION_KIND_REPAIR, delete_origin=True)
+        self.append(kind=outbox.CONTRIBUTION_KIND_REPAIR, delete_origin=False)
+
+        drain.compact(self.device.pk, "static_route")
+
+        rows = self.rows()
+        assert [row.kind for row in rows] == [
+            outbox.CONTRIBUTION_KIND_ORDINARY,
+            outbox.CONTRIBUTION_KIND_REPAIR,
+        ]
+        assert (rows[0].mark_and, rows[0].mark_any) == (True, True)
+        assert (rows[1].mark_and, rows[1].mark_any) == (False, False)
+
+    def test_bounded_compaction_skips_interleaved_keys(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4325))
+        self.append(self.revoke_of(4325), kind=outbox.CONTRIBUTION_KIND_REPAIR)
+        self.append(self.delete_of(4326))
+        interleaved = [(row.pk, row.kind, row.transitions) for row in self.rows()]
+        self.append(scope="vlan")
+        self.append(scope="vlan")
+        survivor = self.rows("vlan")[-1].pk
+
+        for _ in range(3):
+            drain.compact_intent_outbox(limit=1)
+
+        assert [row.pk for row in self.rows("vlan")] == [survivor]
+        assert [(row.pk, row.kind, row.transitions) for row in self.rows()] == interleaved
+
+    def test_one_row_in_each_kind_is_not_a_compaction_candidate(self):
+        from netbox_nso_plugin import drain, outbox
+
+        self.append(self.delete_of(4324))
+        self.append(kind=outbox.CONTRIBUTION_KIND_REPAIR)
+
+        assert (self.device.pk, "static_route") not in drain.compaction_candidates()
+
 
 class TestACompactedRowSendsWhatItsContributorsAuthorized(_CompactionCase):
     """O1.34 third arm (R13-B4): a compacted row must not inherit a per-entry mark."""
@@ -398,10 +464,9 @@ class TestACompactedRowSendsWhatItsContributorsAuthorized(_CompactionCase):
         self.adapter.requests.clear()
 
         with without_commit_drain(), transaction.atomic():
-            kept.status = "imported"  # an unmarked shrink: the operator un-owns it
-            kept.save()
+            write_vlan_state(kept, status="imported")
         with without_commit_drain(), transaction.atomic():
-            going.delete()  # a marked shrink: the object is destroyed in NetBox
+            delete_vlan_state(going)
         assert len(self.rows("vlan")) == 2
 
         drain.compact(self.device.pk, "vlan")
@@ -534,6 +599,28 @@ class TestCompactionRewritesInPlace(_CompactionCase):
         ]
         assert [sql for sql in inserts if "outboxentry" in sql.lower()] == [], inserts
         assert NSOIntentOutboxEntry.objects.order_by("-pk").first().pk == before
+
+    def test_bounded_compaction_keeps_held_rows_as_adjacency_barriers(self):
+        from netbox_nso_plugin import drain
+
+        route = own_route(self.mgmt, "198.18.0.0/28", "198.18.0.1")
+        with without_commit_drain():
+            route.devices.remove(self.device)
+        held = drain.claim(self.device.pk, "static_route")
+        assert [record["route_id"] for record in held.deletions] == [route.pk]
+        self.clear_entries()
+        self.append(self.delete_of(4422))
+        self.append(self.revoke_of(route.pk))
+        self.append(self.delete_of(4423))
+        blocked = [(row.pk, row.transitions) for row in self.rows()]
+        self.append(scope="vlan")
+        self.append(scope="vlan")
+        survivor = self.rows("vlan")[-1].pk
+
+        drain.compact_intent_outbox(limit=1)
+
+        assert [row.pk for row in self.rows("vlan")] == [survivor]
+        assert [(row.pk, row.transitions) for row in self.rows()] == blocked
 
     def test_a_route_the_active_claim_holds_is_excluded_from_the_pass(self):
         from netbox_nso_plugin import drain

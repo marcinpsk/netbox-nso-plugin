@@ -3122,14 +3122,8 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         definitely_not_enqueued = exc.definitely_not_enqueued
         # An ambiguous failure may still have enqueued the Apply, and the stored response is the
         # attempt's immutable answer, so only a deterministic rejection may become it.
-        if (
-            prepared is not None
-            and definitely_not_enqueued
-            and type(exc.status_code) is int
-            and isinstance(exc.response, dict)
-        ):
-            _record_apply_response(prepared, http_status=exc.status_code, response=exc.response)
         if prepared is not None and definitely_not_enqueued:
+            _record_apply_response(prepared, http_status=exc.status_code, response=exc.rejection_response)
             _rollback_prepare_apply(prepared)
         if exc.code == "conflict":
             return self._incumbent_job(request, mgmt, exc, action=action, is_ajax=is_ajax)
@@ -3277,8 +3271,10 @@ class NSOAdapterLinkRetryView(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):
         """Re-attempt the adapter link for the device, then redirect to the NSO tab."""
+        from .management_lifecycle import save_management
+
         mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
-        mgmt.save()  # re-fires sync_scope_to_adapter (onboard → scope → sync-notify)
+        save_management(mgmt)
         mgmt.refresh_from_db()
         if mgmt.adapter_link_error:
             messages.error(request, f"Still couldn't link this device to the adapter: {mgmt.adapter_link_error}")
@@ -3331,6 +3327,68 @@ class NSOForceRemovalView(NSOActionPermissionMixin, View):
                 return JsonResponse({"status": "error", "message": public_error_message(exc)}, status=502)
             messages.error(request, f"Adapter error triggering force removal: {public_error_message(exc)}")
         return redirect(_device_nso_tab_url(mgmt.device.pk))
+
+
+class _NSOGenerationActionView(NSOActionPermissionMixin, View):
+    """Apply one generation-scoped barrier action to the blocked head."""
+
+    action = ""
+    client_method = ""
+
+    def post(self, request, pk):
+        """CAS the operator action against the generation shown in the tab."""
+        from . import adapter_client as client
+
+        device = get_object_or_404(Device, pk=pk)
+        mgmt = getattr(device, "nso_management", None)
+        if (
+            mgmt is not None
+            and not NSODeviceManagement.objects.restrict(request.user, "change").filter(pk=mgmt.pk).exists()
+        ):
+            raise PermissionDenied
+        if mgmt is None or mgmt.adapter_device_id is None:
+            messages.warning(request, "Device is not yet onboarded.")
+            return redirect(_device_nso_tab_url(device.pk))
+        try:
+            generation_id = int(request.POST.get("generation_id", ""))
+        except (TypeError, ValueError):
+            messages.error(request, "Generation ID must be an integer.")
+            return redirect(_device_nso_tab_url(device.pk))
+
+        try:
+            result = getattr(client, self.client_method)(mgmt.adapter_device_id, generation_id)
+        except AdapterError as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            running_job_id = detail.get("job_id")
+            head_generation_id = detail.get("head_generation_id")
+            if exc.status_code == 409 and type(running_job_id) is int and running_job_id > 0:
+                messages.warning(request, f"An action is already running. Job ID: {running_job_id}.")
+            elif exc.status_code == 409 and type(head_generation_id) is int:
+                messages.warning(
+                    request,
+                    f"Generation {generation_id} moved. The current blocked head is generation {head_generation_id}.",
+                )
+            else:
+                messages.error(request, public_error_message(exc))
+        else:
+            job_id = result.get("job_id") if isinstance(result, dict) else None
+            suffix = f" Job ID: {job_id}." if job_id is not None else ""
+            messages.success(request, f"Generation {generation_id} {self.action} queued.{suffix}")
+        return redirect(_device_nso_tab_url(device.pk))
+
+
+class NSOGenerationRetryView(_NSOGenerationActionView):
+    """Retry the exact blocked generation shown to the operator."""
+
+    action = "retry"
+    client_method = "retry_generation"
+
+
+class NSOGenerationAbandonView(_NSOGenerationActionView):
+    """Abandon the exact blocked generation shown to the operator."""
+
+    action = "abandonment"
+    client_method = "abandon_generation"
 
 
 class NSOJobStatusView(LoginRequiredMixin, View):
@@ -3610,6 +3668,8 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                     "last": None,
                     "jobs": [],
                     "generations": [],
+                    "apply_state": None,
+                    "apply_state_error": None,
                     "blocked_removals": [],
                     "residue_removals": [],
                 }
@@ -3635,6 +3695,13 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             )
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
+        apply_state_error = None
+        try:
+            apply_state = client.get_device_apply_state(mgmt.adapter_device_id)
+        except AdapterError as exc:
+            logger.warning("Apply-state poll failed for device %s", pk, exc_info=True)
+            apply_state = None
+            apply_state_error = public_error_message(exc)
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
         serialized_jobs = jobs
         if generation_ids:
@@ -3651,56 +3718,68 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                 "last": last,
                 "jobs": serialized_jobs,
                 "generations": generations,
+                "apply_state": apply_state,
+                "apply_state_error": apply_state_error,
                 "blocked_removals": _blocked_removals(jobs),
                 "residue_removals": _residue_removals(jobs),
             }
         )
 
 
+def _refresh_state_snapshot(mgmt):
+    """Fetch and save one snapshot for the current adapter mapping."""
+    from . import adapter_client as client
+    from .intent_state import footprint_for_instance, mirror_transaction
+    from .management_lifecycle import save_management
+    from .read_gate import _is_authoritative
+    from .renderer_writer import IntentPlanStaleError
+
+    compliance = client.get_state(mgmt.adapter_device_id)
+    doc = client.get_interfaces_doc(mgmt.adapter_device_id)
+    with mirror_transaction(footprint_for_instance(mgmt)):
+        current = get_object_or_404(NSODeviceManagement, pk=mgmt.pk)
+        if current.adapter_device_id != mgmt.adapter_device_id:
+            raise IntentPlanStaleError("the adapter mapping changed during refresh")
+        read_state = doc.get("read_state")
+        authoritative = "read_state" not in doc or (isinstance(read_state, dict) and _is_authoritative(read_state))
+        interfaces = (
+            doc.get("interfaces", []) if authoritative else (current.state_snapshot or {}).get("interfaces", [])
+        )
+        current.state_snapshot = {
+            "compliance": compliance,
+            "interfaces": interfaces,
+            "refreshed_at": timezone.now().isoformat(),
+        }
+        save_management(current, update_fields={"state_snapshot"})
+    return authoritative
+
+
 class NSORefreshStateView(NSOActionPermissionMixin, View):
     """Fetch live compliance + interface data from the adapter and cache it."""
 
     def post(self, request, pk):
-        """Call the adapter and update state_snapshot on the management record."""
-        from . import adapter_client as client
+        """Retry one stale refresh before asking the operator to try again."""
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import IntentPlanStaleError
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
-
-        if mgmt.adapter_device_id is None:
-            messages.warning(request, "Device is not yet onboarded to the adapter.")
-            return redirect(_device_nso_tab_url(mgmt.device.pk))
-
-        try:
-            compliance = client.get_state(mgmt.adapter_device_id)
-            from .read_gate import _is_authoritative
-
-            doc = client.get_interfaces_doc(mgmt.adapter_device_id)
-            interfaces = doc.get("interfaces", [])
-            # The FULL gate tuple decides authoritativeness (codex B5-R2-4) — an
-            # outcome=present with succeeded=false/result=error is a failed read.
-            # Key absent = pre-S4 adapter (legacy, replace); explicit null = malformed.
-            read_state = doc.get("read_state")
-            authoritative = "read_state" not in doc or (isinstance(read_state, dict) and _is_authoritative(read_state))
+        for attempt in range(2):
+            mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+            if mgmt.adapter_device_id is None:
+                messages.warning(request, "Device is not yet onboarded to the adapter.")
+                break
+            try:
+                authoritative = _refresh_state_snapshot(mgmt)
+            except (IntentPlanStaleError, RendererTargetsChanged):
+                if attempt:
+                    messages.warning(request, "Device state changed during refresh. Try again.")
+                continue
+            except AdapterError as exc:
+                messages.error(request, f"Could not reach adapter: {public_error_message(exc)}")
+                break
             if not authoritative:
-                # a non-authoritative doc (e.g. not_ready after a store reset) serves a
-                # legitimately EMPTY list — keep the last-known interfaces (codex B5-F5)
-                interfaces = (mgmt.state_snapshot or {}).get("interfaces", [])
-                messages.warning(request, "Interface read unavailable — kept last-known interface data.")
-            from .intent_state import mirror_refresh
-            from .signals import suppress_intent_push
-
-            with transaction.atomic(), suppress_intent_push():
-                mgmt = NSODeviceManagement.objects.select_for_update(of=("self",)).get(pk=mgmt.pk)
-                mgmt.state_snapshot = {
-                    "compliance": compliance,
-                    "interfaces": interfaces,
-                    "refreshed_at": timezone.now().isoformat(),
-                }
-                with mirror_refresh(mgmt, {"state_snapshot"}):
-                    mgmt.save(update_fields={"state_snapshot"})
+                messages.warning(request, "Interface read unavailable. Kept last-known interface data.")
             messages.success(request, "Compliance data refreshed.")
-        except AdapterError as exc:
-            messages.error(request, f"Could not reach adapter: {public_error_message(exc)}")
+            break
 
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
@@ -4339,8 +4418,40 @@ def _clear_apply_attempt(obj, update_fields) -> None:
     update_fields.add("apply_attempt_id")
 
 
+def _save_owned_svi_edit(obj, old_values):
+    """Claim one edited SVI overlay through its exact writer plan."""
+    import copy
+
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+    candidate = copy.copy(obj)
+    planned_at = timezone.now()
+    if not sm.is_owned(candidate.status):
+        candidate.accepted_at = planned_at
+    candidate.status = sm.on_operator_edit(candidate.status)
+    update_fields = {
+        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
+    }
+    update_fields.add("status")
+    _clear_apply_attempt(candidate, update_fields)
+    if candidate.accepted_at is not None:
+        update_fields.add("accepted_at")
+    plan = RendererMutationPlan.build(
+        saves=(planned_save(candidate, update_fields=update_fields),),
+        planned_at=planned_at,
+    )
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        writer.save(candidate, update_fields=update_fields)
+
+
 def _save_owned_overlay_edit(obj, key, old_values):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
+    if key == "svi":
+        _save_owned_svi_edit(obj, old_values)
+        return
+
     from . import status_machine as sm
     from .intent_state import intent_transaction
 
@@ -4601,9 +4712,11 @@ def _save_route_map_name_edit(state, old_name):
 
 def _save_lacp_edit(obj, key, old_values):
     """Own a complete LACP bundle while preserving which member actually changed."""
+    import copy
+
     from . import status_machine as sm
-    from .intent_state import MutationFootprint, footprint_for_instance, intent_transaction
     from .models import NSOLACPBundleState, NSOLACPMemberState
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
     bundle = (
         obj
@@ -4616,107 +4729,118 @@ def _save_lacp_edit(obj, key, old_values):
             lag_bundle=bundle.interface,
         )
     )
-    footprint = MutationFootprint.merge(
-        footprint_for_instance(bundle),
-        *(footprint_for_instance(member) for member in members),
-    )
     changed_values = {
         field_name: getattr(obj, field_name)
         for field_name, old_value in old_values.items()
         if getattr(obj, field_name) != old_value
     }
-    with intent_transaction(footprint):
-        bundle = NSOLACPBundleState.objects.get(pk=bundle.pk)
-        members = list(
-            NSOLACPMemberState.objects.filter(
-                management=bundle.management,
-                lag_bundle=bundle.interface,
-            ).order_by("pk")
-        )
-        now = timezone.now()
-        for member in members:
-            if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
-                for field_name, value in changed_values.items():
-                    setattr(member, field_name, value)
-                target_status = sm.on_operator_edit(member.status)
-            elif member.status == "deploying":
-                target_status = sm.on_operator_edit(member.status)
-            else:
-                target_status = _status_after_accept(member.status)
-            if not sm.is_owned(member.status):
-                member.accepted_at = now
-            member.status = target_status
-            update_fields = {"status", "accepted_at"}
-            if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
-                update_fields.update(changed_values)
-            member.save(update_fields=update_fields)
-
-        if key == "lacp_bundle":
+    now = timezone.now()
+    saves = []
+    candidates = []
+    for member in members:
+        candidate = copy.copy(member)
+        if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
             for field_name, value in changed_values.items():
-                setattr(bundle, field_name, value)
-        if not sm.is_owned(bundle.status):
-            bundle.accepted_at = now
-        bundle.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
-        bundle_update_fields = {"status", "accepted_at"}
-        if key == "lacp_bundle":
-            bundle_update_fields.update(changed_values)
-        bundle.save(update_fields=bundle_update_fields)
+                setattr(candidate, field_name, value)
+            target_status = sm.on_operator_edit(member.status)
+        elif member.status == "deploying":
+            target_status = sm.on_operator_edit(member.status)
+        else:
+            target_status = _status_after_accept(member.status)
+        if not sm.is_owned(member.status):
+            candidate.accepted_at = now
+        candidate.status = target_status
+        update_fields = {"status", "accepted_at"}
+        if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
+            update_fields.update(changed_values)
+        candidates.append((candidate, update_fields))
+        saves.append(planned_save(candidate, update_fields=update_fields))
+
+    bundle_candidate = copy.copy(bundle)
+    if key == "lacp_bundle":
+        for field_name, value in changed_values.items():
+            setattr(bundle_candidate, field_name, value)
+    if not sm.is_owned(bundle.status):
+        bundle_candidate.accepted_at = now
+    bundle_candidate.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
+    bundle_update_fields = {"status", "accepted_at"}
+    if key == "lacp_bundle":
+        bundle_update_fields.update(changed_values)
+    candidates.append((bundle_candidate, bundle_update_fields))
+    saves.append(planned_save(bundle_candidate, update_fields=bundle_update_fields))
+
+    plan = RendererMutationPlan.build(saves=saves, planned_at=now)
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        for candidate, update_fields in candidates:
+            writer.save(candidate, update_fields=update_fields)
+
+
+def _vlan_name_edit_rows(vlan_model, vlan_id):
+    """Load the native VLAN and every attachment used by one inline edit."""
+    from .models import NSOVLANState
+
+    vlan = vlan_model.objects.filter(pk=vlan_id).first()
+    states = (
+        ()
+        if vlan is None
+        else tuple(NSOVLANState.objects.filter(vlan=vlan).select_related("management").order_by("pk"))
+    )
+    return vlan, states
 
 
 def _save_vlan_name_edit(obj):
     """Rename one shared VLAN and take ownership on every attached managed device."""
-    from django.db import IntegrityError, transaction
+    import copy
+
+    from django.db import IntegrityError
 
     from . import status_machine as sm
-    from .intent_state import intent_transaction, vlan_footprint
-    from .models import NSOVLANState
-    from .signals import suppress_intent_push
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
     from .vlan_reconciler import vlan_name_matches
 
     vlan_model = type(obj.vlan)
     desired_name = obj.vlan.name
-    missing_error = {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
-    if not vlan_model.objects.filter(pk=obj.vlan_id).exists():
-        return missing_error
-    footprint = vlan_footprint(obj.vlan_id, ("vlan",))
+    stored_vlan, states = _vlan_name_edit_rows(vlan_model, obj.vlan_id)
+    if stored_vlan is None:
+        return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
+    vlan = copy.copy(stored_vlan)
+    vlan.name = desired_name
+    now = timezone.now()
+    candidates = []
+    for state in states:
+        candidate = copy.copy(state)
+        candidate.vlan = vlan
+        if not sm.is_owned(candidate.status):
+            candidate.accepted_at = now
+        matches = vlan_name_matches(candidate)
+        candidate.status = (
+            sm.on_operator_edit(candidate.status)
+            if candidate.status == "deploying"
+            else ("in_sync" if matches else "accepted")
+        )
+        update_fields = {"status", "accepted_at"}
+        _clear_apply_attempt(candidate, update_fields)
+        candidates.append((candidate, update_fields))
+    saves = [planned_save(vlan, update_fields=("name",))]
+    saves.extend(planned_save(candidate, update_fields=fields) for candidate, fields in candidates)
     try:
-        with intent_transaction(footprint):
-            vlan = vlan_model.objects.filter(pk=obj.vlan_id).first()
-            if vlan is None:
-                raise _IntentTransactionNoOp(missing_error)
-            vlan.name = desired_name
-            states = list(NSOVLANState.objects.filter(vlan=vlan).order_by("pk"))
-            try:
-                with transaction.atomic(), suppress_intent_push():
-                    vlan.save(update_fields=["name"])
-            except IntegrityError:
-                from django.db.models import Q
+        plan = RendererMutationPlan.build(saves=saves, planned_at=now)
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(vlan, update_fields=("name",))
+            for candidate, fields in candidates:
+                writer.save(candidate, update_fields=fields)
+    except IntegrityError:
+        from django.db.models import Q
 
-                collision_scope = Q(group_id=vlan.group_id)
-                if vlan.qinq_svlan_id is not None:
-                    collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
-                collision = vlan_model.objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
-                if collision.exists():
-                    raise _IntentTransactionNoOp({"name": ["A VLAN with this name already exists in this VLAN scope."]})
-                raise
-
-            now = timezone.now()
-            for state in states:
-                state.vlan = vlan
-                was_deploying = state.status == "deploying"
-                if not sm.is_owned(state.status):
-                    state.accepted_at = now
-                matches = vlan_name_matches(state)
-                state.status = (
-                    sm.on_operator_edit(state.status)
-                    if state.status == "deploying"
-                    else ("in_sync" if matches else "accepted")
-                )
-                if was_deploying:
-                    state.apply_attempt_id = None
-                state.save()
-    except _IntentTransactionNoOp as exc:
-        return exc.result
+        collision_scope = Q(group_id=vlan.group_id)
+        if vlan.qinq_svlan_id is not None:
+            collision_scope |= Q(qinq_svlan_id=vlan.qinq_svlan_id)
+        collision = vlan_model.objects.filter(collision_scope, name=desired_name).exclude(pk=vlan.pk)
+        if collision.exists():
+            return {"name": ["A VLAN with this name already exists in this VLAN scope."]}
+        raise
     return None
 
 
@@ -4849,6 +4973,9 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         from django.apps import apps
         from django.core.exceptions import ValidationError
 
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import IntentPlanStaleError
+
         spec = self._FAMILIES.get(key)
         if spec is None:
             return JsonResponse({"status": "error", "message": f"unknown overlay family: {key}"}, status=400)
@@ -4908,7 +5035,12 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
-            errors = _save_overlay_edit(obj, key, old_values)
+            try:
+                errors = _save_overlay_edit(obj, key, old_values)
+            except (IntentPlanStaleError, RendererTargetsChanged):
+                # A competing write moved a frozen preimage; the plan rolled back whole.
+                message = "This row changed. Refresh the page and try again."
+                errors = {field: [message] for field in changed}
             if errors:
                 return JsonResponse({"status": "error", "errors": errors}, status=400)
         return JsonResponse({"status": "ok", "changed": changed})
@@ -5439,83 +5571,91 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
-        from django.db import transaction
+        import copy
 
+        from .intent_state import IntentMutationProtocolError
         from .models import NSOLACPBundleState, NSOLACPMemberState
+        from .renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
 
-        state = get_object_or_404(NSOLACPBundleState, pk=pk)
-        # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
-        # lag-reconciler refuses it zero-write (a retract of an adopted vPC peer-link would
-        # delete it → dual-active split-brain). Refuse Accept so it never becomes owned/writable.
-        if state.vpc_sensitive:
-            messages.error(
-                request,
-                f"LACP bundle {state.interface.name} is vPC-protected (a vPC member/peer-link/"
-                f"orphan port) — NSO refuses to write it, so it cannot be onboarded. Left unmanaged.",
-            )
-            return redirect(_device_nso_tab_url(state.management.device_id))
-        now = timezone.now()
-        # Accept the bundle + all its members in ONE transaction so the per-save intent
-        # pushes coalesce (via _schedule_intent_push) into a single snapshot push at commit —
-        # otherwise each non-atomic save fires its own push and the member-before-bundle order
-        # emits a spurious bundle_count=0 push (FASTMAP briefly clears the bundle) before the
-        # real bundle_count=1 one.
-        with transaction.atomic():
-            for m in NSOLACPMemberState.objects.filter(management=state.management, lag_bundle=state.interface):
-                m.status = _status_after_accept(m.status)
-                m.accepted_at = now
-                m.save(update_fields=["status", "accepted_at"])
-            state.status = _status_after_accept(state.status)
-            state.accepted_at = now
-            state.save(update_fields=["status", "accepted_at"])
+        for attempt in range(2):
+            try:
+                state = get_object_or_404(NSOLACPBundleState, pk=pk)
+                # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
+                # lag-reconciler refuses it zero-write (a retract of an adopted vPC peer-link would
+                # delete it → dual-active split-brain). Refuse Accept so it never becomes owned/writable.
+                if state.vpc_sensitive:
+                    messages.error(
+                        request,
+                        f"LACP bundle {state.interface.name} is vPC-protected (a vPC member/peer-link/"
+                        f"orphan port) — NSO refuses to write it, so it cannot be onboarded. Left unmanaged.",
+                    )
+                    return redirect(_device_nso_tab_url(state.management.device_id))
+                now = timezone.now()
+                candidates = []
+                for member in NSOLACPMemberState.objects.filter(
+                    management=state.management,
+                    lag_bundle=state.interface,
+                ).order_by("pk"):
+                    candidate = copy.copy(member)
+                    candidate.status = _status_after_accept(member.status)
+                    if candidate.accepted_at is None:
+                        candidate.accepted_at = now
+                    candidates.append(candidate)
+                bundle_candidate = copy.copy(state)
+                bundle_candidate.status = _status_after_accept(state.status)
+                if bundle_candidate.accepted_at is None:
+                    bundle_candidate.accepted_at = now
+                candidates.append(bundle_candidate)
+                plan = RendererMutationPlan.build(
+                    saves=(
+                        planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates
+                    ),
+                    planned_at=now,
+                )
+                mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+                with mutation as writer:
+                    for candidate in candidates:
+                        writer.save(candidate, update_fields=("status", "accepted_at"))
+            except IntentMutationProtocolError:
+                if attempt == 0:
+                    continue
+                messages.error(request, "The LACP bundle changed. Refresh the page and try again.")
+                return redirect(_device_nso_tab_url(state.management.device_id))
+            break
         messages.success(request, f"Accepted LACP bundle {state.interface.name}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
-class _SwitchportAcceptRetry(Exception):
-    """The switchport dependencies changed before their locks were acquired."""
+def _switchport_accept_plan(state):
+    """Freeze the native, overlay, and tagged-VLAN writes for one switchport accept."""
+    import copy
 
+    from .renderer_writer import RendererMutationPlan, planned_m2m_set, planned_save
 
-def _switchport_vlan_ids(state) -> set[int]:
-    vlan_ids = set(state.tagged_vlans.values_list("pk", flat=True))
-    if state.untagged_vlan_id is not None:
-        vlan_ids.add(state.untagged_vlan_id)
-    return vlan_ids
-
-
-def _switchport_accept_footprint(state):
-    """Declare the interface, VLAN, and overlay rows changed by switchport accept."""
-    from .intent_state import MutationFootprint, SourceRow
-
-    vlan_ids = _switchport_vlan_ids(state)
-    return MutationFootprint.for_keys(
-        {(state.management.device_id, "switchport")},
-        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
-        source_rows=(
-            SourceRow("dcim.interface", state.interface_id),
-            *(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+    now = timezone.now()
+    tagged = tuple(state.tagged_vlans.order_by("pk"))
+    interface = copy.copy(state.interface)
+    interface.mode = state.mode or ""
+    interface.untagged_vlan = state.untagged_vlan
+    candidate = copy.copy(state)
+    candidate.status = _status_after_accept(state.status)
+    # staged_days measures the wait since FIRST acceptance; a re-accept must not reset it.
+    if candidate.accepted_at is None:
+        candidate.accepted_at = now
+    plan = RendererMutationPlan.build(
+        saves=(
+            planned_save(interface, update_fields=("mode", "untagged_vlan")),
+            planned_save(candidate, update_fields=("status", "accepted_at")),
         ),
-        overlay_rows=(SourceRow(state._meta.label_lower, state.pk),),
+        m2m_writes=(planned_m2m_set(interface, "tagged_vlans", tagged),),
+        planned_at=now,
     )
-
-
-def _reload_switchport_accept_state(state, vlan_ids):
-    """Revalidate the dependencies after the immutable footprint is locked."""
-    from dcim.models import Interface
-
-    from .models import NSOSwitchportState
-
-    interface = Interface.objects.filter(pk=state.interface_id).first()
-    locked_state = NSOSwitchportState.objects.select_related("management").filter(pk=state.pk).first()
-    if (
-        interface is None
-        or locked_state is None
-        or locked_state.management.device_id != interface.device_id
-        or locked_state.interface_id != interface.pk
-        or _switchport_vlan_ids(locked_state) != vlan_ids
-    ):
-        raise _SwitchportAcceptRetry
-    return locked_state, interface
+    return plan, interface, candidate, tagged
 
 
 class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
@@ -5528,26 +5668,24 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     """
 
     def post(self, request, pk):  # noqa: D102
+        from .intent_state import IntentMutationProtocolError
         from .models import NSOSwitchportState
+        from .renderer_writer import renderer_mirror_writes, renderer_writes
 
         for _attempt in range(2):
             state = get_object_or_404(NSOSwitchportState, pk=pk)
-            vlan_ids = _switchport_vlan_ids(state)
-            from .intent_state import RendererTargetsChanged, intent_transaction
-
-            try:
-                with intent_transaction(_switchport_accept_footprint(state)):
-                    state, iface = _reload_switchport_accept_state(state, vlan_ids)
-                    # native-write-on-accept: make the NetBox interface match what NSO observed.
-                    iface.mode = state.mode or ""
-                    iface.untagged_vlan = state.untagged_vlan
-                    iface.save()
-                    iface.tagged_vlans.set(state.tagged_vlans.all())
-                    state.status = _status_after_accept(state.status)
-                    state.accepted_at = timezone.now()
-                    state.save(update_fields=["status", "accepted_at"])
-            except (RendererTargetsChanged, _SwitchportAcceptRetry):
+            if state.management.device_id != state.interface.device_id:
                 continue
+            plan, interface, candidate, tagged = _switchport_accept_plan(state)
+            mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+            try:
+                with mutation as writer:
+                    writer.save(interface, update_fields=("mode", "untagged_vlan"))
+                    writer.save(candidate, update_fields=("status", "accepted_at"))
+                    writer.m2m_set(interface, "tagged_vlans", tagged)
+            except IntentMutationProtocolError:
+                continue
+            state = candidate
             break
         else:
             messages.error(request, "The switchport changed. Refresh the page and try again.")
@@ -6338,6 +6476,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
     """Per-row accept for an SNMP/logging overlay — mark owned (accepted_at + status)."""
 
     model_class = None
+    renderer_scope = None
 
     def push_blocker(self, state) -> str:
         """Why accepting *state* could not be faithfully applied, or "" when it can.
@@ -6350,6 +6489,8 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
+        if self.renderer_scope is not None:
+            return self._post_with_renderer_writer(request, state)
         from .intent_state import footprint_for_instance, intent_transaction
 
         blocker = self.push_blocker(state)
@@ -6371,6 +6512,44 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             return redirect(_device_nso_tab_url(state.management.device_id))
         messages.success(request, f"Accepted {state}.")
         return redirect(_device_nso_tab_url(state.management.device_id))
+
+    def _post_with_renderer_writer(self, request, state):
+        """Accept one converted overlay through its exact renderer plan."""
+        import copy
+
+        from .intent_state import IntentMutationProtocolError
+        from .renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        fields = ("status", "accepted_at")
+        for attempt in range(2):
+            current = get_object_or_404(self.model_class, pk=state.pk)
+            blocker = self.push_blocker(current)
+            if blocker:
+                messages.error(request, f"Cannot accept {current}: {blocker}")
+                return redirect(_device_nso_tab_url(current.management.device_id))
+            candidate = copy.copy(current)
+            candidate.status = _status_after_accept(current.status)
+            candidate.accepted_at = timezone.now()
+            try:
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(candidate, update_fields=fields),),
+                    planned_at=candidate.accepted_at,
+                )
+                mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+                with mutation as writer:
+                    writer.save(candidate, update_fields=fields)
+                break
+            except IntentMutationProtocolError:
+                if attempt:
+                    messages.error(request, "Routing state changed. Refresh the page and try again.")
+                    return redirect(_device_nso_tab_url(current.management.device_id))
+        messages.success(request, f"Accepted {candidate}.")
+        return redirect(_device_nso_tab_url(candidate.management.device_id))
 
 
 class NSOSnmpCommunityStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
@@ -6572,6 +6751,7 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
 
 class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSVIState
+    renderer_scope = "svi"
 
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
@@ -6623,6 +6803,7 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOVLANState
+    renderer_scope = "vlan"
 
 
 class NSOVLANRescopeView(NSOActionPermissionMixin, View):
@@ -6652,7 +6833,6 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         from ipam.models import VLANGroup
 
-        from .intent_state import RendererTargetsChanged
         from .vlan_reconciler import VLANRescopeConflict, rescope_vlan
 
         state = get_object_or_404(NSOVLANState, pk=pk)
@@ -6660,8 +6840,8 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
         device_id = state.management.device_id
         try:
             action, vlan = rescope_vlan(state, group)
-        # A device that starts rendering the source VLAN during acquisition is the same refusal.
-        except (VLANRescopeConflict, RendererTargetsChanged):
+        # rescope_vlan converts every acquisition-time protocol error into this refusal.
+        except VLANRescopeConflict:
             messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
             return redirect(_device_nso_tab_url(device_id))
         if action == "noop":
@@ -7018,6 +7198,8 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         )
 
     def post(self, request, device_pk):  # noqa: D102
+        import copy
+
         from django.utils import timezone
         from ipam.models import VLAN
 
@@ -7027,29 +7209,50 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         except (TypeError, ValueError):
             messages.error(request, "Select a valid VLAN.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
-        if not VLAN.objects.filter(pk=vlan_id).exists():
+        vlan = VLAN.objects.filter(pk=vlan_id).first()
+        if vlan is None:
             messages.error(request, "The selected VLAN is no longer available.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
-        from .intent_state import intent_transaction, vlan_footprint
 
-        footprint = vlan_footprint(vlan_id, ("vlan",), extra_device_ids=(mgmt.device_id,))
+        current = NSOVLANState.objects.filter(management=mgmt, vlan=vlan).first()
+        created = current is None
+        now = timezone.now()
+        state = (
+            NSOVLANState(management=mgmt, vlan=vlan, status="accepted", accepted_at=now)
+            if created
+            else copy.copy(current)
+        )
+        if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
+            state.status = "accepted"
+            state.accepted_at = now
+        state.last_sync_at = now
+
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        update_fields = None if created else ("status", "accepted_at", "last_sync_at")
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    state,
+                    update_fields=update_fields,
+                    force_insert=created,
+                    natural_key=("management", "vlan"),
+                ),
+            ),
+            planned_at=now,
+        )
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         try:
-            with intent_transaction(footprint):
-                vlan = VLAN.objects.filter(pk=vlan_id).first()
-                if vlan is None:
-                    raise _IntentTransactionNoOp
-
-                state, created = NSOVLANState.objects.get_or_create(
-                    management=mgmt,
-                    vlan=vlan,
-                    defaults={"status": "accepted", "accepted_at": timezone.now()},
-                )
-                if not created and state.status not in ("accepted", "deploying", "in_sync", "apply_failed"):
-                    state.status = "accepted"
-                    state.accepted_at = timezone.now()
-                state.last_sync_at = timezone.now()
-                state.save()  # → _on_vlan_state_save schedules the owned-VLAN intent push
-        except _IntentTransactionNoOp:
+            with mutation as writer:
+                writer.save(state, update_fields=update_fields, force_insert=created)
+        except (IntentPlanStaleError, RendererTargetsChanged):
             messages.error(request, "The selected VLAN is no longer available.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
         messages.success(

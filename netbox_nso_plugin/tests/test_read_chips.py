@@ -25,6 +25,8 @@ from django.utils.dateparse import parse_datetime
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOFamilyReadState, NSOInstance
 
+from ._outbox_case import mirror_update
+
 User = get_user_model()
 
 _INC = ("66666666-ffff-4fff-8fff-666666666666", "2026-07-02T00:00:00Z")
@@ -185,9 +187,7 @@ class TestFamilyChipMatrix(TestCase):
 
     def test_missing_row_on_a_never_adopted_device_renders_no_chip(self):
         """Pre-S4 continuity: no adopted incarnation → no chips at all (R1-F9)."""
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
-            adapter_incarnation="", adapter_incarnation_born=None
-        )
+        mirror_update(self.mgmt, adapter_incarnation="", adapter_incarnation_born=None)
         self.mgmt.refresh_from_db()
         self.assertIsNone(_chip(self.device, self.mgmt, "l2_services"))
 
@@ -204,7 +204,8 @@ class TestFamilyChipMatrix(TestCase):
         """R11/R12: while a reset is pending, old-incarnation rows never render
         healthy — every category shows the reset-pending state."""
         _row(self.mgmt, "l2_service")  # would be healthy
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+        mirror_update(
+            self.mgmt,
             reset_pending_incarnation=_INC_NEW[0],
             reset_pending_born=parse_datetime(_INC_NEW[1]),
         )
@@ -271,7 +272,8 @@ class TestCountsEndpointCarriesReadState(TestCase):
         self.assertIsNone(data["categories"]["l2_services"]["read"])
 
     def test_device_reset_pending_flag_rides_the_payload(self):
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(
+        mirror_update(
+            self.mgmt,
             reset_pending_incarnation=_INC_NEW[0],
             reset_pending_born=parse_datetime(_INC_NEW[1]),
         )
@@ -336,7 +338,7 @@ class TestTabLiveReadStateFetch(TestCase):
         self.assertEqual(resp.status_code, 200)  # the tab renders; chips = persisted
 
     def test_unlinked_device_skips_the_fetch(self):
-        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_device_id=None)
+        mirror_update(self.mgmt, adapter_device_id=None)
         url = reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
         with patch("netbox_nso_plugin.adapter_client.get_device_read_state") as m_rs:
             resp = self.client.get(url)

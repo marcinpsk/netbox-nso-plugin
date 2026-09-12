@@ -10,13 +10,18 @@ on:
     branches:
       - main
       - develop
+      - 'stack/1627-**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CI_SHARDS: "2"
+
 jobs:
   test-netbox:
+    name: test-netbox (${{ matrix.environment.python-version }}, ${{ matrix.environment.netbox-version }}, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 55
     permissions:
@@ -24,13 +29,16 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
-        include:
+        environment: &netbox-environments
           - python-version: "3.12"
-            netbox-version: "v4.6.1"
+            netbox-version: "v4.6.10"
+            netbox-ref: "560da79ea1213a0b8bbc9ecf4ac03714fa2071d7"
           - python-version: "3.13"
-            netbox-version: "v4.6.7"
+            netbox-version: "v4.7.0"
+            netbox-ref: "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
+        shard: [1, 2]
 
     services:
       redis:
@@ -58,20 +66,17 @@ jobs:
           path: netbox-nso-plugin
           persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
-
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.environment.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.environment.python-version }}
 
       - name: Checkout NetBox
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: netbox-community/netbox
           path: netbox
-          ref: ${{ matrix.netbox-version }}
+          ref: ${{ matrix.environment.netbox-ref }}
           persist-credentials: false
 
       # The joined pin boots the real adapter from this exact commit. It verifies
@@ -84,11 +89,21 @@ jobs:
           path: .o3c-adapter
           persist-credentials: false
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          cache-dependency-glob: |
+            netbox/requirements*.txt
+            netbox-nso-plugin/pyproject.toml
+            netbox-nso-plugin/uv.lock
+            netbox-nso-plugin/.github/workflows/test.yaml
+          cache-suffix: ${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}
+
       - name: Install NetBox and plugin
         working-directory: netbox-nso-plugin
         run: |
           uv pip install --system -r ../netbox/requirements.txt
-          uv pip install --system pytest pytest-django pytest-cov pytest-xdist requests-mock tblib
+          uv pip install --system pytest pytest-django pytest-cov pytest-xdist pytest-split==0.11.0 requests-mock tblib
           # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models.
           # Pinned to a commit SHA (not the mutable feature/integration branch) so CI is
           # reproducible and a fork push cannot silently change what this repo tests against.
@@ -138,13 +153,75 @@ jobs:
         env:
           NETBOX_CONFIGURATION: netbox.configuration
           NETBOX_NSO_USE_REAL_NETBOX: "1"
-          PYTHONPATH: ${{ github.workspace }}/netbox/netbox
+          PYTHONPATH: ${{ github.workspace }}/netbox/netbox:${{ github.workspace }}/netbox-nso-plugin/.github/ci
           TEST_DB_NAME: test_netbox_nso_plugin_ci
+          CI_TEST_LANE: ${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}
+          CI_SHARD: ${{ matrix.shard }}
+          COVERAGE_FILE: ${{ github.workspace }}/netbox-nso-plugin/.ci-results/.coverage
         # Four workers match the standard public runner's CPU allocation. The
         # plugin conftest gives each worker an isolated PostgreSQL database.
         # The pythonpath override replaces the ini value (devcontainer netbox +
         # netbox_stubs): the stubs would shadow the real NetBox checkout here.
-        run: pytest -n 4 --disable-warnings -o pythonpath=../netbox/netbox
+        run: |
+          mkdir -p .ci-results
+          python -u -m pytest -n 4 --disable-warnings -o pythonpath=../netbox/netbox \
+            -p sharding --splits "$CI_SHARDS" --group "$CI_SHARD" \
+            --splitting-algorithm least_duration --durations-path .github/ci/durations.json \
+            --ci-shard-report .ci-results/report.json --cov-fail-under=0 --durations=30
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-shard-${{ matrix.shard }}
+          path: netbox-nso-plugin/.ci-results/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  test-netbox-coverage:
+    name: test-netbox (${{ matrix.environment.python-version }}, ${{ matrix.environment.netbox-version }})
+    needs: test-netbox
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: *netbox-environments
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: netbox-nso-plugin
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.environment.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - name: Install gate dependencies
+        run: uv pip install --system pytest pytest-cov pytest-xdist pytest-split==0.11.0
+      - name: Test the shard gate
+        working-directory: netbox-nso-plugin
+        run: python -m unittest discover -s .github/ci -v
+      - name: Download this version's shard evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
+        with:
+          pattern: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-shard-*
+          path: netbox-nso-plugin/.ci-results
+      - name: Verify complete execution and combined coverage
+        working-directory: netbox-nso-plugin
+        run: |
+          python .github/ci/sharding.py aggregate .ci-results --shards "$CI_SHARDS"
+      - name: Upload refreshed timing data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-durations
+          path: netbox-nso-plugin/.ci-results/durations.json
+          if-no-files-found: error
 
   live-adapter-contract:
     name: Live adapter contract
@@ -264,7 +341,7 @@ jobs:
           NSO_LIVE_ADAPTER_URL: http://127.0.0.1:18000
           NSO_LIVE_ADAPTER_TOKEN: contract-adapter-token
         run: >-
-          uv run --native-tls -- pytest
+          uv run -- pytest
           -c /dev/null --rootdir=.
           contract_tests/test_live_adapter_contract.py
           --quiet

@@ -53,6 +53,40 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
+    def test_vlan_reconciler_uses_the_first_repeated_vlan_entry(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        rows = reconcile_vlan_database(
+            self.device,
+            {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627, "name": "SECOND"}]},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].device_name, "FIRST")
+        self.assertEqual(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).count(), 1)
+
+    def test_same_vid_states_do_not_hide_an_unreported_attachment(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        first, second = (
+            NSOVLANState.objects.create(
+                management=self.management,
+                vlan=VLAN.objects.create(vid=1627, name=name),
+                status="imported",
+            )
+            for name in ("REPORTED", "UNREPORTED")
+        )
+
+        rows = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 1627, "name": "REPORTED"}]})
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual([row.pk for row in rows], [first.pk])
+        self.assertEqual(first.device_name, "REPORTED")
+        self.assertIsNotNone(first.last_sync_at)
+        self.assertEqual(second.status, "changed")
+        self.assertIsNone(second.last_sync_at)
+
     def test_vlan_footprint_does_not_create_the_device_group(self):
         from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_footprint
 
@@ -87,6 +121,85 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         _native_vlan_footprint(self.device, {"vlans": [{"vlan_id": 1627}]}, "vlan")
 
         self.assertFalse(VLANGroup.objects.filter(slug=f"nso-{self.device.pk}").exists())
+
+    def test_vlan_reconciler_skips_entries_without_a_usable_vlan_id(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        payload = {
+            "vlans": [
+                None,
+                {},
+                {"vlan_id": None},
+                {"vlan_id": "not-an-integer"},
+                {"vlan_id": 1624, "name": "VALID"},
+            ]
+        }
+        with self.assertLogs("netbox_nso_plugin.vlan_reconciler", level="WARNING"):
+            rows = reconcile_vlan_database(self.device, payload)
+
+        self.assertEqual([row.vlan.vid for row in rows], [1624])
+
+    def test_vlan_reconcile_preflights_native_and_overlay_creations(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
+
+        plan = vlan_reconcile_plan(
+            self.device,
+            {"vlans": [{"vlan_id": 1627, "name": "PREFLIGHT"}]},
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "ipam.vlangroup"),
+                ("save", "ipam.vlan"),
+                ("save", "netbox_nso_plugin.nsovlanstate"),
+            ],
+        )
+
+    def test_vlan_plan_rejects_malformed_entries_for_unmanaged_device(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
+
+        device = _make_device("unmanaged-entries")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
+        with self.assertRaises(AdapterError) as raised:
+            vlan_reconcile_plan(device, {"vlans": 7})
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_vlan_plan_rejects_non_dict_document_for_unmanaged_device(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import vlan_reconcile_plan
+
+        device = _make_device("unmanaged-document")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
+        with self.assertRaises(AdapterError) as raised:
+            vlan_reconcile_plan(device, [])
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_vlan_reconcile_adopts_a_completed_creation_plan(self):
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.vlan_reconciler import (
+            _reconcile_vlan_database,
+            vlan_reconcile_plan,
+        )
+
+        payload = {"vlans": [{"vlan_id": 1645, "name": "RACE"}]}
+        waiting_plan = vlan_reconcile_plan(self.device, payload)
+        winner_plan = vlan_reconcile_plan(self.device, payload)
+        with renderer_mirror_writes(winner_plan) as writer:
+            _reconcile_vlan_database(self.device, payload, writer, winner_plan.planned_at)
+
+        with renderer_mirror_writes(waiting_plan) as writer:
+            rows = _reconcile_vlan_database(self.device, payload, writer, waiting_plan.planned_at)
+
+        self.assertEqual([row.vlan.vid for row in rows], [1645])
+        self.assertEqual(NSOVLANState.objects.filter(management=self.management, vlan__vid=1645).count(), 1)
 
     def test_direct_vlan_reconcile_does_not_advance_intent_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision
@@ -123,6 +236,290 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         revision.refresh_from_db()
         self.assertEqual(revision.revision, before)
+
+    def test_switchport_reconcile_preflights_seed_and_overlay(self):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+        from netbox_nso_plugin.vlan_reconciler import switchport_reconcile_plan
+
+        plan = switchport_reconcile_plan(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "access",
+                        "untagged_vlan": 1627,
+                        "tagged_vlans": [],
+                    }
+                ]
+            },
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "ipam.vlangroup"),
+                ("save", "ipam.vlan"),
+                ("save", "dcim.interface"),
+                ("save", "netbox_nso_plugin.nsoswitchportstate"),
+            ],
+        )
+
+    def test_switchport_reconcile_adopts_a_completed_creation_plan(self):
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes
+        from netbox_nso_plugin.vlan_reconciler import (
+            _reconcile_switchport,
+            prepare_switchport_reconcile,
+        )
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "trunk",
+                    "untagged_vlan": 1646,
+                    "tagged_vlans": [1647],
+                }
+            ]
+        }
+        waiting = prepare_switchport_reconcile(self.device, payload)
+        winner = prepare_switchport_reconcile(self.device, payload)
+        with renderer_mirror_writes(winner.plan) as writer:
+            _reconcile_switchport(self.device, payload, writer, winner.plan.planned_at, winner.interface_pks)
+
+        with renderer_mirror_writes(waiting.plan) as writer:
+            rows = _reconcile_switchport(self.device, payload, writer, waiting.plan.planned_at, waiting.interface_pks)
+
+        self.assertEqual([row.interface_id for row in rows], [self.interface.pk])
+
+    def test_switchport_plan_rejects_malformed_payloads_for_unmanaged_device(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import prepare_switchport_reconcile
+
+        device = _make_device("unmanaged-switchport")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
+        payloads = (
+            [],
+            {"interfaces": 7},
+            {"interfaces": [{"interface_name": "port1", "tagged_vlans": 7}]},
+            {"interfaces": [{"interface_name": [], "mode": "", "tagged_vlans": []}]},
+            {"interfaces": [{"interface_name": "port1", "mode": [], "tagged_vlans": []}]},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(AdapterError) as raised:
+                    prepare_switchport_reconcile(device, payload)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_switchport_reconcile_rejects_malformed_tagged_vlan_values(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_switchport(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": self.interface.name,
+                            "mode": "trunk",
+                            "untagged_vlan": None,
+                            "tagged_vlans": 1648,
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_switchport_reconciler_accepts_the_unconfigured_mode_sentinel(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].mode, "")
+
+    def test_switchport_reconcile_unset_mode_clears_imported_trunk(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": 1648,
+                        "tagged_vlans": [1649],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+        state = rows[0]
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "tagged")
+        self.assertEqual(self.interface.untagged_vlan.vid, 1648)
+        self.assertEqual(list(self.interface.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.mode, "tagged")
+        self.assertEqual(state.untagged_vlan.vid, 1648)
+        self.assertEqual(list(state.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.status, "imported")
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(NSOSwitchportState.objects.filter(management=self.management).count(), 1)
+        state.refresh_from_db()
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "")
+        self.assertIsNone(self.interface.untagged_vlan_id)
+        self.assertFalse(self.interface.tagged_vlans.exists())
+        self.assertEqual(state.mode, "")
+        self.assertIsNone(state.untagged_vlan_id)
+        self.assertFalse(state.tagged_vlans.exists())
+        self.assertEqual(state.status, "imported")
+
+    def test_switchport_tagged_to_access_transition_clears_the_tagged_vlans(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": 1648,
+                        "tagged_vlans": [1649],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+        state = rows[0]
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "tagged")
+        self.assertEqual(self.interface.untagged_vlan.vid, 1648)
+        self.assertEqual(list(self.interface.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.mode, "tagged")
+        self.assertEqual(state.untagged_vlan.vid, 1648)
+        self.assertEqual(list(state.tagged_vlans.values_list("vid", flat=True)), [1649])
+        self.assertEqual(state.status, "imported")
+
+        rows = reconcile_switchport(
+            self.device,
+            {
+                "device_id": 1,
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "access",
+                        "untagged_vlan": 1648,
+                        "tagged_vlans": [],
+                        "source": "switchport",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.assertEqual(NSOSwitchportState.objects.filter(management=self.management).count(), 1)
+        state.refresh_from_db()
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.mode, "access")
+        self.assertEqual(self.interface.untagged_vlan.vid, 1648)
+        self.assertFalse(self.interface.tagged_vlans.exists())
+        self.assertEqual(state.mode, "access")
+        self.assertEqual(state.untagged_vlan.vid, 1648)
+        self.assertFalse(state.tagged_vlans.exists())
+        self.assertEqual(state.status, "imported")
+
+    def test_switchport_reconcile_rejects_an_unknown_mode(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_switchport(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": self.interface.name,
+                            "mode": "acess",
+                            "untagged_vlan": None,
+                            "tagged_vlans": [],
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_switchport_overlay_plan_references_vlans_created_for_the_native_mirror(self):
+        from netbox_nso_plugin.renderer_writer import RendererCreationRef
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group, switchport_reconcile_plan
+
+        _device_vlan_group(self.device)
+
+        plan = switchport_reconcile_plan(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": 1625,
+                        "tagged_vlans": [1626],
+                    }
+                ]
+            },
+        )
+
+        overlay = next(write for write in plan.write_set if write.model_label == "netbox_nso_plugin.nsoswitchportstate")
+        self.assertIsInstance(dict(overlay.values)["untagged_vlan_id"], RendererCreationRef)
+        overlay_m2m = next(
+            write
+            for write in plan.write_set
+            if write.operation == "m2m_set" and write.model_label == "netbox_nso_plugin.nsoswitchportstate"
+        )
+        self.assertEqual(len(overlay_m2m.selected_pks), 1)
+        self.assertIsInstance(overlay_m2m.selected_pks[0], RendererCreationRef)
 
     def test_switchport_plan_detects_a_reported_owned_fragment_change(self):
         from netbox_nso_plugin.models import NSOSwitchportState
@@ -170,8 +567,11 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertTrue(plan.changes_content)
 
-    def test_switchport_plan_recognizes_an_identical_owned_payload(self):
+    def test_switchport_plan_uses_the_registered_renderer_fragment(self):
+        from unittest.mock import patch
+
         from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.signals import switchport_intent_item
         from netbox_nso_plugin.vlan_reconciler import (
             reconcile_switchport,
             reconcile_vlan_database,
@@ -195,17 +595,23 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
         content_update(state, status="in_sync")
 
-        plan = switchport_reconcile_plan(self.device, payload)
+        def extended_fragment(row, tagged_vlan_ids):
+            return {**switchport_intent_item(row, tagged_vlan_ids), "encapsulation": "dot1q"}
+
+        with patch(
+            "netbox_nso_plugin.signals.switchport_intent_item",
+            side_effect=extended_fragment,
+        ) as fragment:
+            plan = switchport_reconcile_plan(self.device, payload)
 
         self.assertFalse(plan.changes_content)
+        self.assertGreaterEqual(fragment.call_count, 2)
 
     def test_switchport_body_writes_only_the_interfaces_resolved_at_plan_time(self):
         """An interface that arrives after the plan is deferred: writing it escapes the footprint."""
-        from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
         from netbox_nso_plugin.vlan_reconciler import (
-            _reconcile_switchport,
             prepare_switchport_reconcile,
             reconcile_switchport,
             reconcile_vlan_database,
@@ -221,8 +627,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         attempt = prepare_switchport_reconcile(self.device, payload)
         late = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
 
-        with reconcile_transaction(attempt.plan), suppress_intent_push():
-            _reconcile_switchport(self.device, payload, attempt.interface_pks)
+        plan = attempt.plan  # the read gate opens the writer for the frozen plan, then runs the body
+        with renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan):
+            reconcile_switchport(self.device, payload, attempt)
 
         late.refresh_from_db()
         self.assertFalse(late.mode)
@@ -240,14 +647,49 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(late.mode, "access")
         self.assertEqual(late.untagged_vlan.vid, 10)
 
-    def test_switchport_body_reloads_the_frozen_interfaces_after_acquisition(self):
-        """An operator edit committed after the plan must not be clobbered from a stale copy."""
-        from netbox_nso_plugin.intent_state import reconcile_transaction
+    def test_standalone_switchport_replan_keeps_the_frozen_interface_set(self):
+        """A replan re-reads the frozen pks; it must never re-resolve names mid-acquisition."""
         from netbox_nso_plugin.models import NSOSwitchportState
-        from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.vlan_reconciler import (
-            _reconcile_switchport,
             prepare_switchport_reconcile,
+            reconcile_switchport,
+            reconcile_vlan_database,
+        )
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 10, "name": "TEN"}]})
+        payload = {
+            "interfaces": [
+                {"interface_name": self.interface.name, "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+                {"interface_name": "GigabitEthernet0/3", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []},
+            ]
+        }
+        attempt = prepare_switchport_reconcile(self.device, payload)
+        late = Interface.objects.create(device=self.device, name="GigabitEthernet0/3", type="1000base-t")
+
+        reconcile_switchport(self.device, payload, attempt)
+
+        late.refresh_from_db()
+        self.assertFalse(late.mode)
+        self.assertIsNone(late.untagged_vlan_id)
+        self.assertFalse(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+        seeded = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual(seeded.status, "imported")
+
+        reconcile_switchport(self.device, payload)  # a fresh attempt resolves it and seeds it
+        self.assertTrue(NSOSwitchportState.objects.filter(management=self.management, interface=late).exists())
+
+    def test_switchport_body_reloads_the_frozen_interfaces_after_acquisition(self):
+        """An operator edit committed after the plan must not be clobbered from a stale copy.
+
+        Only the standalone entry replans a stale pre-image, once. The gated read refuses it
+        (IntentPlanStaleError), and on both the category and the whole-device path that refusal
+        is reported as a skipped stale attempt: no row is moved to ``error``, and the next read
+        re-plans. SVI behaves the same. Card #1659 tracks the gate-path race.
+        """
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import (
+            prepare_switchport_reconcile,
+            reconcile_switchport,
             reconcile_vlan_database,
         )
 
@@ -267,8 +709,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         edited.untagged_vlan = VLAN.objects.get(group=group, vid=20)
         edited.save()
 
-        with reconcile_transaction(attempt.plan), suppress_intent_push():
-            _reconcile_switchport(self.device, payload, attempt.interface_pks)
+        reconcile_switchport(self.device, payload, attempt)
 
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.untagged_vlan.vid, 20)  # operator value NOT clobbered
@@ -442,7 +883,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
     def test_vlan_rename_surfaces_drift_immediately(self):
         """Renaming an ipam.VLAN flips the overlay to changed without a full reconcile."""
-        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, save_vlan_content
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 30, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.management, vlan__vid=30)
@@ -451,26 +892,44 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         # Operator renames the VLAN in NetBox — fires ipam.VLAN post_save only.
         vlan.name = "RENAMED"
-        vlan.save()
+        save_vlan_content(vlan, update_fields=("name",))
 
         state.refresh_from_db()
         self.assertEqual(state.status, "changed")
 
+    def test_direct_vlan_rename_schedules_the_owned_snapshot(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
+        state = NSOVLANState.objects.get(management=self.management, vlan__vid=33)
+        from ._outbox_case import content_update, mirror_update
+
+        mirror_update(self.management, adapter_device_id=33)
+        content_update(state, status="in_sync")
+        state.vlan.name = "RENAMED"
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.vlan.save(update_fields=["name"])
+
+        schedule.assert_called_once_with((self.device.pk, "vlan"))
+
     def test_vlan_rename_back_clears_drift(self):
         """Renaming back to the device value clears the overlay drift immediately."""
-        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, save_vlan_content
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 31, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.management, vlan__vid=31)
         vlan = state.vlan
 
         vlan.name = "RENAMED"
-        vlan.save()
+        save_vlan_content(vlan, update_fields=("name",))
         state.refresh_from_db()
         self.assertEqual(state.status, "changed")
 
         vlan.name = "MGMT"
-        vlan.save()
+        save_vlan_content(vlan, update_fields=("name",))
         state.refresh_from_db()
         self.assertNotEqual(state.status, "changed")
 
@@ -507,6 +966,45 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "deploying")
         self.assertEqual(state.apply_attempt_id, attempt)
 
+    def test_content_changing_read_preserves_other_deploying_vlans(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        from ._outbox_case import content_update
+
+        first, second = reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}, {"vlan_id": 34, "name": "DATA"}]}
+        )
+        content_update(second, status="in_sync")
+        attempt = uuid4()
+        content_update(first, status="deploying", apply_attempt_id=attempt)
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 33, "name": "MGMT"}]})
+
+        first.refresh_from_db()
+        self.assertEqual(first.status, "deploying")
+        self.assertEqual(first.apply_attempt_id, attempt)
+
+    def test_vid_edit_rejects_a_taken_placeholder_name(self):
+        from netbox_nso_plugin.signals import vlan_intent_item
+        from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
+            reconcile_vlan_database,
+            save_vlan_content,
+        )
+
+        from ._outbox_case import content_update
+
+        (state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
+        content_update(state, status="accepted")
+        VLAN.objects.create(group=state.vlan.group, vid=7, name="VLAN 6")
+        state.vlan.vid = 6
+
+        with self.assertRaises(VLANRescopeConflict):
+            save_vlan_content(state.vlan, update_fields=("vid",))
+
+        state.refresh_from_db()
+        self.assertEqual(vlan_intent_item(state), {"vlan_id": 5, "name": ""})
+
     def test_rescope_move_to_empty_group(self):
         """Re-scoping into a group with no collision just moves the VLAN (stays synced)."""
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
@@ -530,6 +1028,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         """Re-scoping into a group that already has the vid merges onto the shared VLAN."""
         from unittest.mock import patch
 
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 41, "name": "MGMT"}]})
@@ -564,6 +1064,23 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(self.interface.untagged_vlan_id, shared.pk)
         self.assertFalse(VLAN.objects.filter(pk=per_device_vlan.pk).exists())
         self.assertEqual(VLAN.objects.filter(group=site, vid=41).count(), 1)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(
+                delivery.render("vlan", self.device.pk, self.management.adapter_device_id).payload
+            ),
+        )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="vlan",
+                native_model_label="ipam.vlan",
+                native_key={"group_id": shared.group_id, "vid": shared.vid},
+                ownership_state="owned",
+            ).exists()
+        )
 
     def test_rescope_merge_repends_an_owned_placeholder_when_its_wire_name_changes(self):
         from unittest.mock import patch
@@ -629,13 +1146,92 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(surviving_state.status, "accepted")
         self.assertFalse(NSOVLANState.objects.filter(pk=source_state.pk).exists())
 
-    def test_rescope_rejects_a_source_vlan_identity_change_while_waiting(self):
+    def test_rescope_merge_deduplicates_existing_target_memberships(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 46, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=46)
+        source_vlan = source_state.vlan
+        target_group = VLANGroup.objects.create(name="Deduplicate Target", slug="deduplicate-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=46, name="MGMT")
+        self.interface.tagged_vlans.set((source_vlan, target_vlan))
+        switchport = NSOSwitchportState.objects.create(
+            management=self.management,
+            interface=self.interface,
+            mode="tagged",
+            status="imported",
+        )
+        switchport.tagged_vlans.set((source_vlan, target_vlan))
+
+        action, surviving = rescope_vlan(source_state, target_group)
+
+        self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
+        self.assertEqual(list(self.interface.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
+        self.assertEqual(list(switchport.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
+
+    def test_merge_plan_batches_tagged_vlan_loads_for_native_and_overlay_owners(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import _vlan_repoint_plan, reconcile_vlan_database, rescope_vlan
+
+        (source_state,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 48, "name": "MGMT"}]})
+        source_vlan = source_state.vlan
+        target_group = VLANGroup.objects.create(name="Batched Merge Target", slug="batched-merge-target")
+        target_vlan = VLAN.objects.create(group=target_group, vid=48, name="MGMT")
+        owners = []
+        for index in range(4):
+            interface = Interface.objects.create(
+                device=self.device, name=f"GigabitEthernet1/{index}", type="1000base-t", mode="tagged"
+            )
+            switchport = NSOSwitchportState.objects.create(
+                management=self.management, interface=interface, mode="tagged", status="imported"
+            )
+            for owner in (interface, switchport):
+                owner.tagged_vlans.set((source_vlan, target_vlan))
+                owners.append(owner)
+        through_tables = {
+            connection.ops.quote_name(model._meta.get_field("tagged_vlans").remote_field.through._meta.db_table)
+            for model in (Interface, NSOSwitchportState)
+        }
+        vlan_table = connection.ops.quote_name(VLAN._meta.db_table)
+
+        with CaptureQueriesContext(connection) as queries:
+            _plan, _saves, m2m_sets, _deletes, _push_targets, _device_ids = _vlan_repoint_plan(source_vlan, target_vlan)
+
+        self.assertCountEqual(
+            [
+                (owner._meta.label_lower, owner.pk, field_name, tuple(vlan.pk for vlan in tagged))
+                for owner, field_name, tagged in m2m_sets
+            ],
+            [(owner._meta.label_lower, owner.pk, "tagged_vlans", (target_vlan.pk,)) for owner in owners],
+        )
+        tagged_queries = [
+            query["sql"]
+            for query in queries
+            if f"FROM {vlan_table}" in query["sql"] and any(table in query["sql"] for table in through_tables)
+        ]
+        self.assertFalse([sql for sql in tagged_queries if sql.lstrip().upper().startswith("SELECT 1 AS")])
+        # Exact writer identity probes remain separate from loading the related VLAN rows.
+        row_loads = [sql for sql in tagged_queries if f'{vlan_table}."name"' in sql.split(" FROM ", 1)[0]]
+        self.assertEqual(len(row_loads), 2)
+        for table in through_tables:
+            self.assertEqual(sum(table in sql for sql in row_loads), 1)
+
+        action, surviving = rescope_vlan(source_state, target_group)
+
+        self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
+        for owner in owners:
+            self.assertEqual(list(owner.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
+
+    def test_rescope_retries_a_merge_after_source_identity_changes_while_waiting(self):
         from unittest.mock import patch
 
         from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
             reconcile_vlan_database,
             rescope_vlan,
         )
@@ -643,34 +1239,64 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 43, "name": "MGMT"}]})
         source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=43)
         target_group = VLANGroup.objects.create(name="Identity Target", slug="identity-target")
-        VLAN.objects.create(group=target_group, vid=43, name="MGMT")
-        original_footprint = intent_state.vlan_footprint
+        target_vlan = VLAN.objects.create(group=target_group, vid=43, name="MGMT")
         changed = False
 
-        def change_source_before_native_lock(vlan_id, scopes, **kwargs):
+        def change_source_before_native_lock(plan):
             nonlocal changed
-            footprint = original_footprint(vlan_id, scopes, **kwargs)
-            if not changed and vlan_id == source_state.vlan_id:
+            if not changed:
                 changed = True
+                footprint = intent_state.footprint_for_instance(source_state.vlan)
                 with suppress_intent_push(), intent_state.intent_transaction(footprint):
-                    VLAN.objects.filter(pk=vlan_id).update(vid=1043)
-            return footprint
+                    VLAN.objects.filter(pk=source_state.vlan_id).update(vid=1043)
+            return plan
 
-        with (
-            patch(
-                "netbox_nso_plugin.intent_state.vlan_footprint",
-                side_effect=change_source_before_native_lock,
-            ),
-            self.assertRaises(VLANRescopeConflict),
+        with patch(
+            "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
+            side_effect=change_source_before_native_lock,
         ):
-            rescope_vlan(source_state, target_group)
+            action, vlan = rescope_vlan(source_state, target_group)
+
+        self.assertTrue(changed)
+        self.assertEqual((action, vlan.pk), ("merged", target_vlan.pk))
+
+    def test_rescope_retries_a_source_identity_change_after_planning(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, rescope_vlan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
+        source_state = NSOVLANState.objects.get(management=self.management, vlan__vid=44)
+        target_group = VLANGroup.objects.create(name="Retry Target", slug="retry-target")
+        changed = False
+
+        def change_source_before_native_lock(plan):
+            nonlocal changed
+            if not changed:
+                changed = True
+                footprint = intent_state.footprint_for_instance(source_state.vlan)
+                with suppress_intent_push(), intent_state.intent_transaction(footprint):
+                    VLAN.objects.filter(pk=source_state.vlan_id).update(vid=1044)
+            return plan
+
+        with patch(
+            "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
+            side_effect=change_source_before_native_lock,
+        ):
+            action, vlan = rescope_vlan(source_state, target_group)
+
+        self.assertTrue(changed)
+        self.assertEqual(action, "moved")
+        self.assertEqual(vlan.group_id, target_group.pk)
 
     def test_rescope_rejects_a_device_that_attaches_before_transaction_acquisition(self):
         from unittest.mock import patch
 
         from netbox_nso_plugin import intent_state
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.vlan_reconciler import (
+            VLANRescopeConflict,
             reconcile_vlan_database,
             rescope_vlan,
         )
@@ -685,13 +1311,11 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             nso_instance=self.instance,
             nso_device_name="late-membership",
         )
-        original_footprint = intent_state.vlan_footprint
         attached = False
 
-        def attach_before_transaction(vlan_id, scopes, **kwargs):
+        def attach_before_transaction(plan):
             nonlocal attached
-            footprint = original_footprint(vlan_id, scopes, **kwargs)
-            if not attached and vlan_id == source_state.vlan_id:
+            if not attached:
                 attached = True
                 late_state = NSOVLANState(
                     management=late_management,
@@ -701,14 +1325,14 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 )
                 with intent_state.intent_transaction(intent_state.footprint_for_instance(late_state)):
                     late_state.save()
-            return footprint
+            return plan
 
         with (
             patch(
-                "netbox_nso_plugin.intent_state.vlan_footprint",
+                "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
                 side_effect=attach_before_transaction,
             ),
-            self.assertRaisesRegex(IntentMutationProtocolError, "changed its renderer targets"),
+            self.assertRaisesRegex(VLANRescopeConflict, "membership changed"),
         ):
             rescope_vlan(source_state, target_group)
 
@@ -755,6 +1379,296 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             },
         )
         self.assertEqual(rows[0].status, "imported")
+
+    def test_switchport_tagged_only_change_mirrors_after_the_scalar_save_is_consumed(self):
+        """A tagged-only device change still mirrors when the planned scalar save is a no-op."""
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, reconcile_vlan_database
+
+        def trunk(vid):
+            return {
+                "interfaces": [
+                    {
+                        "interface_name": self.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [vid],
+                    }
+                ]
+            }
+
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        imported = reconcile_switchport(self.device, trunk(10))
+        self.assertEqual(imported[0].status, "imported")
+        base_before = imported[0].device_base_hash
+
+        reconcile_switchport(self.device, trunk(20))
+
+        self.interface.refresh_from_db()
+        self.assertEqual([vlan.vid for vlan in self.interface.tagged_vlans.all()], [20])
+        state = NSOSwitchportState.objects.get(management=self.management, interface=self.interface)
+        self.assertEqual([vlan.vid for vlan in state.tagged_vlans.all()], [20])
+        self.assertNotEqual(state.device_base_hash, base_before)
+        self.assertEqual(state.status, "imported")
+
+    def test_switchport_completed_tagged_replacement_is_not_re_executed(self):
+        """Consume completed tagged replacements without executing them again."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.merge_util import content_hash
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_set,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+        from netbox_nso_plugin.vlan_reconciler import (
+            prepare_switchport_reconcile,
+            reconcile_switchport,
+            reconcile_vlan_database,
+            switchport_reconcile_plan,
+        )
+
+        def acquire(plan):
+            # read_gate.gated_family_run picks the mutation for a renderer plan exactly this way
+            return renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": self.interface.name,
+                    "mode": "trunk",
+                    "untagged_vlan": None,
+                    "tagged_vlans": [10],
+                }
+            ]
+        }
+        reconcile_vlan_database(
+            self.device, {"vlans": [{"vlan_id": 10, "name": "MGMT"}, {"vlan_id": 20, "name": "DATA"}]}
+        )
+        state = reconcile_switchport(self.device, payload)[0]
+        self.interface.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.device_base_hash, content_hash({"mode": "tagged", "untagged": None, "tagged": [10]}))
+        self.assertEqual(set(self.interface.tagged_vlans.values_list("vid", flat=True)), {10})
+        self.assertEqual(set(state.tagged_vlans.values_list("vid", flat=True)), {10})
+
+        payload["interfaces"][0]["tagged_vlans"] = [10, 20]
+        waiting = prepare_switchport_reconcile(self.device, payload)
+        owners = (self.interface, state)
+        self.assertEqual(
+            {(write.model_label, write.pk) for write in waiting.plan.write_set if write.operation == "m2m_set"},
+            {(owner._meta.label_lower, owner.pk) for owner in owners},
+        )
+        target = tuple(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid__in=(10, 20)).order_by("pk"))
+        competing = RendererMutationPlan.build(
+            m2m_writes=tuple(planned_m2m_set(owner, "tagged_vlans", target) for owner in owners)
+        )
+        # The last point production allows: the competing writer commits before the frozen plan acquires.
+        with acquire(competing) as writer:
+            for owner in owners:
+                writer.m2m_set(owner, "tagged_vlans", target)
+
+        # What the apply-time rebuild will see under the lock: neither replacement is queued any more.
+        replanned = switchport_reconcile_plan(self.device, payload, waiting.interface_pks)
+        self.assertEqual([write for write in replanned.write_set if write.operation == "m2m_set"], [])
+
+        through_tables = {owner._meta.get_field("tagged_vlans").remote_field.through._meta.db_table for owner in owners}
+        # The gated path calls the public reconciler with the frozen plan's writer already acquired.
+        with acquire(waiting.plan) as writer, CaptureQueriesContext(connection) as queries:
+            rows = reconcile_switchport(self.device, payload, attempt=waiting)
+            writer.assert_complete()
+            for owner in owners:
+                self.assertFalse(writer.consume_applied_m2m_set(owner, "tagged_vlans"))
+
+        self.assertEqual(
+            [
+                query["sql"]
+                for query in queries
+                if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+                and any(table in query["sql"] for table in through_tables)
+            ],
+            [],
+        )
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        self.interface.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(set(self.interface.tagged_vlans.values_list("vid", flat=True)), {10, 20})
+        self.assertEqual(set(state.tagged_vlans.values_list("vid", flat=True)), {10, 20})
+        self.assertEqual(state.device_base_hash, content_hash({"mode": "tagged", "untagged": None, "tagged": [10, 20]}))
+        self.assertEqual(state.status, "imported")
+
+    def test_switchport_plan_prefetches_native_tagged_vlans_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, switchport_reconcile_plan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 47, "name": "MGMT"}]})
+        vlan = NSOVLANState.objects.get(management=self.management, vlan__vid=47).vlan
+        peer = Interface.objects.create(device=self.device, name="GigabitEthernet0/2", type="1000base-t")
+        for interface in (self.interface, peer):
+            interface.mode = "tagged"
+            interface.save(update_fields=["mode"])
+            interface.tagged_vlans.add(vlan)
+        payload = {
+            "interfaces": [
+                {"interface_name": interface.name, "mode": "trunk", "tagged_vlans": [47]}
+                for interface in (self.interface, peer)
+            ]
+        }
+        through_table = Interface._meta.get_field("tagged_vlans").remote_field.through._meta.db_table
+
+        with CaptureQueriesContext(connection) as queries:
+            switchport_reconcile_plan(self.device, payload)
+
+        relation_queries = [query for query in queries if through_table in query["sql"]]
+        self.assertEqual(len(relation_queries), 1)
+
+    def test_switchport_plan_prefetches_stale_native_tagged_vlans_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database, switchport_reconcile_plan
+
+        reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 47, "name": "MGMT"}]})
+        vlan = NSOVLANState.objects.get(management=self.management, vlan__vid=47).vlan
+        interfaces = [self.interface]
+        interfaces.extend(
+            Interface.objects.create(device=self.device, name=f"GigabitEthernet0/{index}", type="1000base-t")
+            for index in range(2, 5)
+        )
+        for interface in interfaces:
+            self.assertFalse(interface.mode)
+            self.assertIsNone(interface.untagged_vlan_id)
+            interface.tagged_vlans.add(vlan)
+            NSOSwitchportState.objects.create(
+                management=self.management, interface=interface, mode="tagged", status="imported"
+            )
+        through_table = Interface._meta.get_field("tagged_vlans").remote_field.through._meta.db_table
+
+        with CaptureQueriesContext(connection) as queries:
+            plan = switchport_reconcile_plan(self.device, {"interfaces": []})
+
+        relation_queries = [query for query in queries if through_table in query["sql"]]
+        self.assertEqual(len(relation_queries), 1)
+        self.assertEqual(
+            {write.pk for write in plan.write_set if write.model_label == NSOSwitchportState._meta.label_lower},
+            set(NSOSwitchportState.objects.filter(management=self.management).values_list("pk", flat=True)),
+        )
+
+    def test_vlan_operations_preload_reported_overlay_vlan_group(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.vlan_reconciler import _vlan_reconcile_operations, reconcile_vlan_database
+
+        payload = {"vlans": [{"vlan_id": 47, "name": "MGMT"}]}
+        state = reconcile_vlan_database(self.device, payload)[0]
+        group = state.vlan.group
+
+        _saves, _operations, rows = _vlan_reconcile_operations(self.device, payload, timezone.now())
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        with self.assertNumQueries(0):
+            self.assertEqual(rows[0].vlan.group, group)
+
+    def test_vlan_operations_preload_reported_group_only_vlan_group(self):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.vlan_reconciler import _vlan_reconcile_operations
+
+        group = _device_vlan_group(self.device)
+        vlan = VLAN.objects.create(group=group, vid=47, name="MGMT")
+        self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
+
+        _saves, _operations, rows = _vlan_reconcile_operations(
+            self.device, {"vlans": [{"vlan_id": 47, "name": "MGMT"}]}, timezone.now()
+        )
+
+        self.assertEqual([row.vlan_id for row in rows], [vlan.pk])
+        self.assertIsNone(rows[0].pk)
+        with self.assertNumQueries(0):
+            self.assertEqual(rows[0].vlan.group, group)
+
+    def _assert_switchport_group_query_budget(self, source):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        group = _device_vlan_group(self.device)
+        counts = []
+        for count in (1, 4):
+            device = _make_device(f"group-{source}-{count}")
+            management = NSODeviceManagement.objects.create(
+                device=device, nso_instance=self.instance, nso_device_name=device.name
+            )
+            device_group = _device_vlan_group(device)
+            items = []
+            for index in range(count):
+                vlan = VLAN.objects.create(
+                    group=device_group if source == "group_lookup" else group,
+                    vid=100 + index + count * 10,
+                    name=f"VLAN-{count}-{index}",
+                )
+                interface = Interface.objects.create(
+                    device=device,
+                    name=f"Ethernet{index}",
+                    type="1000base-t",
+                    mode="tagged",
+                    untagged_vlan=vlan if source in ("native_untagged", "state_interface_untagged") else None,
+                )
+                if source in ("native_tagged", "state_interface_tagged"):
+                    interface.tagged_vlans.add(vlan)
+                if source.startswith("state_"):
+                    state = NSOSwitchportState.objects.create(
+                        management=management, interface=interface, mode="tagged", status="imported"
+                    )
+                    if source == "state_tagged":
+                        state.tagged_vlans.add(vlan)
+                if source == "synced_lookup":
+                    NSOVLANState.objects.create(management=management, vlan=vlan, status="imported")
+                items.append(
+                    {
+                        "interface_name": interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": vlan.vid if source in ("synced_lookup", "group_lookup") else None,
+                        "tagged_vlans": [],
+                    }
+                )
+
+            with CaptureQueriesContext(connection) as queries:
+                rows = reconcile_switchport(device, {"interfaces": items})
+
+            self.assertEqual(len(rows), count)
+            counts.append(sum(f'FROM "{VLANGroup._meta.db_table}"' in query["sql"] for query in queries))
+        self.assertEqual(counts, [3, 3], f"{source}: VLAN-group SELECT counts {counts}")
+
+    def test_switchport_group_queries_for_native_untagged_are_constant(self):
+        self._assert_switchport_group_query_budget("native_untagged")
+
+    def test_switchport_group_queries_for_native_tagged_are_constant(self):
+        self._assert_switchport_group_query_budget("native_tagged")
+
+    def test_switchport_group_queries_for_state_interface_untagged_are_constant(self):
+        self._assert_switchport_group_query_budget("state_interface_untagged")
+
+    def test_switchport_group_queries_for_state_interface_tagged_are_constant(self):
+        self._assert_switchport_group_query_budget("state_interface_tagged")
+
+    def test_switchport_group_queries_for_state_tagged_are_constant(self):
+        self._assert_switchport_group_query_budget("state_tagged")
+
+    def test_switchport_group_queries_for_synced_lookup_are_constant(self):
+        self._assert_switchport_group_query_budget("synced_lookup")
+
+    def test_switchport_group_queries_for_group_lookup_are_constant(self):
+        self._assert_switchport_group_query_budget("group_lookup")
 
     def test_switchport_changed_when_netbox_has_divergent_value(self):
         """A non-pristine interface whose L2 differs from the device → changed, NOT clobbered."""
@@ -868,10 +1782,24 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         vlans = mock_put.call_args[0][1]
         assert vlans == [{"vlan_id": 2213, "name": "RENAMED"}]  # live NetBox name, owned only
 
+    def test_foreign_overlay_save_does_not_schedule_vlan_behavior(self):
+        from unittest.mock import patch
+
+        state = self._state(vid=2214, name="FOREIGN", status="accepted")
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.device_name = "FOREIGN-READ"
+            state.save(update_fields=("device_name",))
+
+        schedule.assert_not_called()
+
     def test_accept_marks_owned(self):
         from unittest.mock import patch
 
         from django.contrib.auth import get_user_model
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest
 
         state = self._state(vid=2213, name="RENAMED", status="conflict")
         User = get_user_model()
@@ -882,6 +1810,18 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("vlan", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="vlan",
+            native_model_label="ipam.vlan",
+            native_key={"group_id": state.vlan.group_id, "vid": state.vlan.vid},
+            ownership_state="owned",
+        ).exists()
 
     def test_owned_settles_in_sync_when_device_matches(self):
         """An accepted VLAN whose device name now matches NetBox → in_sync (apply landed)."""

@@ -499,11 +499,11 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         self.assertEqual(row.status, "deploying")
         self.assertEqual(row.apply_attempt_id, attempt_id)
 
-    def test_a_vanished_confirmed_host_repends_a_deploying_levels_row(self):
-        """A vanished confirmed host bears content, so every deploying row in the scope is stale.
+    def test_a_vanished_confirmed_host_keeps_a_deploying_levels_row(self):
+        """The logging plan opts out of the drift re-pend, so a deploying row keeps its attempt.
 
-        The device still reports the pre-apply severity, so only the acquisition re-pend can
-        move the levels row off ``deploying``.
+        The vanished confirmed host still bears content, so the scope revision advances, but
+        ``settles_deploying=False`` on the logging plan keeps the in-flight row untouched.
         """
         from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
@@ -512,7 +512,7 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.9", status="in_sync")
         row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
         attempt_id = uuid4()
-        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        # Marked LAST, and lifecycle-only: only the read under test can move the row.
         mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="logging")
         before = revision.revision
@@ -528,13 +528,17 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         row.refresh_from_db()
         host.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(row.status, "accepted")
-        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(row.status, "deploying")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
         self.assertEqual(host.status, "changed")
         self.assertEqual(revision.revision, before + 1)
 
-    def test_a_vanished_confirmed_host_repends_then_settles_a_matching_levels_row(self):
-        """The re-pend discards the stale attempt, and a matching device entry settles the accepted row."""
+    def test_a_vanished_confirmed_host_keeps_a_matching_deploying_levels_row(self):
+        """The logging plan opt-out also holds when the device entry matches the in-flight row.
+
+        A matching read is not apply evidence, and ``settles_deploying=False`` on the logging
+        plan keeps the drift re-pend off the row, so it stays ``deploying`` with its attempt.
+        """
         from netbox_nso_plugin.intent_state import reconcile_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
         from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
@@ -542,7 +546,7 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.10", status="in_sync")
         row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
         attempt_id = uuid4()
-        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
+        # Marked LAST, and lifecycle-only: only the read under test can move the row.
         mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="logging")
         before = revision.revision
@@ -558,8 +562,8 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         row.refresh_from_db()
         host.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(row.status, "in_sync")
-        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(row.status, "deploying")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
         self.assertEqual(host.status, "changed")
         self.assertEqual(revision.revision, before + 1)
 

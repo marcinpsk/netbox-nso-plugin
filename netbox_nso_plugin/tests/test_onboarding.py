@@ -192,7 +192,7 @@ class TestOnboardCandidate(TestCase):
 
     def test_no_mapping_but_explicit_ned_onboards(self):
         """No mapping is fine when an explicit ned_id is given (override / no mapping)."""
-        from netbox_nso_plugin.models import NSODeviceManagement, NSOPlatformNedMapping
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision, NSOPlatformNedMapping
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         d = _device("nomap2", platform=self.ios, ip="10.5.5.2/24")
@@ -208,6 +208,11 @@ class TestOnboardCandidate(TestCase):
         self.assertTrue(res.get("mapping_created"))
         m = NSOPlatformNedMapping.objects.get(platform=self.ios)
         self.assertEqual(m.ned_id, "cisco-iosxr-cli-7.55:cisco-iosxr-cli-7.55")
+        revision = NSOIntentRevision.objects.get(device=d, scope="interface")
+        # The management create is verified first. The subsequent legacy platform-mapping
+        # create advances the scope again until that input is converted.
+        self.assertIsNotNone(revision.verified_revision)
+        self.assertTrue(revision.verified_fingerprint)
 
     def test_tracking_row_create_failure_reports_job_for_recovery(self):
         """If the tracking-row create fails AFTER the adapter provision job is enqueued, surface
@@ -219,7 +224,7 @@ class TestOnboardCandidate(TestCase):
         d = self._mapped_device("ghost-rtr")
         with (
             patch("netbox_nso_plugin.adapter_client.provision_device", return_value=self._QUEUED) as prov,
-            patch.object(NSODeviceManagement.objects, "create", side_effect=Exception("db down")),
+            patch("netbox_nso_plugin.management_lifecycle.save_management", side_effect=Exception("db down")),
         ):
             res = onboard_candidate(d, self.instance)  # must NOT raise
         prov.assert_called_once()  # the provision job WAS enqueued
@@ -380,7 +385,7 @@ class TestManageExisting(TestCase):
 
     def test_creates_management_no_provision(self):
         """Creating a management row for an already-in-NSO device does not provision."""
-        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision
         from netbox_nso_plugin.onboarding import manage_existing
 
         d = _device("ext-rtr", ip="10.7.7.7/24")
@@ -390,6 +395,9 @@ class TestManageExisting(TestCase):
         prov.assert_not_called()
         mgmt = NSODeviceManagement.objects.get(device=d)
         self.assertEqual(mgmt.nso_device_name, "ext-rtr-nso")
+        revision = NSOIntentRevision.objects.get(device=d, scope="interface")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertTrue(revision.verified_fingerprint)
 
     def test_already_managed_errors(self):
         from netbox_nso_plugin.models import NSODeviceManagement

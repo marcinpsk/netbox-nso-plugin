@@ -280,7 +280,10 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
 
     def test_no_push_when_no_adapter_device_id(self):
         """No push when management.adapter_device_id is None."""
-        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOIntentOutboxEntry, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         inst, _ = NSOInstance.objects.get_or_create(
             name="sr-noid-inst",
@@ -296,12 +299,20 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
             nso_device_name="nso-sr-noid",
             adapter_device_id=None,
         )
-        sr = self._make_route(prefix="10.30.0.0/16", next_hop="10.0.0.3")
+        sr = StaticRoute.objects.create(prefix="198.18.0.0/24", next_hop="198.18.1.1", metric=1)
+        _assign_without_push(sr, extra_dev)
         state = NSOStaticRouteState(management=mgmt, static_route=sr, status="accepted")
 
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
-                _invoke_static_route_state_save(state)
+                with renderer_writes(
+                    RendererMutationPlan.build(
+                        saves=[planned_save(state, force_insert=True, natural_key=("management", "static_route"))]
+                    )
+                ) as writer:
+                    writer.save(state, force_insert=True)
+            self.assertTrue(NSOStaticRouteState.objects.filter(pk=state.pk, management=mgmt, static_route=sr).exists())
+            self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=extra_dev, scope="static_route").exists())
             mock_push.assert_not_called()
 
 

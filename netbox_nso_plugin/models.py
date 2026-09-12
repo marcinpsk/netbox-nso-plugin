@@ -11,6 +11,8 @@ from django.db.models.functions import Now
 from django.urls import reverse
 from netbox.models import NetBoxModel
 
+from .outbox import CONTRIBUTION_KIND_CHOICES, CONTRIBUTION_KIND_ORDINARY
+
 
 class AdapterConnection(NetBoxModel):
     """Singleton — URL and non-secret connection settings for the nso-adapter.
@@ -647,7 +649,7 @@ class NSODeviceManagement(NetBoxModel):
         "adapter_link_attempted_at",
     )
     # One authority for the refresh, so a column protected in one group cannot be missed.
-    _STALE_SAVE_PROTECTED_FIELDS = _PUSH_RECORD_FIELDS + _SETTLEMENT_RECORD_FIELDS
+    _STALE_SAVE_PROTECTED_FIELDS = _PUSH_RECORD_FIELDS + _SETTLEMENT_RECORD_FIELDS + ("source_rekey_pending",)
 
     def __str__(self):
         return f"{self.device} → {self.nso_instance.name}/{self.nso_device_name}"
@@ -673,6 +675,21 @@ class NSODeviceManagement(NetBoxModel):
         A save that NAMES its fields is untouched: every writer of these columns names
         them deliberately, holding this same row lock.
         """
+        from .intent_state import mirror_refresh_is_active
+        from .management_lifecycle import save_management
+        from .renderer_writer import active_renderer_writer
+
+        if active_renderer_writer() is None and not mirror_refresh_is_active():
+            if args or kwargs.keys() - {"force_insert", "update_fields", "using"}:
+                raise TypeError("the management writer accepts only force_insert, update_fields, and using")
+            using = kwargs.get("using")
+            if using not in (None, "default"):
+                raise ValueError("the management writer supports only the default database")
+            return save_management(
+                self,
+                update_fields=kwargs.get("update_fields"),
+                force_insert=kwargs.get("force_insert", False),
+            )
         if kwargs.get("update_fields") is not None or not self.pk:
             with transaction.atomic():
                 return super().save(*args, **kwargs)
@@ -683,6 +700,17 @@ class NSODeviceManagement(NetBoxModel):
                 for field in protected:
                     setattr(self, field, current[field])
             return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        """Route sanctioned management CRUD deletes through the exact writer."""
+        from .management_lifecycle import delete_management
+        from .renderer_writer import active_renderer_writer
+
+        if active_renderer_writer() is None:
+            if args or kwargs:
+                raise TypeError("the management CRUD writer does not accept delete options")
+            return delete_management(self)
+        return super().delete(*args, **kwargs)
 
     def get_absolute_url(self):
         """Return the detail URL for this management record."""
@@ -2889,12 +2917,41 @@ class NSOLinkRoleAssignment(NetBoxModel):
 # fields would multiply the write cost of a bulk edit for records no operator browses.
 
 
+class NSOOwnershipManifest(models.Model):
+    """Durable ownership evidence for one native object in one delivery scope."""
+
+    device_id = models.PositiveBigIntegerField(db_column="device_id", db_index=True)
+    scope = models.CharField(max_length=32)
+    native_model_label = models.CharField(max_length=200)
+    native_key = models.JSONField()
+    ownership_state = models.CharField(max_length=32, default="owned")
+    deletion_authority = models.BooleanField(default=False)
+    acknowledged_lineage = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["device_id", "scope", "native_model_label", "native_key"],
+                name="nso_owner_manifest_identity",
+            )
+        ]
+        ordering = ["device_id", "scope", "native_model_label", "id"]
+        verbose_name = "NSO Ownership Manifest Entry"
+        verbose_name_plural = "NSO Ownership Manifest Entries"
+
+    def __str__(self):
+        return f"{self.device_id}/{self.scope} {self.native_model_label} {self.native_key}"
+
+
 class NSOIntentRevision(models.Model):
     """The durable content revision of one device delivery scope."""
 
     device = models.ForeignKey(to="dcim.Device", on_delete=models.CASCADE, related_name="nso_intent_revisions")
     scope = models.CharField(max_length=32)
     revision = models.BigIntegerField(default=0)
+    verified_revision = models.BigIntegerField(null=True, blank=True)
+    verified_fingerprint = models.CharField(max_length=64, null=True, blank=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -2948,6 +3005,11 @@ class NSOIntentOutboxEntry(models.Model):
 
     device = models.ForeignKey(to="dcim.Device", on_delete=models.CASCADE, related_name="nso_intent_outbox_entries")
     scope = models.CharField(max_length=32)
+    kind = models.CharField(
+        max_length=16,
+        choices=CONTRIBUTION_KIND_CHOICES,
+        default=CONTRIBUTION_KIND_ORDINARY,
+    )
     # ``txid_current()`` — provenance only: the fold is transaction-blind (OQ-O-9), so no
     # rule reads this. It groups the rows one transaction wrote, for an operator reading them.
     batch_id = models.BigIntegerField()
