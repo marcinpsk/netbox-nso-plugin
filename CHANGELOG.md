@@ -2,6 +2,92 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-09-12)
+
+### Bug Fixes
+
+- Fence adapter registration and preserve unrelated apply attempts
+  ([`c1b9240`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c1b9240cbf8a37360e22a178e0e4128302e49a06))
+
+- Protect refresh snapshots and remove duplicate SNMP refusals
+  ([`ba2b369`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ba2b369a54aa0fd82c8379e933ffd69f95324275))
+
+- Resolve renderer writer and VLAN review findings
+  ([`fc83e39`](https://github.com/marcinpsk/netbox-nso-plugin/commit/fc83e39e469bf589372f1fb8519ab95953962338))
+
+- **adapter-client**: Refuse a non-positive apply generation id
+  ([`7db8e34`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7db8e34762c0dad0330da9be3cab3621a88aabdf))
+
+- **apply**: Keep definitive refusals out of replay
+  ([`c3d869c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c3d869c4ddf660180b8db7d4533637073fb8a6fb))
+
+- **apply**: Validate the unknown attempt ids of the replay response too
+  ([`1c7f363`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1c7f363fe9a4cc75f4ed1657a9907285122b36d3))
+
+- **drain**: Select compaction candidates from compactable spans
+  ([`54233a0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/54233a0d494f59cf8851499792c3d3b0152a02b7))
+
+- **intent**: Resolve tagged-VLAN anchor devices with set queries
+  ([`b775216`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b775216e49263bac203d69ed78c901fa284df245))
+
+- **management**: Protect the source fence from a stale full save
+  ([`4c7c24d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4c7c24d80f28fc6e90f7f1a86e38f7570c83a1da))
+
+- **route-policy**: Gate the shared root mutation on the actual fill decision
+  ([`6a84de4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6a84de44e7ccbd385afcdf2a7186ce0a089104fb))
+
+- **route-policy**: Predict a root attribute write only when the plan fills the root
+  ([`5d54ffa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5d54ffa2ef76eac2d512f79b95d35b514ed48c58))
+
+- **snmp**: Keep an unpushable owned row owned and let delivery refuse the snapshot
+  ([`9638140`](https://github.com/marcinpsk/netbox-nso-plugin/commit/96381408e87fb0952b6e05fd0dc8b5ac5799e01c))
+
+- **svi**: Skip a repeated interface name before planning its writes
+  ([`0fd9e72`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0fd9e724aa5bdb696407a1bd4ccfbbbdd790651c))
+
+- **vlan**: Preload the relations the switchport and VLAN planners consume
+  ([`952c685`](https://github.com/marcinpsk/netbox-nso-plugin/commit/952c68523fbf0e5058a29f63c71247350a272fd2))
+
+- **vlan**: Preload the VLAN groups the switchport executor reads
+  ([`a1d5037`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a1d50376eed2bd9df95edbd05fb9cf3311d801dc))
+
+- **vlan**: Reject malformed switchport fields before planning
+  ([`aa9b925`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aa9b925785cac284811bc480a2349628becb48f8))
+
+- **vlan**: Track reported attachment identities
+  ([`c447296`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c447296e4c25b5f88e5e7a72e76371b3326795c7))
+
+### Chores
+
+- **ci**: Bump python-semantic-release/python-semantic-release
+  ([`695fe93`](https://github.com/marcinpsk/netbox-nso-plugin/commit/695fe93cf0a1adbbad14cf2aaec9e6751c134584))
+
+### Refactoring
+
+- **management**: Drop the unused CRUD-active marker
+  ([`d587b3d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d587b3d3b7a0e1286632d448c10303a5c2b544d1))
+
+### Testing
+
+- **gated-reconcile**: Fail the VLAN planner in the category skip-fallback test
+  ([`2cda599`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2cda599ccc44a3d9a4a45ea356e349aa801e5729))
+
+- **intent-state**: Pin one cold parse per DML guard cache
+  ([`4300350`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4300350bb4bec1abb99e61071017468303e1f09f))
+
+- **intent-state**: Pin the parse cache on a registered insert shape
+  ([`9ae0a4c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9ae0a4c05b3e404cc564238a77f0da4baa777f3f))
+
+- **onboard**: Pin that terminal onboarding evidence bumps no intent scope
+  ([`ff8a1d5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ff8a1d5ad451350b9ad68ad98d843dc5d7b49b93))
+
+- **static-route**: Pin the adapter-id guard through the exact writer
+  ([`a0a409d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a0a409d61f424c23015d6f1efe90a5255cb00054))
+
+- **sync-cache**: Target the stale management row
+  ([`439c0b1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/439c0b1e50b91b2fd9d03ca9390b74556b1243c6))
+
+
 ## v1.2.0 (2026-09-07)
 
 ### Bug Fixes
