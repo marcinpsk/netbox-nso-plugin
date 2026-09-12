@@ -2,15 +2,17 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for A4: adapter_client.get_interface_ips and _reconcile_interface_ips."""
 
+import threading
 import unittest
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.db import connections
+from django.test import TestCase, TransactionTestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -186,6 +188,40 @@ class TestReconcileInterfaceIps(TestCase):
             _reconcile_interface_ips(self.device, payload)
 
         self.assertEqual(Prefix.objects.filter(prefix=prefix).count(), 1)
+
+    def test_auto_create_plan_declares_prefix_table_and_address_family_locks(self):
+        from ipam.models import VRF
+
+        from netbox_nso_plugin.template_content import interface_ip_reconcile_plan
+
+        vrf = VRF.objects.create(name="PREFIX-SLOT")
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [
+                {"address": "198.18.245.1/24", "vrf": "", "family": "ipv4", "secondary": False},
+                {"address": "198.18.246.1/24", "vrf": "", "family": "ipv4", "secondary": False},
+                {"address": "2001:db8:ffff::1/64", "vrf": "", "family": "ipv6", "secondary": False},
+                {
+                    "address": "198.18.247.1/24",
+                    "vrf": vrf.name,
+                    "family": "ipv4",
+                    "secondary": False,
+                },
+            ],
+        )
+
+        with self._auto_create_ctx(True):
+            plan = interface_ip_reconcile_plan(self.device, payload)
+
+        prefix_table_keys = {key for key in plan.lock_footprint.shared_keys if key[0] == "ip-prefix-table"}
+        self.assertEqual(
+            prefix_table_keys,
+            {
+                ("ip-prefix-table", "global:ipv4"),
+                ("ip-prefix-table", "global:ipv6"),
+                ("ip-prefix-table", f"vrf:{vrf.pk}:ipv4"),
+            },
+        )
 
     def test_unexpected_prefix_database_failure_aborts_reconcile(self):
         from django.db import OperationalError, connection
@@ -514,6 +550,139 @@ class TestReconcileInterfaceIps(TestCase):
 
         self.assertEqual(result, [])
         self.assertFalse(NSOInterfaceIPState.objects.filter(address="1.2.3.4/32").exists())
+
+
+class TestInterfaceIpPrefixCreationLock(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from ._outbox_case import make_managed, without_commit_drain
+
+        with without_commit_drain():
+            self.device_a, _management_a = make_managed("prefix-slot-a", 4241)
+            self.device_b, _management_b = make_managed("prefix-slot-b", 4242)
+            self.interface_a = Interface.objects.create(device=self.device_a, name="Loopback1", type="virtual")
+            self.interface_b = Interface.objects.create(device=self.device_b, name="Loopback1", type="virtual")
+
+    @staticmethod
+    def _payload(device, address, vrf_name):
+        return {
+            "device_id": device.pk,
+            "interfaces": [
+                {
+                    "interface": "Loopback1",
+                    "addresses": [
+                        {
+                            "address": address,
+                            "vrf": vrf_name,
+                            "family": "ipv4",
+                            "secondary": False,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def _assert_prefix_creation_is_serialized(self, *, addresses, candidate_networks, vrf=None):
+        from django.apps import apps
+        from ipam.models import IPAddress, Prefix
+
+        from netbox_nso_plugin import template_content
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._outbox_case import wait_until_postgres_blocks
+
+        first_ready_to_insert = threading.Event()
+        release_first = threading.Event()
+        second_connected = threading.Event()
+        second_pid: list[int] = []
+        failures: list[BaseException] = []
+        real_prefix_save = Prefix.save
+        vrf_name = "" if vrf is None else vrf.name
+
+        def pause_first_prefix_insert(instance, *args, **kwargs):
+            if threading.current_thread().name == "first-prefix-reconcile":
+                first_ready_to_insert.set()
+                assert release_first.wait(timeout=30), "the first Prefix insert barrier was not released"
+            return real_prefix_save(instance, *args, **kwargs)
+
+        def reconcile(device, address, *, record_pid=False):
+            try:
+                if record_pid:
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute("SELECT pg_backend_pid()")
+                        second_pid.append(cursor.fetchone()[0])
+                    second_connected.set()
+                template_content._reconcile_interface_ips(device, self._payload(device, address, vrf_name))
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        config = apps.get_app_config("netbox_nso_plugin")
+        with (
+            patch.object(config, "_interface_ip_auto_create", True),
+            patch.object(Prefix, "save", pause_first_prefix_insert),
+        ):
+            first = threading.Thread(
+                target=reconcile,
+                args=(self.device_a, addresses[0]),
+                name="first-prefix-reconcile",
+            )
+            second = threading.Thread(
+                target=reconcile,
+                args=(self.device_b, addresses[1]),
+                kwargs={"record_pid": True},
+                name="second-prefix-reconcile",
+            )
+            first.start()
+            self.addCleanup(first.join, 30)
+            self.addCleanup(release_first.set)
+            assert first_ready_to_insert.wait(timeout=30), failures
+            second.start()
+            self.addCleanup(second.join, 30)
+            assert second_connected.wait(timeout=30), "the second reconcile never opened its connection"
+            blocked_failure = None
+            try:
+                wait_until_postgres_blocks(second_pid[0], "the second Prefix creation", locktype="advisory")
+            except BaseException as exc:  # noqa: BLE001
+                blocked_failure = exc
+            finally:
+                release_first.set()
+            first.join(timeout=30)
+            second.join(timeout=30)
+
+        assert not first.is_alive(), "the first Prefix reconcile did not finish"
+        assert not second.is_alive(), "the second Prefix reconcile did not finish"
+        assert not failures, failures
+        self.assertEqual(IPAddress.objects.filter(address__in=addresses, vrf=vrf).count(), 2)
+        self.assertEqual(
+            NSOInterfaceIPState.objects.filter(interface__in=(self.interface_a, self.interface_b)).count(),
+            2,
+        )
+        self.assertEqual(Prefix.objects.filter(prefix__in=candidate_networks, vrf=vrf).count(), 1)
+        if blocked_failure is not None:
+            raise blocked_failure
+
+    def test_global_prefix_creation_serializes_the_network_slot(self):
+        self._assert_prefix_creation_is_serialized(
+            addresses=("198.18.248.1/24", "198.18.248.2/24"),
+            candidate_networks=("198.18.248.0/24",),
+        )
+
+    def test_overlapping_prefix_lengths_serialize_the_containment_namespace(self):
+        self._assert_prefix_creation_is_serialized(
+            addresses=("198.18.250.1/24", "198.18.250.2/25"),
+            candidate_networks=("198.18.250.0/24", "198.18.250.0/25"),
+        )
+
+    def test_named_vrf_prefix_creation_serializes_the_network_slot(self):
+        from ipam.models import VRF
+
+        self._assert_prefix_creation_is_serialized(
+            addresses=("198.18.249.1/24", "198.18.249.2/24"),
+            candidate_networks=("198.18.249.0/24",),
+            vrf=VRF.objects.create(name="PREFIX-SLOT-VRF"),
+        )
 
 
 class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):

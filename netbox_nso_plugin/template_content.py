@@ -14,7 +14,7 @@ from django.utils import timezone
 from netbox.plugins import PluginTemplateExtension
 
 from . import status_machine as sm
-from .intent_state import locked_mirror_refresh, mirror_reconciler
+from .intent_state import IntentMutationProtocolError, MutationFootprint, locked_mirror_refresh, mirror_reconciler
 from .snmp_versions import canonical_snmp_version
 
 logger = logging.getLogger(__name__)
@@ -489,6 +489,13 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
     return saves, deletes, operations, prefixes
 
 
+def _interface_ip_prefix_table(address, vrf_obj):
+    """Return the parsed address and its shared Prefix-table lock key."""
+    address_interface = ip_interface(address)
+    routing_table = "global" if vrf_obj is None else f"vrf:{vrf_obj.pk}"
+    return address_interface, ("ip-prefix-table", f"{routing_table}:ipv{address_interface.version}")
+
+
 def _interface_ip_plan_and_operations(device, payload, planned_at=None):
     """Freeze one interface-IP reconciliation before lock acquisition."""
     from .renderer_writer import RendererMutationPlan
@@ -496,6 +503,11 @@ def _interface_ip_plan_and_operations(device, payload, planned_at=None):
     planned_at = planned_at or timezone.now()
     saves, deletes, operations, prefixes = _interface_ip_reconcile_operations(device, payload, planned_at)
     plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    prefix_footprint = MutationFootprint.for_keys(
+        (),
+        shared_keys=(_interface_ip_prefix_table(address, vrf_obj)[1] for address, vrf_obj in prefixes),
+    )
+    plan = replace(plan, lock_footprint=MutationFootprint.merge(plan.lock_footprint, prefix_footprint))
     return plan, operations, prefixes
 
 
@@ -505,19 +517,24 @@ def interface_ip_reconcile_plan(device, payload):
     return plan
 
 
-def _ensure_interface_ip_prefixes(prefixes):
+def _ensure_interface_ip_prefixes(writer, prefixes):
     """Create missing informational prefixes after their planned IP writes succeed."""
-    from django.db import transaction
+    from django.db import connection
     from ipam.models import Prefix
 
-    for address, vrf_obj in prefixes:
-        address_interface = ip_interface(address)
+    prefix_tables = tuple(_interface_ip_prefix_table(address, vrf_obj) for address, vrf_obj in prefixes)
+    required_keys = {key for _address_interface, key in prefix_tables}
+    if not connection.in_atomic_block:
+        raise IntentMutationProtocolError("interface IP Prefix creation requires a transaction")
+    if not required_keys <= set(writer.plan.lock_footprint.shared_keys):
+        raise IntentMutationProtocolError("interface IP Prefix creation requires its planned shared locks")
+
+    for (address, vrf_obj), (address_interface, _key) in zip(prefixes, prefix_tables, strict=True):
         containing = Prefix.objects.filter(
             prefix__net_contains_or_equals=str(address_interface.ip), vrf=vrf_obj
         ).first()
         if containing is None:
-            with transaction.atomic():
-                Prefix(prefix=str(address_interface.network), vrf=vrf_obj).save()
+            Prefix(prefix=str(address_interface.network), vrf=vrf_obj).save()
 
 
 def _reconcile_interface_ips(device, payload: dict) -> list:
@@ -562,7 +579,7 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
                 writer.delete(instance)
             else:
                 writer.save(instance, update_fields=update_fields, force_insert=force_insert)
-        _ensure_interface_ip_prefixes(prefixes)
+        _ensure_interface_ip_prefixes(writer, prefixes)
 
     return list(NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface"))
 
