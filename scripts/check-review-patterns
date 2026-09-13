@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba
+# Run custom checks locally without replacing CodeRabbit's default rules.
+set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+scan_bin="${OPENGREP_BIN:-opengrep}"
+mode="${1:-scan}"
+if (( $# )); then shift; fi
+case "$mode" in
+  scan)
+    if (( $# == 0 )); then
+      shopt -s globstar nullglob
+      set -- netbox_nso_plugin netbox_nso_plugin/tests/**/*.py
+    fi
+    exec "$scan_bin" scan --config .opengrep/nso-rules.yaml --error -- "$@"
+    ;;
+  test)
+    if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi
+    staging_dir="$(mktemp -d)"
+    trap 'rm -rf "$staging_dir"' EXIT
+    cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"
+    cp .opengrep/tests/review-patterns.py "$staging_dir/review-patterns.py"
+    "$scan_bin" test "$staging_dir"
+    ;;
+  *) echo "Usage: $0 [scan [path ...] | test]" >&2; exit 2 ;;
+esac

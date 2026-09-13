@@ -17,6 +17,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import SimpleTestCase, TestCase
 
+from ._outbox_case import trust_scope
 from .mixins import IntentPushResetMixin
 
 APP = "netbox_nso_plugin"
@@ -241,6 +242,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
                 nso_next_hop="198.51.100.1",
                 intent_generation=generation,
             )
+        trust_scope(device, mgmt, "static_route")
         echo = {"count": 1, "routes": [{"route_id": route.pk, "generation": generation, "fingerprint": "fp-1"}]}
 
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=echo):

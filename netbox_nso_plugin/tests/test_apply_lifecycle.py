@@ -9,7 +9,7 @@ from uuid import uuid4
 from django.db import IntegrityError, models, transaction
 from django.test import SimpleTestCase, TestCase
 
-from ._outbox_case import make_managed, mirror_update, without_commit_drain
+from ._outbox_case import make_managed, mirror_update, trust_scope, without_commit_drain
 
 PROMOTED_MODEL_NAMES = (
     "NSOVLANState",
@@ -75,7 +75,7 @@ class TestApplyAttemptSchema(SimpleTestCase):
 
 
 class TestDeployingAttemptConstraint(TestCase):
-    def test_postgresql_refusal_releases_the_implicit_mutation_permit(self):
+    def test_postgresql_refusal_leaves_no_renderer_transaction_active(self):
         from netbox_nso_plugin.intent_state import _ACTIVE_PERMIT
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
@@ -140,7 +140,8 @@ class TestIntentRevisionWrites(TestCase):
             status="deploying",
             apply_attempt_id=uuid4(),
         )
-        before = NSOIntentRevision.objects.get(device=self.device, scope="logging").revision
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="logging")
+        before = revision.revision
 
         with intent_transaction(footprint_for_instance(row)):
             outbox.enqueue(self.device.pk, "logging")
@@ -151,8 +152,9 @@ class TestIntentRevisionWrites(TestCase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNone(row.apply_attempt_id)
 
-    def test_a_logging_host_edit_repends_the_deploying_level_row(self):
+    def test_a_foreign_logging_host_edit_repends_on_the_next_audit(self):
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOLoggingLevelState
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         with without_commit_drain(), transaction.atomic():
             host = NSOLoggingHostState.objects.create(
@@ -166,10 +168,16 @@ class TestIntentRevisionWrites(TestCase):
                 status="accepted",
             )
         mirror_update(level, status="deploying", apply_attempt_id=uuid4())
+        trust_scope(self.device, self.management, "logging")
 
         with without_commit_drain(), transaction.atomic():
             host.port = 5514
             host.save(update_fields=["port"])
+
+        level.refresh_from_db()
+        self.assertEqual(level.status, "deploying")
+
+        audit_renderer_scopes(self.device.pk, ("logging",), trigger="test", pre_capture=True)
 
         level.refresh_from_db()
         self.assertEqual(level.status, "accepted")
@@ -181,7 +189,8 @@ class TestIntentRevisionWrites(TestCase):
         from netbox_nso_plugin.models import NSOIntentRevision
 
         footprint = MutationFootprint.for_keys({(self.device.pk, "logging")})
-        before = NSOIntentRevision.objects.get(device=self.device, scope="logging").revision
+        revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="logging")
+        before = revision.revision
         with transaction.atomic():
             try:
                 with transaction.atomic(), intent_transaction(footprint):

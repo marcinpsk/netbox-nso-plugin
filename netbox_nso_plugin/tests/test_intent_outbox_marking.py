@@ -318,7 +318,11 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
             wait_until_postgres_blocks(writer_pid[0], "the writer", locktype="transactionid")
             return rendered
 
-        with patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit):
+        with (
+            # Keep the render hook bound to claim formation, not the fronting audit.
+            patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes"),
+            patch("netbox_nso_plugin.delivery.render", side_effect=render_then_commit),
+        ):
             outcome = self.drain(chain=0)
         for worker in workers:
             worker.join(timeout=30)

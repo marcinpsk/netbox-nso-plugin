@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba
+rules:
+  - id: nso-push-inside-suppression
+    languages: [python]
+    severity: ERROR
+    message: Schedule the intent push after the suppression context exits.
+    patterns:
+      - pattern-inside: |
+          with suppress_intent_push():
+              ...
+      - pattern: _schedule_intent_push(...)
+  - id: nso-tautological-assertion
+    languages: [python]
+    severity: ERROR
+    message: Compare the observed value with an independent expected value.
+    patterns:
+      - pattern-either:
+          - pattern: $SELF.assertEqual($VALUE, $VALUE, ...)
+          - pattern: assert $VALUE == $VALUE
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+  - id: nso-global-monotonic-patch
+    languages: [python]
+    severity: ERROR
+    message: Patch a module-local clock wrapper. Patching time.monotonic changes the shared module.
+    patterns:
+      - pattern: unittest.mock.patch($TARGET, ...)
+      - metavariable-regex:
+          metavariable: $TARGET
+          regex: '[\x22\x27](?:[a-zA-Z_][a-zA-Z0-9_]*\.)*time\.monotonic[\x22\x27]'
+  - id: nso-swallowed-barrier-failure
+    languages: [python]
+    severity: ERROR
+    message: Fail the test when a synchronization barrier breaks.
+    pattern-either:
+      - pattern: |
+          try:
+              ...
+          except threading.BrokenBarrierError:
+              pass
+      - pattern: |
+          try:
+              ...
+          except threading.BrokenBarrierError:
+              return
+  - id: nso-vlan-group-mutable-lookup
+    languages: [python]
+    severity: ERROR
+    message: Look up VLANGroup by its unique slug. Put the mutable name in defaults.
+    pattern: ipam.models.VLANGroup.objects.get_or_create(..., slug=$SLUG, name=$NAME, ...)
