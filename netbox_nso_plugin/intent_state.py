@@ -637,9 +637,8 @@ def _declared_fields_fragment(instance):
     spec = _REGISTRY[instance._meta.label_lower]
     if instance._meta.label_lower == "dcim.interface" and instance.pk is None:
         return ABSENT
-    if instance._meta.app_label in {"dcim", "ipam", "netbox_routing"}:
-        if not _native_source_is_rendered(instance):
-            return ABSENT
+    if instance._meta.app_label in {"dcim", "ipam", "netbox_routing"} and not _native_source_is_rendered(instance):
+        return ABSENT
     if instance._meta.label_lower in OVERLAY_MODEL_RANKS and hasattr(instance, "status"):
         from .status_machine import is_owned
 
@@ -682,11 +681,7 @@ def normalize_overlay_lifecycle(instance, update_fields=None):
         return {}
     changed = _raw_content_values(current, spec) != _raw_content_values(instance, spec)
     requested = None if update_fields is None else frozenset(update_fields)
-    explicit_status = (requested is not None and "status" in requested) or getattr(
-        instance,
-        "_nso_explicit_status_update",
-        False,
-    )
+    explicit_status = requested is not None and "status" in requested
     if instance.status != current.status and explicit_status:
         if (
             hasattr(instance, "apply_attempt_id")
@@ -1718,6 +1713,8 @@ def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
         name = getattr(instance, "object_name", "")
         management = getattr(instance, "management", None)
         if family and name and management is not None:
+            # The shared revision keys serialize consumer writes. This state-row path
+            # does not mutate consumer overlays, so it needs no consumer row locks.
             return route_policy_footprint(
                 {(family, name)},
                 device_ids=(management.device_id,),

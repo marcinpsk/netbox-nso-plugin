@@ -2,11 +2,13 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Pure ownership lifecycle rules for the first converted scopes."""
 
+from pathlib import Path
+
 from django.test import SimpleTestCase, TestCase
 
 
 class TestOwnershipStateSignatures(SimpleTestCase):
-    def test_greenfield_native_state_creates_or_acquires_an_overlay(self):
+    def test_greenfield_native_state_creates_an_overlay_but_never_promotes_one(self):
         from netbox_nso_plugin.ownership_planner import (
             OwnershipAction,
             OwnershipSignature,
@@ -23,6 +25,8 @@ class TestOwnershipStateSignatures(SimpleTestCase):
             )
             is OwnershipAction.CREATE
         )
+        # An imported/unknown/changed overlay is device-read state, not operator intent:
+        # the operator Accept is the only entry into ownership.
         assert (
             plan_ownership(
                 rule,
@@ -32,7 +36,7 @@ class TestOwnershipStateSignatures(SimpleTestCase):
                     overlay_present=True,
                 ),
             )
-            is OwnershipAction.ACQUIRE
+            is OwnershipAction.NONE
         )
 
     def test_manifest_distinguishes_native_deletion_from_foreign_overlay_deletion(self):
@@ -132,6 +136,25 @@ class TestOwnershipStateSignatures(SimpleTestCase):
 
         assert action is OwnershipAction.NONE
 
+    def test_retired_identity_is_not_recreated_as_greenfield(self):
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            OwnershipSignature,
+            converted_scope_rules,
+            plan_ownership,
+        )
+
+        action = plan_ownership(
+            converted_scope_rules()["vlan"],
+            OwnershipSignature(
+                native_present=True,
+                native_qualifies=True,
+                manifest_state="retired",
+            ),
+        )
+
+        assert action is OwnershipAction.NONE
+
     def test_owned_overlay_without_native_content_retracts(self):
         from netbox_nso_plugin.ownership_planner import (
             OwnershipAction,
@@ -177,7 +200,9 @@ class TestManifestRetirement(TestCase):
             "device_id": 1627,
             "scope": "vlan",
             "native_model_label": "ipam.vlan",
+            "native_id": 27,
             "native_key": {"group_id": 16, "vid": 27},
+            "state_model_label": "netbox_nso_plugin.nsovlanstate",
         }
         owned = NSOOwnershipManifest.objects.create(**identity)
         detached = NSOOwnershipManifest.objects.create(
@@ -186,7 +211,10 @@ class TestManifestRetirement(TestCase):
         )
 
         retire_manifest_identity(
-            device_ids={1627, 1628}, **{key: identity[key] for key in identity if key != "device_id"}
+            device_ids={1627, 1628},
+            scope=identity["scope"],
+            native_model_label=identity["native_model_label"],
+            native_key=identity["native_key"],
         )
 
         owned.refresh_from_db()
@@ -197,7 +225,7 @@ class TestManifestRetirement(TestCase):
 
 class TestConvertedScopeRuleTable(SimpleTestCase):
     def test_converted_scopes_have_reviewed_acquisition_and_retirement_entries(self):
-        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+        from netbox_nso_plugin.ownership_planner import _NATIVE_BINDING_BUILDERS, converted_scope_rules
 
         rules = converted_scope_rules()
 
@@ -228,7 +256,27 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.overlay_model_labels
             assert rule.deletion_authority
             assert rule.intentional_semantic_delta
-            assert rule.foreign_overlay_delete == "reown"
+            assert rule.foreign_overlay_delete in {"reown", "retire"}
+            assert rule.acquisition_strategy in {"native", "existing_overlay"}
+
+        assert {scope for scope, rule in rules.items() if rule.foreign_overlay_delete == "retire"} == {
+            "bfd",
+            "ospf",
+            "route_policy",
+        }
+        assert {scope for scope, rule in rules.items() if rule.acquisition_strategy == "existing_overlay"} == {
+            "bfd",
+            "l2_sap",
+            "logging",
+            "route_policy",
+            "snmp",
+        }
+        assert set(_NATIVE_BINDING_BUILDERS) == {
+            scope
+            for scope, rule in rules.items()
+            if rule.acquisition_strategy == "native" and scope != "redistribution"
+        }
+        assert len(set(rules) - {"redistribution"}) == 18
 
         retirement_clauses = {
             "bgp": "Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot",
@@ -239,6 +287,51 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert "missing graph dependencies fail fast" in rules["bgp"].intentional_semantic_delta
         assert "foreign-key merge identities use natural graph identities" in rules["bgp"].intentional_semantic_delta
         assert "Legacy PK-shaped peer and template merge bases are reset" in rules["bgp"].intentional_semantic_delta
+
+    def test_direct_overlay_edit_demotion_delta_names_every_affected_scope(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+        clause = (
+            "Stale direct overlay edits no longer demote imported rows to changed. "
+            "Exact writers reload rows before planning."
+        )
+
+        assert {
+            scope for scope, rule in converted_scope_rules().items() if clause in rule.intentional_semantic_delta
+        } == {
+            "bfd",
+            "interface_mtu",
+            "l2_sap",
+            "logging",
+            "route_policy",
+            "static_route",
+            "subinterface",
+            "svi",
+            "vlan",
+        }
+
+    def test_dead_explicit_status_marker_is_absent_from_production(self):
+        package_root = Path(__file__).resolve().parents[1]
+
+        occurrences = [
+            path.relative_to(package_root)
+            for path in package_root.rglob("*.py")
+            if path.relative_to(package_root).parts[0] != "tests" and "_nso_explicit_status_update" in path.read_text()
+        ]
+
+        assert occurrences == []
+
+    def test_reown_is_declared_only_where_the_native_row_carries_the_content(self):
+        """A re-owned overlay is rebuilt from its native anchor, so one must be able to."""
+        from netbox_nso_plugin.ownership_planner import _STATE_SEEDERS, converted_scope_rules
+
+        for scope, rule in converted_scope_rules().items():
+            if rule.foreign_overlay_delete != "reown":
+                continue
+            for model_label, native_field in rule.overlay_native_fields:
+                assert native_field == "__self__" or model_label in _STATE_SEEDERS, (
+                    f"{scope} re-owns {model_label} with no state seeder"
+                )
 
     def test_static_route_rule_names_only_acknowledged_lineage(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules

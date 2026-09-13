@@ -81,5 +81,4 @@ class TestOverlayEventSerialization(TestCase):
         state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
 
         data = serialize_for_event(state)  # must not raise (was: Could not determine serializer)
-        assert "prefix" not in data or True
         assert data["id"] == state.pk
