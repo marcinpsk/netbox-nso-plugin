@@ -327,35 +327,6 @@ class TestUntrackedNativeDeleteIsNoOp(_SignalDBBase):
         self.assertEqual(set(NSOIntentRevision.objects.values_list("device_id", "scope", "revision")), before_revisions)
         self.assertFalse(NSOIntentOutboxEntry.objects.exists())
 
-    @unittest.skip(
-        "#1690: this level retires the raw/bulk DML refusal in favour of audit-time detection; the pin needs an audit-side assertion or a replacement guard"
-    )
-    def test_a_bulk_update_outside_the_deletion_plan_is_still_refused(self):
-        """The permit carries the collector's plan, not a table-wide exemption."""
-        from django.db.models.signals import pre_delete
-        from netbox_routing.models import ISISInstance
-
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
-        from netbox_nso_plugin.models import NSOBGPPeerState
-
-        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
-        self._make_mgmt(adapter_device_id=42)
-
-        def unrelated_bulk_update(sender, instance, **kwargs):
-            NSOBGPPeerState.objects.filter(management__device=self.device).update(remote_as_str="65001")
-
-        pre_delete.connect(
-            unrelated_bulk_update,
-            sender=ISISInstance,
-            dispatch_uid="nso_test_unrelated_bulk_update",
-            weak=False,
-        )
-        try:
-            with self.assertRaises(IntentMutationProtocolError):
-                instance.delete()
-        finally:
-            pre_delete.disconnect(sender=ISISInstance, dispatch_uid="nso_test_unrelated_bulk_update")
-
 
 class TestRekeyedNativeDelete(_SignalDBBase):
     @unittest.skip(

@@ -116,6 +116,20 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertEqual(audits, [self.device.pk] * 3)
         self.assertTrue(is_quiesced())
 
+    def test_a_deferred_scope_fails_and_stays_quiesced(self):
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin.deployment import is_quiesced
+        from netbox_nso_plugin.renderer_audit import RendererAuditResult
+
+        deferred = RendererAuditResult((), (), ("vlan",))
+
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", return_value=deferred):
+            with self.assertRaisesRegex(CommandError, rf"device {self.device.pk}: vlan"):
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
+
+        self.assertTrue(is_quiesced())
+
     def test_a_run_started_under_an_existing_gate_leaves_that_gate_standing(self):
         """The operator who quiesced owns the resume; the cutover must not take it from them."""
         from netbox_nso_plugin.deployment import is_quiesced, quiesce

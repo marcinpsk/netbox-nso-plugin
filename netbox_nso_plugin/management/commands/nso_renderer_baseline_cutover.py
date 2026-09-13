@@ -35,6 +35,11 @@ class Command(BaseCommand):
                             pre_capture=True,
                         )
                         repaired += len(result.repaired)
+                        if result.deferred:
+                            raise CommandError(
+                                f"Renderer baseline audit deferred scopes for device {device_id}: "
+                                f"{', '.join(result.deferred)}"
+                            )
                         if not result.repaired:
                             break
                     else:
