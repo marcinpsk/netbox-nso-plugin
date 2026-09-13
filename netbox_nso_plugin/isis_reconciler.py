@@ -890,13 +890,3 @@ def reconcile_isis(device, payload):
             )
         ),
     }
-
-
-def reconcile_isis_process(device, process_list):
-    """Apply the process half of an exact IS-IS reconciliation."""
-    return reconcile_isis(device, {"processes": process_list})["processes"]
-
-
-def reconcile_isis_interfaces(device, interfaces):
-    """Apply the interface half of an exact IS-IS reconciliation."""
-    return reconcile_isis(device, {"interfaces": interfaces})["interfaces"]
