@@ -205,6 +205,16 @@ class HasNSOChangePermission(BasePermission):
         return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement"))
 
 
+class HasProvisionTombstoneChangePermission(BasePermission):
+    """Require permission to record terminal provision evidence."""
+
+    message = "This action requires the netbox_nso_plugin.change_nsoprovisiontombstone permission."
+
+    def has_permission(self, request, view):  # noqa: D102
+        user = request.user
+        return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsoprovisiontombstone"))
+
+
 class OnboardView(APIView):
     """CICD-facing onboard action.
 
@@ -301,7 +311,7 @@ class ProvisionCompleteView(APIView):
     Body includes ``provision_attempt_id`` and the adapter's terminal evidence.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasProvisionTombstoneChangePermission]
 
     def post(self, request):
         """CAS-mark terminal evidence and delegate every completion action to the sweep."""

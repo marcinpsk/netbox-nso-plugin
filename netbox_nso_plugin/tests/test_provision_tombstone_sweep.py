@@ -301,6 +301,33 @@ class TestProvisionTombstoneSweep(TestCase):
         poll.assert_called_once_with(tombstone.provision_attempt_id)
         offboard.assert_not_called()
 
+    def test_other_attempt_evidence_cannot_complete_the_addressed_tombstone(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, tombstone = self._attempt(
+            "provision-mismatched-attempt",
+            with_management=True,
+            state="open",
+        )
+        evidence = {
+            "provision_attempt_id": str(uuid4()),
+            "status": "succeeded",
+            "job_id": 71,
+            "result": {"ok": True, "device_id": 702},
+        }
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._request", return_value=evidence),
+            self.assertRaises(AdapterError) as caught,
+        ):
+            sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
+        self.assertIsNone(tombstone.terminal_evidence)
+
     def test_malformed_open_attempt_evidence_is_an_adapter_error(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones

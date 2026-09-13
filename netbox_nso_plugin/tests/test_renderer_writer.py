@@ -477,6 +477,55 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         manifest = NSOOwnershipManifest.objects.get(device_id=device.pk, scope="static_route")
         assert manifest.acknowledged_lineage == [acknowledged]
 
+    def test_reowned_static_route_clears_retired_unacknowledged_lineage(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.ownership_planner import manifest_binding
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        device, management = make_managed("writer-static-reown-lineage", 16289)
+        route = StaticRoute.objects.create(prefix="198.18.89.0/24", next_hop="198.18.0.89", metric=1)
+        route.devices.add(device)
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="imported",
+            nso_prefix=str(route.prefix),
+            nso_next_hop=str(route.next_hop),
+            last_acked_triple=None,
+        )
+        binding = manifest_binding(state)
+        retired_key = dict(binding[5])
+        retired_key["prefix"] = "198.18.88.0/24"
+        retired_lineage = {
+            "vrf": "",
+            "prefix": "198.18.88.0/24",
+            "next_hop": "198.18.0.88",
+        }
+        retired = NSOOwnershipManifest.objects.create(
+            device_id=binding[2],
+            scope=binding[1],
+            native_model_label=binding[3],
+            native_id=binding[4],
+            native_key=retired_key,
+            state_model_label=binding[6],
+            state_key=binding[7],
+            ownership_state="retired",
+            deletion_authority=True,
+            acknowledged_lineage=[retired_lineage],
+        )
+        candidate = copy.copy(state)
+        candidate.status = "accepted"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=("status",))
+
+        retired.refresh_from_db()
+        self.assertEqual(retired.ownership_state, "owned")
+        self.assertEqual(retired.native_key, binding[5])
+        self.assertEqual(retired.acknowledged_lineage, [])
+
     def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
         from netbox_routing.models import BFDInterface, BFDProfile
 

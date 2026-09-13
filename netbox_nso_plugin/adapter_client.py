@@ -613,7 +613,10 @@ def provision_device(
 
 def get_provision_attempt(provision_attempt_id):
     """GET terminal or in-flight evidence for one provision attempt."""
-    return _validated_provision_attempt(_request("GET", f"/api/v1/provision-attempts/{provision_attempt_id}"))
+    return _validated_provision_attempt(
+        _request("GET", f"/api/v1/provision-attempts/{provision_attempt_id}"),
+        provision_attempt_id,
+    )
 
 
 def get_failover_config():
@@ -1192,14 +1195,17 @@ def _validated_jobs(jobs, what):
     return jobs
 
 
-def _validated_provision_attempt(evidence):
+def _validated_provision_attempt(evidence, expected_attempt_id):
     """Return structurally valid provision evidence, else leave the attempt undecided."""
     from .provision_lifecycle import validate_provision_evidence
 
     try:
-        return validate_provision_evidence(evidence)
+        validated = validate_provision_evidence(evidence)
     except ValueError as exc:
         raise AdapterError("Adapter returned a malformed provision attempt.", code="invalid_response") from exc
+    if validated.get("provision_attempt_id") != str(expected_attempt_id):
+        raise AdapterError("Adapter returned evidence for another provision attempt.", code="invalid_response")
+    return validated
 
 
 def get_job(job_id):

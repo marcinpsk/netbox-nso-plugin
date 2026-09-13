@@ -616,8 +616,8 @@ def maintain_manifest(instance) -> None:
             "ownership_state": "owned",
             "deletion_authority": rule.deletion_authority,
         }
-        if lineage is not None:
-            defaults["acknowledged_lineage"] = [copy.deepcopy(lineage)]
+        if rule.acknowledged_lineage_field is not None:
+            defaults["acknowledged_lineage"] = [] if lineage is None else [copy.deepcopy(lineage)]
 
         def adopt_manifest(pk, **changes):
             """Update one reusable row without letting a peer insert abort this transaction."""

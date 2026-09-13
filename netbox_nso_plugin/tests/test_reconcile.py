@@ -354,8 +354,50 @@ class TestSyncCompleteEndpoint(APITestCase):
         m.assert_called_once_with(device.pk)
 
 
+class TestProvisionCompletePermission(APITestCase):
+    """Only the adapter service principal can record provision evidence."""
+
+    user_permissions = ()
+
+    def test_authenticated_principal_without_tombstone_change_permission_is_denied(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        device = _make_device("prov-callback-denied")
+        instance = NSOInstance.objects.create(
+            name="prov-callback-denied-nso",
+            adapter_instance_id="prov-callback-denied-nso",
+        )
+        tombstone = NSOProvisionTombstone.objects.create(
+            netbox_device_id=device.pk,
+            nso_instance=instance.adapter_instance_id,
+            nso_device_name="prov-callback-denied",
+            canonical_request={},
+        )
+        payload = {
+            "provision_attempt_id": str(tombstone.provision_attempt_id),
+            "status": "failed",
+            "error": {"code": "provision_failed"},
+        }
+
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            response = self.client.post(
+                "/api/plugins/nso/provision-complete/",
+                payload,
+                format="json",
+                **self.header,
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
+        self.assertIsNone(tombstone.terminal_evidence)
+        enqueue.assert_not_called()
+
+
 class TestProvisionCompleteEndpoint(APITestCase):
     """POST /api/plugins/nso/provision-complete/ — the adapter's provision-done callback."""
+
+    user_permissions = ("netbox_nso_plugin.change_nsoprovisiontombstone",)
 
     def _url(self):
         return "/api/plugins/nso/provision-complete/"
