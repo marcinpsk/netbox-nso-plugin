@@ -481,16 +481,23 @@ class TestSymmetricOwnershipExecutor(TestCase):
         from django.test.utils import CaptureQueriesContext
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.ownership_planner import _native_create_actions
+        from netbox_nso_plugin.ownership_planner import _native_create_actions, converted_scope_rules
 
         def measure(rows):
             device, _management = make_managed(f"owncreate{rows}", 16300 + rows, index=rows)
             group = VLANGroup.objects.create(name=f"Ownership create {rows}", slug=f"nso-{device.pk}")
             for index in range(rows):
                 VLAN.objects.create(group=group, vid=1760 + index, name=f"ownership-create-{rows}-{index}")
-            with CaptureQueriesContext(connection) as captured:
+            with (
+                patch(
+                    "netbox_nso_plugin.ownership_planner.converted_scope_rules",
+                    wraps=converted_scope_rules,
+                ) as rules,
+                CaptureQueriesContext(connection) as captured,
+            ):
                 planned = _native_create_actions(device.pk, frozenset({"vlan"}))
             self.assertEqual(len(planned), rows)
+            self.assertEqual(rules.call_count, 1)
             return len(captured.captured_queries)
 
         self.assertEqual(measure(2), measure(4))
