@@ -681,11 +681,7 @@ def normalize_overlay_lifecycle(instance, update_fields=None):
         return {}
     changed = _raw_content_values(current, spec) != _raw_content_values(instance, spec)
     requested = None if update_fields is None else frozenset(update_fields)
-    explicit_status = (requested is not None and "status" in requested) or getattr(
-        instance,
-        "_nso_explicit_status_update",
-        False,
-    )
+    explicit_status = requested is not None and "status" in requested
     if instance.status != current.status and explicit_status:
         if (
             hasattr(instance, "apply_attempt_id")
