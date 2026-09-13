@@ -491,6 +491,38 @@ class TestLoggingLevelsViews(LevelsTestBase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNotNone(row.accepted_at)
 
+    def test_commit_false_normalizes_the_candidate_without_persisting_it(self):
+        from netbox_nso_plugin.forms import NSOLoggingLevelStateForm
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        attempt_id = uuid4()
+        row = self._row(
+            console_severity="NOTICE",
+            status="deploying",
+            apply_attempt_id=attempt_id,
+        )
+        form = NSOLoggingLevelStateForm(
+            data={
+                "console_severity": "WARNING",
+                "monitor_severity": "",
+                "module_severity": "",
+            },
+            instance=row,
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+
+        candidate = form.save(commit=False)
+
+        self.assertEqual(candidate.console_severity, "WARNING")
+        self.assertEqual(candidate.status, "accepted")
+        self.assertIsNone(candidate.apply_attempt_id)
+        self.assertIsNotNone(candidate.accepted_at)
+        persisted = NSOLoggingLevelState.objects.get(pk=row.pk)
+        self.assertEqual(persisted.console_severity, "NOTICE")
+        self.assertEqual(persisted.status, "deploying")
+        self.assertEqual(persisted.apply_attempt_id, attempt_id)
+        self.assertIsNone(persisted.accepted_at)
+
     def test_field_edit_rejects_a_value_outside_the_closed_oc_enum(self):
         row = self._row(console_severity="NOTICE", status="imported")
         url = reverse("plugins:netbox_nso_plugin:overlay_field_edit", kwargs={"key": "logging_levels", "pk": row.pk})

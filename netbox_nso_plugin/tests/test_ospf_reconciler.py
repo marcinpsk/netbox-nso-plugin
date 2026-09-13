@@ -98,6 +98,58 @@ class TestReconcileOspfFill(TestCase):
         self.assertFalse(NSOOSPFInstanceState.objects.exists())
         self.assertFalse(NSOOSPFInterfaceState.objects.exists())
 
+    def test_first_observation_updates_preexisting_native_rows(self):
+        self._make_mgmt()
+        from ipam.models import VRF
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
+
+        vrf = VRF.objects.create(name="ASPAN")
+        area = OSPFArea.objects.create(area_id="0", area_type="standard")
+        instance = OSPFInstance.objects.create(
+            device=self.device,
+            process_id=10,
+            name="10",
+            router_id="198.18.0.9",
+        )
+        ospf_interface = OSPFInterface.objects.create(
+            instance=instance,
+            area=area,
+            interface=self.tun,
+            passive=False,
+            cost=100,
+            network_type="broadcast",
+        )
+
+        _reconcile_ospf(
+            self.device,
+            self._payload(
+                [self._instance(router_id="198.18.0.1", vrf=vrf.name)],
+                [self._iface(cost=750, network_type="point-to-point", passive=True)],
+            ),
+        )
+
+        instance.refresh_from_db()
+        ospf_interface.refresh_from_db()
+        observed = {
+            "router_id": str(instance.router_id),
+            "vrf": instance.vrf,
+            "cost": ospf_interface.cost,
+            "network_type": ospf_interface.network_type,
+            "passive": ospf_interface.passive,
+        }
+        expected = {
+            "router_id": "198.18.0.1",
+            "vrf": vrf,
+            "cost": 750,
+            "network_type": "point-to-point",
+            "passive": True,
+        }
+        for field, value in expected.items():
+            with self.subTest(field=field):
+                self.assertEqual(observed[field], value)
+
     def test_foreign_overlay_save_is_neutral(self):
         mgmt = self._make_mgmt()
         from netbox_nso_plugin.models import NSOOSPFInstanceState

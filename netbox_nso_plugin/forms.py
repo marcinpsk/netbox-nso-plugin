@@ -261,9 +261,17 @@ class _ExactOverlayFormMixin:
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         obj = super().save(commit=False)
+        created = obj.pk is None or obj._state.adding
+
+        changed_content = bool(set(self.changed_data) - {"tags"})
+        if not created and changed_content:
+            obj.status = sm.on_operator_edit(obj.status)
+            if hasattr(obj, "apply_attempt_id"):
+                obj.apply_attempt_id = None
+            if obj.accepted_at is None:
+                obj.accepted_at = timezone.now()
         if not commit:
             return obj
-        created = obj.pk is None or obj._state.adding
 
         def build_plan():
             return RendererMutationPlan.build(
@@ -276,13 +284,6 @@ class _ExactOverlayFormMixin:
                 )
             )
 
-        changed_content = bool(set(self.changed_data) - {"tags"})
-        if not created and changed_content:
-            obj.status = sm.on_operator_edit(obj.status)
-            if hasattr(obj, "apply_attempt_id"):
-                obj.apply_attempt_id = None
-            if obj.accepted_at is None:
-                obj.accepted_at = timezone.now()
         plan = build_plan()
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:

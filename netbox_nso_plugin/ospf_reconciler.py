@@ -235,7 +235,7 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             )
             if created_native:
                 save(native, force_insert=True, natural_key=("device", "process_id"))
-            elif action == "mirror":
+            elif action in {"seed", "mirror"}:
                 native.router_id = router_id
                 native.vrf = vrf
                 save(native, update_fields=("router_id", "vrf"))
@@ -356,7 +356,7 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
             )
             if created_native:
                 save(native, force_insert=True, natural_key=("interface",))
-            elif action == "mirror":
+            elif action in {"seed", "mirror"}:
                 for name, value in fields.items():
                     setattr(native, name, value)
                 save(native, update_fields=tuple(fields))

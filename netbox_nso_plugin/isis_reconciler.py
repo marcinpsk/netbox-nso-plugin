@@ -262,7 +262,10 @@ def _flex_algo_plan(instance, entries):
         )
         changed = _changed_fields(
             row,
-            {column: data[column] for column in _ISIS_FLEX_COLS if data.get(column) is not None},
+            {
+                column: _absent_value(row, column) if data.get(column) is None else data[column]
+                for column in _ISIS_FLEX_COLS
+            },
         )
         if created:
             operations.save(

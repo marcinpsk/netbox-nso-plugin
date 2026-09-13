@@ -2210,6 +2210,8 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         fas = {fa.algo_id: fa for fa in ISISFlexAlgo.objects.filter(instance=inst)}
         self.assertEqual(set(fas), {128})  # auto-mirrored
         self.assertEqual(fas[128].metric_type, "delay-metric")  # auto-mirrored
+        self.assertIsNone(fas[128].priority)
+        self.assertEqual(fas[128].admin_group_exclude, "")
         self.assertEqual(states[0].status, "imported")
 
     def test_routing_instance_srv6_locators(self):
