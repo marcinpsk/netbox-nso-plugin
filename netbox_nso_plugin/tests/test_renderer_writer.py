@@ -724,6 +724,17 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 )
             )
 
+    def test_plan_rejects_an_unplanned_unsaved_implicit_reference(self):
+        from ipam.models import VLANGroup
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        group = VLANGroup(name="Writer missing group", slug="writer-missing-group")
+        vlan = VLAN(group=group, vid=1647, name="writer-missing-implicit-reference")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "unsaved row outside the plan"):
+            RendererMutationPlan.build(saves=(planned_save(vlan, force_insert=True, natural_key=("group", "vid")),))
+
     def test_writer_rejects_an_explicit_reference_to_a_deleted_row(self):
         from django.db import IntegrityError, connection, transaction
         from tenancy.models import Tenant
