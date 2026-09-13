@@ -9,7 +9,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("netbox_nso_plugin", "0025_nsoprovisiontombstone_and_more"),
+        ("netbox_nso_plugin", "0024_nsoprovisiontombstone_and_more"),
     ]
 
     operations = [
