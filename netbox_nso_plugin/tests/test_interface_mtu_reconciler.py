@@ -56,6 +56,28 @@ class TestInterfaceMtuReconciler(TestCase):
             [("save", "netbox_nso_plugin.nsointerfacemtustate")],
         )
 
+    def test_bound_port_longer_than_the_model_limit_is_rejected_before_planning(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import interface_mtu_reconcile_plan
+
+        max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
+
+        with self.assertRaises(AdapterError) as raised:
+            interface_mtu_reconcile_plan(
+                self.device,
+                {
+                    "interfaces": [
+                        {
+                            "interface_name": self.po1.name,
+                            "bound_port": "x" * (max_length + 1),
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
     def test_reconcile_replays_the_frozen_operations(self):
         from netbox_nso_plugin.interface_mtu_reconciler import (
             interface_mtu_reconcile_plan,
