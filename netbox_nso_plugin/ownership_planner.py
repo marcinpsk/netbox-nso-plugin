@@ -1642,9 +1642,10 @@ def _native_create_actions(device_id, requested, *, management=None, bindings=No
     }
     candidates = []
     overlay_filters = []
+    rules = converted_scope_rules()
     for scope, native, state_model_label, state_key in bindings:
         rule_key = "redistribution" if native._meta.label_lower == "netbox_routing.redistribution" else scope
-        rule = converted_scope_rules()[rule_key]
+        rule = rules[rule_key]
         identity = {
             "device_id": device_id,
             "scope": scope,
