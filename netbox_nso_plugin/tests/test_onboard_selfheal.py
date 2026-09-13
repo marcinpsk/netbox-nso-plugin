@@ -187,7 +187,14 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             def request(_self, method, url, **kwargs):
                 self.assertEqual(method, "GET")
                 self.assertTrue(url.endswith(f"/provision-attempts/{tombstone.provision_attempt_id}"))
-                return make_response(200, {"status": "succeeded", "result": {"ok": False, "steps": steps}})
+                return make_response(
+                    200,
+                    {
+                        "provision_attempt_id": str(tombstone.provision_attempt_id),
+                        "status": "succeeded",
+                        "result": {"ok": False, "steps": steps},
+                    },
+                )
 
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_CLIENT_CONFIG),
