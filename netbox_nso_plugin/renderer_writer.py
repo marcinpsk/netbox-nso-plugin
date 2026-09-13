@@ -417,10 +417,19 @@ def _creation_refs(save_states):
             field = instance._meta.get_field(field_name)
             if field.is_relation and field.many_to_one and field.is_cached(instance):
                 related_instances.append(field.get_cached_value(instance))
-        if any(id(related) in planned_creations and id(related) not in references for related in related_instances):
-            raise IntentMutationProtocolError(
-                f"{instance._meta.label_lower} creation references a row planned after it (a creation planned later)"
-            )
+        for related in related_instances:
+            if related is None:
+                continue
+            if id(related) in planned_creations:
+                if id(related) not in references:
+                    raise IntentMutationProtocolError(
+                        f"{instance._meta.label_lower} creation references a row planned after it "
+                        "(a creation planned later)"
+                    )
+            elif related.pk is None or related._state.adding:
+                raise IntentMutationProtocolError(
+                    f"{instance._meta.label_lower} creation references an unsaved row outside the plan"
+                )
         references[id(instance)] = RendererCreationRef(
             model_label=instance._meta.label_lower,
             natural_key=_natural_key(
