@@ -538,9 +538,12 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                     device_id=device.pk,
                     scope=scope,
                     native_model_label=model._meta.label_lower,
-                    ownership_state="owned",
                 )
-                self.assertEqual(list(manifests.values_list("native_key", flat=True)), [native_key])
+                self.assertEqual(
+                    list(manifests.values_list("native_key", "ownership_state")),
+                    [(native_key, "retired")],
+                )
+
     def test_reowned_static_route_clears_retired_unacknowledged_lineage(self):
         from netbox_routing.models import StaticRoute
 
