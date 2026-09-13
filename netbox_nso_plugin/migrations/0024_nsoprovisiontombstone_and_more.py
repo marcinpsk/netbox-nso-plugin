@@ -12,7 +12,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("netbox_nso_plugin", "0024_reset_bgp_merge_bases"),
+        ("netbox_nso_plugin", "0023_outbox_contribution_kind"),
     ]
 
     operations = [
