@@ -2610,6 +2610,14 @@ def _normalize_overlay_lifecycle(instance, spec, update_fields):
     return deferred
 
 
+def normalize_overlay_lifecycle(instance, update_fields=None):
+    """Apply the shared operator-edit lifecycle to one registered renderer input."""
+    spec = _REGISTRY.get(instance._meta.label_lower)
+    if spec is None:
+        raise IntentMutationProtocolError(f"{instance._meta.label_lower} is not a registered renderer input")
+    return _normalize_overlay_lifecycle(instance, spec, update_fields)
+
+
 def _secondary_dml_footprint(instance, spec):
     """Cover registered rows touched by framework-maintained secondary DML."""
     if instance._meta.label_lower == "dcim.interface" and instance.device_id is not None:
@@ -2790,7 +2798,7 @@ def _begin_implicit(
 
     deferred = {}
     if not deleting and not _is_intent_push_suppressed():
-        deferred = _normalize_overlay_lifecycle(instance, spec, update_fields)
+        deferred = normalize_overlay_lifecycle(instance, update_fields)
     before, after = _mutation_fragments(
         instance,
         spec,

@@ -84,7 +84,7 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
 
         from django.core.exceptions import FieldDoesNotExist
 
-        from ..intent_state import IntentMutationProtocolError
+        from ..intent_state import IntentMutationProtocolError, normalize_overlay_lifecycle
         from ..renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         candidate = copy.copy(serializer.instance)
@@ -105,6 +105,8 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
                 continue
             setattr(candidate, field_name, value)
 
+        if "status" not in serializer.validated_data:
+            normalize_overlay_lifecycle(candidate, serializer.validated_data)
         plan = RendererMutationPlan.build(saves=(planned_save(candidate),))
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         serializer.instance = candidate

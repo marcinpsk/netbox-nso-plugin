@@ -16,7 +16,7 @@ from netbox_nso_plugin.models import (
     NSOInterfaceState,
 )
 
-from ._outbox_case import mirror_update
+from ._outbox_case import content_update, mirror_update
 
 
 class NSOInstanceAPITest(APITestCase):
@@ -289,6 +289,38 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "accepted")
         self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=device, scope="interface").count(), 1)
+
+    def test_content_edit_through_the_api_reopens_an_owned_row(self):
+        self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
+        content_update(self.state, status="in_sync")
+
+        response = self.client.patch(
+            self._get_detail_url(self.state),
+            {"attribute": "enabled"},
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.attribute, "enabled")
+        self.assertEqual(self.state.status, "accepted")
+
+    def test_content_edit_through_the_api_preserves_an_explicit_status(self):
+        self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
+        content_update(self.state, status="in_sync")
+
+        response = self.client.patch(
+            self._get_detail_url(self.state),
+            {"attribute": "enabled", "status": "in_sync"},
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.attribute, "enabled")
+        self.assertEqual(self.state.status, "in_sync")
 
     def test_patch_preserves_serializer_tag_and_custom_field_handling(self):
         from core.models import ObjectType
