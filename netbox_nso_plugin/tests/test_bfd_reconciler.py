@@ -73,6 +73,21 @@ class TestReconcileBfd(TestCase):
         self.assertIsNone(bi.bfd_profile_id)
         self.assertTrue(bi.micro_bfd)
 
+    def test_existing_native_without_profile_receives_a_new_profile(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+
+        native = BFDInterface.objects.create(interface=self.ae1, bfd_profile=None, micro_bfd=False, enabled=True)
+        self.assertIsNone(native.bfd_profile_id)
+        self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
+
+        reconcile_bfd(self.device, [self._entry("ae1", micro=False, tx=333, rx=444, mult=5)])
+
+        native = BFDInterface.objects.get(interface=self.ae1)
+        self.assertIsNotNone(native.bfd_profile_id)
+        self.assertEqual(native.bfd_profile.name, "bfd-333-444-x5")
+
     def test_stale_pruned(self):
         """An interface that stops reporting BFD has its BFDInterface removed."""
         from netbox_routing.models import BFDInterface
@@ -126,6 +141,54 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         st = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
         assert st.status == "imported" and st.min_tx == 300 and st.multiplier == 3 and st.micro_bfd is True
+
+    def test_reconcile_preflights_profile_native_and_overlay_creations(self):
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        plan = bfd_reconcile_plan(
+            self.device,
+            [
+                {
+                    "interface_name": self.iface.name,
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "netbox_routing.bfdprofile"),
+                ("save", "netbox_routing.bfdinterface"),
+                ("save", "netbox_nso_plugin.nsobfdinterfacestate"),
+            ],
+        )
+
+    def test_foreign_overlay_save_does_not_schedule_bfd_behavior(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        state = NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.min_tx = 500
+            state.save(update_fields=("min_tx",))
+
+        schedule.assert_not_called()
 
     def test_reconcile_preserves_owned_status(self):
         from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
@@ -411,7 +474,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
 
         from django.contrib.auth import get_user_model
 
-        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentRevision, NSOOwnershipManifest
 
         state = NSOBFDInterfaceState.objects.create(
             management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="conflict"
@@ -424,3 +488,15 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bfd")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("bfd", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="bfd",
+            native_model_label="dcim.interface",
+            native_key={"device_id": self.iface.device_id, "name": self.iface.name},
+            ownership_state="owned",
+        ).exists()

@@ -406,7 +406,11 @@ class TestDeletePropagation(_SecretBase):
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                row.delete()
+                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+                plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+                with renderer_writes(plan) as writer:
+                    writer.delete(row)
         mock_put.assert_called_once()
         communities = mock_put.call_args[0][1]
         self.assertEqual(communities, [])

@@ -8,7 +8,7 @@ LAG ``dcim.Interface``; each member an ``NSOLACPMemberState`` on its physical
 interface, linked back to the LAG via ``lag_bundle``.
 
 Follows the established overlay-reconcile convention (see
-``_reconcile_isis_interfaces`` / ``reconcile_l2_services``): keyed by
+``reconcile_isis`` / ``reconcile_l2_services``): keyed by
 (management, interface); refresh the NSO-reported fields on every read; set
 status ``imported`` unless the operator has advanced it into a write-path state
 (accepted/deploying/in_sync — never clobbered); rows the payload no longer

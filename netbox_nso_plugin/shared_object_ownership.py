@@ -15,12 +15,10 @@ This module is the family-agnostic core that resolves that tension:
   (``is_materialized``) — its capture is what populates the shared NetBox object;
 * the first device to import an object owns it (no churn: only the owner ever writes);
 * an operator can **re-point** ownership to a different device's version via
-  :func:`rematerialize`, which refills the shared object and flips the flags.
+  :func:`rematerialize`, which delegates to the family's exact graph planner.
 
-A family plugs in by registering a :class:`SharedObjectSpec` (how to materialize a
-capture into the NetBox object + how to hash a capture).  Nothing here knows about
-route-policy specifically, so ACL reuses it by registering its own families and a state
-model that mixes in ``models.SharedObjectStateMixin``.
+A family plugs in by registering a :class:`SharedObjectSpec` for hashing captures and
+extracting current object content. Nothing here performs graph writes.
 """
 
 from __future__ import annotations
@@ -34,19 +32,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SharedObjectSpec:
-    """How one family of shared named objects materializes into its NetBox object.
+    """How one family hashes captures and extracts current NetBox content."""
 
-    ``fill(target_obj, captured)`` rebuilds the NetBox object's content from a device
-    capture (full replace).  ``hash_captured(captured)`` returns a stable digest of a
-    capture so two devices' versions can be compared without re-serialising the object.
-    Both operate on the raw per-object payload dict the device reported.
-    """
-
-    fill: Callable[[object, dict], None]
     hash_captured: Callable[[dict], str]
     label: str = ""
     renderer_models: tuple[str, ...] = ()
-    # Reverse of fill: the CURRENT NetBox object content in device-capture shape, for the
+    # The current NetBox object content in device-capture shape, for the
     # device-caught-up settle (#93). None = the family cannot compare (settle skipped).
     extract: Callable[[object], dict] | None = None
 
@@ -55,7 +46,7 @@ _REGISTRY: dict[str, SharedObjectSpec] = {}
 
 
 def register(family: str, spec: SharedObjectSpec) -> None:
-    """Register a family's materialization spec (idempotent; last registration wins)."""
+    """Register a family's content spec (idempotent; last registration wins)."""
     _REGISTRY[family] = spec
 
 
@@ -151,27 +142,6 @@ def canonical_hash(state_model, family: str, object_name: str) -> str | None:
     return owner.content_hash or None
 
 
-def mark_materialized(state) -> None:
-    """Make ``state`` the sole materialized owner of its group (flag only, no refill).
-
-    Called when a device first fills an empty shared object.  Clears the flag on any
-    sibling so the 'exactly one owner' invariant holds even across races.
-    """
-    from .intent_state import intent_transaction, route_policy_footprint
-
-    with intent_transaction(route_policy_footprint({(state.family, state.object_name)})):
-        # Lock the whole group so two devices first-filling the same shared object serialize:
-        # without this both could pass the "no materialized sibling" check and both flag
-        # themselves owner, leaving two materialized owners (this runs on every reconcile of
-        # every shared route-policy object, so the race is realistic). Take the lock, then clear
-        # any sibling and flag self.
-        list(group_rows(state).select_for_update().values_list("pk", flat=True))
-        group_rows(state).filter(is_materialized=True).exclude(pk=state.pk).update(is_materialized=False)
-        if not state.is_materialized:
-            state.is_materialized = True
-            state.save(update_fields=["is_materialized"])
-
-
 def versions(state_model, family: str, object_name: str) -> list:
     """Every device's version of a shared object, owner first (for the versions UI)."""
     rows = state_model.objects.filter(family=family, object_name__iexact=object_name).select_related(
@@ -223,56 +193,9 @@ def version_items(state_model, family: str, object_name: str) -> list[dict]:
 
 
 def rematerialize(state) -> None:
-    """Re-point a shared object's content to ``state``'s captured version.
+    """Re-point a shared route-policy object through its exact graph planner."""
+    if state._meta.label_lower != "netbox_nso_plugin.nsoroutepolicystate":
+        raise ValueError(f"no exact materialization planner for {state._meta.label_lower!r}")
+    from .route_policy_reconciler import rematerialize_route_policy
 
-    Refills the shared NetBox object from this device's capture, marks this row the
-    materialized owner, and recomputes every sibling's status against the new content
-    (matching device → imported, divergent → conflict; owned rows are left alone).
-
-    Writes only into NetBox (device→NetBox); it does NOT push to any device — that is a
-    separate, explicit operator Accept.  Runs under ``suppress_intent_push`` so the
-    NetBox-object saves don't fire the operator-edit push handlers.
-    """
-    from . import status_machine as sm
-    from .intent_state import intent_transaction, route_policy_footprint
-    from .signals import suppress_intent_push
-
-    spec = get_spec(state.family)
-    if spec is None:
-        raise ValueError(f"no materialization spec registered for family {state.family!r}")
-    target = state.assigned_object
-    if target is None:
-        raise ValueError("overlay row is not linked to a NetBox object")
-    captured = state.captured or {}
-    if not captured:
-        raise ValueError("no captured content to materialize for this device")
-
-    new_hash = spec.hash_captured(captured)
-    with intent_transaction(route_policy_footprint({(state.family, state.object_name)})):
-        with suppress_intent_push():
-            spec.fill(target, captured)
-        for row in group_rows(state):
-            if row.pk == state.pk:
-                row.is_materialized = True
-                row.content_hash = new_hash
-                if not sm.is_owned(row.status):
-                    row.status = sm.IMPORTED
-                row.save(update_fields=["is_materialized", "content_hash", "status"])
-                continue
-            _resettle_sibling(row, spec, new_hash)
-
-
-def _resettle_sibling(row, spec: SharedObjectSpec, owner_hash: str) -> None:
-    """Clear a non-owner row's flag and recompute its conflict status against the owner."""
-    from django.utils import timezone
-
-    from . import status_machine as sm
-
-    row.is_materialized = False
-    if not sm.is_owned(row.status) and row.captured:
-        diverged = spec.hash_captured(row.captured) != owner_hash
-        row.status = sm.CONFLICT if diverged else sm.IMPORTED
-    # Bump last_sync_at alongside the status change so the UI's "last seen" isn't stale next to
-    # a freshly-recomputed status.
-    row.last_sync_at = timezone.now()
-    row.save(update_fields=["is_materialized", "status", "last_sync_at"])
+    rematerialize_route_policy(state)

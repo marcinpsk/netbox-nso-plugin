@@ -72,13 +72,14 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         from ._static_route_case import _assign_without_push
 
         with _quiet_fixture(), transaction.atomic():
             sr = StaticRoute.objects.create(prefix=prefix, next_hop=next_hop, metric=1)
             _assign_without_push(sr, mgmt.device)
-            return NSOStaticRouteState.objects.create(
+            state = NSOStaticRouteState(
                 management=mgmt,
                 static_route=sr,
                 status=status,
@@ -87,6 +88,18 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 nso_next_hop=next_hop,
                 accepted_at=timezone.now(),
             )
+            plan = RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        state,
+                        force_insert=True,
+                        natural_key=("management", "static_route"),
+                    ),
+                )
+            )
+            with renderer_writes(plan) as writer:
+                writer.save(state, force_insert=True)
+            return state
 
     def test_backfills_a_device_with_no_detected_drift(self):
         """P1.5 — ``resync_intent``'s default ``keys`` re-syncs only scopes that already LOOK

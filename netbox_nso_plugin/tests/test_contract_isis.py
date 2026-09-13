@@ -4,9 +4,8 @@
 
 The deepest read contract: a large optional scalar set on processes/interfaces plus the
 four nested JSON bags (``settings``/``levels``/``segment_routing``/``flex_algos``) the
-plugin reads fixed key sets out of. Consumed by
-``template_content._reconcile_isis_process`` / ``_reconcile_isis_interfaces`` — note
-these take the LISTs (``payload["processes"]`` / ``["interfaces"]``), not the dict.
+plugin reads fixed key sets out of. Consumed by ``isis_reconciler.reconcile_isis``,
+which takes the complete document.
 
 Canonical contract: ``nso-adapter/docs/api-contract.md`` (IS-IS §).
 Mirror (producer side): ``nso-adapter/tests/api/test_contract_isis.py`` — the ``*_KEYS``
@@ -18,13 +17,13 @@ from __future__ import annotations
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 
+from netbox_nso_plugin.isis_reconciler import reconcile_isis
 from netbox_nso_plugin.models import (
     NSODeviceManagement,
     NSOInstance,
     NSOISISInstanceState,
     NSOISISInterfaceState,
 )
-from netbox_nso_plugin.template_content import _reconcile_isis_interfaces, _reconcile_isis_process
 
 TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "processes", "interfaces"}
 PROC_REQUIRED_KEYS = {"process_tag"}
@@ -247,8 +246,8 @@ class TestIsisContractConsumer(TestCase):
         except ImportError:
             self.skipTest("netbox_routing not installed")
 
-        proc_rows = _reconcile_isis_process(self.device, CONTRACT_PAYLOAD["processes"])
-        iface_rows = _reconcile_isis_interfaces(self.device, CONTRACT_PAYLOAD["interfaces"])
+        proc_rows = reconcile_isis(self.device, {"processes": CONTRACT_PAYLOAD["processes"]})["processes"]
+        iface_rows = reconcile_isis(self.device, {"interfaces": CONTRACT_PAYLOAD["interfaces"]})["interfaces"]
 
         self.assertEqual(NSOISISInstanceState.objects.filter(management=self.mgmt).count(), 2)
         self.assertEqual(len(proc_rows), 2)
