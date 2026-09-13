@@ -7147,7 +7147,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
                 break
             except IntentMutationProtocolError:
                 if attempt:
-                    messages.error(request, "Routing state changed. Refresh the page and try again.")
+                    messages.error(request, "Configuration state changed. Refresh the page and try again.")
                     return redirect(_device_nso_tab_url(current.management.device_id))
         messages.success(request, f"Accepted {candidate}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))

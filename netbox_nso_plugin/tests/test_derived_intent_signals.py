@@ -315,9 +315,10 @@ class TestInterfaceSaveHandler(TestCase):
         iface1_after = Interface.objects.get(pk=iface1.pk)
         self.assertEqual(iface1_after.description, "[auto]")
 
-    def test_unplanned_description_recompute_does_not_abort_the_planned_save(self):
+    def test_unplanned_description_recompute_aborts_the_planned_save(self):
         import copy
 
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
@@ -346,19 +347,11 @@ class TestInterfaceSaveHandler(TestCase):
         candidate.enabled = False
         plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("enabled",)),))
 
-        with (
-            self.assertLogs("netbox_nso_plugin.signals", level=logging.WARNING) as logs,
-            without_commit_drain(),
-            renderer_writes(plan) as writer,
-        ):
+        with self.assertRaises(IntentMutationProtocolError), without_commit_drain(), renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("enabled",))
 
-        self.assertIn(
-            f"derived_intent.unplanned_write field=description interface_id={iface1.pk}",
-            [record.getMessage() for record in logs.records],
-        )
         iface1.refresh_from_db()
-        self.assertFalse(iface1.enabled)
+        self.assertTrue(iface1.enabled)
         self.assertEqual(iface1.description, "[auto]")
 
     def test_interface_save_noop_when_feature_off(self):

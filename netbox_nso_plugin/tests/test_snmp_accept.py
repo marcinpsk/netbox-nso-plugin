@@ -79,7 +79,7 @@ class TestSnmpAcceptView(_SnmpBase):
 
         self.assertEqual(response.status_code, 302)
         self.assertIn(
-            "Routing state changed. Refresh the page and try again.",
+            "Configuration state changed. Refresh the page and try again.",
             [str(message) for message in get_messages(response.wsgi_request)],
         )
 

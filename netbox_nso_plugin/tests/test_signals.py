@@ -1292,6 +1292,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
 
     def test_foreign_owned_overlay_save_does_not_schedule_interface_behavior(self):
         """A registered row save is behavior-neutral without its exact writer."""
+        self._make_mgmt(adapter_device_id=7)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
         with (
