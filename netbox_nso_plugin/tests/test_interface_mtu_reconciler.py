@@ -62,13 +62,16 @@ class TestInterfaceMtuReconciler(TestCase):
 
         max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
 
-        with self.assertRaises(AdapterError) as raised:
+        with self.assertRaisesRegex(AdapterError, "bound_port is too long") as raised:
             interface_mtu_reconcile_plan(
                 self.device,
                 {
                     "interfaces": [
                         {
                             "interface_name": self.po1.name,
+                            "mtu": None,
+                            "ip_mtu": None,
+                            "mpls_mtu": None,
                             "bound_port": "x" * (max_length + 1),
                         }
                     ]
