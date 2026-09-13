@@ -285,6 +285,28 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual((state.pk, state.status, state.bgp_peer_id, state.device_base_hash), original)
 
+    def test_malformed_persisted_peer_identity_is_quarantined(self):
+        """One corrupt overlay row does not prevent valid peers from reconciling."""
+        management = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        NSOBGPPeerState.objects.create(
+            management=management,
+            asn_str="invalid",
+            peer_address_str="not-an-address",
+        )
+
+        states = _reconcile_bgp_config(
+            self.device,
+            self._payload(self._router_payload(peers=[self._peer_entry()])),
+        )
+
+        states_by_address = {state.peer_address_str: state for state in states}
+        self.assertEqual(states_by_address["not-an-address"].status, "error")
+        self.assertEqual(states_by_address["10.0.0.2"].status, "imported")
+
     def test_missing_required_fields_are_typed_adapter_errors(self):
         """Missing adapter fields fail before stored BGP can change."""
         self._make_mgmt()

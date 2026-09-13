@@ -495,6 +495,47 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 )
             )
 
+    def test_plan_rejects_an_unplanned_unsaved_explicit_reference(self):
+        from tenancy.models import Tenant
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        tenant = Tenant(name="Writer missing tenant", slug="writer-missing-tenant")
+        vlan = VLAN(tenant=tenant, vid=1645, name="writer-missing-reference")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "unsaved row outside the plan"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        vlan,
+                        force_insert=True,
+                        natural_key=("group", "vid"),
+                        references=(("tenant", tenant),),
+                    ),
+                )
+            )
+
+    def test_plan_rejects_an_explicit_reference_to_a_deleted_row(self):
+        from tenancy.models import Tenant
+
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+
+        tenant = Tenant.objects.create(name="Writer deleted tenant", slug="writer-deleted-tenant")
+        tenant.delete()
+        vlan = VLAN(tenant=tenant, vid=1646, name="writer-deleted-reference")
+
+        with self.assertRaisesRegex(IntentMutationProtocolError, "unsaved row outside the plan"):
+            RendererMutationPlan.build(
+                saves=(
+                    planned_save(
+                        vlan,
+                        force_insert=True,
+                        natural_key=("group", "vid"),
+                        references=(("tenant", tenant),),
+                    ),
+                )
+            )
+
     def test_plan_refuses_an_unreferenced_support_row(self):
         from tenancy.models import Tenant
 

@@ -269,19 +269,25 @@ def _indexed_peer_states(rows):
     """Index the lowest-PK peer state and retain its canonical aliases."""
     identities = {}
     duplicates = []
+    invalid = []
     raw_keys = {}
     for row in rows:
-        canonical_key = (
-            str(_parse_asn(row.asn_str)),
-            row.vrf_name,
-            _parse_ip_address(row.peer_address_str).compressed,
-        )
+        try:
+            canonical_key = (
+                str(_parse_asn(row.asn_str)),
+                row.vrf_name,
+                _parse_ip_address(row.peer_address_str).compressed,
+            )
+        except ValueError:
+            logger.warning("BGP: peer state %s has an unparseable identity; quarantined", row.pk)
+            invalid.append(row)
+            continue
         raw_keys[(row.asn_str, row.vrf_name, row.peer_address_str)] = row
         if canonical_key in identities:
             duplicates.append(row)
         else:
             identities[canonical_key] = row
-    return identities, duplicates, raw_keys
+    return identities, duplicates, invalid, raw_keys
 
 
 def _available_peer_state_identity(state, state_key, raw_keys):
@@ -769,7 +775,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if self.management is not None
             else ()
         )
-        self.peer_states, self.duplicate_peer_states, self.peer_state_raw_keys = _indexed_peer_states(peer_state_rows)
+        (
+            self.peer_states,
+            self.duplicate_peer_states,
+            self.invalid_peer_states,
+            self.peer_state_raw_keys,
+        ) = _indexed_peer_states(peer_state_rows)
         self.template_states = (
             {
                 row.template_name: row
@@ -1188,6 +1199,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def build(self):
         if self.management is None:
             return self.operations
+        for state in self.invalid_peer_states:
+            self.plan_invalid_peer_state(state)
         for state in self.duplicate_peer_states:
             self.plan_stale_peer_state(state, force_changed=True)
         routers = sorted(self.router_entries, key=lambda row: row["asn"])
@@ -1236,6 +1249,15 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         from . import status_machine as sm
 
         status = sm.CHANGED if force_changed else sm.on_reconcile(current.status, present=False)
+        if status != current.status:
+            state = copy.copy(current)
+            state.status = status
+            self.save(state, update_fields=("status",))
+
+    def plan_invalid_peer_state(self, current):
+        from . import status_machine as sm
+
+        status = sm.on_reconcile_error(current.status)
         if status != current.status:
             state = copy.copy(current)
             state.status = status

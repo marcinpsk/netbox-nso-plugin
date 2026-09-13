@@ -311,6 +311,10 @@ def _planned_field_value(instance, field, creation_refs, reference_fields=()):
         reference = creation_refs.get(id(explicit_related))
         if reference is not None:
             return reference
+        if explicit_related.pk is None or explicit_related._state.adding:
+            raise IntentMutationProtocolError(
+                f"{instance._meta.label_lower}.{field.name} references an unsaved row outside the plan"
+            )
         return _normal(explicit_related.pk)
     if field.is_relation and field.many_to_one and field.is_cached(instance):
         related = field.get_cached_value(instance)
