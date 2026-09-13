@@ -336,6 +336,30 @@ class TestInterfaceMtuReconciler(TestCase):
                 self.assertEqual(raised.exception.code, "invalid_response")
                 self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
 
+    def test_mtu_values_above_the_model_limit_are_rejected_before_planning(self):
+        from django.db import connection
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        field_names = {
+            "mtu": "l2_mtu",
+            "ip_mtu": "ip_mtu",
+            "mpls_mtu": "mpls_mtu",
+        }
+        for payload_field, model_field in field_names.items():
+            field = NSOInterfaceMtuState._meta.get_field(model_field)
+            _minimum, maximum = connection.ops.integer_field_range(field.get_internal_type())
+            with self.subTest(field=payload_field):
+                with self.assertRaises(AdapterError) as raised:
+                    reconcile_interface_mtu(
+                        self.device,
+                        {"interfaces": [_mtu_entry(self.po1.name, **{payload_field: maximum + 1})]},
+                    )
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
     def test_interface_absent_in_netbox_is_skipped(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
 
