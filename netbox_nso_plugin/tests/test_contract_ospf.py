@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Contract test — consumer side of GET /api/v1/devices/{id}/ospf.
 
-Pins the JSON shape the plugin CONSUMES in ``template_content._reconcile_ospf``
+Pins the JSON shape the plugin CONSUMES in ``ospf_reconciler.reconcile_ospf``
 against the documented adapter contract. Optional keys are omitted when unset.
 
 Canonical contract: ``nso-adapter/docs/api-contract.md`` § "GET .../ospf".
@@ -16,7 +16,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOOSPFInstanceState, NSOOSPFInterfaceState
-from netbox_nso_plugin.template_content import _reconcile_ospf
+from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
 REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "instances", "interfaces"}
 REQUIRED_INSTANCE_KEYS = {"process_id", "vrf", "areas"}

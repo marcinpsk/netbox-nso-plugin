@@ -1160,7 +1160,7 @@ def _recompute_one(interface, templates):
     from .renderer_writer import active_renderer_writer
 
     active = active_renderer_writer()
-    # RF-1: every call site gates on _converted_writer_owns_content, so a writer is always
+    # Every call site gates on _converted_writer_owns_content, so a writer is always
     # active here. Opening one of its own from a signal is the thing that rule forbids.
     if active is None:
         raise IntentMutationProtocolError("a derived description recompute requires an active renderer writer")

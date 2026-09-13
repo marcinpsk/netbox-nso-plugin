@@ -362,7 +362,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         site = Site.objects.get_or_create(name="NoIsisSite", slug="noisissite")[0]
         orphan = Device.objects.create(name="orphan-isis", device_type=dt, role=role, site=site)
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(orphan, self._payload())
         self.assertEqual(result, [])
@@ -370,7 +370,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_empty_payload_returns_empty(self):
         """Empty payload → no state rows created."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload())
         self.assertEqual(result, [])
@@ -402,12 +402,12 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_omitted_and_foreign_deleted_isis_interface_do_not_enqueue_intent(self):
         from netbox_routing.models import ISISInterface
 
-        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOISISInterfaceState
         from netbox_nso_plugin.renderer_writer import active_renderer_writer
 
         self._make_mgmt()
-        reconcile_isis_interfaces(self.device, self._payload(self._entry()))
+        _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
         state = NSOISISInterfaceState.objects.get(interface=self.iface_ge0)
         native = ISISInterface.objects.get(pk=state.isis_interface_id)
         native_pk = native.pk
@@ -417,7 +417,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         # Reconcile uses suppress_intent_push; foreign deletion has no active exact writer.
         with patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent") as push:
             with self.captureOnCommitCallbacks(execute=True):
-                reconcile_isis_interfaces(self.device, self._payload())
+                _reconcile_isis_interfaces(self.device, self._payload())
             self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device).exists())
             push.assert_not_called()
             state.refresh_from_db()
@@ -554,7 +554,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         )
         self.assertEqual(state.status, "accepted")
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         _reconcile_isis_interfaces(
             self.device,
@@ -587,7 +587,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         mgmt = self._make_mgmt()
         from netbox_routing.models import ISISInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(circuit_type="level-2-only")))
 
@@ -614,7 +614,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(circuit_type="", network_type="")))
         self.assertEqual(len(result), 1)
@@ -633,7 +633,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface, ISISPrefixSID
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         entry = self._entry(
             iface_name="GigabitEthernet0/0",
@@ -662,7 +662,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface, ISISPrefixSID
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         _reconcile_isis_interfaces(
             self.device,
@@ -683,7 +683,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         """hello_auth_type / hello_auth_present flow from the adapter payload onto the
         NSOISISInterfaceState overlay (the netbox_routing write is guarded separately)."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(
             self.device,
@@ -703,7 +703,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_bfd_enabled_written_to_routing(self):
         """entry bfd_enabled flows onto netbox_routing ISISInterface.bfd_enabled."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         state = _reconcile_isis_interfaces(self.device, self._payload(self._entry(bfd_enabled=True)))[0]
         ri = state.isis_interface
@@ -717,7 +717,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         Tri-state: an explicit device-side disable (frr_enabled=False, the arcos
         bond2 shape) must persist as False — a falsy-drop would erase the signal."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         state = _reconcile_isis_interfaces(
             self.device, self._payload(self._entry(frr_enabled=True, frr_protection="node"))
@@ -742,7 +742,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         None on the device stays None on the overlay: no opinion → the reconcile leaves
         any brownfield BFD untouched ('we don't delete what we don't have')."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         state = _reconcile_isis_interfaces(self.device, self._payload(self._entry(bfd_enabled=True)))[0]
         self.assertTrue(state.bfd_enabled)
@@ -825,8 +825,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         """An owned bfd_enabled=True intent keeps the row pending until the device reports BFD."""
         from netbox_routing.models import ISISInstance, ISISInterface
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOISISInterfaceState
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
         mgmt = self._make_mgmt()
         inst = ISISInstance.objects.create(device=self.device, process_tag="")
@@ -896,7 +896,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_no_hello_auth_defaults_blank(self):
         """An entry without hello-auth leaves the state blank/false."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         state = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))[0]
         self.assertEqual(state.hello_auth_type, "")
@@ -905,7 +905,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_idempotent_second_call(self):
         """Calling reconcile twice with same payload produces same single row."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry()))
@@ -914,7 +914,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_unknown_interface_skipped(self):
         """Interface name not in NetBox → silently skipped."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(iface_name="Ethernet99/99")))
         self.assertEqual(result, [])
@@ -924,7 +924,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         bound_port (lag-99:10) does → correlate through bound_port."""
         self._make_mgmt()
         port = Interface.objects.create(device=self.device, name="lag-99:10", type="lag")
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(
             self.device,
@@ -937,8 +937,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_resolved_aliases_keep_first_metric_on_first_import(self):
         from netbox_routing.models import ISISInterface
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOISISInterfaceState
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
         self._make_mgmt()
         port = Interface.objects.create(device=self.device, name="lag-99:10", type="lag")
@@ -964,8 +964,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_resolved_aliases_keep_first_metric_on_existing_rows(self):
         from netbox_routing.models import ISISInterface
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOISISInterfaceState
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
         self._make_mgmt()
         port = Interface.objects.create(device=self.device, name="lag-99:10", type="lag")
@@ -992,7 +992,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_nokia_bound_port_unmatched_is_dropped(self):
         """A logical name with a bound_port that still matches no dcim.Interface is dropped."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(
             self.device,
@@ -1003,7 +1003,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_dual_stack_creates_two_rows(self):
         """IPv4 and IPv6 on same interface → two state rows with same interface FK."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(
             self.device,
@@ -1019,7 +1019,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_stale_row_set_to_changed(self):
         """Row present in DB but absent from payload → status=changed."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         # First call: populate two interfaces
         _reconcile_isis_interfaces(
@@ -1038,8 +1038,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_write_path_status_preserved(self):
         """Rows in accepted/deploying/in_sync are not overwritten back to imported."""
         mgmt = self._make_mgmt()
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOISISInterfaceState
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
         # Pre-create a state row in 'accepted' status
         NSOISISInterfaceState.objects.create(
@@ -1060,7 +1060,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_passive_flag_stored(self):
         """Passive flag from payload is stored on the state row."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(passive=True)))
         self.assertTrue(result[0].passive)
@@ -1068,7 +1068,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_metric_stored(self):
         """Metric from payload is stored on the state row."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload(self._entry(metric=100)))
         self.assertEqual(result[0].metric, 100)
@@ -1076,7 +1076,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_missing_interface_name_skipped(self):
         """Entry with empty interface_name is silently skipped."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(self.device, self._payload({"interface_name": "", "af": "ipv4"}))
         self.assertEqual(result, [])
@@ -1084,7 +1084,7 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
     def test_missing_af_skipped(self):
         """Entry with empty af is silently skipped."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         result = _reconcile_isis_interfaces(
             self.device, self._payload({"interface_name": "GigabitEthernet0/0", "af": ""})
@@ -1117,8 +1117,8 @@ class TestReconcileIsisProcess(TestCase):
     def test_empty_process_tag_creates_row(self):
         """Junos' default IS-IS instance has process_tag='' — it must still be stored."""
         self._make_mgmt()
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOISISInstanceState
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         result = _reconcile_isis_process(
             self.device,
@@ -1131,7 +1131,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_absent_process_tag_skipped(self):
         """An entry that genuinely omits process_tag (None) is skipped."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         result = _reconcile_isis_process(self.device, [{"net": "", "is_type": "level-2"}])
         self.assertEqual(result, [])
@@ -1139,7 +1139,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_named_process_tag_creates_row(self):
         """A named process tag is stored as before."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         result = _reconcile_isis_process(self.device, [{"process_tag": "CORE", "net": "", "is_type": "level-2"}])
         self.assertEqual(len(result), 1)
@@ -1148,7 +1148,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_owned_explicit_is_type_survives_device_omission(self):
         """An omitted NED default is absence, not permission to erase accepted intent."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         state = _reconcile_isis_process(
             self.device,
@@ -1166,7 +1166,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_unowned_historical_default_is_type_migrates_to_absence(self):
         """A pre-sweep served default must not survive into a later Accept payload."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         state = _reconcile_isis_process(
             self.device,
@@ -1183,8 +1183,8 @@ class TestReconcileIsisProcess(TestCase):
 
     def test_nokia_owned_explicit_default_is_type_does_not_converge_on_omission(self):
         """A provenance-explicit default must be reported before intent can settle."""
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="Nokia SR OS",
@@ -1212,8 +1212,8 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(state.status, "accepted")
 
     def test_junos_owned_explicit_default_is_type_does_not_converge_on_omission(self):
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="Junos IS-IS",
@@ -1241,8 +1241,8 @@ class TestReconcileIsisProcess(TestCase):
         """The producer-faithful lifecycle: the corrected Junos reader never emits process
         is-type while both levels are enabled, so an owned is_type can only arrive by operator
         edit on top of a BLANK import — and a later omitting read must not erase it."""
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="Junos IS-IS edited",
@@ -1279,8 +1279,8 @@ class TestReconcileIsisProcess(TestCase):
     def test_nokia_omitted_defaults_do_not_confirm_owned_nondefaults(self):
         from netbox_routing.models import ISISSegmentRouting
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="Nokia IS-IS nondefaults",
@@ -1315,8 +1315,8 @@ class TestReconcileIsisProcess(TestCase):
     def test_nokia_omitted_level_default_does_not_settle_owned_level(self):
         from netbox_routing.models import ISISLevel
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="Nokia IS-IS level provenance",
@@ -1341,7 +1341,7 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(state.status, "accepted")
 
     def test_nokia_present_level_with_omitted_default_does_not_settle(self):
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         self._make_mgmt()
         state = _reconcile_isis_process(
@@ -1359,7 +1359,7 @@ class TestReconcileIsisProcess(TestCase):
         self.assertEqual(state.status, "accepted")
 
     def test_nokia_omitted_long_scalar_alone_does_not_settle(self):
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         self._make_mgmt()
         state = _reconcile_isis_process(
@@ -1377,8 +1377,8 @@ class TestReconcileIsisProcess(TestCase):
     def test_arcos_omitted_locator_default_does_not_confirm_owned_nondefault(self):
         from netbox_routing.models import ISISSRv6Locator
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="ArcOS IS-IS nondefaults",
@@ -1417,8 +1417,8 @@ class TestReconcileIsisProcess(TestCase):
     def test_unowned_arcos_locator_omissions_clear_stale_values(self):
         from netbox_routing.models import ISISSRv6Locator
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
 
         platform = Platform.objects.create(
             name="ArcOS IS-IS omission mirror",
@@ -1502,7 +1502,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         result = _reconcile_isis_process(
             self.device,
@@ -1541,7 +1541,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         result = _reconcile_isis_process(
             self.device,
@@ -1571,7 +1571,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(self.device, [{"process_tag": "OL", "overload_bit": False}])
         inst = ISISInstance.objects.get(device=self.device, process_tag="OL")
@@ -1589,7 +1589,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         payload = [{"process_tag": "0", "net": "49.0001.0000.0000.0001.00", "is_type": "level-2"}]
         _reconcile_isis_process(self.device, payload)
@@ -1607,7 +1607,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSetting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(
             self.device,
@@ -1653,7 +1653,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         iface = Interface.objects.create(device=self.device, name="GigabitEthernet0/0", type="1000base-t")
         _reconcile_isis_interfaces(
@@ -1687,7 +1687,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISLevel, ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(
             self.device,
@@ -1741,7 +1741,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(
             self.device, [{"process_tag": "0", "segment_routing": {"enabled": True, "prefix_sid_range": "global"}}]
@@ -1761,7 +1761,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(self.device, [{"process_tag": "0", "segment_routing": {"enabled": True}}])
         inst = ISISInstance.objects.get(device=self.device, process_tag="0")
@@ -1785,7 +1785,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_configured_empty_segment_routing_preserves_existing_child(self):
         from netbox_routing.models import ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         self._make_mgmt()
         _reconcile_isis_process(
@@ -1810,7 +1810,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_configured_empty_segment_routing_creates_child_on_first_import(self):
         from netbox_routing.models import ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         self._make_mgmt()
 
@@ -1830,7 +1830,7 @@ class TestReconcileIsisProcess(TestCase):
     def test_unowned_sr_omitted_columns_are_cleared_before_base_advances(self):
         from netbox_routing.models import ISISInstance, ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         self._make_mgmt()
         _reconcile_isis_process(
@@ -1876,7 +1876,7 @@ class TestReconcileIsisProcess(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSegmentRouting
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(
             self.device,
@@ -1946,7 +1946,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface, ISISInterfaceLevel
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         iface = Interface.objects.create(device=self.device, name="GigabitEthernet0/0", type="1000base-t")
         _reconcile_isis_interfaces(
@@ -1971,7 +1971,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface, ISISInterfaceLevel
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         iface = Interface.objects.create(device=self.device, name="to-omit", type="1000base-t")
         _reconcile_isis_interfaces(
@@ -2006,8 +2006,8 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInterface, ISISInterfaceLevel
 
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
         platform = Platform.objects.create(
             name="Nokia ISIS defaults",
@@ -2058,8 +2058,8 @@ class TestReconcileIsisInterfaceLevels(TestCase):
 
     def test_nokia_owned_interface_without_timer_intent_converges_on_omission(self):
         self._make_mgmt()
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
         from netbox_nso_plugin.models import NSOPlatformNedMapping
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
 
         platform = Platform.objects.create(
             name="Nokia ISIS no timers",
@@ -2090,7 +2090,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
     def test_owned_interface_level_omission_does_not_settle_when_scalars_match(self):
         """A level-only provenance gap must survive the top-level intent comparison."""
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_isis_interfaces
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_interfaces as _reconcile_isis_interfaces
 
         iface = Interface.objects.create(device=self.device, name="to-level-only", type="1000base-t")
         initial = {
@@ -2118,7 +2118,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISFlexAlgo, ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         _reconcile_isis_process(
             self.device,
@@ -2154,7 +2154,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance, ISISSRv6Locator
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         payload = [
             {
@@ -2219,7 +2219,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         payload = [{"process_tag": "0", "suppress_attached_bit": True, "ignore_attached_bit": True}]
         _reconcile_isis_process(self.device, payload)
@@ -2244,7 +2244,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         self._make_mgmt()
         from netbox_routing.models import ISISInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_isis_process
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis_process as _reconcile_isis_process
 
         payload = [{"process_tag": "0", "fast_reroute": "ti-lfa", "microloop_avoidance": True}]
         _reconcile_isis_process(self.device, payload)

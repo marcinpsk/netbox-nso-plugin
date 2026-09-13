@@ -49,11 +49,6 @@ def redistribution_reconcile_plan(device, payload):
     return replace(plan, lock_footprint=lock_footprint)
 
 
-def redistribution_reconcile_footprint(device, payload=None):
-    """Return the exact preflight footprint for compatibility callers."""
-    return redistribution_reconcile_plan(device, payload or {"entries": []}).lock_footprint
-
-
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     """Resolve the native destination object for one redistribution entry."""
     from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, ISISInstance, OSPFInstance

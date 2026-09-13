@@ -334,14 +334,10 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
     from .isis_reconciler import isis_reconcile_plan
-    from .ospf_reconciler import ospf_reconcile_plan
+    from .ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
-    from .template_content import (
-        _reconcile_ospf,
-        _reconcile_static_routes,
-        static_route_reconcile_plan,
-    )
+    from .template_content import _reconcile_static_routes, static_route_reconcile_plan
 
     if not mgmt.manage_routing:
         return
@@ -413,7 +409,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 "ospf_data",
                 mgmt,
                 ("NSOOSPFInstanceState", "NSOOSPFInterfaceState"),
-                _reconcile_ospf,
+                reconcile_ospf,
                 device,
                 ospf_doc,
             ),
@@ -760,14 +756,13 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
     from .isis_reconciler import isis_reconcile_plan
-    from .ospf_reconciler import ospf_reconcile_plan
+    from .ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
     from .template_content import (
         _reconcile_interface_ips,
         _reconcile_logging_config,
-        _reconcile_ospf,
         _reconcile_snmp_config,
         _reconcile_static_routes,
         _upsert_interface_states,
@@ -1142,7 +1137,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 mgmt,
                 "ospf",
                 ospf_doc,
-                lambda: _reconcile_ospf(device, ospf_doc),
+                lambda: reconcile_ospf(device, ospf_doc),
                 epoch=dev_id,
                 ctx_key="ospf_data",
                 pre_body=lambda: ospf_reconcile_plan(device, ospf_doc),

@@ -1954,22 +1954,6 @@ def _isis_instance_object_hash(inst) -> str:
     return merge_util.content_hash(content)
 
 
-# Keep the long-standing test and call-site names while the exact reconciler owns all
-# IS-IS DML.
-@mirror_reconciler
-def _reconcile_isis_interfaces(device, interfaces: list) -> list:
-    from .isis_reconciler import reconcile_isis_interfaces
-
-    return reconcile_isis_interfaces(device, interfaces)
-
-
-@mirror_reconciler
-def _reconcile_isis_process(device, process_list: list) -> list:
-    from .isis_reconciler import reconcile_isis_process
-
-    return reconcile_isis_process(device, process_list)
-
-
 def _clean_router_id(value) -> str:
     """Normalise an exported router-id, treating the literal ``"None"`` as absent.
 
@@ -2000,28 +1984,6 @@ def _canonical_area_id(area_id) -> str:
     except (TypeError, ValueError):
         return s
     return f"{(n >> 24) & 255}.{(n >> 16) & 255}.{(n >> 8) & 255}.{n & 255}"
-
-
-@mirror_reconciler
-def _reconcile_ospf(device, payload: dict) -> dict:
-    """Apply the exact OSPF mutation plan."""
-    from .ospf_reconciler import reconcile_ospf
-
-    return reconcile_ospf(device, payload)
-
-
-def ospf_reconcile_plan(device, payload):
-    """Expose OSPF preflight planning beside the compatibility reconcile entry point."""
-    from .ospf_reconciler import ospf_reconcile_plan as build_plan
-
-    return build_plan(device, payload)
-
-
-def _reconcile_redistribution(device, payload: dict) -> list:
-    """Compatibility shim — delegates to redistribution_reconciler.reconcile_redistribution."""
-    from .redistribution_reconciler import reconcile_redistribution
-
-    return reconcile_redistribution(device, payload)
 
 
 class InterfaceNSOBadge(PluginTemplateExtension):

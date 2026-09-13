@@ -71,7 +71,7 @@ class TestReconcileOspfFill(TestCase):
         from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
         from netbox_nso_plugin.models import NSOOSPFInstanceState, NSOOSPFInterfaceState
-        from netbox_nso_plugin.template_content import ospf_reconcile_plan
+        from netbox_nso_plugin.ospf_reconciler import ospf_reconcile_plan
 
         plan = ospf_reconcile_plan(
             self.device,
@@ -139,7 +139,7 @@ class TestReconcileOspfFill(TestCase):
 
     def test_no_mgmt_returns_empty(self):
         orphan = _make_ospf_device("orphan")
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         result = _reconcile_ospf(orphan, self._payload([self._instance()]))
         self.assertEqual(result, {"instances": [], "interfaces": []})
@@ -148,7 +148,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(self.device, self._payload([self._instance(process_id=10, router_id="10.0.0.1")]))
 
@@ -160,7 +160,7 @@ class TestReconcileOspfFill(TestCase):
         """The OSPF instance overlay mirrors the device admin-state (Nokia 'enabled')."""
         self._make_mgmt()
         from netbox_nso_plugin.models import NSOOSPFInstanceState
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         inst = self._instance(process_id=1)
         inst["enabled"] = True
@@ -180,7 +180,7 @@ class TestReconcileOspfFill(TestCase):
 
     def test_instance_overlay_in_sync_when_linked(self):
         self._make_mgmt()
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         res = _reconcile_ospf(self.device, self._payload([self._instance()]))
         self.assertEqual(len(res["instances"]), 1)
@@ -188,8 +188,8 @@ class TestReconcileOspfFill(TestCase):
 
     def test_owned_instance_overlay_retains_operator_values(self):
         from netbox_nso_plugin.models import NSOOSPFInstanceState
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
         from netbox_nso_plugin.signals import ospf_instance_intent_item
-        from netbox_nso_plugin.template_content import _reconcile_ospf
 
         operator_areas = [{"area-id": "0.0.0.1", "area-type": "stub"}]
         state = NSOOSPFInstanceState.objects.create(
@@ -234,7 +234,7 @@ class TestReconcileOspfFill(TestCase):
         # Device drops the process but its netbox-routing OSPFInstance still exists → drift.
         self._make_mgmt()
         from netbox_nso_plugin.models import NSOOSPFInstanceState
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(self.device, self._payload([self._instance(process_id=10)]))
         _reconcile_ospf(self.device, self._payload([]))
@@ -247,7 +247,7 @@ class TestReconcileOspfFill(TestCase):
         # → pruned rather than left as perpetual false drift.
         mgmt = self._make_mgmt()
         from netbox_nso_plugin.models import NSOOSPFInstanceState
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         NSOOSPFInstanceState.objects.create(management=mgmt, process_id="999", status="imported", ospf_instance=None)
         _reconcile_ospf(self.device, self._payload([]))
@@ -258,7 +258,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.1")]))
         res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.2")]))
@@ -270,7 +270,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(self.device, self._payload([self._instance(router_id="10.0.0.1")]))
         inst = OSPFInstance.objects.get(device=self.device, process_id="10")
@@ -286,7 +286,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="")]))
         self.assertFalse(OSPFInstance.objects.filter(device=self.device).exists())
@@ -300,7 +300,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         res = _reconcile_ospf(self.device, self._payload([self._instance(router_id="None")]))
         self.assertFalse(OSPFInstance.objects.filter(device=self.device).exists())
@@ -312,7 +312,7 @@ class TestReconcileOspfFill(TestCase):
         from ipam.models import VRF
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         vrf = VRF.objects.create(name="ASPAN")
         _reconcile_ospf(self.device, self._payload([self._instance(process_id=100, vrf="ASPAN")]))
@@ -325,7 +325,7 @@ class TestReconcileOspfFill(TestCase):
         from netbox_routing.models import OSPFInstance
 
         from netbox_nso_plugin.models import AdapterConnection
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         AdapterConnection.objects.create(url="http://a:8000", enabled=True, vrf_auto_create=False)
         _reconcile_ospf(self.device, self._payload([self._instance(process_id=100, vrf="MTI")]))
@@ -339,7 +339,7 @@ class TestReconcileOspfFill(TestCase):
         from netbox_routing.models import OSPFInstance
 
         from netbox_nso_plugin.models import AdapterConnection
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         AdapterConnection.objects.create(url="http://a:8000", enabled=True, vrf_auto_create=True)
         _reconcile_ospf(self.device, self._payload([self._instance(process_id=100, vrf="MTI")]))
@@ -350,7 +350,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInstance
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         p = self._payload([self._instance()])
         _reconcile_ospf(self.device, p)
@@ -363,7 +363,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(
             self.device,
@@ -383,7 +383,7 @@ class TestReconcileOspfFill(TestCase):
         from netbox_routing.models import OSPFArea, OSPFInterface
 
         from netbox_nso_plugin.models import NSOOSPFInterfaceState
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(
             self.device,
@@ -412,7 +412,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFArea, OSPFInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         area0 = OSPFArea.objects.create(area_id="0", area_type="standard")
         _reconcile_ospf(
@@ -442,7 +442,7 @@ class TestReconcileOspfFill(TestCase):
             status="accepted",
         )
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         # Device reports the interface present but WITHOUT cost / network-type.
         _reconcile_ospf(
@@ -460,7 +460,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(
             self.device,
@@ -478,7 +478,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(
             self.device,
@@ -490,7 +490,7 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_routing.models import OSPFInterface
 
-        from netbox_nso_plugin.template_content import _reconcile_ospf
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
 
         _reconcile_ospf(
             self.device,
