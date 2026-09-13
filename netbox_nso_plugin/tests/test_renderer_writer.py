@@ -301,6 +301,71 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         manifest = NSOOwnershipManifest.objects.get(device_id=device.pk, scope="static_route")
         assert manifest.acknowledged_lineage == [acknowledged]
 
+    def test_logging_and_snmp_replacements_reuse_their_manifest_identity(self):
+        from netbox_nso_plugin.models import (
+            NSOLoggingHostState,
+            NSOLoggingLevelState,
+            NSOSnmpCommunityState,
+            NSOSnmpHostState,
+            NSOSnmpSystemInfoState,
+            NSOSnmpV3UserState,
+        )
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        device, management = make_managed("writer-stable-manifest", 16287)
+        cases = (
+            (NSOLoggingHostState, "logging", ("address",), {"address": "198.18.0.10"}),
+            (NSOLoggingLevelState, "logging", (), {}),
+            (
+                NSOSnmpCommunityState,
+                "snmp",
+                ("community_hash",),
+                {"community_hash": "abcd1234abcd1234"},
+            ),
+            (NSOSnmpV3UserState, "snmp", ("username",), {"username": "writer-stable-user"}),
+            (NSOSnmpHostState, "snmp", ("address",), {"address": "198.18.0.20"}),
+            (NSOSnmpSystemInfoState, "snmp", (), {}),
+        )
+
+        def execute(plan, operation):
+            mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+            with mutation(plan) as writer:
+                operation(writer)
+
+        for model, scope, identity_fields, values in cases:
+            with self.subTest(model=model._meta.label_lower):
+                natural_key = ("management", *identity_fields)
+                original = model(management=management, status="accepted", **values)
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(original, force_insert=True, natural_key=natural_key),)
+                )
+                execute(plan, lambda writer: writer.save(original, force_insert=True))
+
+                plan = RendererMutationPlan.build(deletes=(planned_delete(original),))
+                execute(plan, lambda writer: writer.delete(original))
+
+                replacement = model(management=management, status="accepted", **values)
+                plan = RendererMutationPlan.build(
+                    saves=(planned_save(replacement, force_insert=True, natural_key=natural_key),)
+                )
+                execute(plan, lambda writer: writer.save(replacement, force_insert=True))
+
+                native_key = {"management_id": management.pk}
+                native_key.update({field_name: values[field_name] for field_name in identity_fields})
+                manifests = NSOOwnershipManifest.objects.filter(
+                    device_id=device.pk,
+                    scope=scope,
+                    native_model_label=model._meta.label_lower,
+                    ownership_state="owned",
+                )
+                self.assertEqual(list(manifests.values_list("native_key", flat=True)), [native_key])
+
     def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
         from netbox_routing.models import BFDInterface, BFDProfile
 
@@ -515,26 +580,33 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 )
             )
 
-    def test_plan_rejects_an_explicit_reference_to_a_deleted_row(self):
+    def test_writer_rejects_an_explicit_reference_to_a_deleted_row(self):
+        from django.db import IntegrityError, connection, transaction
         from tenancy.models import Tenant
 
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         tenant = Tenant.objects.create(name="Writer deleted tenant", slug="writer-deleted-tenant")
+        tenant_pk = tenant.pk
         tenant.delete()
+        tenant.pk = tenant_pk
+        tenant._state.adding = False
         vlan = VLAN(tenant=tenant, vid=1646, name="writer-deleted-reference")
 
-        with self.assertRaisesRegex(IntentMutationProtocolError, "unsaved row outside the plan"):
-            RendererMutationPlan.build(
-                saves=(
-                    planned_save(
-                        vlan,
-                        force_insert=True,
-                        natural_key=("group", "vid"),
-                        references=(("tenant", tenant),),
-                    ),
-                )
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(
+                    vlan,
+                    force_insert=True,
+                    natural_key=("group", "vid"),
+                    references=(("tenant", tenant),),
+                ),
             )
+        )
+        with self.assertRaises(IntegrityError), transaction.atomic(), renderer_mirror_writes(plan) as writer:
+            writer.save(vlan, force_insert=True)
+            connection.check_constraints(table_names=(VLAN._meta.db_table,))
+        self.assertFalse(VLAN.objects.filter(vid=1646, name="writer-deleted-reference").exists())
 
     def test_plan_refuses_an_unreferenced_support_row(self):
         from tenancy.models import Tenant

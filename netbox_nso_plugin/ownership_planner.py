@@ -201,7 +201,11 @@ _CONVERTED_SCOPE_RULES = {
             "netbox_nso_plugin.nsologginghoststate",
             "netbox_nso_plugin.nsologginglevelstate",
         ),
-        native_key_fields=("management_id", "pk"),
+        native_key_fields=(),
+        native_key_fields_by_model=(
+            ("netbox_nso_plugin.nsologginghoststate", ("management_id", "address")),
+            ("netbox_nso_plugin.nsologginglevelstate", ("management_id",)),
+        ),
         overlay_model_labels=(
             "netbox_nso_plugin.nsologginghoststate",
             "netbox_nso_plugin.nsologginglevelstate",
@@ -222,7 +226,13 @@ _CONVERTED_SCOPE_RULES = {
             "netbox_nso_plugin.nsosnmphoststate",
             "netbox_nso_plugin.nsosnmpsysteminfostate",
         ),
-        native_key_fields=("management_id", "pk"),
+        native_key_fields=(),
+        native_key_fields_by_model=(
+            ("netbox_nso_plugin.nsosnmpcommunitystate", ("management_id", "community_hash")),
+            ("netbox_nso_plugin.nsosnmpv3userstate", ("management_id", "username")),
+            ("netbox_nso_plugin.nsosnmphoststate", ("management_id", "address")),
+            ("netbox_nso_plugin.nsosnmpsysteminfostate", ("management_id",)),
+        ),
         overlay_model_labels=(
             "netbox_nso_plugin.nsosnmpcommunitystate",
             "netbox_nso_plugin.nsosnmpv3userstate",

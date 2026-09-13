@@ -16,6 +16,8 @@ def _profile_values(entry):
     tx, rx, mult = entry.get("min_tx"), entry.get("min_rx"), entry.get("multiplier")
     if tx is None or rx is None or mult is None:
         return None
+    if any(type(value) is not int for value in (tx, rx, mult)):
+        return None
     if not (60 <= tx <= 60000 and 60 <= rx <= 60000 and 0 <= mult <= 255):
         return None
     return f"bfd-{tx}-{rx}-x{mult}", tx, rx, mult
@@ -160,15 +162,20 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
             if current_state is not None
             else NSOBFDInterfaceState(management=management, interface=interface)
         )
+        reported_profile_values = _profile_values(entry)
         if owned:
-            matches = all(entry.get(field) == getattr(state, field) for field in ("min_tx", "min_rx", "multiplier"))
+            matches = reported_profile_values is not None and reported_profile_values[1:] == (
+                state.min_tx,
+                state.min_rx,
+                state.multiplier,
+            )
             matches = matches and state.micro_bfd == bool(entry.get("micro_bfd", False))
             # A matching read is not apply evidence: only a correlated apply result settles deploying.
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
-            state.min_tx = entry.get("min_tx")
-            state.min_rx = entry.get("min_rx")
-            state.multiplier = entry.get("multiplier")
+            state.min_tx, state.min_rx, state.multiplier = (
+                reported_profile_values[1:] if reported_profile_values else (None, None, None)
+            )
             state.micro_bfd = bool(entry.get("micro_bfd", False))
             state.status = sm.on_reconcile(state.status)
         state.last_sync_at = planned_at

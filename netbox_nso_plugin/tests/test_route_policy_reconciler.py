@@ -607,6 +607,7 @@ class TestReconcileRoutePolicy(TestCase):
 
         from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
 
+        self._make_mgmt(self.device)
         PrefixList.objects.create(name="PAYLOAD-PL")
         CommunityList.objects.create(name="PAYLOAD-CL")
         ASPath.objects.create(name="PAYLOAD-AP")

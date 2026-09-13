@@ -246,8 +246,9 @@ class TestIsisContractConsumer(TestCase):
         except ImportError:
             self.skipTest("netbox_routing not installed")
 
-        proc_rows = reconcile_isis(self.device, {"processes": CONTRACT_PAYLOAD["processes"]})["processes"]
-        iface_rows = reconcile_isis(self.device, {"interfaces": CONTRACT_PAYLOAD["interfaces"]})["interfaces"]
+        result = reconcile_isis(self.device, CONTRACT_PAYLOAD)
+        proc_rows = result["processes"]
+        iface_rows = result["interfaces"]
 
         self.assertEqual(NSOISISInstanceState.objects.filter(management=self.mgmt).count(), 2)
         self.assertEqual(len(proc_rows), 2)

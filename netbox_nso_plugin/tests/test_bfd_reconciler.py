@@ -142,6 +142,69 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         st = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
         assert st.status == "imported" and st.min_tx == 300 and st.multiplier == 3 and st.micro_bfd is True
 
+    def test_reconcile_sanitizes_non_integer_timer_values(self):
+        from netbox_routing.models import BFDInterface
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        invalid_values = (("min_tx", "300"), ("min_rx", 300.0), ("multiplier", True))
+        for index, (field_name, invalid_value) in enumerate(invalid_values, start=1):
+            with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Port-channel-invalid-{index}",
+                    type="lag",
+                )
+                entry = {
+                    "interface_name": interface.name,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                    field_name: invalid_value,
+                }
+
+                reconcile_bfd(self.device, [entry])
+
+                state = NSOBFDInterfaceState.objects.get(management=self.management, interface=interface)
+                native = BFDInterface.objects.get(interface=interface)
+                self.assertEqual((state.min_tx, state.min_rx, state.multiplier), (None, None, None))
+                self.assertIsNone(native.bfd_profile_id)
+
+    def test_reconcile_rejects_non_integer_timer_match_for_owned_state(self):
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        invalid_values = (("min_tx", 300.0), ("min_rx", 300.0), ("multiplier", True))
+        for index, (field_name, invalid_value) in enumerate(invalid_values, start=1):
+            with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Port-channel-owned-invalid-{index}",
+                    type="lag",
+                )
+                timer_values = {
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 1 if field_name == "multiplier" else 3,
+                }
+                state = NSOBFDInterfaceState.objects.create(
+                    management=self.management,
+                    interface=interface,
+                    status="in_sync",
+                    **timer_values,
+                )
+                entry = {"interface_name": interface.name, **timer_values, field_name: invalid_value}
+
+                reconcile_bfd(self.device, [entry])
+
+                state.refresh_from_db()
+                self.assertEqual(state.status, "accepted")
+                self.assertEqual(
+                    (state.min_tx, state.min_rx, state.multiplier),
+                    (timer_values["min_tx"], timer_values["min_rx"], timer_values["multiplier"]),
+                )
+
     def test_reconcile_preflights_profile_native_and_overlay_creations(self):
         from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan

@@ -409,7 +409,7 @@ class TestLoggingLevelsViews(LevelsTestBase):
                 device_id=self.device.pk,
                 scope="logging",
                 native_model_label="netbox_nso_plugin.nsologginglevelstate",
-                native_key={"management_id": self.mgmt.pk, "pk": row.pk},
+                native_key={"management_id": self.mgmt.pk},
                 ownership_state="owned",
             ).exists()
         )

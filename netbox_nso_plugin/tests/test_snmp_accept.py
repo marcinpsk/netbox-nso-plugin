@@ -115,7 +115,7 @@ class TestSnmpAcceptView(_SnmpBase):
             device_id=self.device.pk,
             scope="snmp",
             native_model_label="netbox_nso_plugin.nsosnmpcommunitystate",
-            native_key={"management_id": mgmt.pk, "pk": c.pk},
+            native_key={"management_id": mgmt.pk, "community_hash": c.community_hash},
             ownership_state="owned",
         ).exists()
 
