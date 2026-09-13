@@ -226,8 +226,8 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.device = _make_device("mk")
         self.mgmt = _make_mgmt(self.device, "mk", 7403)
 
-    def _recorded_params(self, act):
-        """Run *act* against a recorded transport → the params of every adapter request."""
+    def _recorded_requests(self, act):
+        """Run *act* against a recorded transport and return every adapter request."""
         from ._adapter_http import make_response, make_session
 
         session = make_session(response=make_response(200, json_data={"count": 0, "routes": []}))
@@ -236,7 +236,11 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
         ):
             act()
-        return [call.kwargs.get("params") or {} for call in session.request.call_args_list]
+        return session.request.call_args_list
+
+    def _recorded_params(self, act):
+        """Return the parameters of every adapter request made by *act*."""
+        return [call.kwargs.get("params") or {} for call in self._recorded_requests(act)]
 
     def _owned_vlan_state(self, vid: int):
         from ._outbox_case import own_vlan
@@ -334,9 +338,10 @@ class TestOutboxMarkingModes(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             _assign_and_accept(route, other_device)
         NSOIntentOutboxEntry.objects.all().delete()
 
-        params = self._recorded_params(lambda: _unassign_and_retire(route, self.device))
+        requests = self._recorded_requests(lambda: _unassign_and_retire(route, self.device))
 
-        assert len(params) == 1, f"only the removed device must receive a request; saw {params}"
+        assert len(requests) == 1, f"only the removed device must receive a request; saw {requests}"
+        assert f"/api/v1/devices/{self.mgmt.adapter_device_id}/" in requests[0].args[1]
         assert _entries(other_device, "static_route") == [], "the unchanged device must receive no outbox contribution"
 
 
