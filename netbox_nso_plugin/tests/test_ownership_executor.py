@@ -477,6 +477,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(four - three, three - two)
 
     def test_native_create_planning_batches_manifest_and_overlay_reads(self):
+        from cProfile import Profile
+
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
         from ipam.models import VLAN, VLANGroup
@@ -488,16 +490,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
             group = VLANGroup.objects.create(name=f"Ownership create {rows}", slug=f"nso-{device.pk}")
             for index in range(rows):
                 VLAN.objects.create(group=group, vid=1760 + index, name=f"ownership-create-{rows}-{index}")
-            with (
-                patch(
-                    "netbox_nso_plugin.ownership_planner.converted_scope_rules",
-                    wraps=converted_scope_rules,
-                ) as rules,
-                CaptureQueriesContext(connection) as captured,
-            ):
+            with Profile() as profile, CaptureQueriesContext(connection) as captured:
                 planned = _native_create_actions(device.pk, frozenset({"vlan"}))
             self.assertEqual(len(planned), rows)
-            self.assertEqual(rules.call_count, 1)
+            rule_calls = sum(
+                entry.callcount for entry in profile.getstats() if entry.code is converted_scope_rules.__code__
+            )
+            self.assertEqual(rule_calls, 1)
             return len(captured.captured_queries)
 
         self.assertEqual(measure(2), measure(4))
