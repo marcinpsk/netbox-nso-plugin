@@ -16,7 +16,7 @@ from netbox_nso_plugin.models import (
     NSOInterfaceState,
 )
 
-from ._outbox_case import mirror_update
+from ._outbox_case import content_update, mirror_update
 
 
 class NSOInstanceAPITest(APITestCase):
@@ -289,6 +289,76 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "accepted")
         self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=device, scope="interface").count(), 1)
+
+    def test_content_edit_through_the_api_reopens_an_owned_row(self):
+        self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
+        content_update(self.state, status="in_sync")
+
+        response = self.client.patch(
+            self._get_detail_url(self.state),
+            {"attribute": "enabled"},
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.attribute, "enabled")
+        self.assertEqual(self.state.status, "accepted")
+
+    def test_content_edit_through_the_api_preserves_an_explicit_status(self):
+        self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
+        content_update(self.state, status="in_sync")
+
+        response = self.client.patch(
+            self._get_detail_url(self.state),
+            {"attribute": "enabled", "status": "in_sync"},
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.attribute, "enabled")
+        self.assertEqual(self.state.status, "in_sync")
+
+    def test_patch_preserves_serializer_tag_and_custom_field_handling(self):
+        from core.models import ObjectType
+        from extras.choices import CustomFieldTypeChoices
+        from extras.models import CustomField, Tag
+
+        self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
+        tag = Tag.objects.create(name="API state tag", slug="api-state-tag")
+        custom_field = CustomField.objects.create(
+            name="api_state_note",
+            label="API state note",
+            type=CustomFieldTypeChoices.TYPE_TEXT,
+        )
+        custom_field.object_types.add(ObjectType.objects.get_for_model(NSOInterfaceState))
+
+        response = self.client.patch(
+            self._get_detail_url(self.state),
+            {
+                "add_tags": [{"name": tag.name, "slug": tag.slug}],
+                "custom_fields": {custom_field.name: "preserved"},
+            },
+            format="json",
+            **self.header,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.state.refresh_from_db()
+        self.assertEqual(list(self.state.tags.values_list("slug", flat=True)), [tag.slug])
+        self.assertEqual(self.state.custom_field_data[custom_field.name], "preserved")
+
+        for tag_update in ({"remove_tags": [{"name": tag.name, "slug": tag.slug}]}, {"tags": [tag.pk]}):
+            with self.subTest(tag_update=tag_update):
+                response = self.client.patch(self._get_detail_url(self.state), tag_update, format="json", **self.header)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.state.refresh_from_db()
+                expected = [tag.slug] if "tags" in tag_update else []
+                self.assertEqual(list(self.state.tags.values_list("slug", flat=True)), expected)
+                self.assertEqual(self.state.custom_field_data[custom_field.name], "preserved")
 
 
 class OnboardAPIPermissionTest(APITestCase):

@@ -16,8 +16,9 @@ from __future__ import annotations
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 
-from netbox_nso_plugin.l2_service_reconciler import reconcile_l2_services
+from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan, reconcile_l2_services
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
+from netbox_nso_plugin.renderer_writer import RendererMutationPlan
 
 TOP_KEYS = {"device_id", "services"}
 SERVICE_KEYS = {"service_name", "service_type", "service_id", "saps"}
@@ -62,3 +63,12 @@ class TestL2ServicesContractConsumer(TestCase):
         reconcile_l2_services(self.device, CONTRACT_PAYLOAD)
         state = NSOL2SapState.objects.get(management=self.mgmt, service_name="EPIPE-1", sap_id="1/1/1:200")
         self.assertEqual(state.service_type, "epipe")
+
+    def test_preflight_freezes_native_and_overlay_writes(self):
+        plan = l2_service_reconcile_plan(self.device, CONTRACT_PAYLOAD)
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            {write.model_label for write in plan.write_set},
+            {"vpn.l2vpn", "vpn.l2vpntermination", "netbox_nso_plugin.nsol2sapstate"},
+        )

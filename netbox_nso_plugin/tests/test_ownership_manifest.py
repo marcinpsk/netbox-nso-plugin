@@ -57,16 +57,31 @@ class TestOwnershipManifestDurability(TestCase):
 
         with patch.object(
             ownership_planner,
-            "retire_manifest_identity",
-            wraps=ownership_planner.retire_manifest_identity,
-        ) as retire_identity:
+            "retire_device_manifests",
+            wraps=ownership_planner.retire_device_manifests,
+        ) as retire_device:
             device.delete()
 
         manifest.refresh_from_db()
         self.assertEqual(manifest.ownership_state, "retired")
-        retire_identity.assert_called_once_with(
-            device_ids=(device_id,),
-            scope="interface",
-            native_model_label="dcim.interface",
-            native_key={"device_id": device_id, "name": "Ethernet1"},
-        )
+        retire_device.assert_called_once_with(device_id)
+
+    def test_device_manifest_retirement_uses_one_update(self):
+        from netbox_nso_plugin import ownership_planner
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        from ._outbox_case import make_managed
+
+        device, _management = make_managed("manifest-bulk-retirement", 16274)
+        for scope in ("interface", "vlan"):
+            NSOOwnershipManifest.objects.create(
+                device_id=device.pk,
+                scope=scope,
+                native_model_label="dcim.interface",
+                native_key={"device_id": device.pk, "scope": scope},
+            )
+
+        with self.assertNumQueries(1):
+            ownership_planner.retire_device_manifests(device.pk)
+
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, ownership_state="owned").exists())

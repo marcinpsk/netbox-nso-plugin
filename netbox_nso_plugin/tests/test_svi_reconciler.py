@@ -542,7 +542,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(save.call_count, 2)
         self.assertEqual(
             [str(message) for message in get_messages(response.wsgi_request)],
-            ["Routing state changed. Refresh the page and try again."],
+            ["Configuration state changed. Refresh the page and try again."],
         )
         state.refresh_from_db()
         self.assertEqual(state.status, "conflict")
@@ -574,7 +574,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(build.call_count, 2)
         self.assertEqual(
             [str(message) for message in get_messages(response.wsgi_request)],
-            ["Routing state changed. Refresh the page and try again."],
+            ["Configuration state changed. Refresh the page and try again."],
         )
         state.refresh_from_db()
         self.assertEqual(state.status, "conflict")

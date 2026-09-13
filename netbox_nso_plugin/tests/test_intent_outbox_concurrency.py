@@ -36,15 +36,14 @@ from ._outbox_case import (
     ReceiptAdapter,
     entries,
     expire_claim,
-    make_device,
     make_managed,
-    make_mgmt,
     own_route,
     own_vlan,
     state_of,
     wait_until_postgres_blocks,
     without_commit_drain,
 )
+from ._static_route_case import _accept_with_permit, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -70,16 +69,17 @@ class _ConcurrencyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTest
         NSOIntentOutboxEntry.objects.all().delete()
 
 
-class TestL2NativeRowsAreLocked(_ConcurrencyCase):
-    def test_reconcile_locks_native_rows_before_creating_the_first_overlay(self):
+class TestL2NativeWritesAreLocked(_ConcurrencyCase):
+    def test_reconcile_locks_the_native_vpn_before_updating_it(self):
         from dcim.models import Interface
         from django.db import connections
         from vpn.models import L2VPN, L2VPNTermination
 
         from netbox_nso_plugin import l2_service_reconciler
+        from netbox_nso_plugin.renderer_writer import RendererWriter
 
         iface = Interface.objects.create(device=self.device, name="lag-60", type="lag")
-        vpn = L2VPN.objects.create(name="test-vpn", slug=f"nso-{self.device.pk}-test-vpn", type="vpws")
+        vpn = L2VPN.objects.create(name="test-vpn", slug=f"nso-{self.device.pk}-test-vpn", type="vpls")
         termination = L2VPNTermination.objects.create(l2vpn=vpn, assigned_object=iface)
         payload = {
             "services": [
@@ -93,32 +93,35 @@ class TestL2NativeRowsAreLocked(_ConcurrencyCase):
             ]
         }
         outcomes = []
-        original_body = l2_service_reconciler._reconcile_l2_services
+        original_save = RendererWriter.save
 
         def contend():
             try:
-                for obj in (vpn, termination):
-                    try:
-                        with transaction.atomic():
-                            type(obj).objects.select_for_update(nowait=True).get(pk=obj.pk)
-                    except OperationalError as exc:
-                        outcomes.append(getattr(exc.__cause__, "sqlstate", None))
-                    else:
-                        outcomes.append("unlocked")
+                try:
+                    with transaction.atomic():
+                        L2VPN.objects.select_for_update(nowait=True).get(pk=vpn.pk)
+                except OperationalError as exc:
+                    outcomes.append(getattr(exc.__cause__, "sqlstate", None))
+                else:
+                    outcomes.append("unlocked")
             finally:
                 connections.close_all()
 
-        def check_locks_then_reconcile(*args):
-            contender = threading.Thread(target=contend)
-            contender.start()
-            self.addCleanup(contender.join, 30)
-            contender.join(timeout=30)
-            self.assertFalse(contender.is_alive())
-            self.assertEqual(outcomes, ["55P03", "55P03"])
-            return original_body(*args)
+        def check_locks_then_save(writer, instance, **kwargs):
+            if isinstance(instance, L2VPN) and instance.pk == vpn.pk:
+                contender = threading.Thread(target=contend)
+                contender.start()
+                self.addCleanup(contender.join, 30)
+                contender.join(timeout=30)
+                self.assertFalse(contender.is_alive())
+                self.assertEqual(outcomes, ["55P03"])
+            return original_save(writer, instance, **kwargs)
 
-        with patch.object(l2_service_reconciler, "_reconcile_l2_services", new=check_locks_then_reconcile):
+        with patch.object(RendererWriter, "save", new=check_locks_then_save):
             rows = l2_service_reconciler.reconcile_l2_services(self.device, payload)
+        self.assertEqual(outcomes, ["55P03"])
+        vpn.refresh_from_db()
+        self.assertEqual(vpn.type, "vpws")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].l2vpn_id, vpn.pk)
         self.assertEqual(rows[0].termination_id, termination.pk)
@@ -326,7 +329,7 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
                     remover_pid.append(cursor.fetchone()[0])
                 remover_started.set()
                 with transaction.atomic():
-                    route.devices.remove(self.device)
+                    _unassign_and_retire(route, self.device)
             except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
                 failures.append(exc)
             finally:
@@ -373,141 +376,6 @@ class TestTheFoldAndTheRenderShareOneSnapshot(_ConcurrencyCase):
         assert {entry["route_id"] for entry in later.payload} == {keeper.pk}
         assert [record["route_id"] for record in later.deletions] == [route.pk], (
             "the next claim ships the omission WITH its authority"
-        )
-
-
-class TestUntrackedNativeDeletesSerializeWithSaves(_ConcurrencyCase):
-    """A native delete locks its source row before it takes the device-scope lock."""
-
-    tag = "native-delete"
-    adapter_device_id = 7807
-
-    def _assert_delete_blocks_save(self, device, native, field_name, field_value, overlay_model, scope, orphan_filter):
-        from django.db import connections
-
-        from netbox_nso_plugin import intent_state
-
-        held = threading.Event()
-        release = threading.Event()
-        save_connected = threading.Event()
-        save_finished = threading.Event()
-        save_pid: list[int] = []
-        delete_errors: list[BaseException] = []
-        save_errors: list[BaseException] = []
-        real_intent_transaction = intent_state.intent_transaction
-        deleting = None
-
-        @contextmanager
-        def pause_after_delete_lock(*args, **kwargs):
-            with real_intent_transaction(*args, **kwargs) as mutation:
-                if threading.current_thread() is deleting and not held.is_set():
-                    held.set()
-                    assert release.wait(timeout=30), "the delete lock was never released"
-                yield mutation
-
-        def delete_native():
-            try:
-                with transaction.atomic():
-                    type(native).objects.get(pk=native.pk).delete()
-            except BaseException as exc:  # noqa: BLE001 (reported on the main thread)
-                delete_errors.append(exc)
-            finally:
-                connections.close_all()
-
-        def save_native():
-            try:
-                current = type(native).objects.get(pk=native.pk)
-                setattr(current, field_name, field_value)
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_backend_pid()")
-                    save_pid.append(cursor.fetchone()[0])
-                save_connected.set()
-                with transaction.atomic():
-                    current.save(update_fields=[field_name])
-            except BaseException as exc:  # noqa: BLE001 (a deleted native row rejects the save)
-                save_errors.append(exc)
-            finally:
-                save_finished.set()
-                connections.close_all()
-
-        with (
-            without_commit_drain(),
-            patch(
-                "netbox_nso_plugin.intent_state.intent_transaction",
-                side_effect=pause_after_delete_lock,
-            ),
-        ):
-            deleting = threading.Thread(target=delete_native)
-            deleting.start()
-            self.addCleanup(deleting.join, 30)
-            self.addCleanup(release.set)
-            assert held.wait(timeout=30), "the untracked delete never acquired its device-scope lock"
-
-            saving = threading.Thread(target=save_native)
-            saving.start()
-            self.addCleanup(saving.join, 30)
-            # LIFO cleanups: release the barrier before joining the blocked saver.
-            self.addCleanup(release.set)
-            assert save_connected.wait(timeout=30), "the concurrent save never opened its database connection"
-            try:
-                wait_until_postgres_blocks(save_pid[0], "the concurrent native save", locktype="transactionid")
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", [save_pid[0]])
-                    self.assertEqual(cursor.fetchone()[0], "Lock")
-                self.assertFalse(save_finished.is_set(), "the save finished before the delete released its lock")
-            finally:
-                release.set()
-            deleting.join(timeout=30)
-            saving.join(timeout=30)
-
-        assert not deleting.is_alive(), "the native delete did not finish"
-        assert not saving.is_alive(), "the concurrent native save did not finish"
-        assert save_finished.is_set(), "the concurrent save did not finish after the delete released its lock"
-        assert delete_errors == []
-        assert not type(native).objects.filter(pk=native.pk).exists()
-        assert not overlay_model.objects.filter(status="accepted", **orphan_filter).exists()
-        assert not entries(device, scope)
-        self.assertEqual(len(save_errors), 1)
-        self.assertIs(type(save_errors[0]), type(native).NotUpdated)
-        self.assertIn("did not affect any rows", str(save_errors[0]))
-        self.assertNotIn("deadlock", str(save_errors[0]).lower())
-
-    def test_untracked_deletes_block_concurrent_native_saves(self):
-        from dcim.models import Interface
-        from netbox_routing.models import ISISFlexAlgo, ISISInstance, ISISInterface
-
-        from netbox_nso_plugin.models import NSOISISFlexAlgoState, NSOISISInterfaceState
-
-        device = make_device(self.tag, 2)
-        instance = ISISInstance.objects.create(device=device, process_tag="CORE")
-        flex_algo = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
-        interface = Interface.objects.create(device=device, name="Ethernet1", type="1000base-t")
-        isis_interface = ISISInterface.objects.create(
-            interface=interface,
-            address_family="ipv4",
-            instance=instance,
-        )
-        with without_commit_drain(), transaction.atomic():
-            mgmt = make_mgmt(device, self.tag, self.adapter_device_id + 1)
-        self.clear_entries()
-
-        self._assert_delete_blocks_save(
-            device,
-            flex_algo,
-            "priority",
-            111,
-            NSOISISFlexAlgoState,
-            "isis_flex_algo",
-            {"management": mgmt, "isis_flex_algo__isnull": True},
-        )
-        self._assert_delete_blocks_save(
-            device,
-            isis_interface,
-            "metric",
-            111,
-            NSOISISInterfaceState,
-            "isis",
-            {"management": mgmt, "isis_interface__isnull": True},
         )
 
 
@@ -611,11 +479,11 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         return work
 
     def _remove(self, route, **barriers):
-        return self._transaction(lambda: route.devices.remove(self.device), **barriers)
+        return self._transaction(lambda: _unassign_and_retire(route, self.device), **barriers)
 
     def _reown(self, route, **barriers):
         def own():
-            route.devices.add(self.device)
+            _accept_with_permit(route, self.device)
 
         return self._transaction(own, **barriers)
 
@@ -646,8 +514,6 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
     def test_a_second_writer_of_one_route_waits_on_the_first(self):
         """The overlay row is the serialization point, which is what the id order rests on."""
-        from netbox_nso_plugin.signals import _accept_static_route_for_device
-
         route = own_route(self.mgmt, "198.51.100.144/28", "198.51.100.10")
         self.clear_entries()
         deleted = threading.Event()
@@ -656,7 +522,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
 
         def own_the_same_route():
             started = time.monotonic()
-            _accept_static_route_for_device(route, self.device)
+            _accept_with_permit(route, self.device)
             waited.append(time.monotonic() - started)
 
         def release_after_delete():
@@ -693,7 +559,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
     def test_a_re_ownership_committing_first_takes_the_lower_entry_id(self):
         route = own_route(self.mgmt, "198.51.100.160/28", "198.51.100.11")
         with without_commit_drain():
-            route.devices.remove(self.device)  # un-owned, so the re-ownership is a real one
+            _unassign_and_retire(route, self.device)  # un-owned, so the re-ownership is a real one
         self.clear_entries()
         owned = threading.Event()
 
@@ -713,7 +579,7 @@ class TestEntryIdOrderIsCommitOrderForOneRoute(_ConcurrencyCase):
         leaving = own_route(self.mgmt, "198.51.100.176/28", "198.51.100.12")
         returning = own_route(self.mgmt, "198.51.100.192/28", "198.51.100.13")
         with without_commit_drain():
-            returning.devices.remove(self.device)
+            _unassign_and_retire(returning, self.device)
         self.clear_entries()
         held = threading.Event()
         release = threading.Event()
@@ -896,6 +762,7 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
             "routers": [
                 {
                     "asn": "65100",
+                    "router_id": None,
                     "scopes": [
                         {
                             "vrf": "",
@@ -912,17 +779,20 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
         self.state = NSOBGPPeerTemplateState.objects.get(management=self.management)
         self.assertEqual(self.state.status, "imported")
 
-    def _race_accept(self, payload):
+    def _race_accept(self, payload, expected_status):
+        """The Accept commits while the planner is paused; the reconciler replans under the lock.
+
+        L3 plans lock-free, so the Accept never waits behind the reconcile: the write pass runs
+        on the fresh post-Accept row and the acceptance survives.
+        """
         from netbox_nso_plugin import status_machine
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.views import NSOBGPPeerTemplateStateAcceptView
 
         read_done = threading.Event()
         release = threading.Event()
-        accept_started = threading.Event()
         accept_done = threading.Event()
         errors = []
-        accept_pids = []
         responses = []
         on_reconcile = status_machine.on_reconcile
 
@@ -943,14 +813,10 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
 
         def accept():
             try:
-                with connections["default"].cursor() as cursor:
-                    cursor.execute("SELECT pg_backend_pid()")
-                    accept_pids.append(cursor.fetchone()[0])
                 request = RequestFactory().post("/")
                 request.user = self.user
                 request.session = {}
                 request._messages = FallbackStorage(request)
-                accept_started.set()
                 responses.append(NSOBGPPeerTemplateStateAcceptView.as_view()(request, pk=self.state.pk))
             except Exception as exc:  # noqa: BLE001 (re-raised on the test thread)
                 errors.append(exc)
@@ -958,7 +824,6 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
                 connections.close_all()
                 accept_done.set()
 
-        blocked = False
         reader = threading.Thread(target=reconcile)
         writer = threading.Thread(target=accept)
         with patch("netbox_nso_plugin.status_machine.on_reconcile", pause_after_read), without_commit_drain():
@@ -968,15 +833,7 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
                 if errors:
                     raise errors[0]
                 writer.start()
-                self.assertTrue(accept_started.wait(15), "Accept did not start")
-                deadline = time.monotonic() + 10
-                while not accept_done.is_set() and time.monotonic() < deadline:
-                    with connection.cursor() as cursor:
-                        cursor.execute("SELECT cardinality(pg_blocking_pids(%s)) > 0", [accept_pids[0]])
-                        blocked = cursor.fetchone()[0]
-                    if blocked:
-                        break
-                    time.sleep(0.01)
+                self.assertTrue(accept_done.wait(15), "Accept did not commit while the planner was paused")
             finally:
                 release.set()
                 reader.join(15)
@@ -988,12 +845,84 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
             raise errors[0]
         self.assertEqual(responses[0].status_code, 302)
         self.state.refresh_from_db()
-        self.assertEqual(self.state.status, "in_sync")
+        self.assertEqual(self.state.status, expected_status)
         self.assertIsNotNone(self.state.accepted_at)
-        self.assertTrue(blocked, "Accept did not wait for reconciliation to release the template")
 
     def test_accept_survives_reported_template_reconciliation(self):
-        self._race_accept(self.payload)
+        self._race_accept(self.payload, "in_sync")
 
     def test_accept_survives_stale_template_reconciliation(self):
-        self._race_accept({"routers": []})
+        # The payload stops reporting the template, so the fresh owned row drifts to changed.
+        self._race_accept({"routers": []}, "changed")
+
+    def test_accept_between_planning_and_acquisition_is_replanned_once(self):
+        """An Accept that commits after the plan is built makes the reconciler replan once."""
+        from netbox_nso_plugin import bgp_reconciler, renderer_writer
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.views import NSOBGPPeerTemplateStateAcceptView
+
+        planned = threading.Event()
+        release = threading.Event()
+        errors = []
+        mutations = []
+        real_plan = bgp_reconciler.bgp_reconcile_plan
+
+        def pause_after_planning(device, payload):
+            plan = real_plan(device, payload)
+            if not planned.is_set():
+                planned.set()
+                if not release.wait(30):
+                    raise AssertionError("the reconciler was not released")
+            return plan
+
+        def counted(real):
+            def enter(plan):
+                if threading.current_thread() is reader:
+                    mutations.append(plan)
+                return real(plan)
+
+            return enter
+
+        def reconcile():
+            try:
+                _reconcile_bgp_config(self.device, self.payload)
+            except Exception as exc:  # noqa: BLE001 (re-raised on the test thread)
+                errors.append(exc)
+            finally:
+                connections.close_all()
+                planned.set()
+
+        reader = threading.Thread(target=reconcile)
+        with (
+            patch("netbox_nso_plugin.bgp_reconciler.bgp_reconcile_plan", side_effect=pause_after_planning),
+            patch(
+                "netbox_nso_plugin.renderer_writer.renderer_writes",
+                side_effect=counted(renderer_writer.renderer_writes),
+            ),
+            patch(
+                "netbox_nso_plugin.renderer_writer.renderer_mirror_writes",
+                side_effect=counted(renderer_writer.renderer_mirror_writes),
+            ),
+            without_commit_drain(),
+        ):
+            reader.start()
+            try:
+                self.assertTrue(planned.wait(15), "the reconciler did not finish planning")
+                if errors:
+                    raise errors[0]
+                request = RequestFactory().post("/")
+                request.user = self.user
+                request.session = {}
+                request._messages = FallbackStorage(request)
+                response = NSOBGPPeerTemplateStateAcceptView.as_view()(request, pk=self.state.pk)
+            finally:
+                release.set()
+                reader.join(15)
+        self.assertFalse(reader.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(response.status_code, 302)
+        self.state.refresh_from_db()
+        self.assertEqual(self.state.status, "in_sync")
+        self.assertIsNotNone(self.state.accepted_at)
+        self.assertEqual(len(mutations), 2, "the stale acquisition was not retried under a fresh plan")

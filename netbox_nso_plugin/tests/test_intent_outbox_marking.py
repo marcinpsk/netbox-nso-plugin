@@ -35,6 +35,7 @@ from ._outbox_case import (
     without_commit_drain,
     write_vlan_state,
 )
+from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -262,8 +263,10 @@ class TestRevisionLockSerializesClaimFormation(_MarkCase):
         assert not worker.is_alive(), "the writer did not finish"
         assert errors == []
 
+        from ._static_route_case import _touch_owned_route
+
         with without_commit_drain(), transaction.atomic():
-            self.mgmt.static_route_states.get(static_route=route).save()
+            _touch_owned_route(route)
         with as_per_object("static_route"):
             claimed = drain.claim(self.device.pk, "static_route")
             assert claimed is not None
@@ -342,7 +345,7 @@ class TestACommittedRevocationAbandonsAndReformsOnce(_MarkCase):
 
         route = own_route(self.mgmt, "198.51.100.96/28", "198.51.100.7")
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
         self.adapter.place(self.adapter_device_id, ("route_id", route.pk))
 
         real_scan = drain.revocation_hit

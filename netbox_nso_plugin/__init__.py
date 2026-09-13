@@ -37,7 +37,7 @@ class NSOPluginConfig(PluginConfig):
             signals,  # noqa: F401
         )
 
-        # Register the shared-object materialization specs (route-policy families) at startup.
+        # Register the shared route-policy content specs at startup.
         # They live in route_policy_reconciler (run via its module-level _register_specs()), but
         # that module was previously imported only lazily during a reconcile — so a web worker
         # rendering the versions page before any reconcile had an EMPTY registry, making

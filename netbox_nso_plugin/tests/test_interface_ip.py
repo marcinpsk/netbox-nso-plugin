@@ -2,15 +2,17 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Tests for A4: adapter_client.get_interface_ips and _reconcile_interface_ips."""
 
+import threading
 import unittest
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.db import connections
+from django.test import TestCase, TransactionTestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update
-from .mixins import IntentPushResetMixin
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -149,7 +151,7 @@ class TestReconcileInterfaceIps(TestCase):
 
     def test_auto_create_creates_ipaddress_and_sets_in_sync(self):
         """With auto_create=True, a new address is created in IPAM and state=in_sync."""
-        from ipam.models import IPAddress
+        from ipam.models import IPAddress, Prefix
 
         from netbox_nso_plugin.template_content import _reconcile_interface_ips
 
@@ -168,6 +170,85 @@ class TestReconcileInterfaceIps(TestCase):
         self.assertEqual(states["10.10.0.1/30"].status, "imported")  # unowned materialized → imported (unified)
         ip_exists = IPAddress.objects.filter(address="10.10.0.1/30").exists()
         self.assertTrue(ip_exists)
+        self.assertTrue(Prefix.objects.filter(prefix="10.10.0.0/30").exists())
+
+    def test_auto_create_reuses_an_equal_host_prefix(self):
+        from ipam.models import Prefix
+
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        prefix = "198.18.252.1/32"
+        Prefix.objects.create(prefix=prefix)
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": prefix, "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+
+        with self._auto_create_ctx(True):
+            _reconcile_interface_ips(self.device, payload)
+
+        self.assertEqual(Prefix.objects.filter(prefix=prefix).count(), 1)
+
+    def test_auto_create_plan_declares_prefix_table_and_address_family_locks(self):
+        from ipam.models import VRF
+
+        from netbox_nso_plugin.template_content import interface_ip_reconcile_plan
+
+        vrf = VRF.objects.create(name="PREFIX-SLOT")
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [
+                {"address": "198.18.245.1/24", "vrf": "", "family": "ipv4", "secondary": False},
+                {"address": "198.18.246.1/24", "vrf": "", "family": "ipv4", "secondary": False},
+                {"address": "2001:db8:ffff::1/64", "vrf": "", "family": "ipv6", "secondary": False},
+                {
+                    "address": "198.18.247.1/24",
+                    "vrf": vrf.name,
+                    "family": "ipv4",
+                    "secondary": False,
+                },
+            ],
+        )
+
+        with self._auto_create_ctx(True):
+            plan = interface_ip_reconcile_plan(self.device, payload)
+
+        prefix_table_keys = {key for key in plan.lock_footprint.shared_keys if key[0] == "ip-prefix-table"}
+        self.assertEqual(
+            prefix_table_keys,
+            {
+                ("ip-prefix-table", "global:ipv4"),
+                ("ip-prefix-table", "global:ipv6"),
+                ("ip-prefix-table", f"vrf:{vrf.pk}:ipv4"),
+            },
+        )
+
+    def test_unexpected_prefix_database_failure_aborts_reconcile(self):
+        from django.db import OperationalError, connection
+        from ipam.models import IPAddress, Prefix
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.template_content import _reconcile_interface_ips
+
+        payload = self._make_payload(
+            "GigabitEthernet0/0",
+            [{"address": "198.18.251.1/32", "vrf": "", "family": "ipv4", "secondary": False}],
+        )
+
+        def fail_prefix_insert(execute, sql, params, many, context):
+            if sql.lstrip().upper().startswith("INSERT") and f'"{Prefix._meta.db_table}"' in sql:
+                raise OperationalError("unexpected prefix database failure")
+            return execute(sql, params, many, context)
+
+        with (
+            self._auto_create_ctx(True),
+            connection.execute_wrapper(fail_prefix_insert),
+            self.assertRaisesRegex(OperationalError, "unexpected prefix database failure"),
+        ):
+            _reconcile_interface_ips(self.device, payload)
+
+        self.assertFalse(IPAddress.objects.filter(address="198.18.251.1/32").exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(address="198.18.251.1/32").exists())
 
     def test_existing_ip_on_correct_interface_is_in_sync(self):
         """Address already in IPAM assigned to this interface → in_sync."""
@@ -471,13 +552,141 @@ class TestReconcileInterfaceIps(TestCase):
         self.assertFalse(NSOInterfaceIPState.objects.filter(address="1.2.3.4/32").exists())
 
 
-class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
-    """Reassigning an IPAddress from interface A to B must drop A's overlay.
+class TestInterfaceIpPrefixCreationLock(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from ._outbox_case import make_managed, without_commit_drain
 
-    Regression: _on_ip_address_change keyed get_or_create on the NEW interface only, so the OLD
-    interface's NSOInterfaceIPState was orphaned and the adapter's full-snapshot push carried both
-    — device A kept an IP NetBox had moved to device/interface B.
-    """
+        with without_commit_drain():
+            self.device_a, _management_a = make_managed("prefix-slot-a", 4241)
+            self.device_b, _management_b = make_managed("prefix-slot-b", 4242)
+            self.interface_a = Interface.objects.create(device=self.device_a, name="Loopback1", type="virtual")
+            self.interface_b = Interface.objects.create(device=self.device_b, name="Loopback1", type="virtual")
+
+    @staticmethod
+    def _payload(device, address, vrf_name):
+        return {
+            "device_id": device.pk,
+            "interfaces": [
+                {
+                    "interface": "Loopback1",
+                    "addresses": [
+                        {
+                            "address": address,
+                            "vrf": vrf_name,
+                            "family": "ipv4",
+                            "secondary": False,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def _assert_prefix_creation_is_serialized(self, *, addresses, candidate_networks, vrf=None):
+        from django.apps import apps
+        from ipam.models import IPAddress, Prefix
+
+        from netbox_nso_plugin import template_content
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._outbox_case import wait_until_postgres_blocks
+
+        first_ready_to_insert = threading.Event()
+        release_first = threading.Event()
+        second_connected = threading.Event()
+        second_pid: list[int] = []
+        failures: list[BaseException] = []
+        real_prefix_save = Prefix.save
+        vrf_name = "" if vrf is None else vrf.name
+
+        def pause_first_prefix_insert(instance, *args, **kwargs):
+            if threading.current_thread().name == "first-prefix-reconcile":
+                first_ready_to_insert.set()
+                assert release_first.wait(timeout=30), "the first Prefix insert barrier was not released"
+            return real_prefix_save(instance, *args, **kwargs)
+
+        def reconcile(device, address, *, record_pid=False):
+            try:
+                if record_pid:
+                    with connections["default"].cursor() as cursor:
+                        cursor.execute("SELECT pg_backend_pid()")
+                        second_pid.append(cursor.fetchone()[0])
+                    second_connected.set()
+                template_content._reconcile_interface_ips(device, self._payload(device, address, vrf_name))
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(exc)
+            finally:
+                connections["default"].close()
+
+        config = apps.get_app_config("netbox_nso_plugin")
+        with (
+            patch.object(config, "_interface_ip_auto_create", True),
+            patch.object(Prefix, "save", pause_first_prefix_insert),
+        ):
+            first = threading.Thread(
+                target=reconcile,
+                args=(self.device_a, addresses[0]),
+                name="first-prefix-reconcile",
+            )
+            second = threading.Thread(
+                target=reconcile,
+                args=(self.device_b, addresses[1]),
+                kwargs={"record_pid": True},
+                name="second-prefix-reconcile",
+            )
+            first.start()
+            self.addCleanup(first.join, 30)
+            self.addCleanup(release_first.set)
+            assert first_ready_to_insert.wait(timeout=30), failures
+            second.start()
+            self.addCleanup(second.join, 30)
+            assert second_connected.wait(timeout=30), "the second reconcile never opened its connection"
+            blocked_failure = None
+            try:
+                wait_until_postgres_blocks(second_pid[0], "the second Prefix creation", locktype="advisory")
+            except BaseException as exc:  # noqa: BLE001
+                blocked_failure = exc
+            finally:
+                release_first.set()
+            first.join(timeout=30)
+            second.join(timeout=30)
+
+        assert not first.is_alive(), "the first Prefix reconcile did not finish"
+        assert not second.is_alive(), "the second Prefix reconcile did not finish"
+        assert not failures, failures
+        self.assertEqual(IPAddress.objects.filter(address__in=addresses, vrf=vrf).count(), 2)
+        self.assertEqual(
+            NSOInterfaceIPState.objects.filter(interface__in=(self.interface_a, self.interface_b)).count(),
+            2,
+        )
+        self.assertEqual(Prefix.objects.filter(prefix__in=candidate_networks, vrf=vrf).count(), 1)
+        if blocked_failure is not None:
+            raise blocked_failure
+
+    def test_global_prefix_creation_serializes_the_network_slot(self):
+        self._assert_prefix_creation_is_serialized(
+            addresses=("198.18.248.1/24", "198.18.248.2/24"),
+            candidate_networks=("198.18.248.0/24",),
+        )
+
+    def test_overlapping_prefix_lengths_serialize_the_containment_namespace(self):
+        self._assert_prefix_creation_is_serialized(
+            addresses=("198.18.250.1/24", "198.18.250.2/25"),
+            candidate_networks=("198.18.250.0/24", "198.18.250.0/25"),
+        )
+
+    def test_named_vrf_prefix_creation_serializes_the_network_slot(self):
+        from ipam.models import VRF
+
+        self._assert_prefix_creation_is_serialized(
+            addresses=("198.18.249.1/24", "198.18.249.2/24"),
+            candidate_networks=("198.18.249.0/24",),
+            vrf=VRF.objects.create(name="PREFIX-SLOT-VRF"),
+        )
+
+
+class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
+    """Foreign native reassignments do not manufacture IP ownership evidence."""
 
     @classmethod
     def setUpTestData(cls):
@@ -495,24 +704,28 @@ class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
             device=cls.device, nso_instance=nso, nso_device_name="ra-router", adapter_device_id=321
         )
 
-    def test_reassign_drops_old_interface_overlay(self):
+    def test_foreign_reassign_keeps_overlay_unchanged(self):
         from ipam.models import IPAddress
 
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
-        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
-            ip = IPAddress.objects.create(address="10.44.0.1/24", assigned_object=self.if_a)
-        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists())
+        ip = IPAddress.objects.create(address="10.44.0.1/24", assigned_object=self.if_a)
+        NSOInterfaceIPState.objects.create(
+            interface=self.if_a,
+            address="10.44.0.1/24",
+            status="accepted",
+        )
 
-        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent") as mock_put,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             ip.assigned_object = self.if_b
             ip.save()
 
-        self.assertFalse(
-            NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists(),
-            "old interface overlay was orphaned on reassignment",
-        )
-        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_b, address="10.44.0.1/24").exists())
+        self.assertTrue(NSOInterfaceIPState.objects.filter(interface=self.if_a, address="10.44.0.1/24").exists())
+        self.assertFalse(NSOInterfaceIPState.objects.filter(interface=self.if_b, address="10.44.0.1/24").exists())
+        mock_put.assert_not_called()
 
 
 class TestAcceptInterfaceIPConflict(TestCase):
@@ -567,6 +780,9 @@ class TestAcceptInterfaceIPConflict(TestCase):
     def test_accept_moves_ip_to_ned_interface_and_settles_in_sync(self):
         from django.urls import reverse
 
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
         url = reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_accept", kwargs={"pk": self.state.pk})
         resp = self.client.post(url)
         self.assertEqual(resp.status_code, 302)
@@ -576,6 +792,12 @@ class TestAcceptInterfaceIPConflict(TestCase):
         self.state.refresh_from_db()
         self.assertEqual(self.state.status, "in_sync")
         self.assertIsNotNone(self.state.accepted_at)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("ip", self.device.pk, None).payload),
+        )
 
 
 class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
@@ -645,6 +867,9 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         )
 
     def test_edit_rekeys_native_ip_and_overlay(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+
         response = self.client.post(
             self._url(),
             {"address": "198.18.20.2/31"},
@@ -658,19 +883,25 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         self.assertEqual(self.local_ip.assigned_object, self.local)
         self.assertEqual(self.local_state.address, "198.18.20.2/31")
         self.assertEqual(self.local_state.status, "accepted")
+        revision = NSOIntentRevision.objects.get(device=self.device_a, scope="ip")
+        self.assertEqual(revision.verified_revision, revision.revision)
+        self.assertEqual(
+            revision.verified_fingerprint,
+            delivery.canonical_fingerprint(delivery.render("ip", self.device_a.pk, None).payload),
+        )
 
     def test_edit_refuses_a_native_address_reassigned_before_acquisition(self):
         from netbox_nso_plugin import views
 
-        original_footprint = views._ip_edit_footprint
+        original_plan = views._ip_edit_plan_and_operations
 
-        def reassign_after_discovery(updates):
-            footprint = original_footprint(updates)
+        def reassign_after_discovery(updates, planned_at):
+            planned = original_plan(updates, planned_at)
             self.local_ip.assigned_object = self.peer
             self.local_ip.save()
-            return footprint
+            return planned
 
-        with patch.object(views, "_ip_edit_footprint", new=reassign_after_discovery):
+        with patch.object(views, "_ip_edit_plan_and_operations", new=reassign_after_discovery):
             response = self.client.post(self._url(), {"address": "198.18.20.2/31"})
 
         self.assertEqual(response.status_code, 400, response.content)
@@ -680,6 +911,28 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         self.assertEqual(self.local_ip.assigned_object, self.peer)
         self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
         self.assertEqual(self.local_state.address, "198.18.20.0/31")
+
+    def test_edit_schedules_the_ip_snapshot_after_write_suppression(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.signals import _is_intent_push_suppressed
+
+        management = NSODeviceManagement.objects.get(device=self.device_a)
+        management.adapter_device_id = 1627
+        management.save(update_fields=["adapter_device_id"])
+
+        suppression_states = []
+        with patch(
+            "netbox_nso_plugin.signals._schedule_intent_push",
+            side_effect=lambda _key: suppression_states.append(_is_intent_push_suppressed()),
+        ):
+            response = self.client.post(
+                self._url(),
+                {"address": "198.18.20.2/31"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(suppression_states, [False])
 
     def test_unchanged_prefilled_peer_is_not_modified(self):
         """The real two-field popover always submits the displayed peer value.
