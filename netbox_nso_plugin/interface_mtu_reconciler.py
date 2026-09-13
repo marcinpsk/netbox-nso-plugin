@@ -31,11 +31,26 @@ class _ReconcileExecution:
 
 def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
     """Validate one adapter MTU document before planning stale-row changes."""
+    from django.db import connection
+
+    from .models import NSOInterfaceMtuState
+
     if not isinstance(payload, dict):
         raise AdapterError("interface MTU payload must be an object", code="invalid_response")
     items = payload.get("interfaces")
     if not isinstance(items, list):
         raise AdapterError("interface MTU interfaces must be a list", code="invalid_response")
+    model_fields = {
+        "mtu": "l2_mtu",
+        "ip_mtu": "ip_mtu",
+        "mpls_mtu": "mpls_mtu",
+    }
+    maximum_values = {
+        payload_field: connection.ops.integer_field_range(
+            NSOInterfaceMtuState._meta.get_field(model_field).get_internal_type()
+        )[1]
+        for payload_field, model_field in model_fields.items()
+    }
     seen = set()
     for item in items:
         if not isinstance(item, dict):
@@ -57,11 +72,11 @@ def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
                 f"duplicate interface_name in interface MTU payload: {name}",
                 code="invalid_response",
             )
-        for field_name in ("mtu", "ip_mtu", "mpls_mtu"):
+        for field_name, maximum in maximum_values.items():
             value = item.get(field_name)
-            if value is not None and (type(value) is not int or value < 0):
+            if value is not None and (type(value) is not int or value < 0 or value > maximum):
                 raise AdapterError(
-                    f"interface MTU payload entry {field_name} must be a non-negative integer or null",
+                    f"interface MTU payload entry {field_name} must be an integer from 0 through {maximum} or null",
                     code="invalid_response",
                 )
         bound_port = item.get("bound_port")
