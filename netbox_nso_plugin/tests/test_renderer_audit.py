@@ -129,7 +129,10 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
 
         table = connection.ops.quote_name(VLAN._meta.db_table)
         with connection.cursor() as cursor:
-            cursor.execute(f"UPDATE {table} SET name = %s WHERE id = %s", ["raw-sql-renamed", state.vlan_id])
+            cursor.execute(  # noqa: S608 - the quoted table name comes from model metadata
+                f"UPDATE {table} SET name = %s WHERE id = %s",
+                ["raw-sql-renamed", state.vlan_id],
+            )
             self.assertEqual(cursor.rowcount, 1)
 
         revision.refresh_from_db()
