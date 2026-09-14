@@ -1718,6 +1718,42 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(paf.routemap_in.name, "Arbor-IBGP-in")
         self.assertEqual(paf.routemap_out.name, "Arbor-IBGP-out")
 
+    def test_recreated_peer_group_template_restores_address_families(self):
+        """A surviving overlay restores the complete native peer-group graph."""
+        self._make_mgmt()
+
+        from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        group = {
+            "name": "RECREATED-GROUP",
+            "remote_as": "65100",
+            "address_families": [{"af": "ipv4-unicast"}],
+        }
+        payload = self._scope_with_peer_groups([group])
+        _reconcile_bgp_config(self.device, payload)
+        original = BGPPeerTemplate.objects.get(name=group["name"])
+        state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name=group["name"])
+
+        original.delete()
+        state.refresh_from_db()
+        self.assertIsNone(state.template_id)
+
+        _reconcile_bgp_config(self.device, payload)
+
+        replacement = BGPPeerTemplate.objects.get(name=group["name"])
+        state.refresh_from_db()
+        self.assertEqual(state.template_id, replacement.pk)
+        self.assertTrue(
+            BGPPeerAddressFamily.objects.filter(
+                assigned_object_type__model="bgppeertemplate",
+                assigned_object_id=replacement.pk,
+                address_family__address_family="ipv4-unicast",
+            ).exists()
+        )
+
     def test_peer_group_template_af_edit_surfaces_changed_and_survives(self):
         """3-way templates: an operator edit to a peer-group AF policy drifts + is preserved.
 

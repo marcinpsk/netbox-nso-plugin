@@ -1151,13 +1151,14 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 prefix_lists_by_name=self.prefix_lists_by_name,
             )
         )
+        created_template = template.pk is None
         template_address_families = self.peer_address_families.get((self.template_content_type.pk, template.pk), ())
         object_hash = _content_hash(_template_object_content(template, template_address_families))
         base = state.device_base_hash
         matches = True
         conflict = False
         mirror = False
-        if state_created:
+        if state_created or created_template:
             mirror = True
             state.device_base_hash = device_hash
         elif not base:
