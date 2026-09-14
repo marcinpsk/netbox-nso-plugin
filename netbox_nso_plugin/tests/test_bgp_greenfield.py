@@ -101,7 +101,7 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         from django.test.utils import CaptureQueriesContext
         from netbox_routing.models import BGPAddressFamily, BGPPeerAddressFamily
 
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
 
         management = self._mgmt()
         scope = self._scope(self._router())
@@ -128,11 +128,8 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
                 enabled=True,
             )
 
-        with (
-            patch("netbox_nso_plugin.adapter_client.put_bgp_intent"),
-            CaptureQueriesContext(connection) as captured,
-        ):
-            deliver("bgp", self.device.pk, management.adapter_device_id)
+        with CaptureQueriesContext(connection) as captured:
+            render("bgp", self.device.pk, management.adapter_device_id)
 
         table = BGPPeerAddressFamily._meta.db_table
         address_family_queries = [
