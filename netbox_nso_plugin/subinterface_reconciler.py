@@ -154,15 +154,16 @@ def subinterface_reconcile_footprint(device, payload: dict):
 
 def reconcile_subinterface(device, payload: dict) -> list:
     """Apply one frozen subinterface reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    plan = active.plan if active is not None else subinterface_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    mutation = (
+        contextlib.nullcontext((active, active.plan))
+        if active is not None
+        else renderer_writes_replanning_once(lambda: subinterface_reconcile_plan(device, payload))
+    )
+    with mutation as (writer, _plan), suppress_intent_push():
         return _reconcile_frozen_subinterface(writer, payload)
 
 

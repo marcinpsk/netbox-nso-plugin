@@ -56,6 +56,37 @@ class TestInterfaceMtuReconciler(TestCase):
             [("save", "netbox_nso_plugin.nsointerfacemtustate")],
         )
 
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from netbox_nso_plugin import interface_mtu_reconciler
+
+        from ._outbox_case import content_update
+
+        payload = {"interfaces": [{"interface_name": self.po1.name, "mtu": 9000}]}
+        interface_mtu_reconciler.reconcile_interface_mtu(self.device, payload)
+        real_plan = interface_mtu_reconciler._interface_mtu_plan_and_operations
+        plan_calls = 0
+
+        def plan_then_flip(device, observed, planned_at):
+            nonlocal plan_calls
+            plan_calls += 1
+            result = real_plan(device, observed, planned_at)
+            if plan_calls == 1:
+                state = NSOInterfaceMtuState.objects.get(management=self.management, interface=self.po1)
+                content_update(state, status="in_sync")
+            return result
+
+        with patch.object(
+            interface_mtu_reconciler,
+            "_interface_mtu_plan_and_operations",
+            side_effect=plan_then_flip,
+        ):
+            rows = interface_mtu_reconciler.reconcile_interface_mtu(self.device, {"interfaces": []})
+
+        state = NSOInterfaceMtuState.objects.get(management=self.management, interface=self.po1)
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(rows, [])
+        self.assertEqual(state.status, "changed")
+
     def test_bound_port_longer_than_the_model_limit_is_rejected_before_planning(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.interface_mtu_reconciler import interface_mtu_reconcile_plan
@@ -128,19 +159,22 @@ class TestInterfaceMtuReconciler(TestCase):
             ]
         }
         waiting = None
+        plan_calls = 0
 
         def plan_then_compete(device, observed_payload, planned_at):
-            nonlocal waiting
+            nonlocal plan_calls, waiting
 
+            plan_calls += 1
             waiting, operations, rows = _interface_mtu_plan_and_operations(device, observed_payload, planned_at)
-            candidate = NSOInterfaceMtuState.objects.get(pk=state.pk)
-            candidate.l2_mtu = 9000
-            candidate.last_sync_at = waiting.planned_at
-            fields = ("l2_mtu", "last_sync_at")
-            competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=fields)])
-            with renderer_mirror_writes(competing) as writer:
-                writer.save(candidate, update_fields=fields)
-            self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
+            if plan_calls == 1:
+                candidate = NSOInterfaceMtuState.objects.get(pk=state.pk)
+                candidate.l2_mtu = 9000
+                candidate.last_sync_at = waiting.planned_at
+                fields = ("l2_mtu", "last_sync_at")
+                competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=fields)])
+                with renderer_mirror_writes(competing) as writer:
+                    writer.save(candidate, update_fields=fields)
+                self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
             return waiting, operations, rows
 
         if active_writer:

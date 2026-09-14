@@ -375,6 +375,34 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         result = reconcile_isis(self.device, {"interfaces": self._payload()})["interfaces"]
         self.assertEqual(result, [])
 
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from netbox_nso_plugin import isis_reconciler
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        from ._outbox_case import content_update
+
+        management = self._make_mgmt()
+        isis_reconciler.reconcile_isis(self.device, {"interfaces": self._payload(self._entry())})
+        real_plan = isis_reconciler.isis_reconcile_plan
+        plan_calls = 0
+
+        def plan_then_flip(device, observed):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan = real_plan(device, observed)
+            if plan_calls == 1:
+                state = NSOISISInterfaceState.objects.get(management=management, interface=self.iface_ge0)
+                content_update(state, status="in_sync")
+            return plan
+
+        with patch.object(isis_reconciler, "isis_reconcile_plan", side_effect=plan_then_flip):
+            result = isis_reconciler.reconcile_isis(self.device, {"interfaces": self._payload()})
+
+        state = NSOISISInterfaceState.objects.get(management=management, interface=self.iface_ge0)
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(result["interfaces"], [state])
+        self.assertEqual(state.status, "changed")
+
     def test_foreign_isis_interface_save_does_not_acquire_overlay(self):
         """A native save outside an exact writer is not ownership evidence."""
         mgmt = self._make_mgmt()

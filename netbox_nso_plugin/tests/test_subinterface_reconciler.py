@@ -68,6 +68,39 @@ class TestSubinterfaceReconciler(TestCase):
             ],
         )
 
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from netbox_nso_plugin import subinterface_reconciler
+
+        payload = {
+            "interfaces": [
+                {
+                    "interface_name": "GigabitEthernet0/1.1627",
+                    "parent_interface": self.parent.name,
+                    "dot1q_vlan": 1627,
+                }
+            ]
+        }
+        subinterface_reconciler.reconcile_subinterface(self.device, payload)
+        real_plan = subinterface_reconciler.subinterface_reconcile_plan
+        plan_calls = 0
+
+        def plan_then_flip(device, observed):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan = real_plan(device, observed)
+            if plan_calls == 1:
+                state = NSOSubinterfaceState.objects.get(management=self.management)
+                content_update(state, status="in_sync")
+            return plan
+
+        with patch.object(subinterface_reconciler, "subinterface_reconcile_plan", side_effect=plan_then_flip):
+            rows = subinterface_reconciler.reconcile_subinterface(self.device, {"interfaces": []})
+
+        state = NSOSubinterfaceState.objects.get(management=self.management)
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(rows, [])
+        self.assertEqual(state.status, "changed")
+
     def test_creates_subinterface_with_parent_and_records_dot1q(self):
         from netbox_nso_plugin.subinterface_reconciler import reconcile_subinterface
 
@@ -180,16 +213,19 @@ class TestSubinterfaceReconciler(TestCase):
             "interfaces": [{"interface_name": interface.name, "parent_interface": new_parent.name, "dot1q_vlan": 200}]
         }
         waiting = None
+        plan_calls = 0
 
         def plan_then_compete(device, observed_payload):
-            nonlocal waiting
+            nonlocal plan_calls, waiting
 
+            plan_calls += 1
             waiting = subinterface_reconcile_plan(device, observed_payload)
-            candidate = Interface.objects.get(pk=interface.pk)
-            candidate.parent = new_parent
-            competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=("parent",))])
-            with renderer_mirror_writes(competing) as writer:
-                writer.save(candidate, update_fields=("parent",))
+            if plan_calls == 1:
+                candidate = Interface.objects.get(pk=interface.pk)
+                candidate.parent = new_parent
+                competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=("parent",))])
+                with renderer_mirror_writes(competing) as writer:
+                    writer.save(candidate, update_fields=("parent",))
             return waiting
 
         with (
@@ -228,25 +264,28 @@ class TestSubinterfaceReconciler(TestCase):
         }
         waiting = None
         state = None
+        plan_calls = 0
 
         def plan_then_compete(device, observed_payload):
-            nonlocal waiting, state
+            nonlocal plan_calls, waiting, state
 
+            plan_calls += 1
             waiting = subinterface_reconcile_plan(device, observed_payload)
-            state = NSOSubinterfaceState(
-                management=self.management,
-                interface=interface,
-                parent_interface=self.parent,
-                dot1q_vlan=101,
-                vrf="",
-                status="imported",
-                last_sync_at=waiting.planned_at,
-            )
-            competing = RendererMutationPlan.build(
-                saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))]
-            )
-            with renderer_mirror_writes(competing) as writer:
-                writer.save(state, force_insert=True)
+            if plan_calls == 1:
+                state = NSOSubinterfaceState(
+                    management=self.management,
+                    interface=interface,
+                    parent_interface=self.parent,
+                    dot1q_vlan=101,
+                    vrf="",
+                    status="imported",
+                    last_sync_at=waiting.planned_at,
+                )
+                competing = RendererMutationPlan.build(
+                    saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))]
+                )
+                with renderer_mirror_writes(competing) as writer:
+                    writer.save(state, force_insert=True)
             return waiting
 
         with (

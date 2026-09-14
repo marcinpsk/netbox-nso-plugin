@@ -125,21 +125,28 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
 
 def reconcile_interface_mtu(device, payload: dict) -> list:
     """Apply one frozen MTU reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from django.utils import timezone
+
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    if active is None:
-        from django.utils import timezone
-
-        plan, operations, rows = _interface_mtu_plan_and_operations(device, payload, timezone.now())
+    executions = {}
+    if active is not None:
+        mutation = contextlib.nullcontext((active, active.plan))
     else:
-        plan = active.plan
-        operations, rows = _frozen_interface_mtu_operations(plan)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+
+        def plan_fn():
+            plan, operations, rows = _interface_mtu_plan_and_operations(device, payload, timezone.now())
+            executions[id(plan)] = (operations, rows)
+            return plan
+
+        mutation = renderer_writes_replanning_once(plan_fn)
+    with mutation as (writer, plan), suppress_intent_push():
+        if active is None:
+            operations, rows = executions[id(plan)]
+        else:
+            operations, rows = _frozen_interface_mtu_operations(plan)
         _execute_interface_mtu_operations(writer, operations)
     return rows
 

@@ -850,8 +850,7 @@ def reconcile_isis(device, payload):
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
     from .renderer_writer import (
         active_renderer_writer,
-        renderer_mirror_writes,
-        renderer_writes,
+        renderer_writes_replanning_once,
         replay_creation_references,
     )
     from .signals import suppress_intent_push
@@ -860,11 +859,12 @@ def reconcile_isis(device, payload):
     if management is None:
         return {"processes": [], "interfaces": []}
     active = active_renderer_writer()
-    plan = active.plan if active is not None else isis_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    mutation = (
+        contextlib.nullcontext((active, active.plan))
+        if active is not None
+        else renderer_writes_replanning_once(lambda: isis_reconcile_plan(device, payload))
+    )
+    with mutation as (writer, plan), suppress_intent_push():
         operations, dropped = _isis_reconcile_operations(device, payload, plan.planned_at)
         for operation, instance, update_fields, force_insert, references in operations.operations:
             if operation == "delete":

@@ -206,15 +206,16 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
 
 def reconcile_l2_services(device, payload: dict) -> list:
     """Apply one frozen L2-service reconciliation through the renderer writer."""
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     active = active_renderer_writer()
-    plan = active.plan if active is not None else l2_service_reconcile_plan(device, payload)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    mutation = (
+        contextlib.nullcontext((active, active.plan))
+        if active is not None
+        else renderer_writes_replanning_once(lambda: l2_service_reconcile_plan(device, payload))
+    )
+    with mutation as (writer, plan), suppress_intent_push():
         _saves, _deletes, operations = _l2_service_reconcile_operations(device, payload, plan.planned_at)
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)

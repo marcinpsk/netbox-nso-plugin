@@ -115,6 +115,40 @@ class TestReconcileL2Services(TestCase):
         assert st.status == "changed"
         assert L2VPN.objects.filter(slug=f"nso-{self.device.pk}-TL").exists()
 
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import l2_service_reconciler
+
+        from ._outbox_case import content_update
+
+        service = {
+            "service_name": "REPLAN",
+            "service_type": "vpls",
+            "service_id": 701,
+            "saps": [{"sap_id": "1/1/c31/3:701", "port": "1/1/c31/3", "outer_tag": 701}],
+        }
+        l2_service_reconciler.reconcile_l2_services(self.device, _payload([service]))
+        real_plan = l2_service_reconciler.l2_service_reconcile_plan
+        plan_calls = 0
+
+        def plan_then_flip(device, observed):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan = real_plan(device, observed)
+            if plan_calls == 1:
+                state = NSOL2SapState.objects.get(management=self.mgmt, service_name=service["service_name"])
+                content_update(state, status="in_sync")
+            return plan
+
+        with patch.object(l2_service_reconciler, "l2_service_reconcile_plan", side_effect=plan_then_flip):
+            rows = l2_service_reconciler.reconcile_l2_services(self.device, _payload([]))
+
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name=service["service_name"])
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(rows, [state])
+        self.assertEqual(state.status, "changed")
+
     def test_idempotent_no_duplicate_terminations(self):
         p = _payload(
             [

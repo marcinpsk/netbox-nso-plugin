@@ -79,6 +79,37 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(r.metric, 10)
         self.assertEqual(r.metric_type, "external")
 
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin import redistribution_reconciler
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        from ._outbox_case import content_update
+
+        management = self._make_mgmt()
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        redistribution_reconciler.reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        real_plan = redistribution_reconciler.redistribution_reconcile_plan
+        plan_calls = 0
+
+        def plan_then_flip(device, observed):
+            nonlocal plan_calls
+            plan_calls += 1
+            plan = real_plan(device, observed)
+            if plan_calls == 1:
+                state = NSORedistributionState.objects.get(management=management)
+                content_update(state, status="in_sync")
+            return plan
+
+        with patch.object(redistribution_reconciler, "redistribution_reconcile_plan", side_effect=plan_then_flip):
+            rows = redistribution_reconciler.reconcile_redistribution(self.device, {"entries": []})
+
+        state = NSORedistributionState.objects.get(management=management)
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(rows, [state])
+        self.assertEqual(state.status, "changed")
+
     def test_first_import_updates_an_existing_redistribution_from_the_device(self):
         from django.contrib.contenttypes.models import ContentType
         from netbox_routing.models import ISISInstance, Redistribution, RouteMap
@@ -452,17 +483,20 @@ class TestReconcileRedistribution(TestCase):
         payload = {"entries": [self._entry(metric=20)]}
         waiting = None
         native = None
+        plan_calls = 0
 
         def plan_then_compete(device, observed_payload):
-            nonlocal waiting, native
+            nonlocal plan_calls, waiting, native
 
+            plan_calls += 1
             waiting = redistribution_reconcile_plan(device, observed_payload)
             native = Redistribution.objects.get(source_protocol="static")
-            native.metric = 20
-            fields = ("route_map", "metric", "metric_type")
-            competing = RendererMutationPlan.build(saves=[planned_save(native, update_fields=fields)])
-            with renderer_mirror_writes(competing) as writer:
-                writer.save(native, update_fields=fields)
+            if plan_calls == 1:
+                native.metric = 20
+                fields = ("route_map", "metric", "metric_type")
+                competing = RendererMutationPlan.build(saves=[planned_save(native, update_fields=fields)])
+                with renderer_mirror_writes(competing) as writer:
+                    writer.save(native, update_fields=fields)
             return waiting
 
         with (
@@ -515,38 +549,41 @@ class TestReconcileRedistribution(TestCase):
         waiting = None
         state = None
         base_hash = None
+        plan_calls = 0
 
         def plan_then_compete(device, observed_payload):
-            nonlocal waiting, state, base_hash
+            nonlocal plan_calls, waiting, state, base_hash
 
+            plan_calls += 1
             waiting = redistribution_reconcile_plan(device, observed_payload)
-            base_hash = merge_util.content_hash({"route_map": None, "metric": 20, "metric_type": ""})
-            state = NSORedistributionState(
-                management=management,
-                redistribution=native,
-                dest_protocol="isis",
-                dest_ref="",
-                source_protocol="static",
-                source_ref="",
-                route_map="",
-                metric=20,
-                metric_type="",
-                status="imported",
-                device_present=True,
-                device_base_hash=base_hash,
-                last_sync_at=waiting.planned_at,
-            )
-            competing = RendererMutationPlan.build(
-                saves=[
-                    planned_save(
-                        state,
-                        force_insert=True,
-                        natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
-                    )
-                ]
-            )
-            with renderer_mirror_writes(competing) as writer:
-                writer.save(state, force_insert=True)
+            if plan_calls == 1:
+                base_hash = merge_util.content_hash({"route_map": None, "metric": 20, "metric_type": ""})
+                state = NSORedistributionState(
+                    management=management,
+                    redistribution=native,
+                    dest_protocol="isis",
+                    dest_ref="",
+                    source_protocol="static",
+                    source_ref="",
+                    route_map="",
+                    metric=20,
+                    metric_type="",
+                    status="imported",
+                    device_present=True,
+                    device_base_hash=base_hash,
+                    last_sync_at=waiting.planned_at,
+                )
+                competing = RendererMutationPlan.build(
+                    saves=[
+                        planned_save(
+                            state,
+                            force_insert=True,
+                            natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
+                        )
+                    ]
+                )
+                with renderer_mirror_writes(competing) as writer:
+                    writer.save(state, force_insert=True)
             return waiting
 
         with (
