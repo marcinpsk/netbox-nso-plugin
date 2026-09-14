@@ -11,7 +11,7 @@ import logging
 import threading
 from collections import namedtuple
 
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -2926,14 +2926,25 @@ def _bgp_router_id_map(device_id) -> dict:
 
 def _push_bgp_intent_for_device(device_id, adapter_device_id):
     """Build and push the full BGP intent snapshot for a device."""
+    from netbox_routing.models import BGPPeerAddressFamily
+
     from . import adapter_client as client
     from .models import NSOBGPPeerState
 
+    peer_address_families = BGPPeerAddressFamily.objects.select_related(
+        "address_family",
+        "prefixlist_in",
+        "prefixlist_out",
+        "routemap_in",
+        "routemap_out",
+    )
     owned_rows = list(
         NSOBGPPeerState.objects.filter(
             management__device_id=device_id,
             status__in=_OWNED_PUSH_STATUSES,
-        ).select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group")
+        )
+        .select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group")
+        .prefetch_related(Prefetch("bgp_peer__address_families", queryset=peer_address_families))
     )
     incomplete = next((row for row in owned_rows if row.bgp_peer_id is None), None)
     blocked = (
@@ -2980,13 +2991,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
 
         # Build the address-family list from the validated BGPPeer link.
         peer_afs = []
-        for paf in row.bgp_peer.address_families.select_related(
-            "address_family",
-            "prefixlist_in",
-            "prefixlist_out",
-            "routemap_in",
-            "routemap_out",
-        ):
+        for paf in row.bgp_peer.address_families.all():
             peer_afs.append(bgp_peer_address_family_intent_item(paf))
 
         scopes[vrf_name]["peers"].append(bgp_peer_intent_item(row, peer_afs))

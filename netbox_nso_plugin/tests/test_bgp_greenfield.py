@@ -96,6 +96,52 @@ class BgpGreenfieldBase(IntentPushDeliveryMixin, TestCase):
 
 
 class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
+    def test_owned_peer_address_families_are_loaded_in_one_query(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import BGPAddressFamily, BGPPeerAddressFamily
+
+        from netbox_nso_plugin.delivery import deliver
+
+        management = self._mgmt()
+        scope = self._scope(self._router())
+        address_family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+        peer_type = ContentType.objects.get_for_model(BGPPeer)
+        for host in (31, 32):
+            peer, _push = self._create_peer(
+                scope,
+                self._ip(f"198.18.0.{host}/32"),
+            )
+            NSOBGPPeerState.objects.create(
+                management=management,
+                asn_str=str(self.asn.asn),
+                peer_address_str=f"198.18.0.{host}",
+                remote_as_str=str(self.remote_asn.asn),
+                enabled=True,
+                bgp_peer=peer,
+                status="accepted",
+            )
+            BGPPeerAddressFamily.objects.create(
+                assigned_object_type=peer_type,
+                assigned_object_id=peer.pk,
+                address_family=address_family,
+                enabled=True,
+            )
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_bgp_intent"),
+            CaptureQueriesContext(connection) as captured,
+        ):
+            deliver("bgp", self.device.pk, management.adapter_device_id)
+
+        table = BGPPeerAddressFamily._meta.db_table
+        address_family_queries = [
+            query["sql"]
+            for query in captured.captured_queries
+            if query["sql"].startswith("SELECT") and f'FROM "{table}"' in query["sql"]
+        ]
+        self.assertEqual(len(address_family_queries), 1, address_family_queries)
+
     def test_state_save_without_writer_does_not_load_management(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

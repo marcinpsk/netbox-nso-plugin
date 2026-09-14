@@ -250,6 +250,7 @@ class _ExactOverlayFormMixin:
     _NATURAL_KEYS = {
         "netbox_nso_plugin.nsosnmphoststate": ("management", "address"),
         "netbox_nso_plugin.nsosnmpsysteminfostate": ("management",),
+        "netbox_nso_plugin.nsosnmpv3userstate": ("management", "username"),
         "netbox_nso_plugin.nsologginghoststate": ("management", "address"),
         "netbox_nso_plugin.nsologginglevelstate": ("management",),
     }
@@ -437,7 +438,7 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
         return obj
 
 
-class NSOSnmpV3UserStateForm(NetBoxModelForm):
+class NSOSnmpV3UserStateForm(_ExactOverlayFormMixin, NetBoxModelForm):
     """Edit an SNMP v3 user overlay — group/protocols, Vault ref, or set secret values.
 
     The secret fields are write-only (one adapter call writes Vault; nothing is
@@ -516,8 +517,6 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
     def save(self, commit=True):
         from django.utils import timezone
 
-        from . import status_machine as sm
-
         if self._secret_result:
             if "auth" in self._secret_result["fields"]:
                 self.instance.vault_has_auth = True
@@ -525,32 +524,7 @@ class NSOSnmpV3UserStateForm(NetBoxModelForm):
                 self.instance.vault_has_priv = True
             self.instance.status = "accepted"
             self.instance.accepted_at = timezone.now()
-        obj = super().save(commit=False)
-        created = obj.pk is None or obj._state.adding
-        changed_content = bool(set(self.changed_data) - {"tags"})
-        if not created and changed_content:
-            obj.status = sm.on_operator_edit(obj.status)
-            if obj.accepted_at is None:
-                obj.accepted_at = timezone.now()
-        if not commit:
-            return obj
-
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
-
-        plan = RendererMutationPlan.build(
-            saves=(
-                planned_save(
-                    obj,
-                    force_insert=created,
-                    natural_key=("management", "username"),
-                ),
-            )
-        )
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
-            writer.save(obj, force_insert=created)
-            self.save_m2m()
-        return obj
+        return super().save(commit=commit)
 
 
 class NSOSnmpHostStateForm(_ExactOverlayFormMixin, NetBoxModelForm):

@@ -288,15 +288,35 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(state.status, "accepted")  # device mismatch → holds accepted
 
     def test_foreign_overlay_save_does_not_schedule_mtu_behavior(self):
-        from unittest.mock import patch
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         state = self._state(l2_mtu=9216, status="accepted")
 
-        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
-            state.l2_mtu = 9000
-            state.save(update_fields=("l2_mtu",))
+        state.l2_mtu = 9000
+        state.save(update_fields=("l2_mtu",))
 
-        schedule.assert_not_called()
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface_mtu").exists())
+
+    def test_exact_content_writer_schedules_mtu_behavior(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        state = self._state(l2_mtu=9216, status="accepted")
+        state.l2_mtu = 9000
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(state, update_fields=("l2_mtu",)),),
+        )
+
+        with renderer_writes(plan) as writer:
+            writer.save(state, update_fields=("l2_mtu",))
+
+        self.assertTrue(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device,
+                scope="interface_mtu",
+                consumed_by_push_seq__isnull=True,
+            ).exists()
+        )
 
     def test_deploying_waits_for_correlated_apply_evidence(self):
         from uuid import uuid4
