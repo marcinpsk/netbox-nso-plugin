@@ -834,27 +834,30 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(result[0].device_base_hash, _content_hash(_peer_object_content(peer)))
         self.assertEqual(IPAddress.objects.filter(address__net_host=source_address).count(), 1)
 
-    def test_duplicate_peer_does_not_materialize_ignored_asns(self):
-        """Equivalent IPv6 spellings identify one peer before ignored ASNs materialize."""
+    def test_duplicate_peer_rejects_document_before_materializing_asns(self):
+        """Canonical duplicate peers reject the whole adapter document."""
         self._make_mgmt()
 
         from ipam.models import ASN
         from netbox_routing.models import BGPPeer
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         first = self._peer_entry("2001:0db8:0000:0000:0000:0000:0000:0002", remote_as="65200")
         duplicate = self._peer_entry("2001:db8::2", remote_as="65300", local_as="65400")
 
-        _reconcile_bgp_config(
-            self.device,
-            self._payload(self._router_payload(peers=[first, duplicate])),
-        )
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(
+                self.device,
+                self._payload(self._router_payload(peers=[first, duplicate])),
+            )
 
-        self.assertEqual(BGPPeer.objects.count(), 1)
-        self.assertEqual(NSOBGPPeerState.objects.count(), 1)
-        self.assertFalse(ASN.objects.filter(asn__in=(65300, 65400)).exists())
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(BGPPeer.objects.exists())
+        self.assertFalse(NSOBGPPeerState.objects.exists())
+        self.assertFalse(ASN.objects.filter(asn__in=(65200, 65300, 65400)).exists())
 
     def test_persisted_expanded_ipv6_state_reuses_canonical_identity(self):
         """A pre-canonical owned state remains linked and included in the owned snapshot."""
@@ -1048,30 +1051,31 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         pushed_peers = captured["routers"][0]["scopes"][0]["peers"]
         self.assertEqual(len(pushed_peers), 1)
 
-    def test_duplicate_router_asn_keeps_first_definition(self):
-        """A repeated router ASN is warned and ignored before it can update a planned router."""
+    def test_duplicate_router_asn_rejects_document(self):
+        """A repeated router identity rejects the whole adapter document."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPRouter
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
         first = self._router_payload(asn="65100")
         duplicate = self._router_payload(asn="65100", router_id="198.18.0.9")
 
-        with self.assertLogs("netbox_nso_plugin.bgp_reconciler", level="WARNING") as captured:
+        with self.assertRaises(AdapterError) as raised:
             _reconcile_bgp_config(self.device, self._payload(first, duplicate))
 
-        router = BGPRouter.objects.get()
-        self.assertIsNone(router.router_id)
-        self.assertTrue(any("repeated router ASN" in message for message in captured.output))
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(BGPRouter.objects.exists())
 
-    def test_duplicate_address_family_is_hash_and_status_stable(self):
-        """Repeated AF identity persists once and remains stable on the next read."""
+    def test_duplicate_address_family_rejects_document(self):
+        """A repeated peer address-family identity rejects the adapter document."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPPeerAddressFamily
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState
 
@@ -1079,16 +1083,14 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer["address_families"].append({"af": "ipv4-unicast", "enabled": True})
         payload = self._payload(self._router_payload(peers=[peer]))
 
-        first = _reconcile_bgp_config(self.device, payload)[0]
-        first_hash = first.device_base_hash
-        second = _reconcile_bgp_config(self.device, payload)[0]
+        with self.assertRaises(AdapterError) as raised:
+            _reconcile_bgp_config(self.device, payload)
 
-        self.assertEqual(BGPPeer.objects.count(), 1)
-        self.assertEqual(NSOBGPPeerState.objects.count(), 1)
-        self.assertEqual(BGPAddressFamily.objects.count(), 1)
-        self.assertEqual(BGPPeerAddressFamily.objects.count(), 1)
-        self.assertEqual(second.device_base_hash, first_hash)
-        self.assertEqual(second.status, "imported")
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertFalse(BGPPeer.objects.exists())
+        self.assertFalse(NSOBGPPeerState.objects.exists())
+        self.assertFalse(BGPAddressFamily.objects.exists())
+        self.assertFalse(BGPPeerAddressFamily.objects.exists())
 
     def test_push_includes_peer_source_ip(self):
         """BGP delivery must send a peer's source (the local-address IP).
@@ -1782,19 +1784,17 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
         self.assertEqual(state.status, "imported")  # unowned + matches → no drift
 
-    def test_duplicate_peer_group_plan_uses_reconcile_traversal_order(self):
-        """The content-neutral plan and reconcile select the last peer-group definition."""
+    def test_duplicate_peer_group_rejects_document_before_template_change(self):
+        """A repeated global peer-group identity rejects the adapter document."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPPeerAddressFamily, BGPPeerTemplate
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
 
         ipv4 = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv4-unicast"}]}
-        initial = self._payload(
-            self._scope_with_peer_groups([ipv4], asn="65100")["routers"][0],
-            self._scope_with_peer_groups([ipv4], asn="65200")["routers"][0],
-        )
+        initial = self._scope_with_peer_groups([ipv4], asn="65100")
         _reconcile_bgp_config(self.device, initial)
 
         ipv6 = {"name": "PG", "remote_as": "65100", "address_families": [{"af": "ipv6-unicast"}]}
@@ -1803,15 +1803,16 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             self._scope_with_peer_groups([ipv4], asn="65100")["routers"][0],
         )
 
-        self.assertFalse(bgp_reconcile_plan(self.device, reordered).changes_content)
-        _reconcile_bgp_config(self.device, reordered)
+        with self.assertRaises(AdapterError) as raised:
+            bgp_reconcile_plan(self.device, reordered)
 
+        self.assertEqual(raised.exception.code, "invalid_response")
         template = BGPPeerTemplate.objects.get(name="PG")
         address_families = BGPPeerAddressFamily.objects.filter(
             assigned_object_type__model="bgppeertemplate",
             assigned_object_id=template.pk,
         ).values_list("address_family__address_family", flat=True)
-        self.assertEqual(list(address_families), ["ipv6-unicast"])
+        self.assertEqual(list(address_families), ["ipv4-unicast"])
 
     def test_invalid_router_asn_does_not_change_existing_template(self):
         """An invalid router ASN rejects the document before template changes."""
@@ -1833,12 +1834,13 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         state = NSOBGPPeerTemplateState.objects.get(management__device=self.device, template_name="PG")
         self.assertEqual(state.status, "imported")
 
-    def test_duplicate_peer_group_remote_as_uses_reconcile_traversal_order(self):
-        """The plan and reconcile select the same remote AS for a duplicate name."""
+    def test_duplicate_peer_group_remote_as_rejects_document_before_peer_change(self):
+        """Conflicting peer-group definitions leave the existing peer unchanged."""
         self._make_mgmt()
 
         from netbox_routing.models import BGPPeerTemplate
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
         from netbox_nso_plugin.models import NSOBGPPeerState
 
@@ -1847,10 +1849,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer = self._peer_entry("198.18.0.2", remote_as="65100", peer_group="PG")
         low_router = self._scope_with_peer_groups([low], asn="65100")["routers"][0]
         low_router["scopes"][0]["peers"] = [peer]
-        initial = self._payload(
-            low_router,
-            self._scope_with_peer_groups([low], asn="65200")["routers"][0],
-        )
+        initial = self._payload(low_router)
         _reconcile_bgp_config(self.device, initial)
         peer_state = NSOBGPPeerState.objects.get(peer_address_str="198.18.0.2")
         peer_state.status = "accepted"
@@ -1863,10 +1862,13 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             reordered_low_router,
         )
 
-        self.assertTrue(bgp_reconcile_plan(self.device, reordered).changes_content)
-        _reconcile_bgp_config(self.device, reordered)
+        with self.assertRaises(AdapterError) as raised:
+            bgp_reconcile_plan(self.device, reordered)
 
-        self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65200)
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(BGPPeerTemplate.objects.get(name="PG").remote_as.asn, 65100)
+        peer_state.refresh_from_db()
+        self.assertEqual(peer_state.status, "accepted")
 
     def test_invalid_peer_rejects_document_before_template_update(self):
         """An invalid peer rejects the document before it can change a template."""

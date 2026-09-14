@@ -241,30 +241,6 @@ def _canonical_source_ip(value):
     return interface.ip.compressed
 
 
-def _deduplicated(entries, key, *, keep_last=False):
-    """Return entries with one stable representative for each identity."""
-    unique = {}
-    for entry in entries:
-        identity = key(entry)
-        if identity not in unique or keep_last:
-            unique[identity] = entry
-    return tuple(unique.values())
-
-
-def _first_router_definitions(routers):
-    """Keep the first reported definition for each router ASN."""
-    unique = []
-    seen_asns = set()
-    for router in routers:
-        asn = router["asn"]
-        if asn in seen_asns:
-            logger.warning("BGP: repeated router ASN %s ignored; the first definition wins", asn)
-            continue
-        seen_asns.add(asn)
-        unique.append(router)
-    return tuple(unique)
-
-
 def _indexed_peer_states(rows):
     """Index the lowest-PK peer state and retain its canonical aliases."""
     identities = {}
@@ -305,6 +281,11 @@ def _validated_bgp_document(payload):  # noqa: C901
     def reject(message):
         raise AdapterError(message, code="invalid_response")
 
+    def claim_identity(kind, identity, seen):
+        if identity in seen:
+            reject(f"Adapter returned a duplicate BGP {kind} identity.")
+        seen.add(identity)
+
     def validate_scalars(kind, entry):
         for field, (expected_types, required, rule) in _BGP_SCALAR_FIELDS[kind].items():
             if field not in entry:
@@ -343,19 +324,26 @@ def _validated_bgp_document(payload):  # noqa: C901
     if not isinstance(payload, Mapping) or not isinstance(payload.get("routers"), list):
         reject("Adapter returned a malformed BGP document.")
     payload = copy.deepcopy(payload)
+    router_asns = set()
+    peer_group_names = set()
     for router in payload["routers"]:
         if not isinstance(router, Mapping) or not isinstance(router.get("scopes"), list):
             reject("Adapter returned a malformed BGP router.")
         validate_scalars("router", router)
+        claim_identity("router", router["asn"], router_asns)
+        scope_names = set()
         for scope in router["scopes"]:
             if not isinstance(scope, Mapping):
                 reject("Adapter returned a malformed BGP scope.")
             validate_scalars("scope", scope)
+            claim_identity("scope", scope["vrf"], scope_names)
             scope_afs = scope.get("address_families")
             if not isinstance(scope_afs, list):
                 reject("Adapter returned malformed BGP scope address families.")
+            scope_af_names = set()
             for value in scope_afs:
                 validate_scalars("scope address family", {"af": value})
+                claim_identity("scope address family", value, scope_af_names)
             for collection in ("peers", "peer_groups"):
                 entries = scope.get(collection)
                 if not isinstance(entries, list) or not all(isinstance(entry, Mapping) for entry in entries):
@@ -366,12 +354,18 @@ def _validated_bgp_document(payload):  # noqa: C901
                     for entry in entries
                 ):
                     reject(f"Adapter returned malformed BGP {collection} address families.")
+                peer_addresses = set()
                 for entry in entries:
                     kind = "peer" if collection == "peers" else "peer group"
                     validate_scalars(kind, entry)
+                    identity = entry["peer_address"] if collection == "peers" else entry["name"]
+                    seen = peer_addresses if collection == "peers" else peer_group_names
+                    claim_identity(kind, identity, seen)
                     af_kind = f"{kind} address family"
+                    address_family_names = set()
                     for address_family in entry["address_families"]:
                         validate_scalars(af_kind, address_family)
+                        claim_identity(af_kind, address_family["af"], address_family_names)
     return payload
 
 
@@ -424,7 +418,7 @@ def _af_device_content(
             return objects_by_name.get(name)
         return resolver(name)
 
-    for paf in _deduplicated(af_list, key=lambda entry: entry["af"]):
+    for paf in af_list:
         af_str = paf["af"]
         afs.append(
             {
@@ -613,29 +607,22 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.peer_content_type = ContentType.objects.get_for_model(BGPPeer)
         self.template_content_type = ContentType.objects.get_for_model(BGPPeerTemplate)
 
-        self.router_entries = _first_router_definitions(self.payload["routers"])
+        self.router_entries = tuple(self.payload["routers"])
         routers = self.router_entries
-        peer_entries = _deduplicated(
-            (
-                (router, scope, peer)
-                for router in sorted(routers, key=lambda row: row["asn"])
-                for scope in sorted(router["scopes"], key=lambda row: row["vrf"])
-                for peer in sorted(scope["peers"], key=lambda row: row["peer_address"])
-            ),
-            key=lambda item: (item[0]["asn"], item[1]["vrf"], _parse_ip_address(item[2]["peer_address"]).compressed),
+        peer_entries = tuple(
+            (router, scope, peer)
+            for router in sorted(routers, key=lambda row: row["asn"])
+            for scope in sorted(router["scopes"], key=lambda row: row["vrf"])
+            for peer in sorted(scope["peers"], key=lambda row: row["peer_address"])
         )
         self.peer_entries_by_scope = {}
         for _router, scope, peer in peer_entries:
             self.peer_entries_by_scope.setdefault(id(scope), []).append(peer)
-        group_entries = _deduplicated(
-            (
-                (scope, group)
-                for router in sorted(routers, key=lambda row: row["asn"])
-                for scope in sorted(router["scopes"], key=lambda row: row["vrf"])
-                for group in sorted(scope["peer_groups"], key=lambda row: row["name"].casefold())
-            ),
-            key=lambda item: item[1]["name"],
-            keep_last=True,
+        group_entries = tuple(
+            (scope, group)
+            for router in sorted(routers, key=lambda row: row["asn"])
+            for scope in sorted(router["scopes"], key=lambda row: row["vrf"])
+            for group in sorted(scope["peer_groups"], key=lambda row: row["name"].casefold())
         )
         self.reported_group_entry_ids = {id(group) for _scope, group in group_entries}
         reported_asns = {str(router["asn"]) for router in routers}
@@ -1003,7 +990,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             else {}
         )
         seen = set()
-        for entry in _deduplicated(entries, key=lambda value: value["af"]):
+        for entry in entries:
             value = entry["af"]
             seen.add(value)
             address_family = self.address_family(scope, value)
