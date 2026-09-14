@@ -387,13 +387,15 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
             obj.status = sm.on_operator_edit(obj.status)
             if obj.accepted_at is None:
                 obj.accepted_at = timezone.now()
+        rekeys_hosts = bool(self._old_hash and self._old_hash != obj.community_hash)
         if not commit:
+            if rekeys_hosts:
+                raise ValueError("commit=False is not supported for SNMP community rekeys")
             return obj
 
         from .intent_state import MutationFootprint, SourceRow, footprint_for_instance, intent_transaction
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        rekeys_hosts = bool(self._old_hash and self._old_hash != obj.community_hash)
         lock_context = contextlib.nullcontext()
         if rekeys_hosts:
             footprint = MutationFootprint.merge(

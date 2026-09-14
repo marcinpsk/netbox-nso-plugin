@@ -236,15 +236,19 @@ def reconcile_bfd(device, interfaces: list) -> list:
         logger.warning("netbox_routing not installed; skipping BFD reconcile")
         return []
 
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
+    def plan_fn():
+        return bfd_reconcile_plan(device, interfaces)
+
     active = active_renderer_writer()
-    plan = active.plan if active is not None else bfd_reconcile_plan(device, interfaces)
-    mutation = contextlib.nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
+    mutation = (
+        contextlib.nullcontext((active, active.plan))
+        if active is not None
+        else renderer_writes_replanning_once(plan_fn)
+    )
+    with mutation as (writer, plan), suppress_intent_push():
         _saves, _deletes, operations = _bfd_reconcile_operations(device, interfaces, plan.planned_at)
         for operation, instance, update_fields, force_insert in operations:
             if operation == "delete":

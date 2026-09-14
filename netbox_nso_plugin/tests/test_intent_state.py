@@ -858,6 +858,44 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(revision.revision, before + 1)
         self.assertEqual(other_revision.revision, other_before + 1)
 
+    def test_detected_partial_bump_repends_only_the_selected_scope(self):
+        from netbox_nso_plugin.intent_state import _upgrade_detected_reconcile
+
+        other_device, other_management = make_managed("intent-other", 1624, index=2)
+        other = own_vlan(other_management, 1624, "intent-other")
+        attempts = (uuid4(), uuid4())
+        for state, attempt in ((self.state, attempts[0]), (other, attempts[1])):
+            with (
+                transaction.atomic(),
+                suppress_intent_push(),
+                mirror_refresh(state, {"status", "apply_attempt_id"}) as locked,
+            ):
+                locked.status = "deploying"
+                locked.apply_attempt_id = attempt
+                locked.save(update_fields=["status", "apply_attempt_id"])
+
+        selected_key = (self.device.pk, "vlan")
+        other_key = (other_device.pk, "vlan")
+        footprint = MutationFootprint.for_keys({selected_key, other_key})
+        selected_revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
+        other_revision = NSOIntentRevision.objects.get(device=other_device, scope="vlan")
+        selected_before = selected_revision.revision
+        other_before = other_revision.revision
+
+        with without_commit_drain(), mirror_transaction(footprint, detect_content_changes=True) as permit:
+            _upgrade_detected_reconcile(permit, footprint, bump_keys={selected_key})
+
+        self.state.refresh_from_db()
+        other.refresh_from_db()
+        selected_revision.refresh_from_db()
+        other_revision.refresh_from_db()
+        self.assertEqual(self.state.status, "accepted")
+        self.assertIsNone(self.state.apply_attempt_id)
+        self.assertEqual(other.status, "deploying")
+        self.assertEqual(other.apply_attempt_id, attempts[1])
+        self.assertEqual(selected_revision.revision, selected_before + 1)
+        self.assertEqual(other_revision.revision, other_before)
+
     def test_detected_reconcile_locks_deploying_rows_before_capture(self):
         """Apply settlement waits until a detected reconcile finishes its re-pend decision."""
         import threading

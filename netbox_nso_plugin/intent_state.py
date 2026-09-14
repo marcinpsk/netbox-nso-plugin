@@ -2280,7 +2280,11 @@ def _upgrade_detected_reconcile(
     for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
     permit.bumped.update(revision_keys)
-    permit.deferred_repend_rows = permit.initial_deploying_rows
+    deferred_repend_rows = permit.initial_deploying_rows
+    if set(revision_keys) != set(permit.footprint.revision_keys):
+        selected_rows = set(_deploying_scope_rows(replace(permit.footprint, revision_keys=revision_keys)))
+        deferred_repend_rows = tuple(row for row in deferred_repend_rows if row in selected_rows)
+    permit.deferred_repend_rows = deferred_repend_rows
     permit.dml_kind = "content"
     permit.footprint_tables_cache = None
     permit.bump_keys = None

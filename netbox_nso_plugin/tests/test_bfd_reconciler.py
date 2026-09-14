@@ -464,6 +464,46 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert deploying.apply_attempt_id is None
         assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
 
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import bfd_reconciler
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentRevision
+
+        payload = [
+            {
+                "interface_name": self.iface.name,
+                "micro_bfd": True,
+                "enabled": True,
+                "min_tx": 300,
+                "min_rx": 300,
+                "multiplier": 3,
+            }
+        ]
+        bfd_reconciler.reconcile_bfd(self.device, payload)
+        real_plan = bfd_reconciler.bfd_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, interfaces):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, interfaces)
+            if plan_calls == 1:
+                state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+                content_update(state, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="bfd").revision
+            return plan
+
+        with patch.object(bfd_reconciler, "bfd_reconcile_plan", side_effect=plan_then_flip):
+            bfd_reconciler.reconcile_bfd(self.device, [])
+
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bfd")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
+
     def test_matching_timers_keep_a_deploying_row_in_flight(self):
         """Re-reading the intended timers is not apply evidence for an in-flight BFD row."""
         from uuid import uuid4

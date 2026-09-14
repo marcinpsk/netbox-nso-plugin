@@ -8,6 +8,8 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
 
+from ._outbox_case import content_update
+
 
 def _make_ospf_device(suffix="ospf"):
     mfg, _ = Manufacturer.objects.get_or_create(name=f"OspfMfg{suffix}", slug=f"ospfmfg{suffix}")
@@ -207,6 +209,36 @@ class TestReconcileOspfFill(TestCase):
         inst = OSPFInstance.objects.get(device=self.device, process_id=10)
         self.assertEqual(str(inst.router_id), "10.0.0.1")
         self.assertEqual(inst.name, "10")
+
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from netbox_nso_plugin import ospf_reconciler
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOSPFInstanceState
+
+        management = self._make_mgmt()
+        payload = self._payload([self._instance()])
+        ospf_reconciler.reconcile_ospf(self.device, payload)
+        real_plan = ospf_reconciler.ospf_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, observed):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, observed)
+            if plan_calls == 1:
+                state = NSOOSPFInstanceState.objects.get(management=management, process_id="10")
+                content_update(state, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="ospf").revision
+            return plan
+
+        with patch.object(ospf_reconciler, "ospf_reconcile_plan", side_effect=plan_then_flip):
+            ospf_reconciler.reconcile_ospf(self.device, self._payload())
+
+        state = NSOOSPFInstanceState.objects.get(management=management, process_id="10")
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="ospf")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
 
     def test_instance_captures_admin_state(self):
         """The OSPF instance overlay mirrors the device admin-state (Nokia 'enabled')."""
