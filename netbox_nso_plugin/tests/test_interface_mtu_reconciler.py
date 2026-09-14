@@ -73,15 +73,15 @@ class TestInterfaceMtuReconciler(TestCase):
 
         from ._outbox_case import content_update
 
-        payload = {"interfaces": [{"interface_name": self.po1.name, "mtu": 9000}]}
+        payload = {"interfaces": [_mtu_entry(self.po1.name, mtu=9000)]}
         interface_mtu_reconciler.reconcile_interface_mtu(self.device, payload)
-        real_plan = interface_mtu_reconciler._interface_mtu_plan_and_operations
+        real_plan = interface_mtu_reconciler.interface_mtu_reconcile_plan
         plan_calls = 0
 
-        def plan_then_flip(device, observed, planned_at):
+        def plan_then_flip(device, observed):
             nonlocal plan_calls
             plan_calls += 1
-            result = real_plan(device, observed, planned_at)
+            result = real_plan(device, observed)
             if plan_calls == 1:
                 state = NSOInterfaceMtuState.objects.get(management=self.management, interface=self.po1)
                 content_update(state, status="in_sync")
@@ -89,7 +89,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
         with patch.object(
             interface_mtu_reconciler,
-            "_interface_mtu_plan_and_operations",
+            "interface_mtu_reconcile_plan",
             side_effect=plan_then_flip,
         ):
             rows = interface_mtu_reconciler.reconcile_interface_mtu(self.device, {"interfaces": []})
