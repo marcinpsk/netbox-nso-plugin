@@ -79,6 +79,35 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(r.metric, 10)
         self.assertEqual(r.metric_type, "external")
 
+    def test_first_import_updates_an_existing_redistribution_from_the_device(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import ISISInstance, Redistribution, RouteMap
+
+        self._make_mgmt()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="")
+        stale_route_map = RouteMap.objects.create(name="STALE-REDIST")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(instance),
+            destination_id=instance.pk,
+            source_protocol="static",
+            source_ref="",
+            route_map=stale_route_map,
+            metric=20,
+            metric_type="internal",
+        )
+
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        state = reconcile_redistribution(
+            self.device,
+            {"entries": [self._entry(metric=10, metric_type="external")]},
+        )[0]
+
+        native.refresh_from_db()
+        self.assertEqual(state.redistribution_id, native.pk)
+        self.assertIsNone(native.route_map_id)
+        self.assertEqual((native.metric, native.metric_type), (10, "external"))
+
     def test_missing_named_vrf_does_not_select_the_global_bgp_scope(self):
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import ASN, RIR

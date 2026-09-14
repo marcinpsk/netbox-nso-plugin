@@ -416,12 +416,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         device, _management = make_managed("writer-bfd-native-delete", 16282)
         interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
         native = BFDInterface.objects.create(interface=interface, enabled=True)
+        native_pk = native.pk
         plan = RendererMutationPlan.build(deletes=(planned_delete(native),))
 
         with renderer_mirror_writes(plan) as writer:
             writer.delete(native)
 
-        assert not BFDInterface.objects.filter(pk=native.pk).exists()
+        assert not BFDInterface.objects.filter(pk=native_pk).exists()
 
     def test_one_plan_can_delete_a_child_before_its_set_null_parent(self):
         from netbox_routing.models import StaticRoute
@@ -439,6 +440,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             static_route=native,
             status="imported",
         )
+        state_pk = state.pk
+        native_pk = native.pk
         plan = RendererMutationPlan.build(
             deletes=(
                 planned_delete(state),
@@ -450,8 +453,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             writer.delete(state)
             writer.delete(native)
 
-        assert not NSOStaticRouteState.objects.filter(pk=state.pk).exists()
-        assert not StaticRoute.objects.filter(pk=native.pk).exists()
+        assert not NSOStaticRouteState.objects.filter(pk=state_pk).exists()
+        assert not StaticRoute.objects.filter(pk=native_pk).exists()
 
     def test_one_plan_can_create_a_native_row_and_its_overlay(self):
         from ipam.models import VLANGroup
@@ -1219,12 +1222,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             action="permit",
             community=community,
         )
+        community_list_pk = community_list.pk
         plan = RendererMutationPlan.build(deletes=(planned_delete(community_list),))
 
         with renderer_mirror_writes(plan) as writer:
             writer.delete(community_list)
 
-        assert not CommunityList.objects.filter(pk=community_list.pk).exists()
+        assert not CommunityList.objects.filter(pk=community_list_pk).exists()
         assert not CommunityListEntry.objects.filter(pk=entry.pk).exists()
 
     def test_rollback_removes_content_bookkeeping_and_fingerprint_together(self):

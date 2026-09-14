@@ -252,7 +252,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
                     obj_hash=object_hash,
                     dev_hash=device_hash,
                 )
-                if action == "mirror":
+                if action in {"seed", "mirror"} and not created_native:
                     native.route_map = route_map
                     native.metric = entry.get("metric")
                     native.metric_type = _redist_metric_type(entry)
