@@ -417,7 +417,11 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
-        ISISInstance.objects.create(device=self.device, process_tag="CORE", net="49.0001.0198.0180.1741.00")
+        local_instance = ISISInstance.objects.create(
+            device=self.device,
+            process_tag="CORE",
+            net="49.0001.0198.0180.1741.00",
+        )
         foreign_device, _foreign_management = make_managed("ownership-fleet", 16273, index=2)
         foreign_instance = ISISInstance.objects.create(
             device=foreign_device,
@@ -440,10 +444,22 @@ class TestSymmetricOwnershipExecutor(TestCase):
         with CaptureQueriesContext(connection) as after:
             reconcile_scope_ownership(self.device.pk, ["isis"])
 
-        for query in after.captured_queries:
-            sql = query["sql"]
-            if "netbox_routing_redistribution" in sql and sql.lstrip().upper().startswith("SELECT"):
-                self.assertIn(" WHERE ", sql, "the redistribution read has no device predicate")
+        redistribution_reads = [
+            query["sql"]
+            for query in after.captured_queries
+            if 'FROM "netbox_routing_redistribution"' in query["sql"]
+            and query["sql"].lstrip().upper().startswith("SELECT")
+        ]
+        self.assertTrue(redistribution_reads)
+        for sql in redistribution_reads:
+            self.assertIn(
+                f'"netbox_routing_redistribution"."destination_id" = {local_instance.pk}',
+                sql,
+            )
+            self.assertNotIn(
+                f'"netbox_routing_redistribution"."destination_id" = {foreign_instance.pk}',
+                sql,
+            )
         self.assertEqual(len(after.captured_queries), len(before.captured_queries))
 
     def test_recording_missing_manifests_costs_one_device_scan(self):
@@ -467,6 +483,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 )
             with CaptureQueriesContext(connection) as captured:
                 reconcile_scope_ownership(device.pk, ["vlan"])
+            table = NSOVLANState._meta.db_table
+            selects = [
+                query["sql"]
+                for query in captured.captured_queries
+                if query["sql"].lstrip().upper().startswith("SELECT") and f'FROM "{table}"' in query["sql"]
+            ]
+            self.assertEqual(len(selects), 3 * rows + 3)
             return len(captured.captured_queries)
 
         measure(1)
