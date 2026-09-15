@@ -1158,9 +1158,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         matches = True
         conflict = False
         mirror = False
-        if state_created or created_template:
+        if created_template:
             mirror = True
             state.device_base_hash = device_hash
+        elif state_created:
+            matches = False
+            conflict = True
         elif not base:
             state.device_base_hash = device_hash
             matches = object_hash == device_hash

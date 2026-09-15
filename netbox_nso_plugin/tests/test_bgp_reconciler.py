@@ -1718,6 +1718,42 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(paf.routemap_in.name, "Arbor-IBGP-in")
         self.assertEqual(paf.routemap_out.name, "Arbor-IBGP-out")
 
+    def test_unmanaged_peer_group_template_policy_is_preserved_as_conflict(self):
+        """First import does not replace policy on an existing unmanaged template."""
+        self._make_mgmt()
+
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import BGPAddressFamily, BGPPeerAddressFamily, BGPPeerTemplate, RouteMap
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerTemplateState
+
+        _reconcile_bgp_config(self.device, self._payload(self._router_payload()))
+        address_family = BGPAddressFamily.objects.get(address_family="ipv4-unicast")
+        native_policy = RouteMap.objects.create(name="NATIVE-POLICY")
+        RouteMap.objects.create(name="DEVICE-POLICY")
+        template = BGPPeerTemplate.objects.create(name="UNMANAGED-GROUP")
+        template_address_family = BGPPeerAddressFamily.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(BGPPeerTemplate),
+            assigned_object_id=template.pk,
+            address_family=address_family,
+            routemap_in=native_policy,
+        )
+        group = {
+            "name": template.name,
+            "address_families": [{"af": "ipv4-unicast", "routemap_in": "DEVICE-POLICY"}],
+        }
+
+        _reconcile_bgp_config(self.device, self._scope_with_peer_groups([group]))
+
+        template_address_family.refresh_from_db()
+        state = NSOBGPPeerTemplateState.objects.get(
+            management__device=self.device,
+            template_name=template.name,
+        )
+        self.assertEqual(state.status, "conflict")
+        self.assertEqual(template_address_family.routemap_in_id, native_policy.pk)
+
     def test_recreated_peer_group_template_restores_address_families(self):
         """A surviving overlay restores the complete native peer-group graph."""
         self._make_mgmt()
