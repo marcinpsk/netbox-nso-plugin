@@ -74,10 +74,11 @@ class TestSnmpAcceptView(_SnmpBase):
         with patch(
             "netbox_nso_plugin.renderer_writer.RendererWriter.save",
             side_effect=IntentPlanStaleError("changed after planning"),
-        ):
+        ) as save:
             response = self.client.post(f"/plugins/nso/snmp/community-state/{community.pk}/accept/")
 
         self.assertEqual(response.status_code, 302)
+        self.assertEqual(save.call_count, 2)
         self.assertIn(
             "Configuration state changed. Refresh the page and try again.",
             [str(message) for message in get_messages(response.wsgi_request)],

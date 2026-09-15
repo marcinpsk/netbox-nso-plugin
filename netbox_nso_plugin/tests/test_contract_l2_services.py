@@ -68,7 +68,7 @@ class TestL2ServicesContractConsumer(TestCase):
         plan = l2_service_reconcile_plan(self.device, CONTRACT_PAYLOAD)
 
         self.assertIsInstance(plan, RendererMutationPlan)
-        self.assertEqual(
-            {write.model_label for write in plan.write_set},
-            {"vpn.l2vpn", "vpn.l2vpntermination", "netbox_nso_plugin.nsol2sapstate"},
+        self.assertCountEqual(
+            [write.model_label for write in plan.write_set],
+            ["vpn.l2vpn", "vpn.l2vpntermination", "netbox_nso_plugin.nsol2sapstate"],
         )

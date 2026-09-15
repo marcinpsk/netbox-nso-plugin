@@ -1071,9 +1071,9 @@ class TestReconcileRoutePolicy(TestCase):
 
         s2.refresh_from_db()
         self.assertEqual(s2.status, "conflict")
-        self.assertEqual(
-            {(write.operation, write.model_label) for write in plan.write_set},
-            {("save", "netbox_nso_plugin.nsoroutepolicystate")},
+        self.assertCountEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [("save", "netbox_nso_plugin.nsoroutepolicystate")],
         )
 
         cleared = resettle_false_conflicts()

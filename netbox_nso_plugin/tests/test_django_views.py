@@ -5799,13 +5799,13 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         policy_class.refresh_from_db()
         self.assertEqual((route_map.name, row.object_name, policy_class.object_name), ("RM-INLINE-OLD",) * 3)
-        self.assertEqual(
-            {write.model_label for write in plan.write_set},
-            {
+        self.assertCountEqual(
+            [write.model_label for write in plan.write_set],
+            [
                 "netbox_routing.routemap",
                 "netbox_nso_plugin.nsoroutepolicystate",
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
-            },
+            ],
         )
         self.assertTrue(
             {(self.device.pk, "route_policy"), (self.device.pk, "ospf")} <= set(plan.content_keys),
