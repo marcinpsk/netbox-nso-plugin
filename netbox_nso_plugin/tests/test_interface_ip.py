@@ -12,7 +12,7 @@ from django.test import TestCase, TransactionTestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -685,7 +685,7 @@ class TestInterfaceIpPrefixCreationLock(_CascadeFlushMixin, IntentPushResetMixin
         )
 
 
-class TestInterfaceIPReassignment(IntentPushResetMixin, TestCase):
+class TestInterfaceIPReassignment(IntentPushDeliveryMixin, TestCase):
     """Foreign native reassignments do not manufacture IP ownership evidence."""
 
     @classmethod
