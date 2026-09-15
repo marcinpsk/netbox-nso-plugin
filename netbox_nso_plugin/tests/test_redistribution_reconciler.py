@@ -198,7 +198,7 @@ class TestReconcileRedistribution(TestCase):
     def test_owned_state_recreates_a_missing_native_redistribution(self):
         from django.db import transaction
         from django.utils import timezone
-        from netbox_routing.models import ISISInstance, Redistribution
+        from netbox_routing.models import ISISInstance, Redistribution, RouteMap
 
         from netbox_nso_plugin.intent_state import deletion_footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSORedistributionState
@@ -207,12 +207,17 @@ class TestReconcileRedistribution(TestCase):
 
         self._make_mgmt()
         ISISInstance.objects.create(device=self.device, process_tag="")
-        reconcile_redistribution(self.device, {"entries": [self._entry(metric=10)]})
+        device_route_map = RouteMap.objects.create(name="DEVICE-REDIST")
+        accepted_route_map = RouteMap.objects.create(name="ACCEPTED-REDIST")
+        device_entry = self._entry(route_map=device_route_map.name, metric=10, metric_type="external")
+        reconcile_redistribution(self.device, {"entries": [device_entry]})
         state = NSORedistributionState.objects.get()
+        state.route_map = accepted_route_map.name
         state.metric = 20
+        state.metric_type = "internal"
         state.status = "accepted"
         state.accepted_at = timezone.now()
-        state.save(update_fields=["metric", "status", "accepted_at"])
+        state.save(update_fields=["route_map", "metric", "metric_type", "status", "accepted_at"])
 
         footprint = deletion_footprint_for_instance(state.redistribution)
         with transaction.atomic(), intent_transaction(footprint), suppress_intent_push():
@@ -220,7 +225,7 @@ class TestReconcileRedistribution(TestCase):
         state.refresh_from_db()
         self.assertIsNone(state.redistribution_id)
 
-        payload = {"entries": [self._entry(metric=10)]}
+        payload = {"entries": [device_entry]}
         plan = redistribution_reconcile_plan(self.device, payload)
         self.assertEqual(plan.content_keys, ())
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
@@ -230,9 +235,28 @@ class TestReconcileRedistribution(TestCase):
 
         revision.refresh_from_db()
         self.assertIsNotNone(reconciled.redistribution_id)
-        self.assertEqual(reconciled.metric, 20)
-        self.assertEqual(reconciled.redistribution.metric, 20)
-        self.assertEqual(redistribution_intent_item(reconciled)["metric"], 20)
+        self.assertEqual(
+            (reconciled.route_map, reconciled.metric, reconciled.metric_type),
+            (accepted_route_map.name, 20, "internal"),
+        )
+        self.assertEqual(
+            (
+                reconciled.redistribution.route_map_id,
+                reconciled.redistribution.metric,
+                reconciled.redistribution.metric_type,
+            ),
+            (accepted_route_map.pk, 20, "internal"),
+        )
+        self.assertEqual(
+            redistribution_intent_item(reconciled),
+            {
+                "source_protocol": "static",
+                "source_ref": "",
+                "route_map": accepted_route_map.name,
+                "metric": 20,
+                "metric_type": "internal",
+            },
+        )
         self.assertEqual(Redistribution.objects.count(), 1)
         self.assertEqual(revision.revision, before)
 

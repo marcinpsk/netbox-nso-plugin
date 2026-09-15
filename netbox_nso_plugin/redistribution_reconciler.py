@@ -204,11 +204,17 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
         destination = _resolve_redist_destination(device, destination_protocol, destination_ref)
         if destination is not None:
             dependencies[(destination._meta.label_lower, destination.pk)] = destination
-            route_map = (
+            reported_route_map = (
                 RouteMap.objects.filter(name=entry.get("route_map") or "").first() if entry.get("route_map") else None
             )
-            if route_map is not None:
-                dependencies[(route_map._meta.label_lower, route_map.pk)] = route_map
+            route_map = (
+                RouteMap.objects.filter(name=state.route_map).first()
+                if owned and state.route_map
+                else (None if owned else reported_route_map)
+            )
+            for dependency in (reported_route_map, route_map):
+                if dependency is not None:
+                    dependencies[(dependency._meta.label_lower, dependency.pk)] = dependency
             destination_type = ContentType.objects.get_for_model(type(destination))
             current_native = Redistribution.objects.filter(
                 destination_type=destination_type,
@@ -226,11 +232,11 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
                     source_ref=source_ref,
                     route_map=route_map,
                     metric=state.metric if owned else entry.get("metric"),
-                    metric_type=_redist_metric_type(entry),
+                    metric_type=state.metric_type if owned else _redist_metric_type(entry),
                 )
             )
             created_native = current_native is None
-            device_hash = merge_util.content_hash(_redist_device_content(entry, route_map))
+            device_hash = merge_util.content_hash(_redist_device_content(entry, reported_route_map))
             object_hash = merge_util.content_hash(_redist_object_content(native))
             if owned:
                 if created_native:
