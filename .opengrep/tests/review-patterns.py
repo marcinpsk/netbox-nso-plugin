@@ -92,3 +92,10 @@ def write_set_cardinality(self, plan, expected):
     self.assertTrue(expected <= {write.model_label for write in plan.write_set})
     # ok: nso-write-set-cardinality-assertion
     self.assertEqual({item.model_label for item in expected}, {"model"})
+
+
+def wire_signals(handler, sender):
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    pre_save.connect(handler, sender=sender)
+    # ok: nso-signal-connect-without-dispatch-uid
+    post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")

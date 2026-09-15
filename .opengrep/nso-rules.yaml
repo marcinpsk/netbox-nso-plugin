@@ -65,3 +65,19 @@ rules:
       - pattern: $SELF.assertEqual({$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, $EXPECTED, ...)
       - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set}, ...)
       - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, ...)
+  - id: nso-signal-connect-without-dispatch-uid
+    languages: [python]
+    severity: ERROR
+    message: Connect the signal with dispatch_uid; a re-imported module registers the receiver twice.
+    patterns:
+      - pattern-either:
+          - pattern: pre_save.connect(...)
+          - pattern: post_save.connect(...)
+          - pattern: pre_delete.connect(...)
+          - pattern: post_delete.connect(...)
+          - pattern: m2m_changed.connect(...)
+      - pattern-not: $SIGNAL.connect(..., dispatch_uid=$UID, ...)
+    paths:
+      exclude:
+        # Tests connect a temporary receiver and disconnect it in teardown.
+        - "**/tests/**"
