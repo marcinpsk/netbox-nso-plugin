@@ -428,6 +428,51 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         self.assertTrue(native.enabled)
         self.assertEqual(state.status, "accepted")
 
+    def test_owned_native_does_not_create_an_unused_profile(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        device_profile = BFDProfile.objects.create(
+            name="device-profile",
+            min_tx_int=300,
+            min_rx_int=300,
+            multiplier=3,
+        )
+        native = BFDInterface.objects.create(
+            interface=self.iface,
+            bfd_profile=device_profile,
+            micro_bfd=False,
+            enabled=True,
+        )
+        NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=333,
+            min_rx=444,
+            multiplier=5,
+            status="accepted",
+        )
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": False,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        native.refresh_from_db()
+        self.assertEqual(native.bfd_profile_id, device_profile.pk)
+        self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
+
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.
 

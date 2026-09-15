@@ -126,10 +126,9 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
             if owned
             else entry
         )
-        profile = profile_for(desired_entry)
-
         current_native = native_by_interface.get(interface_id)
         if current_native is None:
+            profile = profile_for(desired_entry)
             native = BFDInterface(
                 interface=interface,
                 bfd_profile=profile,
@@ -139,6 +138,7 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
             save(native, force_insert=True, natural_key=("interface",))
             native_by_interface[interface_id] = native
         elif not owned:
+            profile = profile_for(desired_entry)
             desired_micro = bool(entry.get("micro_bfd", False))
             desired_enabled = bool(entry.get("enabled", True))
             if (
