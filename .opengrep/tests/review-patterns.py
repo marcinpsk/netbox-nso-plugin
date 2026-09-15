@@ -64,3 +64,19 @@ def vlan_group_identity():
     VLANGroup.objects.get_or_create(slug="nso-group", name="display name")
     # ok: nso-vlan-group-mutable-lookup
     VLANGroup.objects.get_or_create(slug="nso-group", defaults={"name": "display name"})
+
+
+def write_set_cardinality(self, plan, expected):
+    # ruleid: nso-write-set-cardinality-assertion
+    self.assertEqual({write.model_label for write in plan.write_set}, expected)
+    # ruleid: nso-write-set-cardinality-assertion
+    self.assertEqual(
+        {write.pk for write in plan.write_set if write.operation == "save"},
+        expected,
+    )
+    # ok: nso-write-set-cardinality-assertion
+    self.assertCountEqual([write.model_label for write in plan.write_set], expected)
+    # ok: nso-write-set-cardinality-assertion
+    self.assertTrue(expected <= {write.model_label for write in plan.write_set})
+    # ok: nso-write-set-cardinality-assertion
+    self.assertEqual({item.model_label for item in expected}, {"model"})
