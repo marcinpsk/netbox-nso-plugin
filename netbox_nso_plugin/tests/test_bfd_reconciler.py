@@ -73,6 +73,21 @@ class TestReconcileBfd(TestCase):
         self.assertIsNone(bi.bfd_profile_id)
         self.assertTrue(bi.micro_bfd)
 
+    def test_existing_native_without_profile_receives_a_new_profile(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+
+        native = BFDInterface.objects.create(interface=self.ae1, bfd_profile=None, micro_bfd=False, enabled=True)
+        self.assertIsNone(native.bfd_profile_id)
+        self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
+
+        reconcile_bfd(self.device, [self._entry("ae1", micro=False, tx=333, rx=444, mult=5)])
+
+        native = BFDInterface.objects.get(interface=self.ae1)
+        self.assertIsNotNone(native.bfd_profile_id)
+        self.assertEqual(native.bfd_profile.name, "bfd-333-444-x5")
+
     def test_stale_pruned(self):
         """An interface that stops reporting BFD has its BFDInterface removed."""
         from netbox_routing.models import BFDInterface
@@ -126,6 +141,117 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         st = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
         assert st.status == "imported" and st.min_tx == 300 and st.multiplier == 3 and st.micro_bfd is True
+
+    def test_reconcile_sanitizes_non_integer_timer_values(self):
+        from netbox_routing.models import BFDInterface
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        invalid_values = (("min_tx", "300"), ("min_rx", 300.0), ("multiplier", True))
+        for index, (field_name, invalid_value) in enumerate(invalid_values, start=1):
+            with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Port-channel-invalid-{index}",
+                    type="lag",
+                )
+                entry = {
+                    "interface_name": interface.name,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                    field_name: invalid_value,
+                }
+
+                reconcile_bfd(self.device, [entry])
+
+                state = NSOBFDInterfaceState.objects.get(management=self.management, interface=interface)
+                native = BFDInterface.objects.get(interface=interface)
+                self.assertEqual((state.min_tx, state.min_rx, state.multiplier), (None, None, None))
+                self.assertIsNone(native.bfd_profile_id)
+
+    def test_reconcile_rejects_non_integer_timer_match_for_owned_state(self):
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        invalid_values = (("min_tx", 300.0), ("min_rx", 300.0), ("multiplier", True))
+        for index, (field_name, invalid_value) in enumerate(invalid_values, start=1):
+            with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Port-channel-owned-invalid-{index}",
+                    type="lag",
+                )
+                timer_values = {
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 1 if field_name == "multiplier" else 3,
+                }
+                state = NSOBFDInterfaceState.objects.create(
+                    management=self.management,
+                    interface=interface,
+                    status="in_sync",
+                    **timer_values,
+                )
+                entry = {"interface_name": interface.name, **timer_values, field_name: invalid_value}
+
+                reconcile_bfd(self.device, [entry])
+
+                state.refresh_from_db()
+                self.assertEqual(state.status, "accepted")
+                self.assertEqual(
+                    (state.min_tx, state.min_rx, state.multiplier),
+                    (timer_values["min_tx"], timer_values["min_rx"], timer_values["multiplier"]),
+                )
+
+    def test_reconcile_preflights_profile_native_and_overlay_creations(self):
+        from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        plan = bfd_reconcile_plan(
+            self.device,
+            [
+                {
+                    "interface_name": self.iface.name,
+                    "micro_bfd": True,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [
+                ("save", "netbox_routing.bfdprofile"),
+                ("save", "netbox_routing.bfdinterface"),
+                ("save", "netbox_nso_plugin.nsobfdinterfacestate"),
+            ],
+        )
+
+    def test_foreign_overlay_save_does_not_schedule_bfd_behavior(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        state = NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
+            state.min_tx = 500
+            state.save(update_fields=("min_tx",))
+
+        schedule.assert_not_called()
 
     def test_reconcile_preserves_owned_status(self):
         from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
@@ -302,6 +428,51 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         self.assertTrue(native.enabled)
         self.assertEqual(state.status, "accepted")
 
+    def test_owned_native_does_not_create_an_unused_profile(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        device_profile = BFDProfile.objects.create(
+            name="device-profile",
+            min_tx_int=300,
+            min_rx_int=300,
+            multiplier=3,
+        )
+        native = BFDInterface.objects.create(
+            interface=self.iface,
+            bfd_profile=device_profile,
+            micro_bfd=False,
+            enabled=True,
+        )
+        NSOBFDInterfaceState.objects.create(
+            management=self.management,
+            interface=self.iface,
+            min_tx=333,
+            min_rx=444,
+            multiplier=5,
+            status="accepted",
+        )
+
+        reconcile_bfd(
+            self.device,
+            [
+                {
+                    "interface_name": "Port-channel1",
+                    "micro_bfd": False,
+                    "enabled": True,
+                    "min_tx": 300,
+                    "min_rx": 300,
+                    "multiplier": 3,
+                }
+            ],
+        )
+
+        native.refresh_from_db()
+        self.assertEqual(native.bfd_profile_id, device_profile.pk)
+        self.assertFalse(BFDProfile.objects.filter(name="bfd-333-444-x5").exists())
+
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.
 
@@ -337,6 +508,46 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert deploying.status == "accepted"
         assert deploying.apply_attempt_id is None
         assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
+
+    def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import bfd_reconciler
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentRevision
+
+        payload = [
+            {
+                "interface_name": self.iface.name,
+                "micro_bfd": True,
+                "enabled": True,
+                "min_tx": 300,
+                "min_rx": 300,
+                "multiplier": 3,
+            }
+        ]
+        bfd_reconciler.reconcile_bfd(self.device, payload)
+        real_plan = bfd_reconciler.bfd_reconcile_plan
+        plan_calls = 0
+        revision_after_flip = None
+
+        def plan_then_flip(device, interfaces):
+            nonlocal plan_calls, revision_after_flip
+            plan_calls += 1
+            plan = real_plan(device, interfaces)
+            if plan_calls == 1:
+                state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+                content_update(state, status="in_sync")
+                revision_after_flip = NSOIntentRevision.objects.get(device=self.device, scope="bfd").revision
+            return plan
+
+        with patch.object(bfd_reconciler, "bfd_reconcile_plan", side_effect=plan_then_flip):
+            bfd_reconciler.reconcile_bfd(self.device, [])
+
+        state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bfd")
+        self.assertEqual(plan_calls, 2)
+        self.assertEqual(state.status, "changed")
+        self.assertEqual(revision.revision, revision_after_flip + 1)
 
     def test_matching_timers_keep_a_deploying_row_in_flight(self):
         """Re-reading the intended timers is not apply evidence for an in-flight BFD row."""
@@ -411,7 +622,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
 
         from django.contrib.auth import get_user_model
 
-        from netbox_nso_plugin.models import NSOBFDInterfaceState
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentRevision, NSOOwnershipManifest
 
         state = NSOBFDInterfaceState.objects.create(
             management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="conflict"
@@ -424,3 +636,15 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         assert resp.status_code == 302
         state.refresh_from_db()
         assert state.status == "accepted" and state.accepted_at is not None
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="bfd")
+        assert revision.verified_revision == revision.revision
+        assert revision.verified_fingerprint == delivery.canonical_fingerprint(
+            delivery.render("bfd", self.device.pk, self.management.adapter_device_id).payload
+        )
+        assert NSOOwnershipManifest.objects.filter(
+            device_id=self.device.pk,
+            scope="bfd",
+            native_model_label="dcim.interface",
+            native_key={"device_id": self.iface.device_id, "name": self.iface.name},
+            ownership_state="owned",
+        ).exists()

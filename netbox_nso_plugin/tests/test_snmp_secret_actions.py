@@ -130,6 +130,37 @@ class TestCommunitySecretSet(_SecretBase):
         sent = session.request.call_args.kwargs["json"]
         self.assertEqual(sent, {"vault_ref": expected_ref, "values": {"community": "new-c0mmunity"}})
 
+    def test_community_rekey_rejects_commit_false(self):
+        from netbox_nso_plugin.models import NSOSnmpHostState
+
+        mgmt = self._make_mgmt()
+        row = self._community(mgmt)
+        host = NSOSnmpHostState.objects.create(
+            management=mgmt,
+            address="198.18.0.9",
+            version="v2c",
+            notify_type="trap",
+            community_hash=row.community_hash,
+        )
+        old_hash = row.community_hash
+        new_fp = secret_fingerprint("new-c0mmunity")
+        expected_ref = f"network/netbox/snmp/community/{new_fp}#community"
+        session = make_session(json_data={"vault_ref": expected_ref, "version": 3, "hashes": {"community": new_fp}})
+
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            form = self._form(row, {"secret_value": "new-c0mmunity"})
+            self.assertTrue(form.is_valid(), form.errors)
+            with self.assertRaisesRegex(ValueError, "commit=False is not supported for SNMP community rekeys"):
+                form.save(commit=False)
+
+        row.refresh_from_db()
+        host.refresh_from_db()
+        self.assertEqual(row.community_hash, old_hash)
+        self.assertEqual(host.community_hash, old_hash)
+
     def test_collision_with_existing_community_fails_before_vault(self):
         mgmt = self._make_mgmt()
         row = self._community(mgmt)
@@ -406,7 +437,11 @@ class TestDeletePropagation(_SecretBase):
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_snmp_intent") as mock_put:
             with self.captureOnCommitCallbacks(execute=True):
-                row.delete()
+                from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+                plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+                with renderer_writes(plan) as writer:
+                    writer.delete(row)
         mock_put.assert_called_once()
         communities = mock_put.call_args[0][1]
         self.assertEqual(communities, [])

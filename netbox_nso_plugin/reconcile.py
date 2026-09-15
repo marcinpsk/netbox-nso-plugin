@@ -311,20 +311,33 @@ _ROUTE_POLICY_ATTEMPT_IDS = "_route_policy_attempt_ids"
 _ROUTE_POLICY_ADAPTER_DEVICE_ID = "_route_policy_adapter_device_id"
 
 
+def _isis_gated_body(ctx, mgmt, device, payload):
+    """Publish both IS-IS result sets through one guarded reconciliation body."""
+    from .isis_reconciler import reconcile_isis
+
+    _safe_reconcile(
+        ctx,
+        "isis_data",
+        mgmt,
+        ("NSOISISInstanceState", "NSOISISInterfaceState"),
+        reconcile_isis,
+        device,
+        payload,
+    )
+    result = ctx.pop("isis_data")
+    ctx["isis_interfaces"] = result["interfaces"]
+    ctx["isis_processes"] = result["processes"]
+
+
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .isis_reconciler import isis_reconcile_plan
+    from .ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
-    from .template_content import (
-        _reconcile_isis_interfaces,
-        _reconcile_isis_process,
-        _reconcile_ospf,
-        _reconcile_static_routes,
-        isis_reconcile_plan,
-        ospf_reconcile_plan,
-    )
+    from .template_content import _reconcile_static_routes, static_route_reconcile_plan
 
     if not mgmt.manage_routing:
         return
@@ -341,38 +354,19 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 ctx, "static_routes", mgmt, ("NSOStaticRouteState",), _reconcile_static_routes, device, static_doc
             ),
             epoch=dev_id,
+            pre_body=lambda: static_route_reconcile_plan(device, static_doc),
         )
     if mgmt.manage_isis:
         # R3-6: ONE isis document → ONE gate decision → ONE compound body driving
         # both reconcilers (never two gate calls abusing the equality rerun rule).
         isis_payload = client.get_isis_interfaces(dev_id)
 
-        def _isis_body():
-            _safe_reconcile(
-                ctx,
-                "isis_interfaces",
-                mgmt,
-                ("NSOISISInterfaceState",),
-                _reconcile_isis_interfaces,
-                device,
-                isis_payload.get("interfaces", []),
-            )
-            _safe_reconcile(
-                ctx,
-                "isis_processes",
-                mgmt,
-                ("NSOISISInstanceState",),
-                _reconcile_isis_process,
-                device,
-                isis_payload.get("processes", []),
-            )
-
         _gated(
             ctx,
             mgmt,
             "isis",
             isis_payload,
-            _isis_body,
+            lambda: _isis_gated_body(ctx, mgmt, device, isis_payload),
             epoch=dev_id,
             pre_body=lambda: isis_reconcile_plan(device, isis_payload),
         )
@@ -415,7 +409,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 "ospf_data",
                 mgmt,
                 ("NSOOSPFInstanceState", "NSOOSPFInterfaceState"),
-                _reconcile_ospf,
+                reconcile_ospf,
                 device,
                 ospf_doc,
             ),
@@ -501,7 +495,10 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
         _reconcile_logging_config,
         _reconcile_snmp_config,
         _upsert_interface_states,
+        interface_ip_reconcile_plan,
+        interface_reconcile_plan,
         logging_reconcile_plan,
+        snmp_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -559,6 +556,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     fetched_interfaces,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: interface_reconcile_plan(device, fetched_interfaces),
             )
             if interface_result.disposition in ("ran", "legacy"):
                 ctx["interfaces"] = fetched_interfaces
@@ -628,6 +626,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     ctx, "interface_ips", mgmt, ("NSOInterfaceIPState",), _reconcile_interface_ips, device, ip_doc
                 ),
                 epoch=dev_id,
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
             # LACP/LAG bundle + member overlay states (interface-level).
             from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
@@ -702,6 +701,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
                     snmp_doc,
                 ),
                 epoch=dev_id,
+                pre_body=lambda: snmp_reconcile_plan(device, snmp_doc),
             )
         if mgmt.manage_logging:
             log_doc = client.get_logging_config(dev_id)
@@ -755,20 +755,20 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """
     from . import adapter_client as client
     from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .isis_reconciler import isis_reconcile_plan
+    from .ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
     from .route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
     from .signals import suppress_intent_push
     from .template_content import (
         _reconcile_interface_ips,
-        _reconcile_isis_interfaces,
-        _reconcile_isis_process,
         _reconcile_logging_config,
-        _reconcile_ospf,
         _reconcile_snmp_config,
         _reconcile_static_routes,
         _upsert_interface_states,
-        isis_reconcile_plan,
-        ospf_reconcile_plan,
+        interface_ip_reconcile_plan,
+        interface_reconcile_plan,
+        snmp_reconcile_plan,
     )
 
     ctx = _empty_context()
@@ -819,6 +819,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _upsert_interface_states(device, fetched_interfaces),
                 epoch=dev_id,
                 ctx_key="interface_states",
+                pre_body=lambda: interface_reconcile_plan(device, fetched_interfaces),
             )
             if interface_result.disposition in ("ran", "legacy"):
                 ctx["interfaces"] = fetched_interfaces
@@ -854,6 +855,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_interface_ips(device, ip_doc),
                 epoch=dev_id,
                 ctx_key="interface_ips",
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
             mtu_doc = client.get_interface_mtu(dev_id)
             _gated(
@@ -904,6 +906,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _upsert_interface_states(device, fetched_interfaces),
                 epoch=dev_id,
                 ctx_key="interface_states",
+                pre_body=lambda: interface_reconcile_plan(device, fetched_interfaces),
             )
             if interface_result.disposition in ("ran", "legacy"):
                 ctx["interfaces"] = fetched_interfaces
@@ -939,6 +942,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_interface_ips(device, ip_doc),
                 epoch=dev_id,
                 ctx_key="interface_ips",
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
         elif key == "interface_ips":
             from .subinterface_reconciler import reconcile_subinterface, subinterface_reconcile_plan
@@ -975,6 +979,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_interface_ips(device, ip_doc),
                 epoch=dev_id,
                 ctx_key="interface_ips",
+                pre_body=lambda: interface_ip_reconcile_plan(device, ip_doc),
             )
         elif key == "lacp":
             from .lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
@@ -1082,6 +1087,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_snmp_config(device, snmp_doc),
                 epoch=dev_id,
                 ctx_key="snmp_data",
+                pre_body=lambda: snmp_reconcile_plan(device, snmp_doc),
             )
         elif key == "logging":
             from .template_content import logging_reconcile_plan
@@ -1098,6 +1104,8 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 pre_body=lambda: logging_reconcile_plan(device, log_doc),
             )
         elif key == "static":
+            from .template_content import static_route_reconcile_plan
+
             static_doc = client.get_static_routes(dev_id)
             _gated(
                 ctx,
@@ -1107,21 +1115,18 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 lambda: _reconcile_static_routes(device, static_doc),
                 epoch=dev_id,
                 ctx_key="static_routes",
+                pre_body=lambda: static_route_reconcile_plan(device, static_doc),
             )
         elif key == "isis":
             # R3-6: ONE document → ONE gate decision → ONE compound body.
             isis_payload = client.get_isis_interfaces(dev_id)
-
-            def _isis_body():
-                ctx["isis_interfaces"] = _reconcile_isis_interfaces(device, isis_payload.get("interfaces", []))
-                ctx["isis_processes"] = _reconcile_isis_process(device, isis_payload.get("processes", []))
 
             _gated(
                 ctx,
                 mgmt,
                 "isis",
                 isis_payload,
-                _isis_body,
+                lambda: _isis_gated_body(ctx, mgmt, device, isis_payload),
                 epoch=dev_id,
                 pre_body=lambda: isis_reconcile_plan(device, isis_payload),
             )
@@ -1132,7 +1137,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 mgmt,
                 "ospf",
                 ospf_doc,
-                lambda: _reconcile_ospf(device, ospf_doc),
+                lambda: reconcile_ospf(device, ospf_doc),
                 epoch=dev_id,
                 ctx_key="ospf_data",
                 pre_body=lambda: ospf_reconcile_plan(device, ospf_doc),

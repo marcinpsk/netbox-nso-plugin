@@ -4,20 +4,20 @@
 
 The recent bugs lived in the *transitions* between states and in how those
 transitions surfaced on the tab — not in any single state. The existing
-test_signals.py unit-tests each Decision-G transition in isolation; this file walks
-one interface through the whole arc with REAL ``Interface.save()`` calls (so the
-connected pre_save/post_save signals fire naturally) and asserts the user-facing
-classification (``summary.interface_row_state``) after every step. That ties signals
-(ownership) and summary (display) together — the seam where the surprises happened.
+test_signals.py tests signal gating in isolation. This file walks one interface
+through the full arc with exact native and overlay writer plans. It asserts the
+user-facing classification (``summary.interface_row_state``) after every step.
 
 Runs against the full NetBox stack (devcontainer).
 """
 
 from __future__ import annotations
 
+import copy
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase
-from netbox.context import current_request
+from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 from netbox_nso_plugin.summary import interface_row_state
@@ -61,16 +61,30 @@ class TestInterfaceOwnershipLifecycle(TestCase):
         return interface_row_state(st, self.iface)
 
     def _operator_edit(self, **fields):
-        """Edit the interface AS AN OPERATOR (no adapter header) via a real save, so the
-        connected Decision-G pre/post_save signals fire and (maybe) take ownership."""
-        token = current_request.set(None)
-        try:
-            with self.captureOnCommitCallbacks(execute=True):
-                for k, v in fields.items():
-                    setattr(self.iface, k, v)
-                self.iface.save(update_fields=list(fields))
-        finally:
-            current_request.reset(token)
+        """Edit and acquire one interface attribute through an exact writer."""
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+        from netbox_nso_plugin.summary import matches_device_value
+
+        self.assertEqual(len(fields), 1)
+        attribute, value = next(iter(fields.items()))
+        state = NSOInterfaceState.objects.get(interface=self.iface, attribute=attribute)
+        interface_candidate = copy.copy(self.iface)
+        setattr(interface_candidate, attribute, value)
+        state_candidate = copy.copy(state)
+        state_candidate.status = "in_sync" if matches_device_value(attribute, value, state.nso_value) else "accepted"
+        if state_candidate.accepted_at is None:
+            state_candidate.accepted_at = timezone.now()
+        state_fields = ("status", "accepted_at")
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(interface_candidate, update_fields=(attribute,)),
+                planned_save(state_candidate, update_fields=state_fields),
+            )
+        )
+        with self.captureOnCommitCallbacks(execute=True), renderer_writes(plan) as writer:
+            writer.save(interface_candidate, update_fields=(attribute,))
+            writer.save(state_candidate, update_fields=state_fields)
+        self.iface = interface_candidate
 
     def _adapter_writes(self, attribute="description", **fields):
         """Simulate an adapter sync writing state (never touches accepted_at)."""

@@ -25,6 +25,7 @@ from django.db import connection, transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import make_managed, own_route, own_vlan, rename_vlan, without_commit_drain
+from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 #: Run by both processes. The role decides whether it holds the key or races for it.
@@ -218,7 +219,7 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
             detach_state = NSOStaticRouteState.objects.get(management=mgmt, static_route=detach)
             with intent_transaction(footprint_for_instance(detach_state)):
                 NSOStaticRouteState.objects.filter(pk=detach_state.pk).update(status="imported")
-            retract.devices.remove(device)
+            _unassign_and_retire(retract, device)
         AdapterConnection.objects.create(url=self._adapter_url(), enabled=True, verify_tls=False, timeout_seconds=30)
 
         with tempfile.TemporaryDirectory() as raw:

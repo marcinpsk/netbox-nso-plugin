@@ -1459,9 +1459,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         payload["interfaces"][0]["tagged_vlans"] = [10, 20]
         waiting = prepare_switchport_reconcile(self.device, payload)
         owners = (self.interface, state)
-        self.assertEqual(
-            {(write.model_label, write.pk) for write in waiting.plan.write_set if write.operation == "m2m_set"},
-            {(owner._meta.label_lower, owner.pk) for owner in owners},
+        self.assertCountEqual(
+            [(write.model_label, write.pk) for write in waiting.plan.write_set if write.operation == "m2m_set"],
+            [(owner._meta.label_lower, owner.pk) for owner in owners],
         )
         target = tuple(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid__in=(10, 20)).order_by("pk"))
         competing = RendererMutationPlan.build(
@@ -1556,9 +1556,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         relation_queries = [query for query in queries if through_table in query["sql"]]
         self.assertEqual(len(relation_queries), 1)
-        self.assertEqual(
-            {write.pk for write in plan.write_set if write.model_label == NSOSwitchportState._meta.label_lower},
-            set(NSOSwitchportState.objects.filter(management=self.management).values_list("pk", flat=True)),
+        self.assertCountEqual(
+            [write.pk for write in plan.write_set if write.model_label == NSOSwitchportState._meta.label_lower],
+            NSOSwitchportState.objects.filter(management=self.management).values_list("pk", flat=True),
         )
 
     def test_vlan_operations_preload_reported_overlay_vlan_group(self):

@@ -27,6 +27,12 @@ from ._outbox_case import (
     triple,
     without_commit_drain,
 )
+from ._static_route_case import (
+    _delete_owned_route,
+    _edit_owned_route,
+    _touch_owned_route,
+    _unassign_and_retire,
+)
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -77,7 +83,7 @@ class _ActivationCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestC
 
     def unown(self, route):
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
 
     def reown(self, route, *, callbacks=False):
         from ._static_route_case import _assign_and_accept
@@ -118,7 +124,7 @@ class TestPerObjectMarkingDrivesExecution(_ActivationCase):
 
         with without_commit_drain(), transaction.atomic():
             self.bypass_unown(detach)
-            retract.devices.remove(self.device)
+            _unassign_and_retire(retract, self.device)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
 
@@ -153,7 +159,7 @@ class TestTheListOverridesTheLegacyFlag(_ActivationCase):
         self.land(retract, detach)
         with without_commit_drain(), transaction.atomic():
             self.bypass_unown(detach)
-            retract.devices.remove(self.device)
+            _unassign_and_retire(retract, self.device)
 
         config, session = self.adapter.patches()
         with config, session, adapter_client.delete_origin_pushes():
@@ -173,9 +179,7 @@ class TestCanonicalLineageIsOnTheWire(_ActivationCase):
     adapter_device_id = 7963
 
     def _edit(self, route, next_hop):
-        route.next_hop = next_hop
-        route.save()
-        route.refresh_from_db()
+        _edit_owned_route(route, next_hop=next_hop)
 
     def test_one_form_edit_and_remove_leads_with_the_acknowledged_triple(self):
         from netbox_nso_plugin import drain
@@ -186,7 +190,7 @@ class TestCanonicalLineageIsOnTheWire(_ActivationCase):
 
         with without_commit_drain(), transaction.atomic():
             self._edit(route, "198.18.0.66")
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
         [record] = self.sent()[-1]["body"]["deleted_routes"]
@@ -205,7 +209,7 @@ class TestCanonicalLineageIsOnTheWire(_ActivationCase):
         with without_commit_drain(), transaction.atomic():
             self._edit(route, "198.18.0.82")
         with without_commit_drain(), transaction.atomic():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
         [record] = self.sent()[-1]["body"]["deleted_routes"]
@@ -227,8 +231,7 @@ class TestMembershipAndContentHaveDifferentAuthority(_ActivationCase):
         self.land(edited, removed)
 
         with without_commit_drain(), transaction.atomic():
-            edited.metric = 7
-            edited.save()
+            _edit_owned_route(edited, metric=7)
         assert self.drain(chain=0) == drain.SUCCEEDED
         assert self.sent()[-1]["body"]["deleted_routes"] == []
 
@@ -250,8 +253,10 @@ class TestNetZeroMembershipChangeWritesNoTombstone(_ActivationCase):
         route = own_route(self.mgmt, "198.18.0.128/28", "198.18.0.129")
         self.land(route)
         with without_commit_drain(), transaction.atomic():
-            route.devices.remove(self.device)
-            route.devices.add(self.device)
+            _unassign_and_retire(route, self.device)
+            from ._static_route_case import _accept_with_permit
+
+            _accept_with_permit(route, self.device)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
         [request] = self.sent()
@@ -285,7 +290,7 @@ class TestOutrightDeletionFansOutAuthority(_ActivationCase):
 
         route_id = route.pk
         with without_commit_drain(), transaction.atomic():
-            route.delete()
+            _delete_owned_route(route)
 
         config, session = self.adapter.patches()
         with config, session:
@@ -317,7 +322,7 @@ class TestSignalBypassDetachesOnTheNextPush(_ActivationCase):
         self.land(bypassed, keeper)
         self.bypass_unown(bypassed)
         with without_commit_drain(), transaction.atomic():
-            self.mgmt.static_route_states.get(static_route=keeper).save()
+            _touch_owned_route(keeper)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
         [request] = self.sent()
@@ -384,7 +389,7 @@ class TestAdapterResponsesSettleTheActivatedScope(_ActivationCase):
         route = own_route(self.mgmt, "198.18.0.208/28", "198.18.0.209")
         self.land(route)
         with without_commit_drain(), transaction.atomic():
-            self.mgmt.static_route_states.get(static_route=route).save()
+            _touch_owned_route(route)
         pending = [row.pk for row in entries(self.device, "static_route", unconsumed=True)]
 
         assert self.push_now(mode=delivery.MODE_STORE_ONLY, force=True) is not None
@@ -469,7 +474,6 @@ class TestAnExecutedPerObjectDeletionIsNoDowngrade(_ActivationCase):
 
     def test_a_deletion_folded_with_an_unmarked_edit_records_no_downgrade(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.models import NSOStaticRouteState
 
         going = own_route(self.mgmt, "198.18.2.0/28", "198.18.2.1")
         staying = own_route(self.mgmt, "198.18.2.16/28", "198.18.2.17")
@@ -477,7 +481,7 @@ class TestAnExecutedPerObjectDeletionIsNoDowngrade(_ActivationCase):
 
         self.unown(going)
         with without_commit_drain(), transaction.atomic():
-            NSOStaticRouteState.objects.get(management=self.mgmt, static_route=staying).save()
+            _touch_owned_route(staying)
 
         assert self.drain(chain=0) == drain.SUCCEEDED
 
