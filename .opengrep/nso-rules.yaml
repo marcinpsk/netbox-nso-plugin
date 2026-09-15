@@ -50,3 +50,12 @@ rules:
     severity: ERROR
     message: Look up VLANGroup by its unique slug. Put the mutable name in defaults.
     pattern: ipam.models.VLANGroup.objects.get_or_create(..., slug=$SLUG, name=$NAME, ...)
+  - id: nso-write-set-cardinality-assertion
+    languages: [python]
+    severity: ERROR
+    message: Use assertCountEqual so an exact write-set assertion preserves duplicate writes.
+    pattern-either:
+      - pattern: $SELF.assertEqual({$VALUE for $WRITE in $PLAN.write_set}, $EXPECTED, ...)
+      - pattern: $SELF.assertEqual({$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, $EXPECTED, ...)
+      - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set}, ...)
+      - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, ...)
