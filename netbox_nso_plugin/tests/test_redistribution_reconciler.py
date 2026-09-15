@@ -222,7 +222,7 @@ class TestReconcileRedistribution(TestCase):
 
         payload = {"entries": [self._entry(metric=10)]}
         plan = redistribution_reconcile_plan(self.device, payload)
-        self.assertEqual(plan.content_keys, ((self.device.pk, "isis"),))
+        self.assertEqual(plan.content_keys, ())
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis")
         before = revision.revision
 
@@ -231,10 +231,10 @@ class TestReconcileRedistribution(TestCase):
         revision.refresh_from_db()
         self.assertIsNotNone(reconciled.redistribution_id)
         self.assertEqual(reconciled.metric, 20)
-        self.assertEqual(reconciled.redistribution.metric, 10)
-        self.assertEqual(redistribution_intent_item(reconciled)["metric"], 10)
+        self.assertEqual(reconciled.redistribution.metric, 20)
+        self.assertEqual(redistribution_intent_item(reconciled)["metric"], 20)
         self.assertEqual(Redistribution.objects.count(), 1)
-        self.assertEqual(revision.revision, before + 1)
+        self.assertEqual(revision.revision, before)
 
     def test_category_reconcile_declares_its_native_and_overlay_writes(self):
         management = self._make_mgmt()

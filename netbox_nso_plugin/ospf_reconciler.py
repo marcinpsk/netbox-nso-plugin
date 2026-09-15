@@ -151,6 +151,8 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
         seen_interface_names.add(interface_name)
         raw_process_id = entry.get("process_id")
         entry["process_id"] = str(raw_process_id) if raw_process_id is not None else None
+        raw_priority = entry.get("priority")
+        entry["priority"] = raw_priority if type(raw_priority) is int and 0 <= raw_priority <= 32767 else None
         interface_entries.append(entry)
 
     areas = list(OSPFArea.objects.all().order_by("pk"))

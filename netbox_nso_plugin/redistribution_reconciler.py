@@ -225,7 +225,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
                     source_protocol=source_protocol,
                     source_ref=source_ref,
                     route_map=route_map,
-                    metric=entry.get("metric"),
+                    metric=state.metric if owned else entry.get("metric"),
                     metric_type=_redist_metric_type(entry),
                 )
             )

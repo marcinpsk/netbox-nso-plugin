@@ -557,6 +557,26 @@ class TestReconcileOspfFill(TestCase):
         self.assertIsNone(x.cost)
         self.assertIsNone(x.network_type)
 
+    def test_invalid_priority_is_dropped_before_persistence(self):
+        """An invalid adapter priority must not abort interface reconciliation."""
+        self._make_mgmt()
+        from netbox_routing.models import OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+        from netbox_nso_plugin.ospf_reconciler import reconcile_ospf as _reconcile_ospf
+
+        for priority in ("bogus", -1, 32768, True):
+            with self.subTest(priority=priority):
+                _reconcile_ospf(
+                    self.device,
+                    self._payload(
+                        [self._instance()],
+                        [self._iface(name="Tunnel10", priority=priority)],
+                    ),
+                )
+                self.assertIsNone(OSPFInterface.objects.get(interface=self.tun).priority)
+                self.assertIsNone(NSOOSPFInterfaceState.objects.get(interface=self.tun).priority)
+
     def test_interface_not_in_netbox_dropped(self):
         """An interface NSO reports but NetBox lacks is skipped, not crashed."""
         self._make_mgmt()
