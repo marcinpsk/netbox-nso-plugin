@@ -1137,13 +1137,7 @@ class TestARestoreRebaseClearsTheAdaptersWatermark(_OutcomeCase):
 
 
 class TestABoundaryRejectionDissolvesTheClaim(_OutcomeCase):
-    """codex O1 r5 F2 (§4.2): a deterministic 422 is proven no-effect, so the claim abandons.
-
-    The adapter refuses a duplicate triple or a duplicate route id at its boundary, before
-    it takes its claim guard and therefore before any statement of its own transaction. The
-    body is invalid and will stay invalid, so replaying it takes over the operator's
-    correcting edit on every later drain and the correction never reaches the wire.
-    """
+    """A deterministic boundary rejection retires its trigger until intent changes."""
 
     tag = "reject"
     adapter_device_id = 7713
@@ -1162,7 +1156,7 @@ class TestABoundaryRejectionDissolvesTheClaim(_OutcomeCase):
         with without_commit_drain(), transaction.atomic():
             _edit_owned_route(route, next_hop=next_hop)
 
-    def test_a_rejected_body_abandons_and_the_correction_sends_at_a_fresh_sequence(self):
+    def test_a_rejected_body_retires_its_rows_and_the_correction_sends_at_a_fresh_sequence(self):
         from netbox_nso_plugin import drain
 
         route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.20")
@@ -1177,7 +1171,7 @@ class TestABoundaryRejectionDissolvesTheClaim(_OutcomeCase):
         assert state.push_seq is None, "the rejection is proven no-effect, so the claim dissolves"
         assert state.claimed_at is None and state.last_error_code == "validation_error"
         assert state.fence_withheld_since is None, "a rejected body is not a shut fence"
-        assert entries(self.device, "static_route", unconsumed=True), "the work came back"
+        assert entries(self.device, "static_route") == [], "the rejected trigger is retired"
         burned = self.adapter.sequences[-1]
 
         self.adapter._respond = accepted

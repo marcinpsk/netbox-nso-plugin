@@ -330,15 +330,20 @@ class TestV3SecretSet(_SecretBase):
 class TestVerifyAndHarvestViews(_SecretBase):
     def test_verify_community_stores_fingerprint(self):
         mgmt = self._make_mgmt()
+        fingerprint = "0123456789abcdef"
         row = self._community(
-            mgmt, vault_ref="network/netbox/snmp/community/oldhash1234567890#community", status="accepted"
+            mgmt,
+            community_hash=fingerprint,
+            vault_ref=f"network/netbox/snmp/community/{fingerprint}#community",
+            status="accepted",
         )
         session = make_session(
             json_data={
-                "vault_ref": row.vault_ref,
-                "exists": True,
-                "fields": ["community"],
-                "hashes": {"community": row.community_hash},
+                "operation_id": "placeholder-operation",
+                "status": "present",
+                "fingerprint": row.community_hash,
+                "has_auth": False,
+                "has_priv": False,
                 "version": 4,
             }
         )
@@ -353,19 +358,60 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertEqual(row.vault_secret_hash, row.community_hash)
         self.assertEqual(row.vault_secret_version, 4)
 
+    def test_verify_missing_community_clears_the_previous_observation(self):
+        mgmt = self._make_mgmt()
+        row = self._community(
+            mgmt,
+            vault_ref="network/netbox/snmp/community/oldhash1234567890#community",
+            status="accepted",
+            vault_secret_hash="oldhash1234567890",
+            vault_secret_version=3,
+        )
+        self.client.force_login(_superuser())
+
+        for status in ("missing_path", "missing_field"):
+            row.vault_secret_hash = "oldhash1234567890"
+            row.vault_secret_version = 3
+            row.save(update_fields=("vault_secret_hash", "vault_secret_version"))
+            session = make_session(
+                json_data={
+                    "operation_id": "placeholder-operation",
+                    "status": status,
+                    "fingerprint": None,
+                    "has_auth": False,
+                    "has_priv": False,
+                    "version": None if status == "missing_path" else 4,
+                }
+            )
+            with (
+                patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+                patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+            ):
+                resp = self.client.post(f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/")
+
+            self.assertEqual(resp.status_code, 302)
+            row.refresh_from_db()
+            self.assertEqual(row.vault_secret_hash, "")
+            self.assertIsNone(row.vault_secret_version)
+
     def test_verify_v3_records_field_presence(self):
         from netbox_nso_plugin.models import NSOSnmpV3UserState
 
         mgmt = self._make_mgmt()
         row = NSOSnmpV3UserState.objects.create(
-            management=mgmt, username="monitor", vault_ref="network/netbox/snmp/v3/monitor"
+            management=mgmt,
+            username="monitor",
+            vault_ref="network/netbox/snmp/v3/monitor",
+            vault_has_auth=False,
+            vault_has_priv=True,
         )
         session = make_session(
             json_data={
-                "vault_ref": row.vault_ref,
-                "exists": True,
-                "fields": ["auth"],
-                "hashes": {"auth": "x"},
+                "operation_id": "placeholder-operation",
+                "status": "present",
+                "fingerprint": None,
+                "has_auth": True,
+                "has_priv": False,
                 "version": 1,
             }
         )

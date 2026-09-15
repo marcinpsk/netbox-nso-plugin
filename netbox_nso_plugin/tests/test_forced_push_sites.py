@@ -44,7 +44,7 @@ FORCED_PUSH_SITES = {
 }
 #: The claim a forced push routes through is itself forced. It is not a push site, and it is
 #: named here so the exclusion cannot quietly widen to a module that is one.
-FORCED_CLAIM_SITE = ("drain.py", "_claim_or_wait", "claim")
+FORCED_CLAIM_SITE = ("drain.py", "_claim_or_wait", "_claim_after_audit")
 #: The deployment gate forms one known no-deletion claim, sends it, and verifies its exact
 #: receipt before it resumes mutation. It is an operator protocol, not a product push site.
 DEPLOYMENT_VERIFICATION_CLAIM_SITE = (
