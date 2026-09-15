@@ -59,7 +59,7 @@ class TestReconcileRoutePolicy(TestCase):
 
         self.assertEqual(len(captured), 1)
 
-    def test_direct_reconcile_builds_the_route_policy_graph_once(self):
+    def test_direct_reconcile_reuses_the_acquired_route_policy_graph(self):
         from unittest.mock import patch
 
         from netbox_nso_plugin import route_policy_reconciler
@@ -74,7 +74,9 @@ class TestReconcileRoutePolicy(TestCase):
         ) as build_operations:
             route_policy_reconciler.reconcile_route_policy(self.device, payload)
 
-        self.assertEqual(build_operations.call_count, 1)
+        # The stale-plan helper builds before and after acquisition. Replay must reuse
+        # the selected graph instead of building it a third time.
+        self.assertEqual(build_operations.call_count, 2)
 
     @classmethod
     def setUpTestData(cls):
@@ -2850,12 +2852,11 @@ class TestSharedObjectOwnership(TestCase):
             reconcile_route_policy(device, payload)
         self.assertTrue(fired, "the raced mirror acquisition never ran")
 
-    def test_standalone_replay_refuses_a_sibling_removed_after_planning(self):
-        """The omitted-group branch reads the live sibling, so its removal must refuse the replay."""
+    def test_standalone_replay_replans_after_a_sibling_is_removed_during_acquisition(self):
+        """The standalone entry point retries when the omitted-group plan becomes stale."""
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSODeviceManagement, NSORoutePolicyState
-        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         self._mgmt(self.d1)
@@ -2868,34 +2869,23 @@ class TestSharedObjectOwnership(TestCase):
         )
         empty = {"prefix_lists": []}
         self.assertFalse(route_policy_reconcile_plan(self.d2, empty).changes_content)
+        before = self._rp_revision(self.d2)
 
-        with self.assertRaises(IntentPlanStaleError):
-            self._race_standalone(
-                self.d2,
-                empty,
-                lambda: NSODeviceManagement.objects.get(device=self.d1).delete(),
-            )
-
-        # Nothing was written: the unreferenced root is still there with D2's row.
-        self.assertTrue(PrefixList.objects.filter(name="PL-RACE-GONE").exists())
-        self.assertTrue(
-            NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-RACE-GONE").exists()
+        self._race_standalone(
+            self.d2,
+            empty,
+            lambda: NSODeviceManagement.objects.get(device=self.d1).delete(),
         )
 
-        before = self._rp_revision(self.d2)
-        plan = route_policy_reconcile_plan(self.d2, empty)
-        self.assertTrue(plan.changes_content)
-        reconcile_route_policy(self.d2, empty)
         self.assertFalse(NSORoutePolicyState.objects.filter(object_name="PL-RACE-GONE").exists())
         self.assertFalse(PrefixList.objects.filter(name="PL-RACE-GONE").exists())
         self.assertGreater(self._rp_revision(self.d2), before)
 
-    def test_standalone_replay_refuses_a_sibling_whose_liveness_flipped_after_planning(self):
-        """A sibling that stops reporting between plan and lock changes the stale-group branch."""
+    def test_standalone_replay_replans_after_a_sibling_liveness_flip_during_acquisition(self):
+        """The standalone entry point retries when sibling liveness makes its plan stale."""
         from netbox_routing.models import PrefixList
 
         from netbox_nso_plugin.models import NSORoutePolicyState
-        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         from ._outbox_case import content_update
@@ -2909,11 +2899,10 @@ class TestSharedObjectOwnership(TestCase):
         empty = {"prefix_lists": []}
         self.assertFalse(route_policy_reconcile_plan(self.d2, empty).changes_content)
 
-        with self.assertRaises(IntentPlanStaleError):
-            self._race_standalone(self.d2, empty, lambda: content_update(owner, device_present=False))
+        self._race_standalone(self.d2, empty, lambda: content_update(owner, device_present=False))
 
-        self.assertTrue(PrefixList.objects.filter(name="PL-RACE-FLIP").exists())
-        self.assertTrue(
+        self.assertFalse(PrefixList.objects.filter(name="PL-RACE-FLIP").exists())
+        self.assertFalse(
             NSORoutePolicyState.objects.filter(management__device=self.d2, object_name="PL-RACE-FLIP").exists()
         )
 

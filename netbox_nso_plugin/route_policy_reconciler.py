@@ -1501,24 +1501,29 @@ def reconcile_route_policy(device, payload: dict) -> list:
     (reconcile_device) already suppresses. Returns NSORoutePolicyState instances for the device.
     """
     from .models import NSODeviceManagement, NSORoutePolicyState
-    from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
+    from .renderer_writer import active_renderer_writer, renderer_writes_replanning_once
     from .signals import suppress_intent_push
 
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return []
     active = active_renderer_writer()
-    operations = None
+    operations_by_plan = {}
     if active is not None:
-        plan = active.plan
+        mutation = nullcontext((active, active.plan))
     else:
-        plan, operations = _route_policy_reconcile_plan_and_operations(device, payload)
-    mutation = nullcontext(active)
-    if active is None:
-        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer, suppress_intent_push():
-        if operations is None:
+
+        def plan_fn():
+            plan, operations = _route_policy_reconcile_plan_and_operations(device, payload)
+            operations_by_plan[id(plan)] = operations
+            return plan
+
+        mutation = renderer_writes_replanning_once(plan_fn)
+    with mutation as (writer, plan), suppress_intent_push():
+        if active is not None:
             operations = _route_policy_reconcile_operations(device, payload, plan.planned_at)
+        else:
+            operations = operations_by_plan[id(plan)]
         _replay_operations(writer, operations)
     return list(NSORoutePolicyState.objects.filter(management=management).order_by("family", "object_name"))
 
