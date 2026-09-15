@@ -673,7 +673,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 _upgrade_detected_reconcile(permit, footprint)
         finally:
             if worker.ident is not None:
-                worker.join(10)
+                worker.join()
         self.assertFalse(worker.is_alive())
         if failures:
             raise failures[0]
@@ -761,7 +761,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             release_settlement.set()
             for worker in (settlement_worker, reconcile_worker):
                 if worker.ident is not None:
-                    worker.join(10)
+                    worker.join()
 
         self.assertFalse(settlement_worker.is_alive())
         self.assertFalse(reconcile_worker.is_alive())
