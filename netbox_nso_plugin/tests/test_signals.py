@@ -1390,26 +1390,26 @@ class TestPushIntentOnAccept(_SignalDBBase):
         self.assertEqual([(a["interface"], a["attribute"]) for a in attrs], [("GigabitEthernet0/0", "description")])
         self.assertEqual(attrs[0]["intent_value"], "uplink to spine")
 
-    def test_skips_when_mgmt_does_not_exist(self):
-        # No NSODeviceManagement for this device → NSODeviceManagement.objects.get raises.
+    def test_unmanaged_device_does_not_schedule_interface_behavior(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        # Without management, the plan cannot own an interface delivery key.
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
-        with patch(f"{_MOD}.put_intent") as mock_put:
-            with self.captureOnCommitCallbacks(execute=True):
-                _invoke_push_intent_on_accept(state)
+        _invoke_push_intent_on_accept(state)
 
-        mock_put.assert_not_called()
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists())
 
     def test_skips_when_adapter_id_none(self):
         """A management row without an adapter_device_id yet → nothing to push to."""
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
         self._make_mgmt(adapter_device_id=None)
         state = self._accepted_state(self.iface, "description", nso_value="uplink")
 
-        with patch(f"{_MOD}.put_intent") as mock_put:
-            with self.captureOnCommitCallbacks(execute=True):
-                _invoke_push_intent_on_accept(state)
+        _invoke_push_intent_on_accept(state)
 
-        mock_put.assert_not_called()
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface").exists())
 
     def test_skips_unknown_attribute(self):
         """An owned row outside the wire schema schedules no interface behavior."""
