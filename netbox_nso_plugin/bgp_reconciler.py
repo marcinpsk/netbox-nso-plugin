@@ -230,6 +230,11 @@ def _parse_ip_address(value):
     return ipaddress.ip_address(value)
 
 
+def canonical_bgp_peer_identity(asn, vrf, peer_address):
+    """Return the canonical persisted identity for one BGP peer state."""
+    return str(_parse_asn(asn)), vrf, ipaddress.ip_interface(peer_address).ip.compressed
+
+
 def _canonical_source_ip(value):
     """Return a canonical source IP, or None when the value is an interface name."""
     try:
@@ -249,11 +254,7 @@ def _indexed_peer_states(rows):
     raw_keys = {}
     for row in rows:
         try:
-            canonical_key = (
-                str(_parse_asn(row.asn_str)),
-                row.vrf_name,
-                _parse_ip_address(row.peer_address_str).compressed,
-            )
+            canonical_key = canonical_bgp_peer_identity(row.asn_str, row.vrf_name, row.peer_address_str)
         except ValueError:
             logger.warning("BGP: peer state %s has an unparseable identity; quarantined", row.pk)
             invalid.append(row)
@@ -884,9 +885,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 return global_source, None
             logger.warning("BGP: device source IP address %r is unresolvable in the scope VRF", value)
             return None, None
-        if current_peer is not None and current_peer.source is not None:
-            if str(current_peer.source.address.ip) == address:
-                return current_peer.source, None
+        if (
+            current_peer is not None
+            and current_peer.source is not None
+            and str(current_peer.source.address.ip) == address
+        ):
+            return current_peer.source, None
         return self.peer_ip(value, vrf), None
 
     def router(self, asn, router_id):

@@ -118,14 +118,13 @@ def _set_active(active: bool) -> bool:
     acquired = False
     try:
         try:
-            with transaction.atomic():
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT set_config('lock_timeout', %s, true)",
-                        [f"{_EXCLUSIVE_LOCK_TIMEOUT_MS}ms"],
-                    )
-                    cursor.execute("SELECT pg_advisory_lock(%s)", [_LOCK_KEY])
-                    acquired = True
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    [f"{_EXCLUSIVE_LOCK_TIMEOUT_MS}ms"],
+                )
+                cursor.execute("SELECT pg_advisory_lock(%s)", [_LOCK_KEY])
+                acquired = True
         except OperationalError as exc:
             if getattr(exc.__cause__, "sqlstate", None) == "55P03":
                 raise DeploymentTransitionTimeout("Timed out waiting for active intent operations to finish") from None

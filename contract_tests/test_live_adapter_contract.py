@@ -10,7 +10,7 @@ after starting an isolated adapter and PostgreSQL store.
 import json
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -176,10 +176,8 @@ def _devices(client, count):
         yield [row["id"] for row in made]
     finally:
         for row in made:
-            try:
+            with suppress(client.AdapterError):
                 client.delete_device(row["id"])
-            except client.AdapterError:  # best effort — the store is disposable
-                pass
 
 
 def _settle(client, device_id, *, previously=0):

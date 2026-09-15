@@ -533,13 +533,12 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             should_fill and (not has_materialized_owner or created_root or not self._root_has_entries(family, root))
         )
         changed_fields = []
-        if family == "prefix_list" and fill and captured.get("family") in (4, 6):
-            if root.family != captured["family"]:
-                root = copy.copy(root)
-                root.family = captured["family"]
-                self.roots[family][name.casefold()] = root
-                self.name_maps[family][name] = root
-                changed_fields.append("family")
+        if family == "prefix_list" and fill and captured.get("family") in (4, 6) and root.family != captured["family"]:
+            root = copy.copy(root)
+            root.family = captured["family"]
+            self.roots[family][name.casefold()] = root
+            self.name_maps[family][name] = root
+            changed_fields.append("family")
         if family == "community_list" and fill:
             invert_match = bool(captured.get("invert_match", False))
             if root.invert_match != invert_match:

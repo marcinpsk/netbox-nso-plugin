@@ -35,6 +35,7 @@ from ._outbox_case import (
     in_thread,
     make_managed,
     mirror_update,
+    open_provision_attempt,
     without_commit_drain,
 )
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -51,8 +52,16 @@ def _make_fixtures():
     site = Site.objects.create(name="ViewSiteNSO", slug="viewsitenso")
     device = Device.objects.create(name="view-router-01", device_type=device_type, role=role, site=site)
     nso_instance = NSOInstance.objects.create(name="view-nso", adapter_instance_id="view-nso-id")
+    # `managed_attributes` is the native anchor the interface binding reads: with the flag
+    # unset the row manages no attribute, so an accepted NSOInterfaceState owns nothing the
+    # device carries and the ownership audit demotes it. Only `description` is enabled here,
+    # because a managed attribute with no overlay is adopted as a fresh accepted overlay and
+    # would put a second attribute into every interface push.
     mgmt = NSODeviceManagement.objects.create(
-        device=device, nso_instance=nso_instance, nso_device_name="view-router-01"
+        device=device,
+        nso_instance=nso_instance,
+        nso_device_name="view-router-01",
+        manage_description=True,
     )
     interface = Interface.objects.create(device=device, name="Loopback0", type="virtual")
     iface_state = NSOInterfaceState.objects.create(
@@ -263,31 +272,31 @@ class TestOnboardingDashboardView(ViewTestBase):
 
 
 class TestOnboardStatusView(ViewTestBase):
-    """Async-onboarding status-advance endpoint (polled by the dashboard while a row provisions).
+    """Provision-tombstone sweep endpoint polled by the dashboard.
 
-    Drives the real view through its URL: it polls the adapter job (mocked at the HTTP-boundary
-    client) and advances the NSODeviceManagement row. The success path proves the gated
-    adapter-push signal *re-fires* once the row flips to ready.
+    The success path proves the gated adapter-push signal re-fires after the sole completion
+    owner advances the management row.
     """
 
     def _provisioning_mgmt(self, name, job_id="99"):
         dev = Device.objects.create(
             name=name, device_type=self.device.device_type, role=self.device.role, site=self.device.site
         )
-        # Created in 'provisioning' → the post_save signal is gated (no adapter call here).
-        return NSODeviceManagement.objects.create(
+        mgmt = NSODeviceManagement.objects.create(
             device=dev,
             nso_instance=self.nso_instance,
             nso_device_name=name,
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
+        open_provision_attempt(mgmt)
+        return mgmt
 
     def _post_status(self, mgmt):
         return self.client.post(reverse("plugins:netbox_nso_plugin:onboard_status", args=[mgmt.pk]))
 
-    @patch("netbox_nso_plugin.adapter_client.get_job", return_value={"status": "running"})
-    def test_running_job_stays_provisioning(self, _job):
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value={"status": "running"})
+    def test_running_job_stays_provisioning(self, _attempt):
         mgmt = self._provisioning_mgmt("prov-running")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.status_code, 200)
@@ -299,13 +308,13 @@ class TestOnboardStatusView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client.set_scope")
     @patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 321})
     @patch(
-        "netbox_nso_plugin.adapter_client.get_job",
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
         return_value={
             "status": "succeeded",
             "result": {"ok": True, "steps": [{"step": "create", "status": "ok"}], "device_id": None},
         },
     )
-    def test_succeeded_job_flips_ready_and_fires_signal(self, _job, onboard, _scope, _notify):
+    def test_succeeded_job_flips_ready_and_fires_signal(self, _attempt, onboard, _scope, _notify):
         mgmt = self._provisioning_mgmt("prov-ok")
         # The mapping push is deferred to transaction.on_commit; TestCase never commits.
         with self.captureOnCommitCallbacks(execute=True):
@@ -318,7 +327,7 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(mgmt.adapter_device_id, 321)
 
     @patch(
-        "netbox_nso_plugin.adapter_client.get_job",
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
         return_value={
             "status": "succeeded",
             "result": {
@@ -327,7 +336,7 @@ class TestOnboardStatusView(ViewTestBase):
             },
         },
     )
-    def test_succeeded_but_failed_step_marks_provision_failed(self, _job):
+    def test_succeeded_but_failed_step_marks_provision_failed(self, _attempt):
         mgmt = self._provisioning_mgmt("prov-stepfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
@@ -338,10 +347,10 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(mgmt.onboard_error, "Provisioning failed. See the server log.")
 
     @patch(
-        "netbox_nso_plugin.adapter_client.get_job",
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
         return_value={"status": "failed", "error": {"message": "Provision exceeded 600s timeout"}},
     )
-    def test_failed_job_marks_provision_failed(self, _job):
+    def test_failed_job_marks_provision_failed(self, _attempt):
         mgmt = self._provisioning_mgmt("prov-jobfail")
         resp = self._post_status(mgmt)
         self.assertEqual(resp.json()["status"], "provision_failed")
@@ -361,16 +370,43 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertEqual(resp.json()["status"], "provision_failed")
         self.assertEqual(resp.json()["error"], "earlier failure")
 
-    def test_missing_job_id_marks_failed(self):
-        """A provisioning row with no job id can never advance → provision_failed."""
-        mgmt = self._provisioning_mgmt("prov-nojob", job_id="")
-        resp = self._post_status(mgmt)  # no get_job patch — never reached
-        self.assertEqual(resp.json()["status"], "provision_failed")
-        mgmt.refresh_from_db()
-        self.assertEqual(mgmt.onboard_status, "provision_failed")
+    @patch(
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
+        return_value={"status": "running", "job_id": "99"},
+    )
+    def test_missing_job_receipt_adopts_the_admitted_job_and_stays_open(self, _attempt):
+        """An attempt with no admitted job receipt records the adapter's job id."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
 
-    @patch("netbox_nso_plugin.adapter_client.get_job", side_effect=AdapterError("adapter down"))
-    def test_transient_adapter_error_keeps_provisioning(self, _job):
+        mgmt = self._provisioning_mgmt("prov-nojob", job_id="")
+        resp = self._post_status(mgmt)
+        self.assertEqual(resp.json()["status"], "provisioning")
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "provisioning")
+        tombstone = NSOProvisionTombstone.objects.get(netbox_device_id=mgmt.device_id)
+        self.assertEqual(tombstone.adapter_job_id, "99")
+        self.assertEqual(tombstone.state, "open")
+
+    @patch(
+        "netbox_nso_plugin.adapter_client.get_provision_attempt",
+        return_value={"status": "running", "job_id": "99"},
+    )
+    def test_conflicting_job_receipt_stays_retryable(self, _attempt):
+        """A conflicting adapter receipt is a retryable invalid response, not a server error."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        mgmt = self._provisioning_mgmt("prov-job-conflict", job_id="71")
+        resp = self._post_status(mgmt)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "provisioning")
+        self.assertIn("poll_error", resp.json())
+        tombstone = NSOProvisionTombstone.objects.get(netbox_device_id=mgmt.device_id)
+        self.assertEqual(tombstone.adapter_job_id, "71")
+        self.assertEqual(tombstone.state, "open")
+
+    @patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=AdapterError("adapter down"))
+    def test_transient_adapter_error_keeps_provisioning(self, _attempt):
         """A transient adapter error while polling keeps the row provisioning (client retries)."""
         mgmt = self._provisioning_mgmt("prov-blip")
         resp = self._post_status(mgmt)
@@ -379,6 +415,19 @@ class TestOnboardStatusView(ViewTestBase):
         self.assertIn("poll_error", resp.json())
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.onboard_status, "provisioning")
+
+    def test_a_row_with_no_attempt_is_marked_failed(self):
+        """A provisioning row with no open attempt reaches a terminal verdict."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        mgmt = self._provisioning_mgmt("prov-untracked")
+        NSOProvisionTombstone.objects.filter(netbox_device_id=mgmt.device_id).delete()
+
+        resp = self._post_status(mgmt)  # No attempt patch means that the poll is never reached.
+
+        self.assertEqual(resp.json()["status"], "provision_failed")
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "provision_failed")
 
 
 class TestFailoverSettingsDeploymentWarning(ViewTestBase):
@@ -3539,6 +3588,46 @@ class TestDeviceNSOTabView(ViewTestBase):
     def test_vlan_refresh_rejects_non_object_document(self):
         self._assert_invalid_vlan_refresh_preserves_state(["bad"])
 
+    def test_switchport_refresh_rejects_integer_container(self):
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOSwitchportState
+
+        from .test_read_gate import _rs
+
+        mirror_update(self.mgmt, adapter_device_id=10)
+        NSOSwitchportState.objects.create(
+            management=self.mgmt, interface=self.interface, mode="access", status="imported"
+        )
+        states = NSOSwitchportState.objects.filter(management=self.mgmt).order_by("pk")
+        revisions = NSOIntentRevision.objects.filter(device=self.device).order_by("pk")
+        original_states = list(states.values())
+        original_revisions = list(revisions.values())
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "switchport"}
+        )
+        session = make_session()
+        session.request.side_effect = [
+            make_response(json_data={"vlans": []}),
+            make_response(json_data={"interfaces": 7, "read_state": _rs()}),
+        ]
+        config = {
+            "url": "http://adapter.example",
+            "token": "test-token",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=config),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            response = self.client.get(url, {"refresh": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(states.values()), original_states)
+        self.assertEqual(list(revisions.values()), original_revisions)
+        self.assertContains(response, "The NSO adapter returned an invalid response.")
+        self.assertTrue(any(call.args[1].endswith("/10/switchport") for call in session.request.call_args_list))
+
     def test_vlan_category_renders_compact_inline_name_editor(self):
         from ipam.models import VLAN, VLANGroup
 
@@ -4026,7 +4115,10 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         )
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 21
-        mgmt.save(update_fields=["adapter_device_id"])
+        # This case owns the `enabled` attribute, so its anchor is enabled here rather than
+        # in the shared fixture, where it would adopt one on every interface.
+        mgmt.manage_enabled = True
+        mgmt.save(update_fields=["adapter_device_id", "manage_enabled"])
         self.addCleanup(mirror_update, mgmt, adapter_device_id=None)
 
         mock_cfg.return_value = {
@@ -4595,6 +4687,44 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.l2_mtu, 9100)
         self.assertEqual(row.status, "accepted")
+
+    def test_edit_mtu_returns_conflict_after_two_stale_plans(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        with patch(
+            "netbox_nso_plugin.views._write_owned_interface_mtu",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ) as write_mtu:
+            response = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "9100"})
+
+        self.assertEqual(write_mtu.call_count, 2)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json(),
+            {"status": "error", "message": "Routing state changed. Refresh the page and try again."},
+        )
+
+    def test_accept_mtu_redirects_after_two_stale_plans(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.renderer_writer import IntentPlanStaleError
+
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        url = reverse("plugins:netbox_nso_plugin:interface_mtu_accept", args=[row.pk])
+        with patch(
+            "netbox_nso_plugin.views._write_owned_interface_mtu",
+            side_effect=IntentPlanStaleError("changed after planning"),
+        ) as write_mtu:
+            response = self.client.post(url, follow=True)
+
+        self.assertEqual(write_mtu.call_count, 2)
+        self.assertEqual(response.redirect_chain[0][1], 302)
+        self.assertContains(response, "Routing state changed. Refresh the page and try again.")
 
     def test_edit_bfd_updates_overlay_and_native_profile(self):
         from netbox_routing.models import BFDInterface, BFDProfile
@@ -6000,8 +6130,10 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
     """A write committed between planning and execution must refuse the inline edit.
 
     The converted SVI/LACP/VLAN save paths execute a frozen renderer plan, so a competing
-    lifecycle write moves a preimage and the writer raises IntentPlanStaleError. The
-    endpoint must answer with its field-error JSON instead of a 500, and write nothing.
+    lifecycle write moves a preimage and the writer raises IntentPlanStaleError. These
+    families do not replan, so the endpoint answers the conflict response it gives after an
+    exhausted replan ("fix(protocol): resolve current integration review findings") instead
+    of a 500, and writes nothing.
     """
 
     def _url(self, key, pk):
@@ -6024,11 +6156,12 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
 
         return patch.object(RendererMutationPlan, "build", build)
 
-    def _assert_refused(self, response, field):
-        self.assertEqual(response.status_code, 400, response.content)
-        body = response.json()
-        self.assertEqual(body["status"], "error")
-        self.assertIn(field, body["errors"])
+    def _assert_refused(self, response):
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(
+            response.json(),
+            {"status": "error", "message": "Routing state changed. Refresh the page and try again."},
+        )
 
     def test_svi_edit_refuses_a_plan_staled_after_planning(self):
         from netbox_nso_plugin.models import NSOSVIState
@@ -6044,7 +6177,7 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         with self._race_after_planning(competing):
             response = self.client.post(self._url("svi", state.pk), {"vrf": "BLUE"})
 
-        self._assert_refused(response, "vrf")
+        self._assert_refused(response)
         state.refresh_from_db()
         self.assertEqual(state.vrf, "")
         self.assertEqual(state.status, "imported")
@@ -6069,7 +6202,7 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         with self._race_after_planning(competing):
             response = self.client.post(self._url("lacp_bundle", bundle.pk), {"min_links": "2"})
 
-        self._assert_refused(response, "min_links")
+        self._assert_refused(response)
         bundle.refresh_from_db()
         member.refresh_from_db()
         self.assertEqual(bundle.min_links, 1)
@@ -6092,7 +6225,7 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         with self._race_after_planning(competing):
             response = self.client.post(self._url("vlan_name", state.pk), {"name": "RENAMED-841"})
 
-        self._assert_refused(response, "name")
+        self._assert_refused(response)
         vlan.refresh_from_db()
         state.refresh_from_db()
         self.assertEqual(vlan.name, "VLAN-841")  # the native rename rolled back
