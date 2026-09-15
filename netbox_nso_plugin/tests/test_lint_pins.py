@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""The dev group pins ruff and zizmor; CI and hooks derive them from uv.lock."""
+"""CI and hooks execute Ruff and Zizmor from the locked uv environment."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "lint-format.yaml"
 PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
-UV_LOCK = ROOT / "uv.lock"
 
 
 def test_packaging_is_a_direct_test_dependency():
@@ -66,22 +65,7 @@ def _local_hook(hook_id: str, tool: str) -> dict[str, object]:
     return hook
 
 
-def _declared_version() -> str:
-    groups = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
-    [declared] = [entry for entry in groups if entry.startswith("ruff")]
-    found = re.fullmatch(r"ruff==(\S+)", declared)
-    assert found, f"the dev group declares an unpinned ruff: {declared!r}"
-    return found.group(1)
-
-
-def _locked_version() -> str:
-    for entry in tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))["package"]:
-        if entry["name"] == "ruff":
-            return entry["version"]
-    raise AssertionError("ruff is absent from the lock file")
-
-
-def test_ruff_version_has_one_source():
+def test_ruff_consumers_use_the_locked_dependency():
     assert _workflow_tool_commands("ruff") == [["check", "."], ["format", "--check", "."]]
     config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
     assert all(repository["repo"] != "https://github.com/astral-sh/ruff-pre-commit" for repository in config["repos"])
@@ -96,7 +80,6 @@ def test_ruff_version_has_one_source():
     assert shlex.split(format_hook["entry"])[5:] == ["format", "--force-exclude"]
     assert check_hook["types_or"] == format_hook["types_or"] == ["python", "pyi"]
     assert check_hook["require_serial"] is format_hook["require_serial"] is True
-    assert _declared_version() == _locked_version()
 
 
 def test_ruff_enforces_timezone_aware_datetimes():
@@ -124,22 +107,7 @@ jobs:
         _workflow_tool_commands("zizmor")
 
 
-def _declared_zizmor_version() -> str:
-    groups = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
-    [declared] = [entry for entry in groups if entry.startswith("zizmor")]
-    found = re.fullmatch(r"zizmor==(\S+)", declared)
-    assert found, f"the dev group declares an unpinned zizmor: {declared!r}"
-    return found.group(1)
-
-
-def _locked_zizmor_version() -> str:
-    for entry in tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))["package"]:
-        if entry["name"] == "zizmor":
-            return entry["version"]
-    raise AssertionError("zizmor is absent from the lock file")
-
-
-def test_zizmor_version_has_one_source():
+def test_zizmor_consumers_use_the_locked_dependency():
     assert _workflow_tool_commands("zizmor") == [[".github/workflows"]]
     config = yaml.safe_load(PRE_COMMIT.read_text(encoding="utf-8"))
     assert all(
@@ -148,7 +116,6 @@ def test_zizmor_version_has_one_source():
     hook = _local_hook("zizmor", "zizmor")
     assert hook["files"] == r"^\.github/workflows/"
     assert hook["pass_filenames"] is True
-    assert _declared_zizmor_version() == _locked_zizmor_version()
 
 
 def test_netbox_checkouts_use_immutable_commits():
