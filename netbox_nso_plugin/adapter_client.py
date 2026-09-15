@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import requests
 from django.conf import settings
 
+from .vault_refs import is_secret_fingerprint
+
 logger = logging.getLogger(__name__)
 
 # When set, every adapter request carries ``?store_only=true``: the adapter updates its
@@ -1346,8 +1348,7 @@ def set_secret(vault_ref, values):
 
     ``vault_ref`` "mount/path" (multi-field) or "mount/path#key" (that field);
     ``values`` {field: plaintext}. The plaintext transits this one call and is
-    never persisted plugin-side. Returns {"vault_ref", "version", "hashes"}
-    where hashes are sha256[:16] fingerprints per field.
+    never persisted plugin-side. Returns {"operation_id", "version"}.
     """
     return _request("POST", "/api/v1/secrets", json={"vault_ref": vault_ref, "values": values})
 
@@ -1355,16 +1356,51 @@ def set_secret(vault_ref, values):
 def verify_secret(vault_ref):
     """POST /api/v1/secrets/verify — resolve a ref without exposing values.
 
-    Returns {"vault_ref", "exists", "fields", "hashes", "version"}.
+    Returns the fixed status, fingerprint, role-presence, and version projection.
     """
-    return _request("POST", "/api/v1/secrets/verify", json={"vault_ref": vault_ref})
+    result = _request("POST", "/api/v1/secrets/verify", json={"vault_ref": vault_ref})
+    return _validated_secret_verification(result, keyed="#" in vault_ref)
+
+
+_SECRET_VERIFY_KEYS = frozenset({"operation_id", "status", "fingerprint", "has_auth", "has_priv", "version"})
+
+
+def _validated_secret_verification(result, *, keyed):
+    """Return one complete fixed verification result or refuse the adapter response."""
+    malformed = not isinstance(result, dict) or set(result) != _SECRET_VERIFY_KEYS
+    if not malformed:
+        status = result["status"]
+        fingerprint = result["fingerprint"]
+        has_auth = result["has_auth"]
+        has_priv = result["has_priv"]
+        version = result["version"]
+        malformed = (
+            not isinstance(result["operation_id"], str)
+            or not isinstance(status, str)
+            or status not in {"present", "missing_path", "missing_field"}
+            or (fingerprint is not None and not is_secret_fingerprint(fingerprint))
+            or type(has_auth) is not bool
+            or type(has_priv) is not bool
+            or (version is not None and (type(version) is not int or version < 1))
+        )
+        if status == "present":
+            malformed = malformed or (
+                (keyed and (fingerprint is None or has_auth or has_priv)) or (not keyed and fingerprint is not None)
+            )
+        elif status == "missing_field":
+            malformed = malformed or not keyed or fingerprint is not None or has_auth or has_priv
+        elif status == "missing_path":
+            malformed = malformed or fingerprint is not None or has_auth or has_priv or version is not None
+    if malformed:
+        raise AdapterError("Adapter returned a malformed secret verification.", code="invalid_response")
+    return result
 
 
 def harvest_community(adapter_device_id, community_hash, vault_ref):
     """POST /api/v1/devices/{id}/secrets/harvest-community.
 
     Adopt a device-held community string into Vault by its read-mirror
-    fingerprint. Returns {"vault_ref", "secret_hash", "version", "access", "acl"}.
+    fingerprint. Returns {"operation_id", "secret_hash", "version", "access", "acl"}.
     """
     return _request(
         "POST",

@@ -7232,7 +7232,7 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
 
     Sets ``vault_secret_hash``/``vault_secret_version`` so the badge can state
     whether the Vault-held secret matches what the device reports. Values never
-    leave the adapter — only sha256[:16] fingerprints travel.
+    leave the adapter. Only a sha256[:16] fingerprint travels.
     """
 
     def post(self, request, pk):  # noqa: D102
@@ -7242,10 +7242,10 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         state = get_object_or_404(NSOSnmpCommunityState, pk=pk)
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
-            messages.error(request, "No Vault ref on this community — set one (or a secret value) first.")
+            messages.error(request, "No Vault ref on this community. Set one (or a secret value) first.")
             return redirect(redirect_url)
         try:
-            key = parse_vault_ref(state.vault_ref, require_key=True).key
+            parse_vault_ref(state.vault_ref, require_key=True)
         except VaultRefError as exc:
             messages.error(request, f"Bad Vault ref: {exc}")
             return redirect(redirect_url)
@@ -7255,24 +7255,27 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
             messages.error(request, f"Vault verify failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
-        hashes = result.get("hashes") or {}
-        if result.get("exists") and key in hashes:
-            state.vault_secret_hash = hashes[key]
-            state.vault_secret_version = result.get("version")
+        status = result["status"]
+        if status == "present":
+            state.vault_secret_hash = result["fingerprint"]
+            state.vault_secret_version = result["version"]
             _save_exact_overlay_fields(state, ("vault_secret_hash", "vault_secret_version"))
             verdict = (
                 "matches the device value"
                 if state.vault_secret_hash == state.community_hash
                 else "DIFFERS from the device value (apply pending, or the device changed out-of-band)"
             )
-            messages.success(request, f"Vault secret verified (v{result.get('version')}) — {verdict}.")
+            messages.success(request, f"Vault secret verified (v{result['version']}): {verdict}.")
         else:
-            messages.warning(request, f"Vault has no {key!r} field at {state.vault_ref!r}.")
+            state.vault_secret_hash = ""
+            state.vault_secret_version = None
+            _save_exact_overlay_fields(state, ("vault_secret_hash", "vault_secret_version"))
+            messages.warning(request, "Vault does not hold the referenced secret.")
         return redirect(redirect_url)
 
 
 class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
-    """Resolve the v3 user's Vault path and record which fields (auth/priv) exist."""
+    """Resolve the v3 user's Vault path and record its fixed auth and priv flags."""
 
     def post(self, request, pk):  # noqa: D102
         from . import adapter_client
@@ -7280,7 +7283,7 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         state = get_object_or_404(NSOSnmpV3UserState, pk=pk)
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
-            messages.error(request, "No Vault ref on this v3 user — set one (or secret values) first.")
+            messages.error(request, "No Vault ref on this v3 user. Set one (or secret values) first.")
             return redirect(redirect_url)
         try:
             result = adapter_client.verify_secret(state.vault_ref)
@@ -7288,14 +7291,15 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
             messages.error(request, f"Vault verify failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
-        fields = set(result.get("fields") or [])
-        state.vault_has_auth = "auth" in fields
-        state.vault_has_priv = "priv" in fields
+        status = result["status"]
+        state.vault_has_auth = result["has_auth"] if status == "present" else False
+        state.vault_has_priv = result["has_priv"] if status == "present" else False
         _save_exact_overlay_fields(state, ("vault_has_auth", "vault_has_priv"))
+        fields = [name for name, present in (("auth", state.vault_has_auth), ("priv", state.vault_has_priv)) if present]
         if fields:
-            messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
+            messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result['version']}).")
         else:
-            messages.warning(request, f"Vault has no secret at {state.vault_ref!r}.")
+            messages.warning(request, "Vault does not hold auth or priv secrets for this user.")
         return redirect(redirect_url)
 
 

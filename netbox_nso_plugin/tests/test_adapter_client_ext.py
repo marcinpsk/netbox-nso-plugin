@@ -465,6 +465,59 @@ _JOB_OUT = {
 }
 
 
+_SECRET_VERIFY_OUT = {
+    "operation_id": "placeholder-operation",
+    "status": "present",
+    "fingerprint": "0123456789abcdef",
+    "has_auth": False,
+    "has_priv": False,
+    "version": 4,
+}
+
+
+class TestSecretVerifyBoundaryValidation(unittest.TestCase):
+    """Secret verification is checked once before a view can persist its result."""
+
+    def test_valid_keyed_and_unkeyed_results_are_accepted_unchanged(self):
+        from netbox_nso_plugin.adapter_client import verify_secret
+
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=_SECRET_VERIFY_OUT):
+            self.assertEqual(verify_secret("network/path#community"), _SECRET_VERIFY_OUT)
+
+        unkeyed = {**_SECRET_VERIFY_OUT, "fingerprint": None, "has_auth": True}
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=unkeyed):
+            self.assertEqual(verify_secret("network/path"), unkeyed)
+
+    def test_results_outside_the_fixed_contract_are_refused(self):
+        from netbox_nso_plugin.adapter_client import AdapterError, verify_secret
+
+        invalid_results = (
+            ["not-an-object"],
+            {key: value for key, value in _SECRET_VERIFY_OUT.items() if key != "operation_id"},
+            {**_SECRET_VERIFY_OUT, "extra": "unexpected"},
+            {**_SECRET_VERIFY_OUT, "operation_id": None},
+            {**_SECRET_VERIFY_OUT, "status": "unknown"},
+            {**_SECRET_VERIFY_OUT, "status": []},
+            {**_SECRET_VERIFY_OUT, "fingerprint": "not-a-fingerprint"},
+            {**_SECRET_VERIFY_OUT, "has_auth": 1},
+            {**_SECRET_VERIFY_OUT, "has_priv": "false"},
+            {**_SECRET_VERIFY_OUT, "version": "4"},
+            {**_SECRET_VERIFY_OUT, "fingerprint": None},
+            {**_SECRET_VERIFY_OUT, "has_auth": True},
+            {**_SECRET_VERIFY_OUT, "status": "missing_path", "fingerprint": None, "version": 4},
+            {**_SECRET_VERIFY_OUT, "status": "missing_field", "fingerprint": None},
+        )
+
+        for result in invalid_results:
+            with self.subTest(result=result):
+                status = result.get("status") if isinstance(result, dict) else None
+                reference = "network/path" if status == "missing_field" else "network/path#community"
+                with patch("netbox_nso_plugin.adapter_client._request", return_value=result):
+                    with self.assertRaises(AdapterError) as raised:
+                        verify_secret(reference)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+
 def _job_with_scalar(member):
     """A JobOut-shaped job whose *member* carries a scalar the model cannot emit."""
     return {**_JOB_OUT, member: "boom"}
