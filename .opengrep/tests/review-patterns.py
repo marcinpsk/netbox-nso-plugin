@@ -175,3 +175,10 @@ def visible_adapter_duplicates(payload, normalized, entries, states):
         if key in seen:
             continue
         state.mark_stale()
+
+
+def wire_signals(handler, sender):
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    pre_save.connect(handler, sender=sender)
+    # ok: nso-signal-connect-without-dispatch-uid
+    post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
