@@ -943,7 +943,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             )
         return current
 
-    def template(self, name, remote_as):
+    def template(self, name, remote_as, *, allow_existing_update=True):
         if not name:
             return None
         current = self.templates.get(name)
@@ -951,7 +951,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if created:
             current = self.BGPPeerTemplate(name=name, remote_as=remote_as)
             self.templates[name] = current
-        elif remote_as is not None and _bgp_fk_identity(current.remote_as) != _bgp_fk_identity(remote_as):
+        elif (
+            allow_existing_update
+            and remote_as is not None
+            and _bgp_fk_identity(current.remote_as) != _bgp_fk_identity(remote_as)
+        ):
             if name not in self.template_saved:
                 current = copy.copy(current)
             # An already-saved template is mutated in place: build() freezes values after
@@ -1036,7 +1040,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         current_peer = self.peers.get(peer_key)
         remote_as = self.asn(entry.get("remote_as")) if entry.get("remote_as") not in (None, "") else None
         local_as = self.asn(entry.get("local_as")) if entry.get("local_as") not in (None, "") else None
-        peer_group = self.template(entry.get("peer_group") or "", remote_as)
+        peer_group = self.template(entry.get("peer_group") or "", remote_as, allow_existing_update=False)
         source, update_source = self.source(entry.get("source"), scope.vrf, current_peer)
         desired = _peer_desired(entry, remote_as, local_as, peer_group, source, update_source)
         af_entries = entry["address_families"]
@@ -1131,7 +1135,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
         name = entry["name"]
         remote_as = self.asn(entry.get("remote_as")) if entry.get("remote_as") not in (None, "") else None
-        template = self.template(name, remote_as)
+        template = self.template(name, remote_as, allow_existing_update=False)
         current_state = self.template_states.get(name)
         state_created = current_state is None
         state = (
@@ -1177,6 +1181,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         else:
             conflict = True
         if mirror:
+            template = self.template(name, remote_as)
             self.plan_address_family_rows(template, af_entries, scope)
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         self.template_states[name] = state
