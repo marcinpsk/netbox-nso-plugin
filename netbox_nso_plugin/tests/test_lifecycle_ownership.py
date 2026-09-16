@@ -13,19 +13,23 @@ Runs against the full NetBox stack (devcontainer).
 
 from __future__ import annotations
 
-import copy
+from unittest.mock import patch
 
+from core.models import ObjectType
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.contrib.auth import get_user_model
 from django.test import TestCase
-from django.utils import timezone
+from django.urls import reverse
+from users.models import ObjectPermission
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 from netbox_nso_plugin.summary import interface_row_state
 
 from ._outbox_case import mirror_update
+from .mixins import IntentPushDeliveryMixin
 
 
-class TestInterfaceOwnershipLifecycle(TestCase):
+class TestInterfaceOwnershipLifecycle(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LcMfg", slug="lcmfg")
@@ -46,6 +50,7 @@ class TestInterfaceOwnershipLifecycle(TestCase):
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def setUp(self):
+        super().setUp()
         # Fresh interface + imported state per test (matching device value).
         self.iface = Interface.objects.create(
             device=self.device, name="ge-0/0/0", type="1000base-t", description="dev-desc", enabled=True
@@ -53,6 +58,11 @@ class TestInterfaceOwnershipLifecycle(TestCase):
         self.state = NSOInterfaceState.objects.create(
             interface=self.iface, attribute="description", status="imported", nso_value="dev-desc"
         )
+        user = get_user_model().objects.create_user(username="lifecycle-operator")
+        permission = ObjectPermission.objects.create(name="lifecycle-change-management", actions=["change"])
+        permission.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
+        permission.users.add(user)
+        self.client.force_login(user)
 
     def _classify(self, attribute="description"):
         """Return interface_row_state for an attribute after refreshing from DB."""
@@ -61,30 +71,23 @@ class TestInterfaceOwnershipLifecycle(TestCase):
         return interface_row_state(st, self.iface)
 
     def _operator_edit(self, **fields):
-        """Edit and acquire one interface attribute through an exact writer."""
-        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
-        from netbox_nso_plugin.summary import matches_device_value
-
+        """Edit and acquire one interface attribute through the operator view."""
         self.assertEqual(len(fields), 1)
         attribute, value = next(iter(fields.items()))
         state = NSOInterfaceState.objects.get(interface=self.iface, attribute=attribute)
-        interface_candidate = copy.copy(self.iface)
-        setattr(interface_candidate, attribute, value)
-        state_candidate = copy.copy(state)
-        state_candidate.status = "in_sync" if matches_device_value(attribute, value, state.nso_value) else "accepted"
-        if state_candidate.accepted_at is None:
-            state_candidate.accepted_at = timezone.now()
-        state_fields = ("status", "accepted_at")
-        plan = RendererMutationPlan.build(
-            saves=(
-                planned_save(interface_candidate, update_fields=(attribute,)),
-                planned_save(state_candidate, update_fields=state_fields),
-            )
-        )
-        with self.captureOnCommitCallbacks(execute=True), renderer_writes(plan) as writer:
-            writer.save(interface_candidate, update_fields=(attribute,))
-            writer.save(state_candidate, update_fields=state_fields)
-        self.iface = interface_candidate
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[state.pk])
+        raw_value = str(value).lower() if isinstance(value, bool) else value
+        with patch("netbox_nso_plugin.adapter_client.put_intent"):
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(
+                    url,
+                    {"value": raw_value},
+                    HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+                )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+        self.iface.refresh_from_db()
+        state.refresh_from_db()
 
     def _adapter_writes(self, attribute="description", **fields):
         """Simulate an adapter sync writing state (never touches accepted_at)."""
