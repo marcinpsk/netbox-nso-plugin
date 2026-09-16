@@ -27,6 +27,26 @@ def _calls(functions):
     ]
 
 
+def _call_sites(module_path, tree, names):
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    functions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            qualified_name = [node.name]
+            parent = parents.get(node)
+            while parent is not None:
+                if isinstance(parent, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                    qualified_name.append(parent.name)
+                parent = parents.get(parent)
+            functions.setdefault(".".join(reversed(qualified_name)), []).append(node)
+    return {
+        (module_path, function_name, call)
+        for function_name, function in functions.items()
+        for call in _calls(function)
+        if call in names
+    }
+
+
 def _reachable_calls(functions, entry):
     """Every call *entry* reaches through its own module's helpers.
 
@@ -90,6 +110,40 @@ class TestStructureScanHelpers(SimpleTestCase):
 
         self.assertIn("dlv.render", _render_names(path))
 
+    def test_call_sites_preserve_enclosing_definition_identity(self):
+        source = """
+def capture():
+    drain.claim()
+    delivery.render()
+
+class First:
+    def capture(self):
+        drain.claim()
+        delivery.render()
+
+class Second:
+    def capture(self):
+        drain.claim()
+        delivery.render()
+"""
+        names = {"drain.claim", "delivery.render"}
+        allowed = {
+            ("sample.py", "First.capture", "drain.claim"),
+            ("sample.py", "First.capture", "delivery.render"),
+        }
+
+        offenders = _call_sites("sample.py", ast.parse(source), names) - allowed
+
+        self.assertEqual(
+            offenders,
+            {
+                ("sample.py", "capture", "drain.claim"),
+                ("sample.py", "capture", "delivery.render"),
+                ("sample.py", "Second.capture", "drain.claim"),
+                ("sample.py", "Second.capture", "delivery.render"),
+            },
+        )
+
 
 class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
     def test_public_and_recursive_capture_entry_points_call_the_audit(self):
@@ -107,18 +161,16 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
         for path in sorted(PLUGIN.rglob("*.py")):
             if {"tests", "migrations"} & set(path.relative_to(PLUGIN).parts):
                 continue
-            functions = _functions(path)
-            for function_name, function in functions.items():
-                for call in _calls(function):
-                    if call in {"claim", "drain.claim", "_claim_after_audit"}:
-                        found.add((path.name, function_name, call))
+            module_path = path.relative_to(PLUGIN).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            found |= _call_sites(module_path, tree, {"claim", "drain.claim", "_claim_after_audit"})
 
         self.assertEqual(
             found,
             {
                 ("drain.py", "_claim_or_wait", "_claim_after_audit"),
                 ("drain.py", "claim", "_claim_after_audit"),
-                ("nso_intent_deployment_gate.py", "_verify", "drain.claim"),
+                ("management/commands/nso_intent_deployment_gate.py", "Command._verify", "drain.claim"),
             },
         )
 
@@ -128,10 +180,9 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
             if {"tests", "migrations"} & set(path.relative_to(PLUGIN).parts):
                 continue
             names = _render_names(path)
-            for function_name, function in _functions(path).items():
-                for call in _calls(function):
-                    if call in names:
-                        found.add((path.name, function_name, call))
+            module_path = path.relative_to(PLUGIN).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            found |= _call_sites(module_path, tree, names)
 
         self.assertEqual(
             found,
