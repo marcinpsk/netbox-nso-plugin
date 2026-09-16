@@ -19,20 +19,52 @@ logger = logging.getLogger(__name__)
 
 
 def _validated_interface_items(payload) -> list:
-    """Return interface entries after validating every bound-port value."""
+    """Validate one adapter MTU document before planning any changes."""
+    from django.db import connection
+
     from .adapter_client import AdapterError
     from .models import NSOInterfaceMtuState
 
-    items = payload.get("interfaces", [])
-    maximum_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
+    if not isinstance(payload, dict):
+        raise AdapterError("interface MTU payload must be an object", code="invalid_response")
+    items = payload.get("interfaces")
+    if not isinstance(items, list):
+        raise AdapterError("interface MTU interfaces must be a list", code="invalid_response")
+    model_fields = {
+        "mtu": "l2_mtu",
+        "ip_mtu": "ip_mtu",
+        "mpls_mtu": "mpls_mtu",
+    }
+    value_ranges = {
+        payload_field: connection.ops.integer_field_range(
+            NSOInterfaceMtuState._meta.get_field(model_field).get_internal_type()
+        )
+        for payload_field, model_field in model_fields.items()
+    }
+    bound_port_max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
     for item in items:
+        if not isinstance(item, dict):
+            raise AdapterError("interface MTU payload entry must be an object", code="invalid_response")
+        name = item.get("interface_name")
+        if not isinstance(name, str) or not name:
+            raise AdapterError(
+                "interface MTU payload entry interface_name must be a non-empty string",
+                code="invalid_response",
+            )
+        for field_name, (minimum, maximum) in value_ranges.items():
+            value = item.get(field_name)
+            if value is not None and (type(value) is not int or value < minimum or value > maximum):
+                raise AdapterError(
+                    f"interface MTU payload entry {field_name} must be an integer from {minimum} through {maximum} or null",
+                    code="invalid_response",
+                )
         bound_port = item.get("bound_port")
         if bound_port is not None and not isinstance(bound_port, str):
             raise AdapterError(
                 "interface MTU payload entry bound_port must be a string or null",
                 code="invalid_response",
             )
-        if isinstance(bound_port, str) and len(bound_port) > maximum_length:
+        if isinstance(bound_port, str) and len(bound_port) > bound_port_max_length:
             raise AdapterError(
                 "interface MTU payload entry bound_port is too long",
                 code="invalid_response",

@@ -8,6 +8,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import connection, transaction
 from django.test import TestCase
 from django.utils import timezone
 
@@ -34,6 +35,116 @@ class TestInterfaceMtuReconciler(TestCase):
         )
         cls.po1 = Interface.objects.create(device=cls.device, name="Port-channel1", type="lag")
         cls.lag99 = Interface.objects.create(device=cls.device, name="LAG99:99", type="virtual")
+
+    def _complete_interface_item(self, **updates):
+        item = {
+            "interface_name": self.po1.name,
+            "mtu": 9000,
+            "ip_mtu": 8900,
+            "mpls_mtu": 8800,
+            "bound_port": "lag-1",
+        }
+        item.update(updates)
+        return item
+
+    def _imported_state(self):
+        prior_time = timezone.now() - timedelta(days=1)
+        return NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=1500,
+            ip_mtu=1400,
+            mpls_mtu=1300,
+            bound_port="lag-previous",
+            status="imported",
+            last_sync_at=prior_time,
+            accepted_at=prior_time,
+            last_apply_at=prior_time,
+            last_apply_error="Preserve prior evidence",
+        )
+
+    def _state_snapshot(self, state):
+        state.refresh_from_db()
+        fields = (
+            "l2_mtu",
+            "ip_mtu",
+            "mpls_mtu",
+            "bound_port",
+            "status",
+            "last_sync_at",
+            "accepted_at",
+            "last_apply_at",
+            "last_apply_error",
+        )
+        return tuple(getattr(state, field) for field in fields)
+
+    def _assert_invalid_document_preserves_state(self, payload, state=None):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        state = state or self._imported_state()
+        before = self._state_snapshot(state)
+
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_interface_mtu(self.device, payload)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(self._state_snapshot(state), before)
+
+    def test_string_mtu_rejects_the_entire_document(self):
+        state = self._imported_state()
+        payload = {"interfaces": [self._complete_interface_item(mtu="abc")]}
+
+        self._assert_invalid_document_preserves_state(payload, state)
+
+    def test_negative_mtu_rejects_the_entire_document(self):
+        state = self._imported_state()
+        payload = {"interfaces": [self._complete_interface_item(mtu=-1)]}
+
+        self._assert_invalid_document_preserves_state(payload, state)
+
+    def test_invalid_mtu_values_reject_the_entire_document(self):
+        model_fields = {"mtu": "l2_mtu", "ip_mtu": "ip_mtu", "mpls_mtu": "mpls_mtu"}
+        for payload_field, model_field in model_fields.items():
+            internal_type = NSOInterfaceMtuState._meta.get_field(model_field).get_internal_type()
+            overflow = connection.ops.integer_field_range(internal_type)[1] + 1
+            for label, value in (("boolean", True), ("overflow", overflow)):
+                with self.subTest(field=payload_field, value=label):
+                    with transaction.atomic():
+                        state = self._imported_state()
+                        payload = {"interfaces": [self._complete_interface_item(**{payload_field: value})]}
+                        self._assert_invalid_document_preserves_state(payload, state)
+                        transaction.set_rollback(True)
+
+    def test_invalid_interface_document_shapes_preserve_existing_state(self):
+        missing_name = self._complete_interface_item()
+        missing_name.pop("interface_name")
+        cases = {
+            "non-object payload": [],
+            "missing interfaces": {},
+            "non-list interfaces": {"interfaces": "invalid"},
+            "non-object entry": {"interfaces": [None]},
+            "missing interface name": {"interfaces": [missing_name]},
+            "empty interface name": {"interfaces": [self._complete_interface_item(interface_name="")]},
+            "non-string interface name": {"interfaces": [self._complete_interface_item(interface_name=1)]},
+        }
+        for label, payload in cases.items():
+            with self.subTest(label=label):
+                with transaction.atomic():
+                    state = self._imported_state()
+                    self._assert_invalid_document_preserves_state(payload, state)
+                    transaction.set_rollback(True)
+
+    def test_invalid_unknown_interface_rejects_a_preceding_valid_update(self):
+        state = self._imported_state()
+        payload = {
+            "interfaces": [
+                self._complete_interface_item(mtu=9000),
+                self._complete_interface_item(interface_name="Unknown interface", mtu="abc"),
+            ]
+        }
+
+        self._assert_invalid_document_preserves_state(payload, state)
 
     def test_no_mgmt_returns_empty(self):
         from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
