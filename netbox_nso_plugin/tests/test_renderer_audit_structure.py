@@ -36,7 +36,7 @@ def _call_sites(module_path, tree, names):
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     functions = {"<module>": [tree]}
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
             qualified_name = ["<lambda>" if isinstance(node, ast.Lambda) else node.name]
             parent = parents.get(node)
             while parent is not None:
@@ -160,8 +160,8 @@ def entry():
         self.assertEqual(
             _call_sites("sample.py", ast.parse(source), {"drain.claim", "delivery.render"}),
             {
-                ("sample.py", "entry.Cfg", "drain.claim"),
-                ("sample.py", "entry.Cfg", "delivery.render"),
+                ("sample.py", "entry", "drain.claim"),
+                ("sample.py", "entry", "delivery.render"),
             },
         )
 
