@@ -6473,6 +6473,9 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
         vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf and VRF is not None else None
 
         current_native = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
+        permission = "ipam.change_ipaddress" if current_native is not None else "ipam.add_ipaddress"
+        if not request.user.has_perm(permission):
+            raise PermissionDenied
         native = copy.copy(current_native) if current_native is not None else IPAddress(status="active")
         native.address = state.address
         native.vrf = vrf_obj
