@@ -87,7 +87,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             )
 
         self.assertEqual(raised.exception.code, "invalid_response")
-        self.assertEqual(str(raised.exception), "VLAN payload entry name must be a string or null")
+        self.assertEqual(str(raised.exception), "VLAN payload entry name must be a string")
         self.assertEqual(snapshot(), before)
 
     def test_same_vid_states_do_not_hide_an_unreported_attachment(self):
