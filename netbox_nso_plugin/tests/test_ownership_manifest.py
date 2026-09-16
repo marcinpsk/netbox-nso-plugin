@@ -84,4 +84,7 @@ class TestOwnershipManifestDurability(TestCase):
         with self.assertNumQueries(1):
             ownership_planner.retire_device_manifests(device.pk)
 
-        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, ownership_state="owned").exists())
+        self.assertEqual(
+            sorted(NSOOwnershipManifest.objects.filter(device_id=device.pk).values_list("scope", "ownership_state")),
+            [("interface", "retired"), ("vlan", "retired")],
+        )
