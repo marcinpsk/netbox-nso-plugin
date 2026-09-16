@@ -30,10 +30,11 @@ def _boundary_expressions(node: ast.AST) -> Iterator[ast.AST]:
         yield from node.decorator_list
         yield from node.bases
         yield from (keyword.value for keyword in node.keywords)
+        yield from node.body
 
 
 def scoped_walk(nodes: ast.AST | Iterable[ast.AST]) -> Iterator[ast.AST]:
-    """Yield boundary decorators/defaults/annotations/bases/keywords in the parent scope, but never bodies."""
+    """Yield one scope: function and lambda bodies are boundaries; class bodies run in the enclosing scope and are walked; definition-time expressions of every nested definition are walked."""
     roots = (nodes,) if isinstance(nodes, ast.AST) else tuple(nodes)
     stack = list(reversed(roots))
     while stack:

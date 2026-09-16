@@ -150,6 +150,37 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         called_helper_source = "def push_now():\n    def helper():\n        return _drain_once()\n    return helper()\n"
         assert _function_call_names(called_helper_source)["push_now"] == {"helper"}
 
+    def test_class_body_calls_belong_to_the_enclosing_scope(self):
+        sources = {
+            "class body": (
+                "def push_now():\n    class Config:\n        bypass_claim()\n    return _drain_once()\n",
+                {"bypass_claim", "_drain_once"},
+            ),
+            "method body": (
+                "def push_now():\n"
+                "    class Config:\n"
+                "        def configure(self):\n"
+                "            bypass_claim()\n"
+                "    return _drain_once()\n",
+                {"_drain_once"},
+            ),
+            "nested class body": (
+                "def push_now():\n"
+                "    class Config:\n"
+                "        class Nested:\n"
+                "            bypass_claim()\n"
+                "    return _drain_once()\n",
+                {"bypass_claim", "_drain_once"},
+            ),
+        }
+        for boundary, (source, expected) in sources.items():
+            with self.subTest(boundary=boundary):
+                assert _function_call_names(source)["push_now"] == expected
+
+        class_body_calls = _function_call_names(sources["class body"][0])["push_now"]
+        with self.assertRaisesRegex(AssertionError, "bypass_claim"):
+            assert class_body_calls == {"_drain_once"}, f"extra calls: {class_body_calls - {'_drain_once'}}"
+
     def test_definition_time_calls_belong_to_the_enclosing_scope(self):
         sources = {
             "function default": (
