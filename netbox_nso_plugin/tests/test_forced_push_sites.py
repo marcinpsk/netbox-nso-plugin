@@ -22,6 +22,7 @@ from pathlib import Path
 from django.db import transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
+from ._ast_scope import scoped_walk
 from ._outbox_case import make_managed, own_vlan
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -52,6 +53,16 @@ DEPLOYMENT_VERIFICATION_CLAIM_SITE = (
     "_verify",
     "drain.claim",
 )
+
+
+def _function_call_names(source: str) -> dict[str, set[str]]:
+    """Return direct lexical calls for each top-level function in parsed source."""
+    tree = ast.parse(source)
+    return {
+        function.name: {ast.unparse(node.func) for node in scoped_walk(function.body) if isinstance(node, ast.Call)}
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
 
 
 def _forced_calls() -> collections.Counter:
@@ -113,12 +124,69 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         callees = {site[2] for site in FORCED_PUSH_SITES}
         assert callees == {"drain.push_now", "drain.drain_key"}
         for entry_point in (drain.push_now, drain.drain_key):
-            calls = {
-                ast.unparse(node.func)
-                for node in ast.walk(ast.parse(inspect.getsource(entry_point)))
-                if isinstance(node, ast.Call)
-            }
+            calls = _function_call_names(inspect.getsource(entry_point))[entry_point.__name__]
             assert calls == {"_drain_once"}, f"{entry_point.__name__} bypasses the shared drain: {calls}"
+
+    def test_nested_drain_calls_do_not_certify_the_outer_entry_point(self):
+        nested_sources = {
+            "function": "def push_now():\n    def helper():\n        _drain_once()\n    return None\n",
+            "async function": "def push_now():\n    async def helper():\n        _drain_once()\n    return None\n",
+            "lambda": "def push_now():\n    helper = lambda: _drain_once()\n    return None\n",
+            "class": (
+                "def push_now():\n"
+                "    class Helper:\n"
+                "        def drain(self):\n"
+                "            _drain_once()\n"
+                "    return None\n"
+            ),
+        }
+        for boundary, source in nested_sources.items():
+            with self.subTest(boundary=boundary):
+                assert _function_call_names(source)["push_now"] == set()
+
+        direct_source = "def drain_key():\n    return _drain_once()\n"
+        assert _function_call_names(direct_source)["drain_key"] == {"_drain_once"}
+
+        called_helper_source = "def push_now():\n    def helper():\n        return _drain_once()\n    return helper()\n"
+        assert _function_call_names(called_helper_source)["push_now"] == {"helper"}
+
+    def test_definition_time_calls_belong_to_the_enclosing_scope(self):
+        sources = {
+            "function default": (
+                "def push_now():\n    def unused(value=bypass_claim()):\n        pass\n    return _drain_once()\n",
+                {"bypass_claim", "_drain_once"},
+            ),
+            "function decorator": (
+                "def push_now():\n"
+                "    @forbidden_decorator()\n"
+                "    def unused():\n"
+                "        _drain_once()\n"
+                "    return None\n",
+                {"forbidden_decorator"},
+            ),
+            "lambda default": (
+                "def push_now():\n"
+                "    def unused(callback=lambda value=forbidden_default(): _drain_once()):\n"
+                "        pass\n"
+                "    return None\n",
+                {"forbidden_default"},
+            ),
+            "class base": (
+                "def push_now():\n"
+                "    class Helper(forbidden_base()):\n"
+                "        def drain(self):\n"
+                "            _drain_once()\n"
+                "    return None\n",
+                {"forbidden_base"},
+            ),
+        }
+        for boundary, (source, expected) in sources.items():
+            with self.subTest(boundary=boundary):
+                assert _function_call_names(source)["push_now"] == expected
+
+        default_calls = _function_call_names(sources["function default"][0])["push_now"]
+        with self.assertRaisesRegex(AssertionError, "bypass_claim"):
+            assert default_calls == {"_drain_once"}, f"extra calls: {default_calls - {'_drain_once'}}"
 
     def test_the_scan_reads_calls_a_single_line_search_cannot(self):
         """The named trap: a wrapped call is invisible to a grep and plain to the compiler.
