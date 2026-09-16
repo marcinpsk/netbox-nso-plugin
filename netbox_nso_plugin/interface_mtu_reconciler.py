@@ -51,6 +51,7 @@ def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
         )[1]
         for payload_field, model_field in model_fields.items()
     }
+    bound_port_max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
     seen = set()
     for item in items:
         if not isinstance(item, dict):
@@ -85,6 +86,11 @@ def _validated_interface_items(payload: dict) -> tuple[dict, ...]:
                 "interface MTU payload entry bound_port must be a string or null",
                 code="invalid_response",
             )
+        if isinstance(bound_port, str) and len(bound_port) > bound_port_max_length:
+            raise AdapterError(
+                "interface MTU payload entry bound_port is too long",
+                code="invalid_response",
+            )
         seen.add(name)
     return tuple(items)
 
@@ -111,7 +117,6 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
     from dcim.models import Interface
 
     from . import status_machine as sm
-    from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSOInterfaceMtuState
     from .renderer_writer import planned_delete, planned_save
 
@@ -124,7 +129,6 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
         row.interface_id: row
         for row in NSOInterfaceMtuState.objects.filter(management=management).select_related("interface").order_by("pk")
     }
-    bound_port_max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
     saves = []
     deletes = []
     operations = []
@@ -137,16 +141,6 @@ def _interface_mtu_reconcile_operations(device, payload, planned_at):
         if interface is None:
             continue
         bound_port = item.get("bound_port")
-        if bound_port is not None and not isinstance(bound_port, str):
-            raise AdapterError(
-                "interface MTU payload entry bound_port must be a string or null",
-                code="invalid_response",
-            )
-        if isinstance(bound_port, str) and len(bound_port) > bound_port_max_length:
-            raise AdapterError(
-                "interface MTU payload entry bound_port is too long",
-                code="invalid_response",
-            )
         matched_names.add(name)
         current = states.get(interface.pk)
         candidate = (

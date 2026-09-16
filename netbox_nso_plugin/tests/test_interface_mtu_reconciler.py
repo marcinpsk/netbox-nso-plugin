@@ -259,12 +259,12 @@ class TestInterfaceMtuReconciler(TestCase):
                 self.device,
                 {
                     "interfaces": [
-                        {"interface_name": self.po1.name, "mtu": 9000},
-                        {
-                            "interface_name": "Unknown interface",
-                            "mtu": 1500,
-                            "bound_port": "x" * (max_length + 1),
-                        },
+                        _mtu_entry(self.po1.name, mtu=9000),
+                        _mtu_entry(
+                            "Unknown interface",
+                            mtu=1500,
+                            bound_port="x" * (max_length + 1),
+                        ),
                     ]
                 },
             )
@@ -285,15 +285,7 @@ class TestInterfaceMtuReconciler(TestCase):
 
         rows = reconcile_interface_mtu(
             self.device,
-            {
-                "interfaces": [
-                    {
-                        "interface_name": self.po1.name,
-                        "mtu": 1500,
-                        "bound_port": bound_port,
-                    }
-                ]
-            },
+            {"interfaces": [_mtu_entry(self.po1.name, mtu=1500, bound_port=bound_port)]},
         )
 
         self.assertEqual(len(rows), 1)
