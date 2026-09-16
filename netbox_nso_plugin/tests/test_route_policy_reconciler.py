@@ -2590,6 +2590,264 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(state.is_materialized)
         self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
 
+    def test_diverged_unowned_replacement_keeps_intent_and_revision(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        management = self._mgmt(self.d1)
+        initial = self._pl("PL-UNOWNED-REFRESH", ["198.18.80.0/24"])
+        reconcile_route_policy(self.d1, initial)
+        state = NSORoutePolicyState.objects.get(management=management, object_name="PL-UNOWNED-REFRESH")
+        self.assertEqual((state.status, state.is_materialized), ("imported", True))
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).count(), 1)
+        before_revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        before_payload = delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload
+        NSOIntentOutboxEntry.objects.filter(device=self.d1).delete()
+        payload = self._pl(state.object_name, [])
+
+        plan = route_policy_reconcile_plan(self.d1, payload)
+
+        self.assertFalse(plan.changes_content)
+        reconcile_route_policy(self.d1, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.captured["entries"], [])
+        self.assertTrue(state.is_materialized)
+        self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
+        revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        self.assertEqual(revision, before_revision)
+        self.assertEqual(
+            delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload,
+            before_payload,
+        )
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.d1).exists())
+
+    def test_unowned_reclassification_keeps_intent_and_revision(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import (
+            reconcile_route_policy,
+            route_policy_classification_plan,
+            set_classification,
+        )
+
+        management = self._mgmt(self.d1)
+        name = "PL-MASTER-REPLACEMENT"
+        reconcile_route_policy(self.d1, self._pl(name, ["198.18.81.0/24"]))
+        state = NSORoutePolicyState.objects.get(management=management, object_name=name)
+        root_id = state.object_id
+        set_classification("prefix_list", name, "local")
+        reconcile_route_policy(self.d1, self._pl(name, []))
+        state.refresh_from_db()
+        self.assertFalse(state.is_materialized)
+        self.assertEqual(PrefixListEntry.objects.filter(prefix_list_id=root_id).count(), 1)
+        before_revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        before_payload = delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload
+        NSOIntentOutboxEntry.objects.filter(device=self.d1).delete()
+
+        plan = route_policy_classification_plan("prefix_list", name, "master")
+
+        self.assertFalse(plan.changes_content)
+        set_classification("prefix_list", name, "master")
+        state.refresh_from_db()
+        self.assertEqual(state.captured["entries"], [])
+        self.assertTrue(state.is_materialized)
+        self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
+        revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        self.assertEqual(revision, before_revision)
+        self.assertEqual(
+            delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload,
+            before_payload,
+        )
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.d1).exists())
+
+    def test_diverged_unowned_nonempty_replacement_keeps_intent_and_revision(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        management = self._mgmt(self.d1)
+        initial = self._pl("PL-UNOWNED-NONEMPTY-REFRESH", ["198.18.82.0/24"])
+        reconcile_route_policy(self.d1, initial)
+        state = NSORoutePolicyState.objects.get(management=management, object_name="PL-UNOWNED-NONEMPTY-REFRESH")
+        self.assertEqual((state.status, state.is_materialized), ("imported", True))
+        before_revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        before_payload = delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload
+        NSOIntentOutboxEntry.objects.filter(device=self.d1).delete()
+        payload = self._pl(state.object_name, ["198.18.83.0/24"])
+
+        plan = route_policy_reconcile_plan(self.d1, payload)
+
+        self.assertFalse(plan.changes_content)
+        reconcile_route_policy(self.d1, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.captured["entries"], payload["prefix_lists"][0]["entries"])
+        self.assertTrue(state.is_materialized)
+        self.assertEqual(
+            {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list_id=state.object_id)},
+            {"198.18.83.0/24"},
+        )
+        revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        self.assertEqual(revision, before_revision)
+        self.assertEqual(
+            delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload,
+            before_payload,
+        )
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.d1).exists())
+
+    def test_unowned_nonempty_reclassification_keeps_intent_and_revision(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import (
+            reconcile_route_policy,
+            route_policy_classification_plan,
+            set_classification,
+        )
+
+        management = self._mgmt(self.d1)
+        name = "PL-UNOWNED-NONEMPTY-RECLASSIFICATION"
+        reconcile_route_policy(self.d1, self._pl(name, ["198.18.84.0/24"]))
+        state = NSORoutePolicyState.objects.get(management=management, object_name=name)
+        root_id = state.object_id
+        set_classification("prefix_list", name, "local")
+        payload = self._pl(name, ["198.18.85.0/24"])
+        reconcile_route_policy(self.d1, payload)
+        state.refresh_from_db()
+        self.assertEqual((state.status, state.is_materialized), ("changed", False))
+        self.assertEqual(
+            {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list_id=root_id)},
+            {"198.18.84.0/24"},
+        )
+        before_revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        before_payload = delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload
+        NSOIntentOutboxEntry.objects.filter(device=self.d1).delete()
+
+        plan = route_policy_classification_plan("prefix_list", name, "master")
+
+        self.assertFalse(plan.changes_content)
+        set_classification("prefix_list", name, "master")
+        state.refresh_from_db()
+        self.assertEqual(state.captured["entries"], payload["prefix_lists"][0]["entries"])
+        self.assertTrue(state.is_materialized)
+        self.assertEqual(
+            {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list_id=state.object_id)},
+            {"198.18.85.0/24"},
+        )
+        revision = NSOIntentRevision.objects.get(device=self.d1, scope="route_policy").revision
+        self.assertEqual(revision, before_revision)
+        self.assertEqual(
+            delivery.render("route_policy", self.d1.pk, management.adapter_device_id).payload,
+            before_payload,
+        )
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.d1).exists())
+
+    def test_owned_sibling_refresh_changes_intent_and_revision_without_push(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
+
+        from ._outbox_case import content_update
+
+        source_management = self._mgmt(self.d1)
+        owning_management = self._mgmt(self.d2)
+        name = "PL-OWNED-SIBLING-REFRESH"
+        initial = self._pl(name, ["198.18.86.0/24"])
+        reconcile_route_policy(self.d1, initial)
+        reconcile_route_policy(self.d2, initial)
+        source = NSORoutePolicyState.objects.get(management=source_management, object_name=name)
+        consumer = NSORoutePolicyState.objects.get(management=owning_management, object_name=name)
+        content_update(consumer, status="accepted")
+        source.refresh_from_db()
+        consumer.refresh_from_db()
+        self.assertEqual((source.status, source.is_materialized), ("imported", True))
+        self.assertEqual((consumer.status, consumer.is_materialized), ("accepted", False))
+        before_revision = NSOIntentRevision.objects.get(device=self.d2, scope="route_policy").revision
+        before_payload = delivery.render("route_policy", self.d2.pk, owning_management.adapter_device_id).payload
+        before_object = next(item for item in before_payload if item["name"] == name)
+        self.assertTrue(before_object["entries"])
+        NSOIntentOutboxEntry.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).delete()
+        payload = self._pl(name, [])
+
+        plan = route_policy_reconcile_plan(self.d1, payload)
+
+        self.assertTrue(plan.changes_content)
+        reconcile_route_policy(self.d1, payload)
+        source.refresh_from_db()
+        self.assertEqual(source.captured["entries"], [])
+        self.assertTrue(source.is_materialized)
+        self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=source.object_id).exists())
+        after_payload = delivery.render("route_policy", self.d2.pk, owning_management.adapter_device_id).payload
+        after_object = next(item for item in after_payload if item["name"] == name)
+        self.assertEqual(after_object["entries"], [])
+        self.assertNotEqual(after_payload, before_payload)
+        revision = NSOIntentRevision.objects.get(device=self.d2, scope="route_policy").revision
+        self.assertGreater(revision, before_revision)
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).exists())
+
+    def test_owned_sibling_reclassification_changes_intent_and_revision_without_push(self):
+        from netbox_routing.models import PrefixListEntry
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import (
+            reconcile_route_policy,
+            route_policy_classification_plan,
+            set_classification,
+        )
+
+        from ._outbox_case import content_update
+
+        source_management = self._mgmt(self.d1)
+        owning_management = self._mgmt(self.d2)
+        name = "PL-OWNED-SIBLING-RECLASSIFICATION"
+        initial = self._pl(name, ["198.18.87.0/24"])
+        reconcile_route_policy(self.d1, initial)
+        reconcile_route_policy(self.d2, initial)
+        consumer = NSORoutePolicyState.objects.get(management=owning_management, object_name=name)
+        content_update(consumer, status="accepted")
+        set_classification("prefix_list", name, "local")
+        payload = self._pl(name, ["198.18.88.0/24"])
+        reconcile_route_policy(self.d1, payload)
+        source = NSORoutePolicyState.objects.get(management=source_management, object_name=name)
+        consumer.refresh_from_db()
+        self.assertEqual((source.status, source.is_materialized), ("changed", False))
+        self.assertEqual((consumer.status, consumer.is_materialized), ("accepted", False))
+        before_revision = NSOIntentRevision.objects.get(device=self.d2, scope="route_policy").revision
+        before_payload = delivery.render("route_policy", self.d2.pk, owning_management.adapter_device_id).payload
+        self.assertNotIn(name, {item["name"] for item in before_payload})
+        NSOIntentOutboxEntry.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).delete()
+
+        plan = route_policy_classification_plan("prefix_list", name, "master")
+
+        self.assertTrue(plan.changes_content)
+        set_classification("prefix_list", name, "master")
+        source.refresh_from_db()
+        consumer.refresh_from_db()
+        self.assertEqual(source.captured["entries"], payload["prefix_lists"][0]["entries"])
+        self.assertTrue(source.is_materialized)
+        self.assertEqual((consumer.status, consumer.is_materialized), ("accepted", False))
+        self.assertEqual(
+            {str(entry.assigned_prefix) for entry in PrefixListEntry.objects.filter(prefix_list_id=source.object_id)},
+            {"198.18.88.0/24"},
+        )
+        after_payload = delivery.render("route_policy", self.d2.pk, owning_management.adapter_device_id).payload
+        after_object = next(item for item in after_payload if item["name"] == name)
+        self.assertEqual([entry["prefix"] for entry in after_object["entries"]], ["198.18.88.0/24"])
+        self.assertNotEqual(after_payload, before_payload)
+        revision = NSOIntentRevision.objects.get(device=self.d2, scope="route_policy").revision
+        self.assertGreater(revision, before_revision)
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device_id__in=(self.d1.pk, self.d2.pk)).exists())
+
     def test_reconcile_plans_duplicate_materialized_owner_retirement(self):
         from netbox_nso_plugin.intent_state import SourceRow
         from netbox_nso_plugin.models import NSORoutePolicyState
