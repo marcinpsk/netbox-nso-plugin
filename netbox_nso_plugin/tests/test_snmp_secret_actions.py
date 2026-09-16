@@ -386,6 +386,73 @@ class TestVerifyAndHarvestViews(_SecretBase):
         self.assertEqual(row.vault_secret_hash, row.community_hash)
         self.assertIsNone(row.vault_secret_version)
 
+    def test_verify_community_accepts_unversioned_existing_path_results(self):
+        mgmt = self._make_mgmt(adapter_device_id=None)
+        fingerprint = "0123456789abcdef"
+        row = self._community(
+            mgmt,
+            community_hash=fingerprint,
+            vault_ref=f"network/netbox/snmp/community/{fingerprint}#community",
+            status="accepted",
+        )
+        present_session = make_session(
+            json_data={
+                "operation_id": "placeholder-operation",
+                "status": "present",
+                "fingerprint": fingerprint,
+                "has_auth": False,
+                "has_priv": False,
+                "version": None,
+            }
+        )
+        self.client.force_login(_superuser())
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=present_session),
+        ):
+            response = self.client.post(
+                f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/",
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Vault secret verified (vNone): matches the device value.")
+        row.refresh_from_db()
+        self.assertEqual(row.vault_secret_hash, fingerprint)
+        self.assertIsNone(row.vault_secret_version)
+
+        category = self.client.get(f"/plugins/nso/devices/{self.device.pk}/category/snmp/")
+        self.assertEqual(category.status_code, 200)
+        self.assertContains(category, "Vault ✓ matches device")
+        self.assertContains(category, "(v?).")
+
+        row.vault_secret_version = 3
+        row.save(update_fields=("vault_secret_version",))
+        missing_field_session = make_session(
+            json_data={
+                "operation_id": "placeholder-operation",
+                "status": "missing_field",
+                "fingerprint": None,
+                "has_auth": False,
+                "has_priv": False,
+                "version": None,
+            }
+        )
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=missing_field_session),
+        ):
+            response = self.client.post(
+                f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/",
+                follow=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Vault does not hold the referenced secret.")
+        row.refresh_from_db()
+        self.assertEqual(row.vault_secret_hash, "")
+        self.assertIsNone(row.vault_secret_version)
+
     def test_verify_missing_community_clears_the_previous_observation(self):
         mgmt = self._make_mgmt()
         row = self._community(
