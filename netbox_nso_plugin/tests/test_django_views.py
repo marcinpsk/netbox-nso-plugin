@@ -7826,6 +7826,89 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         self.assertEqual(applied, [])
         self.assertTrue(any("precondition was unmet" in message for message in messages_shown))
 
+    def test_an_unexpected_audit_database_failure_escapes_apply(self):
+        """An audit lock failure remains a server error and changes no Apply state."""
+        from django.db import OperationalError, connection, connections
+
+        from netbox_nso_plugin.models import (
+            NSOApplyAttempt,
+            NSODeviceManagement,
+            NSOIntentOutboxEntry,
+            NSOIntentOutboxState,
+            NSOIntentRevision,
+            NSOSnmpCommunityState,
+        )
+        from netbox_nso_plugin.renderer_audit import _serialization_failure
+
+        community = self._own_a_community()
+        revision = NSOIntentRevision.objects.get(device=self.device, scope="snmp")
+        NSOIntentRevision.objects.filter(pk=revision.pk).update(
+            verified_revision=None,
+            verified_fingerprint=None,
+            verified_at=None,
+        )
+        management_before = NSODeviceManagement.objects.values().get(pk=self.mgmt.pk)
+        community_before = NSOSnmpCommunityState.objects.values().get(pk=community.pk)
+        revisions_before = list(NSOIntentRevision.objects.filter(device=self.device).order_by("scope").values())
+        entries_before = list(NSOIntentOutboxEntry.objects.filter(device=self.device).order_by("pk").values())
+        states_before = list(NSOIntentOutboxState.objects.filter(device=self.device).order_by("scope").values())
+        attempts_before = list(NSOApplyAttempt.objects.filter(management=self.mgmt).order_by("pk").values())
+        revision_table = connection.ops.quote_name(NSOIntentRevision._meta.db_table)
+
+        alias = "apply_audit_blocker"
+        connections[alias] = connection.copy(alias=alias)
+        blocker = connections[alias]
+        database_options = connection.settings_dict["OPTIONS"]
+        request_options = dict(database_options)
+        request_options["options"] = f"{request_options.get('options', '')} -c lock_timeout=100ms".strip()
+        try:
+            blocker.set_autocommit(False)
+            with blocker.cursor() as cursor:
+                cursor.execute(  # noqa: S608, the quoted table name comes from model metadata
+                    f"SELECT 1 FROM {revision_table} WHERE id = %s FOR UPDATE",
+                    [revision.pk],
+                )
+            connection.settings_dict["OPTIONS"] = request_options
+            connection.close()
+            url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.mgmt.pk, "apply"])
+            config, session = self.adapter.patches()
+            with (
+                config,
+                session,
+                self.assertRaises(OperationalError) as raised,
+            ):
+                response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+                self.fail(f"Apply returned HTTP {response.status_code} instead of propagating the database fault")
+        finally:
+            connection.close()
+            connection.settings_dict["OPTIONS"] = database_options
+            blocker.rollback()
+            blocker.close()
+            del connections[alias]
+
+        self.assertEqual(getattr(raised.exception.__cause__, "sqlstate", None), "55P03")
+        self.assertFalse(_serialization_failure(raised.exception))
+        self.assertEqual(NSODeviceManagement.objects.values().get(pk=self.mgmt.pk), management_before)
+        self.assertEqual(NSOSnmpCommunityState.objects.values().get(pk=community.pk), community_before)
+        self.assertEqual(
+            list(NSOIntentRevision.objects.filter(device=self.device).order_by("scope").values()),
+            revisions_before,
+        )
+        self.assertEqual(
+            list(NSOIntentOutboxEntry.objects.filter(device=self.device).order_by("pk").values()),
+            entries_before,
+        )
+        self.assertEqual(
+            list(NSOIntentOutboxState.objects.filter(device=self.device).order_by("scope").values()),
+            states_before,
+        )
+        self.assertEqual(
+            list(NSOApplyAttempt.objects.filter(management=self.mgmt).order_by("pk").values()),
+            attempts_before,
+        )
+        self.assertEqual(self.adapter.requests, [])
+        self.assertEqual(self.adapter.applied, [])
+
 
 class TestDeviceNSOTabDegradedDeletions(ViewTestBase):
     """codex O1 r4 F3 (§4.3(c)): the durable degradation record needs an operator surface.
