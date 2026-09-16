@@ -25,6 +25,8 @@ from pathlib import Path
 
 from django.test import SimpleTestCase
 
+from netbox_nso_plugin.tests._ast_scope import scoped_walk
+
 _MUTATION_METHODS = frozenset(
     {
         "add",
@@ -273,6 +275,18 @@ def _production_modules():
         yield path, relative
 
 
+def _mtu_delegation_offenders(source) -> list[str]:
+    tree = ast.parse(source)
+    target = next(
+        node for node in tree.body if isinstance(node, _FUNCTION_SCOPES) and node.name == "_save_owned_overlay_edit"
+    )
+    calls = {_dotted(node.func) for node in scoped_walk(target.body) if isinstance(node, ast.Call)}
+    whole_tree_calls = {_dotted(node.func) for node in ast.walk(target) if isinstance(node, ast.Call)}
+    if "_save_owned_interface_mtu_edit" not in calls or whole_tree_calls & {"obj.save", "iface.save"}:
+        return [target.name]
+    return []
+
+
 class TestRendererBindingCollector(SimpleTestCase):
     def test_assignment_forms_preserve_model_bindings(self):
         sources = (
@@ -385,15 +399,35 @@ class TestRendererWriterStructure(SimpleTestCase):
 
     def test_mtu_inline_edits_delegate_to_an_exact_plan(self):
         path = Path(__file__).resolve().parents[1] / "views.py"
-        tree = ast.parse(path.read_text(), filename=str(path))
-        target = next(
-            node for node in tree.body if isinstance(node, _FUNCTION_SCOPES) and node.name == "_save_owned_overlay_edit"
-        )
-        calls = {_dotted(node.func) for node in ast.walk(target) if isinstance(node, ast.Call)}
+        self.assertEqual(_mtu_delegation_offenders(path.read_text()), [])
 
-        self.assertIn("_save_owned_interface_mtu_edit", calls)
-        self.assertNotIn("obj.save", calls)
-        self.assertNotIn("iface.save", calls)
+    def test_nested_mtu_delegation_does_not_certify_the_outer_edit(self):
+        nested_bodies = {
+            "function": "    def nested():\n        _save_owned_interface_mtu_edit()\n",
+            "async function": "    async def nested():\n        _save_owned_interface_mtu_edit()\n",
+            "lambda": "    nested = lambda: _save_owned_interface_mtu_edit()\n",
+            "class method": (
+                "    class Nested:\n        def save(self):\n            _save_owned_interface_mtu_edit()\n"
+            ),
+        }
+        for boundary, body in nested_bodies.items():
+            with self.subTest(boundary=boundary):
+                source = "def _save_owned_overlay_edit():\n" + body
+                self.assertEqual(_mtu_delegation_offenders(source), ["_save_owned_overlay_edit"])
+
+        direct_source = "def _save_owned_overlay_edit():\n    _save_owned_interface_mtu_edit()\n"
+        self.assertEqual(_mtu_delegation_offenders(direct_source), [])
+
+    def test_nested_forbidden_save_still_fails_the_mtu_delegation_guard(self):
+        source = """
+def _save_owned_overlay_edit():
+    _save_owned_interface_mtu_edit()
+    def persist():
+        iface.save()
+    persist()
+"""
+
+        self.assertEqual(_mtu_delegation_offenders(source), ["_save_owned_overlay_edit"])
 
 
 #: The seams that acquire the locks a caller-owned plan is then consumed under. Entering one
@@ -404,22 +438,6 @@ _PLAN_BUILDER = "RendererMutationPlan.build"
 #: A helper may front the seed (``_demotion_plan``) and a local name may alias another
 #: (``plan = plans[scope]``), so both derivations are re-read until they settle.
 _BUILDER_PASSES = 3
-_NESTED_SCOPES = (*_FUNCTION_SCOPES, ast.ClassDef, ast.Lambda)
-
-
-def _owned_nodes(node):
-    """Yield a node's lexical subtree without entering nested function scopes."""
-    if isinstance(node, _NESTED_SCOPES):
-        return
-    yield node
-    for child in ast.iter_child_nodes(node):
-        yield from _owned_nodes(child)
-
-
-def _owned_body_nodes(body):
-    """Yield nodes owned by one statement body."""
-    for statement in body:
-        yield from _owned_nodes(statement)
 
 
 def _dotted(node) -> str:
@@ -431,9 +449,18 @@ def _dotted(node) -> str:
     return "?"
 
 
+def _plan_value_nodes(node):
+    # Lambdas are opaque because their expression values are callables, not plans.
+    if isinstance(node, ast.Lambda):
+        return
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _plan_value_nodes(child)
+
+
 def _builds_a_plan(node, builders) -> bool:
     """Whether *node*'s subtree calls anything that hands back a freshly frozen plan."""
-    return any(isinstance(child, ast.Call) and _dotted(child.func) in builders for child in _owned_nodes(node))
+    return any(isinstance(child, ast.Call) and _dotted(child.func) in builders for child in _plan_value_nodes(node))
 
 
 def _root_name(node):
@@ -445,7 +472,7 @@ def _root_name(node):
 
 def _bindings(node):
     """Every ``(targets, value)`` pair *node*'s subtree binds, in the three binding forms."""
-    for child in _owned_nodes(node):
+    for child in scoped_walk(node):
         if isinstance(child, ast.Assign):
             yield child.targets, child.value
         elif isinstance(child, (ast.For, ast.AsyncFor, ast.comprehension)):
@@ -511,7 +538,7 @@ def _statement_bodies(statement):
 
 
 def _contains_node(statement, target) -> bool:
-    return any(node is target for node in _owned_nodes(statement))
+    return any(node is target for node in scoped_walk(statement))
 
 
 def _statements_before(body, target):
@@ -538,11 +565,11 @@ def _plan_builders(tree) -> set:
         for function in functions:
             names = _plan_names(function.body, builders)
             returned = [
-                node.value for node in _owned_body_nodes(function.body) if isinstance(node, ast.Return) and node.value
+                node.value for node in scoped_walk(function.body) if isinstance(node, ast.Return) and node.value
             ]
             hands_one_back = any(
                 _builds_a_plan(value, builders)
-                or any(isinstance(part, ast.Name) and part.id in names for part in ast.walk(value))
+                or any(isinstance(part, ast.Name) and part.id in names for part in _plan_value_nodes(value))
                 for value in returned
             )
             if hands_one_back:
@@ -586,7 +613,7 @@ def _stale_plan_source(source, module) -> list:
     pending = _consumers(tree)
     offenders = []
     for statement in _lock_contexts(tree):
-        inside = set(_owned_body_nodes(statement.body))
+        inside = set(scoped_walk(statement.body))
         for call in [node for node in pending if node in inside]:
             pending.remove(call)
             plan = call.args[0]
@@ -641,6 +668,81 @@ def repair():
         self.assertEqual(
             _stale_plan_source(source, "fixture.py"),
             [("fixture.py", "plan", 10)],
+        )
+
+    def test_returning_a_lambda_does_not_make_a_function_a_plan_builder(self):
+        deferred_source = """
+def deferred():
+    plan = RendererMutationPlan.build()
+    return lambda: plan
+def repair():
+    with intent_transaction(footprint):
+        plan = deferred()
+        consume_renderer_plan(plan, permit)
+"""
+        self.assertEqual(
+            _stale_plan_source(deferred_source, "fixture.py"),
+            [("fixture.py", "plan", 8)],
+        )
+
+        direct_source = deferred_source.replace("return lambda: plan", "return plan")
+        self.assertEqual(_stale_plan_source(direct_source, "fixture.py"), [])
+
+        default_source = """
+def deferred():
+    return lambda p=RendererMutationPlan.build(): p
+def repair():
+    with intent_transaction(footprint):
+        plan = deferred()
+        consume_renderer_plan(plan, permit)
+"""
+        self.assertEqual(
+            _stale_plan_source(default_source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_lambda_valued_assignment_is_not_a_plan(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = lambda p=RendererMutationPlan.build(): p
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 5)],
+        )
+
+        direct_source = source.replace("lambda p=RendererMutationPlan.build(): p", "RendererMutationPlan.build()")
+        self.assertEqual(_stale_plan_source(direct_source, "fixture.py"), [])
+
+    def test_lambda_branches_do_not_make_a_conditional_assignment_a_plan(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = (lambda p=RendererMutationPlan.build(): p) if flag else (lambda: None)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 5)],
+        )
+
+    def test_returning_lambda_branches_does_not_make_a_function_a_plan_builder(self):
+        source = """
+def deferred(flag):
+    return (lambda p=RendererMutationPlan.build(): p) if flag else (lambda: None)
+def repair():
+    with intent_transaction(footprint):
+        plan = deferred(flag)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
         )
 
     def test_a_deferred_nested_consumer_is_not_inside_its_defining_lock(self):
