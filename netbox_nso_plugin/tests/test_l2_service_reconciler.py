@@ -16,6 +16,18 @@ def _payload(services):
     return {"device_id": 1, "services": services}
 
 
+def _l2_table_snapshot():
+    def rows(model):
+        fields = [field.attname for field in model._meta.concrete_fields]
+        return list(model.objects.order_by("pk").values_list(*fields))
+
+    return {
+        "l2vpns": rows(L2VPN),
+        "terminations": rows(L2VPNTermination),
+        "states": rows(NSOL2SapState),
+    }
+
+
 class TestReconcileL2Services(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -30,6 +42,81 @@ class TestReconcileL2Services(TestCase):
         )
         cls.port = Interface.objects.create(device=cls.device, name="1/1/c31/3", type="other")
         cls.lag = Interface.objects.create(device=cls.device, name="lag-60", type="lag")
+        cls.extra_port = Interface.objects.create(device=cls.device, name="1/1/c31/4", type="other")
+
+    def _assert_invalid_service_type_rejected(self, invalid_service, expected_value):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        existing_service = {
+            "service_name": "EXISTING",
+            "service_type": "epipe",
+            "service_id": 4022,
+            "saps": [{"sap_id": "1/1/c31/3:4022", "port": self.port.name, "outer_tag": 4022}],
+        }
+        valid_service = {
+            "service_name": "VALID",
+            "service_type": "vpls",
+            "service_id": 9000,
+            "saps": [{"sap_id": "lag-60:9000", "port": self.lag.name, "outer_tag": 9000}],
+        }
+        reconcile_l2_services(self.device, _payload([existing_service]))
+        before = _l2_table_snapshot()
+        error = None
+
+        try:
+            reconcile_l2_services(self.device, _payload([valid_service, invalid_service]))
+        except AdapterError as exc:
+            error = exc
+
+        new_service_names = (valid_service["service_name"], invalid_service["service_name"])
+        new_slugs = [f"nso-{self.device.pk}-{service_name}" for service_name in new_service_names]
+        created_vpns = list(L2VPN.objects.filter(slug__in=new_slugs).order_by("slug").values_list("slug", "type"))
+        created_states = list(
+            NSOL2SapState.objects.filter(
+                management=self.mgmt,
+                service_name__in=new_service_names,
+            )
+            .order_by("service_name")
+            .values_list("service_name", "status", "service_type")
+        )
+        self.assertEqual((created_vpns, created_states), ([], []))
+        self.assertEqual(_l2_table_snapshot(), before)
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, "invalid_response")
+        self.assertIn(invalid_service["service_name"], str(error))
+        self.assertIn(expected_value, str(error))
+
+    def test_unsupported_service_type_rejects_the_entire_document(self):
+        self._assert_invalid_service_type_rejected(
+            {
+                "service_name": "UNSUPPORTED",
+                "service_type": "foo",
+                "service_id": 9001,
+                "saps": [{"sap_id": "1/1/c31/4:9001", "port": self.extra_port.name, "outer_tag": 9001}],
+            },
+            "'foo'",
+        )
+
+    def test_missing_service_type_rejects_the_entire_document(self):
+        self._assert_invalid_service_type_rejected(
+            {
+                "service_name": "MISSING",
+                "service_id": 9002,
+                "saps": [{"sap_id": "1/1/c31/4:9002", "port": self.extra_port.name, "outer_tag": 9002}],
+            },
+            "<missing>",
+        )
+
+    def test_null_service_type_rejects_the_entire_document(self):
+        self._assert_invalid_service_type_rejected(
+            {
+                "service_name": "NULL",
+                "service_type": None,
+                "service_id": 9003,
+                "saps": [{"sap_id": "1/1/c31/4:9003", "port": self.extra_port.name, "outer_tag": 9003}],
+            },
+            "None",
+        )
 
     def test_creates_l2vpn_termination_and_state(self):
         rows = reconcile_l2_services(

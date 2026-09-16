@@ -14,6 +14,27 @@ logger = logging.getLogger(__name__)
 _L2VPN_TYPE = {"epipe": "vpws", "vpls": "vpls"}
 
 
+def _validated_l2_services(payload) -> list:
+    """Return L2 services after validating every reported service type."""
+    from .adapter_client import AdapterError
+
+    services = payload.get("services", []) if isinstance(payload, dict) else []
+    services = services if isinstance(services, list) else []
+    for service in services:
+        if not isinstance(service, dict):
+            continue
+        service_type = service.get("service_type")
+        if isinstance(service_type, str) and service_type in _L2VPN_TYPE:
+            continue
+        service_name = service.get("service_name")
+        value = repr(service_type) if "service_type" in service else "<missing>"
+        raise AdapterError(
+            f"L2 service {service_name!r} has unsupported service_type {value}.",
+            code="invalid_response",
+        )
+    return services
+
+
 def l2_service_reconcile_plan(device, payload: dict):
     """Freeze every native VPN, termination, and L2 SAP overlay write."""
     from django.utils import timezone
@@ -44,6 +65,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
     from .models import NSODeviceManagement, NSOL2SapState
     from .renderer_writer import planned_save
 
+    services = _validated_l2_services(payload)
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], []
@@ -66,8 +88,6 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
         .select_related("l2vpn", "termination")
         .order_by("pk")
     }
-    services = payload.get("services", []) if isinstance(payload, dict) else []
-    services = services if isinstance(services, list) else []
     saves = []
     operations = []
     reported = set()
@@ -91,8 +111,8 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
         if not service_name or service_name in reported_services:
             continue
         reported_services.add(service_name)
-        service_type = service.get("service_type", "")
-        l2vpn_type = _L2VPN_TYPE.get(service_type, "vpls")
+        service_type = service["service_type"]
+        l2vpn_type = _L2VPN_TYPE[service_type]
         slug = f"nso-{device.pk}-{service_name}"
         current_l2vpn = l2vpns.get(slug)
         if current_l2vpn is None:
