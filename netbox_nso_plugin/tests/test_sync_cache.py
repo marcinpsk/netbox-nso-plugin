@@ -586,6 +586,56 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
         mgmt.refresh_from_db()
         self.assertEqual(mgmt.adapter_device_id, 704)
 
+    def test_unmapped_reonboarding_makes_retained_baselines_stale(self):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentRevision
+        from netbox_nso_plugin.renderer_audit import _optimistic_candidates, _trusted
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-unmapped-baselines", None)
+        fresh_adapter_id = 705
+        scopes = ("interface", "vlan")
+        _stamp_verified_baselines(mgmt)
+        for scope in scopes:
+            fingerprint = delivery.canonical_fingerprint(
+                delivery.render(scope, mgmt.device_id, fresh_adapter_id).payload
+            )
+            NSOIntentRevision.objects.filter(device=mgmt.device, scope=scope).update(verified_fingerprint=fingerprint)
+        stamped = {row.scope: row for row in NSOIntentRevision.objects.filter(device=mgmt.device, scope__in=scopes)}
+        for scope in scopes:
+            self.assertTrue(_trusted(stamped[scope]))
+
+        session = make_session(json_data={"id": fresh_adapter_id})
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            result = reconcile_device_links(
+                NSODeviceManagement.objects.all(),
+                snapshot=([mgmt], {}, {}),
+            )
+
+        self.assertEqual(result, (1, 1))
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, fresh_adapter_id)
+        current = {row.scope: row for row in NSOIntentRevision.objects.filter(device=mgmt.device, scope__in=scopes)}
+        candidates, deferred = _optimistic_candidates(
+            mgmt.device_id,
+            scopes,
+            mgmt,
+            float("inf"),
+            pre_capture=True,
+        )
+        self.assertEqual(deferred, ())
+        for scope in scopes:
+            with self.subTest(scope=scope, condition="revision advanced"):
+                self.assertGreater(current[scope].revision, stamped[scope].verified_revision)
+            with self.subTest(scope=scope, condition="baseline is not trusted"):
+                self.assertFalse(_trusted(current[scope]))
+            with self.subTest(scope=scope, condition="audit selects repair"):
+                self.assertIn(scope, candidates)
+
     def test_unmapped_row_adopts_its_one_matching_adapter_device(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.sync_cache import reconcile_device_links
