@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """Shared fixtures for the #1396 R3 static-route suites (P2 transition, P6 push errors).
 
-Defined once, here, so the two suites cannot drift on what a device, a brownfield route or
+Defined once, in here, so the two suites cannot drift on what a device, a brownfield route or
 an owned overlay looks like. Same role as :mod:`._settlement_case` for the Appendix S suites.
 """
 
