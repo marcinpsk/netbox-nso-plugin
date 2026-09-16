@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
@@ -111,6 +112,80 @@ class TestInterfaceMtuReconciler(TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_response")
         self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.po1).exists())
+
+    def test_unknown_interface_bound_port_overflow_rejects_the_entire_document(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        prior_time = timezone.now() - timedelta(days=1)
+        state = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=self.po1,
+            l2_mtu=1500,
+            status="imported",
+            last_sync_at=prior_time,
+            accepted_at=prior_time,
+            last_apply_at=prior_time,
+        )
+        tracked_fields = (
+            "l2_mtu",
+            "ip_mtu",
+            "mpls_mtu",
+            "bound_port",
+            "status",
+            "last_sync_at",
+            "accepted_at",
+            "last_apply_at",
+        )
+        before = tuple(getattr(state, field) for field in tracked_fields)
+        max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
+        error = None
+
+        try:
+            reconcile_interface_mtu(
+                self.device,
+                {
+                    "interfaces": [
+                        {"interface_name": self.po1.name, "mtu": 9000},
+                        {
+                            "interface_name": "Unknown interface",
+                            "mtu": 1500,
+                            "bound_port": "x" * (max_length + 1),
+                        },
+                    ]
+                },
+            )
+        except AdapterError as exc:
+            error = exc
+
+        state.refresh_from_db()
+        self.assertEqual(tuple(getattr(state, field) for field in tracked_fields), before)
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, "invalid_response")
+        self.assertIn("bound_port is too long", str(error))
+
+    def test_bound_port_at_the_model_limit_is_accepted(self):
+        from netbox_nso_plugin.interface_mtu_reconciler import reconcile_interface_mtu
+
+        max_length = NSOInterfaceMtuState._meta.get_field("bound_port").max_length
+        bound_port = "x" * max_length
+
+        rows = reconcile_interface_mtu(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": self.po1.name,
+                        "mtu": 1500,
+                        "bound_port": bound_port,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        state = NSOInterfaceMtuState.objects.get(management=self.management, interface=self.po1)
+        self.assertEqual((state.l2_mtu, state.bound_port, state.status), (1500, bound_port, "imported"))
 
     def test_reconcile_replays_the_frozen_operations(self):
         from netbox_nso_plugin.interface_mtu_reconciler import (
