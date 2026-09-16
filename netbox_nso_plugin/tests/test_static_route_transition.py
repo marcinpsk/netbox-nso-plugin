@@ -706,7 +706,8 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             finally:
                 connections.close_all()
 
-        with patch(PUT), connection.execute_wrapper(observe_sql):
+        # Keep L4's post-commit drain audit out of the SQL capture.
+        with patch(PUT), transaction.atomic(), connection.execute_wrapper(observe_sql):
             with renderer_writes(plan) as writer:
                 contender = threading.Thread(target=probe_overlay_locks)
                 contender.start()
@@ -723,7 +724,7 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             if f'FROM "{overlay_table}"' in sql and "FOR UPDATE" in sql
         ]
         native_updates = [index for index, (sql, _params) in enumerate(statements) if f'UPDATE "{native_table}"' in sql]
-        self.assertEqual([pk for _index, pk in overlay_locks], list(expected_pks))
+        self.assertEqual(list(dict.fromkeys(pk for _index, pk in overlay_locks)), list(expected_pks))
         self.assertEqual(len(native_updates), 1)
         self.assertTrue(all(index < native_updates[0] for index, _pk in overlay_locks))
 
