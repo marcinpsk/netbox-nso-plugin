@@ -9,6 +9,8 @@ from pathlib import Path
 
 from django.test import SimpleTestCase
 
+from ._ast_scope import scoped_walk
+
 PLUGIN = Path(__file__).resolve().parent.parent
 
 
@@ -23,20 +25,23 @@ def _functions(path):
 
 def _calls(functions):
     return [
-        ast.unparse(node.func) for function in functions for node in ast.walk(function) if isinstance(node, ast.Call)
+        ast.unparse(node.func)
+        for function in functions
+        for node in scoped_walk(function.body)
+        if isinstance(node, ast.Call)
     ]
 
 
 def _call_sites(module_path, tree, names):
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    functions = {}
+    functions = {"<module>": [tree]}
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            qualified_name = [node.name]
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+            qualified_name = ["<lambda>" if isinstance(node, ast.Lambda) else node.name]
             parent = parents.get(node)
             while parent is not None:
-                if isinstance(parent, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
-                    qualified_name.append(parent.name)
+                if isinstance(parent, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                    qualified_name.append("<lambda>" if isinstance(parent, ast.Lambda) else parent.name)
                 parent = parents.get(parent)
             functions.setdefault(".".join(reversed(qualified_name)), []).append(node)
     return {
@@ -141,6 +146,110 @@ class Second:
                 ("sample.py", "capture", "delivery.render"),
                 ("sample.py", "Second.capture", "drain.claim"),
                 ("sample.py", "Second.capture", "delivery.render"),
+            },
+        )
+
+    def test_call_sites_inventory_nested_class_bodies(self):
+        source = """
+def entry():
+    class Cfg:
+        claimed = drain.claim()
+        rendered = delivery.render()
+"""
+
+        self.assertEqual(
+            _call_sites("sample.py", ast.parse(source), {"drain.claim", "delivery.render"}),
+            {
+                ("sample.py", "entry.Cfg", "drain.claim"),
+                ("sample.py", "entry.Cfg", "delivery.render"),
+            },
+        )
+
+    def test_call_sites_inventory_definition_time_expressions(self):
+        source = """
+def capture(value=delivery.render("snmp", 1, 42)):
+    pass
+
+@audit.decorator()
+def decorated():
+    pass
+
+class Config(build_base()):
+    pass
+
+def outer():
+    def nested(value=drain.claim()):
+        pass
+"""
+
+        self.assertEqual(
+            _call_sites(
+                "sample.py",
+                ast.parse(source),
+                {"audit.decorator", "build_base", "delivery.render", "drain.claim"},
+            ),
+            {
+                ("sample.py", "<module>", "audit.decorator"),
+                ("sample.py", "<module>", "build_base"),
+                ("sample.py", "<module>", "delivery.render"),
+                ("sample.py", "outer", "drain.claim"),
+            },
+        )
+
+    def test_nested_scopes_do_not_certify_outer_entries(self):
+        from types import SimpleNamespace
+
+        source = """
+def direct():
+    audit_renderer_scopes()
+
+def nested_function():
+    def helper():
+        audit_renderer_scopes()
+
+def nested_async_function():
+    async def async_helper():
+        audit_renderer_scopes()
+
+def nested_lambda():
+    helper = lambda: audit_renderer_scopes()
+
+def nested_class():
+    class Helper:
+        def audit(self):
+            audit_renderer_scopes()
+
+def called_helper():
+    def audit_helper():
+        audit_renderer_scopes()
+
+    audit_helper()
+"""
+        functions = _functions(SimpleNamespace(read_text=lambda **_kwargs: source))
+        entries = {
+            "direct",
+            "nested_function",
+            "nested_async_function",
+            "nested_lambda",
+            "nested_class",
+            "called_helper",
+        }
+
+        offenders = {entry for entry in entries if "audit_renderer_scopes" not in _reachable_calls(functions, entry)}
+
+        self.assertEqual(
+            offenders,
+            {"nested_function", "nested_async_function", "nested_lambda", "nested_class"},
+        )
+        self.assertEqual(
+            _call_sites("sample.py", ast.parse(source), {"audit_renderer_scopes"}),
+            {
+                ("sample.py", "direct", "audit_renderer_scopes"),
+                ("sample.py", "nested_function.helper", "audit_renderer_scopes"),
+                ("sample.py", "nested_async_function.async_helper", "audit_renderer_scopes"),
+                ("sample.py", "nested_lambda.<lambda>", "audit_renderer_scopes"),
+                ("sample.py", "nested_class.Helper.audit", "audit_renderer_scopes"),
+                ("sample.py", "called_helper.audit_helper", "audit_renderer_scopes"),
             },
         )
 
