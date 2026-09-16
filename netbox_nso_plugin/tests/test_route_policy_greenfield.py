@@ -587,6 +587,158 @@ class TestOwnershipCascade(_RPBase):
         assert owned.get(("community_list", "CL-CASCADE")) == "accepted"
         assert owned.get(("prefix_list", "PL-CASCADE")) == "accepted"
 
+    def test_first_cross_device_acquisition_only_advances_route_policy_scope(self):
+        import json
+
+        from django.contrib.auth import get_user_model
+        from django.contrib.contenttypes.models import ContentType
+        from django.urls import reverse
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import (
+            NSOBGPPeerState,
+            NSODeviceManagement,
+            NSOIntentOutboxEntry,
+            NSOIntentRevision,
+            NSORoutePolicyState,
+        )
+        from netbox_nso_plugin.signals import reset_intent_push_state
+
+        from ._outbox_case import content_update
+
+        owner_management = self._mgmt()
+        route_map = RouteMap.objects.create(name="RM-FIRST-ACQUISITION")
+        _save_without_push(
+            NSORoutePolicyState(
+                management=owner_management,
+                family="route_map",
+                object_name=route_map.name,
+                content_type=ContentType.objects.get_for_model(RouteMap),
+                object_id=route_map.pk,
+                status="in_sync",
+                is_materialized=True,
+            )
+        )
+        acquiring_device = Device.objects.create(
+            name="rp-acquiring-router",
+            device_type=self.device.device_type,
+            role=self.device.role,
+            site=self.device.site,
+        )
+        acquiring_management = NSODeviceManagement.objects.create(
+            device=acquiring_device,
+            nso_instance=owner_management.nso_instance,
+            nso_device_name="nso-rp-acquiring",
+            adapter_device_id=197,
+        )
+        payload = {
+            "device_id": acquiring_device.pk,
+            "routers": [
+                {
+                    "asn": "64512",
+                    "router_id": None,
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": ["ipv4-unicast"],
+                            "peers": [
+                                {
+                                    "peer_address": "198.18.0.2",
+                                    "enabled": True,
+                                    "remote_as": "64513",
+                                    "address_families": [
+                                        {
+                                            "af": "ipv4-unicast",
+                                            "enabled": True,
+                                            "routemap_in": route_map.name,
+                                        }
+                                    ],
+                                }
+                            ],
+                            "peer_groups": [],
+                        }
+                    ],
+                }
+            ],
+        }
+        _reconcile_bgp_config(acquiring_device, payload)
+        content_update(NSOBGPPeerState.objects.get(management=acquiring_management), status="in_sync")
+        NSOIntentOutboxEntry.objects.filter(device_id__in=(self.device.pk, acquiring_device.pk)).delete()
+        reset_intent_push_state()
+
+        protocol_scopes = ("bgp", "isis", "ospf")
+
+        def render_protocols():
+            return {
+                scope: delivery.render(scope, acquiring_device.pk, acquiring_management.adapter_device_id).payload
+                for scope in protocol_scopes
+            }
+
+        def document_bytes(payloads):
+            return {
+                scope: json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+                for scope, payload in payloads.items()
+            }
+
+        def revisions(device):
+            return dict(NSOIntentRevision.objects.filter(device=device).values_list("scope", "revision"))
+
+        before_payloads = render_protocols()
+        before_documents = document_bytes(before_payloads)
+        self.assertEqual(
+            before_payloads["bgp"][0]["scopes"][0]["peers"][0]["address_families"][0]["routemap_in"],
+            route_map.name,
+        )
+        before_revisions = revisions(acquiring_device)
+        owner_rows_before = list(
+            NSORoutePolicyState.objects.filter(management=owner_management).order_by("pk").values()
+        )
+        owner_revision_rows_before = list(
+            NSOIntentRevision.objects.filter(device=self.device).order_by("scope").values()
+        )
+        native_rows_before = list(RouteMap.objects.filter(pk=route_map.pk).values())
+        user = get_user_model().objects.create_superuser(
+            username="rp-first-acquisition",
+            password="x",
+            email="rp-first-acquisition@example.test",
+        )
+        self.client.force_login(user)
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:route_policy_attach", args=[acquiring_device.pk]),
+            {"policy": f"route_map:{ContentType.objects.get_for_model(RouteMap).pk}:{route_map.pk}"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            NSOIntentOutboxEntry.objects.filter(
+                device=acquiring_device,
+                scope="route_policy",
+                consumed_by_push_seq__isnull=True,
+            ).exists()
+        )
+        after_revisions = revisions(acquiring_device)
+        self.assertGreater(after_revisions.get("route_policy", 0), before_revisions.get("route_policy", 0))
+        self.assertEqual(document_bytes(render_protocols()), before_documents)
+        self.assertEqual(
+            {scope: after_revisions.get(scope, 0) for scope in protocol_scopes},
+            {scope: before_revisions.get(scope, 0) for scope in protocol_scopes},
+        )
+        self.assertFalse(
+            NSOIntentOutboxEntry.objects.filter(device=acquiring_device, scope__in=protocol_scopes).exists()
+        )
+        self.assertEqual(
+            list(NSORoutePolicyState.objects.filter(management=owner_management).order_by("pk").values()),
+            owner_rows_before,
+        )
+        self.assertEqual(
+            list(NSOIntentRevision.objects.filter(device=self.device).order_by("scope").values()),
+            owner_revision_rows_before,
+        )
+        self.assertEqual(list(RouteMap.objects.filter(pk=route_map.pk).values()), native_rows_before)
+
     def test_contributor_queries_do_not_grow_with_route_map_entries(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
