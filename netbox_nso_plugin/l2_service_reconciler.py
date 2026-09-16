@@ -15,23 +15,40 @@ _L2VPN_TYPE = {"epipe": "vpws", "vpls": "vpls"}
 
 
 def _validated_l2_services(payload) -> list:
-    """Return L2 services after validating every reported service type."""
+    """Validate one adapter L2 document before planning any changes."""
     from .adapter_client import AdapterError
 
-    services = payload.get("services", []) if isinstance(payload, dict) else []
-    services = services if isinstance(services, list) else []
+    if not isinstance(payload, dict):
+        raise AdapterError("L2 service payload must be an object.", code="invalid_response")
+    services = payload.get("services", [])
+    if not isinstance(services, list):
+        raise AdapterError("L2 services must be a list.", code="invalid_response")
     for service in services:
         if not isinstance(service, dict):
-            continue
-        service_type = service.get("service_type")
-        if isinstance(service_type, str) and service_type in _L2VPN_TYPE:
-            continue
+            raise AdapterError("L2 service entries must be objects.", code="invalid_response")
         service_name = service.get("service_name")
-        value = repr(service_type) if "service_type" in service else "<missing>"
-        raise AdapterError(
-            f"L2 service {service_name!r} has unsupported service_type {value}.",
-            code="invalid_response",
-        )
+        if not isinstance(service_name, str) or not service_name:
+            raise AdapterError("L2 service names must be non-empty strings.", code="invalid_response")
+        service_type = service.get("service_type")
+        if not isinstance(service_type, str) or service_type not in _L2VPN_TYPE:
+            value = repr(service_type) if "service_type" in service else "<missing>"
+            raise AdapterError(
+                f"L2 service {service_name!r} has unsupported service_type {value}.",
+                code="invalid_response",
+            )
+        saps = service.get("saps", [])
+        if not isinstance(saps, list):
+            raise AdapterError(f"L2 service {service_name!r} SAPs must be a list.", code="invalid_response")
+        for sap in saps:
+            if not isinstance(sap, dict):
+                raise AdapterError("L2 SAP entries must be objects.", code="invalid_response")
+            for field_name in ("sap_id", "port"):
+                value = sap.get(field_name)
+                if not isinstance(value, str) or not value:
+                    raise AdapterError(
+                        f"L2 SAP {field_name} values must be non-empty strings.",
+                        code="invalid_response",
+                    )
     return services
 
 
@@ -105,10 +122,8 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
         operations.append((instance, update_fields, force_insert))
 
     for service in services:
-        if not isinstance(service, dict):
-            continue
-        service_name = service.get("service_name")
-        if not service_name or service_name in reported_services:
+        service_name = service["service_name"]
+        if service_name in reported_services:
             continue
         reported_services.add(service_name)
         service_type = service["service_type"]
@@ -140,11 +155,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
                 save(l2vpn, update_fields=fields)
                 l2vpns[slug] = l2vpn
 
-        raw_saps = service.get("saps", [])
-        saps = raw_saps if isinstance(raw_saps, list) else []
-        for sap in saps:
-            if not isinstance(sap, dict) or not sap.get("sap_id"):
-                continue
+        for sap in service.get("saps", []):
             key = (service_name, sap["sap_id"])
             if key in reported:
                 continue

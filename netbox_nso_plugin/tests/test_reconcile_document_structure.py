@@ -145,6 +145,8 @@ def test_defaulted_constant_lookup_allows_a_literal_unmapped_sentinel():
     assert _defaulted_constant_lookups(source) == []
 
 
-def test_interface_mtu_validation_is_separate_from_resolution_skips():
-    path = _PACKAGE_ROOT / "interface_mtu_reconciler.py"
-    assert _validation_and_skip_loops(path) == []
+def test_reconciler_validation_is_separate_from_resolution_skips():
+    violations = []
+    for path in sorted(_PACKAGE_ROOT.glob("*_reconciler.py")):
+        violations.extend(_validation_and_skip_loops(path))
+    assert violations == []

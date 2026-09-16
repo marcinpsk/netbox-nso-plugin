@@ -140,6 +140,14 @@ class TestReadStatePassthrough(unittest.TestCase):
         out = self._fetch("get_l2_services", {"device_id": 9, "read_state": _READ_STATE, "services": []}, 9)
         self.assertEqual(out.get("read_state"), _READ_STATE)
 
+    def test_l2_rebuilder_rejects_a_non_object_body(self):
+        from netbox_nso_plugin import adapter_client
+
+        with self.assertRaises(adapter_client.AdapterError) as raised:
+            self._fetch("get_l2_services", [], 9)
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_bfd_rebuilder_keeps_read_state(self):
         out = self._fetch("get_bfd", {"device_id": 9, "read_state": _READ_STATE, "interfaces": []}, 9)
         self.assertEqual(out.get("read_state"), _READ_STATE)

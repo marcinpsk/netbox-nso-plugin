@@ -44,6 +44,110 @@ class TestReconcileL2Services(TestCase):
         cls.lag = Interface.objects.create(device=cls.device, name="lag-60", type="lag")
         cls.extra_port = Interface.objects.create(device=cls.device, name="1/1/c31/4", type="other")
 
+    def _service(self, name="VALID", *, port=None, sap_id=None):
+        port = port or self.lag.name
+        sap_id = sap_id or f"{port}:9000"
+        return {
+            "service_name": name,
+            "service_type": "vpls",
+            "service_id": 9000,
+            "saps": [{"sap_id": sap_id, "port": port, "outer_tag": 9000, "inner_tag": None}],
+        }
+
+    def _seed_imported_sap(self):
+        service = self._service("EXISTING", port=self.port.name, sap_id=f"{self.port.name}:4022")
+        service["service_type"] = "epipe"
+        service["service_id"] = 4022
+        service["saps"][0]["outer_tag"] = 4022
+        reconcile_l2_services(self.device, _payload([service]))
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name="EXISTING")
+        self.assertEqual(state.status, "imported")
+
+    def _assert_invalid_document_preserves_tables(self, payload):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        self._seed_imported_sap()
+        before = _l2_table_snapshot()
+        error = None
+
+        try:
+            reconcile_l2_services(self.device, payload)
+        except AdapterError as exc:
+            error = exc
+
+        self.assertEqual(_l2_table_snapshot(), before)
+        self.assertIsNotNone(error)
+        self.assertEqual(error.code, "invalid_response")
+
+    def test_non_object_payload_is_rejected_without_writes(self):
+        self._assert_invalid_document_preserves_tables([])
+
+    def test_non_list_services_are_rejected_without_writes(self):
+        self._assert_invalid_document_preserves_tables({"services": {}})
+
+    def test_non_object_service_after_valid_service_is_rejected_without_writes(self):
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), None]))
+
+    def test_missing_service_name_is_rejected_without_writes(self):
+        invalid = self._service("INVALID")
+        invalid.pop("service_name")
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), invalid]))
+
+    def test_empty_service_name_is_rejected_without_writes(self):
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), self._service("")]))
+
+    def test_non_string_service_name_is_rejected_without_writes(self):
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), self._service(7)]))
+
+    def test_non_list_saps_are_rejected_without_writes(self):
+        invalid = self._service("INVALID")
+        invalid["saps"] = {}
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), invalid]))
+
+    def _assert_invalid_sap_is_rejected(self, invalid_sap):
+        service = self._service("INVALID", port=self.extra_port.name)
+        service["saps"].append(invalid_sap)
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), service]))
+
+    def test_non_object_sap_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected(None)
+
+    def test_missing_sap_id_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected({"port": self.extra_port.name, "outer_tag": 9001, "inner_tag": None})
+
+    def test_empty_sap_id_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected(
+            {"sap_id": "", "port": self.extra_port.name, "outer_tag": 9001, "inner_tag": None}
+        )
+
+    def test_non_string_sap_id_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected(
+            {"sap_id": 7, "port": self.extra_port.name, "outer_tag": 9001, "inner_tag": None}
+        )
+
+    def test_missing_sap_port_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected(
+            {"sap_id": f"{self.extra_port.name}:9001", "outer_tag": 9001, "inner_tag": None}
+        )
+
+    def test_empty_sap_port_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected(
+            {"sap_id": f"{self.extra_port.name}:9001", "port": "", "outer_tag": 9001, "inner_tag": None}
+        )
+
+    def test_non_string_sap_port_is_rejected_without_writes(self):
+        self._assert_invalid_sap_is_rejected(
+            {"sap_id": f"{self.extra_port.name}:9001", "port": 7, "outer_tag": 9001, "inner_tag": None}
+        )
+
+    def test_absent_services_is_an_authoritative_empty_snapshot(self):
+        self._seed_imported_sap()
+
+        reconcile_l2_services(self.device, {"device_id": 1})
+
+        state = NSOL2SapState.objects.get(management=self.mgmt, service_name="EXISTING")
+        self.assertEqual(state.status, "changed")
+
     def _assert_invalid_service_type_rejected(self, invalid_service, expected_value):
         from netbox_nso_plugin.adapter_client import AdapterError
 

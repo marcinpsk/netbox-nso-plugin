@@ -898,6 +898,8 @@ def get_l2_services(adapter_device_id: int) -> dict:
     The shape rebuild passes ``read_state`` through.
     """
     data = _request("GET", f"/api/v1/devices/{adapter_device_id}/l2-services")
+    if not isinstance(data, dict):
+        raise AdapterError("Adapter returned a malformed L2 services document.", code="invalid_response")
     out = {"services": data.get("services", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
