@@ -633,24 +633,61 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         self.assertEqual(state.nso_next_hop, "10.0.0.1")
         self._assert_put_patch_did_not_leak()
 
-    def test_the_overlay_lock_is_taken_in_ascending_management_id_order(self):
-        """P2.9(c) — a fan-out over an unordered queryset can take the same two rows in
-        opposite orders in two transactions, which deadlocks the operator's save."""
-        from django.test.utils import CaptureQueriesContext
+    def test_exact_metric_writer_locks_each_owned_overlay_before_the_native_update(self):
+        import copy
+
+        from django.db.utils import OperationalError
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         with _fixtures():
-            sr = _route("10.37.0.0/16", "10.0.0.1", devices=[self.d1, self.d2])
-            _own(sr, self.mgmt1, status="in_sync")
-            _own(sr, self.mgmt2, status="in_sync")
+            route = _route("10.37.0.0/16", "10.0.0.1", devices=[self.d1, self.d2])
+            first = _own(route, self.mgmt1, status="in_sync")
+            second = _own(route, self.mgmt2, status="in_sync")
+        candidate = copy.copy(route)
+        candidate.metric = 51
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("metric",)),))
+        overlay_label = NSOStaticRouteState._meta.label_lower
+        expected_pks = tuple(row.pk for row in plan.lock_footprint.overlay_rows if row.model_label == overlay_label)
+        self.assertEqual(set(expected_pks), {first.pk, second.pk})
+        statements = []
+        probe_results = []
 
-        with patch(PUT), CaptureQueriesContext(connection) as queries:
-            with transaction.atomic():
-                sr.metric = 51
-                sr.save(update_fields=["metric"])
+        def observe_sql(execute, sql, params, many, context):
+            statements.append((str(sql), tuple(params or ())))
+            return execute(sql, params, many, context)
 
-        locking = [q["sql"] for q in queries.captured_queries if "FOR UPDATE" in q["sql"]]
-        self.assertTrue(locking, "the fan-out must lock the overlays it re-arms")
-        self.assertTrue(
-            any("ORDER BY" in sql and "management_id" in sql for sql in locking),
-            f"no management-id-ordered lock among {locking}",
-        )
+        def probe_overlay_locks():
+            try:
+                for pk in expected_pks:
+                    try:
+                        with transaction.atomic():
+                            NSOStaticRouteState.objects.select_for_update(nowait=True).get(pk=pk)
+                    except OperationalError as exc:
+                        probe_results.append((pk, getattr(exc.__cause__, "sqlstate", None)))
+                    else:
+                        probe_results.append((pk, "unlocked"))
+            finally:
+                connections.close_all()
+
+        with patch(PUT), connection.execute_wrapper(observe_sql):
+            with renderer_writes(plan) as writer:
+                contender = threading.Thread(target=probe_overlay_locks)
+                contender.start()
+                contender.join(timeout=30)
+                self.assertFalse(contender.is_alive(), "the overlay lock probe did not finish")
+                self.assertEqual(probe_results, [(pk, "55P03") for pk in expected_pks])
+                writer.save(candidate, update_fields=("metric",))
+
+        overlay_table = NSOStaticRouteState._meta.db_table
+        native_table = route._meta.db_table
+        overlay_locks = [
+            (index, params[-1])
+            for index, (sql, params) in enumerate(statements)
+            if f'FROM "{overlay_table}"' in sql and "FOR UPDATE" in sql
+        ]
+        native_updates = [index for index, (sql, _params) in enumerate(statements) if f'UPDATE "{native_table}"' in sql]
+        self.assertEqual([pk for _index, pk in overlay_locks], list(expected_pks))
+        self.assertEqual(len(native_updates), 1)
+        self.assertTrue(all(index < native_updates[0] for index, _pk in overlay_locks))
