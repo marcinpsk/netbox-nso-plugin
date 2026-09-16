@@ -70,7 +70,6 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
     if not isinstance(items, list):
         raise AdapterError("VLAN payload vlans must be a list", code="invalid_response")
     normalized = []
-    seen = set()
     for item in items:
         if not isinstance(item, dict):
             raise AdapterError("VLAN payload entry must be an object", code="invalid_response")
@@ -78,14 +77,19 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
             vlan_id = _validated_vlan_id(item.get("vlan_id"), "VLAN payload entry vlan_id")
         except AdapterError as exc:
             raise AdapterError(f"VLAN payload entry is invalid: {exc}", code="invalid_response") from exc
-        if vlan_id in seen:
-            continue
         name = item.get("name")
         if name is not None and not isinstance(name, str):
             raise AdapterError("VLAN payload entry name must be a string or null", code="invalid_response")
-        seen.add(vlan_id)
         normalized.append({**item, "vlan_id": vlan_id})
-    return tuple(normalized)
+
+    deduplicated = []
+    seen = set()
+    for item in normalized:
+        if item["vlan_id"] in seen:
+            continue
+        seen.add(item["vlan_id"])
+        deduplicated.append(item)
+    return tuple(deduplicated)
 
 
 def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:

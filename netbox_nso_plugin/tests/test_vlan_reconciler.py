@@ -66,6 +66,27 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         self.assertEqual(rows[0].device_name, "FIRST")
         self.assertEqual(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).count(), 1)
 
+    def test_vlan_reconciler_rejects_a_malformed_repeated_vlan_entry(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        def snapshot():
+            return (
+                tuple(VLAN.objects.order_by("pk").values_list()),
+                tuple(NSOVLANState.objects.order_by("pk").values_list()),
+            )
+
+        before = snapshot()
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_vlan_database(
+                self.device,
+                {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627, "name": 123}]},
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(str(raised.exception), "VLAN payload entry name must be a string or null")
+        self.assertEqual(snapshot(), before)
+
     def test_same_vid_states_do_not_hide_an_unreported_attachment(self):
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
