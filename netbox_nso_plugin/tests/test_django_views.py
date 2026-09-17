@@ -7159,6 +7159,67 @@ class TestBfdGrid(ViewTestBase):
         self.assertEqual(embedded["counts"], {"all": 3, "drift": 1, "pending": 1})
 
 
+class TestMalformedRoutingCategoryResponses(ViewTestBase):
+    """Malformed adapter documents keep routing categories available from persisted state."""
+
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOISISInterfaceState
+
+        self.mgmt.adapter_device_id = 4242
+        self.mgmt.save(update_fields=["adapter_device_id"])
+        self.isis_interface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+        self.bfd_interface = Interface.objects.create(device=self.device, name="Ethernet2", type="1000base-t")
+        NSOISISInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.isis_interface,
+            af="ipv4",
+            process_tag="CORE",
+            status="imported",
+        )
+        NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.bfd_interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="imported",
+        )
+
+    def _get_with_empty_adapter_response(self, key):
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": key},
+        )
+        session = make_session(content=b"")
+        config = {
+            "url": "http://adapter.example",
+            "token": "test-token",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=config),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            return self.client.get(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+    def test_isis_category_renders_persisted_rows_after_invalid_response(self):
+        response = self._get_with_empty_adapter_response("isis")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "The NSO adapter returned an invalid response")
+        self.assertContains(response, self.isis_interface.name)
+
+    def test_bfd_category_renders_persisted_rows_after_invalid_response(self):
+        response = self._get_with_empty_adapter_response("bfd")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "The NSO adapter returned an invalid response")
+        self.assertContains(response, self.bfd_interface.name)
+
+
 class TestGridCategoryPayloads(ViewTestBase):
     """Structural guard for every client-side grid category (nso-grid.js).
 

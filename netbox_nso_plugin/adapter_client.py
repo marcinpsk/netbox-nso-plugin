@@ -334,6 +334,12 @@ class AdapterError(Exception):
         return {"error": {"code": self.code, "message": public_error_message(self)}}
 
 
+def _document(data, what: str) -> dict:
+    if isinstance(data, dict):
+        return data
+    raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
+
+
 _PUBLIC_ERROR_MESSAGES = {
     "configuration_error": "The NSO adapter is not configured. See the server log.",
     "invalid_response": "The NSO adapter returned an invalid response. See the server log.",
@@ -885,6 +891,7 @@ def get_isis_interfaces(adapter_device_id: int) -> dict:
     under the reconcile gate. The shape rebuild passes ``read_state`` through.
     """
     data = _request("GET", f"/api/v1/devices/{adapter_device_id}/isis-interfaces")
+    data = _document(data, "IS-IS interfaces document")
     out = {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
@@ -898,8 +905,7 @@ def get_l2_services(adapter_device_id: int) -> dict:
     The shape rebuild passes ``read_state`` through.
     """
     data = _request("GET", f"/api/v1/devices/{adapter_device_id}/l2-services")
-    if not isinstance(data, dict):
-        raise AdapterError("Adapter returned a malformed L2 services document.", code="invalid_response")
+    data = _document(data, "L2 services document")
     out = {"services": data.get("services", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
@@ -913,6 +919,7 @@ def get_bfd(adapter_device_id: int) -> dict:
     The shape rebuild passes ``read_state`` through.
     """
     data = _request("GET", f"/api/v1/devices/{adapter_device_id}/bfd")
+    data = _document(data, "BFD document")
     out = {"interfaces": data.get("interfaces", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
@@ -1019,8 +1026,7 @@ def get_device_apply_state(adapter_device_id: int) -> dict:
     from .apply_settlement import GENERATION_DISPOSITIONS
 
     state = _request("GET", f"/api/v1/devices/{adapter_device_id}/apply-state")
-    if not isinstance(state, dict):
-        raise AdapterError("Adapter returned a malformed Apply state.", code="invalid_response")
+    state = _document(state, "Apply state")
     expected_types = {
         "device_id": int,
         "blocked": bool,
@@ -1212,7 +1218,8 @@ def get_static_route_intent(adapter_device_id):
     one looks like a legitimate answer and is counted as settled.
     """
     echoed = _request("GET", f"/api/v1/devices/{adapter_device_id}/static-route-intent")
-    if not isinstance(echoed, dict) or not isinstance(echoed.get("routes"), list):
+    echoed = _document(echoed, "static-route intent read-back")
+    if not isinstance(echoed.get("routes"), list):
         raise AdapterError("Adapter returned a malformed static-route intent read-back.", code="invalid_response")
     return echoed
 
