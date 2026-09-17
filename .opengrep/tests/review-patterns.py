@@ -12,6 +12,9 @@ def suppressed_push(device):
     with suppress_intent_push():
         # ruleid: nso-push-inside-suppression
         _schedule_intent_push(device, "ip")
+    with suppress_intent_push(), patch("netbox_nso_plugin.signals.logger"):
+        # ruleid: nso-push-inside-suppression
+        _schedule_intent_push(device, "ip")
     # ok: nso-push-inside-suppression
     _schedule_intent_push(device, "ip")
 
