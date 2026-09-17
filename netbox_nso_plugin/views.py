@@ -7286,11 +7286,17 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):  # noqa: D102
         from . import adapter_client
+        from .vault_refs import VaultRefError, parse_vault_ref
 
         state = get_object_or_404(NSOSnmpV3UserState, pk=pk)
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
             messages.error(request, "No Vault ref on this v3 user. Set one (or secret values) first.")
+            return redirect(redirect_url)
+        try:
+            parse_vault_ref(state.vault_ref, require_key=False)
+        except VaultRefError as exc:
+            messages.error(request, f"Bad Vault ref: {exc}")
             return redirect(redirect_url)
         try:
             result = adapter_client.verify_secret(state.vault_ref)

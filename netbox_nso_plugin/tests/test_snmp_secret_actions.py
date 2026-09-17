@@ -494,6 +494,51 @@ class TestVerifyAndHarvestViews(_SecretBase):
             self.assertEqual(row.vault_secret_hash, "")
             self.assertIsNone(row.vault_secret_version)
 
+    def test_verify_v3_rejects_keyed_vault_ref_before_adapter_request(self):
+        from django.contrib import messages
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSOSnmpV3UserState
+
+        mgmt = self._make_mgmt()
+        row = NSOSnmpV3UserState.objects.create(
+            management=mgmt,
+            username="alice",
+            vault_ref="network/snmp/v3/alice#auth",
+            vault_has_auth=True,
+            vault_has_priv=True,
+        )
+        session = make_session(
+            json_data={
+                "operation_id": "placeholder-operation",
+                "status": "present",
+                "fingerprint": secret_fingerprint("auth-secret"),
+                "has_auth": False,
+                "has_priv": False,
+                "version": 1,
+            }
+        )
+        self.client.force_login(_superuser())
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:snmp_verify_v3_user_secret", kwargs={"pk": row.pk}),
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, row.get_absolute_url())
+        error_messages = [message for message in get_messages(response.wsgi_request) if message.level == messages.ERROR]
+        self.assertEqual(len(error_messages), 1)
+        self.assertIn("Bad Vault ref", str(error_messages[0]))
+        self.assertIn(row.vault_ref, str(error_messages[0]))
+        row.refresh_from_db()
+        self.assertTrue(row.vault_has_auth)
+        self.assertTrue(row.vault_has_priv)
+        session.request.assert_not_called()
+
     def test_verify_v3_records_field_presence(self):
         from netbox_nso_plugin.models import NSOSnmpV3UserState
 
@@ -527,6 +572,15 @@ class TestVerifyAndHarvestViews(_SecretBase):
         row.refresh_from_db()
         self.assertTrue(row.vault_has_auth)
         self.assertFalse(row.vault_has_priv)
+        verification_calls = [
+            request_call
+            for request_call in session.request.call_args_list
+            if request_call.args[:2] == ("POST", "http://adapter.local/api/v1/secrets/verify")
+        ]
+        self.assertEqual(len(verification_calls), 1)
+        method, url = verification_calls[0].args[:2]
+        self.assertEqual((method, url), ("POST", "http://adapter.local/api/v1/secrets/verify"))
+        self.assertEqual(verification_calls[0].kwargs["json"], {"vault_ref": row.vault_ref})
 
     def test_verify_v3_displays_unknown_version(self):
         from netbox_nso_plugin.models import NSOSnmpV3UserState
