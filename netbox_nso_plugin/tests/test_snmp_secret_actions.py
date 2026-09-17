@@ -362,15 +362,20 @@ class TestVerifyAndHarvestViews(_SecretBase):
 
     def test_verify_community_displays_unknown_version(self):
         mgmt = self._make_mgmt()
+        fingerprint = "0123456789abcdef"
         row = self._community(
-            mgmt, vault_ref="network/netbox/snmp/community/oldhash1234567890#community", status="accepted"
+            mgmt,
+            community_hash=fingerprint,
+            vault_ref=f"network/netbox/snmp/community/{fingerprint}#community",
+            status="accepted",
         )
         session = make_session(
             json_data={
-                "vault_ref": row.vault_ref,
-                "exists": True,
-                "fields": ["community"],
-                "hashes": {"community": row.community_hash},
+                "operation_id": "placeholder-operation",
+                "status": "present",
+                "fingerprint": fingerprint,
+                "has_auth": False,
+                "has_priv": False,
                 "version": None,
             }
         )
@@ -381,9 +386,9 @@ class TestVerifyAndHarvestViews(_SecretBase):
         ):
             resp = self.client.post(f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/", follow=True)
         self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, "Vault secret verified (v?)")
+        self.assertContains(resp, "Vault secret verified (v?): matches the device value.")
         row.refresh_from_db()
-        self.assertEqual(row.vault_secret_hash, row.community_hash)
+        self.assertEqual(row.vault_secret_hash, fingerprint)
         self.assertIsNone(row.vault_secret_version)
 
     def test_verify_community_accepts_unversioned_existing_path_results(self):
@@ -416,7 +421,7 @@ class TestVerifyAndHarvestViews(_SecretBase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Vault secret verified (vNone): matches the device value.")
+        self.assertContains(response, "Vault secret verified (v?): matches the device value.")
         row.refresh_from_db()
         self.assertEqual(row.vault_secret_hash, fingerprint)
         self.assertIsNone(row.vault_secret_version)
@@ -532,10 +537,11 @@ class TestVerifyAndHarvestViews(_SecretBase):
         )
         session = make_session(
             json_data={
-                "vault_ref": row.vault_ref,
-                "exists": True,
-                "fields": ["auth"],
-                "hashes": {"auth": "x"},
+                "operation_id": "placeholder-operation",
+                "status": "present",
+                "fingerprint": None,
+                "has_auth": True,
+                "has_priv": False,
                 "version": None,
             }
         )
