@@ -6,10 +6,16 @@ rules:
     severity: ERROR
     message: Schedule the intent push after the suppression context exits.
     patterns:
-      - pattern-inside: |
-          with suppress_intent_push():
-              ...
-      - pattern: _schedule_intent_push(...)
+      - pattern-either:
+          - pattern-inside: |
+              with suppress_intent_push():
+                  ...
+          - pattern-inside: |
+              with $MODULE.suppress_intent_push():
+                  ...
+      - pattern-either:
+          - pattern: _schedule_intent_push(...)
+          - pattern: $SIGNALS._schedule_intent_push(...)
   - id: nso-tautological-assertion
     languages: [python]
     severity: ERROR

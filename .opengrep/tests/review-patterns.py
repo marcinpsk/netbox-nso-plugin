@@ -6,6 +6,7 @@ from unittest.mock import patch
 from threading import BrokenBarrierError
 from ipam.models import VLANGroup
 from netbox_nso_plugin.signals import suppress_intent_push, _schedule_intent_push
+from netbox_nso_plugin import signals
 
 
 def suppressed_push(device):
@@ -15,6 +16,14 @@ def suppressed_push(device):
     with suppress_intent_push(), patch("netbox_nso_plugin.signals.logger"):
         # ruleid: nso-push-inside-suppression
         _schedule_intent_push(device, "ip")
+    with signals.suppress_intent_push():
+        # ruleid: nso-push-inside-suppression
+        signals._schedule_intent_push(device, "ip")
+    with signals.suppress_intent_push(), patch("netbox_nso_plugin.signals.logger"):
+        # ruleid: nso-push-inside-suppression
+        _schedule_intent_push(device, "ip")
+    # ok: nso-push-inside-suppression
+    signals._schedule_intent_push(device, "ip")
     # ok: nso-push-inside-suppression
     _schedule_intent_push(device, "ip")
 

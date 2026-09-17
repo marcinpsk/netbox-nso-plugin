@@ -44,7 +44,7 @@ References checked on 2026-09-12:
 
 | Issue class | Mechanical check | Limit |
 | --- | --- | --- |
-| Push scheduled while suppression is active | `nso-push-inside-suppression` | Direct calls in a suppression context. It does not follow helper calls. |
+| Push scheduled while suppression is active | `nso-push-inside-suppression` | Direct or module-qualified calls (`signals.suppress_intent_push()`) in a suppression context. It does not follow helper calls. |
 | Assertion compares a value with itself | `nso-tautological-assertion` | Literal assertion shapes, not proof that every assertion reaches the intended path. |
 | Global monotonic clock patched through a module | `nso-global-monotonic-patch` | Literal `patch` targets that name `time.monotonic`. |
 | Race test hides a broken barrier | `nso-swallowed-barrier-failure` | Exception handlers that contain only `pass` or a bare `return`. |
