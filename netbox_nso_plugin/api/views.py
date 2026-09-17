@@ -78,6 +78,41 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
     serializer_class = NSOInterfaceStateSerializer
     filterset_class = NSOInterfaceStateFilterSet
 
+    def perform_update(self, serializer):
+        """Apply an API overlay update through one exact renderer plan."""
+        import copy
+
+        from django.core.exceptions import FieldDoesNotExist
+
+        from ..intent_state import IntentMutationProtocolError, normalize_overlay_lifecycle
+        from ..renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
+
+        candidate = copy.copy(serializer.instance)
+        if "status" in serializer.validated_data:
+            candidate._nso_explicit_status_update = True
+        for field_name, value in serializer.validated_data.items():
+            try:
+                field = candidate._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                if field_name in {"add_tags", "remove_tags"}:
+                    continue
+                if field_name == "changelog_message":
+                    continue
+                raise IntentMutationProtocolError(f"unsupported serializer-only field {field_name!r}")
+            if field.many_to_many:
+                if field_name != "tags":
+                    raise IntentMutationProtocolError(f"unsupported deferred M2M field {field_name!r}")
+                continue
+            setattr(candidate, field_name, value)
+
+        if "status" not in serializer.validated_data:
+            normalize_overlay_lifecycle(candidate, serializer.validated_data)
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate),))
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        serializer.instance = candidate
+        with mutation as writer:
+            writer.save_via(candidate, serializer.save)
+
 
 class NSOLinkRoleViewSet(NetBoxModelViewSet):
     """REST API for NSOLinkRole — the configurable provisioning catalog."""

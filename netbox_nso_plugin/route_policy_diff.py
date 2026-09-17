@@ -272,12 +272,11 @@ def route_map_diff(device_captured: dict | None, netbox_captured: dict | None) -
 
 
 def netbox_route_map_captured(rm_obj) -> dict:
-    """Reconstruct a capture-shaped dict from a materialised ``RouteMap`` (inverse of the fill).
+    """Reconstruct a capture-shaped dict from a materialized ``RouteMap``.
 
-    Mirrors what ``route_policy_reconciler._fill_route_map_entries`` wrote, so feeding this back
-    through ``summarize_route_map`` yields the same projection as the device capture would for
-    identical content. ``match`` / ``set`` blobs round-trip as dicts (``summarize`` accepts
-    either dicts or JSON strings); ``flow_control`` is folded back into the set blob.
+    Mirrors the graph planner's stored fields. Feeding this back through
+    ``summarize_route_map`` yields the same projection as an identical device capture.
+    ``match`` and ``set`` blobs round-trip as dicts. ``flow_control`` returns to the set blob.
     """
     entries = []
     qs = rm_obj.route_map_entries.all().prefetch_related("match_prefix_list", "match_community_list", "match_aspath")

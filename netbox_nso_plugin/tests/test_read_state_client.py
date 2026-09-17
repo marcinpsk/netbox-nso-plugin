@@ -118,10 +118,10 @@ class TestReadStatePassthrough(unittest.TestCase):
     """Every fetcher must RETAIN a served read_state — including the shape-rebuilders
     (isis/l2/bfd), whose dict reconstruction silently dropped unknown keys."""
 
-    def _fetch(self, fn_name, body, *args):
+    def _fetch(self, fn_name, body, *args, raw=False):
         from netbox_nso_plugin import adapter_client
 
-        session = make_session(status_code=200, json_data=body)
+        session = make_session(status_code=200, content=body) if raw else make_session(status_code=200, json_data=body)
         with (
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
@@ -136,13 +136,40 @@ class TestReadStatePassthrough(unittest.TestCase):
         )
         self.assertEqual(out.get("read_state"), _READ_STATE)
 
+    def test_isis_rebuilder_rejects_non_object_bodies(self):
+        from netbox_nso_plugin import adapter_client
+
+        for label, body in (("empty", b""), ("null", b"null"), ("list", b"[]")):
+            with self.subTest(body=label):
+                with self.assertRaises(adapter_client.AdapterError) as raised:
+                    self._fetch("get_isis_interfaces", body, 9, raw=True)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_l2_rebuilder_keeps_read_state(self):
         out = self._fetch("get_l2_services", {"device_id": 9, "read_state": _READ_STATE, "services": []}, 9)
         self.assertEqual(out.get("read_state"), _READ_STATE)
 
+    def test_l2_rebuilder_rejects_non_object_bodies(self):
+        from netbox_nso_plugin import adapter_client
+
+        for label, body in (("empty", b""), ("null", b"null"), ("list", b"[]")):
+            with self.subTest(body=label):
+                with self.assertRaises(adapter_client.AdapterError) as raised:
+                    self._fetch("get_l2_services", body, 9, raw=True)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_bfd_rebuilder_keeps_read_state(self):
         out = self._fetch("get_bfd", {"device_id": 9, "read_state": _READ_STATE, "interfaces": []}, 9)
         self.assertEqual(out.get("read_state"), _READ_STATE)
+
+    def test_bfd_rebuilder_rejects_non_object_bodies(self):
+        from netbox_nso_plugin import adapter_client
+
+        for label, body in (("empty", b""), ("null", b"null"), ("list", b"[]")):
+            with self.subTest(body=label):
+                with self.assertRaises(adapter_client.AdapterError) as raised:
+                    self._fetch("get_bfd", body, 9, raw=True)
+                self.assertEqual(raised.exception.code, "invalid_response")
 
     def test_passthrough_fetcher_keeps_read_state(self):
         out = self._fetch("get_static_routes", {"device_id": 9, "read_state": _READ_STATE, "routes": []}, 9)

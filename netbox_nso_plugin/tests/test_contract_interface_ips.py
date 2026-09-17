@@ -16,7 +16,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState
-from netbox_nso_plugin.template_content import _reconcile_interface_ips
+from netbox_nso_plugin.template_content import _reconcile_interface_ips, interface_ip_reconcile_plan
 
 TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "interfaces"}
 IFACE_KEYS = {"interface", "bound_port", "addresses"}
@@ -65,3 +65,16 @@ class TestInterfaceIpsContractConsumer(TestCase):
         state = NSOInterfaceIPState.objects.get(interface__name="GE0/0", address="10.0.0.1/24")
         self.assertEqual(state.family, "ipv4")
         self.assertFalse(state.secondary)
+
+    def test_reconcile_preflight_is_an_exact_renderer_plan(self):
+        """Preflight freezes the native IP and overlay creations before the read write."""
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan
+
+        plan = interface_ip_reconcile_plan(self.device, CONTRACT_PAYLOAD)
+
+        self.assertIsInstance(plan, RendererMutationPlan)
+        self.assertEqual(
+            [(write.operation, write.model_label) for write in plan.write_set],
+            [("save", "netbox_nso_plugin.nsointerfaceipstate")],
+        )
+        self.assertTrue(plan.write_set[0].force_insert)

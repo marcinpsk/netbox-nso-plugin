@@ -4,28 +4,32 @@
 
 The recent bugs lived in the *transitions* between states and in how those
 transitions surfaced on the tab — not in any single state. The existing
-test_signals.py unit-tests each Decision-G transition in isolation; this file walks
-one interface through the whole arc with REAL ``Interface.save()`` calls (so the
-connected pre_save/post_save signals fire naturally) and asserts the user-facing
-classification (``summary.interface_row_state``) after every step. That ties signals
-(ownership) and summary (display) together — the seam where the surprises happened.
+test_signals.py tests signal gating in isolation. This file walks one interface
+through the full arc with exact native and overlay writer plans. It asserts the
+user-facing classification (``summary.interface_row_state``) after every step.
 
 Runs against the full NetBox stack (devcontainer).
 """
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+from core.models import ObjectType
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.contrib.auth import get_user_model
 from django.test import TestCase
-from netbox.context import current_request
+from django.urls import reverse
+from users.models import ObjectPermission
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 from netbox_nso_plugin.summary import interface_row_state
 
 from ._outbox_case import mirror_update
+from .mixins import IntentPushDeliveryMixin
 
 
-class TestInterfaceOwnershipLifecycle(TestCase):
+class TestInterfaceOwnershipLifecycle(IntentPushDeliveryMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LcMfg", slug="lcmfg")
@@ -46,6 +50,7 @@ class TestInterfaceOwnershipLifecycle(TestCase):
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def setUp(self):
+        super().setUp()
         # Fresh interface + imported state per test (matching device value).
         self.iface = Interface.objects.create(
             device=self.device, name="ge-0/0/0", type="1000base-t", description="dev-desc", enabled=True
@@ -53,6 +58,11 @@ class TestInterfaceOwnershipLifecycle(TestCase):
         self.state = NSOInterfaceState.objects.create(
             interface=self.iface, attribute="description", status="imported", nso_value="dev-desc"
         )
+        user = get_user_model().objects.create_user(username="lifecycle-operator")
+        permission = ObjectPermission.objects.create(name="lifecycle-change-management", actions=["change"])
+        permission.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
+        permission.users.add(user)
+        self.client.force_login(user)
 
     def _classify(self, attribute="description"):
         """Return interface_row_state for an attribute after refreshing from DB."""
@@ -61,16 +71,23 @@ class TestInterfaceOwnershipLifecycle(TestCase):
         return interface_row_state(st, self.iface)
 
     def _operator_edit(self, **fields):
-        """Edit the interface AS AN OPERATOR (no adapter header) via a real save, so the
-        connected Decision-G pre/post_save signals fire and (maybe) take ownership."""
-        token = current_request.set(None)
-        try:
+        """Edit and acquire one interface attribute through the operator view."""
+        self.assertEqual(len(fields), 1)
+        attribute, value = next(iter(fields.items()))
+        state = NSOInterfaceState.objects.get(interface=self.iface, attribute=attribute)
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[state.pk])
+        raw_value = str(value).lower() if isinstance(value, bool) else value
+        with patch("netbox_nso_plugin.adapter_client.put_intent"):
             with self.captureOnCommitCallbacks(execute=True):
-                for k, v in fields.items():
-                    setattr(self.iface, k, v)
-                self.iface.save(update_fields=list(fields))
-        finally:
-            current_request.reset(token)
+                response = self.client.post(
+                    url,
+                    {"value": raw_value},
+                    HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+                )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+        self.iface.refresh_from_db()
+        state.refresh_from_db()
 
     def _adapter_writes(self, attribute="description", **fields):
         """Simulate an adapter sync writing state (never touches accepted_at)."""

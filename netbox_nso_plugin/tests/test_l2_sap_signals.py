@@ -144,8 +144,8 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
             },
         )[0]
 
-    def test_save_triggers_intent_push(self):
-        """Saving NSOL2SapState triggers put_l2_sap_intent."""
+    def test_foreign_save_does_not_trigger_intent_push(self):
+        """A foreign overlay save is not ownership evidence."""
         from netbox_nso_plugin.models import NSOL2SapState
 
         mgmt = self._make_mgmt()
@@ -161,8 +161,7 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
             )
             with self.captureOnCommitCallbacks(execute=True):
                 state.save()
-            mock_push.assert_called_once()
-            assert mock_push.call_args[0][0] == 99
+            mock_push.assert_not_called()
 
     def test_no_push_when_no_adapter_device_id(self):
         """No push when management.adapter_device_id is None."""

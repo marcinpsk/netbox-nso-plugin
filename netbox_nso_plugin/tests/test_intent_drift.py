@@ -280,8 +280,13 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         (§4.3(d)), so the claim refuses and the wire stays empty. Appending the key anyway
         told the operator the orphaned intent was gone while the drift was untouched.
         """
-        with without_commit_drain(), transaction.atomic():
-            NSOLoggingHostState.objects.filter(management=self.mgmt).delete()
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        rows = tuple(NSOLoggingHostState.objects.filter(management=self.mgmt).order_by("pk"))
+        plan = RendererMutationPlan.build(deletes=(planned_delete(row) for row in rows))
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            for row in rows:
+                writer.delete(row)
 
         returned: list = []
         calls = self._recorded_requests(

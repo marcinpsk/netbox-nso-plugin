@@ -29,6 +29,7 @@ from ._outbox_case import (
     triple,
     without_commit_drain,
 )
+from ._static_route_case import _delete_owned_route, _edit_owned_route, _touch_owned_route, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -57,7 +58,7 @@ class _LineageCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
 
     def unown(self, route):
         with without_commit_drain():
-            route.devices.remove(self.device)
+            _unassign_and_retire(route, self.device)
 
     def reown(self, route):
         from ._static_route_case import _accept_with_permit
@@ -68,9 +69,7 @@ class _LineageCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase
     def retriple(self, route, prefix, next_hop):
         """Move the route's own content, which is what makes a re-own a DIFFERENT triple."""
         with without_commit_drain(), transaction.atomic():
-            route.prefix, route.next_hop = prefix, next_hop
-            route.save()
-        route.refresh_from_db()
+            _edit_owned_route(route, prefix=prefix, next_hop=next_hop)
 
     def stamp(self, route, value):
         from netbox_nso_plugin.models import NSOStaticRouteState
@@ -102,7 +101,7 @@ class TestTheRecordIsCapturedAtProvenanceTime(_LineageCase):
         self.unown(route)  # the callback never runs; the overlay and the route are gone
         route_id = route.pk
         with without_commit_drain():
-            route.delete()
+            _delete_owned_route(route)
 
         claimed = drain.claim(self.device.pk, "static_route")
         assert [r["route_id"] for r in claimed.deletions] == [route_id]
@@ -253,7 +252,7 @@ class TestTheLineageTransfersAcrossReOwnership(_LineageCase):
         route = own_route(self.mgmt, "198.51.100.128/28", "198.51.100.9")
         self.clear_entries()
 
-        with patch("netbox_nso_plugin.signals._carried_last_acked") as carried:
+        with patch("netbox_nso_plugin.tests._static_route_case._carried_last_acked") as carried:
             with without_commit_drain(), transaction.atomic():
                 _accept_with_permit(route, self.device)
 
@@ -373,7 +372,7 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
         route = own_route(self.mgmt, "198.51.100.224/28", "198.51.100.31")
         self.clear_entries()
         with without_commit_drain(), transaction.atomic():
-            self.mgmt.static_route_states.get(static_route=route).save()
+            _touch_owned_route(route)
 
         assert self.drain(mode=delivery.MODE_BACKFILL_ONLY, force=True) == drain.SUCCEEDED
         assert last_acked(self.mgmt, route) is None
