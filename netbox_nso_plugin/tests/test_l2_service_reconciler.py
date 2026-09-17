@@ -422,6 +422,27 @@ class TestReconcileL2Services(TestCase):
         self.assertEqual(rows, [state])
         self.assertEqual(state.status, "changed")
 
+    def test_frozen_plan_rejects_mutated_payload_without_writes(self):
+        from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan
+        from netbox_nso_plugin.renderer_writer import (
+            IntentMutationProtocolError,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        payload = _payload([self._service()])
+        plan = l2_service_reconcile_plan(self.device, payload)
+        mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+        before = _l2_table_snapshot()
+        payload["services"][0]["saps"][0]["outer_tag"] = 9001
+
+        with self.assertRaises(IntentMutationProtocolError) as raised:
+            with mutation(plan):
+                reconcile_l2_services(self.device, payload)
+
+        self.assertIn("outside the frozen write set", str(raised.exception))
+        self.assertEqual(_l2_table_snapshot(), before)
+
     def test_idempotent_no_duplicate_terminations(self):
         p = _payload(
             [
