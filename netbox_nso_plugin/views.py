@@ -7198,6 +7198,10 @@ def _save_exact_overlay_fields(state, fields):
         writer.save(state, update_fields=fields)
 
 
+def _vault_version_label(version) -> str:
+    return "?" if version is None else str(version)
+
+
 class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
     """Resolve the row's Vault ref via the adapter and store the value fingerprint.
 
@@ -7236,7 +7240,9 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
                 if state.vault_secret_hash == state.community_hash
                 else "DIFFERS from the device value (apply pending, or the device changed out-of-band)"
             )
-            messages.success(request, f"Vault secret verified (v{result.get('version')}) — {verdict}.")
+            messages.success(
+                request, f"Vault secret verified (v{_vault_version_label(result.get('version'))}) — {verdict}."
+            )
         else:
             messages.warning(request, f"Vault has no {key!r} field at {state.vault_ref!r}.")
         return redirect(redirect_url)
@@ -7264,7 +7270,9 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         state.vault_has_priv = "priv" in fields
         _save_exact_overlay_fields(state, ("vault_has_auth", "vault_has_priv"))
         if fields:
-            messages.success(request, f"Vault holds: {', '.join(sorted(fields))} (v{result.get('version')}).")
+            messages.success(
+                request, f"Vault holds: {', '.join(sorted(fields))} (v{_vault_version_label(result.get('version'))})."
+            )
         else:
             messages.warning(request, f"Vault has no secret at {state.vault_ref!r}.")
         return redirect(redirect_url)

@@ -347,11 +347,39 @@ class TestVerifyAndHarvestViews(_SecretBase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
         ):
-            resp = self.client.post(f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/")
-        self.assertEqual(resp.status_code, 302)
+            resp = self.client.post(f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.redirect_chain, [(row.get_absolute_url(), 302)])
+        self.assertContains(resp, "Vault secret verified (v4)")
         row.refresh_from_db()
         self.assertEqual(row.vault_secret_hash, row.community_hash)
         self.assertEqual(row.vault_secret_version, 4)
+
+    def test_verify_community_displays_unknown_version(self):
+        mgmt = self._make_mgmt()
+        row = self._community(
+            mgmt, vault_ref="network/netbox/snmp/community/oldhash1234567890#community", status="accepted"
+        )
+        session = make_session(
+            json_data={
+                "vault_ref": row.vault_ref,
+                "exists": True,
+                "fields": ["community"],
+                "hashes": {"community": row.community_hash},
+                "version": None,
+            }
+        )
+        self.client.force_login(_superuser())
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            resp = self.client.post(f"/plugins/nso/snmp/community-state/{row.pk}/verify-secret/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Vault secret verified (v?)")
+        row.refresh_from_db()
+        self.assertEqual(row.vault_secret_hash, row.community_hash)
+        self.assertIsNone(row.vault_secret_version)
 
     def test_verify_v3_records_field_presence(self):
         from netbox_nso_plugin.models import NSOSnmpV3UserState
@@ -374,8 +402,38 @@ class TestVerifyAndHarvestViews(_SecretBase):
             patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
             patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
         ):
-            resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{row.pk}/verify-secret/")
-        self.assertEqual(resp.status_code, 302)
+            resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{row.pk}/verify-secret/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.redirect_chain, [(row.get_absolute_url(), 302)])
+        self.assertContains(resp, "Vault holds: auth (v1).")
+        row.refresh_from_db()
+        self.assertTrue(row.vault_has_auth)
+        self.assertFalse(row.vault_has_priv)
+
+    def test_verify_v3_displays_unknown_version(self):
+        from netbox_nso_plugin.models import NSOSnmpV3UserState
+
+        mgmt = self._make_mgmt()
+        row = NSOSnmpV3UserState.objects.create(
+            management=mgmt, username="monitor", vault_ref="network/netbox/snmp/v3/monitor"
+        )
+        session = make_session(
+            json_data={
+                "vault_ref": row.vault_ref,
+                "exists": True,
+                "fields": ["auth"],
+                "hashes": {"auth": "x"},
+                "version": None,
+            }
+        )
+        self.client.force_login(_superuser())
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            resp = self.client.post(f"/plugins/nso/snmp/v3-user-state/{row.pk}/verify-secret/", follow=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Vault holds: auth (v?).")
         row.refresh_from_db()
         self.assertTrue(row.vault_has_auth)
         self.assertFalse(row.vault_has_priv)
