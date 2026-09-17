@@ -28,8 +28,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
             resume()
         super().tearDown()
 
-    def test_unknown_baseline_is_repaired_and_verified_before_resume(self):
-        from netbox_nso_plugin.deployment import is_quiesced
+    def _prepare_unknown_vlan_baseline(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision
 
         state = own_vlan(self.management, 1674, "renderer-cutover")
@@ -42,6 +41,13 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
             verified_at=None,
         )
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
+        return state, revision
+
+    def test_unknown_baseline_is_repaired_and_verified_before_resume(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+
+        state, revision = self._prepare_unknown_vlan_baseline()
         stdout = io.StringIO()
 
         with strict_writer_harness() as records:
@@ -57,6 +63,48 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertTrue(revision.verified_fingerprint)
         self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan", kind="repair").exists())
         self.assertIn("Renderer baseline cutover passed", stdout.getvalue())
+
+    def test_resume_failure_reports_that_the_gate_may_remain_active(self):
+        from django.db import DatabaseError
+
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        self._prepare_unknown_vlan_baseline()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+
+        with patch(
+            "netbox_nso_plugin.management.commands.nso_renderer_baseline_cutover.resume",
+            side_effect=failure,
+        ):
+            with self.assertRaises(DatabaseError) as caught:
+                call_command("nso_renderer_baseline_cutover", stdout=stdout, stderr=stderr)
+
+        self.assertIs(caught.exception, failure)
+        self.assertIn("Renderer baseline cutover passed, but intent work may remain quiesced", stderr.getvalue())
+        self.assertNotIn("Renderer baseline cutover passed", stdout.getvalue())
+        self.assertTrue(is_quiesced())
+
+    def test_interrupt_during_resume_reports_that_the_gate_may_remain_active(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        self._prepare_unknown_vlan_baseline()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        failure = KeyboardInterrupt()
+
+        with patch(
+            "netbox_nso_plugin.management.commands.nso_renderer_baseline_cutover.resume",
+            side_effect=failure,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                call_command("nso_renderer_baseline_cutover", stdout=stdout, stderr=stderr)
+
+        self.assertIs(caught.exception, failure)
+        self.assertIn("Renderer baseline cutover passed, but intent work may remain quiesced", stderr.getvalue())
+        self.assertNotIn("Renderer baseline cutover passed", stdout.getvalue())
+        self.assertTrue(is_quiesced())
 
     def test_failure_leaves_the_exclusive_gate_active(self):
         from netbox_nso_plugin.deployment import is_quiesced

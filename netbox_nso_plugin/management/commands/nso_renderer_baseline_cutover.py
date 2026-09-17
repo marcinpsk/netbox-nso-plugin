@@ -54,7 +54,13 @@ class Command(BaseCommand):
             raise CommandError(f"Renderer baseline cutover failed: {exc}") from exc
 
         if created_gate:
-            resume()
+            try:
+                resume()
+            except BaseException:
+                self.stderr.write(
+                    self.style.ERROR("Renderer baseline cutover passed, but intent work may remain quiesced")
+                )
+                raise
         self.stdout.write(
             self.style.SUCCESS(f"Renderer baseline cutover passed: {len(devices)} devices, {repaired} repairs")
         )
