@@ -16,13 +16,20 @@ _L2VPN_TYPE = {"epipe": "vpws", "vpls": "vpls"}
 
 def _validated_l2_services(payload) -> list:
     """Validate one adapter L2 document before planning any changes."""
+    from django.db import connection
+
     from .adapter_client import AdapterError
+    from .models import NSOL2SapState
 
     if not isinstance(payload, dict):
         raise AdapterError("L2 service payload must be an object.", code="invalid_response")
     services = payload.get("services", [])
     if not isinstance(services, list):
         raise AdapterError("L2 services must be a list.", code="invalid_response")
+    value_ranges = {
+        field_name: connection.ops.integer_field_range(NSOL2SapState._meta.get_field(field_name).get_internal_type())
+        for field_name in ("service_id", "outer_tag", "inner_tag")
+    }
     for service in services:
         if not isinstance(service, dict):
             raise AdapterError("L2 service entries must be objects.", code="invalid_response")
@@ -36,6 +43,13 @@ def _validated_l2_services(payload) -> list:
                 f"L2 service {service_name!r} has unsupported service_type {value}.",
                 code="invalid_response",
             )
+        minimum, maximum = value_ranges["service_id"]
+        service_id = service.get("service_id")
+        if service_id is not None and (type(service_id) is not int or service_id < minimum or service_id > maximum):
+            raise AdapterError(
+                f"L2 service {service_name!r} service_id must be an integer from {minimum} through {maximum} or null.",
+                code="invalid_response",
+            )
         saps = service.get("saps", [])
         if not isinstance(saps, list):
             raise AdapterError(f"L2 service {service_name!r} SAPs must be a list.", code="invalid_response")
@@ -47,6 +61,14 @@ def _validated_l2_services(payload) -> list:
                 if not isinstance(value, str) or not value:
                     raise AdapterError(
                         f"L2 SAP {field_name} values must be non-empty strings.",
+                        code="invalid_response",
+                    )
+            for field_name in ("outer_tag", "inner_tag"):
+                minimum, maximum = value_ranges[field_name]
+                value = sap.get(field_name)
+                if value is not None and (type(value) is not int or value < minimum or value > maximum):
+                    raise AdapterError(
+                        f"L2 SAP {sap['sap_id']!r} {field_name} must be an integer from {minimum} through {maximum} or null.",
                         code="invalid_response",
                     )
     return services

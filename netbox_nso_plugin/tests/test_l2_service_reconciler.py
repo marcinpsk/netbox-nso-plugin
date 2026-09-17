@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from django.db import connection
 from django.test import TestCase
 from vpn.models import L2VPN, L2VPNTermination
 
@@ -139,6 +140,87 @@ class TestReconcileL2Services(TestCase):
         self._assert_invalid_sap_is_rejected(
             {"sap_id": f"{self.extra_port.name}:9001", "port": 7, "outer_tag": 9001, "inner_tag": None}
         )
+
+    def _assert_invalid_numeric_field_is_rejected(self, field_name, value):
+        invalid = self._service("INVALID", port=self.extra_port.name)
+        if field_name == "service_id":
+            invalid[field_name] = value
+        else:
+            invalid["saps"][0][field_name] = value
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), invalid]))
+
+    def test_numeric_string_numeric_fields_are_rejected_without_writes(self):
+        for field_name in ("service_id", "outer_tag", "inner_tag"):
+            with self.subTest(field_name=field_name):
+                self._assert_invalid_numeric_field_is_rejected(field_name, "10")
+
+    def test_nonnumeric_string_numeric_fields_are_rejected_without_writes(self):
+        for field_name in ("service_id", "outer_tag", "inner_tag"):
+            with self.subTest(field_name=field_name):
+                self._assert_invalid_numeric_field_is_rejected(field_name, "bad")
+
+    def test_mapping_numeric_fields_are_rejected_without_writes(self):
+        for field_name in ("service_id", "outer_tag", "inner_tag"):
+            with self.subTest(field_name=field_name):
+                self._assert_invalid_numeric_field_is_rejected(field_name, {})
+
+    def test_boolean_numeric_fields_are_rejected_without_writes(self):
+        for field_name in ("service_id", "outer_tag", "inner_tag"):
+            with self.subTest(field_name=field_name):
+                self._assert_invalid_numeric_field_is_rejected(field_name, True)
+
+    def test_negative_numeric_fields_are_rejected_without_writes(self):
+        for field_name in ("service_id", "outer_tag", "inner_tag"):
+            with self.subTest(field_name=field_name):
+                self._assert_invalid_numeric_field_is_rejected(field_name, -1)
+
+    def test_oversized_numeric_fields_are_rejected_without_writes(self):
+        field = NSOL2SapState._meta.get_field("service_id")
+        maximum = connection.ops.integer_field_range(field.get_internal_type())[1]
+        for field_name in ("service_id", "outer_tag", "inner_tag"):
+            with self.subTest(field_name=field_name):
+                self._assert_invalid_numeric_field_is_rejected(field_name, maximum + 1)
+
+    def test_malformed_numeric_field_is_rejected_while_planning(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan
+
+        invalid = self._service("INVALID", port=self.extra_port.name)
+        invalid["service_id"] = "10"
+        before = _l2_table_snapshot()
+
+        with self.assertRaises(AdapterError) as raised:
+            l2_service_reconcile_plan(self.device, _payload([self._service(), invalid]))
+
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertEqual(_l2_table_snapshot(), before)
+
+    def test_null_and_zero_numeric_fields_are_persisted(self):
+        zero = self._service("ZERO")
+        zero["service_id"] = 0
+        zero["saps"][0]["outer_tag"] = 0
+        zero["saps"][0]["inner_tag"] = 0
+        null = self._service("NULL", port=self.extra_port.name)
+        null["service_id"] = None
+        null["saps"][0]["outer_tag"] = None
+        null["saps"][0]["inner_tag"] = None
+
+        reconcile_l2_services(self.device, _payload([zero, null]))
+
+        zero_vpn = L2VPN.objects.get(slug=f"nso-{self.device.pk}-ZERO")
+        null_vpn = L2VPN.objects.get(slug=f"nso-{self.device.pk}-NULL")
+        zero_state = NSOL2SapState.objects.get(management=self.mgmt, service_name="ZERO")
+        null_state = NSOL2SapState.objects.get(management=self.mgmt, service_name="NULL")
+        self.assertEqual(zero_vpn.identifier, 0)
+        self.assertIsNone(null_vpn.identifier)
+        self.assertEqual((zero_state.service_id, zero_state.outer_tag, zero_state.inner_tag), (0, 0, 0))
+        self.assertEqual((null_state.service_id, null_state.outer_tag, null_state.inner_tag), (None, None, None))
+
+    def test_malformed_duplicate_sap_is_rejected_without_writes(self):
+        invalid = self._service("INVALID", port=self.extra_port.name)
+        invalid["saps"].append({**invalid["saps"][0], "outer_tag": "bad"})
+
+        self._assert_invalid_document_preserves_tables(_payload([self._service(), invalid]))
 
     def test_absent_services_is_an_authoritative_empty_snapshot(self):
         self._seed_imported_sap()
