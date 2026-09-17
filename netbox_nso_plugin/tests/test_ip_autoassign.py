@@ -132,7 +132,7 @@ class TestFindPool(TestCase):
         self.assertIsNone(result)
 
 
-class TestAutoAssignIP(TestCase):
+class TestAutoAssignIP(IntentPushDeliveryMixin, TestCase):
     """auto_assign_ip: end-to-end allocation through to NSOInterfaceIPState creation."""
 
     @classmethod
@@ -172,7 +172,10 @@ class TestAutoAssignIP(TestCase):
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback100", type="virtual")
 
-        with patch("netbox_nso_plugin.adapter_client.put_ip_intent"):
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_ip_intent") as put_ip_intent,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             from netbox_nso_plugin.ip_autoassign import auto_assign_ip
 
             result = auto_assign_ip(iface, families=("ipv4",))
@@ -199,6 +202,10 @@ class TestAutoAssignIP(TestCase):
         self.assertEqual(
             revision.verified_fingerprint,
             delivery.canonical_fingerprint(delivery.render("ip", self.device.pk, mgmt.adapter_device_id).payload),
+        )
+        put_ip_intent.assert_called_once_with(
+            mgmt.adapter_device_id,
+            delivery.render("ip", self.device.pk, mgmt.adapter_device_id).payload,
         )
 
         mgmt.delete()
