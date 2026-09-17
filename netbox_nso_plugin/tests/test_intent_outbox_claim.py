@@ -91,6 +91,18 @@ class TestPreCaptureDeadline(_ClaimCase):
 
         self._assert_expired_audit_refuses_capture(drain.drain_key)
 
+    def test_drain_refuses_capture_when_the_send_budget_is_already_spent(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        own_vlan(self.mgmt, 811, "send-budget")
+        config, session = self.adapter.patches()
+        with config, session, self.assertRaises(delivery.SendDeadlineExceeded):
+            drain.drain_key(self.device.pk, "vlan", deadline=0)
+
+        self.assertFalse(NSOIntentOutboxState.objects.filter(device=self.device, claimed_at__isnull=False).exists())
+        self.assertEqual(self.adapter.requests, [])
+
 
 class TestClaimFoldsEveryEntryOnce(_ClaimCase):
     """O1.6 (R8-B1): N saves cost one claim, and a batched pass truncates keys, not folds."""
@@ -492,6 +504,32 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
 
         assert outcome == drain.SUCCEEDED
         assert deadlines == [8, 5]
+
+    def test_an_exhausted_carried_budget_fails_the_chained_send_instead_of_escaping(self):
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 885, self.tag)
+        stale = self._stale_unacknowledged_claim()
+        deadlines = []
+
+        def answer(_rendered, _payload, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return {"count": 1}
+
+        ticks = iter((100, 100, 102, 111))
+        with (
+            patch("netbox_nso_plugin.delivery.send", new=answer),
+            patch("netbox_nso_plugin.drain._send_clock", new=lambda: next(ticks)),
+        ):
+            outcome = drain.drain_key(self.device.pk, "vlan", force=True, deadline=10)
+
+        assert outcome == drain.FAILED
+        assert deadlines == [8]
+        row = state_of(self.device, "vlan")
+        assert row.claimed_at is None
+        assert (row.attempts, row.last_error_code) == (1, "nso_send_deadline")
+        assert row.last_error_at is not None
+        assert row.push_seq > stale
 
     def test_an_exhausted_chain_never_reports_a_preparatory_replay_as_this_call(self):
         from netbox_nso_plugin import delivery, drain
