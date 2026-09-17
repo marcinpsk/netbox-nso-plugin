@@ -438,6 +438,7 @@ def _restore_static_route_generations(before: list[dict]) -> int:
     transaction becomes an explicit inverse, restoring the sentinel and the demoted status
     so a later run finds these rows and retries them. Without it a generation the adapter
     never stored would correlate with nothing forever.
+    The inverse disables re-pending because it restores captured Apply identities.
 
     Outside a transaction the inverse needs a compare-and-set on the armed generation and
     status. An operator can re-accept, promote, or settle a row while the push is on the
@@ -463,7 +464,10 @@ def _restore_static_route_generations(before: list[dict]) -> int:
         candidate = copy.copy(state)
         for field_name, value in fields.items():
             setattr(candidate, field_name, value)
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields, expected_before=state),))
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=fields, expected_before=state),),
+            settles_deploying=False,
+        )
         try:
             with suppress_intent_push(), renderer_writes(plan) as writer:
                 writer.save(candidate, update_fields=fields)

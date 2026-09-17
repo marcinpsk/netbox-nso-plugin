@@ -902,8 +902,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         ``nso_static_deploy_attempt`` refuses ``deploying`` with a NULL attempt, and the raise
         breaks out of ``_safe_restore``, leaving the row armed on a generation the adapter
-        never stored. The deploying row is armed last: a later restore is a content write, and
-        its re-pend would demote a row this one has just put back.
+        never stored. The inverse disables re-pending while it restores the captured Apply identity.
         """
         from uuid import uuid4
 
@@ -934,6 +933,44 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt_id)
         assert deploying.intent_generation == UNALLOCATED
         assert accepted.intent_generation == UNALLOCATED
+
+    def test_an_unacknowledged_push_restores_each_deploying_identity(self):
+        """A later inverse write must preserve a deploying identity restored earlier."""
+        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_generation import UNALLOCATED
+        from netbox_nso_plugin.intent_state import mirror_refresh
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        _, mgmt = self._managed_device("two-deploying-rollback", 8113)
+        first = self._own_route(mgmt, "198.18.86.0/24", "198.18.0.86")
+        second = self._own_route(mgmt, "198.18.87.0/24", "198.18.0.87")
+        first_attempt_id = uuid4()
+        second_attempt_id = uuid4()
+        fields = {"status", "apply_attempt_id"}
+        for state, attempt_id in ((first, first_attempt_id), (second, second_attempt_id)):
+            current = NSOStaticRouteState.objects.get(pk=state.pk)
+            with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
+                locked.status = "deploying"
+                locked.apply_attempt_id = attempt_id
+                locked.save(update_fields=fields)
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        assert (first.status, first.apply_attempt_id) == ("deploying", first_attempt_id)
+        assert (second.status, second.apply_attempt_id) == ("deploying", second_attempt_id)
+
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=None):
+            results = resync_static_route_intent_fleet()
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        assert results[0]["ok"] is False
+        assert results[0]["armed_rolled_back"] == 2
+        assert (first.status, first.apply_attempt_id) == ("deploying", first_attempt_id)
+        assert first.intent_generation == UNALLOCATED
+        assert (second.status, second.apply_attempt_id) == ("deploying", second_attempt_id)
+        assert second.intent_generation == UNALLOCATED
 
     def test_backfill_demotes_deploying_and_leaves_other_statuses(self):
         """S6.2 — a row already ``deploying`` cannot wait on a generation it has just replaced.
