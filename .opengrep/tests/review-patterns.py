@@ -4,6 +4,9 @@
 
 from unittest.mock import patch
 from threading import BrokenBarrierError
+from django.db.models import signals as model_signals
+from django.db.models.signals import post_delete as post_delete_signal
+from django.db.models.signals import post_save, pre_save
 from ipam.models import VLANGroup
 from netbox_nso_plugin.signals import suppress_intent_push, _schedule_intent_push
 from netbox_nso_plugin import signals
@@ -94,8 +97,16 @@ def write_set_cardinality(self, plan, expected):
     self.assertEqual({item.model_label for item in expected}, {"model"})
 
 
-def wire_signals(handler, sender):
+def wire_signals(handler, sender, custom_signal):
     # ruleid: nso-signal-connect-without-dispatch-uid
     pre_save.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.post_save.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    post_delete_signal.connect(handler, sender=sender)
     # ok: nso-signal-connect-without-dispatch-uid
     post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
+    # ok: nso-signal-connect-without-dispatch-uid
+    model_signals.post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
+    # ok: nso-signal-connect-without-dispatch-uid
+    custom_signal.connect(handler, sender=sender)
