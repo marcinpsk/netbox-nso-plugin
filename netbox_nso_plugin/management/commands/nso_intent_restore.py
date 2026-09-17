@@ -182,5 +182,9 @@ class Command(BaseCommand):
                     drain.release_restored_replay(state.device_id, state.scope)
                 self.stdout.write(f"{key_name}: {verdict}")
         if created:
-            resume()
+            try:
+                resume()
+            except BaseException:
+                self.stderr.write(self.style.ERROR("Intent restore completed, but intent work may remain quiesced"))
+                raise
         self.stdout.write(self.style.SUCCESS(f"Restore resolved {len(states)} outstanding claim(s)"))

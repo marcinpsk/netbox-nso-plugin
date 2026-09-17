@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import close_old_connections, connection, transaction
+from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -656,6 +656,45 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         finally:
             resume()
 
+    def test_completed_verification_reports_resume_failure_and_keeps_the_gate(self):
+        from netbox_nso_plugin import deployment, drain
+
+        own_route(self.mgmt, "198.18.45.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+
+        deployment.quiesce()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    verify=True,
+                    device_id=self.device.pk,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+            self.assertIs(caught.exception, failure)
+            self.assertIn("Deployment verification passed, but intent work may remain quiesced", stderr.getvalue())
+            self.assertNotIn("Deployment verification passed", stdout.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
     def test_the_full_gate_sequence_quiesces_and_verifies_a_no_deletion_static_push(self):
         from django.http import HttpResponse
         from django.test import RequestFactory
@@ -766,6 +805,34 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         assert state_of(self.device, "vlan").push_seq is None
         assert entries(self.device, "vlan") == []
         assert claim.push_seq is not None
+
+    def test_completed_restore_reports_resume_failure_and_keeps_the_gate(self):
+        from netbox_nso_plugin import deployment
+
+        self._lost_vlan_response(940)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_restore.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command("nso_intent_restore", stdout=stdout, stderr=stderr)
+
+            self.assertIs(caught.exception, failure)
+            self.assertIn("Intent restore completed, but intent work may remain quiesced", stderr.getvalue())
+            self.assertNotIn("Restore resolved", stdout.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
 
     def test_higher_receipt_rebases_and_returns_consumed_rows_to_the_fold(self):
         from netbox_nso_plugin.outbox import allocate_push_seq

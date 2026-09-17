@@ -164,7 +164,11 @@ class Command(BaseCommand):
         blockers = drain.gate_blockers()
         if blockers:
             raise CommandError("New work appeared during verification: " + "; ".join(blockers))
-        resume()
+        try:
+            resume()
+        except BaseException:
+            self.stderr.write(self.style.ERROR("Deployment verification passed, but intent work may remain quiesced"))
+            raise
         self.stdout.write(self.style.SUCCESS("Deployment verification passed; normal intent operation resumed"))
 
     @staticmethod
