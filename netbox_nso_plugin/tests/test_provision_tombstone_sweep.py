@@ -5,7 +5,7 @@
 import threading
 from datetime import timedelta
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
@@ -78,7 +78,7 @@ class TestProvisionEvidenceValidation(SimpleTestCase):
 
 
 class TestProvisionTombstoneSweep(TestCase):
-    def _attempt(self, tag, *, with_management, state="terminal"):
+    def _attempt(self, tag, *, with_management, state="terminal", provision_attempt_id=None):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOProvisionTombstone
 
         device = make_device(tag)
@@ -92,7 +92,8 @@ class TestProvisionTombstoneSweep(TestCase):
                 onboard_status="provisioning",
                 onboard_job_id="71",
             )
-        provision_attempt_id = uuid4()
+        if provision_attempt_id is None:
+            provision_attempt_id = uuid4()
         evidence = {
             "provision_attempt_id": str(provision_attempt_id),
             "status": "succeeded",
@@ -299,6 +300,42 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertEqual(management.onboard_steps, [{"name": "sync", "ok": True}])
         self.assertEqual(tombstone.state, "closed")
         poll.assert_called_once_with(tombstone.provision_attempt_id)
+        offboard.assert_not_called()
+
+    def test_open_attempt_accepts_uppercase_uuid_evidence_and_completes(self):
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, management, tombstone = self._attempt(
+            "provision-uppercase-attempt",
+            with_management=True,
+            state="open",
+            provision_attempt_id=UUID("abcdefab-1234-4567-89ab-abcdefabcdef"),
+        )
+        evidence = {
+            "provision_attempt_id": str(tombstone.provision_attempt_id).upper(),
+            "status": "succeeded",
+            "job_id": tombstone.adapter_job_id,
+            "result": {"ok": True, "device_id": 701, "steps": [{"name": "sync", "ok": True}]},
+        }
+        self.assertNotEqual(evidence["provision_attempt_id"], str(tombstone.provision_attempt_id))
+        with (
+            patch("netbox_nso_plugin.adapter_client._request", return_value=evidence) as request,
+            patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard,
+        ):
+            checked, closed = sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+        management.refresh_from_db()
+        tombstone.refresh_from_db()
+        self.assertEqual((checked, closed), (1, 1))
+        self.assertEqual(management.onboard_status, "")
+        self.assertEqual(management.onboard_steps, [{"name": "sync", "ok": True}])
+        self.assertEqual(tombstone.state, "closed")
+        self.assertEqual(tombstone.terminal_status, "succeeded")
+        self.assertEqual(tombstone.terminal_evidence, evidence)
+        request.assert_called_once_with(
+            "GET",
+            f"/api/v1/provision-attempts/{tombstone.provision_attempt_id}",
+        )
         offboard.assert_not_called()
 
     def test_other_attempt_evidence_cannot_complete_the_addressed_tombstone(self):

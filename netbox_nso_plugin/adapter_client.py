@@ -1207,13 +1207,20 @@ def _validated_jobs(jobs, what):
 
 def _validated_provision_attempt(evidence, expected_attempt_id):
     """Return structurally valid provision evidence, else leave the attempt undecided."""
+    import uuid
+
     from .provision_lifecycle import validate_provision_evidence
 
     try:
         validated = validate_provision_evidence(evidence)
     except ValueError as exc:
         raise AdapterError("Adapter returned a malformed provision attempt.", code="invalid_response") from exc
-    if validated.get("provision_attempt_id") != str(expected_attempt_id):
+    try:
+        evidence_attempt_id = uuid.UUID(str(validated.get("provision_attempt_id")))
+        expected_attempt_id = uuid.UUID(str(expected_attempt_id))
+    except ValueError as exc:
+        raise AdapterError("Adapter returned a malformed provision attempt id.", code="invalid_response") from exc
+    if evidence_attempt_id != expected_attempt_id:
         raise AdapterError("Adapter returned evidence for another provision attempt.", code="invalid_response")
     return validated
 

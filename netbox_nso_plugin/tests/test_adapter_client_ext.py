@@ -1056,6 +1056,67 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_get_provision_attempt_accepts_equivalent_uuid_spellings(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import get_provision_attempt
+
+        attempt_id = "abcdefab-1234-4567-89ab-abcdefabcdef"
+        session = self._make_session()
+        mock_s.return_value = session
+
+        for returned_attempt_id in (attempt_id.upper(), f"urn:uuid:{attempt_id}"):
+            evidence = {
+                "provision_attempt_id": returned_attempt_id,
+                "status": "running",
+                "result": None,
+                "error": None,
+            }
+            session.request.return_value = make_response(200, evidence)
+
+            with self.subTest(returned_attempt_id=returned_attempt_id):
+                self.assertEqual(get_provision_attempt(attempt_id), evidence)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_get_provision_attempt_rejects_another_uuid(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, get_provision_attempt
+
+        attempt_id = "abcdefab-1234-4567-89ab-abcdefabcdef"
+        evidence = {
+            "provision_attempt_id": "00000000-0000-4000-8000-000000000002",
+            "status": "running",
+            "result": None,
+            "error": None,
+        }
+        mock_s.return_value = self._make_session(200, evidence)
+
+        with self.assertRaises(AdapterError) as raised:
+            get_provision_attempt(attempt_id)
+
+        self.assertEqual(str(raised.exception), "Adapter returned evidence for another provision attempt.")
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_get_provision_attempt_rejects_a_malformed_uuid(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, get_provision_attempt
+
+        attempt_id = "abcdefab-1234-4567-89ab-abcdefabcdef"
+        evidence = {
+            "provision_attempt_id": "not-a-uuid",
+            "status": "running",
+            "result": None,
+            "error": None,
+        }
+        mock_s.return_value = self._make_session(200, evidence)
+
+        with self.assertRaises(AdapterError) as raised:
+            get_provision_attempt(attempt_id)
+
+        self.assertEqual(str(raised.exception), "Adapter returned a malformed provision attempt id.")
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_device_generations_reject_a_malformed_listing(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
 
