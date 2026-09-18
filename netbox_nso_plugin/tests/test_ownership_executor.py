@@ -18,6 +18,32 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.addCleanup(set_scope.stop)
         self.device, self.management = make_managed("ownership-executor", 16271)
 
+    def _make_native_bgp_peers(self, *addresses):
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        rir = RIR.objects.create(name="Ownership private", slug="ownership-private")
+        local_as = ASN.objects.create(asn=64520, rir=rir)
+        remote_as = ASN.objects.create(asn=64521, rir=rir)
+        router = BGPRouter.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=self.device.pk,
+            asn=local_as,
+            name="64520",
+        )
+        scope = BGPScope.objects.create(router=router)
+        return tuple(
+            BGPPeer.objects.create(
+                scope=scope,
+                peer=IPAddress.objects.create(address=address),
+                remote_as=remote_as,
+                enabled=True,
+            )
+            for address in addresses
+        )
+
     def test_foreign_overlay_delete_reowns_from_the_surviving_manifest(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
@@ -809,6 +835,95 @@ class TestSymmetricOwnershipExecutor(TestCase):
         )
 
         self.assertIsNone(manifest_binding(state))
+
+    def test_malformed_bgp_identity_refuses_ownership_before_writes(self):
+        from netbox_nso_plugin.models import (
+            NSOBGPPeerState,
+            NSOIntentOutboxEntry,
+            NSOIntentRevision,
+            NSOOwnershipManifest,
+        )
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        malformed_peer, other_peer = self._make_native_bgp_peers(
+            "198.18.173.2/32",
+            "198.18.173.3/32",
+        )
+        malformed = NSOBGPPeerState.objects.create(
+            management=self.management,
+            bgp_peer=malformed_peer,
+            asn_str="invalid",
+            vrf_name="",
+            peer_address_str="198.18.173.2",
+            status="imported",
+        )
+        cases = (
+            ("nonnumeric ASN", "invalid", "198.18.173.2"),
+            ("out-of-range ASN", "0", "198.18.173.2"),
+            ("invalid address", "64520", "not-an-address"),
+        )
+
+        for label, asn_str, peer_address_str in cases:
+            with self.subTest(label=label):
+                NSOBGPPeerState.objects.filter(pk=malformed.pk).update(
+                    asn_str=asn_str,
+                    peer_address_str=peer_address_str,
+                )
+                malformed.refresh_from_db()
+                row_before = NSOBGPPeerState.objects.values().get(pk=malformed.pk)
+                manifest_count_before = NSOOwnershipManifest.objects.filter(device_id=self.device.pk).count()
+                other_overlays_before = list(
+                    NSOBGPPeerState.objects.filter(bgp_peer=other_peer).order_by("pk").values()
+                )
+                revisions_before = list(
+                    NSOIntentRevision.objects.filter(device=self.device).order_by("scope", "pk").values()
+                )
+                outbox_before = list(NSOIntentOutboxEntry.objects.filter(device=self.device).order_by("pk").values())
+
+                with self.assertRaises(ValueError):
+                    reconcile_scope_ownership(self.device.pk, ["bgp"])
+
+                malformed.refresh_from_db()
+                self.assertEqual(NSOBGPPeerState.objects.values().get(pk=malformed.pk), row_before)
+                self.assertEqual(
+                    NSOOwnershipManifest.objects.filter(device_id=self.device.pk).count(),
+                    manifest_count_before,
+                )
+                self.assertFalse(
+                    NSOOwnershipManifest.objects.filter(
+                        device_id=self.device.pk,
+                        scope="bgp",
+                        state_model_label=malformed._meta.label_lower,
+                        state_key={
+                            "asn_str": asn_str,
+                            "vrf_name": "",
+                            "peer_address_str": peer_address_str,
+                        },
+                    ).exists()
+                )
+                self.assertEqual(NSOBGPPeerState.objects.filter(bgp_peer=malformed_peer).count(), 1)
+                self.assertFalse(
+                    NSOBGPPeerState.objects.filter(
+                        management=self.management,
+                        asn_str="64520",
+                        vrf_name="",
+                        peer_address_str="198.18.173.2",
+                    )
+                    .exclude(pk=malformed.pk)
+                    .exists()
+                )
+                self.assertEqual(
+                    list(NSOBGPPeerState.objects.filter(bgp_peer=other_peer).order_by("pk").values()),
+                    other_overlays_before,
+                )
+                self.assertEqual(
+                    list(NSOIntentRevision.objects.filter(device=self.device).order_by("scope", "pk").values()),
+                    revisions_before,
+                )
+                self.assertEqual(
+                    list(NSOIntentOutboxEntry.objects.filter(device=self.device).order_by("pk").values()),
+                    outbox_before,
+                )
 
     def test_native_routing_graph_creates_every_owned_overlay(self):
         from dcim.models import Device, Interface

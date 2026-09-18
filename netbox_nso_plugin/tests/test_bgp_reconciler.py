@@ -307,6 +307,64 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(states_by_address["not-an-address"].status, "error")
         self.assertEqual(states_by_address["10.0.0.2"].status, "imported")
 
+    def test_linked_malformed_peer_identity_is_quarantined_without_ownership(self):
+        """A corrupt linked overlay is quarantined without entering ownership."""
+        management = self._make_mgmt()
+
+        from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOOwnershipManifest
+
+        payload = self._payload(
+            self._router_payload(
+                peers=[
+                    self._peer_entry(),
+                    self._peer_entry("10.0.0.3", remote_as="65201"),
+                ]
+            )
+        )
+        initial = {state.peer_address_str: state for state in _reconcile_bgp_config(self.device, payload)}
+        malformed = initial["10.0.0.2"]
+        linked_peer_id = malformed.bgp_peer_id
+        self.assertIsNotNone(linked_peer_id)
+        NSOBGPPeerState.objects.filter(pk=malformed.pk).update(
+            asn_str="invalid",
+            peer_address_str="not-an-address",
+        )
+
+        states = _reconcile_bgp_config(self.device, payload)
+
+        malformed.refresh_from_db()
+        valid = NSOBGPPeerState.objects.get(
+            management=management,
+            asn_str="65100",
+            vrf_name="",
+            peer_address_str="10.0.0.3",
+        )
+        self.assertEqual(malformed.status, "error")
+        self.assertEqual(malformed.bgp_peer_id, linked_peer_id)
+        self.assertEqual(valid.status, "imported")
+        self.assertNotEqual(valid.bgp_peer_id, linked_peer_id)
+        self.assertIn(malformed, states)
+        self.assertIn(valid, states)
+        self.assertFalse(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="bgp",
+                state_model_label=malformed._meta.label_lower,
+                state_key={
+                    "asn_str": "invalid",
+                    "vrf_name": "",
+                    "peer_address_str": "not-an-address",
+                },
+            ).exists()
+        )
+        self.assertFalse(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                state_model_label=malformed._meta.label_lower,
+            ).exists()
+        )
+
     def test_missing_required_fields_are_typed_adapter_errors(self):
         """Missing adapter fields fail before stored BGP can change."""
         self._make_mgmt()
