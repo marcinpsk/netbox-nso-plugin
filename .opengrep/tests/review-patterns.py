@@ -89,6 +89,13 @@ def write_set_cardinality(self, plan, expected):
         {write.pk for write in plan.write_set if write.operation == "save"},
         expected,
     )
+    # ruleid: nso-write-set-cardinality-assertion
+    self.assertEqual(expected, {write.model_label for write in plan.write_set})
+    # ruleid: nso-write-set-cardinality-assertion
+    self.assertEqual(
+        expected,
+        {write.pk for write in plan.write_set if write.operation == "save"},
+    )
     # ok: nso-write-set-cardinality-assertion
     self.assertCountEqual([write.model_label for write in plan.write_set], expected)
     # ok: nso-write-set-cardinality-assertion
@@ -186,7 +193,11 @@ def wire_signals(handler, sender, custom_signal):
     # ruleid: nso-signal-connect-without-dispatch-uid
     model_signals.post_save.connect(handler, sender=sender)
     # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.pre_delete.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
     post_delete_signal.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.m2m_changed.connect(handler, sender=sender)
     # ok: nso-signal-connect-without-dispatch-uid
     post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
     # ok: nso-signal-connect-without-dispatch-uid

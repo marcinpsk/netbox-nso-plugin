@@ -21,6 +21,10 @@ supported: `scripts/check-review-patterns scan path/to/file.py`. Arguments after
 `scan` are paths, not scanner options. Fixtures contain deliberate defects, so
 Ruff excludes only `.opengrep/tests`.
 
+Every rule ID and every positive pattern alternative must match at least one
+`# ruleid:` fixture line. The fixture hook fails when a rule or alternative has
+no matching defect.
+
 ## Preserve CodeRabbit's default scan
 
 The rules live in `.opengrep/nso-rules.yaml`. This custom filename does not match

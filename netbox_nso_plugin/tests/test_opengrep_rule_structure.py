@@ -17,9 +17,16 @@ from django.test import SimpleTestCase
 _RULES_PATH = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
 _FIXTURE_PATH = Path(__file__).resolve().parents[2] / ".opengrep" / "tests" / "review-patterns.py"
 _MONOTONIC_RULE_ID = "nso-global-monotonic-patch"
+_COVERAGE_PATH = _RULES_PATH.parent / "tests" / "coverage.py"
 _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside"}
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
 _ROOT_NAME = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)(?=\s*[.(])")
+
+_COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
+assert _COVERAGE_SPEC is not None
+assert _COVERAGE_SPEC.loader is not None
+_COVERAGE = importlib.util.module_from_spec(_COVERAGE_SPEC)
+_COVERAGE_SPEC.loader.exec_module(_COVERAGE)
 
 
 def _pattern_texts(node):
@@ -150,3 +157,195 @@ class TestOpenGrepRuleStructure(SimpleTestCase):
             rules_path.write_text(yaml.safe_dump(document), encoding="utf-8")
 
             self.assertEqual(_rule_violations(rules_path), [f"{_MONOTONIC_RULE_ID}: patch"])
+
+
+class TestOpenGrepAlternativeCoverage(SimpleTestCase):
+    def test_nested_top_level_alternatives_yield_one_sub_rule_per_leaf(self):
+        document = {
+            "rules": [
+                {
+                    "id": "example",
+                    "pattern-either": [
+                        {"pattern": "first(...)"},
+                        {
+                            "patterns": [
+                                {
+                                    "pattern-either": [
+                                        {"pattern": "second(...)"},
+                                        {"pattern": "def $F(:"},
+                                    ]
+                                },
+                                {"pattern-not": "excluded(...)"},
+                            ]
+                        },
+                    ],
+                }
+            ]
+        }
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+
+        self.assertEqual(len(alternatives), 3)
+        self.assertEqual(
+            [rule["pattern-either"] for _, _, rule in alternatives],
+            [
+                [{"pattern": "first(...)"}],
+                [
+                    {
+                        "patterns": [
+                            {"pattern-either": [{"pattern": "second(...)"}]},
+                            {"pattern-not": "excluded(...)"},
+                        ]
+                    }
+                ],
+                [
+                    {
+                        "patterns": [
+                            {"pattern-either": [{"pattern": "def $F(:"}]},
+                            {"pattern-not": "excluded(...)"},
+                        ]
+                    }
+                ],
+            ],
+        )
+
+    def test_metavariable_pattern_alternatives_keep_outer_pattern(self):
+        document = {
+            "rules": [
+                {
+                    "id": "example",
+                    "patterns": [
+                        {"pattern": "outer($VALUE)"},
+                        {
+                            "metavariable-pattern": {
+                                "metavariable": "$VALUE",
+                                "pattern-either": [
+                                    {"pattern": "first(...)"},
+                                    {"pattern-regex": "second\\(.*"},
+                                ],
+                            }
+                        },
+                    ],
+                }
+            ]
+        }
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+
+        self.assertEqual(len(alternatives), 2)
+        self.assertTrue(all(rule["patterns"][0] == {"pattern": "outer($VALUE)"} for _, _, rule in alternatives))
+        self.assertEqual(
+            [rule["patterns"][1]["metavariable-pattern"]["pattern-either"] for _, _, rule in alternatives],
+            [
+                [{"pattern": "first(...)"}],
+                [{"pattern-regex": "second\\(.*"}],
+            ],
+        )
+
+    def test_unsupported_alternative_operator_names_rule_and_key(self):
+        document = {
+            "rules": [
+                {
+                    "id": "unsupported-example",
+                    "pattern-either": [
+                        {"pattern": "first(...)"},
+                        {"pattern-not-regex": "excluded"},
+                    ],
+                }
+            ]
+        }
+
+        with self.assertRaises(ValueError) as context:
+            _COVERAGE.split_rule_alternatives(document)
+
+        self.assertIn("unsupported-example", str(context.exception))
+        self.assertIn("pattern-not-regex", str(context.exception))
+
+    def test_top_level_pattern_either_yields_one_sub_rule_per_branch(self):
+        document = {
+            "rules": [
+                {
+                    "id": "example",
+                    "pattern-either": [
+                        {"pattern": "first(...)"},
+                        {"pattern": "second(...)"},
+                        {"pattern": "third(...)"},
+                    ],
+                    "pattern-not-inside": "ignored(...)",
+                }
+            ]
+        }
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+
+        self.assertEqual(
+            [(rule_id, index) for rule_id, index, _ in alternatives],
+            [("example", 1), ("example", 2), ("example", 3)],
+        )
+        self.assertEqual(
+            [rule["id"] for _, _, rule in alternatives],
+            ["example--alt1", "example--alt2", "example--alt3"],
+        )
+        self.assertEqual(
+            [rule["pattern-either"] for _, _, rule in alternatives],
+            [
+                [{"pattern": "first(...)"}],
+                [{"pattern": "second(...)"}],
+                [{"pattern": "third(...)"}],
+            ],
+        )
+        self.assertTrue(all(rule["pattern-not-inside"] == "ignored(...)" for _, _, rule in alternatives))
+
+    def test_nested_pattern_either_keeps_other_patterns_entries(self):
+        document = {
+            "rules": [
+                {
+                    "id": "example",
+                    "patterns": [
+                        {"pattern-inside": "def wrapper():\n    ..."},
+                        {
+                            "pattern-either": [
+                                {"pattern": "first(...)"},
+                                {"pattern": "second(...)"},
+                            ]
+                        },
+                        {"pattern-not": "excluded(...)"},
+                    ],
+                }
+            ]
+        }
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+
+        self.assertEqual(len(alternatives), 2)
+        self.assertEqual(
+            [rule["patterns"][1] for _, _, rule in alternatives],
+            [
+                {"pattern-either": [{"pattern": "first(...)"}]},
+                {"pattern-either": [{"pattern": "second(...)"}]},
+            ],
+        )
+        self.assertTrue(
+            all(
+                rule["patterns"][0] == {"pattern-inside": "def wrapper():\n    ..."}
+                and rule["patterns"][2] == {"pattern-not": "excluded(...)"}
+                for _, _, rule in alternatives
+            )
+        )
+
+    def test_single_pattern_yields_one_sub_rule(self):
+        document = {"rules": [{"id": "example", "pattern": "target(...)"}]}
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+
+        self.assertEqual(len(alternatives), 1)
+        self.assertEqual(alternatives[0][0:2], ("example", 1))
+        self.assertEqual(alternatives[0][2]["pattern"], "target(...)")
+
+    def test_current_rules_each_yield_an_alternative(self):
+        document = yaml.safe_load(_RULES_PATH.read_text(encoding="utf-8"))
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+        covered_rule_ids = {rule_id for rule_id, _, _ in alternatives}
+
+        self.assertEqual(covered_rule_ids, {rule["id"] for rule in document["rules"]})

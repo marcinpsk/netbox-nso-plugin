@@ -23,6 +23,7 @@ case "$mode" in
     cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"
     cp .opengrep/tests/review-patterns.py "$staging_dir/review-patterns.py"
     "$scan_bin" test "$staging_dir"
+    python3 .opengrep/tests/coverage.py --opengrep-bin "$scan_bin"
     ;;
   *) echo "Usage: $0 [scan [path ...] | test]" >&2; exit 2 ;;
 esac
