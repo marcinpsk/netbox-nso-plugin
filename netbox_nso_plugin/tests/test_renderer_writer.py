@@ -1522,6 +1522,81 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert not CommunityList.objects.filter(pk=community_list_pk).exists()
         assert not CommunityListEntry.objects.filter(pk=entry.pk).exists()
 
+    def test_malformed_bgp_identity_rolls_back_the_writer_plan(self):
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        device, management = make_managed("writer-bgp-rollback", 16298)
+        rir = RIR.objects.create(name="Writer BGP private", slug="writer-bgp-private")
+        local_as = ASN.objects.create(asn=64530, rir=rir)
+        remote_as = ASN.objects.create(asn=64531, rir=rir)
+        router = BGPRouter.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=device.pk,
+            asn=local_as,
+            name="64530",
+        )
+        scope = BGPScope.objects.create(router=router)
+        peer = BGPPeer.objects.create(
+            scope=scope,
+            peer=IPAddress.objects.create(address="198.18.98.2/32"),
+            remote_as=remote_as,
+            enabled=True,
+        )
+        malformed = NSOBGPPeerState.objects.create(
+            management=management,
+            bgp_peer=peer,
+            asn_str="64530",
+            vrf_name="",
+            peer_address_str="198.18.98.2",
+            status="imported",
+        )
+        NSOBGPPeerState.objects.filter(pk=malformed.pk).update(status="accepted", asn_str="invalid")
+        malformed.refresh_from_db()
+        other = NSOVLANState.objects.create(
+            management=management,
+            vlan=VLAN.objects.create(vid=1635, name="writer-bgp-rollback-other"),
+            status="imported",
+        )
+        malformed_before = NSOBGPPeerState.objects.values().get(pk=malformed.pk)
+        other_before = NSOVLANState.objects.values().get(pk=other.pk)
+        revisions_before = list(NSOIntentRevision.objects.filter(device=device).order_by("scope", "pk").values())
+        outbox_before = list(NSOIntentOutboxEntry.objects.filter(device=device).order_by("scope", "pk").values())
+        other_candidate = copy.copy(other)
+        other_candidate.status = "accepted"
+        malformed_candidate = copy.copy(malformed)
+        malformed_candidate.last_apply_error = "planned"
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(other_candidate, update_fields=("status",)),
+                planned_save(malformed_candidate, update_fields=("last_apply_error",)),
+            )
+        )
+
+        with self.assertRaises(ValueError), without_commit_drain():
+            with renderer_writes(plan) as writer:
+                writer.save(other_candidate, update_fields=("status",))
+                writer.save(malformed_candidate, update_fields=("last_apply_error",))
+
+        malformed.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(NSOBGPPeerState.objects.values().get(pk=malformed.pk), malformed_before)
+        self.assertEqual(NSOVLANState.objects.values().get(pk=other.pk), other_before)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk).exists())
+        self.assertEqual(
+            list(NSOIntentRevision.objects.filter(device=device).order_by("scope", "pk").values()),
+            revisions_before,
+        )
+        self.assertEqual(
+            list(NSOIntentOutboxEntry.objects.filter(device=device).order_by("scope", "pk").values()),
+            outbox_before,
+        )
+
     def test_rollback_removes_content_bookkeeping_and_fingerprint_together(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
