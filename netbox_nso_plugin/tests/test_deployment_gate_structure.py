@@ -76,7 +76,7 @@ def _is_best_effort_report(statement: ast.stmt, bindings: dict[str, str]) -> boo
     if len(context.args) != 1 or context.keywords or resolve_call_target(context, bindings) != "contextlib.suppress":
         return False
     exception = context.args[0]
-    if not isinstance(exception, ast.Name) or exception.id not in {"Exception", "BaseException"}:
+    if not isinstance(exception, ast.Name) or exception.id != "Exception":
         return False
     if len(statement.body) != 1 or not isinstance(statement.body[0], ast.Expr):
         return False
@@ -440,6 +440,26 @@ def handle(self):
         resume()
     except BaseException:
         with contextlib.suppress(OSError):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+"""
+        )
+
+    def test_failure_guidance_with_base_exception_suppress_is_rejected(self):
+        self.assert_resume_site_is_reported(
+            """\
+import contextlib
+from netbox_nso_plugin.deployment import resume
+
+def handle(self):
+    try:
+        resume()
+    except BaseException:
+        with contextlib.suppress(BaseException):
             self.stderr.write(
                 self.style.ERROR(
                     "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
