@@ -348,4 +348,4 @@ def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, 
     except (RendererAuditBudgetExceeded, RendererAuditRepairFailed) as exc:
         raise adapter_client.AdapterError("Renderer audit failed.", code="renderer_audit_failed") from exc
     rendered = render(key, device_id, adapter_device_id)
-    return send(rendered, rendered.payload, mode=mode, mark=mark)
+    return send(rendered, rendered.payload, mode=mode, mark=mark, deadline=SEND_DEADLINE.total_seconds())

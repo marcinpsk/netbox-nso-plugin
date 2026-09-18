@@ -148,6 +148,30 @@ class TestTheSendCarriesItsOwnDeadline(_DripCase):
         errors = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
         assert "vlan" in errors, errors
 
+    def test_direct_delivery_bounds_a_dripping_response(self):
+        from netbox_nso_plugin import delivery, drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        own_vlan(self.mgmt, 881, self.tag)
+        errors: list[BaseException] = []
+
+        def deliver():
+            try:
+                delivery.deliver("vlan", self.device.pk, self.adapter_device_id)
+            except BaseException as exc:  # noqa: BLE001 (reported on the test thread)
+                errors.append(exc)
+
+        thread = threading.Thread(target=deliver, daemon=True)
+        with patch.object(drain, "SEND_DEADLINE", datetime.timedelta(seconds=1)), self.pointed_at_the_drip():
+            thread.start()
+            thread.join(timeout=8)
+
+        assert not thread.is_alive(), "direct delivery outlived its send deadline"
+        assert len(errors) == 1
+        assert isinstance(errors[0], delivery.SendDeadlineExceeded)
+        recorded = NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
+        assert "vlan" in recorded, recorded
+
 
 class TestTheTransportEndsItsOwnSocket(_DripCase):
     """The mechanism itself, at the transport: what close() cannot do and abort() does."""
