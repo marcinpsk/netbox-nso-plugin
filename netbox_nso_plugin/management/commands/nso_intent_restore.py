@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
-from contextlib import contextmanager
 
 from django.core.management.base import BaseCommand, CommandError
 
@@ -14,7 +14,7 @@ from netbox_nso_plugin.deployment import gate_bypass, quiesce, resume
 from netbox_nso_plugin.restore import advance_static_route_pk
 
 
-@contextmanager
+@contextlib.contextmanager
 def _gate_failure_guidance(*, created):
     """Name the manual recovery for a restore that deliberately fails closed."""
     try:
@@ -185,14 +185,12 @@ class Command(BaseCommand):
             try:
                 resume()
             except BaseException:
-                try:
+                with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
                     self.stderr.write(
                         self.style.ERROR(
                             "Intent restore completed, but intent work may remain quiesced. "
                             "Fix the cause and run nso_intent_deployment_gate --abort."
                         )
                     )
-                except Exception:  # noqa: BLE001 (the resume() failure must propagate)
-                    pass
                 raise
         self.stdout.write(self.style.SUCCESS(f"Restore resolved {len(states)} outstanding claim(s)"))

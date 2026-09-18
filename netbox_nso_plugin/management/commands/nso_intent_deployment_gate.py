@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 from django.conf import settings
@@ -111,15 +112,13 @@ class Command(BaseCommand):
                 try:
                     resume()
                 except BaseException:
-                    try:
+                    with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
                         self.stderr.write(
                             self.style.ERROR(
                                 "Deployment gate preparation failed and intent work may remain quiesced. "
                                 "Fix the cause and run nso_intent_deployment_gate --abort."
                             )
                         )
-                    except Exception:  # noqa: BLE001 (the resume() failure must propagate)
-                        pass
                     raise
             raise
         self.stdout.write(self.style.SUCCESS("Deployment gate prepared; deploy the adapter, then the plugin"))
@@ -182,15 +181,13 @@ class Command(BaseCommand):
         try:
             resume()
         except BaseException:
-            try:
+            with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
                 self.stderr.write(
                     self.style.ERROR(
                         "Deployment verification passed, but intent work may remain quiesced. "
                         "Fix the cause and run nso_intent_deployment_gate --abort."
                     )
                 )
-            except Exception:  # noqa: BLE001 (the resume() failure must propagate)
-                pass
             raise
         self.stdout.write(self.style.SUCCESS("Deployment verification passed; normal intent operation resumed"))
 

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import delivery
@@ -57,15 +59,13 @@ class Command(BaseCommand):
             try:
                 resume()
             except BaseException:
-                try:
+                with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
                     self.stderr.write(
                         self.style.ERROR(
                             "Renderer baseline cutover passed, but intent work may remain quiesced. "
                             "Fix the cause and run nso_intent_deployment_gate --abort."
                         )
                     )
-                except Exception:  # noqa: BLE001 (the resume() failure must propagate)
-                    pass
                 raise
         self.stdout.write(
             self.style.SUCCESS(f"Renderer baseline cutover passed: {len(devices)} devices, {repaired} repairs")
