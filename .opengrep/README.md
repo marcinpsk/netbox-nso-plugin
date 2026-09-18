@@ -50,6 +50,7 @@ References checked on 2026-09-12:
 | Race test hides a broken barrier | `nso-swallowed-barrier-failure` | Exception handlers that contain only `pass` or a bare `return`. |
 | Mutable display name used as VLAN group identity | `nso-vlan-group-mutable-lookup` | Imported `VLANGroup` manager calls with both `name` and `slug` lookup keys. |
 | Exact write-set assertion loses duplicate writes | `nso-write-set-cardinality-assertion` | Direct `assertEqual` set comprehensions over a frozen `write_set`. Membership and subset checks stay valid. |
+| Model signal receiver connected without `dispatch_uid` | `nso-signal-connect-without-dispatch-uid` | `connect` calls on the `django.db.models.signals` objects, including module-qualified and aliased imports. A signal object stored in a variable is not followed. Test modules are excluded. |
 | Registered renderer inputs written outside the writer | `test_renderer_writer_structure.py` | Uses the live model registry and reviewed call sites. Dynamic model targets need review. |
 | Retired SQL guard restored in production | `test_renderer_writer_structure.py` | Structural guard over production modules. |
 | Spec-less object mocks | Existing `mock-discipline` hook | Tests beyond the recorded baseline. |
