@@ -9,9 +9,12 @@ from pathlib import Path
 
 from django.test import SimpleTestCase
 
-from ._ast_scope import scoped_walk
+from ._ast_scope import import_bindings, resolve_call_target, scope_bindings, scoped_walk
 
 PLUGIN = Path(__file__).resolve().parent.parent
+_CLAIM_TARGET = "netbox_nso_plugin.drain.claim"
+_CLAIM_AFTER_AUDIT_TARGET = "netbox_nso_plugin.drain._claim_after_audit"
+_RENDER_TARGET = "netbox_nso_plugin.delivery.render"
 
 
 def _functions(path):
@@ -34,6 +37,13 @@ def _calls(functions):
 
 def _call_sites(module_path, tree, names):
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    registered = {}
+    if module_path == "delivery.py":
+        registered["render"] = _RENDER_TARGET
+    elif module_path == "drain.py":
+        registered["claim"] = _CLAIM_TARGET
+        registered["_claim_after_audit"] = _CLAIM_AFTER_AUDIT_TARGET
+    bindings = scope_bindings(tree, registered)
     functions = {"<module>": [tree]}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
@@ -45,10 +55,11 @@ def _call_sites(module_path, tree, names):
                 parent = parents.get(parent)
             functions.setdefault(".".join(reversed(qualified_name)), []).append(node)
     return {
-        (module_path, function_name, call)
+        (module_path, function_name, ast.unparse(node.func))
         for function_name, function in functions.items()
-        for call in _calls(function)
-        if call in names
+        for candidate in function
+        for node in scoped_walk(candidate.body)
+        if isinstance(node, ast.Call) and resolve_call_target(node, bindings[node]) in names
     }
 
 
@@ -84,17 +95,11 @@ def _render_names(path):
     names = {"delivery.render"}
     if path.name == "delivery.py":
         names.add("render")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[-1] == "delivery":
-            names |= {alias.asname or alias.name for alias in node.names if alias.name == "render"}
-        if isinstance(node, ast.ImportFrom) and node.module is None:
-            names |= {f"{alias.asname}.render" for alias in node.names if alias.name == "delivery" and alias.asname}
-        if isinstance(node, ast.Import):
-            names |= {
-                f"{alias.asname or alias.name}.render"
-                for alias in node.names
-                if alias.name.split(".")[-1] == "delivery"
-            }
+    for local_name, target in import_bindings(tree).items():
+        if target == "netbox_nso_plugin.delivery":
+            names.add(f"{local_name}.render")
+        elif target == _RENDER_TARGET:
+            names.add(local_name)
     return names
 
 
@@ -115,8 +120,58 @@ class TestStructureScanHelpers(SimpleTestCase):
 
         self.assertIn("dlv.render", _render_names(path))
 
+    def test_call_sites_resolve_delivery_import_aliases(self):
+        source = """\
+from netbox_nso_plugin import delivery as dlv
+from netbox_nso_plugin.delivery import render as render_payload
+from . import delivery as local_delivery
+
+def module_alias():
+    dlv.render()
+
+def symbol_alias():
+    render_payload()
+
+def relative_alias():
+    local_delivery.render()
+"""
+
+        self.assertEqual(
+            _call_sites("sample.py", ast.parse(source), {"netbox_nso_plugin.delivery.render"}),
+            {
+                ("sample.py", "module_alias", "dlv.render"),
+                ("sample.py", "symbol_alias", "render_payload"),
+                ("sample.py", "relative_alias", "local_delivery.render"),
+            },
+        )
+
+    def test_call_sites_keep_function_imports_in_their_lexical_scope(self):
+        source = """\
+def plugin_call():
+    from netbox_nso_plugin import delivery as dlv
+    dlv.render()
+
+def unrelated(dlv):
+    dlv.render()
+"""
+
+        self.assertEqual(
+            _call_sites("sample.py", ast.parse(source), {_RENDER_TARGET}),
+            {("sample.py", "plugin_call", "dlv.render")},
+        )
+
+    def test_call_sites_ignore_unbound_parameter_methods(self):
+        source = """\
+def unrelated(dlv):
+    dlv.render()
+"""
+
+        self.assertEqual(_call_sites("sample.py", ast.parse(source), {"dlv.render"}), set())
+
     def test_call_sites_preserve_enclosing_definition_identity(self):
-        source = """
+        source = """\
+from netbox_nso_plugin import delivery, drain
+
 def capture():
     drain.claim()
     delivery.render()
@@ -131,7 +186,7 @@ class Second:
         drain.claim()
         delivery.render()
 """
-        names = {"drain.claim", "delivery.render"}
+        names = {_CLAIM_TARGET, _RENDER_TARGET}
         allowed = {
             ("sample.py", "First.capture", "drain.claim"),
             ("sample.py", "First.capture", "delivery.render"),
@@ -150,7 +205,9 @@ class Second:
         )
 
     def test_call_sites_inventory_nested_class_bodies(self):
-        source = """
+        source = """\
+from netbox_nso_plugin import delivery, drain
+
 def entry():
     class Cfg:
         claimed = drain.claim()
@@ -158,7 +215,7 @@ def entry():
 """
 
         self.assertEqual(
-            _call_sites("sample.py", ast.parse(source), {"drain.claim", "delivery.render"}),
+            _call_sites("sample.py", ast.parse(source), {_CLAIM_TARGET, _RENDER_TARGET}),
             {
                 ("sample.py", "entry", "drain.claim"),
                 ("sample.py", "entry", "delivery.render"),
@@ -166,7 +223,10 @@ def entry():
         )
 
     def test_call_sites_inventory_definition_time_expressions(self):
-        source = """
+        source = """\
+from netbox_nso_plugin import audit, delivery, drain
+from netbox_nso_plugin.config import build_base
+
 def capture(value=delivery.render("snmp", 1, 42)):
     pass
 
@@ -186,7 +246,12 @@ def outer():
             _call_sites(
                 "sample.py",
                 ast.parse(source),
-                {"audit.decorator", "build_base", "delivery.render", "drain.claim"},
+                {
+                    "netbox_nso_plugin.audit.decorator",
+                    "netbox_nso_plugin.config.build_base",
+                    _CLAIM_TARGET,
+                    _RENDER_TARGET,
+                },
             ),
             {
                 ("sample.py", "<module>", "audit.decorator"),
@@ -199,7 +264,9 @@ def outer():
     def test_nested_scopes_do_not_certify_outer_entries(self):
         from types import SimpleNamespace
 
-        source = """
+        source = """\
+from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
 def direct():
     audit_renderer_scopes()
 
@@ -242,7 +309,11 @@ def called_helper():
             {"nested_function", "nested_async_function", "nested_lambda", "nested_class"},
         )
         self.assertEqual(
-            _call_sites("sample.py", ast.parse(source), {"audit_renderer_scopes"}),
+            _call_sites(
+                "sample.py",
+                ast.parse(source),
+                {"netbox_nso_plugin.renderer_audit.audit_renderer_scopes"},
+            ),
             {
                 ("sample.py", "direct", "audit_renderer_scopes"),
                 ("sample.py", "nested_function.helper", "audit_renderer_scopes"),
@@ -272,7 +343,7 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
                 continue
             module_path = path.relative_to(PLUGIN).as_posix()
             tree = ast.parse(path.read_text(encoding="utf-8"))
-            found |= _call_sites(module_path, tree, {"claim", "drain.claim", "_claim_after_audit"})
+            found |= _call_sites(module_path, tree, {_CLAIM_TARGET, _CLAIM_AFTER_AUDIT_TARGET})
 
         self.assertEqual(
             found,
@@ -288,10 +359,9 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
         for path in sorted(PLUGIN.rglob("*.py")):
             if {"tests", "migrations"} & set(path.relative_to(PLUGIN).parts):
                 continue
-            names = _render_names(path)
             module_path = path.relative_to(PLUGIN).as_posix()
             tree = ast.parse(path.read_text(encoding="utf-8"))
-            found |= _call_sites(module_path, tree, names)
+            found |= _call_sites(module_path, tree, {_RENDER_TARGET})
 
         self.assertEqual(
             found,

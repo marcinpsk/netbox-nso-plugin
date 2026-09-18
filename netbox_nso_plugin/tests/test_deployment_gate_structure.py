@@ -9,33 +9,33 @@ from pathlib import Path
 
 from django.test import SimpleTestCase
 
+from ._ast_scope import resolve_call_target, scope_bindings
+
 _COMMANDS_ROOT = Path(__file__).resolve().parents[1] / "management" / "commands"
 _ALLOWED_RESUME_SITES = {
     # Abort is the requested operation, so its failure already names the failed operation.
     ("nso_intent_deployment_gate.py", "handle"),
 }
+_RESUME_TARGET = "netbox_nso_plugin.deployment.resume"
 
 
-def _is_resume_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    if isinstance(node.func, ast.Name):
-        return node.func.id == "resume"
-    return (
-        isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "deployment"
-        and node.func.attr == "resume"
-    )
+def _is_resume_call(node: ast.AST, bindings: dict[str, str]) -> bool:
+    return isinstance(node, ast.Call) and resolve_call_target(node, bindings) == _RESUME_TARGET
 
 
 def _resume_calls():
     for path in sorted(_COMMANDS_ROOT.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-        for node in ast.walk(tree):
-            if _is_resume_call(node):
-                yield path, node, parents
+        for node, parents in _resume_calls_in_module(tree):
+            yield path, node, parents
+
+
+def _resume_calls_in_module(tree: ast.Module):
+    bindings = scope_bindings(tree)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(tree):
+        if _is_resume_call(node, bindings[node]):
+            yield node, parents
 
 
 def _ancestor(node: ast.AST, parents: dict[ast.AST, ast.AST], kind):
@@ -97,6 +97,8 @@ def _has_failure_guidance(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bo
 def _snippet_has_failure_guidance(message_expression: str) -> bool:
     tree = ast.parse(
         f"""
+from netbox_nso_plugin import deployment
+
 def handle(self):
     try:
         deployment.resume()
@@ -105,12 +107,53 @@ def handle(self):
         raise
 """
     )
-    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    resume_call = next(node for node in ast.walk(tree) if _is_resume_call(node))
+    resume_call, parents = next(_resume_calls_in_module(tree))
     return _has_failure_guidance(resume_call, parents)
 
 
+def _violations_in_module(tree: ast.Module, label: str) -> list[str]:
+    return [
+        f"{label}:{node.lineno}"
+        for node, parents in _resume_calls_in_module(tree)
+        if not _is_allowed(Path(label), node, parents) and not _has_failure_guidance(node, parents)
+    ]
+
+
 class TestDeploymentGateResumeStructure(SimpleTestCase):
+    def test_import_aliases_are_checked_and_guarded_aliases_are_allowed(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin import deployment as gate
+from netbox_nso_plugin.deployment import resume as restart
+from ... import deployment as relative_gate
+
+def module_alias():
+    gate.resume()
+
+def symbol_alias():
+    restart()
+
+def relative_alias():
+    relative_gate.resume()
+
+def guarded_alias(self):
+    try:
+        gate.resume()
+    except BaseException:
+        self.stderr.write(
+            self.style.ERROR(
+                "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+            )
+        )
+        raise
+"""
+        )
+
+        self.assertEqual(
+            _violations_in_module(tree, "snippet.py"),
+            ["snippet.py:6", "snippet.py:9", "snippet.py:12"],
+        )
+
     def test_failure_guidance_accepts_f_string(self):
         self.assertTrue(
             _snippet_has_failure_guidance(

@@ -9,13 +9,13 @@ from pathlib import Path
 
 from django.test import SimpleTestCase
 
-from ._ast_scope import scoped_walk
+from ._ast_scope import resolve_call_target, scope_bindings, scoped_walk
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGE_ROOT = _REPO_ROOT / "netbox_nso_plugin"
-_VERIFY_FUNCTIONS = {"adapter_client.verify_secret", "verify_secret"}
-_PARSE_FUNCTIONS = {"parse_vault_ref", "vault_refs.parse_vault_ref"}
-_ERROR_TYPES = {"VaultRefError", "vault_refs.VaultRefError"}
+_VERIFY_TARGET = "netbox_nso_plugin.adapter_client.verify_secret"
+_PARSE_TARGET = "netbox_nso_plugin.vault_refs.parse_vault_ref"
+_ERROR_TARGET = "netbox_nso_plugin.vault_refs.VaultRefError"
 
 
 def _production_modules():
@@ -25,15 +25,19 @@ def _production_modules():
             yield path
 
 
-def _is_call_to(node: ast.AST, functions: set[str]) -> bool:
-    return isinstance(node, ast.Call) and ast.unparse(node.func) in functions
+def _is_call_to(node: ast.AST, target: str, bindings: dict[ast.AST, dict[str, str]]) -> bool:
+    return isinstance(node, ast.Call) and resolve_call_target(node, bindings[node]) == target
 
 
-def _verification_sites_in_module(tree: ast.Module):
+def _verification_sites_in_module(
+    tree: ast.Module,
+    bindings: dict[ast.AST, dict[str, str]] | None = None,
+):
+    bindings = bindings or scope_bindings(tree)
     function_types = ast.FunctionDef | ast.AsyncFunctionDef
     for function in (node for node in ast.walk(tree) if isinstance(node, function_types)):
         for node in scoped_walk(function.body):
-            if _is_call_to(node, _VERIFY_FUNCTIONS):
+            if _is_call_to(node, _VERIFY_TARGET, bindings):
                 yield node, function
 
 
@@ -51,10 +55,10 @@ def _has_literal_polarity(call: ast.Call) -> bool:
     )
 
 
-def _rejects_vault_ref_error(node: ast.Try) -> bool:
+def _rejects_vault_ref_error(node: ast.Try, bindings: dict[ast.AST, dict[str, str]]) -> bool:
     return any(
         handler.type is not None
-        and ast.unparse(handler.type) in _ERROR_TYPES
+        and resolve_call_target(handler.type, bindings[handler.type]) == _ERROR_TARGET
         and bool(handler.body)
         and isinstance(handler.body[-1], ast.Return)
         for handler in node.handlers
@@ -82,38 +86,47 @@ def _statement_list_chain(node: ast.AST, target: ast.AST) -> list[tuple[list[ast
     return None
 
 
-def _is_validation_try(node: ast.stmt, verification_argument: str) -> bool:
+def _is_validation_try(
+    node: ast.stmt,
+    verification_argument: str,
+    bindings: dict[ast.AST, dict[str, str]],
+) -> bool:
     if not isinstance(node, ast.Try) or len(node.body) != 1:
         return False
     statement = node.body[0]
-    if not isinstance(statement, ast.Expr) or not _is_call_to(statement.value, _PARSE_FUNCTIONS):
+    if not isinstance(statement, ast.Expr) or not _is_call_to(statement.value, _PARSE_TARGET, bindings):
         return False
     parse_call = statement.value
     return bool(
         parse_call.args
         and ast.unparse(parse_call.args[0]) == verification_argument
         and _has_literal_polarity(parse_call)
-        and _rejects_vault_ref_error(node)
+        and _rejects_vault_ref_error(node, bindings)
     )
 
 
-def _has_prior_validation(verification: ast.Call, function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+def _has_prior_validation(
+    verification: ast.Call,
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    bindings: dict[ast.AST, dict[str, str]],
+) -> bool:
     if not verification.args:
         return False
     verification_argument = ast.unparse(verification.args[0])
     chain = _statement_list_chain(function, verification)
     return chain is not None and any(
-        _is_validation_try(statement, verification_argument)
+        _is_validation_try(statement, verification_argument, bindings)
         for statements, verification_index in chain
         for statement in statements[:verification_index]
     )
 
 
 def _violations_in_module(tree: ast.Module, label: str | Path) -> list[str]:
+    bindings = scope_bindings(tree)
     return [
         f"{label}:{verification.lineno}"
-        for verification, function in _verification_sites_in_module(tree)
-        if not _has_prior_validation(verification, function)
+        for verification, function in _verification_sites_in_module(tree, bindings)
+        if not _has_prior_validation(verification, function, bindings)
     ]
 
 
@@ -129,9 +142,155 @@ class TestSecretVerificationStructure(SimpleTestCase):
     def test_secret_verification_scan_finds_callers(self):
         self.assertGreaterEqual(len(list(_verification_sites())), 2)
 
+    def test_import_aliases_are_checked_and_guarded_aliases_are_allowed(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin import adapter_client as client
+from netbox_nso_plugin.adapter_client import verify_secret as verify
+from .adapter_client import verify_secret as relative_verify
+from netbox_nso_plugin.vault_refs import parse_vault_ref as parse_ref
+from netbox_nso_plugin.vault_refs import VaultRefError as InvalidVaultRef
+
+def module_alias(ref):
+    client.verify_secret(ref)
+
+def symbol_alias(ref):
+    verify(ref)
+
+def relative_alias(ref):
+    relative_verify(ref)
+
+def guarded_alias(ref):
+    try:
+        parse_ref(ref, require_key=False)
+    except InvalidVaultRef:
+        return
+    verify(ref)
+"""
+        )
+
+        self.assertEqual(
+            _violations_in_module(tree, "snippet.py"),
+            ["snippet.py:8", "snippet.py:11", "snippet.py:14"],
+        )
+
+    def test_function_import_does_not_bind_a_sibling_parameter(self):
+        tree = ast.parse(
+            """\
+def guarded(ref):
+    from netbox_nso_plugin import adapter_client as client
+    from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
+    try:
+        parse_vault_ref(ref, require_key=False)
+    except VaultRefError:
+        return
+    client.verify_secret(ref)
+
+def unrelated(client, ref):
+    client.verify_secret(ref)
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), [])
+
+    def test_rebound_parser_does_not_certify_validation(self):
+        tree = ast.parse(
+            """\
+def verify(ref):
+    from netbox_nso_plugin import adapter_client
+    from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
+    parse_vault_ref = lambda *args, **kwargs: None
+    try:
+        parse_vault_ref(ref, require_key=False)
+    except VaultRefError:
+        return
+    adapter_client.verify_secret(ref)
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:9"])
+
+    def test_parser_parameter_does_not_certify_validation(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
+
+def verify(ref, parse_vault_ref):
+    try:
+        parse_vault_ref(ref, require_key=False)
+    except VaultRefError:
+        return
+    adapter_client.verify_secret(ref)
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:9"])
+
+    def test_later_same_scope_import_does_not_certify_validation(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
+
+def verify(ref):
+    from netbox_nso_plugin.vault_refs import parse_vault_ref
+    from netbox_nso_plugin.fakes import parse_vault_ref
+    try:
+        parse_vault_ref(ref, require_key=False)
+    except VaultRefError:
+        return
+    adapter_client.verify_secret(ref)
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:11"])
+
+    def test_conflicting_branch_imports_do_not_certify_validation(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError
+
+def verify(ref, use_real_parser):
+    if use_real_parser:
+        from netbox_nso_plugin.vault_refs import parse_vault_ref
+    else:
+        from netbox_nso_plugin.fakes import parse_vault_ref
+    try:
+        parse_vault_ref(ref, require_key=False)
+    except VaultRefError:
+        return
+    adapter_client.verify_secret(ref)
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:13"])
+
+    def test_later_matching_import_certifies_validation(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError
+
+def verify(ref):
+    from netbox_nso_plugin.vault_refs import parse_vault_ref
+    from netbox_nso_plugin.vault_refs import parse_vault_ref
+    try:
+        parse_vault_ref(ref, require_key=False)
+    except VaultRefError:
+        return
+    adapter_client.verify_secret(ref)
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), [])
+
     def test_conditional_validation_does_not_guard_later_verification(self):
         tree = ast.parse(
             """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
 def verify(ref):
     if False:
         try:
@@ -142,11 +301,13 @@ def verify(ref):
 """
         )
 
-        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:7"])
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:9"])
 
     def test_validation_of_different_argument_does_not_guard_verification(self):
         tree = ast.parse(
             """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
 def verify(ref, other):
     try:
         parse_vault_ref(other, require_key=False)
@@ -156,11 +317,13 @@ def verify(ref, other):
 """
         )
 
-        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:6"])
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:8"])
 
     def test_preceding_function_validation_guards_nested_verification(self):
         tree = ast.parse(
             """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
 def verify(ref):
     try:
         parse_vault_ref(ref, require_key=True)
@@ -178,6 +341,8 @@ def verify(ref):
     def test_preceding_block_validation_guards_nested_verification(self):
         tree = ast.parse(
             """\
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.vault_refs import VaultRefError, parse_vault_ref
 def verify(state):
     if state.vault_ref:
         try:
