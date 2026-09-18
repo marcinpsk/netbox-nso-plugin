@@ -1448,14 +1448,17 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 class TestContentOwnershipComesFromThePlan(IntentPushResetMixin, TestCase):
     """The plan decides what is content; a caller's declaration cannot widen it."""
 
-    def _lifecycle_only_plan(self, tag, adapter_device_id, vid):
+    def _lifecycle_only_plan(self, tag, adapter_device_id, vid, *, validate_after_acquire=None):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save
 
         device, management = make_managed(tag, adapter_device_id)
         row = own_vlan(management, vid, tag)
         candidate = copy.copy(NSOVLANState.objects.get(pk=row.pk))
         candidate.last_apply_error = "lifecycle only"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=("last_apply_error",)),),
+            validate_after_acquire=validate_after_acquire,
+        )
         assert plan.content_keys == ()
         return device, plan, candidate
 
@@ -1472,6 +1475,35 @@ class TestContentOwnershipComesFromThePlan(IntentPushResetMixin, TestCase):
 
         assert owned is False
         assert NSOVLANState.objects.get(pk=candidate.pk).last_apply_error == "lifecycle only"
+
+    def test_a_caller_owned_permit_runs_post_acquire_validation_before_writes(self):
+        from netbox_nso_plugin.intent_state import mirror_transaction
+        from netbox_nso_plugin.renderer_writer import consume_renderer_plan
+
+        class Sentinel(Exception):
+            pass
+
+        def reject_stale_plan():
+            raise Sentinel
+
+        _device, plan, candidate = self._lifecycle_only_plan(
+            "writer-validate-after-acquire",
+            16295,
+            1642,
+            validate_after_acquire=reject_stale_plan,
+        )
+        before = NSOVLANState.objects.get(pk=candidate.pk).last_apply_error
+        entered = False
+
+        with mirror_transaction(plan.lock_footprint) as permit:
+            with self.assertRaises(Sentinel):
+                with consume_renderer_plan(plan, permit, content=True) as writer:
+                    entered = True
+                    writer.save(candidate, update_fields=("last_apply_error",))
+
+        candidate.refresh_from_db()
+        self.assertIs(entered, False)
+        self.assertEqual(candidate.last_apply_error, before)
 
     def test_renderer_writes_refuses_the_same_lifecycle_only_plan(self):
         from netbox_nso_plugin.renderer_writer import renderer_writes

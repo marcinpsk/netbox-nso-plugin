@@ -1337,6 +1337,8 @@ def consume_renderer_plan(plan: RendererMutationPlan, permit, *, content: bool):
         raise IntentMutationProtocolError("renderer writer contexts cannot nest")
     if not permit.footprint.covers(plan.lock_footprint):
         raise IntentMutationProtocolError("the caller-owned lock footprint does not cover the renderer plan")
+    if plan.validate_after_acquire is not None:
+        plan.validate_after_acquire()
     writer = RendererWriter(plan, content=content, permit=permit)
     token = _ACTIVE_WRITER.set(writer)
     try:
