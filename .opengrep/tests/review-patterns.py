@@ -37,10 +37,35 @@ import _last_pushed_hashes as last_pushed_hashes
 # ruleid: nso-retired-coalescer-state
 from _pending_pushes import *
 
+# ruleid: nso-retired-renderer-writer-symbol
+from netbox_nso_plugin.signals import _IMPLICIT_PERMITS
+# ruleid: nso-retired-renderer-writer-symbol
+from netbox_nso_plugin.signals import _authorize_dml as authorize_dml
+# ruleid: nso-retired-renderer-writer-symbol
+import renderer_writer._begin_delete_implicit
+# ruleid: nso-retired-renderer-writer-symbol
+import _begin_implicit
+# ruleid: nso-retired-renderer-writer-symbol
+import _begin_m2m_implicit as begin_m2m_implicit
+# ruleid: nso-retired-renderer-writer-symbol
+from _install_guard import *
+
 # ruleid: nso-retired-push-builder
 _push_vlan_intent_for_device: object
 # ruleid: nso-retired-coalescer-state
 _pending_pushes: dict
+# ruleid: nso-retired-renderer-writer-symbol
+_parse_dml_target: object
+
+
+# ruleid: nso-retired-renderer-writer-symbol
+def _create_greenfield_subif_state():
+    return None
+
+
+# ruleid: nso-retired-renderer-writer-symbol
+async def _transition_static_route_content():
+    return None
 
 
 def suppressed_push(device):
@@ -167,6 +192,35 @@ def retired_coalescer_state_shapes(module):
     # ok: nso-retired-coalescer-state
     state = pending_pushes
     return state
+
+
+def retired_renderer_writer_symbol_shapes(module, factory):
+    # ruleid: nso-retired-renderer-writer-symbol
+    _discard_rolled_back_implicit_permit()
+    # ruleid: nso-retired-renderer-writer-symbol
+    module._dml_guard()
+    # ruleid: nso-retired-renderer-writer-symbol
+    _end_implicit = factory
+    # ruleid: nso-retired-renderer-writer-symbol
+    callback = _end_m2m_implicit
+    # ruleid: nso-retired-renderer-writer-symbol
+    callback = module._on_routing_static_route_pre_save
+    # ok: nso-retired-renderer-writer-symbol
+    callback = module._on_static_route_pre_save
+    return callback
+
+
+def retired_interface_config_literal():
+    # ruleid: nso-retired-interface-config-literal
+    double_quoted = "interface_config"
+    # ruleid: nso-retired-interface-config-literal
+    single_quoted = 'interface_config'
+    # ruleid: nso-retired-interface-config-literal
+    bytes_literal = b"interface_config"
+    # ruleid: nso-retired-interface-config-literal
+    concatenated_literal = "interface_" + "config"
+    # ok: nso-retired-interface-config-literal
+    different_literal = "interface_state"
 
 
 def retired_push_builder_match_capture(value):

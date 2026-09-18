@@ -170,6 +170,55 @@ rules:
       exclude:
         - "**/tests/**"
         - "**/migrations/**"
+  - id: nso-retired-renderer-writer-symbol
+    languages: [python]
+    severity: ERROR
+    message: Do not restore retired renderer-writer symbols.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $M.$F(...)
+          - pattern: '$F: $T'
+          - pattern: |
+              def $F(...):
+                  ...
+          - patterns:
+              - pattern: $F
+              - pattern-not-inside: $F(...)
+              - pattern-not-inside: $M.$F
+              - pattern-not-inside: from $M import $F
+              - pattern-not-inside: from $M import $F as $A
+              - pattern-not-inside: import $F
+              - pattern-not-inside: import $F as $A
+              - pattern-not-inside: import $M.$F
+          - patterns:
+              - pattern: $M.$F
+              - pattern-not-inside: $M.$F(...)
+              - pattern-not-inside: import $M.$F
+          - pattern: from $M import $F
+          - pattern: from $M import $F as $A
+          - pattern: import $M.$F
+          - pattern: import $F
+          - pattern: import $F as $A
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_(?:IMPLICIT_PERMITS|authorize_dml|begin_delete_implicit|begin_implicit|begin_m2m_implicit|create_greenfield_subif_state|discard_rolled_back_implicit_permit|dml_guard|end_implicit|end_m2m_implicit|install_guard|on_routing_static_route_pre_save|parse_dml_target|remove_static_route_for_device|static_route_content|transition_static_route_content)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "netbox_nso_plugin/tests/**"
+        - "netbox_nso_plugin/migrations/**"
+  - id: nso-retired-interface-config-literal
+    languages: [python]
+    severity: ERROR
+    message: Read the interface receipt section from the delivery registry.
+    pattern: '"interface_config"'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/delivery.py"
   - id: nso-vlan-group-mutable-lookup
     languages: [python]
     severity: ERROR

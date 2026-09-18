@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 # Exclude generated migrations from the local OpenGrep target set.
-migrations/
+/netbox_nso_plugin/migrations/

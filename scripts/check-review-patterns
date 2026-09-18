@@ -14,7 +14,7 @@ case "$mode" in
       shopt -s globstar nullglob
       set -- netbox_nso_plugin netbox_nso_plugin/tests/**/*.py .github/ci/**/*.py conftest.py isolated_test_settings.py contract_tests/**/*.py netbox_stubs/**/*.py .devcontainer/**/*.py
     fi
-    exec "$scan_bin" scan --no-git-ignore --include '*.py' --config .opengrep/nso-rules.yaml --error -- "$@"
+    exec "$scan_bin" scan --no-git-ignore --include '*.py' --max-target-bytes 0 --config .opengrep/nso-rules.yaml --error -- "$@"
     ;;
   test)
     if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi

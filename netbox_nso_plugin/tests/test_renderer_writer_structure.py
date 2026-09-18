@@ -357,38 +357,9 @@ class TestRendererWriterStructure(SimpleTestCase):
 
         self.assertEqual(sorted(_REVIEWED_MUTATION_SITES - live), [])
 
-    def test_no_process_global_sql_or_implicit_permit_guard_remains(self):
-        forbidden = {
-            "_IMPLICIT_PERMITS",
-            "_authorize_dml",
-            "_begin_delete_implicit",
-            "_begin_implicit",
-            "_begin_m2m_implicit",
-            "_discard_rolled_back_implicit_permit",
-            "_dml_guard",
-            "_end_implicit",
-            "_end_m2m_implicit",
-            "_install_guard",
-            "_parse_dml_target",
-        }
-        found = set()
-        for path, _relative in _production_modules():
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            found.update(node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id in forbidden)
-
-        self.assertEqual(found, set())
-
-    def test_signals_do_not_keep_retired_mutation_paths(self):
+    def test_signals_do_not_import_copy_inside_a_function(self):
         path = Path(__file__).resolve().parents[1] / "signals.py"
         tree = ast.parse(path.read_text(), filename=str(path))
-        functions = {node.name for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES)}
-        retired = {
-            "_create_greenfield_subif_state",
-            "_on_routing_static_route_pre_save",
-            "_remove_static_route_for_device",
-            "_static_route_content",
-            "_transition_static_route_content",
-        }
         local_copy_imports = [
             node.lineno
             for function in (node for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES))
@@ -396,7 +367,6 @@ class TestRendererWriterStructure(SimpleTestCase):
             if isinstance(node, ast.Import) and any(alias.name == "copy" for alias in node.names)
         ]
 
-        self.assertEqual(sorted(functions & retired), [])
         self.assertEqual(local_copy_imports, [])
 
     def test_mtu_inline_edits_delegate_to_an_exact_plan(self):

@@ -16,10 +16,11 @@ repository hooks with `pre-commit install --install-hooks`.
 
 The pre-commit hooks scan the package and its test files when Python code, rules,
 or the runner changes. The directory scan uses the root `.semgrepignore` instead
-of OpenGrep defaults and disables Git ignore handling, so it checks every Python
-file under `netbox_nso_plugin` except files in `migrations` directories. Rule
-changes also run the annotated fixtures. Missing OpenGrep, invalid rules, and
-findings fail the hook. An explicit target is also supported:
+of OpenGrep defaults and disables Git ignore handling. It checks every Python
+file under `netbox_nso_plugin` except files in `/netbox_nso_plugin/migrations/`.
+The leading slash anchors this path at the repository root. The scan applies no
+file-size limit. Rule changes also run the annotated fixtures. Missing OpenGrep,
+invalid rules, and findings fail the hook. An explicit target is also supported:
 `scripts/check-review-patterns scan path/to/file.py`. Arguments after `scan` are
 paths, not scanner options. Fixtures contain deliberate defects, so Ruff excludes
 only `.opengrep/tests`.
@@ -59,13 +60,14 @@ References checked on 2026-09-12:
 | Test thread join has no bounded timeout | `nso-unbounded-thread-join` | Enforces bounded `.join()` calls in test modules that contain a `threading` import.<br>Limit: An import inside a function, class, `if` or `else` branch, `try`, `except`, or `finally` block, loop, or `with` block does not enable detection of joins outside that block, although the module-level Python walk caught these cases.<br>Limit: Relative imports, such as `from .threading import Thread`, aliased `from ..threading import ...`, and relative wildcard imports, do not enable this rule, although they enabled the module-level Python walk.<br>Limit: The shared fixture file always imports from `threading`. The module-without-threading negative case remains covered only by the unit contract in the commit history. |
 | Retired direct push builder named outside the delivery registry | `nso-retired-push-builder` | Covers calls, references, and imports in production Python modules. The owner file `delivery.py` is excluded. The rule also reports dotted imports, wildcard imports from a matching module, and matching names used as `case` captures.<br>New limit: Unlike the old AST check, this rule does not match Unicode-normalized identifier spellings.<br>Existing limit: A name built with `getattr` and a string is not matched. |
 | Retired in-memory coalescer state named in production | `nso-retired-coalescer-state` | Covers calls, references, and imports of `_pending_pushes` and `_last_pushed_hashes` in production Python modules. The rule also reports dotted imports, wildcard imports from a matching module, and matching names used as `case` captures.<br>New limit: Unlike the old AST check, this rule does not match Unicode-normalized identifier spellings.<br>Existing limit: A name built with `getattr` and a string is not matched. |
+| Retired renderer-writer symbol named in production | `nso-retired-renderer-writer-symbol` | Covers calls, references, attributes, definitions, assignment targets, and imports of the retired renderer-writer names in production Python modules.<br>Limit: Unlike the old AST checks, this rule does not match Unicode-normalized identifier spellings. Python normalizes `_ＩＭＰＬＩＣＩＴ_PERMITS` to `_IMPLICIT_PERMITS`, but the text rule does not. |
+| Retired interface receipt literal used outside the delivery registry | `nso-retired-interface-config-literal` | Covers ordinary single-quoted or double-quoted `"interface_config"` literals in production Python modules. The same literal pattern also reports `b"interface_config"` and `"interface_" + "config"`.<br>Limit: Escaped, adjacent, and f-string spellings are not covered.<br>Limit: The `delivery.py` owner is excluded by path, so the fixture does not test that exclusion. |
 | Mutable display name used as VLAN group identity | `nso-vlan-group-mutable-lookup` | Imported `VLANGroup` manager calls with both `name` and `slug` lookup keys. |
 | Exact write-set assertion loses duplicate writes | `nso-write-set-cardinality-assertion` | Direct `assertEqual` set comprehensions over a frozen `write_set`. Membership and subset checks stay valid. |
 | Text file read or written without an explicit encoding | `nso-implicit-text-encoding` | `read_text`, `write_text`, `Path.open`, and builtin `open` calls that have no `encoding=` keyword. Any attribute call named `open` is reported, including `os.open` and `tokenize.open`, which have no encoding parameter. The rule also reports a positional encoding (`p.read_text("utf-8")`). An encoding that arrives through `**kwargs` or through a differently named keyword is not seen. The rule detects binary mode from a literal mode string only. |
 | Duplicate adapter entries silently kept | `nso-silent-duplicate-adapter-entry` | Rejects `continue` on a seen key while iterating a redistribution `payload["entries"]` list or normalized VLAN entries. Other payload shapes still need behavior tests. |
 | Model signal receiver connected without `dispatch_uid` | `nso-signal-connect-without-dispatch-uid` | `connect` calls on the `django.db.models.signals` objects, including module-qualified and aliased imports. A signal object stored in a variable is not followed. Test modules are excluded. |
 | Registered renderer inputs written outside the writer | `test_renderer_writer_structure.py` | Uses the live model registry and reviewed call sites. Dynamic model targets need review. |
-| Retired SQL guard restored in production | `test_renderer_writer_structure.py` | Structural guard over production modules. |
 | Spec-less object mocks | Existing `mock-discipline` hook | Tests beyond the recorded baseline. |
 | Duplicate definitions, dead imports, naive datetimes | Existing Ruff rules | Python source checked by the repository lint gate. |
 | Raw SQL or ORM bypass leaves stale rendered intent | `test_renderer_audit.py` and `test_intent_outbox_claim.py` | Real database assertions cover drift, repair, and claim interleavings. |
