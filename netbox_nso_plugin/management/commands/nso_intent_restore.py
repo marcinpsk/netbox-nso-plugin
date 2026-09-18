@@ -185,6 +185,11 @@ class Command(BaseCommand):
             try:
                 resume()
             except BaseException:
-                self.stderr.write(self.style.ERROR("Intent restore completed, but intent work may remain quiesced"))
+                self.stderr.write(
+                    self.style.ERROR(
+                        "Intent restore completed, but intent work may remain quiesced. "
+                        "Fix the cause and run nso_intent_deployment_gate --abort."
+                    )
+                )
                 raise
         self.stdout.write(self.style.SUCCESS(f"Restore resolved {len(states)} outstanding claim(s)"))

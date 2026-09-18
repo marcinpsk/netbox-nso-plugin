@@ -167,7 +167,12 @@ class Command(BaseCommand):
         try:
             resume()
         except BaseException:
-            self.stderr.write(self.style.ERROR("Deployment verification passed, but intent work may remain quiesced"))
+            self.stderr.write(
+                self.style.ERROR(
+                    "Deployment verification passed, but intent work may remain quiesced. "
+                    "Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
             raise
         self.stdout.write(self.style.SUCCESS("Deployment verification passed; normal intent operation resumed"))
 

@@ -83,6 +83,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
 
         self.assertIs(caught.exception, failure)
         self.assertIn("Renderer baseline cutover passed, but intent work may remain quiesced", stderr.getvalue())
+        self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
         self.assertNotIn("Renderer baseline cutover passed", stdout.getvalue())
         self.assertTrue(is_quiesced())
 
@@ -103,6 +104,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
 
         self.assertIs(caught.exception, failure)
         self.assertIn("Renderer baseline cutover passed, but intent work may remain quiesced", stderr.getvalue())
+        self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
         self.assertNotIn("Renderer baseline cutover passed", stdout.getvalue())
         self.assertTrue(is_quiesced())
 

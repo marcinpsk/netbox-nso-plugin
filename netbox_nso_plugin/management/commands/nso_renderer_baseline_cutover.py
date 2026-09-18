@@ -58,7 +58,10 @@ class Command(BaseCommand):
                 resume()
             except BaseException:
                 self.stderr.write(
-                    self.style.ERROR("Renderer baseline cutover passed, but intent work may remain quiesced")
+                    self.style.ERROR(
+                        "Renderer baseline cutover passed, but intent work may remain quiesced. "
+                        "Fix the cause and run nso_intent_deployment_gate --abort."
+                    )
                 )
                 raise
         self.stdout.write(

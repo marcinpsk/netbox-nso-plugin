@@ -658,6 +658,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
     def test_completed_verification_reports_resume_failure_and_keeps_the_gate(self):
         from netbox_nso_plugin import deployment, drain
+        from netbox_nso_plugin.deployment import is_quiesced
 
         own_route(self.mgmt, "198.18.45.0/24", "198.18.0.1")
         config, session = self.adapter.patches()
@@ -689,8 +690,11 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
 
             self.assertIs(caught.exception, failure)
             self.assertIn("Deployment verification passed, but intent work may remain quiesced", stderr.getvalue())
+            self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
             self.assertNotIn("Deployment verification passed", stdout.getvalue())
             self.assertTrue(deployment.is_quiesced())
+            call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
+            assert not is_quiesced(), "--abort must release the gate"
         finally:
             if deployment.is_quiesced():
                 deployment.resume()
@@ -828,6 +832,7 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
 
             self.assertIs(caught.exception, failure)
             self.assertIn("Intent restore completed, but intent work may remain quiesced", stderr.getvalue())
+            self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
             self.assertNotIn("Restore resolved", stdout.getvalue())
             self.assertTrue(deployment.is_quiesced())
         finally:

@@ -53,6 +53,21 @@ def _is_allowed(path: Path, node: ast.Call, parents: dict[ast.AST, ast.AST]) -> 
     return function is not None and (path.name, function.name) in _ALLOWED_RESUME_SITES
 
 
+def _literal_messages(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.JoinedStr):
+        return [
+            "".join(
+                segment.value
+                for segment in node.values
+                if isinstance(segment, ast.Constant) and isinstance(segment.value, str)
+            )
+        ]
+    messages = [node.value] if isinstance(node, ast.Constant) and isinstance(node.value, str) else []
+    for child in ast.iter_child_nodes(node):
+        messages.extend(_literal_messages(child))
+    return messages
+
+
 def _has_failure_guidance(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bool:
     statement = _ancestor(node, parents, ast.stmt)
     if statement is None:
@@ -64,7 +79,13 @@ def _has_failure_guidance(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bo
     if not isinstance(handler.type, ast.Name) or handler.type.id != "BaseException":
         return False
     writes_guidance = any(
-        isinstance(candidate, ast.Call) and ast.unparse(candidate.func) == "self.stderr.write"
+        isinstance(candidate, ast.Call)
+        and ast.unparse(candidate.func) == "self.stderr.write"
+        and candidate.args
+        and any(
+            "may remain quiesced" in message and "nso_intent_deployment_gate --abort" in message
+            for message in _literal_messages(candidate.args[0])
+        )
         for handler_statement in handler.body
         for candidate in ast.walk(handler_statement)
     )
@@ -73,7 +94,36 @@ def _has_failure_guidance(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bo
     return writes_guidance and reraises
 
 
+def _snippet_has_failure_guidance(message_expression: str) -> bool:
+    tree = ast.parse(
+        f"""
+def handle(self):
+    try:
+        deployment.resume()
+    except BaseException as exc:
+        self.stderr.write(self.style.ERROR({message_expression}))
+        raise
+"""
+    )
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    resume_call = next(node for node in ast.walk(tree) if _is_resume_call(node))
+    return _has_failure_guidance(resume_call, parents)
+
+
 class TestDeploymentGateResumeStructure(SimpleTestCase):
+    def test_failure_guidance_accepts_f_string(self):
+        self.assertTrue(
+            _snippet_has_failure_guidance(
+                'f"Intent work may remain quiesced: {exc}. Fix the cause and run nso_intent_deployment_gate --abort."'
+            )
+        )
+
+    def test_failure_guidance_rejects_bare_variable(self):
+        self.assertFalse(_snippet_has_failure_guidance("message"))
+
+    def test_failure_guidance_requires_recovery_command(self):
+        self.assertFalse(_snippet_has_failure_guidance('"Intent work may remain quiesced."'))
+
     def test_resume_failures_report_that_intent_work_may_remain_quiesced(self):
         violations = {
             f"{path.name}:{node.lineno}"
