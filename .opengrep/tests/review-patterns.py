@@ -431,3 +431,59 @@ def wire_signals(handler, sender, custom_signal):
     model_signals.post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
     # ok: nso-signal-connect-without-dispatch-uid
     custom_signal.connect(handler, sender=sender)
+
+
+# ruleid: nso-renderer-writer-single-resolver
+class RendererWriter:
+    def render(self):
+        return None
+
+
+# ruleid: nso-renderer-writer-single-resolver
+class RendererWriter:
+    def _resolve_reference(self, reference):
+        return reference
+
+    def _resolve_reference(self, reference):
+        return reference
+
+
+# ok: nso-renderer-writer-single-resolver
+class RendererWriter:
+    def _resolve_reference(self, reference):
+        return reference
+
+    def helper(self):
+        def _resolve_reference(reference):
+            return reference
+
+        return _resolve_reference
+
+
+# ok: nso-renderer-writer-single-resolver
+class RendererWriter:
+    def _resolve_reference(self, reference):
+        return reference
+
+    class RendererWriter:
+        pass
+
+
+# ok: nso-renderer-writer-single-resolver
+class ＲendererWriter:
+    def render(self):
+        return None
+
+
+# ruleid: nso-renderer-writer-single-resolver
+class RendererWriter:
+    def _ｒesolve_reference(self, reference):
+        return reference
+
+
+# ok: nso-renderer-writer-single-resolver
+class Writer:
+    pass
+
+
+RendererWriter = Writer

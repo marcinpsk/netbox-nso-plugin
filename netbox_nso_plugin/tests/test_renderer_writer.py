@@ -358,21 +358,6 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         state.vrf = "missing-vrf"
         self.assertIsNone(manifest_binding(state))
 
-    def test_renderer_writer_declares_one_reference_resolver(self):
-        import ast
-        import inspect
-
-        from netbox_nso_plugin.renderer_writer import RendererWriter
-
-        renderer_writer = ast.parse(inspect.getsource(RendererWriter)).body[0]
-        resolvers = [
-            node
-            for node in renderer_writer.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_resolve_reference"
-        ]
-
-        self.assertEqual(len(resolvers), 1)
-
     def test_route_map_consumers_ignore_undeclared_redistribution_scopes(self):
         from netbox_routing.models import RouteMap
 
