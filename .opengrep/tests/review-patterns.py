@@ -11,6 +11,37 @@ from ipam.models import VLANGroup
 from netbox_nso_plugin.signals import suppress_intent_push, _schedule_intent_push
 from netbox_nso_plugin import signals
 
+# ruleid: nso-retired-push-builder
+from netbox_nso_plugin.delivery import _push_vlan_intent_for_device
+# ruleid: nso-retired-push-builder
+from netbox_nso_plugin.delivery import _push_interface_intent_for_device as push_interface
+# ruleid: nso-retired-push-builder
+import delivery._push_static_route_intent_for_device
+# ruleid: nso-retired-push-builder
+import _push_isis_intent_for_device
+# ruleid: nso-retired-push-builder
+import _push_bgp_intent_for_device as push_bgp
+# ruleid: nso-retired-push-builder
+from _push_vlan_intent_for_device import *
+
+# ruleid: nso-retired-coalescer-state
+from netbox_nso_plugin.signals import _pending_pushes
+# ruleid: nso-retired-coalescer-state
+from netbox_nso_plugin.signals import _last_pushed_hashes as pushed_hashes
+# ruleid: nso-retired-coalescer-state
+import signals._pending_pushes
+# ruleid: nso-retired-coalescer-state
+import _pending_pushes
+# ruleid: nso-retired-coalescer-state
+import _last_pushed_hashes as last_pushed_hashes
+# ruleid: nso-retired-coalescer-state
+from _pending_pushes import *
+
+# ruleid: nso-retired-push-builder
+_push_vlan_intent_for_device: object
+# ruleid: nso-retired-coalescer-state
+_pending_pushes: dict
+
 
 def suppressed_push(device):
     with suppress_intent_push():
@@ -108,6 +139,48 @@ def unpacked_thread_join_shapes(worker, a, b, x):
     worker.join(**a, other=x)
     # ok: nso-unbounded-thread-join
     worker.join(**a, timeout=5)
+
+
+def retired_push_builder_shapes(module):
+    # ruleid: nso-retired-push-builder
+    _push_vlan_intent_for_device()
+    # ruleid: nso-retired-push-builder
+    module._push_interface_intent_for_device()
+    # ruleid: nso-retired-push-builder
+    builder = _push_ospf_intent_for_device
+    # ruleid: nso-retired-push-builder
+    builder = module._push_bgp_intent_for_device
+    # ok: nso-retired-push-builder
+    builder = _push_intent_registry
+    return builder
+
+
+def retired_coalescer_state_shapes(module):
+    # ruleid: nso-retired-coalescer-state
+    _pending_pushes()
+    # ruleid: nso-retired-coalescer-state
+    module._last_pushed_hashes()
+    # ruleid: nso-retired-coalescer-state
+    state = _last_pushed_hashes
+    # ruleid: nso-retired-coalescer-state
+    state = module._pending_pushes
+    # ok: nso-retired-coalescer-state
+    state = pending_pushes
+    return state
+
+
+def retired_push_builder_match_capture(value):
+    match value:
+        # ruleid: nso-retired-push-builder
+        case _push_vlan_intent_for_device:
+            return None
+
+
+def retired_coalescer_state_match_capture(value):
+    match value:
+        # ruleid: nso-retired-coalescer-state
+        case _pending_pushes:
+            return None
 
 
 def threading_import_before(worker):

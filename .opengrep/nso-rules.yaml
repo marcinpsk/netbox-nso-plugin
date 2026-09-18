@@ -99,6 +99,77 @@ rules:
               from threading import $X as $Y
     paths:
       include: ["netbox_nso_plugin/tests/**"]
+  - id: nso-retired-push-builder
+    languages: [python]
+    severity: ERROR
+    message: Name push builders only in the delivery registry.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $M.$F(...)
+          - pattern: '$F: $T'
+          - patterns:
+              - pattern: $F
+              - pattern-not-inside: $F(...)
+              - pattern-not-inside: $M.$F
+              - pattern-not-inside: from $M import $F
+              - pattern-not-inside: from $M import $F as $A
+              - pattern-not-inside: import $F
+              - pattern-not-inside: import $F as $A
+              - pattern-not-inside: import $M.$F
+          - patterns:
+              - pattern: $M.$F
+              - pattern-not-inside: $M.$F(...)
+              - pattern-not-inside: import $M.$F
+          - pattern: from $M import $F
+          - pattern: from $M import $F as $A
+          - pattern: import $M.$F
+          - pattern: import $F
+          - pattern: import $F as $A
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_push_[a-z0-9_]+_intent_for_device$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/delivery.py"
+  - id: nso-retired-coalescer-state
+    languages: [python]
+    severity: ERROR
+    message: Keep intent state in the durable outbox.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $M.$F(...)
+          - pattern: '$F: $T'
+          - patterns:
+              - pattern: $F
+              - pattern-not-inside: $F(...)
+              - pattern-not-inside: $M.$F
+              - pattern-not-inside: from $M import $F
+              - pattern-not-inside: from $M import $F as $A
+              - pattern-not-inside: import $F
+              - pattern-not-inside: import $F as $A
+              - pattern-not-inside: import $M.$F
+          - patterns:
+              - pattern: $M.$F
+              - pattern-not-inside: $M.$F(...)
+              - pattern-not-inside: import $M.$F
+          - pattern: from $M import $F
+          - pattern: from $M import $F as $A
+          - pattern: import $M.$F
+          - pattern: import $F
+          - pattern: import $F as $A
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_(?:pending_pushes|last_pushed_hashes)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
   - id: nso-vlan-group-mutable-lookup
     languages: [python]
     severity: ERROR

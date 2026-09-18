@@ -15,11 +15,14 @@ executable. The rules and fixtures are tested with OpenGrep 1.30.0. Install the
 repository hooks with `pre-commit install --install-hooks`.
 
 The pre-commit hooks scan the package and its test files when Python code, rules,
-or the runner changes. Rule changes also run the annotated fixtures. Missing
-OpenGrep, invalid rules, and findings fail the hook. An explicit target is also
-supported: `scripts/check-review-patterns scan path/to/file.py`. Arguments after
-`scan` are paths, not scanner options. Fixtures contain deliberate defects, so
-Ruff excludes only `.opengrep/tests`.
+or the runner changes. The directory scan uses the root `.semgrepignore` instead
+of OpenGrep defaults and disables Git ignore handling, so it checks every Python
+file under `netbox_nso_plugin` except files in `migrations` directories. Rule
+changes also run the annotated fixtures. Missing OpenGrep, invalid rules, and
+findings fail the hook. An explicit target is also supported:
+`scripts/check-review-patterns scan path/to/file.py`. Arguments after `scan` are
+paths, not scanner options. Fixtures contain deliberate defects, so Ruff excludes
+only `.opengrep/tests`.
 
 Every rule ID and every positive pattern alternative must match at least one
 `# ruleid:` fixture line. The fixture hook fails when a rule or alternative has
@@ -54,6 +57,8 @@ References checked on 2026-09-12:
 | Global monotonic clock patched through a module | `nso-global-monotonic-patch` | Literal `patch` targets that name `time.monotonic`. |
 | Race test hides a broken barrier | `nso-swallowed-barrier-failure` | Exception handlers that contain only `pass` or a bare `return`. |
 | Test thread join has no bounded timeout | `nso-unbounded-thread-join` | Enforces bounded `.join()` calls in test modules that contain a `threading` import.<br>Limit: An import inside a function, class, `if` or `else` branch, `try`, `except`, or `finally` block, loop, or `with` block does not enable detection of joins outside that block, although the module-level Python walk caught these cases.<br>Limit: Relative imports, such as `from .threading import Thread`, aliased `from ..threading import ...`, and relative wildcard imports, do not enable this rule, although they enabled the module-level Python walk.<br>Limit: The shared fixture file always imports from `threading`. The module-without-threading negative case remains covered only by the unit contract in the commit history. |
+| Retired direct push builder named outside the delivery registry | `nso-retired-push-builder` | Covers calls, references, and imports in production Python modules. The owner file `delivery.py` is excluded. The rule also reports dotted imports, wildcard imports from a matching module, and matching names used as `case` captures.<br>New limit: Unlike the old AST check, this rule does not match Unicode-normalized identifier spellings.<br>Existing limit: A name built with `getattr` and a string is not matched. |
+| Retired in-memory coalescer state named in production | `nso-retired-coalescer-state` | Covers calls, references, and imports of `_pending_pushes` and `_last_pushed_hashes` in production Python modules. The rule also reports dotted imports, wildcard imports from a matching module, and matching names used as `case` captures.<br>New limit: Unlike the old AST check, this rule does not match Unicode-normalized identifier spellings.<br>Existing limit: A name built with `getattr` and a string is not matched. |
 | Mutable display name used as VLAN group identity | `nso-vlan-group-mutable-lookup` | Imported `VLANGroup` manager calls with both `name` and `slug` lookup keys. |
 | Exact write-set assertion loses duplicate writes | `nso-write-set-cardinality-assertion` | Direct `assertEqual` set comprehensions over a frozen `write_set`. Membership and subset checks stay valid. |
 | Text file read or written without an explicit encoding | `nso-implicit-text-encoding` | `read_text`, `write_text`, `Path.open`, and builtin `open` calls that have no `encoding=` keyword. Any attribute call named `open` is reported, including `os.open` and `tokenize.open`, which have no encoding parameter. The rule also reports a positional encoding (`p.read_text("utf-8")`). An encoding that arrives through `**kwargs` or through a differently named keyword is not seen. The rule detects binary mode from a literal mode string only. |
