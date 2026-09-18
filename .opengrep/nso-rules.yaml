@@ -51,6 +51,54 @@ rules:
               ...
           except threading.BrokenBarrierError:
               return
+  - id: nso-unbounded-thread-join
+    languages: [python]
+    severity: ERROR
+    message: Use a bounded timeout for thread joins.
+    patterns:
+      - pattern-either:
+          - pattern: $THREAD.join()
+          - pattern: $THREAD.join(None)
+          - pattern: $THREAD.join(timeout=None)
+          - pattern: $THREAD.join(**$OPTIONS)
+          - patterns:
+              - pattern: $THREAD.join(**$OPTIONS, ...)
+              - pattern-not: $THREAD.join(..., timeout=$TIMEOUT, ...)
+          - pattern: $THREAD.join(timeout=None, **$OPTIONS)
+          - pattern: $THREAD.join(None, **$OPTIONS)
+          - pattern: $THREAD.join(None, ...)
+          - pattern: $THREAD.join(..., timeout=None, ...)
+          - patterns:
+              - pattern: $THREAD.join(...)
+              - pattern-not: $THREAD.join($ARG, ...)
+              - pattern-not: $THREAD.join(..., timeout=$TIMEOUT, ...)
+      - pattern-either:
+          - pattern-inside: |
+              import threading
+              ...
+          - pattern-inside: |
+              import threading as $T
+              ...
+          - pattern-inside: |
+              from threading import $X
+              ...
+          - pattern-inside: |
+              from threading import $X as $Y
+              ...
+          - pattern-inside: |
+              ...
+              import threading
+          - pattern-inside: |
+              ...
+              import threading as $T
+          - pattern-inside: |
+              ...
+              from threading import $X
+          - pattern-inside: |
+              ...
+              from threading import $X as $Y
+    paths:
+      include: ["netbox_nso_plugin/tests/**"]
   - id: nso-vlan-group-mutable-lookup
     languages: [python]
     severity: ERROR

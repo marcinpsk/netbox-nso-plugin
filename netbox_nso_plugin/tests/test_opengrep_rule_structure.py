@@ -160,6 +160,24 @@ class TestOpenGrepRuleStructure(SimpleTestCase):
 
 
 class TestOpenGrepAlternativeCoverage(SimpleTestCase):
+    def test_generated_sub_rules_drop_path_filters(self):
+        document = {
+            "rules": [
+                {
+                    "id": "example",
+                    "pattern-either": [
+                        {"pattern": "first(...)"},
+                        {"pattern": "second(...)"},
+                    ],
+                    "paths": {"include": ["netbox_nso_plugin/tests/**"]},
+                }
+            ]
+        }
+
+        alternatives = _COVERAGE.split_rule_alternatives(document)
+
+        self.assertTrue(all("paths" not in rule for _, _, rule in alternatives))
+
     def test_nested_top_level_alternatives_yield_one_sub_rule_per_leaf(self):
         document = {
             "rules": [

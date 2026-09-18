@@ -154,6 +154,7 @@ def split_rule_alternatives(document: dict) -> list[tuple[str, int, dict]]:
 
         for alternative_index, variant in enumerate(variants, start=1):
             sub_rule = deepcopy(rule)
+            sub_rule.pop("paths", None)
             sub_rule["id"] = f"{rule_id}--alt{alternative_index}"
             sub_rule[formula_key] = variant[formula_key]
             alternatives.append((rule_id, alternative_index, sub_rule))

@@ -66,6 +66,106 @@ def swallowed_barrier(barrier):
         return
 
 
+def unbounded_thread_join_shapes(worker, options, timeout):
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+    # ruleid: nso-unbounded-thread-join
+    worker.join(None)
+    # ruleid: nso-unbounded-thread-join
+    worker.join((None))
+    # ruleid: nso-unbounded-thread-join
+    worker.join(timeout=None)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(**options)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(timeout=None, **options)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(None, **options)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(None, other=timeout)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(5, timeout=None)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(other=timeout)
+    # ok: nso-unbounded-thread-join
+    worker.join(5)
+    # ok: nso-unbounded-thread-join
+    worker.join(timeout=5)
+    # ok: nso-unbounded-thread-join
+    worker.join(timeout=timeout)
+    # ok: nso-unbounded-thread-join
+    worker.join(timeout=timeout, **options)
+    # ok: nso-unbounded-thread-join
+    worker.join(*options)
+    # ok: nso-unbounded-thread-join
+    ",".join(items)
+
+
+def unpacked_thread_join_shapes(worker, a, b, x):
+    # ruleid: nso-unbounded-thread-join
+    worker.join(**a, **b)
+    # ruleid: nso-unbounded-thread-join
+    worker.join(**a, other=x)
+    # ok: nso-unbounded-thread-join
+    worker.join(**a, timeout=5)
+
+
+def threading_import_before(worker):
+    import threading
+
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+
+def aliased_threading_import_before(worker):
+    import threading as thread_module
+
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+
+def threading_symbol_import_before(worker):
+    from threading import Thread
+
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+
+def aliased_threading_symbol_import_before(worker):
+    from threading import Thread as WorkerThread
+
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+
+def threading_import_after(worker):
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+    import threading
+
+
+def aliased_threading_import_after(worker):
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+    import threading as thread_module
+
+
+def threading_symbol_import_after(worker):
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+    from threading import Thread
+
+
+def aliased_threading_symbol_import_after(worker):
+    # ruleid: nso-unbounded-thread-join
+    worker.join()
+
+    from threading import Thread as WorkerThread
+
+
 def visible_barrier_failure(barrier):
     # ok: nso-swallowed-barrier-failure
     try:

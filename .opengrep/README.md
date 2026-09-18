@@ -23,7 +23,8 @@ Ruff excludes only `.opengrep/tests`.
 
 Every rule ID and every positive pattern alternative must match at least one
 `# ruleid:` fixture line. The fixture hook fails when a rule or alternative has
-no matching defect.
+no matching defect. Path filters are not part of the coverage check; the tree
+scan proves them.
 
 ## Preserve CodeRabbit's default scan
 
@@ -52,6 +53,7 @@ References checked on 2026-09-12:
 | Assertion compares a value with itself | `nso-tautological-assertion` | Literal assertion shapes, not proof that every assertion reaches the intended path. |
 | Global monotonic clock patched through a module | `nso-global-monotonic-patch` | Literal `patch` targets that name `time.monotonic`. |
 | Race test hides a broken barrier | `nso-swallowed-barrier-failure` | Exception handlers that contain only `pass` or a bare `return`. |
+| Test thread join has no bounded timeout | `nso-unbounded-thread-join` | Enforces bounded `.join()` calls in test modules that contain a `threading` import.<br>Limit: An import inside a function, class, `if` or `else` branch, `try`, `except`, or `finally` block, loop, or `with` block does not enable detection of joins outside that block, although the module-level Python walk caught these cases.<br>Limit: Relative imports, such as `from .threading import Thread`, aliased `from ..threading import ...`, and relative wildcard imports, do not enable this rule, although they enabled the module-level Python walk.<br>Limit: The shared fixture file always imports from `threading`. The module-without-threading negative case remains covered only by the unit contract in the commit history. |
 | Mutable display name used as VLAN group identity | `nso-vlan-group-mutable-lookup` | Imported `VLANGroup` manager calls with both `name` and `slug` lookup keys. |
 | Exact write-set assertion loses duplicate writes | `nso-write-set-cardinality-assertion` | Direct `assertEqual` set comprehensions over a frozen `write_set`. Membership and subset checks stay valid. |
 | Text file read or written without an explicit encoding | `nso-implicit-text-encoding` | `read_text`, `write_text`, `Path.open`, and builtin `open` calls that have no `encoding=` keyword. Any attribute call named `open` is reported, including `os.open` and `tokenize.open`, which have no encoding parameter. The rule also reports a positional encoding (`p.read_text("utf-8")`). An encoding that arrives through `**kwargs` or through a differently named keyword is not seen. The rule detects binary mode from a literal mode string only. |
