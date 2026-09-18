@@ -16,6 +16,11 @@ from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .strict_writer import assert_each_operation_consumed_once, strict_writer_harness
 
 
+class _BrokenStderr(io.StringIO):
+    def write(self, value):
+        raise OSError("stderr is unavailable")
+
+
 class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
@@ -87,6 +92,24 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertNotIn("Renderer baseline cutover passed", stdout.getvalue())
         self.assertTrue(is_quiesced())
 
+    def test_resume_failure_survives_stderr_failure(self):
+        from django.db import DatabaseError
+
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        self._prepare_unknown_vlan_baseline()
+        failure = DatabaseError("connection lost")
+
+        with patch(
+            "netbox_nso_plugin.management.commands.nso_renderer_baseline_cutover.resume",
+            side_effect=failure,
+        ):
+            with self.assertRaises(DatabaseError) as caught:
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=_BrokenStderr())
+
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(is_quiesced())
+
     def test_interrupt_during_resume_reports_that_the_gate_may_remain_active(self):
         from netbox_nso_plugin.deployment import is_quiesced
 
@@ -106,6 +129,22 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertIn("Renderer baseline cutover passed, but intent work may remain quiesced", stderr.getvalue())
         self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
         self.assertNotIn("Renderer baseline cutover passed", stdout.getvalue())
+        self.assertTrue(is_quiesced())
+
+    def test_interrupt_during_resume_survives_stderr_failure(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        self._prepare_unknown_vlan_baseline()
+        failure = KeyboardInterrupt()
+
+        with patch(
+            "netbox_nso_plugin.management.commands.nso_renderer_baseline_cutover.resume",
+            side_effect=failure,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=_BrokenStderr())
+
+        self.assertIs(caught.exception, failure)
         self.assertTrue(is_quiesced())
 
     def test_failure_leaves_the_exclusive_gate_active(self):

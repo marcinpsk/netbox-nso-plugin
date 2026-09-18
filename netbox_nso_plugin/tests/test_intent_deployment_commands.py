@@ -29,6 +29,11 @@ from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
+class _BrokenStderr(io.StringIO):
+    def write(self, value):
+        raise OSError("stderr is unavailable")
+
+
 class TestReceiptSelectors(SimpleTestCase):
     def test_deployment_gate_rejects_a_boolean_device_id(self):
         from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import _receipt_for
@@ -90,11 +95,14 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         self.device, self.mgmt = make_managed(self.tag, self.adapter_device_id)
 
     def _prepare(self):
+        return self._prepare_with_stderr(io.StringIO())
+
+    def _prepare_with_stderr(self, stderr):
         return call_command(
             "nso_intent_deployment_gate",
             prepare=True,
             stdout=io.StringIO(),
-            stderr=io.StringIO(),
+            stderr=stderr,
         )
 
     def test_quiesce_times_out_while_a_shared_operation_is_active(self):
@@ -617,6 +625,38 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         finally:
             resume()
 
+    def test_prepare_cleanup_resume_failure_reports_recovery_and_keeps_the_gate(self):
+        from netbox_nso_plugin import deployment
+
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+        try:
+            with (
+                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"),
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.gate_blockers",
+                    return_value=["a test blocker"],
+                ),
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                self._prepare_with_stderr(stderr)
+
+            self.assertIs(caught.exception, failure)
+            self.assertIsInstance(caught.exception.__context__, CommandError)
+            self.assertIn("Deployment gate blocked: a test blocker", str(caught.exception.__context__))
+            self.assertIn("intent work may remain quiesced", stderr.getvalue())
+            self.assertIn("nso_intent_deployment_gate --abort", stderr.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+            call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
+            self.assertFalse(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
     def test_verification_abandons_a_claim_that_carries_deletions(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.deployment import quiesce, resume
@@ -695,6 +735,41 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             self.assertTrue(deployment.is_quiesced())
             call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
             assert not is_quiesced(), "--abort must release the gate"
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
+    def test_verification_resume_failure_survives_stderr_failure(self):
+        from netbox_nso_plugin import deployment, drain
+
+        own_route(self.mgmt, "198.18.46.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+
+        deployment.quiesce()
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    verify=True,
+                    device_id=self.device.pk,
+                    stdout=io.StringIO(),
+                    stderr=_BrokenStderr(),
+                )
+
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(deployment.is_quiesced())
         finally:
             if deployment.is_quiesced():
                 deployment.resume()
@@ -834,6 +909,30 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
             self.assertIn("Intent restore completed, but intent work may remain quiesced", stderr.getvalue())
             self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
             self.assertNotIn("Restore resolved", stdout.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
+    def test_restore_resume_failure_survives_stderr_failure(self):
+        from netbox_nso_plugin import deployment
+
+        self._lost_vlan_response(941)
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_restore.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command("nso_intent_restore", stdout=io.StringIO(), stderr=_BrokenStderr())
+
+            self.assertIs(caught.exception, failure)
             self.assertTrue(deployment.is_quiesced())
         finally:
             if deployment.is_quiesced():

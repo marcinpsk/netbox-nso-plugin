@@ -47,8 +47,6 @@ def _ancestor(node: ast.AST, parents: dict[ast.AST, ast.AST], kind):
 
 
 def _is_allowed(path: Path, node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bool:
-    if _ancestor(node, parents, ast.ExceptHandler) is not None:
-        return True
     function = _ancestor(node, parents, ast.FunctionDef | ast.AsyncFunctionDef)
     return function is not None and (path.name, function.name) in _ALLOWED_RESUME_SITES
 
@@ -78,17 +76,39 @@ def _has_failure_guidance(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> bo
     handler = guarded.handlers[0]
     if not isinstance(handler.type, ast.Name) or handler.type.id != "BaseException":
         return False
-    writes_guidance = any(
-        isinstance(candidate, ast.Call)
-        and ast.unparse(candidate.func) == "self.stderr.write"
-        and candidate.args
-        and any(
-            "may remain quiesced" in message and "nso_intent_deployment_gate --abort" in message
-            for message in _literal_messages(candidate.args[0])
-        )
-        for handler_statement in handler.body
-        for candidate in ast.walk(handler_statement)
-    )
+    writes_guidance = False
+    for handler_statement in handler.body:
+        for candidate in ast.walk(handler_statement):
+            if not (
+                isinstance(candidate, ast.Call)
+                and ast.unparse(candidate.func) == "self.stderr.write"
+                and candidate.args
+                and any(
+                    "may remain quiesced" in message and "nso_intent_deployment_gate --abort" in message
+                    for message in _literal_messages(candidate.args[0])
+                )
+            ):
+                continue
+            write_statement = _ancestor(candidate, parents, ast.stmt)
+            report = parents.get(write_statement) if write_statement is not None else None
+            if not isinstance(report, ast.Try) or report.body != [write_statement] or len(report.handlers) != 1:
+                continue
+            report_handler = report.handlers[0]
+            if not isinstance(report_handler.type, ast.Name) or report_handler.type.id not in {
+                "Exception",
+                "BaseException",
+            }:
+                continue
+            if any(
+                isinstance(descendant, ast.Raise)
+                for statement in report_handler.body
+                for descendant in ast.walk(statement)
+            ):
+                continue
+            writes_guidance = True
+            break
+        if writes_guidance:
+            break
     last_statement = handler.body[-1] if handler.body else None
     reraises = isinstance(last_statement, ast.Raise) and last_statement.exc is None and last_statement.cause is None
     return writes_guidance and reraises
@@ -103,7 +123,10 @@ def handle(self):
     try:
         deployment.resume()
     except BaseException as exc:
-        self.stderr.write(self.style.ERROR({message_expression}))
+        try:
+            self.stderr.write(self.style.ERROR({message_expression}))
+        except Exception:
+            pass
         raise
 """
     )
@@ -140,11 +163,14 @@ def guarded_alias(self):
     try:
         gate.resume()
     except BaseException:
-        self.stderr.write(
-            self.style.ERROR(
-                "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+        try:
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
             )
-        )
+        except Exception:
+            pass
         raise
 """
         )
@@ -166,6 +192,65 @@ def guarded_alias(self):
 
     def test_failure_guidance_requires_recovery_command(self):
         self.assertFalse(_snippet_has_failure_guidance('"Intent work may remain quiesced."'))
+
+    def test_failure_guidance_requires_a_best_effort_stderr_write(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin.deployment import resume
+
+def handle(self):
+    try:
+        resume()
+    except BaseException:
+        self.stderr.write(
+            self.style.ERROR(
+                "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+            )
+        )
+        raise
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:5"])
+
+    def test_cleanup_resume_under_an_exception_handler_requires_guidance(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin.deployment import resume
+
+def handle():
+    try:
+        fail()
+    except BaseException:
+        resume()
+        raise
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), ["snippet.py:7"])
+
+    def test_full_best_effort_failure_guidance_is_accepted(self):
+        tree = ast.parse(
+            """\
+from netbox_nso_plugin.deployment import resume
+
+def handle(self):
+    try:
+        resume()
+    except BaseException:
+        try:
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        except Exception:
+            pass
+        raise
+"""
+        )
+
+        self.assertEqual(_violations_in_module(tree, "snippet.py"), [])
 
     def test_resume_failures_report_that_intent_work_may_remain_quiesced(self):
         violations = {

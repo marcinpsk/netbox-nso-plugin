@@ -57,12 +57,15 @@ class Command(BaseCommand):
             try:
                 resume()
             except BaseException:
-                self.stderr.write(
-                    self.style.ERROR(
-                        "Renderer baseline cutover passed, but intent work may remain quiesced. "
-                        "Fix the cause and run nso_intent_deployment_gate --abort."
+                try:
+                    self.stderr.write(
+                        self.style.ERROR(
+                            "Renderer baseline cutover passed, but intent work may remain quiesced. "
+                            "Fix the cause and run nso_intent_deployment_gate --abort."
+                        )
                     )
-                )
+                except Exception:  # noqa: BLE001 (the resume() failure must propagate)
+                    pass
                 raise
         self.stdout.write(
             self.style.SUCCESS(f"Renderer baseline cutover passed: {len(devices)} devices, {repaired} repairs")
