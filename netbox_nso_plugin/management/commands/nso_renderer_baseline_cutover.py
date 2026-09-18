@@ -50,7 +50,13 @@ class Command(BaseCommand):
                             f"{_STABILITY_PASSES} complete audits"
                         )
         except BaseException as exc:
-            self.stderr.write(self.style.ERROR("Renderer baseline cutover failed; intent work remains quiesced"))
+            with contextlib.suppress(Exception):  # best effort: the audit failure must propagate
+                self.stderr.write(
+                    self.style.ERROR(
+                        "Renderer baseline cutover failed; intent work remains quiesced. "
+                        "Fix the cause and rerun the cutover, then run nso_intent_deployment_gate --abort."
+                    )
+                )
             if not isinstance(exc, Exception) or isinstance(exc, CommandError):
                 raise
             raise CommandError(f"Renderer baseline cutover failed: {exc}") from exc

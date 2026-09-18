@@ -171,6 +171,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
                 call_command("nso_renderer_baseline_cutover", stderr=stderr)
 
         self.assertIn("intent work remains quiesced", stderr.getvalue())
+        self.assertIn("rerun the cutover, then run nso_intent_deployment_gate --abort", stderr.getvalue())
         self.assertTrue(is_quiesced())
 
     def test_interrupt_reports_that_the_gate_remains_active(self):
@@ -182,6 +183,16 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
                 call_command("nso_renderer_baseline_cutover", stderr=stderr)
 
         self.assertIn("intent work remains quiesced", stderr.getvalue())
+        self.assertIn("rerun the cutover, then run nso_intent_deployment_gate --abort", stderr.getvalue())
+        self.assertTrue(is_quiesced())
+
+    def test_interrupt_during_audit_survives_stderr_failure(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                call_command("nso_renderer_baseline_cutover", stderr=_BrokenStderr())
+
         self.assertTrue(is_quiesced())
 
     def test_a_baseline_that_never_stops_repairing_fails_and_stays_quiesced(self):
@@ -200,7 +211,7 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
 
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", never_stabilizes):
             with self.assertRaisesMessage(CommandError, "did not stabilize"):
-                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=_BrokenStderr())
 
         self.assertEqual(audits, [self.device.pk] * 3)
         self.assertTrue(is_quiesced())
@@ -212,12 +223,33 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         from netbox_nso_plugin.renderer_audit import RendererAuditResult
 
         deferred = RendererAuditResult((), (), ("vlan",))
+        stderr = io.StringIO()
 
         with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", return_value=deferred):
             with self.assertRaisesRegex(CommandError, rf"device {self.device.pk}: vlan"):
-                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=stderr)
+
+        self.assertIn("intent work remains quiesced", stderr.getvalue())
+        self.assertIn("rerun the cutover, then run nso_intent_deployment_gate --abort", stderr.getvalue())
+        self.assertTrue(is_quiesced())
+
+    def test_passing_rerun_requires_an_explicit_abort_to_release_the_failed_cutover_gate(self):
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin.deployment import is_quiesced
+        from netbox_nso_plugin.renderer_audit import RendererAuditResult
+
+        deferred = RendererAuditResult((), (), ("vlan",))
+
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", return_value=deferred):
+            with self.assertRaisesRegex(CommandError, rf"device {self.device.pk}: vlan"):
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=io.StringIO())
 
         self.assertTrue(is_quiesced())
+        call_command("nso_renderer_baseline_cutover", stdout=io.StringIO())
+        self.assertTrue(is_quiesced())
+        call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO())
+        self.assertFalse(is_quiesced())
 
     def test_a_run_started_under_an_existing_gate_leaves_that_gate_standing(self):
         """The operator who quiesced owns the resume; the cutover must not take it from them."""
