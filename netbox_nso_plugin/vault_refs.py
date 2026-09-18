@@ -17,7 +17,17 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-__all__ = ["VaultRef", "VaultRefError", "parse_vault_ref", "qualify_snmp_ref", "secret_fingerprint"]
+__all__ = [
+    "VaultRef",
+    "VaultRefError",
+    "is_secret_fingerprint",
+    "parse_vault_ref",
+    "qualify_snmp_ref",
+    "secret_fingerprint",
+]
+
+_FINGERPRINT_LENGTH = 16
+_LOWER_HEX = frozenset("0123456789abcdef")
 
 
 def qualify_snmp_ref(raw: str, *, kind: str, kv_mount: str | None, base_path: str | None) -> str:
@@ -57,7 +67,12 @@ def secret_fingerprint(value: str) -> str:
     Matches network-state-export's ``_community_hash`` (the read mirror's
     community identity), so vault-vs-device comparison is string equality.
     """
-    return hashlib.sha256(value.encode()).hexdigest()[:16]
+    return hashlib.sha256(value.encode()).hexdigest()[:_FINGERPRINT_LENGTH]
+
+
+def is_secret_fingerprint(value) -> bool:
+    """Return whether *value* has the fixed cross-repo fingerprint shape."""
+    return isinstance(value, str) and len(value) == _FINGERPRINT_LENGTH and set(value) <= _LOWER_HEX
 
 
 @dataclass(frozen=True)

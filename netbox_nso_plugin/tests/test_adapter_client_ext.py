@@ -465,6 +465,59 @@ _JOB_OUT = {
 }
 
 
+_SECRET_VERIFY_OUT = {
+    "operation_id": "placeholder-operation",
+    "status": "present",
+    "fingerprint": "0123456789abcdef",
+    "has_auth": False,
+    "has_priv": False,
+    "version": 4,
+}
+
+
+class TestSecretVerifyBoundaryValidation(unittest.TestCase):
+    """Secret verification is checked once before a view can persist its result."""
+
+    def test_valid_keyed_and_unkeyed_results_are_accepted_unchanged(self):
+        from netbox_nso_plugin.adapter_client import verify_secret
+
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=_SECRET_VERIFY_OUT):
+            self.assertEqual(verify_secret("network/path#community"), _SECRET_VERIFY_OUT)
+
+        unkeyed = {**_SECRET_VERIFY_OUT, "fingerprint": None, "has_auth": True}
+        with patch("netbox_nso_plugin.adapter_client._request", return_value=unkeyed):
+            self.assertEqual(verify_secret("network/path"), unkeyed)
+
+    def test_results_outside_the_fixed_contract_are_refused(self):
+        from netbox_nso_plugin.adapter_client import AdapterError, verify_secret
+
+        invalid_results = (
+            ["not-an-object"],
+            {key: value for key, value in _SECRET_VERIFY_OUT.items() if key != "operation_id"},
+            {**_SECRET_VERIFY_OUT, "extra": "unexpected"},
+            {**_SECRET_VERIFY_OUT, "operation_id": None},
+            {**_SECRET_VERIFY_OUT, "status": "unknown"},
+            {**_SECRET_VERIFY_OUT, "status": []},
+            {**_SECRET_VERIFY_OUT, "fingerprint": "not-a-fingerprint"},
+            {**_SECRET_VERIFY_OUT, "has_auth": 1},
+            {**_SECRET_VERIFY_OUT, "has_priv": "false"},
+            {**_SECRET_VERIFY_OUT, "version": "4"},
+            {**_SECRET_VERIFY_OUT, "fingerprint": None},
+            {**_SECRET_VERIFY_OUT, "has_auth": True},
+            {**_SECRET_VERIFY_OUT, "status": "missing_path", "fingerprint": None, "version": 4},
+            {**_SECRET_VERIFY_OUT, "status": "missing_field", "fingerprint": None},
+        )
+
+        for result in invalid_results:
+            with self.subTest(result=result):
+                status = result.get("status") if isinstance(result, dict) else None
+                reference = "network/path" if status == "missing_field" else "network/path#community"
+                with patch("netbox_nso_plugin.adapter_client._request", return_value=result):
+                    with self.assertRaises(AdapterError) as raised:
+                        verify_secret(reference)
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+
 def _job_with_scalar(member):
     """A JobOut-shaped job whose *member* carries a scalar the model cannot emit."""
     return {**_JOB_OUT, member: "boom"}
@@ -573,6 +626,49 @@ class TestJobBoundaryValidation(unittest.TestCase):
 
 class TestAdapterClientRemainingFunctions(unittest.TestCase):
     """Smoke tests for API functions not covered in test_models.py."""
+
+    def test_control_state_normalizes_valid_adapter_payloads(self):
+        from netbox_nso_plugin.adapter_client import AdapterControlState
+
+        state = AdapterControlState.from_adapter(
+            {"failover": {"primary_ip": "198.18.0.1", "oob_ip": None}},
+            {"attributes": ["enabled", "description"], "auto_apply": False, "sync_before_apply": True},
+        )
+
+        self.assertEqual(
+            state,
+            AdapterControlState(
+                managed_attributes=("description", "enabled"),
+                auto_apply=False,
+                sync_before_apply=True,
+                primary_ip="198.18.0.1",
+                oob_ip=None,
+            ),
+        )
+
+    def test_control_state_rejects_malformed_adapter_payloads(self):
+        from netbox_nso_plugin.adapter_client import AdapterControlState, AdapterError
+
+        valid_device = {"failover": None}
+        valid_scope = {"attributes": [], "auto_apply": False, "sync_before_apply": True}
+        malformed = (
+            (None, valid_scope),
+            (valid_device, None),
+            ({}, valid_scope),
+            ({"failover": []}, valid_scope),
+            ({"failover": {}}, valid_scope),
+            ({"failover": {"primary_ip": 1, "oob_ip": None}}, valid_scope),
+            (valid_device, {**valid_scope, "attributes": "description"}),
+            (valid_device, {**valid_scope, "auto_apply": 1}),
+            (valid_device, {**valid_scope, "sync_before_apply": None}),
+        )
+
+        for device_state, scope_state in malformed:
+            with self.subTest(device_state=device_state, scope_state=scope_state):
+                with self.assertRaises(AdapterError) as raised:
+                    AdapterControlState.from_adapter(device_state, scope_state)
+
+                self.assertEqual(raised.exception.code, "invalid_response")
 
     def _make_session(self, status=200, json_data=None, content=None):
         return make_session(status_code=status, json_data=json_data, content=content)
@@ -701,6 +797,29 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
         mock_s.return_value = session
         result = get_device(5)
         self.assertEqual(result["id"], 5)
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_get_scope(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import get_scope
+
+        session = self._make_session(
+            200,
+            {
+                "device_id": 5,
+                "attributes": ["description"],
+                "auto_apply": True,
+                "sync_before_apply": False,
+            },
+        )
+        mock_s.return_value = session
+
+        result = get_scope(5)
+
+        self.assertEqual(result["attributes"], ["description"])
+        args, _ = session.request.call_args
+        self.assertEqual(args[0], "GET")
+        self.assertTrue(args[1].endswith("/api/v1/devices/5/scope"))
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
