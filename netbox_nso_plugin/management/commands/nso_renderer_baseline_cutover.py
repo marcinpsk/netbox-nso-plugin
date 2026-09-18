@@ -9,7 +9,7 @@ import contextlib
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import delivery
-from netbox_nso_plugin.deployment import gate_bypass, quiesce, resume
+from netbox_nso_plugin.deployment import gate_bypass, gate_recovery_guidance, quiesce, resume
 
 _STABILITY_PASSES = 3
 
@@ -54,7 +54,7 @@ class Command(BaseCommand):
                 self.stderr.write(
                     self.style.ERROR(
                         "Renderer baseline cutover failed; intent work remains quiesced. "
-                        "Fix the cause and rerun the cutover, then run nso_intent_deployment_gate --abort."
+                        + gate_recovery_guidance("the cutover", created=created_gate)
                     )
                 )
             if not isinstance(exc, Exception) or isinstance(exc, CommandError):

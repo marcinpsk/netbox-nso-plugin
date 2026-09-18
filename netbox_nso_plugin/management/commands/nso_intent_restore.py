@@ -10,7 +10,7 @@ import math
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import adapter_client, delivery, drain, outbox
-from netbox_nso_plugin.deployment import gate_bypass, quiesce, resume
+from netbox_nso_plugin.deployment import gate_bypass, gate_recovery_guidance, quiesce, resume
 from netbox_nso_plugin.restore import advance_static_route_pk
 
 
@@ -20,13 +20,7 @@ def _gate_failure_guidance(*, created):
     try:
         yield
     except (CommandError, adapter_client.AdapterError) as exc:
-        if created:
-            recovery = (
-                "Fix the cause, rerun nso_intent_restore, then run nso_intent_deployment_gate --abort "
-                "after the restore succeeds."
-            )
-        else:
-            recovery = "Fix the cause and rerun nso_intent_restore. The gate's owning operation must release it."
+        recovery = gate_recovery_guidance("nso_intent_restore", created=created)
         raise CommandError(f"{exc}. The deployment gate remains closed. {recovery}") from exc
 
 

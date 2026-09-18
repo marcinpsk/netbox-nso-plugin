@@ -171,7 +171,10 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
                 call_command("nso_renderer_baseline_cutover", stderr=stderr)
 
         self.assertIn("intent work remains quiesced", stderr.getvalue())
-        self.assertIn("rerun the cutover, then run nso_intent_deployment_gate --abort", stderr.getvalue())
+        self.assertIn(
+            "Fix the cause, rerun the cutover, then run nso_intent_deployment_gate --abort after it succeeds.",
+            stderr.getvalue(),
+        )
         self.assertTrue(is_quiesced())
 
     def test_interrupt_reports_that_the_gate_remains_active(self):
@@ -183,7 +186,10 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
                 call_command("nso_renderer_baseline_cutover", stderr=stderr)
 
         self.assertIn("intent work remains quiesced", stderr.getvalue())
-        self.assertIn("rerun the cutover, then run nso_intent_deployment_gate --abort", stderr.getvalue())
+        self.assertIn(
+            "Fix the cause, rerun the cutover, then run nso_intent_deployment_gate --abort after it succeeds.",
+            stderr.getvalue(),
+        )
         self.assertTrue(is_quiesced())
 
     def test_interrupt_during_audit_survives_stderr_failure(self):
@@ -230,7 +236,10 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
                 call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=stderr)
 
         self.assertIn("intent work remains quiesced", stderr.getvalue())
-        self.assertIn("rerun the cutover, then run nso_intent_deployment_gate --abort", stderr.getvalue())
+        self.assertIn(
+            "Fix the cause, rerun the cutover, then run nso_intent_deployment_gate --abort after it succeeds.",
+            stderr.getvalue(),
+        )
         self.assertTrue(is_quiesced())
 
     def test_passing_rerun_requires_an_explicit_abort_to_release_the_failed_cutover_gate(self):
@@ -262,4 +271,24 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         call_command("nso_renderer_baseline_cutover", stdout=stdout)
 
         self.assertIn("Renderer baseline cutover passed", stdout.getvalue())
+        self.assertTrue(is_quiesced())
+
+    def test_audit_failure_under_an_existing_gate_names_the_owner_recovery(self):
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin.deployment import is_quiesced, quiesce
+        from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
+
+        self.assertTrue(quiesce())
+        stderr = io.StringIO()
+
+        with patch(
+            "netbox_nso_plugin.renderer_audit.audit_renderer_scopes",
+            side_effect=RendererAuditRepairFailed("racing baseline"),
+        ):
+            with self.assertRaisesRegex(CommandError, "racing baseline"):
+                call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=stderr)
+
+        self.assertIn("The gate's owning operation must release it.", stderr.getvalue())
+        self.assertNotIn("--abort", stderr.getvalue())
         self.assertTrue(is_quiesced())

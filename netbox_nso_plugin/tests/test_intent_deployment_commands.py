@@ -58,7 +58,31 @@ class TestReceiptSelectors(SimpleTestCase):
                 raise CommandError("Restore failed closed")
 
         message = str(raised.exception)
+        self.assertIn(
+            "Fix the cause, rerun nso_intent_restore, then run nso_intent_deployment_gate --abort after it succeeds.",
+            message,
+        )
         self.assertLess(message.index("nso_intent_restore"), message.index("nso_intent_deployment_gate --abort"))
+
+    def test_gate_recovery_guidance_tracks_gate_ownership(self):
+        from netbox_nso_plugin.deployment import gate_recovery_guidance
+
+        rerun = "nso_probe"
+        created = gate_recovery_guidance(rerun, created=True)
+        not_created = gate_recovery_guidance(rerun, created=False)
+
+        self.assertEqual(
+            created,
+            "Fix the cause, rerun nso_probe, then run nso_intent_deployment_gate --abort after it succeeds.",
+        )
+        self.assertEqual(
+            not_created,
+            "Fix the cause and rerun nso_probe. The gate's owning operation must release it.",
+        )
+        self.assertIn(rerun, created)
+        self.assertIn(rerun, not_created)
+        self.assertIn("nso_intent_deployment_gate --abort", created)
+        self.assertNotIn("nso_intent_deployment_gate --abort", not_created)
 
     def test_restore_does_not_tell_the_operator_to_abort_a_preexisting_gate(self):
         from netbox_nso_plugin.management.commands.nso_intent_restore import _gate_failure_guidance
