@@ -731,6 +731,83 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
                 failure.__cause__ = cause
                 self.assertIs(_serialization_failure(failure), expected)
 
+    def test_a_caller_transaction_does_not_retry_a_serialization_failure(self):
+        """A real 40001 needs a cross-connection race inside the repair, so the seam is faked."""
+        import time
+
+        from django.db import transaction
+
+        from netbox_nso_plugin.renderer_audit import _repair_with_retries
+
+        own_vlan(self.management, 1642, "renderer-audit-caller-transaction")
+
+        class SerializationFailure(Exception):
+            sqlstate = "40001"
+
+        failure = OperationalError("serialization failure")
+        failure.__cause__ = SerializationFailure()
+        with (
+            patch("netbox_nso_plugin.renderer_audit._repair_candidates", side_effect=failure) as repair,
+            transaction.atomic(),
+            self.assertRaises(OperationalError),
+        ):
+            _repair_with_retries(
+                self.device.pk,
+                ("vlan",),
+                self.management,
+                time.monotonic() + 60,
+            )
+
+        self.assertEqual(repair.call_count, 1)
+
+    def test_a_caller_transaction_does_not_start_repair_after_its_budget_expires(self):
+        from django.db import transaction
+
+        from netbox_nso_plugin.renderer_audit import (
+            RendererAuditBudgetExceeded,
+            _monotonic,
+            _repair_with_retries,
+        )
+
+        own_vlan(self.management, 1644, "renderer-audit-expired-caller-budget")
+
+        with (
+            patch("netbox_nso_plugin.renderer_audit._repair_candidates") as repair,
+            transaction.atomic(),
+            self.assertRaises(RendererAuditBudgetExceeded),
+        ):
+            _repair_with_retries(
+                self.device.pk,
+                ("vlan",),
+                self.management,
+                deadline=_monotonic() - 1,
+            )
+
+        self.assertEqual(repair.call_count, 0)
+
+    def test_a_transaction_free_serialization_failure_exhausts_the_retry_budget(self):
+        import time
+
+        from netbox_nso_plugin.renderer_audit import _REPAIR_ATTEMPTS, _repair_with_retries
+
+        own_vlan(self.management, 1643, "renderer-audit-retry-budget")
+
+        class SerializationFailure(Exception):
+            sqlstate = "40001"
+
+        failure = OperationalError("serialization failure")
+        failure.__cause__ = SerializationFailure()
+        with patch("netbox_nso_plugin.renderer_audit._repair_candidates", side_effect=failure) as repair:
+            repaired = _repair_with_retries(
+                self.device.pk,
+                ("vlan",),
+                self.management,
+                time.monotonic() + 60,
+            )
+
+        self.assertEqual(repair.call_count, _REPAIR_ATTEMPTS)
+        self.assertIsNone(repaired)
+
     def test_serialization_exhaustion_leaves_the_key_unknown(self):
         from netbox_nso_plugin.models import NSOIntentRevision
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes

@@ -12,7 +12,7 @@ import time
 
 from django.apps import apps
 from django.conf import settings
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Q
 from django.db.utils import OperationalError
 from django.utils import timezone
@@ -318,6 +318,11 @@ def _leave_unknown(device_id, scopes) -> None:
 
 def _repair_with_retries(device_id, candidates, management, deadline):
     """Retry a serialization failure without asserting a false fingerprint."""
+    if connection.in_atomic_block:
+        if _budget_expired(deadline):
+            raise RendererAuditBudgetExceeded("renderer repair exhausted its time budget")
+        # A caller-owned transaction keeps its snapshot, so a serialization retry cannot succeed here.
+        return _repair_candidates(device_id, candidates, management)
     for attempt in range(_REPAIR_ATTEMPTS):
         if _budget_expired(deadline):
             raise RendererAuditBudgetExceeded("renderer repair exhausted its time budget")
