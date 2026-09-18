@@ -35,6 +35,8 @@ from netbox_nso_plugin.signals import suppress_intent_push
 from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
+_WORKER_JOIN_SECONDS = 30
+
 
 def _qualified_table_aliases(token):
     if isinstance(token, Identifier) and token.get_parent_name() is not None:
@@ -673,8 +675,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 _upgrade_detected_reconcile(permit, footprint)
         finally:
             if worker.ident is not None:
-                worker.join()
-        self.assertFalse(worker.is_alive())
+                worker.join(_WORKER_JOIN_SECONDS)
+        self.assertFalse(worker.is_alive(), "the settlement worker did not stop")
         if failures:
             raise failures[0]
         self.state.refresh_from_db()
@@ -761,10 +763,10 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             release_settlement.set()
             for worker in (settlement_worker, reconcile_worker):
                 if worker.ident is not None:
-                    worker.join()
+                    worker.join(_WORKER_JOIN_SECONDS)
 
-        self.assertFalse(settlement_worker.is_alive())
-        self.assertFalse(reconcile_worker.is_alive())
+        self.assertFalse(settlement_worker.is_alive(), "the settlement worker did not stop")
+        self.assertFalse(reconcile_worker.is_alive(), "the reconcile worker did not stop")
         if failures:
             raise failures[0]
         self.state.refresh_from_db()
