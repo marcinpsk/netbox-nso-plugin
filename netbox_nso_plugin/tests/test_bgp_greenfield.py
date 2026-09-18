@@ -416,6 +416,7 @@ class TestBgpIncompleteSnapshotDrain(_CascadeFlushMixin, IntentPushResetMixin, T
 
             drain.drain_intent_outbox()
             drain.drain_intent_outbox()
+            self.assertEqual(entries(self.device, "bgp", unconsumed=True), [])
 
         mock_put.assert_not_called()
         self.mgmt.refresh_from_db()
