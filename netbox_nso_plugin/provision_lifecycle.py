@@ -269,8 +269,19 @@ def _complete_terminal_attempt(tombstone) -> bool:
         if management is not None:
             _apply_terminal_evidence(management, tombstone)
             return _close_tombstone(provision_attempt_id, expected_state="terminal")
-        if relevant_management.exists():
+        if relevant_management.filter(
+            device_id=tombstone.netbox_device_id,
+            nso_instance__adapter_instance_id=tombstone.nso_instance,
+            nso_device_name=tombstone.nso_device_name,
+        ).exists():
             return _close_tombstone(provision_attempt_id, expected_state="terminal")
+        if relevant_management.exists():
+            # A partial match may keep this adapter device ID live under other coordinates.
+            _record_offboard_error(
+                provision_attempt_id,
+                "Conflicting management identity prevents safe provision offboarding.",
+            )
+            return False
 
         # An orphan matches no management row, so the adapter calls below hold the tombstone
         # fence alone. No device, management, or instance row is locked across them.

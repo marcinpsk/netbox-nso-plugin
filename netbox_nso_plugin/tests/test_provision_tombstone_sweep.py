@@ -464,6 +464,64 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertEqual(tombstone.state, "closed")
         offboard.assert_not_called()
 
+    def test_conflicting_management_identity_keeps_terminal_attempt_retryable(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        for conflict in ("device-name", "instance", "device"):
+            with self.subTest(conflict=conflict):
+                tag = f"provision-conflict-{conflict}"
+                device, instance, _management, tombstone = self._attempt(tag, with_management=False)
+                surviving_device = device
+                surviving_instance = instance
+                surviving_name = tombstone.nso_device_name
+                if conflict == "device-name":
+                    surviving_name = f"{tag}-replacement"
+                elif conflict == "instance":
+                    surviving_instance = NSOInstance.objects.create(
+                        name=f"{tag}-replacement-nso",
+                        adapter_instance_id=f"{tag}-replacement-nso",
+                    )
+                else:
+                    surviving_device = make_device(f"{tag}-adopter")
+                management = NSODeviceManagement.objects.create(
+                    device=surviving_device,
+                    nso_instance=surviving_instance,
+                    nso_device_name=surviving_name,
+                    onboard_job_id="72",
+                    onboard_status="provisioning",
+                    adapter_device_id=701,
+                )
+                onboard_evidence = (
+                    management.onboarded_at,
+                    management.onboard_steps,
+                    management.onboard_error,
+                )
+
+                with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard:
+                    checked, closed = sweep_provision_tombstones(tombstone.provision_attempt_id)
+
+                offboard.assert_not_called()
+                tombstone.refresh_from_db()
+                management.refresh_from_db()
+                self.assertEqual((checked, closed), (1, 0))
+                self.assertEqual(tombstone.state, "terminal")
+                self.assertIsNone(tombstone.closed_at)
+                self.assertEqual(
+                    tombstone.offboard_error,
+                    "Conflicting management identity prevents safe provision offboarding.",
+                )
+                self.assertEqual(management.device_id, surviving_device.pk)
+                self.assertEqual(management.nso_instance_id, surviving_instance.pk)
+                self.assertEqual(management.nso_device_name, surviving_name)
+                self.assertEqual(management.adapter_device_id, 701)
+                self.assertEqual(management.onboard_job_id, "72")
+                self.assertEqual(management.onboard_status, "provisioning")
+                self.assertEqual(
+                    (management.onboarded_at, management.onboard_steps, management.onboard_error),
+                    onboard_evidence,
+                )
+
     def test_ui_poll_delegates_completion_to_the_attempt_sweep(self):
         from netbox_nso_plugin.onboarding import advance_provisioning
 
