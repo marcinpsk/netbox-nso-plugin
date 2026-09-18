@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 from uuid import uuid4
 
 from django.db import IntegrityError, models, transaction
@@ -94,6 +95,51 @@ class TestDeployingAttemptConstraint(TestCase):
 class TestIntentRevisionWrites(TestCase):
     def setUp(self):
         self.device, self.management = make_managed("intent-revision", 1624)
+
+    def test_full_save_explicit_status_clears_attempt_without_a_deferred_correction(self):
+        from netbox_nso_plugin.intent_state import normalize_overlay_lifecycle
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        attempt_id = uuid4()
+        row = NSOLoggingLevelState.objects.create(
+            management=self.management,
+            console_severity="WARNING",
+            status="accepted",
+            apply_attempt_id=attempt_id,
+        )
+        candidate = copy.copy(row)
+        candidate.status = "in_sync"
+        candidate._nso_explicit_status_update = True
+
+        self.assertEqual(normalize_overlay_lifecycle(candidate), {})
+        self.assertIsNone(candidate.apply_attempt_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
+
+    def test_partial_status_save_defers_the_attempt_clear(self):
+        from netbox_nso_plugin.intent_state import normalize_overlay_lifecycle
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        attempt_id = uuid4()
+        row = NSOLoggingLevelState.objects.create(
+            management=self.management,
+            console_severity="WARNING",
+            status="accepted",
+            apply_attempt_id=attempt_id,
+        )
+        candidate = copy.copy(row)
+        candidate.status = "in_sync"
+        candidate._nso_explicit_status_update = True
+
+        self.assertEqual(
+            normalize_overlay_lifecycle(candidate, update_fields=["status"]),
+            {"apply_attempt_id": None},
+        )
+        self.assertIsNone(candidate.apply_attempt_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
 
     def test_revision_upsert_uses_the_models_table_name(self):
         from unittest.mock import patch

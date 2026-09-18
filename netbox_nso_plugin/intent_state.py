@@ -694,7 +694,9 @@ def normalize_overlay_lifecycle(instance, update_fields=None):
             and instance.apply_attempt_id == current.apply_attempt_id
         ):
             instance.apply_attempt_id = None
-            return {} if "apply_attempt_id" in requested else {"apply_attempt_id": None}
+            if requested is None or "apply_attempt_id" in requested:
+                return {}
+            return {"apply_attempt_id": None}
         return {}
     from .status_machine import is_owned
 
