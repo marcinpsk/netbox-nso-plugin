@@ -177,6 +177,53 @@ class TestAttachBlockOverride(_CapBase):
 
         return f"{family}:{ContentType.objects.get_for_model(obj).pk}:{obj.pk}"
 
+    def test_attach_candidates_follow_the_native_model_registry(self):
+        from netbox_routing.models import PrefixList
+
+        self._mgmt(adapter_device_id=None)
+        PrefixList.objects.create(name="CAP-PL-REGISTRY")
+        self._route_map("CAP-RM-REGISTRY")
+
+        with patch(
+            "netbox_nso_plugin.ownership_planner.ROUTE_POLICY_NATIVE_MODEL_LABELS",
+            {"prefix_list": "netbox_routing.prefixlist"},
+        ):
+            response = self.client.get(self._attach_url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({item["value"].split(":", 1)[0] for item in response.context["candidates"]}, {"prefix_list"})
+
+    def test_attach_fails_if_a_registered_model_cannot_be_resolved(self):
+        self._mgmt(adapter_device_id=None)
+
+        with (
+            patch(
+                "netbox_nso_plugin.ownership_planner.ROUTE_POLICY_NATIVE_MODEL_LABELS",
+                {"prefix_list": "netbox_routing.missing"},
+            ),
+            self.assertRaises(LookupError),
+        ):
+            self.client.get(self._attach_url())
+
+    def test_attach_rejects_a_model_from_another_family(self):
+        from django.contrib.messages import get_messages
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+
+        self._mgmt(adapter_device_id=None)
+        route_map = self._route_map("CAP-RM-WRONG-FAMILY")
+
+        response = self.client.post(
+            self._attach_url(),
+            {"policy": self._policy_value("prefix_list", route_map)},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(NSORoutePolicyState.objects.filter(object_name=route_map.name).exists())
+        self.assertIn(
+            "Invalid route-policy selection.", [str(message) for message in get_messages(response.wsgi_request)]
+        )
+
     def test_known_negative_blocks_and_creates_no_overlay(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
 

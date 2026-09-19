@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import close_old_connections, connection, transaction
+from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -27,6 +27,11 @@ from ._outbox_case import (
 )
 from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+
+
+class _BrokenStderr(io.StringIO):
+    def write(self, value):
+        raise OSError("stderr is unavailable")
 
 
 class TestReceiptSelectors(SimpleTestCase):
@@ -53,7 +58,31 @@ class TestReceiptSelectors(SimpleTestCase):
                 raise CommandError("Restore failed closed")
 
         message = str(raised.exception)
+        self.assertIn(
+            "Fix the cause, rerun nso_intent_restore, then run nso_intent_deployment_gate --abort after it succeeds.",
+            message,
+        )
         self.assertLess(message.index("nso_intent_restore"), message.index("nso_intent_deployment_gate --abort"))
+
+    def test_gate_recovery_guidance_tracks_gate_ownership(self):
+        from netbox_nso_plugin.deployment import gate_recovery_guidance
+
+        rerun = "nso_probe"
+        created = gate_recovery_guidance(rerun, created=True)
+        not_created = gate_recovery_guidance(rerun, created=False)
+
+        self.assertEqual(
+            created,
+            "Fix the cause, rerun nso_probe, then run nso_intent_deployment_gate --abort after it succeeds.",
+        )
+        self.assertEqual(
+            not_created,
+            "Fix the cause and rerun nso_probe. The gate's owning operation must release it.",
+        )
+        self.assertIn(rerun, created)
+        self.assertIn(rerun, not_created)
+        self.assertIn("nso_intent_deployment_gate --abort", created)
+        self.assertNotIn("nso_intent_deployment_gate --abort", not_created)
 
     def test_restore_does_not_tell_the_operator_to_abort_a_preexisting_gate(self):
         from netbox_nso_plugin.management.commands.nso_intent_restore import _gate_failure_guidance
@@ -90,11 +119,14 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         self.device, self.mgmt = make_managed(self.tag, self.adapter_device_id)
 
     def _prepare(self):
+        return self._prepare_with_stderr(io.StringIO())
+
+    def _prepare_with_stderr(self, stderr):
         return call_command(
             "nso_intent_deployment_gate",
             prepare=True,
             stdout=io.StringIO(),
-            stderr=io.StringIO(),
+            stderr=stderr,
         )
 
     def test_quiesce_times_out_while_a_shared_operation_is_active(self):
@@ -617,6 +649,38 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         finally:
             resume()
 
+    def test_prepare_cleanup_resume_failure_reports_recovery_and_keeps_the_gate(self):
+        from netbox_nso_plugin import deployment
+
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+        try:
+            with (
+                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"),
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.gate_blockers",
+                    return_value=["a test blocker"],
+                ),
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                self._prepare_with_stderr(stderr)
+
+            self.assertIs(caught.exception, failure)
+            self.assertIsInstance(caught.exception.__context__, CommandError)
+            self.assertIn("Deployment gate blocked: a test blocker", str(caught.exception.__context__))
+            self.assertIn("intent work may remain quiesced", stderr.getvalue())
+            self.assertIn("nso_intent_deployment_gate --abort", stderr.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+            call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
+            self.assertFalse(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
     def test_verification_abandons_a_claim_that_carries_deletions(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.deployment import quiesce, resume
@@ -655,6 +719,84 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             assert [record["route_id"] for record in state.queued_deletions] == [route.pk]
         finally:
             resume()
+
+    def test_completed_verification_reports_resume_failure_and_keeps_the_gate(self):
+        from netbox_nso_plugin import deployment, drain
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        own_route(self.mgmt, "198.18.45.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+
+        deployment.quiesce()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    verify=True,
+                    device_id=self.device.pk,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+            self.assertIs(caught.exception, failure)
+            self.assertIn("Deployment verification passed, but intent work may remain quiesced", stderr.getvalue())
+            self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
+            self.assertNotIn("Deployment verification passed", stdout.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+            call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
+            assert not is_quiesced(), "--abort must release the gate"
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
+    def test_verification_resume_failure_survives_stderr_failure(self):
+        from netbox_nso_plugin import deployment, drain
+
+        own_route(self.mgmt, "198.18.46.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+
+        deployment.quiesce()
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    verify=True,
+                    device_id=self.device.pk,
+                    stdout=io.StringIO(),
+                    stderr=_BrokenStderr(),
+                )
+
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
 
     def test_the_full_gate_sequence_quiesces_and_verifies_a_no_deletion_static_push(self):
         from django.http import HttpResponse
@@ -766,6 +908,59 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
         assert state_of(self.device, "vlan").push_seq is None
         assert entries(self.device, "vlan") == []
         assert claim.push_seq is not None
+
+    def test_completed_restore_reports_resume_failure_and_keeps_the_gate(self):
+        from netbox_nso_plugin import deployment
+
+        self._lost_vlan_response(940)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_restore.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command("nso_intent_restore", stdout=stdout, stderr=stderr)
+
+            self.assertIs(caught.exception, failure)
+            self.assertIn("Intent restore completed, but intent work may remain quiesced", stderr.getvalue())
+            self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
+            self.assertNotIn("Restore resolved", stdout.getvalue())
+            self.assertTrue(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
+
+    def test_restore_resume_failure_survives_stderr_failure(self):
+        from netbox_nso_plugin import deployment
+
+        self._lost_vlan_response(941)
+        failure = DatabaseError("connection lost")
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_restore.resume",
+                    side_effect=failure,
+                ),
+                self.assertRaises(DatabaseError) as caught,
+            ):
+                call_command("nso_intent_restore", stdout=io.StringIO(), stderr=_BrokenStderr())
+
+            self.assertIs(caught.exception, failure)
+            self.assertTrue(deployment.is_quiesced())
+        finally:
+            if deployment.is_quiesced():
+                deployment.resume()
 
     def test_higher_receipt_rebases_and_returns_consumed_rows_to_the_fold(self):
         from netbox_nso_plugin.outbox import allocate_push_seq

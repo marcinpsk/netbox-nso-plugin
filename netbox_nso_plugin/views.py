@@ -2675,6 +2675,30 @@ def _apply_refusal_message(exc, mgmt) -> str:
     return _APPLY_REFUSED_MESSAGE
 
 
+def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
+    """Front one Apply capture with a pre-capture audit inside the Apply's send deadline.
+
+    The audit budgets on ``time.monotonic()`` while the send deadline is on the drain's
+    clock, so it is handed the Apply's REMAINING share rather than the deadline value.
+    """
+    import time
+
+    from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed, audit_renderer_scopes
+
+    try:
+        audit_renderer_scopes(
+            mgmt.device_id,
+            scopes,
+            trigger=trigger,
+            pre_capture=True,
+            deadline=time.monotonic() + remaining_budget(),
+        )
+    except RendererAuditBudgetExceeded as exc:
+        raise ApplyDeadlineExpired from exc
+    except RendererAuditRepairFailed as exc:
+        raise ApplyRefused from exc
+
+
 def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
     """Force-push the out-of-protocol device snapshots, last, and abort truthfully.
 
@@ -2731,6 +2755,8 @@ def _prepare_apply(mgmt):
         if remaining <= 0:
             raise ApplyDeadlineExpired
         return remaining
+
+    _audit_capture(mgmt, tuple(delivery.delivery_keys()), "views._prepare_apply", remaining_budget)
 
     # Each of these takes its OWN forced claim, so Apply re-ships the operator's intent
     # whatever the acknowledged baseline says and whatever a queued claim was carrying:
@@ -2800,6 +2826,12 @@ def _prepare_apply(mgmt):
             raise ApplySnmpRefused
         if outcome != drain.SUCCEEDED:
             raise ApplyPreparationRefused("snmp", _PREPARE_NOT_SETTLED)
+
+    # A foreign writer can commit after an earlier scope receipt. Audit the complete
+    # selector once more before promotion so that its repair revision invalidates any
+    # receipt captured before that commit. Ahead of the direct pushes: a repair bump that
+    # aborts the Apply after an irreversible device write leaves the device changed.
+    _audit_capture(mgmt, tuple(registry), "views._prepare_apply.finalize", remaining_budget)
 
     # Direct snapshots do not participate in the adapter selector. Keep them outside
     # the receipt capture so only in-protocol store-only claims reach promotion.
@@ -7207,7 +7239,7 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
 
     Sets ``vault_secret_hash``/``vault_secret_version`` so the badge can state
     whether the Vault-held secret matches what the device reports. Values never
-    leave the adapter — only sha256[:16] fingerprints travel.
+    leave the adapter. Only a sha256[:16] fingerprint travels.
     """
 
     def post(self, request, pk):  # noqa: D102
@@ -7217,10 +7249,10 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         state = get_object_or_404(NSOSnmpCommunityState, pk=pk)
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
-            messages.error(request, "No Vault ref on this community — set one (or a secret value) first.")
+            messages.error(request, "No Vault ref on this community. Set one (or a secret value) first.")
             return redirect(redirect_url)
         try:
-            key = parse_vault_ref(state.vault_ref, require_key=True).key
+            parse_vault_ref(state.vault_ref, require_key=True)
         except VaultRefError as exc:
             messages.error(request, f"Bad Vault ref: {exc}")
             return redirect(redirect_url)
@@ -7230,34 +7262,41 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
             messages.error(request, f"Vault verify failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
-        hashes = result.get("hashes") or {}
-        if result.get("exists") and key in hashes:
-            state.vault_secret_hash = hashes[key]
-            state.vault_secret_version = result.get("version")
+        status = result["status"]
+        if status == "present":
+            state.vault_secret_hash = result["fingerprint"]
+            state.vault_secret_version = result["version"]
             _save_exact_overlay_fields(state, ("vault_secret_hash", "vault_secret_version"))
             verdict = (
                 "matches the device value"
                 if state.vault_secret_hash == state.community_hash
                 else "DIFFERS from the device value (apply pending, or the device changed out-of-band)"
             )
-            messages.success(
-                request, f"Vault secret verified (v{_vault_version_label(result.get('version'))}) — {verdict}."
-            )
+            messages.success(request, f"Vault secret verified (v{_vault_version_label(result['version'])}): {verdict}.")
         else:
-            messages.warning(request, f"Vault has no {key!r} field at {state.vault_ref!r}.")
+            state.vault_secret_hash = ""
+            state.vault_secret_version = None
+            _save_exact_overlay_fields(state, ("vault_secret_hash", "vault_secret_version"))
+            messages.warning(request, "Vault does not hold the referenced secret.")
         return redirect(redirect_url)
 
 
 class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
-    """Resolve the v3 user's Vault path and record which fields (auth/priv) exist."""
+    """Resolve the v3 user's Vault path and record its fixed auth and priv flags."""
 
     def post(self, request, pk):  # noqa: D102
         from . import adapter_client
+        from .vault_refs import VaultRefError, parse_vault_ref
 
         state = get_object_or_404(NSOSnmpV3UserState, pk=pk)
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
-            messages.error(request, "No Vault ref on this v3 user — set one (or secret values) first.")
+            messages.error(request, "No Vault ref on this v3 user. Set one (or secret values) first.")
+            return redirect(redirect_url)
+        try:
+            parse_vault_ref(state.vault_ref, require_key=False)
+        except VaultRefError as exc:
+            messages.error(request, f"Bad Vault ref: {exc}")
             return redirect(redirect_url)
         try:
             result = adapter_client.verify_secret(state.vault_ref)
@@ -7265,16 +7304,17 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
             messages.error(request, f"Vault verify failed: {public_error_message(exc)}")
             return redirect(redirect_url)
 
-        fields = set(result.get("fields") or [])
-        state.vault_has_auth = "auth" in fields
-        state.vault_has_priv = "priv" in fields
+        status = result["status"]
+        state.vault_has_auth = result["has_auth"] if status == "present" else False
+        state.vault_has_priv = result["has_priv"] if status == "present" else False
         _save_exact_overlay_fields(state, ("vault_has_auth", "vault_has_priv"))
+        fields = [name for name, present in (("auth", state.vault_has_auth), ("priv", state.vault_has_priv)) if present]
         if fields:
             messages.success(
-                request, f"Vault holds: {', '.join(sorted(fields))} (v{_vault_version_label(result.get('version'))})."
+                request, f"Vault holds: {', '.join(sorted(fields))} (v{_vault_version_label(result['version'])})."
             )
         else:
-            messages.warning(request, f"Vault has no secret at {state.vault_ref!r}.")
+            messages.warning(request, "Vault does not hold auth or priv secrets for this user.")
         return redirect(redirect_url)
 
 
@@ -7477,12 +7517,12 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device_id))
 
 
-_RP_ATTACH_FAMILIES = [
-    ("prefix_list", "Prefix List", "PrefixList"),
-    ("route_map", "Route Map", "RouteMap"),
-    ("community_list", "Community List", "CommunityList"),
-    ("as_path", "AS Path", "ASPath"),
-]
+_RP_ATTACH_LABELS = {
+    "prefix_list": "Prefix List",
+    "community_list": "Community List",
+    "as_path": "AS Path",
+    "route_map": "Route Map",
+}
 
 
 class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
@@ -7496,24 +7536,23 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
     """
 
     def get(self, request, device_pk):  # noqa: D102
+        from django.apps import apps
         from django.contrib.contenttypes.models import ContentType
+
+        from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
 
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         attached = set(NSORoutePolicyState.objects.filter(management=mgmt).values_list("content_type_id", "object_id"))
         candidates = []
-        try:
-            import netbox_routing.models as rm
-        except ImportError:
-            rm = None
-        for family, label, model_name in _RP_ATTACH_FAMILIES:
-            model = getattr(rm, model_name, None) if rm else None
-            if model is None:
-                continue
+        for family, native_model_label in ROUTE_POLICY_NATIVE_MODEL_LABELS.items():
+            model = apps.get_model(native_model_label)
             ct = ContentType.objects.get_for_model(model)
             for obj in model.objects.all().order_by("name"):
                 if (ct.id, obj.pk) in attached:
                     continue
-                candidates.append({"value": f"{family}:{ct.id}:{obj.pk}", "label": label, "name": obj.name})
+                candidates.append(
+                    {"value": f"{family}:{ct.id}:{obj.pk}", "label": _RP_ATTACH_LABELS[family], "name": obj.name}
+                )
         return render(
             request,
             "netbox_nso_plugin/attach_route_policy.html",
@@ -7524,11 +7563,15 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
         from django.contrib.contenttypes.models import ContentType
         from django.utils import timezone
 
+        from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
+
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         try:
             family, ct_id, obj_pk = request.POST.get("policy", "").split(":")
             ct = ContentType.objects.get_for_id(int(ct_id))
             obj = ct.get_object_for_this_type(pk=int(obj_pk))
+            if ROUTE_POLICY_NATIVE_MODEL_LABELS.get(family) != obj._meta.label_lower:
+                raise ValueError
         except (ValueError, ContentType.DoesNotExist, Exception):  # noqa: BLE001
             messages.error(request, "Invalid route-policy selection.")
             return redirect(_device_nso_tab_url(mgmt.device_id))

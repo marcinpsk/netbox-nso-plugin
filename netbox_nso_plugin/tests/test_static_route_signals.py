@@ -5,10 +5,11 @@
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
+from ._outbox_case import trust_scope
 from ._static_route_case import _assign_without_push
-from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 
@@ -401,16 +402,14 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
             mock_push.assert_not_called()
 
 
-class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
-    """#1396 R3 P1 — ``route_id`` + ``generation`` in the push, and the echoed expectation."""
-
-    @classmethod
-    def setUpTestData(cls):
+class _StaticRouteWireCase:
+    def setUp(self):
+        super().setUp()
         mfg = Manufacturer.objects.create(name="SrGenMfg", slug="srgenmfg")
-        cls.dt = DeviceType.objects.create(manufacturer=mfg, model="SrGenDev", slug="srgendev")
-        cls.role = DeviceRole.objects.create(name="SrGenRole", slug="srgenrole")
-        cls.site = Site.objects.create(name="SrGenSite", slug="srgensite")
-        cls.device = Device.objects.create(name="sr-gen-router", device_type=cls.dt, role=cls.role, site=cls.site)
+        self.dt = DeviceType.objects.create(manufacturer=mfg, model="SrGenDev", slug="srgendev")
+        self.role = DeviceRole.objects.create(name="SrGenRole", slug="srgenrole")
+        self.site = Site.objects.create(name="SrGenSite", slug="srgensite")
+        self.device = Device.objects.create(name="sr-gen-router", device_type=self.dt, role=self.role, site=self.site)
 
     def _mgmt(self):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
@@ -433,7 +432,7 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             interface_next_hop="GigabitEthernet0/0" if next_hop_is_none else "",
         )
         _assign_without_push(sr, self.device)
-        return NSOStaticRouteState.objects.create(
+        state = NSOStaticRouteState.objects.create(
             management=mgmt,
             static_route=sr,
             status="accepted",
@@ -441,6 +440,12 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
             nso_next_hop="" if next_hop_is_none else next_hop,
             intent_generation=generation,
         )
+        trust_scope(self.device, mgmt, "static_route")
+        return state
+
+
+class TestStaticRouteIntentGenerationOnTheWire(_StaticRouteWireCase, IntentPushResetMixin, TestCase):
+    """#1396 R3 P1 — ``route_id`` + ``generation`` in the push, and the echoed expectation."""
 
     def test_push_names_the_netbox_pk_and_the_allocated_generation(self):
         """P1.1 — the pk is what opens the fence; the generation is what a result correlates on."""
@@ -524,37 +529,6 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
         assert state.expected_generation == generation
         assert state.expected_fingerprint == "f00d"
 
-    def test_a_response_naming_a_superseded_generation_records_nothing(self):
-        """P1.9 — the PUT commits before it answers, so an edit can bump the generation between
-        the request and the response. Writing the stale echo would make the *next* result settle
-        content the operator has already replaced."""
-        from netbox_nso_plugin.delivery import deliver
-        from netbox_nso_plugin.intent_generation import allocate_intent_generation
-
-        mgmt = self._mgmt()
-        pushed = allocate_intent_generation()
-        state = self._state(mgmt, "10.46.0.0/16", "10.0.0.46", generation=pushed)
-        newer = allocate_intent_generation()
-
-        def _bump_then_answer(*args, **kwargs):
-            # The concurrent edit lands while the request is in flight.
-            from ._outbox_case import content_bulk_update
-
-            content_bulk_update(state, intent_generation=newer)
-            return {
-                "device_id": 4242,
-                "count": 1,
-                "routes": [{"route_id": state.static_route.pk, "generation": pushed, "fingerprint": "stale"}],
-            }
-
-        with patch(PUT, side_effect=_bump_then_answer):
-            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
-
-        state.refresh_from_db()
-        assert state.intent_generation == newer
-        assert state.expected_generation is None
-        assert state.expected_fingerprint == ""
-
     def test_an_echo_for_an_unallocated_row_records_nothing(self):
         """A row still on the sentinel has no generation to correlate — recording a fingerprint
         for it would create an expectation nothing can legitimately match."""
@@ -630,3 +604,41 @@ class TestStaticRouteIntentGenerationOnTheWire(IntentPushResetMixin, TestCase):
 
         changed = {name for name, value in before.items() if getattr(state, name) != value}
         assert changed == set(_STATIC_ROUTE_ARMED_FIELDS)
+
+
+class TestStaticRouteIntentGenerationRace(
+    _StaticRouteWireCase,
+    _CascadeFlushMixin,
+    IntentPushResetMixin,
+    TransactionTestCase,
+):
+    def test_a_response_naming_a_superseded_generation_records_nothing(self):
+        """P1.9 — the PUT commits before it answers, so an edit can bump the generation between
+        the request and the response. Writing the stale echo would make the *next* result settle
+        content the operator has already replaced."""
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.intent_generation import allocate_intent_generation
+
+        mgmt = self._mgmt()
+        pushed = allocate_intent_generation()
+        state = self._state(mgmt, "10.46.0.0/16", "10.0.0.46", generation=pushed)
+        newer = allocate_intent_generation()
+
+        def _bump_then_answer(*args, **kwargs):
+            # The concurrent edit lands while the request is in flight.
+            from ._outbox_case import content_bulk_update
+
+            content_bulk_update(state, intent_generation=newer)
+            return {
+                "device_id": 4242,
+                "count": 1,
+                "routes": [{"route_id": state.static_route.pk, "generation": pushed, "fingerprint": "stale"}],
+            }
+
+        with patch(PUT, side_effect=_bump_then_answer):
+            deliver("static_route", self.device.pk, mgmt.adapter_device_id)
+
+        state.refresh_from_db()
+        assert state.intent_generation == newer
+        assert state.expected_generation is None
+        assert state.expected_fingerprint == ""

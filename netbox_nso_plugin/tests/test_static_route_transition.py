@@ -20,8 +20,10 @@ from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client as _adapter_client
 
+from ._outbox_case import trust_scope
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
+from .strict_writer import assert_each_operation_consumed_once, strict_writer_harness
 
 #: Captured at import, before any test can patch it — see ``_assert_put_patch_did_not_leak``.
 _REAL_PUT = _adapter_client.put_static_route_intent
@@ -52,16 +54,28 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         self.assertIsNotNone(state.generation_started_at)
         put.assert_not_called()
 
-    def test_a_deploying_row_is_demoted_too(self):
-        """P2.2 — an apply in flight would otherwise settle the NEW intent from the OLD result."""
+    def _trust_the_current_baseline(self):
+        """Certify what the scope renders right now, as a settled push leaves it."""
+        return trust_scope(self.device, self.mgmt, "static_route")
+
+    def test_a_foreign_edit_demotes_a_deploying_row_during_audit(self):
+        """An audit prevents an old result from settling foreign-edited intent."""
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+
         with _fixtures():
             sr = _route("10.21.0.0/16", "10.0.0.1", devices=[self.device])
             state = _own(sr, self.mgmt, status="deploying")
         accepted_at = state.accepted_at
+        self._trust_the_current_baseline()
 
         with patch(PUT), self.captureOnCommitCallbacks(execute=True):
             sr.next_hop = "10.0.0.2"
             sr.save()
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "deploying")
+
+        audit_renderer_scopes(self.device.pk, ("static_route",), trigger="test", pre_capture=True)
 
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
@@ -113,22 +127,32 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(state.intent_generation, before)
         put.assert_not_called()
 
-    def test_a_suppressed_content_save_is_refused_and_a_no_delta_save_does_nothing(self):
-        """Suppression cannot hide rendered changes, and labels do not reach the wire."""
-        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+    def test_suppression_does_not_turn_a_foreign_save_into_an_own_write(self):
+        """Foreign writes stay neutral even when the caller uses push suppression.
+
+        The refusal this case carries moved rather than went away. A suppressed content save
+        used to raise ``changes rendered content`` at the write; under foreign-writer
+        neutrality it commits silently, so the certified baseline is what refuses: the next
+        pre-capture audit finds the render moved under it and repairs the scope instead of
+        letting an Apply settle on a snapshot the device never got.
+        """
+        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
         from netbox_nso_plugin.signals import suppress_intent_push
 
         with _fixtures():
             sr = _route("10.25.0.0/16", "10.0.0.1", devices=[self.device])
             state = _own(sr, self.mgmt, status="in_sync")
         before = state.intent_generation
+        revision = self._trust_the_current_baseline()
+        certified = revision.revision
 
         with patch(PUT) as put, self.captureOnCommitCallbacks(execute=True):
-            with self.assertRaisesRegex(IntentMutationProtocolError, "changes rendered content"):
-                with suppress_intent_push():
-                    sr.next_hop = "10.0.0.9"
-                    sr.save()
+            with suppress_intent_push():
+                sr.next_hop = "10.0.0.9"
+                sr.save()
         state.refresh_from_db()
+        sr.refresh_from_db()
+        self.assertEqual(str(sr.next_hop), "10.0.0.9")
         self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.intent_generation, before)
         put.assert_not_called()
@@ -141,6 +165,16 @@ class TestStaticRouteContentTransition(IntentPushDeliveryMixin, TestCase):
         self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.intent_generation, before)
         put.assert_not_called()
+
+        result = audit_renderer_scopes(self.device.pk, ("static_route",), trigger="test", pre_capture=True)
+
+        self.assertEqual(result.repaired, ("static_route",))
+        state.refresh_from_db()
+        revision.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertGreater(state.intent_generation, before)
+        self.assertGreater(revision.revision, certified)
+        self.assertEqual(revision.verified_revision, revision.revision)
 
     def test_a_field_the_save_did_not_persist_is_not_a_content_change(self):
         """``update_fields`` means the database never saw the other attributes. Reading them
@@ -329,9 +363,10 @@ class TestStaticRouteBulkAcceptOutsideATransaction(_CascadeFlushMixin, IntentPus
         half-armed snapshot."""
         states = self._drifted(3)
 
-        with patch(PUT) as put:
+        with strict_writer_harness() as records, patch(PUT) as put:
             response = self._post()
 
+        assert_each_operation_consumed_once(records)
         self.assertEqual(response.status_code, 302)
         self.assertEqual(put.call_count, 1)
         for state in states:
@@ -671,7 +706,8 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             finally:
                 connections.close_all()
 
-        with patch(PUT), connection.execute_wrapper(observe_sql):
+        # Keep L4's post-commit drain audit out of the SQL capture.
+        with patch(PUT), transaction.atomic(), connection.execute_wrapper(observe_sql):
             with renderer_writes(plan) as writer:
                 contender = threading.Thread(target=probe_overlay_locks)
                 contender.start()
@@ -688,6 +724,23 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             if f'FROM "{overlay_table}"' in sql and "FOR UPDATE" in sql
         ]
         native_updates = [index for index, (sql, _params) in enumerate(statements) if f'UPDATE "{native_table}"' in sql]
-        self.assertEqual([pk for _index, pk in overlay_locks], list(expected_pks))
+        self.assertEqual(list(dict.fromkeys(pk for _index, pk in overlay_locks)), list(expected_pks))
         self.assertEqual(len(native_updates), 1)
         self.assertTrue(all(index < native_updates[0] for index, _pk in overlay_locks))
+
+    def test_a_foreign_fan_out_edit_takes_no_plugin_overlay_locks(self):
+        """A foreign save does not lock plugin overlays in its transaction."""
+        from django.test.utils import CaptureQueriesContext
+
+        with _fixtures():
+            sr = _route("10.37.0.0/16", "10.0.0.1", devices=[self.d1, self.d2])
+            _own(sr, self.mgmt1, status="in_sync")
+            _own(sr, self.mgmt2, status="in_sync")
+
+        with patch(PUT), CaptureQueriesContext(connection) as queries:
+            with transaction.atomic():
+                sr.metric = 51
+                sr.save(update_fields=["metric"])
+
+        locking = [q["sql"] for q in queries.captured_queries if "FOR UPDATE" in q["sql"]]
+        self.assertEqual(locking, [])
