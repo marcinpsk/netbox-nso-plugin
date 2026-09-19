@@ -2,6 +2,108 @@
 
 <!-- version list -->
 
+## v1.3.1 (2026-09-17)
+
+### Bug Fixes
+
+- Preserve device values on first redistribution import
+  ([`b94c1e4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b94c1e4778e64eccfce535df34b2fc852627ee2c))
+
+- Preserve intent mutation invariants
+  ([`35ef81d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/35ef81d185439b9d5c417eda9eea55042a459991))
+
+- Retry stale reconciler acquisitions
+  ([`a3f6106`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a3f6106df0816b790cbfe3eaaa4ed4222d681039))
+
+- **adapter-client**: Refuse malformed IS-IS and BFD documents before reshaping them
+  ([`4098875`](https://github.com/marcinpsk/netbox-nso-plugin/commit/409887559d25f3db3759bd9bbf78999e475a008f))
+
+- **bfd**: Avoid unused owned profiles
+  ([`d254beb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d254bebb0b0a4fe342cde15a2e044ddbbf4d433b))
+
+- **bgp**: Reject duplicate adapter identities
+  ([`8dadb52`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8dadb52b6bfd7e94bf9b3c5cb101f3ee36ea71b8))
+
+- **bgp**: Restore recreated template families
+  ([`f4c4387`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f4c4387eee58edccfe7d8cbf3599e218b21f80a6))
+
+- **l2**: Refuse malformed numeric service and SAP fields before planning
+  ([`2227298`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2227298749d157eee85f0320ddb6b9de1786286d))
+
+- **l2**: Refuse malformed service and SAP shapes instead of skipping them
+  ([`8e7351e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8e7351e43f16ec345967e5fe75c69985276baa00))
+
+- **l2**: Refuse unsupported service types before native persistence
+  ([`b9f203a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b9f203a8f752a8748c7f71643c76a2a69ec87ff6))
+
+- **mtu**: Validate document shape and MTU ranges before planning
+  ([`a46ff28`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a46ff28a67ffbde57a78777ff37063db874c4865))
+
+- **mtu**: Validate every payload entry before the unknown-interface skip
+  ([`d0a0ecb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d0a0ecbbd3c213a6c7b18a0273d85e77fb0e64a1))
+
+- **reconcile**: Validate imported routing intent
+  ([`e6976d0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e6976d0dd826a137273008afffb05288b82f8895))
+
+- **redistribution**: Recreate accepted state coherently
+  ([`0c7c77f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0c7c77ff131d302bf039b45d9570efd5555b2cb3))
+
+- **route-policy**: Retry stale acquisition
+  ([`4bb8365`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4bb8365d85d002455df11b10eac29dd6c30fde85))
+
+- **views**: Require the IPAM permission before the IP Accept view writes the native address
+  ([`c13d773`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c13d7730bbaf7b28e6202aba920d99f6e155102e))
+
+- **views**: Show an unknown Vault secret version as v? in the verify messages
+  ([`9c157fd`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9c157fdd18a376963fb5b8e7dfec811e8dc38c61))
+
+### Chores
+
+- **deps**: Bump the python-minor-patch group across 1 directory with 9 updates
+  ([`231cbde`](https://github.com/marcinpsk/netbox-nso-plugin/commit/231cbde3884bc3ce2bce6ba795a3d7f765aef054))
+
+### Testing
+
+- **interface-ip**: Enable delivery assertions
+  ([`703104a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/703104a2656cface09840ea2be58300d316a526b))
+
+- **ip-autoassign**: Assert the allocation push reaches the adapter
+  ([`b1bf5cf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b1bf5cf01ff94139154e55cb56a0feb40b30fffe))
+
+- **l2**: Pin that a frozen plan fails closed on a payload mutated after planning
+  ([`6e95cee`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6e95cee39260bf843c9e9d27a5e9beed9c8810e8))
+
+- **lifecycle**: Drive operator edits through the real field-edit view
+  ([`8e0d402`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8e0d4022d20122358f452568a089472761b7035d))
+
+- **manifest**: Assert both manifest rows retire
+  ([`aaf0949`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aaf09490fa94edc449ea6076834e8e83b58389b5))
+
+- **review**: Preserve plan cardinality and retry count
+  ([`12d78ff`](https://github.com/marcinpsk/netbox-nso-plugin/commit/12d78ff229af2f14a9ff8fe74dd2d273c46f82fa))
+
+- **route-policy**: Pin that unowned entry replacement keeps intent and revision
+  ([`5cf4e97`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5cf4e978c8c17eeb278b166e0c65685ca05271f0))
+
+- **route-policy**: Prove a first cross-device acquisition advances only the route-policy scope
+  ([`115b63d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/115b63debca42249f0cf1214354bfb7cf1946f3b))
+
+- **signals**: Pin intent scheduling guards
+  ([`e7196e3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e7196e3dea7be212fafcbb270bf35bf0500cbe4c))
+
+- **static-route**: Lock each owned overlay before the native update through the exact writer
+  ([`7a5c296`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7a5c296b884003c0bf6b6efacedba30d12492805))
+
+- **structure**: Guard defaulted mapping lookups and validation inside skip loops
+  ([`d21a3ad`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d21a3ad2182c4dd21b1a5db856ed7109f7e5722c))
+
+- **structure**: Scope AST call scans to the enclosing function
+  ([`e0bcf4f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e0bcf4fa789edb4ea2fb43db71d218bac3585d2f))
+
+- **structure**: Walk class bodies as part of the enclosing scope
+  ([`76228da`](https://github.com/marcinpsk/netbox-nso-plugin/commit/76228da4e6bff9c06cec4e248db0eae67136eb4b))
+
+
 ## v1.3.0 (2026-09-12)
 
 ### Bug Fixes
