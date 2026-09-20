@@ -90,7 +90,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           cache-dependency-glob: |
             netbox/requirements*.txt
@@ -171,7 +171,7 @@ jobs:
 
       - name: Upload shard evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-shard-${{ matrix.shard }}
           path: netbox-nso-plugin/.ci-results/
@@ -201,14 +201,14 @@ jobs:
         with:
           python-version: ${{ matrix.environment.python-version }}
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
       - name: Install gate dependencies
         run: uv pip install --system pytest pytest-cov pytest-xdist pytest-split==0.11.0
       - name: Test the shard gate
         working-directory: netbox-nso-plugin
         run: python -m unittest discover -s .github/ci -v
       - name: Download this version's shard evidence
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           pattern: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-shard-*
           path: netbox-nso-plugin/.ci-results
@@ -217,7 +217,7 @@ jobs:
         run: |
           python .github/ci/sharding.py aggregate .ci-results --shards "$CI_SHARDS"
       - name: Upload refreshed timing data
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-durations
           path: netbox-nso-plugin/.ci-results/durations.json
@@ -264,7 +264,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
