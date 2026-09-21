@@ -4,7 +4,9 @@
 
 from unittest.mock import patch
 
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
+
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestOwnershipManifestSchema(SimpleTestCase):
@@ -60,34 +62,55 @@ _MANIFEST_TABLE = "netbox_nso_plugin_nsoownershipmanifest"
 
 
 class _PeerManifestInsert:
-    """Land a peer audit's identical manifest row right after this audit read the identity.
+    """Land a peer audit's identical manifest row in the window this audit leaves open.
 
     The identity read and the write are separate statements, so a second audit can land the
     row in the window between them. Reproduce that against the real unique index.
     """
 
-    def __init__(self, identity):
+    def __init__(self, identity, *, seam="select"):
         self.identity = identity
+        self.seam = seam
         self.fired = False
 
-    def __call__(self, execute, sql, params, many, context):
-        result = execute(sql, params, many, context)
-        if not self.fired and sql.lstrip().upper().startswith("SELECT") and _MANIFEST_TABLE in sql:
-            self.fired = True
-            from netbox_nso_plugin.models import NSOOwnershipManifest
+    def _reached(self, sql):
+        if self.fired or _MANIFEST_TABLE not in sql:
+            return False
+        return sql.lstrip().upper().startswith(self.seam.upper())
 
-            NSOOwnershipManifest.objects.create(
+    def _insert_peer_row(self):
+        """Commit the peer row off this connection, so no savepoint of ours can undo it."""
+        from django.db import connection, connections
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        self.fired = True
+        alias = "ownership_manifest_peer"
+        connections[alias] = connection.copy(alias=alias)
+        try:
+            NSOOwnershipManifest.objects.using(alias).create(
                 **self.identity,
                 native_id=0,
                 ownership_state="owned",
                 deletion_authority=False,
             )
+        finally:
+            connections[alias].close()
+            del connections[alias]
+
+    def __call__(self, execute, sql, params, many, context):
+        # The insert seam has to fire BEFORE the statement it races; the select seam after it.
+        if self.seam == "insert" and self._reached(sql):
+            self._insert_peer_row()
+        result = execute(sql, params, many, context)
+        if self.seam == "select" and self._reached(sql):
+            self._insert_peer_row()
         return result
 
 
-class TestOwnershipManifestConcurrency(TestCase):
+class TestOwnershipManifestConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def test_a_peer_insert_does_not_abort_the_recording_transaction(self):
-        from django.db import connection
+        from django.db import connection, transaction
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
@@ -122,20 +145,28 @@ class TestOwnershipManifestConcurrency(TestCase):
             "state_model_label": state_model_label,
             "state_key": state_key,
         }
-        peer = _PeerManifestInsert(identity)
+        peer = _PeerManifestInsert(identity, seam="insert")
 
-        with connection.execute_wrapper(peer):
-            maintain_manifest(state)
+        with transaction.atomic():
+            # The wrapper covers only the call under test, so the seam is maintain_manifest's own.
+            with connection.execute_wrapper(peer):
+                maintain_manifest(state)
+            # An aborted transaction would refuse this write instead of committing it.
+            survivor = NSOOwnershipManifest.objects.create(
+                **(identity | {"native_key": identity["native_key"] | {"vid": 1729}}),
+                native_id=vlan.pk,
+            )
 
         manifest = NSOOwnershipManifest.objects.get(**identity)
         self.assertTrue(peer.fired)
+        self.assertTrue(NSOOwnershipManifest.objects.filter(pk=survivor.pk).exists())
         self.assertEqual(NSOOwnershipManifest.objects.filter(**identity).count(), 1)
         self.assertEqual(manifest.native_id, vlan.pk)
         self.assertEqual(manifest.ownership_state, "owned")
         self.assertTrue(manifest.deletion_authority)
 
     def test_a_peer_insert_does_not_abort_retired_manifest_adoption(self):
-        from django.db import connection
+        from django.db import connection, transaction
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
@@ -168,7 +199,7 @@ class TestOwnershipManifestConcurrency(TestCase):
         )
         peer = _PeerManifestInsert(identity)
 
-        with connection.execute_wrapper(peer):
+        with connection.execute_wrapper(peer), transaction.atomic():
             maintain_manifest(state)
 
         previous.refresh_from_db()
