@@ -316,7 +316,8 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         occurrences = [
             path.relative_to(package_root)
             for path in package_root.rglob("*.py")
-            if path.relative_to(package_root).parts[0] != "tests" and "_nso_explicit_status_update" in path.read_text()
+            if path.relative_to(package_root).parts[0] != "tests"
+            and "_nso_explicit_status_update" in path.read_text(encoding="utf-8")
         ]
 
         assert occurrences == []

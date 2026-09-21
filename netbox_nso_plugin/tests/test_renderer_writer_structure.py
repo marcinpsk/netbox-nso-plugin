@@ -359,7 +359,7 @@ class TestRendererWriterStructure(SimpleTestCase):
 
     def test_signals_do_not_import_copy_inside_a_function(self):
         path = Path(__file__).resolve().parents[1] / "signals.py"
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         local_copy_imports = [
             node.lineno
             for function in (node for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES))
@@ -371,7 +371,7 @@ class TestRendererWriterStructure(SimpleTestCase):
 
     def test_mtu_inline_edits_delegate_to_an_exact_plan(self):
         path = Path(__file__).resolve().parents[1] / "views.py"
-        self.assertEqual(_mtu_delegation_offenders(path.read_text()), [])
+        self.assertEqual(_mtu_delegation_offenders(path.read_text(encoding="utf-8")), [])
 
     def test_nested_mtu_delegation_does_not_certify_the_outer_edit(self):
         nested_bodies = {
@@ -598,7 +598,7 @@ def _stale_plan_source(source, module) -> list:
 
 
 def _stale_plan_sites(path, module) -> list:
-    return _stale_plan_source(path.read_text(), module)
+    return _stale_plan_source(path.read_text(encoding="utf-8"), module)
 
 
 class TestPlansAreBuiltUnderTheLocksThatConsumeThem(SimpleTestCase):
@@ -737,7 +737,7 @@ def repair():
         modules = set()
         builders = {}
         for path, relative in _production_modules():
-            tree = ast.parse(path.read_text(), filename=str(path))
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             if _consumers(tree):
                 modules.add(relative)
                 builders[relative] = sorted(_plan_builders(tree) - {_PLAN_BUILDER})

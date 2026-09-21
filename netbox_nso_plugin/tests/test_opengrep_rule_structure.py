@@ -21,6 +21,8 @@ _COVERAGE_PATH = _RULES_PATH.parent / "tests" / "coverage.py"
 _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside"}
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
 _ROOT_NAME = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)(?=\s*[.(])")
+# opengrep matches the method receiver literally, so "self" is never an import root.
+_ALLOWED_ROOT_NAMES = frozenset({"self"})
 
 _COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
 assert _COVERAGE_SPEC is not None
@@ -39,9 +41,7 @@ def _pattern_texts(node):
     for key, value in node.items():
         if key in _PATTERN_KEYS and isinstance(value, str):
             yield value
-        elif key in _PATTERN_KEYS and isinstance(value, (dict, list)):
-            yield from _pattern_texts(value)
-        elif key in _PATTERN_LIST_KEYS:
+        elif key in _PATTERN_LIST_KEYS or (key in _PATTERN_KEYS and isinstance(value, (dict, list))):
             yield from _pattern_texts(value)
 
 
@@ -71,7 +71,7 @@ def _scan_rules(rules_path: Path) -> tuple[list[str], set[str]]:
         scanned_names.update(names)
         violations.extend(
             f"{rule['id']}: {name}"
-            for name in names
+            for name in names - _ALLOWED_ROOT_NAMES
             if not _is_importable(name) and not _has_qualified_pattern(name, patterns)
         )
     return sorted(violations), scanned_names
