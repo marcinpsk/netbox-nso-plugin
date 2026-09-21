@@ -453,18 +453,23 @@ def _bindings(node):
             yield [child.optional_vars], child.context_expr
 
 
-def _plan_names(nodes, builders) -> set:
-    """Every local name *nodes* bind to a plan built there, aliases included."""
+def _bound_plan_names(nodes, builders, extract) -> set:
+    """The alias fixed point over the bindings *extract* reads out of each node."""
     bound: set[str] = set()
     for _ in range(_BUILDER_PASSES):
         for node in nodes:
-            for targets, value in _bindings(node):
+            for targets, value in extract(node):
                 if not _builds_a_plan(value, builders) and _root_name(value) not in bound:
                     continue
                 for target in targets:
                     elements = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
                     bound.update(element.id for element in elements if isinstance(element, ast.Name))
     return bound
+
+
+def _plan_names(nodes, builders) -> set:
+    """Every local name *nodes* bind to a plan built there, aliases included."""
+    return _bound_plan_names(nodes, builders, _bindings)
 
 
 def _direct_bindings(node):
@@ -483,16 +488,7 @@ def _direct_bindings(node):
 
 def _direct_plan_names(nodes, builders) -> set:
     """Plan names bound directly by these statements, aliases included."""
-    bound: set[str] = set()
-    for _ in range(_BUILDER_PASSES):
-        for node in nodes:
-            for targets, value in _direct_bindings(node):
-                if not _builds_a_plan(value, builders) and _root_name(value) not in bound:
-                    continue
-                for target in targets:
-                    elements = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
-                    bound.update(element.id for element in elements if isinstance(element, ast.Name))
-    return bound
+    return _bound_plan_names(nodes, builders, _direct_bindings)
 
 
 def _statement_bodies(statement):
@@ -608,6 +604,18 @@ class TestPlansAreBuiltUnderTheLocksThatConsumeThem(SimpleTestCase):
             offenders.extend(_stale_plan_sites(path, relative))
 
         self.assertEqual(sorted(offenders), [])
+
+    def test_both_plan_name_collectors_share_one_alias_fixed_point(self):
+        source = """
+def repair():
+    third = second
+    second = first
+    first = RendererMutationPlan.build()
+"""
+        body = ast.parse(source).body[0].body
+
+        self.assertEqual(_plan_names(body, {_PLAN_BUILDER}), {"first", "second", "third"})
+        self.assertEqual(_direct_plan_names(body, {_PLAN_BUILDER}), {"first", "second", "third"})
 
     def test_a_later_rebuild_does_not_authorize_an_earlier_stale_plan(self):
         source = """
