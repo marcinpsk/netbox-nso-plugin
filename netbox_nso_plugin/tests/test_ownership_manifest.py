@@ -312,6 +312,221 @@ class TestOwnershipManifestMaintenance(TestCase):
             counts.append(len(queries))
         self.assertEqual(counts[0], counts[1])
 
+    def test_manifest_scan_query_count_does_not_grow_with_interface_ip_rows(self):
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
+
+        vrf = VRF.objects.create(name="manifest-scan-vrf")
+        # Warm the process-wide content-type cache, so the counts below vary with rows alone.
+        _manifest_record_actions(self.device.pk, frozenset({"ip"}))
+        counts = []
+        states = []
+        for count in (1, 4):
+            while len(states) < count:
+                index = len(states)
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Ethernet1/{index}",
+                    type="1000base-t",
+                )
+                address = IPAddress.objects.create(
+                    address=f"198.18.1.{index}/32",
+                    vrf=vrf,
+                    assigned_object=interface,
+                )
+                states.append(
+                    NSOInterfaceIPState.objects.create(
+                        interface=interface,
+                        address=str(address.address),
+                        vrf=vrf.name,
+                        status="accepted",
+                    )
+                )
+            NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
+            with CaptureQueriesContext(connection) as queries:
+                actions = _manifest_record_actions(self.device.pk, frozenset({"ip"}))
+            self.assertCountEqual(
+                actions,
+                [(OwnershipAction.RECORD_MANIFEST, "ip", state._meta.label_lower, state.pk) for state in states],
+            )
+            counts.append(len(queries))
+        self.assertEqual(counts[0], counts[1])
+
+    def test_manifest_scan_query_count_does_not_grow_with_ospf_interface_rows(self):
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
+
+        ospf_instance = OSPFInstance.objects.create(
+            device=self.device,
+            process_id="1627",
+            name="1627",
+            router_id="198.18.2.1",
+        )
+        area = OSPFArea.objects.create(area_id="0.0.0.0", area_type="standard")
+        # Warm the process-wide content-type cache, so the counts below vary with rows alone.
+        _manifest_record_actions(self.device.pk, frozenset({"ospf"}))
+        counts = []
+        states = []
+        for count in (1, 4):
+            while len(states) < count:
+                index = len(states)
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Ethernet2/{index}",
+                    type="1000base-t",
+                )
+                OSPFInterface.objects.create(
+                    instance=ospf_instance,
+                    area=area,
+                    interface=interface,
+                    cost=1627,
+                )
+                states.append(
+                    NSOOSPFInterfaceState.objects.create(
+                        management=self.management,
+                        interface=interface,
+                        process_id="1627",
+                        status="accepted",
+                    )
+                )
+            NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
+            with CaptureQueriesContext(connection) as queries:
+                actions = _manifest_record_actions(self.device.pk, frozenset({"ospf"}))
+            self.assertCountEqual(
+                actions,
+                [(OwnershipAction.RECORD_MANIFEST, "ospf", state._meta.label_lower, state.pk) for state in states],
+            )
+            counts.append(len(queries))
+        self.assertEqual(counts[0], counts[1])
+
+    def test_interface_ip_binding_keeps_the_lowest_pk_native_on_a_duplicate_identity(self):
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import _native_bindings, _native_prefetch, manifest_binding
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet3/0", type="1000base-t")
+        vrf = VRF.objects.create(name="manifest-duplicate-vrf")
+        first = IPAddress.objects.create(address="198.18.3.1/32", vrf=vrf, assigned_object=interface)
+        second = IPAddress.objects.create(address="198.18.3.1/32", vrf=vrf, assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(first.address),
+            vrf=vrf.name,
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ip"})))
+
+        self.assertLess(first.pk, second.pk)
+        self.assertEqual(manifest_binding(state)[4], first.pk)
+        self.assertEqual(manifest_binding(state, natives=natives)[4], first.pk)
+
+    def test_owned_ospf_overlay_whose_interface_moved_device_is_still_retracted(self):
+        from dcim.models import Interface
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            _manifest_record_actions,
+            _native_bindings,
+            _native_prefetch,
+            manifest_binding,
+        )
+
+        from ._outbox_case import make_device
+
+        # The overlay stays on this device's management while its interface belongs to another device.
+        other_device = make_device("manifest-maintenance", 2)
+        interface = Interface.objects.create(device=other_device, name="Ethernet4/0", type="1000base-t")
+        OSPFInterface.objects.create(
+            instance=OSPFInstance.objects.create(
+                device=other_device,
+                process_id="1628",
+                name="1628",
+                router_id="198.18.4.1",
+            ),
+            area=OSPFArea.objects.create(area_id="0.0.0.1", area_type="standard"),
+            interface=interface,
+            cost=1628,
+        )
+        state = NSOOSPFInterfaceState.objects.create(
+            management=self.management,
+            interface=interface,
+            process_id="1628",
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ospf"})))
+
+        self.assertIsNotNone(manifest_binding(state))
+        self.assertEqual(manifest_binding(state, natives=natives), manifest_binding(state))
+        self.assertCountEqual(
+            _manifest_record_actions(self.device.pk, frozenset({"ospf"})),
+            [(OwnershipAction.RETRACT, "ospf", state._meta.label_lower, state.pk)],
+        )
+
+    def test_interface_ip_binding_ignores_a_vrf_that_a_same_name_vrf_outranks(self):
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import _native_bindings, _native_prefetch, manifest_binding
+
+        canonical = VRF.objects.create(name="dup", rd="65000:1")
+        outranked = VRF.objects.create(name="dup")
+        interface = Interface.objects.create(device=self.device, name="Ethernet5/0", type="1000base-t")
+        address = IPAddress.objects.create(address="198.18.5.1/32", vrf=outranked, assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(address.address),
+            vrf="dup",
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ip"})))
+
+        # A NULL rd sorts last in the model's ('name', 'rd', 'pk') order, so the rd-bearing VRF is canonical.
+        self.assertEqual(VRF.objects.filter(name="dup").values_list("pk", flat=True).first(), canonical.pk)
+        self.assertIsNone(manifest_binding(state))
+        self.assertIsNone(manifest_binding(state, natives=natives))
+
+    def test_interface_ip_binding_resolves_the_canonical_vrf_on_both_paths(self):
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import _native_bindings, _native_prefetch, manifest_binding
+
+        canonical = VRF.objects.create(name="dup", rd="65000:1")
+        VRF.objects.create(name="dup")
+        interface = Interface.objects.create(device=self.device, name="Ethernet5/1", type="1000base-t")
+        address = IPAddress.objects.create(address="198.18.5.2/32", vrf=canonical, assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(address.address),
+            vrf="dup",
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ip"})))
+
+        binding = manifest_binding(state)
+        self.assertEqual(binding[4], address.pk)
+        self.assertEqual(manifest_binding(state, natives=natives), binding)
+
     def test_owned_ip_writer_records_the_managed_interfaces_native_identity(self):
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType

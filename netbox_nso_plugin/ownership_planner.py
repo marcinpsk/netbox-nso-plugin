@@ -505,14 +505,14 @@ def _validated_native_key_fields(native, rule):
     return native_label, key_fields
 
 
-def manifest_binding(instance):
+def manifest_binding(instance, *, natives=None):
     """Return the durable manifest identity for one overlay instance."""
     label = instance._meta.label_lower
     for rule in converted_scope_rules().values():
         native_field = dict(rule.overlay_native_fields).get(label)
         if native_field is None:
             continue
-        native = _manifest_native(instance, native_field)
+        native = _manifest_native(instance, native_field, natives=natives)
         management = _manifest_management(instance)
         native_fields = None if native is None else _validated_native_key_fields(native, rule)
         if native_fields is None or management is None:
@@ -536,16 +536,28 @@ def manifest_binding(instance):
     return None
 
 
-def _manifest_native(instance, native_field):
+def _prepared_address(value):
+    """Render one address the way the IPAddress lookup prepares it, so both sides key alike."""
+    from ipam.models import IPAddress
+
+    return IPAddress._meta.get_field("address").get_prep_value(value)
+
+
+def _manifest_native(instance, native_field, *, natives=None):
+    # The map is a cache, not the authority: a miss falls through to the device-agnostic per-row lookup.
     if native_field == "__self__":
         return instance
     if native_field == "__ip_address__":
+        vrf_name = getattr(instance, "vrf", "")
+        if natives is not None:
+            native = natives.get((native_field, instance.interface_id, _prepared_address(instance.address), vrf_name))
+            if native is not None:
+                return native
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import VRF, IPAddress
 
         interface_type = ContentType.objects.get_for_model(Interface)
-        vrf_name = getattr(instance, "vrf", "")
         vrf_id = VRF.objects.filter(name=vrf_name).values_list("pk", flat=True).first() if vrf_name else None
         if vrf_name and vrf_id is None:
             return None
@@ -556,6 +568,10 @@ def _manifest_native(instance, native_field):
             assigned_object_id=instance.interface_id,
         ).first()
     if native_field == "__ospf_interface__":
+        if natives is not None:
+            native = natives.get((native_field, instance.interface_id))
+            if native is not None:
+                return native
         from netbox_routing.models import OSPFInterface
 
         return OSPFInterface.objects.filter(interface_id=instance.interface_id).first()
@@ -778,11 +794,11 @@ def _manifest_states(device_id, requested):
     }
 
 
-def _record_action_for(instance, device_id, requested, qualifying, manifest_states):
+def _record_action_for(instance, device_id, requested, qualifying, manifest_states, *, natives=None):
     """Return one overlay's planned record action, or ``None`` when it needs no work."""
     from .status_machine import is_owned
 
-    binding = manifest_binding(instance)
+    binding = manifest_binding(instance, natives=natives)
     if binding is None:
         return None
     (
@@ -868,13 +884,16 @@ def _device_overlays(device_id, requested):
             yield instance
 
 
-def _manifest_record_actions(device_id, requested, *, qualifying=None):
+def _manifest_record_actions(device_id, requested, *, qualifying=None, natives=None):
     """Return the owned overlays whose durable manifest evidence needs work."""
-    qualifying = _qualifying_overlay_signatures(device_id, requested) if qualifying is None else qualifying
+    if qualifying is None or natives is None:
+        scanned_qualifying, scanned_natives = _scan_context(device_id, requested)
+        qualifying = scanned_qualifying if qualifying is None else qualifying
+        natives = scanned_natives if natives is None else natives
     manifest_states = _manifest_states(device_id, requested)
     planned = []
     for instance in _device_overlays(device_id, requested):
-        action = _record_action_for(instance, device_id, requested, qualifying, manifest_states)
+        action = _record_action_for(instance, device_id, requested, qualifying, manifest_states, natives=natives)
         if action is not None:
             planned.append(action)
     return tuple(planned)
@@ -1556,6 +1575,57 @@ def _native_bindings(management, requested):
     return tuple(bindings)
 
 
+def _canonical_vrf_names(rows):
+    """Name each VRF an overlay can still reach by name, dropping the ones a same-name VRF outranks."""
+    from ipam.models import VRF
+
+    vrf_ids = {row.vrf_id for row in rows if row.vrf_id}
+    if not vrf_ids:
+        return {}
+    named = {}
+    # Default ordering, because that is the order the per-row `filter(name=...).first()` resolves.
+    for name, pk in VRF.objects.filter(name__in=VRF.objects.filter(pk__in=vrf_ids).values("name")).values_list(
+        "name", "pk"
+    ):
+        named.setdefault(name, pk)
+    return {pk: name for name, pk in named.items()}
+
+
+def _native_prefetch(bindings):
+    """Index one scan's native rows under the identities the synthetic overlay lookups resolve."""
+    native_fields = {
+        label: field for rule in converted_scope_rules().values() for label, field in rule.overlay_native_fields
+    }
+    rows = [(native_fields.get(state_model_label), native) for _scope, native, state_model_label, _key in bindings]
+    vrf_names = _canonical_vrf_names(native for field, native in rows if field == "__ip_address__")
+    natives = {}
+    for field, native in rows:
+        if field == "__ip_address__":
+            vrf_name = "" if native.vrf_id is None else vrf_names.get(native.vrf_id)
+            if vrf_name is None:
+                continue
+            key = (field, native.assigned_object_id, _prepared_address(native.address), vrf_name)
+        elif field == "__ospf_interface__":
+            key = (field, native.interface_id)
+        else:
+            continue
+        # The builders read in pk order, so first wins keeps the ip lowest-pk tie-break; the 1:1 ospf key cannot tie.
+        natives.setdefault(key, native)
+    return natives
+
+
+def _scan_context(device_id, requested):
+    """Read one device's native rows once, for both the qualifying set and the per-overlay lookups."""
+    from .models import NSODeviceManagement
+
+    management = NSODeviceManagement.objects.filter(device_id=device_id).first()
+    if management is None:
+        return frozenset(), {}
+    bindings = _native_bindings(management, requested)
+    qualifying = _qualifying_overlay_signatures(device_id, requested, management=management, bindings=bindings)
+    return qualifying, _native_prefetch(bindings)
+
+
 def _qualifying_overlay_signatures(device_id, requested, *, management=None, bindings=None):
     """Return the exact native bindings that qualify for ownership."""
     from .models import NSODeviceManagement
@@ -1830,12 +1900,12 @@ def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
     return tuple(planned)
 
 
-def _execute_overlay_records(device_id, requested, *, qualifying=None):
+def _execute_overlay_records(device_id, requested, *, qualifying=None, natives=None):
     """Record the missing manifests, and demote the owned overlays that have none to record."""
     from .intent_state import mirror_transaction, reconcile_family_footprint
 
     completed = []
-    planned = _manifest_record_actions(device_id, requested, qualifying=qualifying)
+    planned = _manifest_record_actions(device_id, requested, qualifying=qualifying, natives=natives)
     if not planned:
         return completed
     records = tuple(entry for entry in planned if entry[0] is OwnershipAction.RECORD_MANIFEST)
@@ -1844,14 +1914,17 @@ def _execute_overlay_records(device_id, requested, *, qualifying=None):
         footprint = reconcile_family_footprint(device_id, requested)
         with mirror_transaction(footprint):
             # One device scan under the lock, then an O(1) re-check of each planned identity.
-            qualifying = _qualifying_overlay_signatures(device_id, requested)
+            qualifying, natives = _scan_context(device_id, requested)
             manifest_states = _manifest_states(device_id, requested)
             for entry in records:
                 _action, scope, model_label, pk = entry
                 instance = apps.get_model(model_label).objects.filter(pk=pk).first()
                 if instance is None:
                     continue
-                if _record_action_for(instance, device_id, requested, qualifying, manifest_states) != entry:
+                if (
+                    _record_action_for(instance, device_id, requested, qualifying, manifest_states, natives=natives)
+                    != entry
+                ):
                     continue
                 maintain_manifest(instance)
                 completed.append((scope, pk))
@@ -1916,7 +1989,12 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
         management=management,
         bindings=bindings,
     )
-    completed = _execute_overlay_records(device_id, requested, qualifying=qualifying)
+    completed = _execute_overlay_records(
+        device_id,
+        requested,
+        qualifying=qualifying,
+        natives=_native_prefetch(bindings),
+    )
     completed.extend(_execute_manifest_lifecycle(device_id, requested, qualifying=qualifying))
     completed.extend(
         _execute_native_creates(
