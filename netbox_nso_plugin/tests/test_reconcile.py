@@ -411,6 +411,7 @@ class TestProvisionCompleteEndpoint(APITestCase):
             netbox_device_id=device.pk,
             nso_instance=inst.adapter_instance_id,
             nso_device_name=f"prov-{job_id}",
+            # A deliberately divergent id: the callback must correlate by the row key, not this.
             canonical_request={"provision_attempt_id": str(uuid4())},
             adapter_job_id=job_id,
         )
@@ -510,6 +511,40 @@ class TestProvisionCompleteEndpoint(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         self.assertFalse(response.data["queued"])
         enqueue.assert_not_called()
+
+    def test_the_callback_correlates_by_the_tombstone_key_not_the_request_body(self):
+        tombstone = self._tombstone("81")
+
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            by_body = self.client.post(
+                self._url(),
+                {
+                    "provision_attempt_id": tombstone.canonical_request["provision_attempt_id"],
+                    "status": "failed",
+                },
+                format="json",
+                **self.header,
+            )
+
+        self.assertEqual(by_body.status_code, status.HTTP_202_ACCEPTED)
+        self.assertFalse(by_body.data["queued"])
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
+        enqueue.assert_not_called()
+
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            by_key = self.client.post(
+                self._url(),
+                {"provision_attempt_id": str(tombstone.provision_attempt_id), "status": "failed"},
+                format="json",
+                **self.header,
+            )
+
+        self.assertEqual(by_key.status_code, status.HTTP_202_ACCEPTED)
+        self.assertTrue(by_key.data["queued"])
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "terminal")
+        enqueue.assert_called_once_with(tombstone.provision_attempt_id)
 
 
 class TestStaticRouteApplySettle(APITestCase):
