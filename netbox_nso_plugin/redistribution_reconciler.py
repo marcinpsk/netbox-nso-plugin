@@ -29,7 +29,6 @@ def redistribution_reconcile_plan(device, payload):
     from .intent_state import MutationFootprint, route_policy_footprint
     from .renderer_writer import RendererMutationPlan
 
-    entries = _validated_redistribution_entries(payload)
     planned_at = timezone.now()
     try:
         import netbox_routing.models  # noqa: F401
@@ -37,6 +36,7 @@ def redistribution_reconcile_plan(device, payload):
         if error.name not in {"netbox_routing", "netbox_routing.models"}:
             raise
         return RendererMutationPlan.build(planned_at=planned_at)
+    entries = _validated_redistribution_entries(payload)
     saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, entries, planned_at)
     plan = RendererMutationPlan.build(
         saves=saves,
@@ -361,7 +361,6 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
 
 def reconcile_redistribution(device, payload: dict) -> list:
     """Apply one frozen redistribution reconciliation through the renderer writer."""
-    _validated_redistribution_entries(payload)
     try:
         from netbox_routing.models import Redistribution  # noqa: F401
     except ModuleNotFoundError as error:
@@ -370,6 +369,7 @@ def reconcile_redistribution(device, payload: dict) -> list:
         logger.warning("netbox_routing not installed; skipping redistribution reconcile")
         return []
 
+    _validated_redistribution_entries(payload)
     from .models import NSODeviceManagement, NSORedistributionState
     from .renderer_writer import (
         active_renderer_writer,

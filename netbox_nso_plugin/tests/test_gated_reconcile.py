@@ -866,7 +866,7 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             with self.subTest(reconcile=reconcile.__name__), patch.dict(vars(models)):
                 delattr(models, symbol)
                 with self.assertRaisesRegex(ImportError, symbol):
-                    reconcile(device, {})
+                    reconcile(device, {"entries": []} if reconcile is reconcile_redistribution else {})
 
     def test_redistribution_plan_propagates_missing_destination_models(self):
         from netbox_routing import models
@@ -945,7 +945,7 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             with self.subTest(planner=planner.__name__), patch.dict(vars(models)):
                 delattr(models, symbol)
                 with self.assertRaisesRegex(ImportError, symbol):
-                    planner(device, {})
+                    planner(device, {"entries": []} if planner is redistribution_reconcile_plan else {})
 
     def test_routing_plans_propagate_unrelated_missing_modules(self):
         import builtins
@@ -985,7 +985,10 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                 patch("builtins.__import__", side_effect=import_with_missing_dependency),
                 self.assertRaisesRegex(ModuleNotFoundError, "routing_dependency"),
             ):
-                planner(device, {})
+                planner(
+                    device,
+                    {"entries": []} if planner in {redistribution_reconcile_plan, reconcile_redistribution} else {},
+                )
 
     def test_routing_plans_allow_only_missing_routing_packages(self):
         from netbox_nso_plugin.bfd_reconciler import bfd_reconcile_plan
@@ -1007,7 +1010,7 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                 redistribution_reconcile_plan,
             ):
                 with self.subTest(missing=missing, planner=planner.__name__), patch.dict(sys.modules, {missing: None}):
-                    plan = planner(device, {})
+                    plan = planner(device, {"entries": []} if planner is redistribution_reconcile_plan else {})
                     self.assertEqual(plan.write_set, ())
                     self.assertEqual(plan.lock_footprint, MutationFootprint())
                     self.assertFalse(plan.changes_content)

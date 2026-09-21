@@ -101,7 +101,7 @@ rules:
               continue
       - pattern-either:
           - pattern-inside: |
-              for $ENTRY in payload.get("entries") or []:
+              for $ENTRY in $PAYLOAD.get("entries") or []:
                   ...
           - pattern-inside: |
               for $ENTRY in normalized:
