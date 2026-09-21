@@ -4,6 +4,7 @@
 
 from unittest.mock import patch
 
+from django.db import IntegrityError
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
@@ -72,9 +73,12 @@ class _PeerManifestInsert:
         self.identity = identity
         self.seam = seam
         self.fired = False
+        self.conflicted = False
 
     def _reached(self, sql):
         if self.fired or _MANIFEST_TABLE not in sql:
+            return False
+        if self.seam == "update" and '"native_key"' not in sql.partition(" WHERE ")[0]:
             return False
         return sql.lstrip().upper().startswith(self.seam.upper())
 
@@ -99,11 +103,17 @@ class _PeerManifestInsert:
             del connections[alias]
 
     def __call__(self, execute, sql, params, many, context):
-        # The insert seam has to fire BEFORE the statement it races; the select seam after it.
-        if self.seam == "insert" and self._reached(sql):
+        # The write seams fire before their statement; the select seam fires after it.
+        at_seam = self._reached(sql)
+        if self.seam in {"insert", "update"} and at_seam:
             self._insert_peer_row()
-        result = execute(sql, params, many, context)
-        if self.seam == "select" and self._reached(sql):
+        try:
+            result = execute(sql, params, many, context)
+        except IntegrityError:
+            if self.seam == "update" and at_seam:
+                self.conflicted = True
+            raise
+        if self.seam == "select" and at_seam:
             self._insert_peer_row()
         return result
 
@@ -197,7 +207,7 @@ class TestOwnershipManifestConcurrency(_CascadeFlushMixin, IntentPushResetMixin,
             native_id=vlan.pk,
             ownership_state="retired",
         )
-        peer = _PeerManifestInsert(identity)
+        peer = _PeerManifestInsert(identity, seam="update")
 
         with connection.execute_wrapper(peer), transaction.atomic():
             maintain_manifest(state)
@@ -205,6 +215,7 @@ class TestOwnershipManifestConcurrency(_CascadeFlushMixin, IntentPushResetMixin,
         previous.refresh_from_db()
         manifest = NSOOwnershipManifest.objects.get(**identity)
         self.assertTrue(peer.fired)
+        self.assertTrue(peer.conflicted)
         self.assertEqual(previous.ownership_state, "retired")
         self.assertEqual(manifest.native_id, vlan.pk)
         self.assertTrue(manifest.deletion_authority)
