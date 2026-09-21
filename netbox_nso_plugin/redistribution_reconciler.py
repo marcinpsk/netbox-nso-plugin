@@ -174,7 +174,10 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
         source_protocol = entry.get("source_protocol") or ""
         source_ref = entry.get("source_ref") or ""
         if not destination_protocol or not source_protocol:
-            continue
+            raise AdapterError(
+                "Adapter returned a redistribution entry without a destination or source protocol",
+                code="invalid_response",
+            )
         key = (destination_protocol, destination_ref, source_protocol, source_ref)
         if key in seen:
             raise AdapterError("Adapter returned duplicate redistribution identity", code="invalid_response")

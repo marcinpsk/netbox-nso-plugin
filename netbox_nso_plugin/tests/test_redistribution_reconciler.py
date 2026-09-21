@@ -447,6 +447,27 @@ class TestReconcileRedistribution(TestCase):
         self.assertFalse(Redistribution.objects.exists())
         self.assertFalse(NSORedistributionState.objects.exists())
 
+    def test_entry_without_required_protocol_is_rejected_before_persistence(self):
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        entry = self._entry()
+
+        for field in ("dest_protocol", "source_protocol"):
+            with self.subTest(field=field):
+                with self.assertRaises(AdapterError) as raised:
+                    reconcile_redistribution(self.device, {"entries": [entry, {**entry, field: ""}]})
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertIn("destination or source protocol", str(raised.exception))
+                self.assertFalse(Redistribution.objects.exists())
+                self.assertFalse(NSORedistributionState.objects.exists())
+
     def test_edit_surfaces_as_changed_and_survives(self):
         """Editing the Redistribution object → drift, and the edit is not clobbered."""
         self._make_mgmt()
