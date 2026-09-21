@@ -128,7 +128,7 @@ def text_file_encodings(path, data, archive):
     archive.open(path, "rb")
 
 
-def silent_adapter_duplicates(payload, normalized):
+def silent_adapter_duplicates(payload, normalized, entries):
     seen = set()
     for entry in payload.get("entries") or []:
         # ruleid: nso-silent-duplicate-adapter-entry
@@ -143,8 +143,14 @@ def silent_adapter_duplicates(payload, normalized):
             continue
         seen.add(entry["id"])
 
+    for entry in entries:
+        # ruleid: nso-silent-duplicate-adapter-entry
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
 
-def visible_adapter_duplicates(payload, normalized, states):
+
+def visible_adapter_duplicates(payload, normalized, entries, states):
     seen = set()
     for entry in payload.get("entries") or []:
         # ok: nso-silent-duplicate-adapter-entry
@@ -153,6 +159,12 @@ def visible_adapter_duplicates(payload, normalized, states):
         seen.add(entry["id"])
 
     for entry in normalized:
+        # ok: nso-silent-duplicate-adapter-entry
+        if entry["id"] in seen:
+            raise ValueError("duplicate entry")
+        seen.add(entry["id"])
+
+    for entry in entries:
         # ok: nso-silent-duplicate-adapter-entry
         if entry["id"] in seen:
             raise ValueError("duplicate entry")
