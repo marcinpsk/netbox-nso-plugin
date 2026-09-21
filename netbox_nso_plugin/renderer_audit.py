@@ -31,6 +31,7 @@ from .renderer_writer import RendererMutationPlan, consume_renderer_plan, planne
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TICK_BUDGET_SECONDS = 240.0
+_SWEEP_BUDGET_SHARE = 0.25
 _REPAIR_ATTEMPTS = 3
 _SERIALIZATION_FAILURE = "40001"
 
@@ -451,13 +452,18 @@ def audit_renderer_fleet() -> RendererFleetAuditResult:
         _DEFAULT_TICK_BUDGET_SECONDS,
         float,
     )
-    deadline = _monotonic() + budget
+    started = _monotonic()
+    deadline = started + budget
     scopes = tuple(delivery.delivery_keys())
     # The provision backstop belongs on this five-minute cadence rather than on the hourly job:
     # an orphan offboard or a stranded onboard would otherwise wait an hour. It runs before
     # the device loop, which can spend the whole budget, and its failure is not this pass's.
+    # Its deadline is only a share of the tick: it checks between attempts, so a few hung
+    # adapter reads would otherwise burn the whole budget before the device loop's first check.
+    # The cap bounds when the next attempt starts, not when it returns: one hung read still
+    # overruns it by the adapter timeout.
     try:
-        sweep_provision_tombstones(deadline=deadline)
+        sweep_provision_tombstones(deadline=started + budget * _SWEEP_BUDGET_SHARE)
     except DeploymentQuiesced:
         raise
     except Exception:  # noqa: BLE001 (the next cadence retries the sweep)

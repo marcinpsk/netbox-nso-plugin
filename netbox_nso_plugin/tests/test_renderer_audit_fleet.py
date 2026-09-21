@@ -170,11 +170,11 @@ class TestRendererFleetAudit(_FleetCase):
 
 
 class TestRendererFleetTombstoneSweep(_FleetCase):
-    def _tombstone(self, state):
+    def _tombstone(self, state, *, netbox_device_id=None):
         from netbox_nso_plugin.models import NSOProvisionTombstone
 
         return NSOProvisionTombstone.objects.create(
-            netbox_device_id=self.device_ids[0],
+            netbox_device_id=self.device_ids[0] if netbox_device_id is None else netbox_device_id,
             nso_instance="cl-fleet-inst",
             nso_device_name="nso-cl-fleet-orphan",
             canonical_request={},
@@ -192,7 +192,7 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
         tombstone.refresh_from_db()
         self.assertEqual(tombstone.state, "closed")
 
-    def test_the_cadence_gives_the_tombstone_sweep_its_shared_deadline(self):
+    def test_the_cadence_caps_the_tombstone_sweep_below_the_device_budget(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
 
         with (
@@ -202,7 +202,38 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
         ):
             audit_renderer_fleet()
 
-        sweep.assert_called_once_with(deadline=250.0)
+        sweep.assert_called_once_with(deadline=70.0)
+
+    def test_a_slow_sweep_leaves_the_device_loop_its_share_of_the_tick(self):
+        from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
+
+        for index in range(8):
+            self._tombstone("open", netbox_device_id=90_000 + index)
+        now = [0.0]
+        polled = []
+        reached = []
+
+        def poll(attempt_id):
+            polled.append(attempt_id)
+            # One hung attempt costs the adapter client's default read timeout.
+            now[0] += 30.0
+            return {"status": "running"}
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=poll),
+            patch("netbox_nso_plugin.renderer_audit._monotonic", side_effect=lambda: now[0]),
+            patch("netbox_nso_plugin.provision_lifecycle._monotonic", side_effect=lambda: now[0]),
+            patch(
+                "netbox_nso_plugin.renderer_audit.audit_renderer_scopes",
+                side_effect=self._canned(audited=("vlan",), record=reached),
+            ),
+        ):
+            result = audit_renderer_fleet()
+
+        self.assertEqual(reached, self.device_ids)
+        self.assertEqual((result.devices, result.deferred), (3, 0))
+        self.assertEqual(len(polled), 2)
+        self.assertEqual(now[0], 60.0)
 
     def test_a_failing_sweep_does_not_fail_the_renderer_audit(self):
         from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
