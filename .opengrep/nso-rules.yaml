@@ -91,3 +91,18 @@ rules:
             - metavariable-regex:
                 metavariable: $MODE
                 regex: '^[\x22\x27][^\x22\x27]*b'
+  - id: nso-silent-duplicate-adapter-entry
+    languages: [python]
+    severity: ERROR
+    message: Reject a repeated adapter entry instead of keeping the first value.
+    patterns:
+      - pattern: |
+          if $KEY in $SEEN:
+              continue
+      - pattern-either:
+          - pattern-inside: |
+              for $ENTRY in payload.get("entries") or []:
+                  ...
+          - pattern-inside: |
+              for $ENTRY in normalized:
+                  ...

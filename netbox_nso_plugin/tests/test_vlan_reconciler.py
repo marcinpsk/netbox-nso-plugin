@@ -54,17 +54,20 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(management=self.management, vlan__group=group, vlan__vid=10).exists()
         )
 
-    def test_vlan_reconciler_uses_the_first_repeated_vlan_entry(self):
+    def test_vlan_reconciler_rejects_duplicate_vlan_ids(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
-        rows = reconcile_vlan_database(
-            self.device,
-            {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627, "name": "SECOND"}]},
-        )
+        with self.assertRaises(AdapterError) as raised:
+            reconcile_vlan_database(
+                self.device,
+                {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627, "name": "SECOND"}]},
+            )
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].device_name, "FIRST")
-        self.assertEqual(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).count(), 1)
+        self.assertEqual(raised.exception.code, "invalid_response")
+        self.assertIn("duplicate vlan_id 1627", str(raised.exception))
+        self.assertFalse(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid=1627).exists())
+        self.assertFalse(NSOVLANState.objects.filter(management=self.management, vlan__vid=1627).exists())
 
     def test_vlan_reconciler_rejects_a_malformed_repeated_vlan_entry(self):
         from netbox_nso_plugin.adapter_client import AdapterError

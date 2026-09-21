@@ -126,3 +126,40 @@ def text_file_encodings(path, data, archive):
     # A module-level open takes the file first and the mode second.
     # ok: nso-implicit-text-encoding
     archive.open(path, "rb")
+
+
+def silent_adapter_duplicates(payload, normalized):
+    seen = set()
+    for entry in payload.get("entries") or []:
+        # ruleid: nso-silent-duplicate-adapter-entry
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+
+    seen = set()
+    for entry in normalized:
+        # ruleid: nso-silent-duplicate-adapter-entry
+        if entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+
+
+def visible_adapter_duplicates(payload, normalized, states):
+    seen = set()
+    for entry in payload.get("entries") or []:
+        # ok: nso-silent-duplicate-adapter-entry
+        if entry["id"] in seen:
+            raise ValueError("duplicate entry")
+        seen.add(entry["id"])
+
+    for entry in normalized:
+        # ok: nso-silent-duplicate-adapter-entry
+        if entry["id"] in seen:
+            raise ValueError("duplicate entry")
+        seen.add(entry["id"])
+
+    for key, state in states.items():
+        # ok: nso-silent-duplicate-adapter-entry
+        if key in seen:
+            continue
+        state.mark_stale()

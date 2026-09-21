@@ -133,6 +133,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
 
     from . import merge_util
     from . import status_machine as sm
+    from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSORedistributionState
     from .renderer_writer import planned_delete, planned_save
 
@@ -176,7 +177,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
             continue
         key = (destination_protocol, destination_ref, source_protocol, source_ref)
         if key in seen:
-            continue
+            raise AdapterError("Adapter returned duplicate redistribution identity", code="invalid_response")
         seen.add(key)
         current = states.get(key)
         state = (

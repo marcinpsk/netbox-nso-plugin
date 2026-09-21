@@ -79,14 +79,15 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
             raise AdapterError("VLAN payload entry name must be a string or null", code="invalid_response")
         normalized.append({**item, "vlan_id": vlan_id})
 
-    deduplicated = []
     seen = set()
     for item in normalized:
         if item["vlan_id"] in seen:
-            continue
+            raise AdapterError(
+                f"VLAN payload contains duplicate vlan_id {item['vlan_id']}",
+                code="invalid_response",
+            )
         seen.add(item["vlan_id"])
-        deduplicated.append(item)
-    return tuple(deduplicated)
+    return tuple(normalized)
 
 
 def _validated_switchport_items(payload: dict) -> tuple[dict, ...]:
