@@ -205,6 +205,41 @@ class TestAttachBlockOverride(_CapBase):
         ):
             self.client.get(self._attach_url())
 
+    def test_attach_page_lists_every_registered_family_when_routing_is_installed(self):
+        from netbox_routing.models import ASPath, PrefixList
+
+        from netbox_nso_plugin.ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
+
+        self._mgmt(adapter_device_id=None)
+        PrefixList.objects.create(name="CAP-PL-EVERY")
+        self._route_map("CAP-RM-EVERY")
+        self._community_list("CAP-CL-EVERY", ["65000:7"])
+        ASPath.objects.create(name="CAP-AP-EVERY")
+
+        response = self.client.get(self._attach_url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {item["value"].split(":", 1)[0] for item in response.context["candidates"]},
+            set(ROUTE_POLICY_NATIVE_MODEL_LABELS),
+        )
+
+    def test_attach_page_reports_an_unresolvable_family_by_name(self):
+        self._mgmt(adapter_device_id=None)
+
+        with (
+            patch(
+                "netbox_nso_plugin.ownership_planner.ROUTE_POLICY_NATIVE_MODEL_LABELS",
+                {"prefix_list": "netbox_routing.prefixlist", "route_map": "netbox_routing.missing"},
+            ),
+            self.assertRaises(LookupError) as caught,
+        ):
+            self.client.get(self._attach_url())
+
+        message = str(caught.exception)
+        self.assertIn("netbox_routing", message)
+        self.assertIn("missing", message)
+
     def test_attach_rejects_a_model_from_another_family(self):
         from django.contrib.messages import get_messages
 

@@ -381,6 +381,53 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
             self.assertTrue(NSOStaticRouteState.objects.filter(pk=state.pk).exists())
             mock_push.assert_not_called()
 
+    def test_clear_devices_inside_the_exact_writer_is_a_protocol_error(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+
+        mgmt = self._mgmt()
+        sr = StaticRoute.objects.create(prefix="10.9.13.0/24", next_hop="10.0.0.13", metric=1)
+        _assign_without_push(sr, self.device)
+        NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(sr, "devices", ()),))
+
+        with patch(PUT):
+            with self.assertRaisesRegex(IntentMutationProtocolError, "bypassed the active renderer writer"):
+                with renderer_writes(plan):
+                    sr.devices.clear()
+
+        self.assertTrue(
+            StaticRoute.devices.through.objects.filter(staticroute_id=sr.pk, device_id=self.device.pk).exists()
+        )
+
+    def test_removing_the_last_device_through_the_writer_schedules_the_shrink(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOStaticRouteState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+
+        mgmt = self._mgmt()
+        sr = StaticRoute.objects.create(prefix="10.9.14.0/24", next_hop="10.0.0.14", metric=1)
+        _assign_without_push(sr, self.device)
+        NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(sr, "devices", ()),))
+
+        self.assertIn((self.device.pk, "static_route"), plan.content_keys)
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="static_route").exists())
+
+        with patch(PUT):
+            with self.captureOnCommitCallbacks(execute=True):
+                with renderer_writes(plan) as writer:
+                    writer.m2m_set(sr, "devices", ())
+
+        self.assertFalse(
+            StaticRoute.devices.through.objects.filter(staticroute_id=sr.pk, device_id=self.device.pk).exists()
+        )
+        self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="static_route").exists())
+
     def test_delete_route_only_applies_the_database_cascade(self):
         from netbox_routing.models import StaticRoute
 

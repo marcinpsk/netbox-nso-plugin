@@ -672,6 +672,7 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             self.assertIs(caught.exception, failure)
             self.assertIsInstance(caught.exception.__context__, CommandError)
             self.assertIn("Deployment gate blocked: a test blocker", str(caught.exception.__context__))
+            self.assertIsNone(caught.exception.__cause__)
             self.assertIn("intent work may remain quiesced", stderr.getvalue())
             self.assertIn("nso_intent_deployment_gate --abort", stderr.getvalue())
             self.assertTrue(deployment.is_quiesced())
