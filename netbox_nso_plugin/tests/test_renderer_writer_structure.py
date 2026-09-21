@@ -258,7 +258,7 @@ def _scan(scope, inherited, registry, module, parents, found):
 
 
 def _module_sites(path, module, registry) -> list:
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: list[_Site] = []
     _scan(tree, {}, registry, module, _parents(tree), found)
     return found
@@ -285,7 +285,7 @@ class TestRendererBindingCollector(SimpleTestCase):
             path = Path(directory) / "bindings.py"
             for source in sources:
                 with self.subTest(source=source):
-                    path.write_text("from ipam.models import VLAN\n" + source + "\n")
+                    path.write_text("from ipam.models import VLAN\n" + source + "\n", encoding="utf-8")
                     sites = _module_sites(path, path.name, registry)
                     self.assertEqual([site.label for site in sites], ["ipam.vlan"])
 
@@ -298,7 +298,8 @@ class TestRendererBindingCollector(SimpleTestCase):
                     path.write_text(
                         "from ipam.models import VLAN\n"
                         f"row, created = VLAN.objects.{method}(vid=100)\n"
-                        "row.save()\ncreated.save()\n"
+                        "row.save()\ncreated.save()\n",
+                        encoding="utf-8",
                     )
                     sites = _module_sites(path, path.name, registry)
                     self.assertEqual([site.expression for site in sites], [f"VLAN.objects.{method}", "row.save"])
@@ -312,7 +313,8 @@ class TestRendererBindingCollector(SimpleTestCase):
                 "a = VLAN\nb = Interface\nc = IPAddress\n"
                 "def mutate():\n"
                 "    global a, b, c\n"
-                "    a = b\n    b = c\n    c = a\n    a.objects.update()\n"
+                "    a = b\n    b = c\n    c = a\n    a.objects.update()\n",
+                encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "model bindings do not converge"):
                 _module_sites(path, path.name, _registry())
@@ -357,7 +359,7 @@ class TestRendererWriterStructure(SimpleTestCase):
         }
         found = set()
         for path, _relative in _production_modules():
-            tree = ast.parse(path.read_text(), filename=str(path))
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             found.update(node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id in forbidden)
 
         self.assertEqual(found, set())

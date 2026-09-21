@@ -65,3 +65,29 @@ rules:
       - pattern: $SELF.assertEqual({$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, $EXPECTED, ...)
       - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set}, ...)
       - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, ...)
+  - id: nso-implicit-text-encoding
+    languages: [python]
+    severity: ERROR
+    message: Pass encoding="utf-8" so the text file decodes the same on every platform.
+    patterns:
+      - pattern-either:
+          - pattern: $P.read_text(...)
+          - pattern: $P.write_text(...)
+          - pattern: $P.open(...)
+          - pattern: open(...)
+      - pattern-not: $P.read_text(..., encoding=$E, ...)
+      - pattern-not: $P.write_text(..., encoding=$E, ...)
+      - pattern-not: $P.open(..., encoding=$E, ...)
+      - pattern-not: open(..., encoding=$E, ...)
+      # A literal mode string that contains "b" opens the file in binary mode.
+      - pattern-not:
+          patterns:
+            - pattern-either:
+                - pattern: open($FILE, $MODE, ...)
+                - pattern: open(..., mode=$MODE, ...)
+                - pattern: $P.open($MODE, ...)
+                - pattern: $P.open($FILE, $MODE, ...)
+                - pattern: $P.open(..., mode=$MODE, ...)
+            - metavariable-regex:
+                metavariable: $MODE
+                regex: '^[\x22\x27][^\x22\x27]*b'

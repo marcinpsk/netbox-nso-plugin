@@ -180,7 +180,7 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
             # A second edit that really changes the body, so the racer has an operation of
             # its own rather than a digest-equal claim the drop path retires.
             self._rename(state)
-            (work / "go").write_text("1")
+            (work / "go").write_text("1", encoding="utf-8")
             # The send barrier: the holder's request sits inside the far side while the
             # racer keeps trying, so the two overlap on the wire and not only in the claim.
             time.sleep(1.0)
@@ -228,7 +228,7 @@ class TestOneClaimerAcrossTwoProcesses(_CascadeFlushMixin, IntentPushResetMixin,
             second = self._spawn("second", work, device.pk, script=_STATIC_SCRIPT)
             self._await(work / "ready-first", first, second)
             self._await(work / "ready-second", first, second)
-            (work / "go").write_text("1")
+            (work / "go").write_text("1", encoding="utf-8")
             self._await_request("/static-route-intent", first, second)
             time.sleep(1.0)
             self.server.hold.set()

@@ -119,7 +119,7 @@ def test_zizmor_consumers_use_the_locked_dependency():
 
 
 def test_netbox_checkouts_use_immutable_commits():
-    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "test.yaml").read_text())
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "test.yaml").read_text(encoding="utf-8"))
     checkouts = 0
     for job in workflow["jobs"].values():
         for step in job.get("steps", []):

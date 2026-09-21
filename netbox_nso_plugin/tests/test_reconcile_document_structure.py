@@ -18,7 +18,7 @@ class _SyntheticSource:
         self.name = name
         self.source = source
 
-    def read_text(self):
+    def read_text(self, encoding=None):
         return self.source
 
     def __str__(self):
@@ -46,7 +46,7 @@ def _module_constants(tree):
 
 
 def _defaulted_constant_lookups(path):
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     constants = _module_constants(tree)
     violations = []
     for node in ast.walk(tree):
@@ -99,7 +99,7 @@ def _raises_adapter_error(node, bindings):
 
 
 def _validation_and_skip_loops(path):
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     bindings = scope_bindings(tree)
     violations = []
     for loop in (node for node in ast.walk(tree) if isinstance(node, (ast.For, ast.AsyncFor))):

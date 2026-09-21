@@ -54,7 +54,7 @@ repos:
         entry: scripts/check-review-patterns scan
         language: system
         pass_filenames: false
-        files: ^(netbox_nso_plugin/.*\.py|\.opengrep/|scripts/check-review-patterns$)
+        files: ^(netbox_nso_plugin/.*\.py|\.github/ci/.*\.py|conftest\.py|isolated_test_settings\.py|contract_tests/.*\.py|netbox_stubs/.*\.py|\.devcontainer/.*\.py|\.opengrep/|scripts/check-review-patterns$)
       - id: review-pattern-tests
         name: custom review pattern fixtures (OpenGrep)
         entry: scripts/check-review-patterns test

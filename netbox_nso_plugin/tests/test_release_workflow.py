@@ -65,7 +65,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _commit(repo: Path, contents: str, message: str) -> str:
-    (repo / "release.txt").write_text(contents)
+    (repo / "release.txt").write_text(contents, encoding="utf-8")
     _git(repo, "add", "release.txt")
     _git(repo, "commit", "-m", message)
     return _git(repo, "rev-parse", "HEAD")

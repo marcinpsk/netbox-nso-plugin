@@ -30,7 +30,7 @@ def _delivery_keys_at_the_push_sites() -> set[str]:
     A hand-kept list drifts (``ip`` versus ``interface_ip``, O-P12); the compiler's own
     view of the call sites cannot.
     """
-    source = Path(inspect.getsourcefile(__import__(f"{APP}.signals", fromlist=["signals"]))).read_text()
+    source = Path(inspect.getsourcefile(__import__(f"{APP}.signals", fromlist=["signals"]))).read_text(encoding="utf-8")
     keys: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
@@ -128,7 +128,7 @@ class TestDeliveryRegistry(SimpleTestCase):
             scanned.append(relative.as_posix())
             literals = {
                 node.value
-                for node in ast.walk(ast.parse(path.read_text()))
+                for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
             }
             if "interface_config" in literals:

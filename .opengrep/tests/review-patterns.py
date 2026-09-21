@@ -92,3 +92,37 @@ def write_set_cardinality(self, plan, expected):
     self.assertTrue(expected <= {write.model_label for write in plan.write_set})
     # ok: nso-write-set-cardinality-assertion
     self.assertEqual({item.model_label for item in expected}, {"model"})
+
+
+def text_file_encodings(path, data, archive):
+    # ruleid: nso-implicit-text-encoding
+    path.read_text()
+    # ruleid: nso-implicit-text-encoding
+    path.write_text(data)
+    # ruleid: nso-implicit-text-encoding
+    path.open()
+    # ruleid: nso-implicit-text-encoding
+    path.open("w")
+    # ruleid: nso-implicit-text-encoding
+    open(path)
+    # ruleid: nso-implicit-text-encoding
+    open(path, "w")
+    # ok: nso-implicit-text-encoding
+    path.read_text(encoding="utf-8")
+    # ok: nso-implicit-text-encoding
+    path.write_text(data, encoding="utf-8")
+    # ok: nso-implicit-text-encoding
+    path.open("w", encoding="utf-8")
+    # ok: nso-implicit-text-encoding
+    open(path, "w", encoding="utf-8")
+    # ok: nso-implicit-text-encoding
+    path.open("wb")
+    # ok: nso-implicit-text-encoding
+    path.open(mode="rb")
+    # ok: nso-implicit-text-encoding
+    open(path, "rb")
+    # ok: nso-implicit-text-encoding
+    open(path, mode="rb")
+    # A module-level open takes the file first and the mode second.
+    # ok: nso-implicit-text-encoding
+    archive.open(path, "rb")

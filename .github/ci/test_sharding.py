@@ -18,18 +18,23 @@ def create_shard_artifacts(temporary):
     helper = Path(__file__).with_name("sharding.py")
     root = Path(temporary)
     (root / "sample.py").write_text(
-        "def classify(value):\n    if value > 0:\n        return 'positive'\n    return 'negative'\n"
+        "def classify(value):\n    if value > 0:\n        return 'positive'\n    return 'negative'\n",
+        encoding="utf-8",
     )
     (root / "test_sample.py").write_text(
         "from sample import classify\n"
         "def test_positive():\n    assert classify(1) == 'positive'\n"
-        "def test_negative():\n    assert classify(-1) == 'negative'\n"
+        "def test_negative():\n    assert classify(-1) == 'negative'\n",
+        encoding="utf-8",
     )
     (root / "pyproject.toml").write_text(
-        '[tool.coverage.run]\nbranch = true\nsource = ["sample"]\n[tool.coverage.report]\nfail_under = 100\n'
+        '[tool.coverage.run]\nbranch = true\nsource = ["sample"]\n[tool.coverage.report]\nfail_under = 100\n',
+        encoding="utf-8",
     )
     durations = root / "durations.json"
-    durations.write_text(json.dumps({"test_sample.py::test_positive": 1, "test_sample.py::test_negative": 1}))
+    durations.write_text(
+        json.dumps({"test_sample.py::test_positive": 1, "test_sample.py::test_negative": 1}), encoding="utf-8"
+    )
     environment = dict(os.environ, PYTHONPATH=str(helper.parent), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     for shard in (1, 2):
         output = root / f"shard-{shard}"
@@ -81,8 +86,8 @@ class ShardingContractTests(unittest.TestCase):
             self.assertIn("100%", result.stdout)
 
             report_path = root / "shard-2" / "report.json"
-            original = json.loads(report_path.read_text())
-            first = json.loads((root / "shard-1" / "report.json").read_text())
+            original = json.loads(report_path.read_text(encoding="utf-8"))
+            first = json.loads((root / "shard-1" / "report.json").read_text(encoding="utf-8"))
             for corruption in (
                 {"selected": first["selected"], "completed": first["completed"]},
                 {"completed": []},
@@ -92,10 +97,10 @@ class ShardingContractTests(unittest.TestCase):
                 {"full": original["full"][:1]},
             ):
                 with self.subTest(corruption=corruption):
-                    report_path.write_text(json.dumps(dict(original, **corruption)))
+                    report_path.write_text(json.dumps(dict(original, **corruption)), encoding="utf-8")
                     result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            report_path.write_text(json.dumps(original))
+            report_path.write_text(json.dumps(original), encoding="utf-8")
             report_path.unlink()
             result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -103,7 +108,7 @@ class ShardingContractTests(unittest.TestCase):
     def test_the_workflow_gate_step_runs_the_aggregator_for_its_own_environment(self):
         helper = Path(__file__).with_name("sharding.py")
         workflow = helper.parents[1] / "workflows" / "test.yaml"
-        lines = iter(workflow.read_text().splitlines())
+        lines = iter(workflow.read_text(encoding="utf-8").splitlines())
         for line in lines:
             if line.strip() == "- name: Verify complete execution and combined coverage":
                 step_indentation = len(line) - len(line.lstrip())
