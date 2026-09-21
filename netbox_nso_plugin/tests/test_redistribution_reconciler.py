@@ -468,6 +468,25 @@ class TestReconcileRedistribution(TestCase):
                 self.assertFalse(Redistribution.objects.exists())
                 self.assertFalse(NSORedistributionState.objects.exists())
 
+    def test_malformed_entries_do_not_remove_unowned_redistribution(self):
+        self._make_mgmt()
+        from netbox_routing.models import ISISInstance, Redistribution
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        ISISInstance.objects.create(device=self.device, process_tag="")
+        for payload in (None, {}, {"entries": None}, {"entries": {}}, {"entries": ()}, {"entries": [None]}):
+            with self.subTest(payload=payload):
+                reconcile_redistribution(self.device, {"entries": [self._entry()]})
+                with self.assertRaises(AdapterError) as raised:
+                    reconcile_redistribution(self.device, payload)
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.assertEqual(NSORedistributionState.objects.count(), 1)
+                self.assertEqual(Redistribution.objects.count(), 1)
+
     def test_edit_surfaces_as_changed_and_survives(self):
         """Editing the Redistribution object → drift, and the edit is not clobbered."""
         self._make_mgmt()

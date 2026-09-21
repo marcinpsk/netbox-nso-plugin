@@ -10,6 +10,18 @@ from dataclasses import replace
 logger = logging.getLogger(__name__)
 
 
+def _validated_redistribution_entries(payload) -> list[dict]:
+    """Require the adapter's redistribution collection before planning writes."""
+    from .adapter_client import AdapterError
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        raise AdapterError("Adapter redistribution entries must be a list", code="invalid_response")
+    entries = payload["entries"]
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise AdapterError("Adapter redistribution entries must be objects", code="invalid_response")
+    return entries
+
+
 def redistribution_reconcile_plan(device, payload):
     """Freeze every native and overlay redistribution write before reconciliation."""
     from django.utils import timezone
@@ -17,6 +29,7 @@ def redistribution_reconcile_plan(device, payload):
     from .intent_state import MutationFootprint, route_policy_footprint
     from .renderer_writer import RendererMutationPlan
 
+    entries = _validated_redistribution_entries(payload)
     planned_at = timezone.now()
     try:
         import netbox_routing.models  # noqa: F401
@@ -24,16 +37,14 @@ def redistribution_reconcile_plan(device, payload):
         if error.name not in {"netbox_routing", "netbox_routing.models"}:
             raise
         return RendererMutationPlan.build(planned_at=planned_at)
-    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, payload, planned_at)
+    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, entries, planned_at)
     plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
         read_dependencies=dependencies,
         planned_at=planned_at,
     )
-    route_map_groups = {
-        ("route_map", entry.get("route_map")) for entry in payload.get("entries") or [] if entry.get("route_map")
-    }
+    route_map_groups = {("route_map", entry.get("route_map")) for entry in entries if entry.get("route_map")}
     policy_footprint = route_policy_footprint(route_map_groups)
     policy_dependencies = MutationFootprint.for_keys(
         (),
@@ -126,7 +137,7 @@ def _redist_overlay_matches_device(state, entry: dict) -> bool:
     )
 
 
-def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: C901
+def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: C901
     """Build the deterministic redistribution writes used by preflight and apply."""
     from django.contrib.contenttypes.models import ContentType
     from netbox_routing.models import Redistribution, RouteMap
@@ -168,7 +179,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
         deletes.append(planned_delete(instance))
         operations.append(("delete", instance, None, False, ()))
 
-    for entry in payload.get("entries") or []:
+    for entry in entries:
         destination_protocol = entry.get("dest_protocol") or ""
         destination_ref = entry.get("dest_ref") or ""
         source_protocol = entry.get("source_protocol") or ""
@@ -350,6 +361,7 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
 
 def reconcile_redistribution(device, payload: dict) -> list:
     """Apply one frozen redistribution reconciliation through the renderer writer."""
+    _validated_redistribution_entries(payload)
     try:
         from netbox_routing.models import Redistribution  # noqa: F401
     except ModuleNotFoundError as error:
