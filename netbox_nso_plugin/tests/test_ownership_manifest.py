@@ -133,7 +133,7 @@ class TestOwnershipManifestMaintenance(TestCase):
         interface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
         interface_type = ContentType.objects.get_for_model(Interface)
         for vrf in (None, VRF.objects.create(name="manifest-vrf")):
-            with self.subTest(vrf=vrf):
+            with self.subTest(vrf_id=vrf.pk if vrf is not None else None):
                 address = IPAddress.objects.create(address="198.18.0.1/32", vrf=vrf, assigned_object=interface)
                 state = NSOInterfaceIPState(
                     interface=interface,
