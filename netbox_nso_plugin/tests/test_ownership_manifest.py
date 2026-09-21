@@ -705,6 +705,55 @@ class TestOwnershipManifestMaintenance(TestCase):
         self.assertEqual(manifest.ownership_state, "retired")
         self.assertFalse(manifest.deletion_authority)
 
+    def test_a_replacement_logging_host_does_not_reopen_a_retired_identity(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import (
+            maintain_manifest,
+            manifest_binding,
+            reconcile_scope_ownership,
+            retire_overlay_manifest,
+        )
+
+        original = NSOLoggingHostState.objects.create(
+            management=self.management,
+            address="198.18.7.11",
+            severity="informational",
+            status="accepted",
+        )
+        maintain_manifest(original)
+        binding = manifest_binding(original)
+        _rule, scope, device_id, native_model_label, _native_id, native_key, state_model_label, state_key = binding
+        identity = {
+            "device_id": device_id,
+            "scope": scope,
+            "native_model_label": native_model_label,
+            "native_key": native_key,
+            "state_model_label": state_model_label,
+            "state_key": state_key,
+        }
+        self.assertEqual(NSOOwnershipManifest.objects.get(**identity).ownership_state, "owned")
+        retire_overlay_manifest(original)
+        original.delete()
+        # The replacement is a new pk at the same address, so it carries the same pk-free identity.
+        replacement = NSOLoggingHostState.objects.create(
+            management=self.management,
+            address="198.18.7.11",
+            severity="warning",
+            status="accepted",
+        )
+        maintain_manifest(replacement)
+
+        completed = tuple(reconcile_scope_ownership(self.device.pk, {"logging"}) for _ in range(2))
+
+        self.assertEqual(completed, ((), ()))
+        *_, replacement_native_key, _state_model_label, _state_key = manifest_binding(replacement)
+        self.assertEqual(replacement_native_key, native_key)
+        manifests = list(NSOOwnershipManifest.objects.filter(**identity))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(manifests[0].ownership_state, "retired")
+        replacement.refresh_from_db()
+        self.assertEqual(replacement.status, "accepted")
+
     def test_repeated_audits_skip_retired_manifest_with_owned_vlan(self):
         from ipam.models import VLAN
 
