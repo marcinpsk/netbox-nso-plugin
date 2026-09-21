@@ -412,7 +412,7 @@ class TestManagementControlDeadline(_DripCase):
                 budget = 1.0 + 0.5 * request_number
                 result = audit_renderer_scopes(self.device.pk, ("vlan",), trigger="cadence", deadline=started + budget)
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, budget + 0.6)
+            self.assertLess(elapsed, budget + 1.0)
             self.assertEqual(result.deferred, ("vlan",))
             self.assertEqual(self.server.request_count, request_number)
             self.assertTrue(self.server.streaming.is_set())

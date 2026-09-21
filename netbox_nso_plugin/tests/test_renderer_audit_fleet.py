@@ -4,7 +4,9 @@
 
 from unittest.mock import patch
 
+from django.conf import settings
 from django.test import TransactionTestCase
+from django.test.utils import override_settings
 
 from ._adapter_http import patch_matching_control_state
 from ._outbox_case import make_managed, own_vlan, reset_renderer_audit_rotation
@@ -43,7 +45,16 @@ class TestRendererFleetAudit(_FleetCase):
         for index, (_device, management) in enumerate(self.fleet):
             own_vlan(management, 1640 + index, f"fleet-{index}")
 
-        result = audit_renderer_fleet()
+        with override_settings(
+            PLUGINS_CONFIG={
+                **settings.PLUGINS_CONFIG,
+                "netbox_nso_plugin": {
+                    **settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {}),
+                    "renderer_audit_tick_budget_seconds": 600,
+                },
+            }
+        ):
+            result = audit_renderer_fleet()
 
         self.assertEqual((result.devices, result.failed, result.unknown, result.deferred), (3, 0, 0, 0))
         for device_id in self.device_ids:

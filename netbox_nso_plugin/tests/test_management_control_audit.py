@@ -354,8 +354,9 @@ class TestManagementControlAudit(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         with (
             patch("netbox_nso_plugin.management_lifecycle.reconcile_management_control") as control,
-            patch("netbox_nso_plugin.renderer_audit._optimistic_candidates", return_value=((), ())),
+            patch("netbox_nso_plugin.renderer_audit._optimistic_candidates", return_value=((), ())) as optimistic,
         ):
             audit_renderer_scopes(self.device.pk, ("vlan",), trigger="test", pre_capture=True)
 
+        optimistic.assert_called_once()
         control.assert_not_called()

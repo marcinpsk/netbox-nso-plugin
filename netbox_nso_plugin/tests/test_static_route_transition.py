@@ -732,6 +732,8 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         """A foreign save does not lock plugin overlays in its transaction."""
         from django.test.utils import CaptureQueriesContext
 
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
         with _fixtures():
             sr = _route("10.37.0.0/16", "10.0.0.1", devices=[self.d1, self.d2])
             _own(sr, self.mgmt1, status="in_sync")
@@ -741,6 +743,12 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             with transaction.atomic():
                 sr.metric = 51
                 sr.save(update_fields=["metric"])
+                type(self.d1).objects.select_for_update().get(pk=self.d1.pk)
 
-        locking = [q["sql"] for q in queries.captured_queries if "FOR UPDATE" in q["sql"]]
+        overlay_table = NSOStaticRouteState._meta.db_table
+        locking = [
+            q["sql"]
+            for q in queries.captured_queries
+            if f'FROM "{overlay_table}"' in q["sql"] and "FOR UPDATE" in q["sql"]
+        ]
         self.assertEqual(locking, [])

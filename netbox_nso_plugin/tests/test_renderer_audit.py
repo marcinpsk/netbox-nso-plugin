@@ -810,7 +810,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
 
     def test_serialization_exhaustion_leaves_the_key_unknown(self):
         from netbox_nso_plugin.models import NSOIntentRevision
-        from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
+        from netbox_nso_plugin.renderer_audit import _REPAIR_ATTEMPTS, audit_renderer_scopes
 
         own_vlan(self.management, 1632, "renderer-audit-race")
         revision = NSOIntentRevision.objects.get(device=self.device, scope="vlan")
@@ -829,7 +829,7 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
             )
 
         revision.refresh_from_db()
-        self.assertEqual(repair.call_count, 3)
+        self.assertEqual(repair.call_count, _REPAIR_ATTEMPTS)
         self.assertEqual(result.repaired, ())
         self.assertEqual(result.unknown, ("vlan",))
         self.assertIsNone(revision.verified_revision)
