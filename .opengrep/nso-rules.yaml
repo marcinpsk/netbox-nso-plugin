@@ -629,3 +629,106 @@ rules:
                 regex: '^handle$'
     paths:
       include: ["netbox_nso_plugin/management/commands/**"]
+  - id: nso-adapter-error-after-continue
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Validate the entry before the loop can skip it. A loop that raises AdapterError and also
+      continues leaves a skipped entry unvalidated.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              for $ITEM in $ITEMS:
+                  ...
+                  continue
+                  ...
+          - pattern-inside: |
+              async for $ITEM in $ITEMS:
+                  ...
+                  continue
+                  ...
+      - pattern-either:
+          - pattern: raise netbox_nso_plugin.adapter_client.AdapterError(...)
+          - patterns:
+              - pattern-inside: |
+                  import netbox_nso_plugin as $PACKAGE
+                  ...
+              - pattern: raise $PACKAGE.adapter_client.AdapterError(...)
+          # A relative import resolves to the package at every dot level, so spell each level out.
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      import netbox_nso_plugin.adapter_client as $CLIENT
+                      ...
+                  - pattern-inside: |
+                      from netbox_nso_plugin import adapter_client as $CLIENT
+                      ...
+                  - pattern-inside: |
+                      from . import adapter_client as $CLIENT
+                      ...
+                  - pattern-inside: |
+                      from .. import adapter_client as $CLIENT
+                      ...
+                  - pattern-inside: |
+                      from ... import adapter_client as $CLIENT
+                      ...
+              - pattern: raise $CLIENT.AdapterError(...)
+              - pattern-not-inside: |
+                  def $SHADOW(..., $CLIENT, ...):
+                      ...
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      from netbox_nso_plugin import adapter_client
+                      ...
+                  - pattern-inside: |
+                      from . import adapter_client
+                      ...
+                  - pattern-inside: |
+                      from .. import adapter_client
+                      ...
+                  - pattern-inside: |
+                      from ... import adapter_client
+                      ...
+              - pattern: raise adapter_client.AdapterError(...)
+              - pattern-not-inside: |
+                  def $SHADOW(..., adapter_client, ...):
+                      ...
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      from netbox_nso_plugin.adapter_client import AdapterError
+                      ...
+                  - pattern-inside: |
+                      from .adapter_client import AdapterError
+                      ...
+                  - pattern-inside: |
+                      from ..adapter_client import AdapterError
+                      ...
+                  - pattern-inside: |
+                      from ...adapter_client import AdapterError
+                      ...
+              - pattern: raise AdapterError(...)
+              - pattern-not-inside: |
+                  def $SHADOW(..., AdapterError, ...):
+                      ...
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      from netbox_nso_plugin.adapter_client import AdapterError as $ERR
+                      ...
+                  - pattern-inside: |
+                      from .adapter_client import AdapterError as $ERR
+                      ...
+                  - pattern-inside: |
+                      from ..adapter_client import AdapterError as $ERR
+                      ...
+                  - pattern-inside: |
+                      from ...adapter_client import AdapterError as $ERR
+                      ...
+              - pattern: raise $ERR(...)
+              - pattern-not-inside: |
+                  def $SHADOW(..., $ERR, ...):
+                      ...
+    paths:
+      include: ["netbox_nso_plugin/*_reconciler.py"]

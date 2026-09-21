@@ -1176,3 +1176,315 @@ def resume_in_cleanup_of_a_guarded_call(self, other):
     finally:
         # ok: nso-resume-failure-guidance
         resume()
+
+
+def adapter_error_fully_qualified(items):
+    import netbox_nso_plugin.adapter_client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise netbox_nso_plugin.adapter_client.AdapterError("invalid")
+
+
+def adapter_error_package_alias(items):
+    import netbox_nso_plugin as package
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise package.adapter_client.AdapterError("invalid")
+
+
+def adapter_error_module_alias(items):
+    import netbox_nso_plugin.adapter_client as client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise client.AdapterError("invalid")
+
+
+def adapter_error_absolute_module_alias(items):
+    from netbox_nso_plugin import adapter_client as client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise client.AdapterError("invalid")
+
+
+def adapter_error_relative_module_alias(items):
+    from . import adapter_client as client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise client.AdapterError("invalid")
+
+
+def adapter_error_parent_module_alias(items):
+    from .. import adapter_client as client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise client.AdapterError("invalid")
+
+
+def adapter_error_grandparent_module_alias(items):
+    from ... import adapter_client as client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise client.AdapterError("invalid")
+
+
+def adapter_error_absolute_module(items):
+    from netbox_nso_plugin import adapter_client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise adapter_client.AdapterError("invalid")
+
+
+def adapter_error_relative_module(items):
+    from . import adapter_client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise adapter_client.AdapterError("invalid")
+
+
+def adapter_error_parent_module(items):
+    from .. import adapter_client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise adapter_client.AdapterError("invalid")
+
+
+def adapter_error_grandparent_module(items):
+    from ... import adapter_client
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise adapter_client.AdapterError("invalid")
+
+
+def adapter_error_absolute_symbol(items):
+    from netbox_nso_plugin.adapter_client import AdapterError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_relative_symbol(items):
+    from .adapter_client import AdapterError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_parent_symbol(items):
+    from ..adapter_client import AdapterError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_grandparent_symbol(items):
+    from ...adapter_client import AdapterError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_absolute_symbol_alias(items):
+    from netbox_nso_plugin.adapter_client import AdapterError as PayloadError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise PayloadError("invalid")
+
+
+def adapter_error_relative_symbol_alias(items):
+    from .adapter_client import AdapterError as PayloadError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise PayloadError("invalid")
+
+
+def adapter_error_parent_symbol_alias(items):
+    from ..adapter_client import AdapterError as PayloadError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise PayloadError("invalid")
+
+
+def adapter_error_grandparent_symbol_alias(items):
+    from ...adapter_client import AdapterError as PayloadError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise PayloadError("invalid")
+
+
+def adapter_error_before_the_continue(items):
+    from .adapter_client import AdapterError
+
+    for item in items:
+        if not item:
+            # ruleid: nso-adapter-error-after-continue
+            raise AdapterError("invalid")
+        continue
+
+
+def adapter_error_over_a_nested_continue(items):
+    from .adapter_client import AdapterError
+
+    for item in items:
+        for part in item:
+            if part:
+                continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+async def adapter_error_in_an_async_loop(items):
+    from .adapter_client import AdapterError
+
+    async for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_chained_to_a_cause(items, cause):
+    from .adapter_client import AdapterError
+
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise AdapterError("invalid") from cause
+
+
+# The import binding survives a later rebinding, so this alias is an accepted false positive.
+def adapter_error_rebound_alias(items):
+    from .adapter_client import AdapterError as PayloadError
+
+    PayloadError = ValueError
+    for item in items:
+        if not item:
+            continue
+        # ruleid: nso-adapter-error-after-continue
+        raise PayloadError("invalid")
+
+
+def adapter_error_validated_before_the_loop(items):
+    from .adapter_client import AdapterError
+
+    if not all(items):
+        # ok: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+    for item in items:
+        if not item:
+            continue
+
+
+def adapter_error_in_a_loop_without_continue(items):
+    from .adapter_client import AdapterError
+
+    for item in items:
+        # ok: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_shadowed_symbol(items, AdapterError):
+    from .adapter_client import AdapterError as _reserved
+
+    for item in items:
+        if not item:
+            continue
+        # ok: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+# The parameter shadow outlasts the import that rebinds it, so this is an accepted false negative.
+def adapter_error_shadowed_alias(items, PayloadError):
+    from .adapter_client import AdapterError as PayloadError
+
+    for item in items:
+        if not item:
+            continue
+        # ok: nso-adapter-error-after-continue
+        raise PayloadError("invalid")
+
+
+# The parameter shadow outlasts the import that rebinds it, so this is an accepted false negative.
+def adapter_error_shadowed_module(items, adapter_client):
+    from . import adapter_client as adapter_client
+
+    for item in items:
+        if not item:
+            continue
+        # ok: nso-adapter-error-after-continue
+        raise adapter_client.AdapterError("invalid")
+
+
+def adapter_error_unimported_symbol(items):
+    for item in items:
+        if not item:
+            continue
+        # ok: nso-adapter-error-after-continue
+        raise AdapterError("invalid")
+
+
+def adapter_error_unrelated_exception(items):
+    from .adapter_client import AdapterError as _reserved
+
+    for item in items:
+        if not item:
+            continue
+        # ok: nso-adapter-error-after-continue
+        raise ValueError("invalid")
