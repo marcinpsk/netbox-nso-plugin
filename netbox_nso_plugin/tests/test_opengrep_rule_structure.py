@@ -279,6 +279,15 @@ class TestOpenGrepAlternativeCoverage(SimpleTestCase):
         self.assertIn("unsupported-example", str(context.exception))
         self.assertIn("pattern-not-regex", str(context.exception))
 
+    def test_a_rule_without_a_positive_pattern_aborts_the_split(self):
+        document = {"rules": [{"id": "negative-only", "patterns": [{"pattern-not": "excluded(...)"}]}]}
+
+        with self.assertRaises(ValueError) as context:
+            _COVERAGE.split_rule_alternatives(document)
+
+        self.assertIn("negative-only", str(context.exception))
+        self.assertIn("no supported positive pattern", str(context.exception))
+
     def test_top_level_pattern_either_yields_one_sub_rule_per_branch(self):
         document = {
             "rules": [

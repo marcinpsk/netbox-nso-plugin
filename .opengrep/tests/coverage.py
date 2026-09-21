@@ -241,10 +241,6 @@ def main(argv: list[str] | None = None) -> int:
             if result["start"]["line"] in annotations.get(rule_id, set()):
                 covered.add((rule_id, alternative_index))
 
-    covered_rule_ids = {rule_id for rule_id, _, _ in alternatives}
-    failures.extend(
-        f"{rule_id}: no positive pattern alternatives" for rule_id in original_rule_ids if rule_id not in covered_rule_ids
-    )
     failures.extend(
         f"{rule_id} alternative {alternative_index}: no fixture line matches"
         for rule_id, alternative_index, _ in alternatives
