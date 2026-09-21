@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba
 """Positive and negative examples for the custom review checks."""
 
+import contextlib
 from unittest.mock import patch
 from threading import BrokenBarrierError
 from django.db.models import signals as model_signals
@@ -487,3 +488,691 @@ class Writer:
 
 
 RendererWriter = Writer
+
+
+def resume_qualified_sites(self):
+    import netbox_nso_plugin.deployment
+
+    try:
+        # ok: nso-resume-failure-guidance
+        netbox_nso_plugin.deployment.resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    netbox_nso_plugin.deployment.resume()
+
+
+def resume_module_alias_sites(self):
+    import netbox_nso_plugin.deployment as deployment_module
+
+    try:
+        # ok: nso-resume-failure-guidance
+        deployment_module.resume()
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"Intent work may remain quiesced: {exc}. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    deployment_module.resume()
+
+
+def resume_package_alias_sites(self):
+    import netbox_nso_plugin as plugin_package
+
+    try:
+        # ok: nso-resume-failure-guidance
+        plugin_package.deployment.resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    plugin_package.deployment.resume()
+
+
+def resume_package_module_sites(self):
+    from netbox_nso_plugin import deployment
+    from contextlib import suppress
+
+    try:
+        # ok: nso-resume-failure-guidance
+        deployment.resume()
+    except BaseException:
+        with suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    deployment.resume()
+
+
+def resume_relative_module_sites(self):
+    from ... import deployment
+
+    try:
+        # ok: nso-resume-failure-guidance
+        deployment.resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    deployment.resume()
+
+
+def resume_symbol_sites(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ok: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    resume()
+
+
+def resume_symbol_alias_sites(self):
+    from netbox_nso_plugin.deployment import resume as restart
+
+    try:
+        # ok: nso-resume-failure-guidance
+        restart()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    restart()
+
+
+def resume_relative_symbol_sites(self):
+    from ...deployment import resume
+
+    try:
+        # ok: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    resume()
+
+
+def resume_relative_symbol_alias_sites(self):
+    from ...deployment import resume as relative_restart
+
+    try:
+        # ok: nso-resume-failure-guidance
+        relative_restart()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    # ruleid: nso-resume-failure-guidance
+    relative_restart()
+
+
+def resume_relative_sibling_module_site():
+    from . import deployment
+
+    # ruleid: nso-resume-failure-guidance
+    deployment.resume()
+
+
+def resume_relative_parent_module_site():
+    from .. import deployment
+
+    # ruleid: nso-resume-failure-guidance
+    deployment.resume()
+
+
+def resume_relative_sibling_module_alias_site():
+    from . import deployment as sibling_gate
+
+    # ruleid: nso-resume-failure-guidance
+    sibling_gate.resume()
+
+
+def resume_relative_parent_module_alias_site():
+    from .. import deployment as parent_gate
+
+    # ruleid: nso-resume-failure-guidance
+    parent_gate.resume()
+
+
+def resume_relative_package_module_alias_site():
+    from ... import deployment as package_gate
+
+    # ruleid: nso-resume-failure-guidance
+    package_gate.resume()
+
+
+def resume_relative_sibling_symbol_site():
+    from .deployment import resume
+
+    # ruleid: nso-resume-failure-guidance
+    resume()
+
+
+def resume_relative_parent_symbol_site():
+    from ..deployment import resume
+
+    # ruleid: nso-resume-failure-guidance
+    resume()
+
+
+def resume_relative_parent_symbol_alias_site():
+    from ..deployment import resume as parent_restart
+
+    # ruleid: nso-resume-failure-guidance
+    parent_restart()
+
+
+def resume_relative_sibling_symbol_alias_site():
+    from .deployment import resume as sibling_restart
+
+    # ruleid: nso-resume-failure-guidance
+    sibling_restart()
+
+
+def resume_report_with_cleanup(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ok: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        self.close_connection()
+
+
+def resume_report_with_write_options(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ok: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                ),
+                ending="",
+            )
+        raise
+
+
+def resume_report_with_contextlib_alias(self):
+    import contextlib as gate_contextlib
+
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ok: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with gate_contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_report_in_nested_try(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        try:
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        except Exception:
+            pass
+        raise
+
+
+def resume_report_in_nested_definition(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+
+        def report():
+            with contextlib.suppress(Exception):
+                self.stderr.write(
+                    self.style.ERROR(
+                        "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                    )
+                )
+
+        raise
+
+
+def resume_report_in_condition(self, should_report):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        if should_report:
+            with contextlib.suppress(Exception):
+                self.stderr.write(
+                    self.style.ERROR(
+                        "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                    )
+                )
+        raise
+
+
+def resume_report_with_second_statement(self, note_reported):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+            note_reported()
+        raise
+
+
+def resume_report_with_early_exit(self, skip_reraise):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        if skip_reraise:
+            return
+        raise
+
+
+def resume_report_after_bare_raise(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        raise
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_report_after_explicit_raise(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        raise RuntimeError("resume failed")
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_report_suppressing_os_error(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(OSError):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_report_suppressing_base_exception(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_report_in_null_context(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.nullcontext(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_report_without_suppression(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        self.stderr.write(
+            self.style.ERROR(
+                "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+            )
+        )
+        raise
+
+
+def resume_report_without_recovery_command(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(self.style.ERROR("Intent work may remain quiesced."))
+        raise
+
+
+def resume_report_from_bare_variable(self, message):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(self.style.ERROR(message))
+        raise
+
+
+def resume_cleanup_under_handler(self, run):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        run()
+    except BaseException:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+        raise
+
+
+class DeploymentGateCommand:
+    def handle(self, *args, **options):
+        from netbox_nso_plugin.deployment import resume
+
+        if options["abort"]:
+            # ok: nso-resume-failure-guidance
+            resume()
+            self.stdout.write("Deployment gate aborted")
+            return
+        # ruleid: nso-resume-failure-guidance
+        resume()
+
+
+def resume_on_unbound_receiver(receiver):
+    # ok: nso-resume-failure-guidance
+    receiver.resume()
+
+
+def resume_with_a_second_handler(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError:
+        pass
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_with_a_second_handler_and_cleanup(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError:
+        pass
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        self.close_connection()
+
+
+def resume_with_a_bound_second_handler(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError as error:
+        del error
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"Intent work may remain quiesced: {exc}. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_with_a_bound_base_handler(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError:
+        pass
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"Intent work may remain quiesced: {exc}. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_with_a_bound_base_handler_and_cleanup(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError:
+        pass
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"Intent work may remain quiesced: {exc}. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        self.close_connection()
+
+
+def resume_with_a_bound_first_handler(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError as error:
+        del error
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+
+
+def resume_with_a_bound_first_handler_and_cleanup(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError as error:
+        del error
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        self.close_connection()
+
+
+def resume_with_a_bound_second_handler_and_cleanup(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ruleid: nso-resume-failure-guidance
+        resume()
+    except ValueError as error:
+        del error
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    f"Intent work may remain quiesced: {exc}. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        self.close_connection()
+
+
+def resume_in_cleanup_of_a_guarded_call(self, other):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        other()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        # ok: nso-resume-failure-guidance
+        resume()

@@ -331,3 +331,301 @@ rules:
       - pattern-regex: '(?m)^class[ \t]+RendererWriter(?:[ \t]*\[|[ \t]*\(|[ \t]*:)'
     paths:
       include: ["netbox_nso_plugin/renderer_writer.py"]
+  - id: nso-resume-failure-guidance
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Call resume() as the only statement of a try. Its BaseException handler must report the
+      quiesced state and the nso_intent_deployment_gate --abort recovery inside
+      contextlib.suppress(Exception), then re-raise.
+    patterns:
+      - pattern-either:
+          - pattern: netbox_nso_plugin.deployment.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  import netbox_nso_plugin as $PACKAGE
+                  ...
+              - pattern: $PACKAGE.deployment.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  import netbox_nso_plugin.deployment as $DEPLOYMENT
+                  ...
+              - pattern: $DEPLOYMENT.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from netbox_nso_plugin import deployment
+                  ...
+              - pattern: deployment.resume(...)
+          # A relative import resolves to the package at every dot level, so spell each level out.
+          - patterns:
+              - pattern-inside: |
+                  from . import deployment
+                  ...
+              - pattern: deployment.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from .. import deployment
+                  ...
+              - pattern: deployment.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from ... import deployment
+                  ...
+              - pattern: deployment.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from . import deployment as $DEPLOYMENT
+                  ...
+              - pattern: $DEPLOYMENT.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from .. import deployment as $DEPLOYMENT
+                  ...
+              - pattern: $DEPLOYMENT.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from ... import deployment as $DEPLOYMENT
+                  ...
+              - pattern: $DEPLOYMENT.resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from netbox_nso_plugin.deployment import resume
+                  ...
+              - pattern: resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from netbox_nso_plugin.deployment import resume as $RESUME
+                  ...
+              - pattern: $RESUME(...)
+          - patterns:
+              - pattern-inside: |
+                  from .deployment import resume
+                  ...
+              - pattern: resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from ..deployment import resume
+                  ...
+              - pattern: resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from ...deployment import resume
+                  ...
+              - pattern: resume(...)
+          - patterns:
+              - pattern-inside: |
+                  from .deployment import resume as $RESUME
+                  ...
+              - pattern: $RESUME(...)
+          - patterns:
+              - pattern-inside: |
+                  from ..deployment import resume as $RESUME
+                  ...
+              - pattern: $RESUME(...)
+          - patterns:
+              - pattern-inside: |
+                  from ...deployment import resume as $RESUME
+                  ...
+              - pattern: $RESUME(...)
+      - pattern-not-inside:
+          patterns:
+            - pattern-either:
+                - pattern: |
+                    try:
+                        $CALL(...)
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            self.stderr.write($MESSAGE, ...)
+                        raise
+                - pattern: |
+                    try:
+                        $CALL(...)
+                    except BaseException as $EXC:
+                        with contextlib.suppress(Exception):
+                            self.stderr.write($MESSAGE, ...)
+                        raise
+                # A finally clause does not change the handler contract.
+                - pattern: |
+                    try:
+                        $CALL(...)
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            self.stderr.write($MESSAGE, ...)
+                        raise
+                    finally:
+                        ...
+                - pattern: |
+                    try:
+                        $CALL(...)
+                    except BaseException as $EXC:
+                        with contextlib.suppress(Exception):
+                            self.stderr.write($MESSAGE, ...)
+                        raise
+                    finally:
+                        ...
+                - patterns:
+                    - pattern-inside: |
+                        from contextlib import suppress
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException:
+                            with suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                - patterns:
+                    - pattern-inside: |
+                        from contextlib import suppress
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException as $EXC:
+                            with suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                - patterns:
+                    - pattern-inside: |
+                        from contextlib import suppress
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException:
+                            with suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                        finally:
+                            ...
+                - patterns:
+                    - pattern-inside: |
+                        from contextlib import suppress
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException as $EXC:
+                            with suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                        finally:
+                            ...
+                - patterns:
+                    - pattern-inside: |
+                        import contextlib as $CONTEXTLIB
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException:
+                            with $CONTEXTLIB.suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                - patterns:
+                    - pattern-inside: |
+                        import contextlib as $CONTEXTLIB
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException as $EXC:
+                            with $CONTEXTLIB.suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                - patterns:
+                    - pattern-inside: |
+                        import contextlib as $CONTEXTLIB
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException:
+                            with $CONTEXTLIB.suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                        finally:
+                            ...
+                - patterns:
+                    - pattern-inside: |
+                        import contextlib as $CONTEXTLIB
+                        ...
+                    - pattern: |
+                        try:
+                            $CALL(...)
+                        except BaseException as $EXC:
+                            with $CONTEXTLIB.suppress(Exception):
+                                self.stderr.write($MESSAGE, ...)
+                            raise
+                        finally:
+                            ...
+            # A second handler can swallow the resume failure before the BaseException handler runs.
+            # One bound clause covers both binding orders; spell out the bound and finally combinations.
+            - pattern-not: |
+                try:
+                    ...
+                except $FIRST:
+                    ...
+                except $SECOND:
+                    ...
+            - pattern-not: |
+                try:
+                    ...
+                except $FIRST:
+                    ...
+                except $SECOND:
+                    ...
+                finally:
+                    ...
+            - pattern-not: |
+                try:
+                    ...
+                except $FIRST:
+                    ...
+                except $SECOND as $E2:
+                    ...
+            - pattern-not: |
+                try:
+                    ...
+                except $FIRST:
+                    ...
+                except $SECOND as $E2:
+                    ...
+                finally:
+                    ...
+            - pattern-not: |
+                try:
+                    ...
+                except $FIRST as $E1:
+                    ...
+                except $SECOND as $E2:
+                    ...
+            - pattern-not: |
+                try:
+                    ...
+                except $FIRST as $E1:
+                    ...
+                except $SECOND as $E2:
+                    ...
+                finally:
+                    ...
+            - metavariable-regex:
+                metavariable: $MESSAGE
+                regex: '(?s).*may remain quiesced'
+            - metavariable-regex:
+                metavariable: $MESSAGE
+                regex: '(?s).*nso_intent_deployment_gate --abort'
+      # Abort is the requested operation, so its failure already names the failed operation.
+      - pattern-not-inside:
+          patterns:
+            - pattern: |
+                if $OPTIONS["abort"]:
+                    ...
+            - pattern-inside: |
+                def $HANDLE(self, *args, **options):
+                    ...
+            - metavariable-regex:
+                metavariable: $HANDLE
+                regex: '^handle$'
+    paths:
+      include: ["netbox_nso_plugin/management/commands/**"]
