@@ -57,7 +57,7 @@ _REVIEWED_MUTATION_SITES = frozenset(
         ("link_role.py", "apply_description_for_role", "NSOInterfaceState.objects.update_or_create"),
         ("link_role.py", "enable_igp_for_role", "NSOISISInterfaceState.objects.update_or_create"),
         ("link_role.py", "enable_igp_for_role", "NSOOSPFInterfaceState.objects.update_or_create"),
-        ("onboarding.py", "onboard_candidate", "NSOPlatformNedMapping.objects.get_or_create"),
+        ("onboarding.py", "_submit_claimed_provision", "NSOPlatformNedMapping.objects.get_or_create"),
         ("template_content.py", "_reconcile_lag_topology", "stale.save"),
     }
 )
@@ -409,7 +409,6 @@ _LOCK_CONTEXTS = frozenset({"_intent_transaction", "intent_transaction", "mirror
 _PLAN_BUILDER = "RendererMutationPlan.build"
 #: A helper may front the seed (``_demotion_plan``) and a local name may alias another
 #: (``plan = plans[scope]``), so both derivations are re-read until they settle.
-_BUILDER_PASSES = 3
 
 
 def _dotted(node) -> str:
@@ -442,6 +441,47 @@ def _root_name(node):
     return node.id if isinstance(node, ast.Name) else None
 
 
+def _builder_paths(builders, name) -> frozenset[tuple[int, ...]]:
+    if isinstance(builders, dict):
+        return builders.get(name, frozenset())
+    return frozenset({()}) if name in builders else frozenset()
+
+
+def _plan_paths(node, bound, builders) -> frozenset[tuple[int, ...]]:
+    """Paths through a value that definitely contain a plan on every execution path."""
+    if isinstance(node, ast.Lambda):
+        return frozenset()
+    if isinstance(node, ast.IfExp):
+        return _plan_paths(node.body, bound, builders) & _plan_paths(node.orelse, bound, builders)
+    if isinstance(node, ast.BoolOp):
+        paths = [_plan_paths(value, bound, builders) for value in node.values]
+        return frozenset.intersection(*paths) if paths else frozenset()
+    if isinstance(node, ast.NamedExpr):
+        return _plan_paths(node.value, bound, builders)
+    if isinstance(node, ast.Await):
+        return _plan_paths(node.value, bound, builders)
+    if isinstance(node, ast.Call):
+        return _builder_paths(builders, _dotted(node.func))
+    if isinstance(node, ast.DictComp):
+        return frozenset({()}) if () in _plan_paths(node.value, bound, builders) else frozenset()
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return frozenset({()}) if () in _plan_paths(node.elt, bound, builders) else frozenset()
+    if isinstance(node, ast.Dict):
+        values = [_plan_paths(value, bound, builders) for value in node.values]
+        return frozenset({()}) if values and all(() in paths for paths in values) else frozenset()
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        element_paths = [_plan_paths(value, bound, builders) for value in node.elts]
+        paths = {(index, *path) for index, value_paths in enumerate(element_paths) for path in value_paths}
+        if element_paths and all(() in value_paths for value_paths in element_paths):
+            paths.add(())
+        return frozenset(paths)
+    return frozenset({()}) if _root_name(node) in bound else frozenset()
+
+
+def _value_holds_plan(node, bound, builders) -> bool:
+    return () in _plan_paths(node, bound, builders)
+
+
 def _bindings(node):
     """Every ``(targets, value)`` pair *node*'s subtree binds, in the three binding forms."""
     for child in scoped_walk(node):
@@ -456,7 +496,8 @@ def _bindings(node):
 def _bound_plan_names(nodes, builders, extract) -> set:
     """The alias fixed point over the bindings *extract* reads out of each node."""
     bound: set[str] = set()
-    for _ in range(_BUILDER_PASSES):
+    while True:
+        previous_size = len(bound)
         for node in nodes:
             for targets, value in extract(node):
                 if not _builds_a_plan(value, builders) and _root_name(value) not in bound:
@@ -464,7 +505,8 @@ def _bound_plan_names(nodes, builders, extract) -> set:
                 for target in targets:
                     elements = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
                     bound.update(element.id for element in elements if isinstance(element, ast.Name))
-    return bound
+        if len(bound) == previous_size:
+            return bound
 
 
 def _plan_names(nodes, builders) -> set:
@@ -486,63 +528,481 @@ def _direct_bindings(node):
                 yield [item.optional_vars], item.context_expr
 
 
+def _target_names(target) -> set[str]:
+    """Local names one assignment target writes or deletes."""
+    return {
+        child.id
+        for child in ast.walk(target)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del))
+    }
+
+
+def _pattern_bound_names(pattern) -> set[str]:
+    """Local names one match pattern captures."""
+    names = set()
+    for child in ast.walk(pattern):
+        if isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name is not None:
+            names.add(child.name)
+        elif isinstance(child, ast.MatchMapping) and child.rest is not None:
+            names.add(child.rest)
+    return names
+
+
+def _target_plan_names(target, paths, prefix=()) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id} if prefix in paths else set()
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return set().union(
+            *(_target_plan_names(element, paths, (*prefix, index)) for index, element in enumerate(target.elts))
+        )
+    return set()
+
+
+def _bind_plan_value(bound, targets, value, builders) -> set[str]:
+    """Apply one value binding to the definite-plan state."""
+    result = set(bound)
+    names = set().union(*(_target_names(target) for target in targets))
+    result.difference_update(names)
+    paths = _plan_paths(value, bound, builders)
+    if () in paths:
+        result.update(names)
+    elif len(targets) == 1 and isinstance(targets[0], (ast.Tuple, ast.List)):
+        result.update(_target_plan_names(targets[0], paths))
+    return result
+
+
+def _comprehension_state_after(node, bound, builders) -> set[str]:
+    """Apply definite outer-iterable effects and possible iteration effects."""
+    outer = _expression_state_after(node.generators[0].iter, bound, builders)
+    iteration = set(outer)
+    exits = [set(outer)]
+    for index, generator in enumerate(node.generators):
+        if index:
+            iteration = _expression_state_after(generator.iter, iteration, builders)
+            exits.append(set(iteration))
+        for condition in generator.ifs:
+            iteration = _expression_state_after(condition, iteration, builders)
+            exits.append(set(iteration))
+    if isinstance(node, ast.DictComp):
+        iteration = _expression_state_after(node.key, iteration, builders)
+        iteration = _expression_state_after(node.value, iteration, builders)
+    else:
+        iteration = _expression_state_after(node.elt, iteration, builders)
+    exits.append(iteration)
+    return _merge_plan_states(exits)
+
+
+def _expression_state_after(node, bound, builders) -> set[str]:
+    """Apply assignment expressions in evaluation order, excluding deferred scopes."""
+    if isinstance(node, ast.Lambda):
+        return set(bound)
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return _comprehension_state_after(node, bound, builders)
+    if isinstance(node, ast.NamedExpr):
+        evaluated = _expression_state_after(node.value, bound, builders)
+        return _bind_plan_value(evaluated, [node.target], node.value, builders)
+    if isinstance(node, ast.BoolOp):
+        result = _expression_state_after(node.values[0], bound, builders)
+        for value in node.values[1:]:
+            evaluated = _expression_state_after(value, result, builders)
+            result = _merge_plan_states((result, evaluated))
+        return result
+    if isinstance(node, ast.IfExp):
+        tested = _expression_state_after(node.test, bound, builders)
+        return _merge_plan_states(
+            (
+                _expression_state_after(node.body, tested, builders),
+                _expression_state_after(node.orelse, tested, builders),
+            )
+        )
+    if isinstance(node, ast.Compare):
+        result = _expression_state_after(node.left, bound, builders)
+        for index, comparator in enumerate(node.comparators):
+            evaluated = _expression_state_after(comparator, result, builders)
+            result = evaluated if index == 0 else _merge_plan_states((result, evaluated))
+        return result
+    if isinstance(node, ast.Dict):
+        result = set(bound)
+        for key, value in zip(node.keys, node.values, strict=True):
+            if key is not None:
+                result = _expression_state_after(key, result, builders)
+            result = _expression_state_after(value, result, builders)
+        return result
+    result = set(bound)
+    for child in ast.iter_child_nodes(node):
+        result = _expression_state_after(child, result, builders)
+    return result
+
+
+def _match_case_state(case, bound, builders) -> set[str]:
+    """Apply a match case's captures and guard to the definite-plan state."""
+    result = set(bound) - _pattern_bound_names(case.pattern)
+    if case.guard is not None:
+        result = _expression_state_after(case.guard, result, builders)
+    return result
+
+
+def _merge_plan_states(states) -> set[str]:
+    states = list(states)
+    return set.intersection(*states) if states else set()
+
+
+def _match_case_states(statement, bound, builders):
+    """Return each case entry and the state that can pass every case."""
+    remaining = _expression_state_after(statement.subject, bound, builders)
+    case_states = []
+    for case in statement.cases:
+        entered = _match_case_state(case, remaining, builders)
+        case_states.append((case, entered))
+        if case.guard is not None:
+            remaining = _merge_plan_states((remaining, entered))
+    return case_states, remaining
+
+
+@dataclasses.dataclass
+class _LoopFlow:
+    normal: set[str] | None
+    continues: list[set[str]] = dataclasses.field(default_factory=list)
+    breaks: list[set[str]] = dataclasses.field(default_factory=list)
+
+
+def _merge_reachable_states(states) -> set[str] | None:
+    reachable = [state for state in states if state is not None]
+    return _merge_plan_states(reachable) if reachable else None
+
+
+def _merge_loop_flows(flows) -> _LoopFlow:
+    flows = list(flows)
+    return _LoopFlow(
+        _merge_reachable_states(flow.normal for flow in flows),
+        [state for flow in flows for state in flow.continues],
+        [state for flow in flows for state in flow.breaks],
+    )
+
+
+def _flow_through_finally(flow, finalbody, builders) -> _LoopFlow:
+    if not finalbody:
+        return flow
+    output = _LoopFlow(None)
+
+    def apply(state, kind):
+        final = _loop_flow_block(finalbody, state, builders)
+        if final.normal is not None:
+            if kind == "normal":
+                output.normal = final.normal
+            else:
+                getattr(output, kind).append(final.normal)
+        output.continues.extend(final.continues)
+        output.breaks.extend(final.breaks)
+
+    if flow.normal is not None:
+        apply(flow.normal, "normal")
+    for state in flow.continues:
+        apply(state, "continues")
+    for state in flow.breaks:
+        apply(state, "breaks")
+    return output
+
+
+def _loop_flow_try(statement, bound, builders) -> _LoopFlow:
+    body = _loop_flow_block(statement.body, bound, builders)
+    flows = []
+    if body.normal is not None:
+        flows.append(_loop_flow_block(statement.orelse, body.normal, builders))
+    flows.append(_LoopFlow(None, body.continues, body.breaks))
+    handler_entry = _handler_entry_state(statement.body, bound, builders)
+    for handler in statement.handlers:
+        entered = set(handler_entry)
+        if handler.name is not None:
+            entered.discard(handler.name)
+        flows.append(_loop_flow_block(handler.body, entered, builders))
+    return _flow_through_finally(_merge_loop_flows(flows), statement.finalbody, builders)
+
+
+def _loop_flow_statement(statement, bound, builders) -> _LoopFlow:
+    if isinstance(statement, ast.Continue):
+        return _LoopFlow(None, continues=[set(bound)])
+    if isinstance(statement, ast.Break):
+        return _LoopFlow(None, breaks=[set(bound)])
+    if isinstance(statement, (ast.Return, ast.Raise)):
+        return _LoopFlow(None)
+    if isinstance(statement, ast.If):
+        tested = _expression_state_after(statement.test, bound, builders)
+        body = _loop_flow_block(statement.body, tested, builders)
+        alternate = _loop_flow_block(statement.orelse, tested, builders)
+        return _LoopFlow(
+            _merge_reachable_states((body.normal, alternate.normal)),
+            body.continues + alternate.continues,
+            body.breaks + alternate.breaks,
+        )
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        entered = set(bound)
+        for item in statement.items:
+            if item.optional_vars is not None:
+                entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
+        return _loop_flow_block(statement.body, entered, builders)
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        return _loop_flow_try(statement, bound, builders)
+    if isinstance(statement, ast.Match):
+        case_states, unmatched = _match_case_states(statement, bound, builders)
+        flows = [_LoopFlow(unmatched)]
+        for case, entered in case_states:
+            flows.append(_loop_flow_block(case.body, entered, builders))
+        return _merge_loop_flows(flows)
+    return _LoopFlow(_plan_state_after(statement, bound, builders))
+
+
+def _loop_flow_block(body, bound, builders) -> _LoopFlow:
+    normal = set(bound)
+    continues = []
+    breaks = []
+    for statement in body:
+        if normal is None:
+            break
+        flow = _loop_flow_statement(statement, normal, builders)
+        normal = flow.normal
+        continues.extend(flow.continues)
+        breaks.extend(flow.breaks)
+    return _LoopFlow(normal, continues, breaks)
+
+
+def _loop_body_entry(statement, bound, builders) -> set[str]:
+    """Definite plan names at the body entry across the first and later iterations."""
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        first = _bind_plan_value(bound, [statement.target], statement.iter, builders)
+    else:
+        first = set(bound)
+    entry = set(first)
+    while True:
+        previous = set(entry)
+        flow = _loop_flow_block(statement.body, entry, builders)
+        backedges = [*flow.continues]
+        if flow.normal is not None:
+            backedges.append(flow.normal)
+        if isinstance(statement, (ast.For, ast.AsyncFor)):
+            backedges = [_bind_plan_value(state, [statement.target], statement.iter, builders) for state in backedges]
+        if backedges:
+            entry.intersection_update(_merge_plan_states(backedges))
+        if entry == previous:
+            return entry
+
+
+def _loop_no_break_state(statement, bound, builders) -> set[str]:
+    entered = _loop_body_entry(statement, bound, builders)
+    flow = _loop_flow_block(statement.body, entered, builders)
+    exits = [set(bound), entered, *flow.continues]
+    if flow.normal is not None:
+        exits.append(flow.normal)
+    return _merge_plan_states(exits)
+
+
+def _loop_state_after(statement, bound, builders) -> set[str]:
+    entered = _loop_body_entry(statement, bound, builders)
+    flow = _loop_flow_block(statement.body, entered, builders)
+    no_break = _loop_no_break_state(statement, bound, builders)
+    exits = [_plan_state_after_block(statement.orelse, no_break, builders), *flow.breaks]
+    return _merge_plan_states(exits)
+
+
+def _handler_entry_state(body, bound, builders) -> set[str]:
+    """Plans that survive every statement prefix from which a handler can run."""
+    entry = set(bound)
+    current = set(bound)
+    for statement in body:
+        current = _plan_state_after(statement, current, builders)
+        entry.intersection_update(current)
+    return entry
+
+
+def _plan_state_after_compound(statement, bound, builders) -> set[str]:
+    if isinstance(statement, ast.If):
+        tested = _expression_state_after(statement.test, bound, builders)
+        return _merge_plan_states(
+            (
+                _plan_state_after_block(statement.body, tested, builders),
+                _plan_state_after_block(statement.orelse, tested, builders),
+            )
+        )
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        entered = set(bound)
+        for item in statement.items:
+            if item.optional_vars is not None:
+                entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
+        return _plan_state_after_block(statement.body, entered, builders)
+    if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+        return _loop_state_after(statement, bound, builders)
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        normal = _plan_state_after_block(statement.body, bound, builders)
+        normal = _plan_state_after_block(statement.orelse, normal, builders)
+        branches = [normal]
+        handler_entry = _handler_entry_state(statement.body, bound, builders)
+        for handler in statement.handlers:
+            handler_bound = set(handler_entry)
+            if handler.name is not None:
+                handler_bound.discard(handler.name)
+            branches.append(_plan_state_after_block(handler.body, handler_bound, builders))
+        return _plan_state_after_block(statement.finalbody, _merge_plan_states(branches), builders)
+    if isinstance(statement, ast.Match):
+        case_states, unmatched = _match_case_states(statement, bound, builders)
+        branches = [unmatched]
+        branches.extend(_plan_state_after_block(case.body, entered, builders) for case, entered in case_states)
+        return _merge_plan_states(branches)
+    return set(bound)
+
+
+def _plan_state_after(statement, bound, builders) -> set[str]:
+    """Names that definitely hold a plan after one statement completes normally."""
+    if isinstance(statement, ast.Assign):
+        evaluated = _expression_state_after(statement.value, bound, builders)
+        return _bind_plan_value(evaluated, statement.targets, statement.value, builders)
+    if isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        evaluated = _expression_state_after(statement.value, bound, builders)
+        return _bind_plan_value(evaluated, [statement.target], statement.value, builders)
+    if isinstance(statement, ast.AugAssign):
+        return set(bound) - _target_names(statement.target)
+    if isinstance(statement, ast.Delete):
+        deleted = set().union(*(_target_names(target) for target in statement.targets))
+        return set(bound) - deleted
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return set(bound) - {statement.name}
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        imported = {alias.asname or alias.name.split(".")[0] for alias in statement.names}
+        return set(bound) - imported
+    if isinstance(statement, ast.Expr):
+        return _expression_state_after(statement.value, bound, builders)
+    return _plan_state_after_compound(statement, bound, builders)
+
+
+def _plan_state_after_block(nodes, bound, builders) -> set[str]:
+    result = set(bound)
+    for node in nodes:
+        result = _plan_state_after(node, result, builders)
+    return result
+
+
 def _direct_plan_names(nodes, builders) -> set:
-    """Plan names bound directly by these statements, aliases included."""
-    return _bound_plan_names(nodes, builders, _direct_bindings)
-
-
-def _statement_bodies(statement):
-    """Yield nested statement lists owned by one compound statement."""
-    for name in ("body", "orelse", "finalbody"):
-        body = getattr(statement, name, None)
-        if body:
-            yield body
-    for handler in getattr(statement, "handlers", ()):
-        if handler.body:
-            yield handler.body
-    for case in getattr(statement, "cases", ()):
-        if case.body:
-            yield case.body
+    """Names that definitely hold a plan after the statements run in source order."""
+    return _plan_state_after_block(nodes, set(), builders)
 
 
 def _contains_node(statement, target) -> bool:
     return any(node is target for node in scoped_walk(statement))
 
 
-def _statements_before(body, target):
-    """Return direct bindings that dominate target along its enclosing statement path."""
-    preceding = []
-    for index, statement in enumerate(body):
-        if not _contains_node(statement, target):
-            continue
-        preceding.extend(body[:index])
-        preceding.append(statement)
-        for nested in _statement_bodies(statement):
-            if any(_contains_node(child, target) for child in nested):
-                preceding.extend(_statements_before(nested, target))
-                break
-        return preceding
-    return preceding
+def _body_contains(body, target) -> bool:
+    return any(_contains_node(node, target) for node in body)
 
 
-def _plan_builders(tree) -> set:
+def _plan_names_before_loop(statement, target, builders, bound) -> set[str]:
+    entered = _loop_body_entry(statement, bound, builders)
+    if _body_contains(statement.body, target):
+        return _plan_names_before(statement.body, target, builders, entered)
+    return _plan_names_before(
+        statement.orelse,
+        target,
+        builders,
+        _loop_no_break_state(statement, bound, builders),
+    )
+
+
+def _plan_names_before_try(statement, target, builders, bound) -> set[str]:
+    if _body_contains(statement.body, target):
+        return _plan_names_before(statement.body, target, builders, bound)
+    normal = _plan_state_after_block(statement.body, bound, builders)
+    if _body_contains(statement.orelse, target):
+        return _plan_names_before(statement.orelse, target, builders, normal)
+    handler_states = []
+    handler_entry = _handler_entry_state(statement.body, bound, builders)
+    for handler in statement.handlers:
+        handler_bound = set(handler_entry)
+        if handler.name is not None:
+            handler_bound.discard(handler.name)
+        if _body_contains(handler.body, target):
+            return _plan_names_before(handler.body, target, builders, handler_bound)
+        handler_states.append(_plan_state_after_block(handler.body, handler_bound, builders))
+    branches = [_plan_state_after_block(statement.orelse, normal, builders), *handler_states]
+    return _plan_names_before(statement.finalbody, target, builders, _merge_plan_states(branches))
+
+
+def _plan_names_inside(statement, target, builders, bound) -> set[str]:
+    if isinstance(statement, ast.If):
+        branch = statement.body if _body_contains(statement.body, target) else statement.orelse
+        tested = _expression_state_after(statement.test, bound, builders)
+        return _plan_names_before(branch, target, builders, tested)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        entered = set(bound)
+        for item in statement.items:
+            if item.optional_vars is not None:
+                entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
+        return _plan_names_before(statement.body, target, builders, entered)
+    if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+        return _plan_names_before_loop(statement, target, builders, bound)
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        return _plan_names_before_try(statement, target, builders, bound)
+    if isinstance(statement, ast.Match):
+        case_states, _unmatched = _match_case_states(statement, bound, builders)
+        for case, entered in case_states:
+            if _body_contains(case.body, target):
+                return _plan_names_before(case.body, target, builders, entered)
+    return set(bound)
+
+
+def _plan_names_before(body, target, builders, bound=None) -> set[str]:
+    """Names that definitely hold a plan on every path that reaches *target*."""
+    result = set() if bound is None else set(bound)
+    for statement in body:
+        if _contains_node(statement, target):
+            return _plan_names_inside(statement, target, builders, result)
+        result = _plan_state_after(statement, result, builders)
+    return result
+
+
+def _statement_may_fall_through(statement) -> bool:
+    if isinstance(statement, (ast.Return, ast.Raise)):
+        return False
+    if isinstance(statement, ast.If):
+        return _block_may_fall_through(statement.body) or _block_may_fall_through(statement.orelse)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return _block_may_fall_through(statement.body)
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        if statement.finalbody and not _block_may_fall_through(statement.finalbody):
+            return False
+        normal = _block_may_fall_through(statement.body) and _block_may_fall_through(statement.orelse)
+        return normal or any(_block_may_fall_through(handler.body) for handler in statement.handlers)
+    return True
+
+
+def _block_may_fall_through(body) -> bool:
+    return all(_statement_may_fall_through(statement) for statement in body)
+
+
+def _plan_builders(tree) -> dict[str, frozenset[tuple[int, ...]]]:
     """``RendererMutationPlan.build`` plus every module-local helper that returns its result."""
-    builders = {_PLAN_BUILDER}
+    builders = {_PLAN_BUILDER: frozenset({()})}
     functions = [node for node in ast.walk(tree) if isinstance(node, _FUNCTION_SCOPES)]
-    for _ in range(_BUILDER_PASSES):
+    while True:
+        previous = dict(builders)
         for function in functions:
-            names = _plan_names(function.body, builders)
-            returned = [
-                node.value for node in scoped_walk(function.body) if isinstance(node, ast.Return) and node.value
+            returned = [node for node in scoped_walk(function.body) if isinstance(node, ast.Return)]
+            if not returned or _block_may_fall_through(function.body):
+                continue
+            returned_paths = [
+                (
+                    _plan_paths(
+                        statement.value,
+                        _plan_names_before(function.body, statement, builders),
+                        builders,
+                    )
+                    if statement.value is not None
+                    else frozenset()
+                )
+                for statement in returned
             ]
-            hands_one_back = any(
-                _builds_a_plan(value, builders)
-                or any(isinstance(part, ast.Name) and part.id in names for part in _plan_value_nodes(value))
-                for value in returned
-            )
-            if hands_one_back:
-                builders.add(function.name)
-    return builders
+            common_paths = frozenset.intersection(*returned_paths)
+            if common_paths:
+                builders[function.name] = common_paths
+        if builders == previous:
+            return builders
 
 
 def _lock_contexts(tree):
@@ -580,13 +1040,14 @@ def _stale_plan_source(source, module) -> list:
     builders = _plan_builders(tree)
     pending = _consumers(tree)
     offenders = []
-    for statement in _lock_contexts(tree):
+    locks = sorted(_lock_contexts(tree), key=lambda statement: sum(1 for _ in scoped_walk(statement.body)))
+    for statement in locks:
         inside = set(scoped_walk(statement.body))
         for call in [node for node in pending if node in inside]:
             pending.remove(call)
             plan = call.args[0]
-            bound = _direct_plan_names(_statements_before(statement.body, call), builders)
-            if not _builds_a_plan(plan, builders) and _root_name(plan) not in bound:
+            bound = _plan_names_before(statement.body, call, builders)
+            if not _value_holds_plan(plan, bound, builders):
                 offenders.append((module, ast.unparse(plan), call.lineno))
     # A consumer that no lock context encloses at all has no locks to be planned under.
     offenders.extend((module, ast.unparse(call.args[0]), call.lineno) for call in pending)
@@ -615,7 +1076,39 @@ def repair():
         body = ast.parse(source).body[0].body
 
         self.assertEqual(_plan_names(body, {_PLAN_BUILDER}), {"first", "second", "third"})
-        self.assertEqual(_direct_plan_names(body, {_PLAN_BUILDER}), {"first", "second", "third"})
+        self.assertEqual(_direct_plan_names(body, {_PLAN_BUILDER}), {"first"})
+
+    def test_reverse_ordered_plan_aliases_reach_their_fixed_point(self):
+        source = """
+def repair():
+    fourth = third
+    third = second
+    second = first
+    first = RendererMutationPlan.build()
+"""
+        body = ast.parse(source).body[0].body
+
+        expected = {"first", "second", "third", "fourth"}
+        self.assertEqual(_plan_names(body, {_PLAN_BUILDER}), expected)
+        self.assertEqual(_direct_plan_names(body, {_PLAN_BUILDER}), {"first"})
+
+    def test_reverse_ordered_plan_builders_reach_their_fixed_point(self):
+        source = """
+def fourth():
+    return third()
+def third():
+    return second()
+def second():
+    return first()
+def first():
+    return RendererMutationPlan.build()
+def repair():
+    with intent_transaction(footprint):
+        plan = fourth()
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [])
 
     def test_a_later_rebuild_does_not_authorize_an_earlier_stale_plan(self):
         source = """
@@ -630,6 +1123,493 @@ def repair():
         self.assertEqual(
             _stale_plan_source(source, "fixture.py"),
             [("fixture.py", "plan", 5)],
+        )
+
+    def test_a_later_non_plan_binding_invalidates_an_in_lock_plan(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        plan = stale
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_named_expression_invalidates_an_in_lock_plan(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        (plan := stale)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_nested_named_expression_invalidates_an_in_lock_plan(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        ignored = (plan := stale)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_short_circuited_plan_rebuild_does_not_certify_the_plan(self):
+        source = """
+def repair(stale, skip):
+    with intent_transaction(footprint):
+        plan = stale
+        skip or (plan := RendererMutationPlan.build())
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_conditional_expression_rebuild_does_not_certify_the_plan(self):
+        source = """
+def repair(stale, rebuild):
+    with intent_transaction(footprint):
+        plan = stale
+        (plan := RendererMutationPlan.build()) if rebuild else None
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_dictionary_bindings_follow_runtime_pair_order(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = stale
+        {0: (plan := RendererMutationPlan.build()), (plan := stale): 1}
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_comprehension_filter_can_skip_a_later_plan_rebuild(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        [(plan := RendererMutationPlan.build()) for _ in items if (plan := stale) if False]
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_conditional_non_plan_binding_invalidates_an_in_lock_plan(self):
+        source = """
+def repair(stale, replace):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        if replace:
+            plan = stale
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_with_body_non_plan_binding_invalidates_an_in_lock_plan(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        with nullcontext():
+            plan = stale
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_both_conditional_branches_can_build_an_in_lock_plan(self):
+        source = """
+def repair(rebuild):
+    with intent_transaction(footprint):
+        if rebuild:
+            plan = RendererMutationPlan.build()
+        else:
+            plan = RendererMutationPlan.build()
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [])
+
+    def test_a_helper_returning_an_obsolete_plan_binding_is_not_a_builder(self):
+        source = """
+def stale_plan(stale):
+    plan = RendererMutationPlan.build()
+    plan = stale
+    return plan
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = stale_plan(stale)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_handler_sees_a_non_plan_binding_from_the_try_body(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            plan = stale
+            raise ValueError()
+        except ValueError:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_later_loop_iteration_sees_the_previous_non_plan_binding(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            consume_renderer_plan(plan, permit)
+            plan = stale
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_continue_carries_a_non_plan_binding_to_the_next_iteration(self):
+        source = """
+def repair(stale, skip):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            consume_renderer_plan(plan, permit)
+            plan = stale
+            if skip:
+                continue
+            plan = RendererMutationPlan.build()
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_continue_in_try_carries_a_non_plan_binding_to_the_next_iteration(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for index in range(2):
+            consume_renderer_plan(plan, permit)
+            try:
+                if index == 0:
+                    plan = stale
+                    continue
+            finally:
+                pass
+            plan = RendererMutationPlan.build()
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
+        )
+
+    def test_a_break_carries_a_non_plan_binding_out_of_the_loop(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            plan = stale
+            break
+            plan = RendererMutationPlan.build()
+        else:
+            plan = RendererMutationPlan.build()
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_a_break_in_match_carries_a_non_plan_binding_out_of_the_loop(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            match item:
+                case _:
+                    plan = stale
+                    break
+            plan = RendererMutationPlan.build()
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_a_match_capture_replaces_a_plan_before_break(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            match item:
+                case {"plan": plan}:
+                    break
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_match_capture_replaces_a_plan_before_the_consumer(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        match value:
+            case plan:
+                consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_failed_match_guard_carries_its_capture_to_a_later_case(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        match value:
+            case plan if False:
+                pass
+            case _:
+                consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_failed_match_guard_carries_its_capture_to_a_later_break(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            match item:
+                case plan if False:
+                    pass
+                case _:
+                    break
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_a_short_circuited_match_guard_rebuild_does_not_certify_the_capture(self):
+        source = """
+def repair(flag):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        match value:
+            case plan if flag or (plan := RendererMutationPlan.build()):
+                consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_short_circuited_match_subject_rebuild_does_not_certify_the_plan(self):
+        source = """
+def repair(stale, flag):
+    with intent_transaction(footprint):
+        plan = stale
+        match flag or (plan := RendererMutationPlan.build()):
+            case _:
+                consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_match_guard_comprehension_can_invalidate_a_fresh_plan(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        match value:
+            case _ if [plan := stale for _ in items]:
+                consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_helper_with_a_non_plan_return_path_is_not_a_builder(self):
+        source = """
+def maybe_plan(stale, fresh):
+    if fresh:
+        return RendererMutationPlan.build()
+    return stale
+def repair(stale, fresh):
+    with intent_transaction(footprint):
+        plan = maybe_plan(stale, fresh)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_helper_with_an_implicit_non_plan_return_is_not_a_builder(self):
+        source = """
+def maybe_plan(fresh):
+    if fresh:
+        return RendererMutationPlan.build()
+def repair(fresh):
+    with intent_transaction(footprint):
+        plan = maybe_plan(fresh)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 8)],
+        )
+
+    def test_a_helper_with_a_bare_return_is_not_a_builder(self):
+        source = """
+def maybe_plan(empty):
+    if empty:
+        return
+    return RendererMutationPlan.build()
+def repair(empty):
+    with intent_transaction(footprint):
+        plan = maybe_plan(empty)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_mixed_tuple_helper_certifies_only_its_plan_positions(self):
+        source = """
+def mixed(stale):
+    return RendererMutationPlan.build(), stale
+def repair(stale):
+    with intent_transaction(footprint):
+        fresh, plan = mixed(stale)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_nested_mixed_tuple_helper_certifies_only_its_plan_positions(self):
+        source = """
+def mixed(stale):
+    return (RendererMutationPlan.build(), stale), None
+def repair(stale):
+    with intent_transaction(footprint):
+        (fresh, plan), ignored = mixed(stale)
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 7)],
+        )
+
+    def test_a_conditional_plan_expression_requires_two_plan_paths(self):
+        source = """
+def repair(stale, fresh):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build() if fresh else stale
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 5)],
+        )
+
+    def test_a_nested_lock_requires_a_plan_built_under_that_lock(self):
+        source = """
+def repair():
+    with intent_transaction(outer_footprint):
+        plan = RendererMutationPlan.build()
+        with intent_transaction(inner_footprint):
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 6)],
         )
 
     def test_a_nested_plan_return_does_not_make_its_outer_function_a_builder(self):
@@ -748,7 +1728,7 @@ def repair():
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             if _consumers(tree):
                 modules.add(relative)
-                builders[relative] = sorted(_plan_builders(tree) - {_PLAN_BUILDER})
+                builders[relative] = sorted(set(_plan_builders(tree)) - {_PLAN_BUILDER})
 
         self.assertEqual(sorted(modules), ["ownership_planner.py", "renderer_audit.py"])
         self.assertIn("_demotion_plan", builders["ownership_planner.py"])

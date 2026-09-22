@@ -330,9 +330,145 @@ class TestOnboardCandidate(TestCase):
         provision.assert_called_once()
         self.assertEqual(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).count(), 1)
 
+    def test_definite_adapter_rejection_releases_claim_for_corrected_retry(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("rejected-provision-retry")
+        rejection = AdapterError("Unsupported NED", code="invalid_ned", status_code=422)
+        unknown_attempt = AdapterError("not found", code="not_found", status_code=404)
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.provision_device",
+                side_effect=(rejection, self._QUEUED),
+            ) as provision,
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=unknown_attempt),
+        ):
+            first = onboard_candidate(device, self.instance, ned_id="invalid-ned")
+            second = onboard_candidate(device, self.instance, ned_id="valid-ned")
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(provision.call_count, 2)
+        attempts = list(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).order_by("created_at"))
+        self.assertEqual([attempt.state for attempt in attempts], ["closed", "open"])
+        self.assertIsNotNone(attempts[0].closed_at)
+        self.assertNotEqual(attempts[0].provision_attempt_id, attempts[1].provision_attempt_id)
+
+    def test_new_auth_rejection_releases_claim_when_evidence_uses_the_same_bad_credentials(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("auth-rejection-retry")
+        rejection = AdapterError("Authentication failed", code="unauthorized", status_code=401)
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.provision_device",
+                side_effect=(rejection, self._QUEUED),
+            ) as provision,
+            patch(
+                "netbox_nso_plugin.adapter_client.get_provision_attempt",
+                side_effect=AdapterError("Authentication failed", code="unauthorized", status_code=401),
+            ),
+        ):
+            first = onboard_candidate(device, self.instance, ned_id="first-ned")
+            second = onboard_candidate(device, self.instance, ned_id="corrected-ned")
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(provision.call_count, 2)
+        attempts = list(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).order_by("created_at"))
+        self.assertEqual([attempt.state for attempt in attempts], ["closed", "open"])
+
+    def test_later_rejection_preserves_an_attempt_the_adapter_already_admitted(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("admitted-before-rejection")
+        response_lost = AdapterError("response lost", code="transport_error")
+        rejection = AdapterError("Authentication failed", code="unauthorized", status_code=401)
+        admitted = {
+            "provision_attempt_id": None,
+            "job_id": "77",
+            "status": "running",
+            "error": None,
+            "result": None,
+        }
+
+        def lookup(provision_attempt_id):
+            return {**admitted, "provision_attempt_id": str(provision_attempt_id)}
+
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.provision_device",
+                side_effect=(response_lost, rejection, self._QUEUED),
+            ) as provision,
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", side_effect=lookup),
+        ):
+            first = onboard_candidate(device, self.instance, ned_id="first-ned")
+            second = onboard_candidate(device, self.instance, ned_id="first-ned")
+            changed = onboard_candidate(device, self.instance, ned_id="changed-ned")
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertFalse(changed["ok"])
+        self.assertEqual(changed["_http_status"], 409)
+        self.assertEqual(provision.call_count, 2)
+        attempt = NSOProvisionTombstone.objects.get(netbox_device_id=device.pk)
+        self.assertEqual(attempt.state, "open")
+
+    def test_submit_claimed_provision_closes_a_definitely_rejected_attempt(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import _submit_claimed_provision
+
+        device = self._mapped_device("direct-refusal")
+        attempt = NSOProvisionTombstone.objects.create(
+            netbox_device_id=device.pk,
+            nso_instance=self.instance.adapter_instance_id,
+            nso_device_name=device.name,
+            canonical_request={},
+        )
+        attempt.canonical_request = {
+            "nso_instance": self.instance.adapter_instance_id,
+            "device_name": device.name,
+            "address": "198.18.0.1",
+            "ned_id": "invalid-ned",
+            "authgroup": "network",
+            "admin_state": "unlocked",
+            "sync": True,
+            "oob_ip": None,
+            "provision_attempt_id": str(attempt.provision_attempt_id),
+        }
+        attempt.save(update_fields=["canonical_request"])
+        result = {"ok": False, "error": None, "provisioning": False, "job_id": None, "managed": False}
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.provision_device",
+                side_effect=AdapterError("Unsupported NED", code="invalid_ned", status_code=422),
+            ) as provision,
+            patch(
+                "netbox_nso_plugin.adapter_client.get_provision_attempt",
+                side_effect=AdapterError("not found", code="not_found", status_code=404),
+            ),
+        ):
+            response = _submit_claimed_provision(self.instance, attempt, result, claim_was_new=True)
+
+        self.assertFalse(response["ok"])
+        self.assertIn("Provisioning request failed", response["error"])
+        provision.assert_called_once_with(**attempt.canonical_request)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.state, "closed")
+        self.assertIsNotNone(attempt.closed_at)
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+
     def test_adapter_conflict_preserves_the_running_job(self):
         """An adapter conflict remains a 409 envelope with its recovery job id."""
         from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOProvisionTombstone
         from netbox_nso_plugin.onboarding import onboard_candidate
 
         device = self._mapped_device("adapter-conflict-provision")
@@ -342,12 +478,18 @@ class TestOnboardCandidate(TestCase):
             detail={"job_id": 73},
             status_code=409,
         )
-        with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=conflict):
+        with (
+            patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=conflict),
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value={"job_id": "73"}),
+        ):
             result = onboard_candidate(device, self.instance)
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["_http_status"], 409)
         self.assertEqual(result["error"]["detail"]["job_id"], 73)
+        attempt = NSOProvisionTombstone.objects.get(netbox_device_id=device.pk)
+        self.assertEqual(attempt.state, "open")
+        self.assertEqual(attempt.adapter_job_id, "73")
 
     def test_no_mapping_but_explicit_ned_onboards(self):
         """No mapping is fine when an explicit ned_id is given (override / no mapping)."""

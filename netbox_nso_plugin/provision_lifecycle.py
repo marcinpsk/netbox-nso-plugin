@@ -128,6 +128,7 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
     """Advance matching provision tombstones through the fenced completion states."""
     from .models import NSOProvisionTombstone
 
+    inventory_cache = {}
     tombstones = NSOProvisionTombstone.objects.exclude(state="closed").order_by(
         "updated_at",
         "created_at",
@@ -138,7 +139,7 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
         attempts = list(
             tombstones.filter(provision_attempt_id=provision_attempt_id).values_list("provision_attempt_id", flat=True)
         )
-        return len(attempts), sum(int(_sweep_one(attempt_id)) for attempt_id in attempts)
+        return len(attempts), sum(int(_sweep_one(attempt_id, inventory_cache)) for attempt_id in attempts)
 
     checked = 0
     closed = 0
@@ -147,7 +148,7 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
             break
         checked += 1
         try:
-            closed += int(_sweep_one(tombstone_id))
+            closed += int(_sweep_one(tombstone_id, inventory_cache))
         except DeploymentQuiesced:
             raise
         except Exception:  # noqa: BLE001 - one attempt must not stop the fleet sweep
@@ -159,7 +160,7 @@ def sweep_provision_tombstones(provision_attempt_id=None, *, deadline: float | N
     return checked, closed
 
 
-def _sweep_one(provision_attempt_id) -> bool:
+def _sweep_one(provision_attempt_id, inventory_cache) -> bool:
     """Advance one attempt. Every adapter call runs outside the device and management locks."""
     from .models import NSOProvisionTombstone
 
@@ -174,7 +175,7 @@ def _sweep_one(provision_attempt_id) -> bool:
         return _close_tombstone(provision_attempt_id, expected_state="offboarded")
     if tombstone.state != "terminal":
         return False
-    return _complete_terminal_attempt(tombstone)
+    return _complete_terminal_attempt(tombstone, inventory_cache)
 
 
 def _poll_open_attempt(tombstone) -> bool:
@@ -231,7 +232,7 @@ def _is_not_found(exc) -> bool:
     return exc.status_code == 404 or str(exc.code) == "404"
 
 
-def _complete_terminal_attempt(tombstone) -> bool:
+def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
     """Retire one terminal attempt behind the tombstone fence, holding no foreign row lock."""
     from django.db.models import Q
 
@@ -288,7 +289,7 @@ def _complete_terminal_attempt(tombstone) -> bool:
         adapter_device_id = tombstone.adapter_device_id
         ambiguous = False
         if adapter_device_id is None:
-            adapter_device_id, ambiguous = _recover_adapter_device_id(tombstone)
+            adapter_device_id, ambiguous = _recover_adapter_device_id(tombstone, inventory_cache)
         if ambiguous:
             _record_offboard_error(
                 provision_attempt_id,
@@ -327,15 +328,35 @@ def _record_offboard_error(provision_attempt_id, message: str) -> None:
     ).update(offboard_error=message, updated_at=timezone.now())
 
 
-def _recover_adapter_device_id(tombstone):
-    """Resolve an orphan by logical identity. No match means it is already absent."""
+def _device_inventory(inventory_cache):
+    """Read and validate one adapter inventory outcome per sweep."""
     from . import adapter_client
+    from .adapter_client import AdapterError
 
-    inventory = adapter_client.list_devices()
+    if "error" in inventory_cache:
+        raise inventory_cache["error"]
+    if "devices" in inventory_cache:
+        return inventory_cache["devices"]
+    try:
+        inventory = adapter_client.list_devices()
+    except AdapterError as exc:
+        inventory_cache["error"] = exc
+        raise
     if not isinstance(inventory, list):
-        raise _invalid_adapter_response("Adapter device inventory must be a list.")
+        error = _invalid_adapter_response("Adapter device inventory must be a list.")
+        inventory_cache["error"] = error
+        raise error
     if not all(isinstance(row, dict) for row in inventory):
-        raise _invalid_adapter_response("Adapter device inventory entries must be objects.")
+        error = _invalid_adapter_response("Adapter device inventory entries must be objects.")
+        inventory_cache["error"] = error
+        raise error
+    inventory_cache["devices"] = inventory
+    return inventory
+
+
+def _recover_adapter_device_id(tombstone, inventory_cache):
+    """Resolve an orphan by logical identity. No match means it is already absent."""
+    inventory = _device_inventory(inventory_cache)
     matches = [
         row
         for row in inventory

@@ -25,6 +25,7 @@ import re
 
 from django.db import IntegrityError, transaction
 from django.db.models import Q
+from django.utils import timezone
 
 from .deployment import guarded as _deployment_guarded
 
@@ -275,8 +276,8 @@ def _claim_provision_attempt(locked_device, instance, nso_name, request_body):
             and tombstone.nso_device_name == nso_name
         )
         if exact_identity and canonical_body == request_body:
-            return tombstone, None
-        return None, _provision_attempt_detail(tombstone)
+            return tombstone, None, False
+        return None, _provision_attempt_detail(tombstone), False
 
     tombstone = NSOProvisionTombstone(
         netbox_device_id=locked_device.pk,
@@ -289,7 +290,7 @@ def _claim_provision_attempt(locked_device, instance, nso_name, request_body):
         "provision_attempt_id": str(tombstone.provision_attempt_id),
     }
     tombstone.save(force_insert=True)
-    return tombstone, None
+    return tombstone, None, True
 
 
 def _provision_failure(result, *, nso_name, job_id, exc):
@@ -329,6 +330,115 @@ def _adapter_provision_failure(result, *, nso_name, job_id, exc):
     return _provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
 
 
+def _close_rejected_provision_claim(tombstone):
+    """Close an open claim that cannot have reached the adapter queue."""
+    from .models import NSOProvisionTombstone
+
+    now = timezone.now()
+    NSOProvisionTombstone.objects.filter(
+        provision_attempt_id=tombstone.provision_attempt_id,
+        state="open",
+        adapter_job_id="",
+    ).update(state="closed", closed_at=now, updated_at=now)
+
+
+def _reconcile_rejected_provision_claim(tombstone):
+    """Close a reused claim only when the adapter has no earlier admission."""
+    from . import adapter_client as client
+    from .models import NSOProvisionTombstone
+
+    try:
+        evidence = client.get_provision_attempt(tombstone.provision_attempt_id)
+    except client.AdapterError as exc:
+        if exc.status_code != 404 and str(exc.code) != "404":
+            return
+    else:
+        job_id = str((evidence or {}).get("job_id") or "")
+        if job_id:
+            NSOProvisionTombstone.objects.filter(
+                provision_attempt_id=tombstone.provision_attempt_id,
+                state="open",
+                adapter_job_id="",
+            ).update(adapter_job_id=job_id, updated_at=timezone.now())
+        return
+
+    _close_rejected_provision_claim(tombstone)
+
+
+def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new):
+    """Send a claimed request and record its admission while the identity is locked."""
+    from . import adapter_client as client
+    from .models import NSODeviceManagement, NSOPlatformNedMapping, NSOProvisionTombstone
+
+    device_id = tombstone.netbox_device_id
+    nso_name = tombstone.nso_device_name
+    job_id = ""
+    try:
+        with transaction.atomic():
+            locked_device, conflict = _lock_provision_tombstone_identity(device_id, instance, nso_name)
+            if conflict is not None:
+                result["error"] = conflict
+                return result
+
+            tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=tombstone.provision_attempt_id)
+            if tombstone.state != "open":
+                result["error"] = "The provision attempt is already completing."
+                return result
+
+            try:
+                prov = client.provision_device(**tombstone.canonical_request)
+            except client.AdapterError as exc:
+                if not exc.definitely_not_enqueued:
+                    raise
+                if claim_was_new and exc.status_code != 409:
+                    _close_rejected_provision_claim(tombstone)
+                else:
+                    _reconcile_rejected_provision_claim(tombstone)
+                return _adapter_provision_failure(result, nso_name=nso_name, job_id="", exc=exc)
+            job_id = str((prov or {}).get("job_id") or "")
+            if not job_id:
+                result["error"] = "Adapter did not return a provision job id."
+                return result
+            NSOProvisionTombstone.objects.filter(
+                provision_attempt_id=tombstone.provision_attempt_id,
+                state="open",
+                adapter_job_id="",
+            ).update(adapter_job_id=job_id)
+
+            # The post_save signal stays gated while NSO builds the node. The tombstone
+            # sweep records the terminal outcome and re-fires it after successful completion.
+            from .management_lifecycle import save_management
+
+            save_management(
+                NSODeviceManagement(
+                    device=locked_device,
+                    nso_instance=instance,
+                    nso_device_name=nso_name,
+                    onboarded_at=timezone.now(),
+                    onboard_status="provisioning",
+                    onboard_job_id=job_id,
+                )
+            )
+
+            # Learn the platform-to-NED mapping from this onboard. The first explicit NED
+            # becomes the default for later devices on the same platform.
+            if locked_device.platform_id is not None:
+                _, created = NSOPlatformNedMapping.objects.get_or_create(
+                    platform_id=locked_device.platform_id,
+                    defaults={"ned_id": tombstone.canonical_request["ned_id"]},
+                )
+                result["mapping_created"] = created
+    except client.AdapterError as exc:
+        return _adapter_provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
+    except Exception as exc:
+        return _provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
+
+    result["ok"] = True
+    result["provisioning"] = True
+    result["job_id"] = job_id
+    return result
+
+
 @_deployment_guarded("provisioning")
 def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", sync=True) -> dict:
     """Onboard one NetBox device into NSO (the write action).
@@ -355,10 +465,8 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     managed) or an adapter enqueue failure; ``ok=True, provisioning=True`` once the job is
     queued and the row exists (the device is not yet managed because the job is still running).
     """
-    from . import adapter_client as client
     from .models import (
         OPEN_PROVISION_NAME_CONSTRAINT,
-        NSODeviceManagement,
         NSOPlatformNedMapping,
         NSOProvisionTombstone,
     )
@@ -406,7 +514,12 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
                 result["error"] = conflict
                 return result
 
-            tombstone, active_conflict = _claim_provision_attempt(locked_device, instance, nso_name, request_body)
+            tombstone, active_conflict, claim_was_new = _claim_provision_attempt(
+                locked_device,
+                instance,
+                nso_name,
+                request_body,
+            )
             if active_conflict is not None:
                 return _provision_conflict(
                     result,
@@ -427,66 +540,7 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
             message="A different provision attempt is already active for this device or NSO name.",
             detail=_provision_attempt_detail(active) if active is not None else None,
         )
-    provision_request = dict(tombstone.canonical_request)
-
-    job_id = ""
-    try:
-        with transaction.atomic():
-            locked_device, conflict = _lock_provision_tombstone_identity(device.pk, instance, nso_name)
-            if conflict is not None:
-                result["error"] = conflict
-                return result
-
-            tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=tombstone.provision_attempt_id)
-            if tombstone.state != "open":
-                result["error"] = "The provision attempt is already completing."
-                return result
-
-            prov = client.provision_device(**provision_request)
-            job_id = str((prov or {}).get("job_id") or "")
-            if not job_id:
-                result["error"] = "Adapter did not return a provision job id."
-                return result
-            NSOProvisionTombstone.objects.filter(
-                provision_attempt_id=tombstone.provision_attempt_id,
-                state="open",
-                adapter_job_id="",
-            ).update(adapter_job_id=job_id)
-
-            # The post_save signal stays gated while NSO builds the node. The tombstone
-            # sweep records the terminal outcome and re-fires it after successful completion.
-            from django.utils import timezone
-
-            from .management_lifecycle import save_management
-
-            save_management(
-                NSODeviceManagement(
-                    device=locked_device,
-                    nso_instance=instance,
-                    nso_device_name=nso_name,
-                    onboarded_at=timezone.now(),
-                    onboard_status="provisioning",
-                    onboard_job_id=job_id,
-                )
-            )
-
-            # Learn the platform-to-NED mapping from this onboard. The first explicit NED
-            # becomes the default for later devices on the same platform.
-            if locked_device.platform_id is not None:
-                _, created = NSOPlatformNedMapping.objects.get_or_create(
-                    platform_id=locked_device.platform_id,
-                    defaults={"ned_id": chosen_ned},
-                )
-                result["mapping_created"] = created
-    except client.AdapterError as exc:
-        return _adapter_provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
-    except Exception as exc:
-        return _provision_failure(result, nso_name=nso_name, job_id=job_id, exc=exc)
-
-    result["ok"] = True
-    result["provisioning"] = True
-    result["job_id"] = job_id
-    return result
+    return _submit_claimed_provision(instance, tombstone, result, claim_was_new=claim_was_new)
 
 
 @_deployment_guarded("provisioning")

@@ -168,24 +168,23 @@ def _index(payload):
 
 def _classify(mgmt, by_id, by_identity):
     """Classify one management row against the snapshot. Returns ``(state, adapter_device)``."""
-    if mgmt.adapter_device_id is None:
-        candidates = [d for d in by_identity.get(_row_identity(mgmt), []) if _is_ours(mgmt, d)]
-        if len(candidates) == 1:
-            return _REMAPPED, candidates[0]
-        if len(candidates) > 1:
-            return _IDENTITY_CHANGED, None
-        return _UNMAPPED, None
-    current = by_id.get(mgmt.adapter_device_id)
-    if current is not None:
-        return (_MATCHED, current) if _is_ours(mgmt, current) else (_IDENTITY_CHANGED, current)
-    candidates = [d for d in by_identity.get(_row_identity(mgmt), []) if _is_ours(mgmt, d)]
-    # Exactly one unambiguous owner can be adopted; several means duplicate adapter rows for
-    # one node, which is a conflict to surface rather than a mapping to guess at.
-    if len(candidates) == 1:
-        return _REMAPPED, candidates[0]
-    if len(candidates) > 1:
+    current = by_id.get(mgmt.adapter_device_id) if mgmt.adapter_device_id is not None else None
+    matches = by_identity.get(_row_identity(mgmt), [])
+    # Count every owner before choosing a row. A foreign owner is a conflict, not absence.
+    if len(matches) > 1:
         return _IDENTITY_CHANGED, None
-    return _DELETED, None
+    if matches:
+        candidate = matches[0]
+        if current is candidate and _is_ours(mgmt, candidate):
+            return _MATCHED, candidate
+        if not _is_ours(mgmt, candidate):
+            return _IDENTITY_CHANGED, candidate
+        if current is not None and current.get("netbox_device_id") == mgmt.device_id:
+            return _IDENTITY_CHANGED, current
+        return _REMAPPED, candidate
+    if current is not None:
+        return _IDENTITY_CHANGED, current
+    return (_UNMAPPED if mgmt.adapter_device_id is None else _DELETED), None
 
 
 def _snapshot(rows):
@@ -368,6 +367,14 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
                         # Nothing is provable and nothing is written, so nothing may be invalidated:
                         # blanking here cost the device its whole verified baseline on every sweep.
                         _flag_link_error(current, "Adapter identity is ambiguous; repair requires operator action.")
+                        continue
+                    if (adapter_device.get("nso_instance"), adapter_device.get("nso_device_name")) == _row_identity(
+                        current
+                    ) and adapter_device.get("netbox_device_id") not in (None, current.device_id):
+                        _flag_link_error(
+                            current,
+                            "Adapter identity belongs to another NetBox device; repair requires operator action.",
+                        )
                         continue
                     if adapter_device.get("netbox_device_id") == current.device_id:
                         logger.warning(

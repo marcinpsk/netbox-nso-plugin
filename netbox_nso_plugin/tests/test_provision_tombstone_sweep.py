@@ -211,6 +211,56 @@ class TestProvisionTombstoneSweep(TestCase):
         inventory.assert_called_once()
         offboard.assert_called_once_with(702)
 
+    def test_fleet_sweep_reads_inventory_once_for_multiple_orphans(self):
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        tombstones = [self._attempt(f"provision-fleet-orphan-{index}", with_management=False)[3] for index in (1, 2)]
+        for tombstone in tombstones:
+            tombstone.adapter_device_id = None
+            tombstone.save(update_fields=["adapter_device_id"])
+        inventory_rows = [
+            {
+                "id": 700 + index,
+                "nso_instance": tombstone.nso_instance,
+                "nso_device_name": tombstone.nso_device_name,
+                "netbox_device_id": tombstone.netbox_device_id,
+            }
+            for index, tombstone in enumerate(tombstones, start=1)
+        ]
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=inventory_rows) as inventory,
+            patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard,
+        ):
+            self.assertEqual(sweep_provision_tombstones(), (2, 2))
+
+        inventory.assert_called_once()
+        self.assertEqual({call.args[0] for call in offboard.call_args_list}, {701, 702})
+        self.assertEqual(offboard.call_count, 2)
+        for tombstone in tombstones:
+            tombstone.refresh_from_db()
+            self.assertEqual(tombstone.state, "closed")
+
+    def test_fleet_sweep_does_not_repeat_a_failed_inventory_read(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        tombstones = [self._attempt(f"provision-inventory-error-{index}", with_management=False)[3] for index in (1, 2)]
+        for tombstone in tombstones:
+            tombstone.adapter_device_id = None
+            tombstone.save(update_fields=["adapter_device_id"])
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.list_devices",
+            side_effect=AdapterError("inventory unavailable", code="transport_error"),
+        ) as inventory:
+            self.assertEqual(sweep_provision_tombstones(), (2, 0))
+
+        inventory.assert_called_once()
+        for tombstone in tombstones:
+            tombstone.refresh_from_db()
+            self.assertEqual(tombstone.state, "terminal")
+
     def test_failed_orphan_with_no_adapter_mapping_closes_as_already_absent(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 

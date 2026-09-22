@@ -490,6 +490,85 @@ class TestReconcileDeviceLinks(_SyncCacheTestBase):
     stands in for the autocommit that fires the push inline in production.
     """
 
+    def test_foreign_owner_of_our_identity_requires_operator_action(self):
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        for case, stored_id, adapter_id in (
+            ("unmapped", None, 812),
+            ("deleted", 196, 812),
+            ("current", 813, 813),
+        ):
+            with self.subTest(case=case):
+                mgmt = self._mgmt(f"cache-foreign-identity-{case}", stored_id)
+                foreign = _adapter_row(mgmt, id=adapter_id, netbox_device_id=mgmt.device_id + 1000)
+                with (
+                    patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[foreign]),
+                    patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 900}) as onboard,
+                    patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+                    self.captureOnCommitCallbacks(execute=True),
+                ):
+                    self.assertEqual(reconcile_device_links([mgmt]), (1, 1))
+
+                onboard.assert_not_called()
+                set_scope.assert_not_called()
+                mgmt.refresh_from_db()
+                self.assertEqual(mgmt.adapter_device_id, stored_id)
+                self.assertIn("another NetBox device", mgmt.adapter_link_error)
+
+    def test_foreign_owner_of_our_identity_wins_over_a_separate_reused_id(self):
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-reused-and-foreign", 813)
+        reused_id = _adapter_row(
+            mgmt,
+            id=813,
+            nso_device_name="somebody-else",
+            netbox_device_id=mgmt.device_id + 1000,
+        )
+        foreign_identity = _adapter_row(mgmt, id=814, netbox_device_id=mgmt.device_id + 1001)
+        with (
+            patch("netbox_nso_plugin.adapter_client.list_devices", return_value=[reused_id, foreign_identity]),
+            patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 900}) as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}) as set_scope,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.assertEqual(reconcile_device_links([mgmt]), (1, 1))
+
+        onboard.assert_not_called()
+        set_scope.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 813)
+        self.assertIn("operator action", mgmt.adapter_link_error)
+
+    def test_owned_old_source_wins_over_a_separate_unlinked_candidate(self):
+        from netbox_nso_plugin.sync_cache import reconcile_device_links
+
+        mgmt = self._mgmt("cache-owned-old-source", 813)
+        current = _adapter_row(mgmt, id=813, nso_device_name="old-source")
+        unlinked_candidate = _adapter_row(mgmt, id=814, netbox_device_id=None)
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client.list_devices",
+                return_value=[current, unlinked_candidate],
+            ),
+            patch("netbox_nso_plugin.adapter_client.patch_device", return_value={"source_epoch": 9}) as rekey,
+            patch("netbox_nso_plugin.adapter_client.onboard_device") as onboard,
+            patch("netbox_nso_plugin.adapter_client.set_scope", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.assertEqual(reconcile_device_links([mgmt]), (1, 1))
+
+        rekey.assert_called_once_with(
+            adapter_device_id=813,
+            nso_instance=mgmt.nso_instance.adapter_instance_id,
+            nso_device_name=mgmt.nso_device_name,
+        )
+        onboard.assert_not_called()
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.adapter_device_id, 813)
+        self.assertFalse(mgmt.source_rekey_pending)
+
     def test_relinks_a_row_the_adapter_no_longer_knows(self):
         """A device absent from the adapter is re-onboarded onto a live device row."""
         from netbox_nso_plugin.sync_cache import reconcile_device_links

@@ -500,7 +500,7 @@ def resume_qualified_sites(self):
     import netbox_nso_plugin.deployment
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         netbox_nso_plugin.deployment.resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -510,7 +510,7 @@ def resume_qualified_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     netbox_nso_plugin.deployment.resume()
 
 
@@ -518,7 +518,7 @@ def resume_module_alias_sites(self):
     import netbox_nso_plugin.deployment as deployment_module
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         deployment_module.resume()
     except BaseException as exc:
         with contextlib.suppress(Exception):
@@ -528,7 +528,7 @@ def resume_module_alias_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     deployment_module.resume()
 
 
@@ -536,7 +536,7 @@ def resume_package_alias_sites(self):
     import netbox_nso_plugin as plugin_package
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         plugin_package.deployment.resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -546,7 +546,7 @@ def resume_package_alias_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     plugin_package.deployment.resume()
 
 
@@ -555,7 +555,7 @@ def resume_package_module_sites(self):
     from contextlib import suppress
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         deployment.resume()
     except BaseException:
         with suppress(Exception):
@@ -565,7 +565,7 @@ def resume_package_module_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     deployment.resume()
 
 
@@ -573,7 +573,7 @@ def resume_relative_module_sites(self):
     from ... import deployment
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         deployment.resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -583,7 +583,7 @@ def resume_relative_module_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     deployment.resume()
 
 
@@ -591,7 +591,7 @@ def resume_symbol_sites(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -601,7 +601,7 @@ def resume_symbol_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     resume()
 
 
@@ -609,7 +609,7 @@ def resume_symbol_alias_sites(self):
     from netbox_nso_plugin.deployment import resume as restart
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         restart()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -619,7 +619,7 @@ def resume_symbol_alias_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     restart()
 
 
@@ -627,7 +627,7 @@ def resume_relative_symbol_sites(self):
     from ...deployment import resume
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -637,7 +637,7 @@ def resume_relative_symbol_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     resume()
 
 
@@ -645,7 +645,7 @@ def resume_relative_symbol_alias_sites(self):
     from ...deployment import resume as relative_restart
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         relative_restart()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -655,70 +655,70 @@ def resume_relative_symbol_alias_sites(self):
                 )
             )
         raise
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     relative_restart()
 
 
 def resume_relative_sibling_module_site():
     from . import deployment
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     deployment.resume()
 
 
 def resume_relative_parent_module_site():
     from .. import deployment
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     deployment.resume()
 
 
 def resume_relative_sibling_module_alias_site():
     from . import deployment as sibling_gate
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     sibling_gate.resume()
 
 
 def resume_relative_parent_module_alias_site():
     from .. import deployment as parent_gate
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     parent_gate.resume()
 
 
 def resume_relative_package_module_alias_site():
     from ... import deployment as package_gate
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     package_gate.resume()
 
 
 def resume_relative_sibling_symbol_site():
     from .deployment import resume
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     resume()
 
 
 def resume_relative_parent_symbol_site():
     from ..deployment import resume
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     resume()
 
 
 def resume_relative_parent_symbol_alias_site():
     from ..deployment import resume as parent_restart
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     parent_restart()
 
 
 def resume_relative_sibling_symbol_alias_site():
     from .deployment import resume as sibling_restart
 
-    # ruleid: nso-resume-failure-guidance
+    # ast-finding: nso-resume-failure-guidance
     sibling_restart()
 
 
@@ -726,7 +726,7 @@ def resume_report_with_cleanup(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -744,7 +744,7 @@ def resume_report_with_write_options(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -763,7 +763,7 @@ def resume_report_with_contextlib_alias(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ok: nso-resume-failure-guidance
+        # ast-clean: nso-resume-failure-guidance
         resume()
     except BaseException:
         with gate_contextlib.suppress(Exception):
@@ -779,7 +779,7 @@ def resume_report_in_nested_try(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         try:
@@ -797,7 +797,7 @@ def resume_report_in_nested_definition(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
 
@@ -816,7 +816,7 @@ def resume_report_in_condition(self, should_report):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         if should_report:
@@ -833,7 +833,7 @@ def resume_report_with_second_statement(self, note_reported):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -850,7 +850,7 @@ def resume_report_with_early_exit(self, skip_reraise):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -868,7 +868,7 @@ def resume_report_after_bare_raise(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         raise
@@ -885,7 +885,7 @@ def resume_report_after_explicit_raise(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         raise RuntimeError("resume failed")
@@ -902,7 +902,7 @@ def resume_report_suppressing_os_error(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(OSError):
@@ -918,7 +918,7 @@ def resume_report_suppressing_base_exception(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(BaseException):
@@ -934,7 +934,7 @@ def resume_report_in_null_context(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.nullcontext(Exception):
@@ -950,7 +950,7 @@ def resume_report_without_suppression(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         self.stderr.write(
@@ -965,7 +965,7 @@ def resume_report_without_recovery_command(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -977,7 +977,7 @@ def resume_report_from_bare_variable(self, message):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except BaseException:
         with contextlib.suppress(Exception):
@@ -991,7 +991,7 @@ def resume_cleanup_under_handler(self, run):
     try:
         run()
     except BaseException:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
         raise
 
@@ -1001,16 +1001,62 @@ class DeploymentGateCommand:
         from netbox_nso_plugin.deployment import resume
 
         if options["abort"]:
-            # ok: nso-resume-failure-guidance
+            # ast-clean: nso-resume-failure-guidance
             resume()
             self.stdout.write("Deployment gate aborted")
             return
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
 
 
+class DeploymentGateAlternateBranchCommand:
+    def handle(self, *args, **options):
+        from netbox_nso_plugin.deployment import resume
+
+        if options["abort"]:
+            self.stdout.write("Deployment gate aborted")
+        elif options["retry"]:
+            # ast-finding: nso-resume-failure-guidance
+            resume()
+        else:
+            # ast-finding: nso-resume-failure-guidance
+            resume()
+
+
+class DeploymentGateNestedAbortDefinitionCommand:
+    def handle(self, *args, **options):
+        from netbox_nso_plugin.deployment import resume
+
+        if options["abort"]:
+
+            def deferred():
+                # ast-finding: nso-resume-failure-guidance
+                resume()
+
+            return deferred
+
+
+class DeploymentGateNestedAbortLambdaCommand:
+    def handle(self, *args, **options):
+        from netbox_nso_plugin.deployment import resume
+
+        if options["abort"]:
+            # ast-finding: nso-resume-failure-guidance
+            deferred = lambda: resume()
+            return deferred
+
+
+class DeploymentGateNestedAbortGeneratorCommand:
+    def handle(self, *args, **options):
+        from netbox_nso_plugin.deployment import resume
+
+        if options["abort"]:
+            # ast-finding: nso-resume-failure-guidance
+            return (resume() for _ in [1])
+
+
 def resume_on_unbound_receiver(receiver):
-    # ok: nso-resume-failure-guidance
+    # ast-clean: nso-resume-failure-guidance
     receiver.resume()
 
 
@@ -1018,7 +1064,7 @@ def resume_with_a_second_handler(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError:
         pass
@@ -1036,7 +1082,7 @@ def resume_with_a_second_handler_and_cleanup(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError:
         pass
@@ -1056,7 +1102,7 @@ def resume_with_a_bound_second_handler(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError as error:
         del error
@@ -1074,7 +1120,7 @@ def resume_with_a_bound_base_handler(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError:
         pass
@@ -1092,7 +1138,7 @@ def resume_with_a_bound_base_handler_and_cleanup(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError:
         pass
@@ -1112,7 +1158,7 @@ def resume_with_a_bound_first_handler(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError as error:
         del error
@@ -1130,7 +1176,7 @@ def resume_with_a_bound_first_handler_and_cleanup(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError as error:
         del error
@@ -1150,7 +1196,7 @@ def resume_with_a_bound_second_handler_and_cleanup(self):
     from netbox_nso_plugin.deployment import resume
 
     try:
-        # ruleid: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
     except ValueError as error:
         del error
@@ -1180,8 +1226,39 @@ def resume_in_cleanup_of_a_guarded_call(self, other):
             )
         raise
     finally:
-        # ok: nso-resume-failure-guidance
+        # ast-finding: nso-resume-failure-guidance
         resume()
+
+
+def resume_in_cleanup_of_the_same_guarded_call(self):
+    from netbox_nso_plugin.deployment import resume
+
+    try:
+        # ast-clean: nso-resume-failure-guidance
+        resume()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            self.stderr.write(
+                self.style.ERROR(
+                    "Intent work may remain quiesced. Fix the cause and run nso_intent_deployment_gate --abort."
+                )
+            )
+        raise
+    finally:
+        # ast-finding: nso-resume-failure-guidance
+        resume()
+
+
+class DeploymentGateSameCallAlternateBranchCommand:
+    def handle(self, *args, **options):
+        from netbox_nso_plugin.deployment import resume
+
+        if options["abort"]:
+            # ast-clean: nso-resume-failure-guidance
+            resume()
+        else:
+            # ast-finding: nso-resume-failure-guidance
+            resume()
 
 
 def adapter_error_fully_qualified(items):
@@ -1190,7 +1267,7 @@ def adapter_error_fully_qualified(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise netbox_nso_plugin.adapter_client.AdapterError("invalid")
 
 
@@ -1200,7 +1277,7 @@ def adapter_error_package_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise package.adapter_client.AdapterError("invalid")
 
 
@@ -1210,7 +1287,7 @@ def adapter_error_module_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise client.AdapterError("invalid")
 
 
@@ -1220,7 +1297,7 @@ def adapter_error_absolute_module_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise client.AdapterError("invalid")
 
 
@@ -1230,7 +1307,7 @@ def adapter_error_relative_module_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise client.AdapterError("invalid")
 
 
@@ -1240,7 +1317,7 @@ def adapter_error_parent_module_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise client.AdapterError("invalid")
 
 
@@ -1250,7 +1327,7 @@ def adapter_error_grandparent_module_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise client.AdapterError("invalid")
 
 
@@ -1260,7 +1337,7 @@ def adapter_error_absolute_module(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise adapter_client.AdapterError("invalid")
 
 
@@ -1270,7 +1347,7 @@ def adapter_error_relative_module(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise adapter_client.AdapterError("invalid")
 
 
@@ -1280,7 +1357,7 @@ def adapter_error_parent_module(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise adapter_client.AdapterError("invalid")
 
 
@@ -1290,7 +1367,7 @@ def adapter_error_grandparent_module(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise adapter_client.AdapterError("invalid")
 
 
@@ -1300,7 +1377,7 @@ def adapter_error_absolute_symbol(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1310,7 +1387,7 @@ def adapter_error_relative_symbol(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1320,7 +1397,7 @@ def adapter_error_parent_symbol(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1330,7 +1407,7 @@ def adapter_error_grandparent_symbol(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1340,7 +1417,7 @@ def adapter_error_absolute_symbol_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise PayloadError("invalid")
 
 
@@ -1350,7 +1427,7 @@ def adapter_error_relative_symbol_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise PayloadError("invalid")
 
 
@@ -1360,7 +1437,7 @@ def adapter_error_parent_symbol_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise PayloadError("invalid")
 
 
@@ -1370,7 +1447,7 @@ def adapter_error_grandparent_symbol_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise PayloadError("invalid")
 
 
@@ -1379,7 +1456,7 @@ def adapter_error_before_the_continue(items):
 
     for item in items:
         if not item:
-            # ruleid: nso-adapter-error-after-continue
+            # ast-finding: nso-adapter-error-after-continue
             raise AdapterError("invalid")
         continue
 
@@ -1391,7 +1468,7 @@ def adapter_error_over_a_nested_continue(items):
         for part in item:
             if part:
                 continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1401,7 +1478,7 @@ async def adapter_error_in_an_async_loop(items):
     async for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1411,7 +1488,7 @@ def adapter_error_chained_to_a_cause(items, cause):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise AdapterError("invalid") from cause
 
 
@@ -1423,7 +1500,7 @@ def adapter_error_rebound_alias(items):
     for item in items:
         if not item:
             continue
-        # ruleid: nso-adapter-error-after-continue
+        # ast-finding: nso-adapter-error-after-continue
         raise PayloadError("invalid")
 
 
@@ -1431,7 +1508,7 @@ def adapter_error_validated_before_the_loop(items):
     from .adapter_client import AdapterError
 
     if not all(items):
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise AdapterError("invalid")
     for item in items:
         if not item:
@@ -1442,7 +1519,7 @@ def adapter_error_in_a_loop_without_continue(items):
     from .adapter_client import AdapterError
 
     for item in items:
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1452,7 +1529,7 @@ def adapter_error_shadowed_symbol(items, AdapterError):
     for item in items:
         if not item:
             continue
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1463,7 +1540,7 @@ def adapter_error_shadowed_alias(items, PayloadError):
     for item in items:
         if not item:
             continue
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise PayloadError("invalid")
 
 
@@ -1474,7 +1551,7 @@ def adapter_error_shadowed_module(items, adapter_client):
     for item in items:
         if not item:
             continue
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise adapter_client.AdapterError("invalid")
 
 
@@ -1482,7 +1559,7 @@ def adapter_error_unimported_symbol(items):
     for item in items:
         if not item:
             continue
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise AdapterError("invalid")
 
 
@@ -1492,5 +1569,5 @@ def adapter_error_unrelated_exception(items):
     for item in items:
         if not item:
             continue
-        # ok: nso-adapter-error-after-continue
+        # ast-clean: nso-adapter-error-after-continue
         raise ValueError("invalid")

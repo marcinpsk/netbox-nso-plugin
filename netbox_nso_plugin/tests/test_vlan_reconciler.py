@@ -116,9 +116,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
-        payload = {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627}]}
+        payload = {"vlans": [{"vlan_id": 1627, "name": "FIRST"}, {"vlan_id": 1627, "name": "SECOND"}]}
 
-        with self.assertRaisesRegex(AdapterError, "name must be a string") as raised:
+        with self.assertRaisesRegex(AdapterError, "duplicate vlan_id") as raised:
             reconcile_vlan_database(self.device, payload)
 
         self.assertEqual(raised.exception.code, "invalid_response")
@@ -177,11 +177,11 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         self.assertFalse(NSOVLANState.objects.filter(management=self.management).exists())
 
-    def test_vlan_reconciler_rejects_a_missing_or_non_string_name(self):
+    def test_vlan_reconciler_rejects_a_non_string_name(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
 
-        for entry in ({"vlan_id": 100}, {"vlan_id": 100, "name": None}):
+        for entry in ({"vlan_id": 100, "name": 123}, {"vlan_id": 100, "name": False}):
             with self.subTest(entry=entry):
                 with self.assertRaisesRegex(AdapterError, "name must be a string") as raised:
                     reconcile_vlan_database(self.device, {"vlans": [entry]})
@@ -1117,6 +1117,19 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(len(rows), 2)
         self.assertEqual({r.status for r in rows}, {"imported"})
+        group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
+        self.assertEqual(VLAN.objects.get(group=group, vid=5).name, "VLAN 5")
+        self.assertEqual(VLAN.objects.get(group=group, vid=6).name, "VLAN 6")
+
+    def test_omitted_and_null_vlan_names_get_placeholder_names(self):
+        from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        rows = reconcile_vlan_database(
+            self.device,
+            {"vlans": [{"vlan_id": 5}, {"vlan_id": 6, "name": None}]},
+        )
+
+        self.assertEqual({row.status for row in rows}, {"imported"})
         group = VLANGroup.objects.get(slug=f"nso-{self.device.pk}")
         self.assertEqual(VLAN.objects.get(group=group, vid=5).name, "VLAN 5")
         self.assertEqual(VLAN.objects.get(group=group, vid=6).name, "VLAN 6")

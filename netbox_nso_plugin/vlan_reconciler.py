@@ -75,9 +75,11 @@ def _validated_vlan_items(payload: dict) -> tuple[dict, ...]:
         except AdapterError as exc:
             raise AdapterError(f"VLAN payload entry is invalid: {exc}", code="invalid_response") from exc
         name = item.get("name")
-        if "name" not in item or not isinstance(name, str):
+        if name is None:
+            name = ""
+        if not isinstance(name, str):
             raise AdapterError("VLAN payload entry name must be a string", code="invalid_response")
-        normalized.append({**item, "vlan_id": vlan_id})
+        normalized.append({**item, "vlan_id": vlan_id, "name": name})
 
     seen = set()
     for item in normalized:
