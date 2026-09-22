@@ -3017,6 +3017,9 @@ class NSOApplyAttempt(models.Model):
         return str(self.pk)
 
 
+OPEN_PROVISION_NAME_CONSTRAINT = "nso_open_provision_name"
+
+
 class NSOProvisionTombstone(models.Model):
     """Durable identity and completion fence for one provision request."""
 
@@ -3043,8 +3046,19 @@ class NSOProvisionTombstone(models.Model):
     closed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["nso_instance", "nso_device_name"],
+                condition=models.Q(state="open"),
+                name=OPEN_PROVISION_NAME_CONSTRAINT,
+            ),
+        ]
         indexes = [
-            models.Index(fields=["state", "created_at"], name="nso_provision_sweep"),
+            models.Index(
+                fields=["updated_at", "created_at", "provision_attempt_id"],
+                condition=~models.Q(state="closed"),
+                name="nso_provision_sweep",
+            ),
             models.Index(
                 fields=["netbox_device_id", "nso_instance", "nso_device_name"],
                 name="nso_provision_identity",

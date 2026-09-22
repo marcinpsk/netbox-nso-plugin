@@ -60,6 +60,7 @@ rules:
           - pattern: $THREAD.join()
           - pattern: $THREAD.join(None)
           - pattern: $THREAD.join(timeout=None)
+          - pattern: $THREAD.join(*$OPTIONS)
           - pattern: $THREAD.join(**$OPTIONS)
           - patterns:
               - pattern: $THREAD.join(**$OPTIONS, ...)
@@ -102,7 +103,7 @@ rules:
   - id: nso-retired-push-builder
     languages: [python]
     severity: ERROR
-    message: Name push builders only in the delivery registry.
+    message: Use push builders only through the delivery registry.
     patterns:
       - pattern-either:
           - pattern: $F(...)
@@ -134,6 +135,24 @@ rules:
       exclude:
         - "**/tests/**"
         - "**/migrations/**"
+        - "**/delivery.py"
+  - id: nso-push-builder-definition-outside-signals
+    languages: [python]
+    severity: ERROR
+    message: Define push builders in signals and register them with delivery.
+    patterns:
+      - pattern: |
+          def $F(...):
+              ...
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_push_[a-z0-9_]+_intent_for_device$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/signals.py"
         - "**/delivery.py"
   - id: nso-retired-coalescer-state
     languages: [python]

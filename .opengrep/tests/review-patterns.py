@@ -152,8 +152,10 @@ def unbounded_thread_join_shapes(worker, options, timeout):
     worker.join(timeout=timeout)
     # ok: nso-unbounded-thread-join
     worker.join(timeout=timeout, **options)
-    # ok: nso-unbounded-thread-join
+    # ruleid: nso-unbounded-thread-join
     worker.join(*options)
+    # ok: nso-unbounded-thread-join
+    worker.join(*options, timeout=5)
     # ok: nso-unbounded-thread-join
     ",".join(items)
 
@@ -168,6 +170,10 @@ def unpacked_thread_join_shapes(worker, a, b, x):
 
 
 def retired_push_builder_shapes(module):
+    # ruleid: nso-push-builder-definition-outside-signals
+    def _push_vlan_intent_for_device():
+        pass
+
     # ruleid: nso-retired-push-builder
     _push_vlan_intent_for_device()
     # ruleid: nso-retired-push-builder

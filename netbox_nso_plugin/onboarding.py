@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 
 from .deployment import guarded as _deployment_guarded
@@ -351,7 +351,12 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
     queued and the row exists (the device is not yet managed because the job is still running).
     """
     from . import adapter_client as client
-    from .models import NSODeviceManagement, NSOPlatformNedMapping, NSOProvisionTombstone
+    from .models import (
+        OPEN_PROVISION_NAME_CONSTRAINT,
+        NSODeviceManagement,
+        NSOPlatformNedMapping,
+        NSOProvisionTombstone,
+    )
 
     result = {"ok": False, "error": None, "provisioning": False, "job_id": None, "managed": False}
 
@@ -389,19 +394,28 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         "sync": sync,
         "oob_ip": oob_address,
     }
-    with transaction.atomic():
-        locked_device, conflict = _lock_provision_identity(device.pk, instance, nso_name)
-        if conflict is not None:
-            result["error"] = conflict
-            return result
+    try:
+        with transaction.atomic():
+            locked_device, conflict = _lock_provision_identity(device.pk, instance, nso_name)
+            if conflict is not None:
+                result["error"] = conflict
+                return result
 
-        tombstone, active_conflict = _claim_provision_attempt(locked_device, instance, nso_name, request_body)
-        if active_conflict is not None:
-            return _provision_conflict(
-                result,
-                message="A different provision attempt is already active for this device or NSO name.",
-                detail=active_conflict,
-            )
+            tombstone, active_conflict = _claim_provision_attempt(locked_device, instance, nso_name, request_body)
+            if active_conflict is not None:
+                return _provision_conflict(
+                    result,
+                    message="A different provision attempt is already active for this device or NSO name.",
+                    detail=active_conflict,
+                )
+    except IntegrityError as exc:
+        constraint = getattr(getattr(exc.__cause__, "diag", None), "constraint_name", None)
+        if constraint != OPEN_PROVISION_NAME_CONSTRAINT:
+            raise
+        return _provision_conflict(
+            result,
+            message="A different provision attempt is already active for this device or NSO name.",
+        )
     provision_request = dict(tombstone.canonical_request)
 
     job_id = ""

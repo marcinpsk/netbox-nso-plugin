@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from ._outbox_case import make_device
@@ -78,6 +79,24 @@ class TestProvisionEvidenceValidation(SimpleTestCase):
 
 
 class TestProvisionTombstoneSweep(TestCase):
+    def test_fleet_sweep_reads_eligible_attempts_in_index_order(self):
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        with CaptureQueriesContext(connection) as queries:
+            self.assertEqual(sweep_provision_tombstones(), (0, 0))
+        sweep_queries = [
+            query["sql"]
+            for query in queries
+            if '"netbox_nso_plugin_nsoprovisiontombstone"' in query["sql"] and "ORDER BY" in query["sql"]
+        ]
+        self.assertEqual(len(sweep_queries), 1)
+        with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL enable_seqscan = off")
+            cursor.execute("SET LOCAL enable_bitmapscan = off")
+            cursor.execute("EXPLAIN " + sweep_queries[0])
+            plan = "\n".join(row[0] for row in cursor.fetchall())
+        self.assertNotIn("Sort", plan)
+
     def _attempt(self, tag, *, with_management, state="terminal", provision_attempt_id=None):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOProvisionTombstone
 

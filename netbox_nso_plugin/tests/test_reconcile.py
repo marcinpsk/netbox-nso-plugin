@@ -393,6 +393,19 @@ class TestProvisionCompletePermission(APITestCase):
         self.assertIsNone(tombstone.terminal_evidence)
         enqueue.assert_not_called()
 
+        self.add_permissions("netbox_nso_plugin.change_nsoprovisiontombstone")
+        with patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue:
+            response = self.client.post(
+                "/api/plugins/nso/provision-complete/",
+                payload,
+                format="json",
+                **self.header,
+            )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "terminal")
+        enqueue.assert_called_once()
+
 
 class TestProvisionCompleteEndpoint(APITestCase):
     """POST /api/plugins/nso/provision-complete/ — the adapter's provision-done callback."""

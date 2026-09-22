@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
-from django.test import SimpleTestCase, TestCase
+from django.db import connection, connections
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from ipam.models import IPAddress
 from netaddr import IPNetwork
 
@@ -23,6 +24,74 @@ def _device(name, *, status="active", platform=None, ip=None):
         d.primary_ip4 = addr
         d.save()
     return d
+
+
+class _PeerProvisionClaim:
+    """Insert a competing open claim after onboarding reads an empty claim set."""
+
+    def __init__(self, *, device_id, instance_id, nso_name):
+        self.device_id = device_id
+        self.instance_id = instance_id
+        self.nso_name = nso_name
+        self.fired = False
+
+    def __call__(self, execute, sql, params, many, context):
+        result = execute(sql, params, many, context)
+        if self.fired or not sql.lstrip().upper().startswith("SELECT"):
+            return result
+        if 'FROM "netbox_nso_plugin_nsoprovisiontombstone"' not in sql or '"state"' not in sql:
+            return result
+
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        self.fired = True
+        alias = "onboarding_claim_peer"
+        connections[alias] = connection.copy(alias=alias)
+        try:
+            NSOProvisionTombstone.objects.using(alias).create(
+                netbox_device_id=self.device_id,
+                nso_instance=self.instance_id,
+                nso_device_name=self.nso_name,
+                canonical_request={},
+            )
+        finally:
+            connections[alias].close()
+            del connections[alias]
+        return result
+
+
+class TestConcurrentProvisionClaims(TransactionTestCase):
+    def test_competing_name_claim_returns_conflict_before_adapter_send(self):
+        from netbox_nso_plugin.models import NSOInstance, NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        instance = NSOInstance.objects.create(name="claim-instance", adapter_instance_id="claim-instance")
+        first = _device("claim device", ip="198.18.0.1/32")
+        peer = _device("claim-device", ip="198.18.0.2/32")
+        seam = _PeerProvisionClaim(
+            device_id=peer.pk,
+            instance_id=instance.adapter_instance_id,
+            nso_name="claim-device",
+        )
+
+        with (
+            connection.execute_wrapper(seam),
+            patch("netbox_nso_plugin.adapter_client.provision_device") as provision,
+        ):
+            result = onboard_candidate(first, instance, ned_id="test-ned:test-ned")
+
+        self.assertTrue(seam.fired)
+        self.assertEqual(result["_http_status"], 409)
+        self.assertEqual(result["error"]["code"], "conflict")
+        provision.assert_not_called()
+        self.assertEqual(
+            NSOProvisionTombstone.objects.filter(
+                nso_instance=instance.adapter_instance_id,
+                nso_device_name="claim-device",
+                state="open",
+            ).count(),
+            1,
+        )
 
 
 class TestOnboardingDashboard(TestCase):

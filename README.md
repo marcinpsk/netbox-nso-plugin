@@ -60,6 +60,15 @@ Run migrations:
 python manage.py migrate netbox_nso_plugin
 ```
 
+Give the adapter's NetBox callback token to a service user with an `ObjectPermission`
+for the `change` action on **NSO Provision Tombstone**. The adapter uses this token
+when it posts to `POST /api/plugins/nso/provision-complete/`. An authenticated token
+without `netbox_nso_plugin.change_nsoprovisiontombstone` receives HTTP 403. The
+periodic tombstone sweep still checks jobs when a callback cannot be delivered.
+
+The `adapter_token` setting above authenticates requests from NetBox to the adapter.
+The callback token authenticates requests from the adapter to NetBox.
+
 Programmatic writers must wrap each create, save, or delete of a managed intent model in
 `intent_transaction()`. The renderer write, revision bump, and intent outbox entry must
 commit together. The mutation footprint must be complete before the first write.

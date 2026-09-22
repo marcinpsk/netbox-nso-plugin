@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +107,20 @@ class TestDeliveryRegistry(SimpleTestCase):
 
         missing = [entry.push_name for entry in delivery_keys().values() if not hasattr(signals, entry.push_name)]
         assert missing == []
+
+    def test_every_push_builder_definition_is_registered(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.delivery import delivery_keys
+
+        defined = {
+            name
+            for name, value in vars(signals).items()
+            if re.fullmatch(r"_push_[a-z0-9_]+_intent_for_device", name)
+            and inspect.isfunction(value)
+            and value.__module__ == signals.__name__
+        }
+        registered = {entry.push_name for entry in delivery_keys().values()}
+        assert defined == registered
 
     def test_receipt_sections_are_a_registry_fact(self):
         from netbox_nso_plugin.delivery import delivery_keys
