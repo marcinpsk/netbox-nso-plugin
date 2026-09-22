@@ -27,8 +27,8 @@ only `.opengrep/tests`.
 
 Every rule ID and every positive pattern alternative must match at least one
 `# ruleid:` fixture line. The fixture hook fails when a rule or alternative has
-no matching defect. Path filters are not part of the coverage check; the tree
-scan proves them.
+no matching defect. The fixture hook also checks that a push builder definition
+in `delivery.py` is reported. The tree scan checks the remaining path filters.
 
 ## Preserve CodeRabbit's default scan
 

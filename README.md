@@ -36,6 +36,13 @@ become intent that is applied back to the device through NSO (reconcile-mode com
 - NetBox ≥ 4.6.0
 - Python ≥ 3.12
 
+## Development status
+
+This plugin, the NSO adapter, and the NSO packages have no deployed installations.
+The three repositories move together during development. Migrations 0024 and
+0025 replace the development ownership manifest. They do not preserve rows from
+migration 0022 because no deployed data uses that schema.
+
 ## Installation
 
 ```bash

@@ -241,6 +241,30 @@ def main(argv: list[str] | None = None) -> int:
             if result["start"]["line"] in annotations.get(rule_id, set()):
                 covered.add((rule_id, alternative_index))
 
+        delivery_fixture = temporary_path / "netbox_nso_plugin" / "delivery.py"
+        delivery_fixture.parent.mkdir()
+        delivery_fixture.write_text(
+            "def _push_vlan_intent_for_device():\n    pass\n"
+            "\ndef delivery_keys():\n    return '_push_vlan_intent_for_device'\n",
+            encoding="utf-8",
+        )
+        delivery_scan = subprocess.run(
+            [args.opengrep_bin, "scan", "--config", str(args.rules), "--json", str(delivery_fixture)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if delivery_scan.returncode != 0:
+            failures.append(f"delivery.py rule scan failed: {delivery_scan.stderr.strip()}")
+        else:
+            delivery_results = json.loads(delivery_scan.stdout).get("results", [])
+            placement_rule = "nso-push-builder-definition-outside-signals"
+            if not any(
+                result["check_id"].endswith(placement_rule) and result["start"]["line"] == 1
+                for result in delivery_results
+            ):
+                failures.append(f"{placement_rule}: delivery.py definition is not reported")
+
     failures.extend(
         f"{rule_id} alternative {alternative_index}: no fixture line matches"
         for rule_id, alternative_index, _ in alternatives

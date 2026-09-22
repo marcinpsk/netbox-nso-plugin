@@ -153,7 +153,6 @@ rules:
         - "**/tests/**"
         - "**/migrations/**"
         - "**/signals.py"
-        - "**/delivery.py"
   - id: nso-retired-coalescer-state
     languages: [python]
     severity: ERROR
