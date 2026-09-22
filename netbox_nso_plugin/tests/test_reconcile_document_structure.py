@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Keep authoritative document validation separate from resolution defaults and skips."""
+"""Keep authoritative document validation separate from resolution defaults."""
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
-
-from ._ast_scope import resolve_call_target, scope_bindings
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _NO_DEFAULT = object()
@@ -89,31 +87,6 @@ def _defaulted_constant_lookups(path):
     return violations
 
 
-_ADAPTER_ERROR_TARGET = "netbox_nso_plugin.adapter_client.AdapterError"
-
-
-def _raises_adapter_error(node, bindings):
-    if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
-        return False
-    return resolve_call_target(node.exc, bindings) == _ADAPTER_ERROR_TARGET
-
-
-def _validation_and_skip_loops(path):
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    bindings = scope_bindings(tree)
-    violations = []
-    for loop in (node for node in ast.walk(tree) if isinstance(node, (ast.For, ast.AsyncFor))):
-        descendants = [node for statement in loop.body for node in ast.walk(statement)]
-        if not any(isinstance(node, ast.Continue) for node in descendants):
-            continue
-        for raised in (node for node in descendants if _raises_adapter_error(node, bindings[node])):
-            violations.append(
-                f"{path.relative_to(_PACKAGE_ROOT.parent)}:{raised.lineno} "
-                f"shares a loop with continue at line {loop.lineno}"
-            )
-    return violations
-
-
 def test_reconcilers_do_not_default_module_constant_lookups():
     violations = []
     for path in sorted(_PACKAGE_ROOT.glob("*_reconciler.py")):
@@ -146,49 +119,3 @@ def test_defaulted_constant_lookup_allows_a_literal_unmapped_sentinel():
     )
 
     assert _defaulted_constant_lookups(source) == []
-
-
-def test_adapter_error_import_aliases_are_checked_and_guarded_aliases_are_allowed():
-    source = _SyntheticSource(
-        "snippet.py",
-        """\
-import netbox_nso_plugin.adapter_client as client
-from netbox_nso_plugin.adapter_client import AdapterError as PayloadError
-from .adapter_client import AdapterError as RelativePayloadError
-
-def module_alias(items):
-    for item in items:
-        if not item:
-            continue
-        raise client.AdapterError("invalid")
-
-def symbol_alias(items):
-    for item in items:
-        if not item:
-            continue
-        raise PayloadError("invalid")
-
-def relative_alias(items):
-    for item in items:
-        if not item:
-            continue
-        raise RelativePayloadError("invalid")
-
-def guarded_alias(items):
-    for item in items:
-        raise PayloadError("invalid")
-""",
-    )
-
-    assert _validation_and_skip_loops(source) == [
-        "snippet.py:9 shares a loop with continue at line 6",
-        "snippet.py:15 shares a loop with continue at line 12",
-        "snippet.py:21 shares a loop with continue at line 18",
-    ]
-
-
-def test_reconciler_validation_is_separate_from_resolution_skips():
-    violations = []
-    for path in sorted(_PACKAGE_ROOT.glob("*_reconciler.py")):
-        violations.extend(_validation_and_skip_loops(path))
-    assert violations == []

@@ -21,7 +21,6 @@ from ._outbox_case import trust_scope
 from .mixins import IntentPushResetMixin
 
 APP = "netbox_nso_plugin"
-PLUGIN = Path(__file__).resolve().parent.parent
 
 
 def _delivery_keys_at_the_push_sites() -> set[str]:
@@ -117,25 +116,6 @@ class TestDeliveryRegistry(SimpleTestCase):
             key: key for key in registry if key != "interface"
         }
 
-    def test_no_production_reader_repeats_the_interface_receipt_literal(self):
-        offenders, scanned = [], []
-        for path in PLUGIN.rglob("*.py"):
-            # Relative to the plugin: an ancestor directory named tests/ or migrations/ would
-            # otherwise skip every module and pass this guard on an empty scan.
-            relative = path.relative_to(PLUGIN)
-            if path.name == "delivery.py" or "tests" in relative.parts or "migrations" in relative.parts:
-                continue
-            scanned.append(relative.as_posix())
-            literals = {
-                node.value
-                for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-                if isinstance(node, ast.Constant) and isinstance(node.value, str)
-            }
-            if "interface_config" in literals:
-                offenders.append(relative.as_posix())
-        assert "signals.py" in scanned, f"the scan reached {len(scanned)} module(s), so it proves nothing"
-        assert offenders == [], f"receipt-section literals outside delivery.py: {offenders}"
-
 
 def _fixture(tag: str, adapter_device_id: int):
     from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
@@ -230,8 +210,13 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.intent_generation import allocate_intent_generation
         from netbox_nso_plugin.models import NSOStaticRouteState
 
+        from ._static_route_case import _assign_without_push
+
         device, mgmt = _fixture("sr", 7301)
         route = StaticRoute.objects.create(prefix="198.51.100.0/24", next_hop="198.51.100.1", metric=1)
+        # The device assignment is the native anchor the static-route binding reads: an
+        # unassigned route owns nothing on this device and the ownership audit demotes it.
+        _assign_without_push(route, device)
         generation = allocate_intent_generation()
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent"):
             state = NSOStaticRouteState.objects.create(

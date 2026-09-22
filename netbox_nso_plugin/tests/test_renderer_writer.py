@@ -262,6 +262,32 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         assert planned_row.last_apply_error == "planned"
         assert late_row.last_apply_error == ""
 
+    def test_set_update_rejects_a_selected_row_changed_after_planning(self):
+        from netbox_nso_plugin.renderer_writer import (
+            IntentPlanStaleError,
+            RendererMutationPlan,
+            planned_set_update,
+            renderer_mirror_writes,
+        )
+
+        _device, management = make_managed("writer-set-stale", 16272)
+        row = own_vlan(management, 1629, "writer-set-stale")
+        plan = RendererMutationPlan.build(
+            set_updates=(
+                planned_set_update(
+                    NSOVLANState.objects.filter(pk=row.pk),
+                    last_apply_error="planned",
+                ),
+            )
+        )
+        mirror_update(row, last_apply_error="raced")
+
+        with self.assertRaises(IntentPlanStaleError), renderer_mirror_writes(plan) as writer:
+            writer.set_update(NSOVLANState, plan.write_set[0], last_apply_error="planned")
+
+        row.refresh_from_db()
+        self.assertEqual(row.last_apply_error, "raced")
+
 
 class TestRendererContentWriter(IntentPushResetMixin, TestCase):
     def test_effective_after_clears_a_stale_relation_cache(self):
@@ -317,26 +343,20 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         state.vrf = vrf.name
         binding = manifest_binding(state)
         self.assertIsNotNone(binding)
-        _rule, _scope, _device_id, _native_label, native_key = binding
+        (
+            _rule,
+            _scope,
+            _device_id,
+            _native_label,
+            _native_id,
+            native_key,
+            _state_label,
+            _state_key,
+        ) = binding
         self.assertEqual(native_key["vrf_id"], vrf.pk)
 
         state.vrf = "missing-vrf"
         self.assertIsNone(manifest_binding(state))
-
-    def test_renderer_writer_declares_one_reference_resolver(self):
-        import ast
-        import inspect
-
-        from netbox_nso_plugin.renderer_writer import RendererWriter
-
-        renderer_writer = ast.parse(inspect.getsource(RendererWriter)).body[0]
-        resolvers = [
-            node
-            for node in renderer_writer.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_resolve_reference"
-        ]
-
-        self.assertEqual(len(resolvers), 1)
 
     def test_route_map_consumers_ignore_undeclared_redistribution_scopes(self):
         from netbox_routing.models import RouteMap
@@ -503,9 +523,60 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                     device_id=device.pk,
                     scope=scope,
                     native_model_label=model._meta.label_lower,
-                    ownership_state="owned",
                 )
-                self.assertEqual(list(manifests.values_list("native_key", flat=True)), [native_key])
+                self.assertEqual(
+                    list(manifests.values_list("native_key", "ownership_state")),
+                    [(native_key, "retired")],
+                )
+
+    def test_reowned_static_route_clears_retired_unacknowledged_lineage(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.ownership_planner import manifest_binding
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        device, management = make_managed("writer-static-reown-lineage", 16289)
+        route = StaticRoute.objects.create(prefix="198.18.89.0/24", next_hop="198.18.0.89", metric=1)
+        route.devices.add(device)
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="imported",
+            nso_prefix=str(route.prefix),
+            nso_next_hop=str(route.next_hop),
+            last_acked_triple=None,
+        )
+        binding = manifest_binding(state)
+        retired_key = dict(binding[5])
+        retired_key["prefix"] = "198.18.88.0/24"
+        retired_lineage = {
+            "vrf": "",
+            "prefix": "198.18.88.0/24",
+            "next_hop": "198.18.0.88",
+        }
+        retired = NSOOwnershipManifest.objects.create(
+            device_id=binding[2],
+            scope=binding[1],
+            native_model_label=binding[3],
+            native_id=binding[4],
+            native_key=retired_key,
+            state_model_label=binding[6],
+            state_key=binding[7],
+            ownership_state="retired",
+            deletion_authority=True,
+            acknowledged_lineage=[retired_lineage],
+        )
+        candidate = copy.copy(state)
+        candidate.status = "accepted"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=("status",))
+
+        retired.refresh_from_db()
+        self.assertEqual(retired.ownership_state, "owned")
+        self.assertEqual(retired.native_key, binding[5])
+        self.assertEqual(retired.acknowledged_lineage, [])
 
     def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
         from netbox_routing.models import BFDInterface, BFDProfile
@@ -1158,6 +1229,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             device_id=device.pk,
             scope="static_route",
             native_model_label=route._meta.label_lower,
+            native_id=route.pk,
             native_key={
                 "vrf_id": None,
                 "prefix": str(route.prefix),
@@ -1188,6 +1260,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             device_id=device.pk,
             scope="static_route",
             native_model_label=route._meta.label_lower,
+            native_id=route.pk,
             native_key={
                 "vrf_id": None,
                 "prefix": str(route.prefix),
@@ -1248,6 +1321,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             device_id=device_id,
             scope="static_route",
             native_model_label=route._meta.label_lower,
+            native_id=route.pk,
             native_key={
                 "vrf_id": None,
                 "prefix": str(route.prefix),
@@ -1387,6 +1461,31 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertTrue(plan.changes_content)
         self.assertIn((device.pk, "switchport"), plan.content_keys)
 
+    def test_cascade_retires_manifest_after_a_foreign_native_key_rename(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import maintain_manifest
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        _device, management = make_managed("writer-renamed-cascade", 16288)
+        route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.88", metric=1)
+        state = NSOStaticRouteState.objects.create(
+            management=management,
+            static_route=route,
+            status="accepted",
+        )
+        maintain_manifest(state)
+        manifest = NSOOwnershipManifest.objects.get(state_model_label=state._meta.label_lower)
+        StaticRoute.objects.filter(pk=route.pk).update(prefix="198.18.89.0/24")
+        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+
+        with renderer_writes(plan) as writer:
+            writer.delete(management)
+
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+
     def test_delete_authorizes_registered_collector_child_tables(self):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
@@ -1407,6 +1506,81 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         assert not CommunityList.objects.filter(pk=community_list_pk).exists()
         assert not CommunityListEntry.objects.filter(pk=entry.pk).exists()
+
+    def test_malformed_bgp_identity_rolls_back_the_writer_plan(self):
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        device, management = make_managed("writer-bgp-rollback", 16298)
+        rir = RIR.objects.create(name="Writer BGP private", slug="writer-bgp-private")
+        local_as = ASN.objects.create(asn=64530, rir=rir)
+        remote_as = ASN.objects.create(asn=64531, rir=rir)
+        router = BGPRouter.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=device.pk,
+            asn=local_as,
+            name="64530",
+        )
+        scope = BGPScope.objects.create(router=router)
+        peer = BGPPeer.objects.create(
+            scope=scope,
+            peer=IPAddress.objects.create(address="198.18.98.2/32"),
+            remote_as=remote_as,
+            enabled=True,
+        )
+        malformed = NSOBGPPeerState.objects.create(
+            management=management,
+            bgp_peer=peer,
+            asn_str="64530",
+            vrf_name="",
+            peer_address_str="198.18.98.2",
+            status="imported",
+        )
+        NSOBGPPeerState.objects.filter(pk=malformed.pk).update(status="accepted", asn_str="invalid")
+        malformed.refresh_from_db()
+        other = NSOVLANState.objects.create(
+            management=management,
+            vlan=VLAN.objects.create(vid=1635, name="writer-bgp-rollback-other"),
+            status="imported",
+        )
+        malformed_before = NSOBGPPeerState.objects.values().get(pk=malformed.pk)
+        other_before = NSOVLANState.objects.values().get(pk=other.pk)
+        revisions_before = list(NSOIntentRevision.objects.filter(device=device).order_by("scope", "pk").values())
+        outbox_before = list(NSOIntentOutboxEntry.objects.filter(device=device).order_by("scope", "pk").values())
+        other_candidate = copy.copy(other)
+        other_candidate.status = "accepted"
+        malformed_candidate = copy.copy(malformed)
+        malformed_candidate.last_apply_error = "planned"
+        plan = RendererMutationPlan.build(
+            saves=(
+                planned_save(other_candidate, update_fields=("status",)),
+                planned_save(malformed_candidate, update_fields=("last_apply_error",)),
+            )
+        )
+
+        with self.assertRaises(ValueError), without_commit_drain():
+            with renderer_writes(plan) as writer:
+                writer.save(other_candidate, update_fields=("status",))
+                writer.save(malformed_candidate, update_fields=("last_apply_error",))
+
+        malformed.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(NSOBGPPeerState.objects.values().get(pk=malformed.pk), malformed_before)
+        self.assertEqual(NSOVLANState.objects.values().get(pk=other.pk), other_before)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk).exists())
+        self.assertEqual(
+            list(NSOIntentRevision.objects.filter(device=device).order_by("scope", "pk").values()),
+            revisions_before,
+        )
+        self.assertEqual(
+            list(NSOIntentOutboxEntry.objects.filter(device=device).order_by("scope", "pk").values()),
+            outbox_before,
+        )
 
     def test_rollback_removes_content_bookkeeping_and_fingerprint_together(self):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes

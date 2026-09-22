@@ -113,7 +113,7 @@ line-length = 120
 extend-exclude = [".opengrep/tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ"]
+select = ["E", "F", "W", "D", "C901", "I", "RET", "UP", "DTZ", "ASYNC", "SIM"]
 ignore = [
     "E501",
     "F403",
@@ -138,6 +138,7 @@ ignore = [
 max-complexity = 15
 
 [tool.ruff.lint.per-file-ignores]
+"netbox_nso_plugin/tests/**" = ["SIM117"]
 "__init__.py" = ["F401"]
 "*/migrations/*.py" = ["D"]
 "*/tests/*.py" = ["D"]

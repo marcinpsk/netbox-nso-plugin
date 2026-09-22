@@ -190,6 +190,89 @@ class TestOnboardCandidate(TestCase):
     # adapter-push signal gated) and the dashboard polls the job to completion.
     _QUEUED = {"job_id": "55", "nso_device_name": "x", "status": "queued"}
 
+    def test_persists_provision_attempt_before_post(self):
+        """The adapter sees an attempt only after its immutable request is durable."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("durable-provision")
+
+        def admit(**request):
+            tombstone = NSOProvisionTombstone.objects.get(provision_attempt_id=request["provision_attempt_id"])
+            self.assertEqual(tombstone.state, "open")
+            self.assertEqual(tombstone.netbox_device_id, device.pk)
+            self.assertEqual(tombstone.nso_instance, self.instance.adapter_instance_id)
+            self.assertEqual(tombstone.nso_device_name, "durable-provision")
+            self.assertEqual(tombstone.canonical_request, request)
+            self.assertEqual(tombstone.adapter_job_id, "")
+            return self._QUEUED
+
+        with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=admit) as provision:
+            result = onboard_candidate(device, self.instance)
+
+        self.assertTrue(result["ok"])
+        provision.assert_called_once()
+        tombstone = NSOProvisionTombstone.objects.get(netbox_device_id=device.pk)
+        self.assertEqual(tombstone.adapter_job_id, "55")
+
+    def test_retries_the_same_request_with_the_same_attempt(self):
+        """A lost admission response resubmits the durable request unchanged."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("retry-provision")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            side_effect=(RuntimeError("response lost"), self._QUEUED),
+        ) as provision:
+            first = onboard_candidate(device, self.instance)
+            second = onboard_candidate(device, self.instance)
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        first_request, second_request = (call.kwargs for call in provision.call_args_list)
+        self.assertEqual(first_request, second_request)
+        self.assertEqual(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).count(), 1)
+
+    def test_changed_retry_is_refused_while_the_original_attempt_is_open(self):
+        """A changed retry cannot create a second claim for the same device."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("changed-retry-provision")
+        with patch(
+            "netbox_nso_plugin.adapter_client.provision_device",
+            side_effect=RuntimeError("response lost"),
+        ) as provision:
+            first = onboard_candidate(device, self.instance)
+            second = onboard_candidate(device, self.instance, ned_id="test-ned:test-ned")
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["_http_status"], 409)
+        self.assertEqual(second["error"]["code"], "conflict")
+        provision.assert_called_once()
+        self.assertEqual(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).count(), 1)
+
+    def test_adapter_conflict_preserves_the_running_job(self):
+        """An adapter conflict remains a 409 envelope with its recovery job id."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = self._mapped_device("adapter-conflict-provision")
+        conflict = AdapterError(
+            "job running",
+            code="conflict",
+            detail={"job_id": 73},
+            status_code=409,
+        )
+        with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=conflict):
+            result = onboard_candidate(device, self.instance)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["_http_status"], 409)
+        self.assertEqual(result["error"]["detail"]["job_id"], 73)
+
     def test_no_mapping_but_explicit_ned_onboards(self):
         """No mapping is fine when an explicit ned_id is given (override / no mapping)."""
         from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentRevision, NSOPlatformNedMapping
@@ -372,6 +455,104 @@ class TestOnboardCandidate(TestCase):
         res = onboard_candidate(d, self.instance)
         self.assertFalse(res["ok"])
         self.assertIn("already managed", res["error"].lower())
+
+
+class TestAdvanceProvisioning(TestCase):
+    """The UI poll must reach a verdict, and must say when the poll itself failed."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from netbox_nso_plugin.models import NSOInstance
+
+        cls.instance = NSOInstance.objects.create(name="advP", adapter_instance_id="advP")
+
+    def _provisioning(self, tag, *, job_id="99", attempt_job_id="99", with_attempt=True):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOProvisionTombstone
+
+        device = _device(tag)
+        mgmt = NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=self.instance,
+            nso_device_name=tag,
+            onboard_status="provisioning",
+            onboard_job_id=job_id,
+        )
+        if not with_attempt:
+            return mgmt, None
+        tombstone = NSOProvisionTombstone(
+            netbox_device_id=device.pk,
+            nso_instance=self.instance.adapter_instance_id,
+            nso_device_name=tag,
+            canonical_request={},
+            adapter_job_id=attempt_job_id,
+        )
+        tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+        tombstone.save(force_insert=True)
+        return mgmt, tombstone
+
+    def test_a_row_with_no_provision_attempt_is_terminated(self):
+        """Nothing can ever complete this row, so it must not report 'provisioning' forever."""
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        mgmt, _none = self._provisioning("adv-noattempt", with_attempt=False)
+
+        result = advance_provisioning(mgmt)
+
+        self.assertEqual(result["status"], "provision_failed")
+        self.assertTrue(result["error"])
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "provision_failed")
+
+    def test_an_attempt_whose_job_id_was_never_admitted_is_still_swept(self):
+        """A rolled-back job-id update must not hide the attempt from its own poll."""
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        mgmt, tombstone = self._provisioning("adv-nojobid", attempt_job_id="")
+        evidence = {
+            "status": "succeeded",
+            "job_id": 99,
+            "result": {"ok": True, "steps": [{"name": "sync", "ok": True}]},
+        }
+
+        with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value=evidence) as poll:
+            with patch("netbox_nso_plugin.adapter_client.onboard_device", return_value={"id": 4242}):
+                result = advance_provisioning(mgmt)
+
+        poll.assert_called_once_with(tombstone.provision_attempt_id)
+        self.assertEqual(result["status"], "ready")
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "")
+
+    def test_a_transient_poll_failure_is_reported_as_a_poll_error(self):
+        """The dashboard must tell 'still running' apart from 'the poll itself failed'."""
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        mgmt, _tombstone = self._provisioning("adv-blip")
+
+        with patch(
+            "netbox_nso_plugin.adapter_client.get_provision_attempt",
+            side_effect=AdapterError("adapter down", code="nso_unreachable"),
+        ):
+            result = advance_provisioning(mgmt)
+
+        self.assertEqual(result["status"], "provisioning")
+        self.assertEqual(result["poll_error"], "The NSO adapter request failed. See the server log.")
+        mgmt.refresh_from_db()
+        self.assertEqual(mgmt.onboard_status, "provisioning")
+
+    def test_a_deleted_management_row_does_not_raise_out_of_the_poll(self):
+        """A concurrent delete must not escape from the JSON poll view."""
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.onboarding import advance_provisioning
+
+        mgmt, _tombstone = self._provisioning("adv-deleted")
+        NSODeviceManagement.objects.filter(pk=mgmt.pk).delete()
+
+        with patch("netbox_nso_plugin.adapter_client.get_provision_attempt", return_value={"status": "running"}):
+            result = advance_provisioning(mgmt)
+
+        self.assertEqual(result["status"], "deleted")
 
 
 class TestManageExisting(TestCase):
