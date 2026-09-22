@@ -2,6 +2,54 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-09-22)
+
+### Bug Fixes
+
+- **opengrep**: Cover validated adapter entry loops
+  ([`3e4b28c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3e4b28c90cf3f399e86d6073beb927e4ed39cf59))
+
+- **reconcile**: Preserve routing import contracts
+  ([`e2e2db4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e2e2db4640fafeea44267b31786eaf8bb638ebf8))
+
+- **reconcile**: Reject duplicate adapter identities
+  ([`ee101ff`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ee101ff0d58268fc3d618c646dea9474cf040af5))
+
+- **redistribution**: Reject incomplete adapter identities
+  ([`1b88011`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1b88011a7a4b1d16f383e8fbe0732ce349252111))
+
+- **redistribution**: Validate adapter entry collections
+  ([`e9e263d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e9e263dcbb0c4b40f4838d56c3f5ecfe6bb90ce1))
+
+- **tests**: Read and write text files with an explicit encoding
+  ([`8e0b5e6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8e0b5e6106a8895bc2b30fbdd9d0dd12ed9fd152))
+
+### Chores
+
+- **ci**: Bump the actions group with 3 updates
+  ([`e91374f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e91374f9594dcb6887cc5c4373a9a19236a5d5dc))
+
+- **deps**: Bump jsdom in the js-minor-patch group across 1 directory
+  ([`a978b9b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a978b9b6c9aaa12ada1599e4cdaf90bd9c10ac89))
+
+- **deps**: Bump the python-minor-patch group with 2 updates
+  ([`8919839`](https://github.com/marcinpsk/netbox-nso-plugin/commit/89198399d7d39ce4540b84c2008526ba63472325))
+
+- **deps**: Bump vitest from 4.1.11 to 5.0.1
+  ([`d6a19d8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d6a19d86726ec06f3c3e54879f55243622e91e43))
+
+### Testing
+
+- Pin the behaviour behind four declined review findings
+  ([`8a89bdc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8a89bdc185c4046c2c6c5512a7a4d3fac87aa4f6))
+
+- **ownership**: Use a serializable VRF subtest label
+  ([`2621ab2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2621ab2416d4c270e12f4da46a23d7340f085aaa))
+
+- **review**: Exercise audit boundaries and strict VLAN IDs
+  ([`ebf01af`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ebf01af7c76f243154bca772b17200d382e50a76))
+
+
 ## v1.3.1 (2026-09-17)
 
 ### Bug Fixes
