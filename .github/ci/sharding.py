@@ -110,13 +110,13 @@ class ShardReport:
         }
         output = Path(self.config.getoption("ci_shard_report"))
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def aggregate(directory, shards):
     paths = sorted(directory.glob("*/report.json"))
     require(len(paths) == shards, f"Expected {shards} shard reports, found {len(paths)}")
-    reports = [json.loads(path.read_text()) for path in paths]
+    reports = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
     first = reports[0]
     require({row["shard"] for row in reports} == set(range(1, shards + 1)), "Missing or duplicate shard numbers")
     selected = []
@@ -138,7 +138,7 @@ def aggregate(directory, shards):
     require(bool(first["full"]), "Empty full collection")
     require(len(set(first["full"])) == len(first["full"]), "Duplicate node IDs in full collection")
     require(Counter(selected) == Counter(first["full"]), "Shard union omits or duplicates tests")
-    (directory / "durations.json").write_text(json.dumps(durations, indent=2, sort_keys=True) + "\n")
+    (directory / "durations.json").write_text(json.dumps(durations, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     subprocess.run([sys.executable, "-m", "coverage", "combine", "--keep", *coverage_files], check=True)
     subprocess.run([sys.executable, "-m", "coverage", "report"], check=True)
     print(f"Verified {len(selected)} tests across {shards} shards")

@@ -29,7 +29,7 @@ class TestTemplateCommentSyntax(SimpleTestCase):
         templates_dir = pathlib.Path(__file__).resolve().parent.parent / "templates"
         problems = []
         for path in templates_dir.rglob("*.html"):
-            for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
                 for open_t, close_t in self._TOKEN_PAIRS:
                     idx = 0
                     while True:
@@ -77,7 +77,7 @@ class TestBadgeContrast(SimpleTestCase):
         templates_dir = pathlib.Path(__file__).resolve().parent.parent / "templates"
         problems = []
         for path in templates_dir.rglob("*.html"):
-            for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
                 for class_value in self._CLASS_ATTR_RE.findall(line):
                     if "badge" not in class_value.split():
                         continue
@@ -384,7 +384,7 @@ class TestCliDiffDevicesSubtreeToggle(SimpleTestCase):
 
     def test_tab_template_ships_filter_and_toggle(self):
         tpl = pathlib.Path(__file__).resolve().parent.parent / "templates/netbox_nso_plugin/device_nso_tab.html"
-        src = tpl.read_text()
+        src = tpl.read_text(encoding="utf-8")
         self.assertIn("data-clidevonly", src)  # the toggle button
         self.assertIn("window.nsoCliDevicesSubtree", src)  # the exposed filter
         self.assertIn("cliDevicesOnly", src)  # the state the renderer honours

@@ -19,6 +19,9 @@ class NSOPluginConfig(PluginConfig):
     default_settings = {
         "adapter_url": "",
         "adapter_token": "",
+        # Leave one minute of the five-minute audit cadence for other maintenance work.
+        # renderer_audit derives the separate scope cap from the delivery registry.
+        "renderer_audit_tick_budget_seconds": 240,
         # A 'deploying' row that outlives a SUCCEEDED apply by this long without the
         # device ever showing its value escalates to apply_failed (silent drop, #26).
         "stuck_deploying_grace_minutes": 10,
@@ -44,21 +47,14 @@ class NSOPluginConfig(PluginConfig):
         # hash_captured() return "" and every device version falsely read as "matches". Importing
         # it here guarantees the specs exist in every process (web + worker).
         from .derived_intent import _register_description_from_cable
-        from .intent_state import (
-            connect_renderer_input_end_handlers,
-            ensure_delete_signal_origin,
-            register_builtin_renderer_inputs,
-        )
+        from .intent_state import ensure_delete_signal_origin, register_builtin_renderer_inputs
         from .signals import _connect_g_activated
 
         # The field is always available; enabled templates are read live from NetBox.
         _register_description_from_cable()
         ensure_delete_signal_origin()
-        # Register the begin hooks before behavior signals. Register the matching end hooks
-        # afterwards so one implicit permit encloses the complete save or delete sequence.
-        register_builtin_renderer_inputs(connect_ends=False)
+        register_builtin_renderer_inputs()
         _connect_g_activated()
-        connect_renderer_input_end_handlers()
 
         cfg = settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
         self._interface_ip_auto_create = cfg.get("interface_ip_auto_create", False)

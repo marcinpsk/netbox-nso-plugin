@@ -37,7 +37,7 @@ def _adapter_commit_from_workflow() -> str:
     """Read the joined adapter pin from the workflow that checks it out."""
     match = re.search(
         r"repository: marcinpsk/nso-adapter\s+ref: ([0-9a-f]{40})",
-        _WORKFLOW.read_text(),
+        _WORKFLOW.read_text(encoding="utf-8"),
     )
     if match is None:
         raise AssertionError(f"O3c adapter commit is missing or malformed in {_WORKFLOW}")
@@ -402,7 +402,8 @@ class _O3CEnvironment:
                     "  worker_concurrency: 1",
                     "",
                 )
-            )
+            ),
+            encoding="utf-8",
         )
         return config_path, token
 
@@ -487,7 +488,7 @@ class _O3CEnvironment:
         # The adapter runs against the store DSN, and a connection failure both logs it
         # and calls this method, whose output rides into assertion messages. Redact before
         # truncating: a cut inside the DSN drops the ``://`` the lookbehind matches on.
-        text = _DSN_CREDENTIAL.sub("***:***", log_path.read_text(errors="replace"))
+        text = _DSN_CREDENTIAL.sub("***:***", log_path.read_text(encoding="utf-8", errors="replace"))
         return text[-12000:]
 
     def stop(self) -> None:
@@ -846,7 +847,10 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
         environment = _O3CEnvironment()
         self.addCleanup(environment.stop)
         log_path = Path(environment.tempdir.name) / "adapter.log"
-        log_path.write_text('connection to "postgresql+asyncpg://nso_user:s3cr3t-pw@db-host:5432/store" failed\n')
+        log_path.write_text(
+            'connection to "postgresql+asyncpg://nso_user:s3cr3t-pw@db-host:5432/store" failed\n',
+            encoding="utf-8",
+        )
 
         text = environment.log_text(log_path)
 
@@ -863,7 +867,7 @@ class TestO3CEnvironmentFailFast(SimpleTestCase):
         # characters and starts at the password itself.
         tail = 's3cr3t-pw@db-host:5432/store" failed\n'
         head = "A" * 5000 + 'connection to "postgresql+asyncpg://nso_user:'
-        log_path.write_text(head + tail + "x" * (12000 - len(tail)))
+        log_path.write_text(head + tail + "x" * (12000 - len(tail)), encoding="utf-8")
 
         text = environment.log_text(log_path)
 

@@ -26,6 +26,13 @@ class DeploymentTransitionTimeout(RuntimeError):
     """The fleet switch could not acquire its exclusive lock before the deadline."""
 
 
+def gate_recovery_guidance(rerun: str, *, created: bool) -> str:
+    """Return recovery guidance that respects gate ownership."""
+    if created:
+        return f"Fix the cause, rerun {rerun}, then run nso_intent_deployment_gate --abort after it succeeds."
+    return f"Fix the cause and rerun {rerun}. The gate's owning operation must release it."
+
+
 def is_quiesced() -> bool:
     """Return whether the durable fleet switch is active."""
     from .models import NSOIntentDeploymentControl
@@ -118,14 +125,13 @@ def _set_active(active: bool) -> bool:
     acquired = False
     try:
         try:
-            with transaction.atomic():
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT set_config('lock_timeout', %s, true)",
-                        [f"{_EXCLUSIVE_LOCK_TIMEOUT_MS}ms"],
-                    )
-                    cursor.execute("SELECT pg_advisory_lock(%s)", [_LOCK_KEY])
-                    acquired = True
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    [f"{_EXCLUSIVE_LOCK_TIMEOUT_MS}ms"],
+                )
+                cursor.execute("SELECT pg_advisory_lock(%s)", [_LOCK_KEY])
+                acquired = True
         except OperationalError as exc:
             if getattr(exc.__cause__, "sqlstate", None) == "55P03":
                 raise DeploymentTransitionTimeout("Timed out waiting for active intent operations to finish") from None

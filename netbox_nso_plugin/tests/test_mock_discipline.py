@@ -155,13 +155,14 @@ class MockDisciplineAnalyzerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pkg = Path(tmp) / "tests"
             pkg.mkdir()
-            (pkg / "__init__.py").write_text("")
+            (pkg / "__init__.py").write_text("", encoding="utf-8")
             (pkg / "test_thing.py").write_text(
                 "from unittest.mock import MagicMock\n\n"
                 "def test_x():\n"
                 "    a = MagicMock()\n"
                 "    b = MagicMock()\n"
-                "    return a, b\n"
+                "    return a, b\n",
+                encoding="utf-8",
             )
             # Budget of 1 for the two-mock site → exactly one excess is reported.
             self.assertEqual(len(unapproved(root=pkg, baseline={"test_thing.py::test_x": 1})), 1)

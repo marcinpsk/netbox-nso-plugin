@@ -10,6 +10,18 @@ from dataclasses import replace
 logger = logging.getLogger(__name__)
 
 
+def _validated_redistribution_entries(payload) -> list[dict]:
+    """Require the adapter's redistribution collection before planning writes."""
+    from .adapter_client import AdapterError
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        raise AdapterError("Adapter redistribution entries must be a list", code="invalid_response")
+    entries = payload["entries"]
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise AdapterError("Adapter redistribution entries must be objects", code="invalid_response")
+    return entries
+
+
 def redistribution_reconcile_plan(device, payload):
     """Freeze every native and overlay redistribution write before reconciliation."""
     from django.utils import timezone
@@ -24,16 +36,15 @@ def redistribution_reconcile_plan(device, payload):
         if error.name not in {"netbox_routing", "netbox_routing.models"}:
             raise
         return RendererMutationPlan.build(planned_at=planned_at)
-    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, payload, planned_at)
+    entries = _validated_redistribution_entries(payload)
+    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, entries, planned_at)
     plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
         read_dependencies=dependencies,
         planned_at=planned_at,
     )
-    route_map_groups = {
-        ("route_map", entry.get("route_map")) for entry in payload.get("entries") or [] if entry.get("route_map")
-    }
+    route_map_groups = {("route_map", entry.get("route_map")) for entry in entries if entry.get("route_map")}
     policy_footprint = route_policy_footprint(route_map_groups)
     policy_dependencies = MutationFootprint.for_keys(
         (),
@@ -126,13 +137,14 @@ def _redist_overlay_matches_device(state, entry: dict) -> bool:
     )
 
 
-def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: C901
+def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: C901
     """Build the deterministic redistribution writes used by preflight and apply."""
     from django.contrib.contenttypes.models import ContentType
     from netbox_routing.models import Redistribution, RouteMap
 
     from . import merge_util
     from . import status_machine as sm
+    from .adapter_client import AdapterError
     from .models import NSODeviceManagement, NSORedistributionState
     from .renderer_writer import planned_delete, planned_save
 
@@ -167,16 +179,19 @@ def _redistribution_reconcile_operations(device, payload, planned_at):  # noqa: 
         deletes.append(planned_delete(instance))
         operations.append(("delete", instance, None, False, ()))
 
-    for entry in payload.get("entries") or []:
+    for entry in entries:
         destination_protocol = entry.get("dest_protocol") or ""
         destination_ref = entry.get("dest_ref") or ""
         source_protocol = entry.get("source_protocol") or ""
         source_ref = entry.get("source_ref") or ""
         if not destination_protocol or not source_protocol:
-            continue
+            raise AdapterError(
+                "Adapter returned a redistribution entry without a destination or source protocol",
+                code="invalid_response",
+            )
         key = (destination_protocol, destination_ref, source_protocol, source_ref)
         if key in seen:
-            continue
+            raise AdapterError("Adapter returned duplicate redistribution identity", code="invalid_response")
         seen.add(key)
         current = states.get(key)
         state = (
@@ -354,6 +369,7 @@ def reconcile_redistribution(device, payload: dict) -> list:
         logger.warning("netbox_routing not installed; skipping redistribution reconcile")
         return []
 
+    _validated_redistribution_entries(payload)
     from .models import NSODeviceManagement, NSORedistributionState
     from .renderer_writer import (
         active_renderer_writer,

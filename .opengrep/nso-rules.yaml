@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba
+rules:
+  - id: nso-push-inside-suppression
+    languages: [python]
+    severity: ERROR
+    message: Schedule the intent push after the suppression context exits.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              with suppress_intent_push():
+                  ...
+          - pattern-inside: |
+              with $MODULE.suppress_intent_push():
+                  ...
+      - pattern-either:
+          - pattern: _schedule_intent_push(...)
+          - pattern: $SIGNALS._schedule_intent_push(...)
+  - id: nso-tautological-assertion
+    languages: [python]
+    severity: ERROR
+    message: Compare the observed value with an independent expected value.
+    patterns:
+      - pattern-either:
+          - pattern: $SELF.assertEqual($VALUE, $VALUE, ...)
+          - pattern: assert $VALUE == $VALUE
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+  - id: nso-global-monotonic-patch
+    languages: [python]
+    severity: ERROR
+    message: Patch a module-local clock wrapper. Patching time.monotonic changes the shared module.
+    patterns:
+      - pattern: unittest.mock.patch($TARGET, ...)
+      - metavariable-regex:
+          metavariable: $TARGET
+          regex: '[\x22\x27](?:[a-zA-Z_][a-zA-Z0-9_]*\.)*time\.monotonic[\x22\x27]'
+  - id: nso-swallowed-barrier-failure
+    languages: [python]
+    severity: ERROR
+    message: Fail the test when a synchronization barrier breaks.
+    pattern-either:
+      - pattern: |
+          try:
+              ...
+          except threading.BrokenBarrierError:
+              pass
+      - pattern: |
+          try:
+              ...
+          except threading.BrokenBarrierError:
+              return
+  - id: nso-vlan-group-mutable-lookup
+    languages: [python]
+    severity: ERROR
+    message: Look up VLANGroup by its unique slug. Put the mutable name in defaults.
+    pattern: ipam.models.VLANGroup.objects.get_or_create(..., slug=$SLUG, name=$NAME, ...)
+  - id: nso-write-set-cardinality-assertion
+    languages: [python]
+    severity: ERROR
+    message: Use assertCountEqual so an exact write-set assertion preserves duplicate writes.
+    pattern-either:
+      - pattern: $SELF.assertEqual({$VALUE for $WRITE in $PLAN.write_set}, $EXPECTED, ...)
+      - pattern: $SELF.assertEqual({$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, $EXPECTED, ...)
+      - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set}, ...)
+      - pattern: $SELF.assertEqual($EXPECTED, {$VALUE for $WRITE in $PLAN.write_set if $CONDITION}, ...)
+  - id: nso-implicit-text-encoding
+    languages: [python]
+    severity: ERROR
+    message: Pass encoding="utf-8" so the text file decodes the same on every platform.
+    patterns:
+      - pattern-either:
+          - pattern: $P.read_text(...)
+          - pattern: $P.write_text(...)
+          - pattern: $P.open(...)
+          - pattern: open(...)
+      - pattern-not: $P.read_text(..., encoding=$E, ...)
+      - pattern-not: $P.write_text(..., encoding=$E, ...)
+      - pattern-not: $P.open(..., encoding=$E, ...)
+      - pattern-not: open(..., encoding=$E, ...)
+      # A literal mode string that contains "b" opens the file in binary mode.
+      - pattern-not:
+          patterns:
+            - pattern-either:
+                - pattern: open($FILE, $MODE, ...)
+                - pattern: open(..., mode=$MODE, ...)
+                - pattern: $P.open($MODE, ...)
+                - pattern: $P.open($FILE, $MODE, ...)
+                - pattern: $P.open(..., mode=$MODE, ...)
+            - metavariable-regex:
+                metavariable: $MODE
+                regex: '^[\x22\x27][^\x22\x27]*b'
+  - id: nso-silent-duplicate-adapter-entry
+    languages: [python]
+    severity: ERROR
+    message: Reject a repeated adapter entry instead of keeping the first value.
+    patterns:
+      - pattern: |
+          if $KEY in $SEEN:
+              continue
+      - pattern-either:
+          - pattern-inside: |
+              for $ENTRY in $PAYLOAD.get("entries") or []:
+                  ...
+          - pattern-inside: |
+              for $ENTRY in normalized:
+                  ...
+          - pattern-inside: |
+              for $ENTRY in entries:
+                  ...

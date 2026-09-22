@@ -13,6 +13,7 @@ an already-accepted sequence returns the stored response and applies nothing, ex
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import json
@@ -71,28 +72,72 @@ def mirror_update(instance, **values):
     return update_mirror_fields(instance, **values)
 
 
+def reset_renderer_audit_rotation(test_case):
+    """Reset process-local audit cursors before and after one test case."""
+    from netbox_nso_plugin import renderer_audit
+
+    def reset():
+        renderer_audit._FLEET_ROTATION["after_device_id"] = 0
+        renderer_audit._SCOPE_ROTATION.clear()
+
+    reset()
+    test_case.addCleanup(reset)
+
+
+def trust_scope(device, management, scope):
+    """Certify the current render as one scope's verified baseline."""
+    from django.utils import timezone
+
+    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.models import NSOIntentRevision
+
+    revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope=scope)
+    revision.verified_revision = revision.revision
+    revision.verified_fingerprint = delivery.canonical_fingerprint(
+        delivery.render(scope, device.pk, management.adapter_device_id).payload
+    )
+    revision.verified_at = timezone.now()
+    revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
+    return revision
+
+
 def content_update(instance, **values):
-    """Persist a fixture's rendered change through its exact content footprint."""
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    """Persist a fixture change through the production exact writer."""
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
     current = type(instance).objects.get(pk=instance.pk)
-    footprint = footprint_for_instance(current)
-    with without_commit_drain(), intent_transaction(footprint):
-        for field_name, value in values.items():
-            setattr(current, field_name, value)
-        current.save(update_fields=set(values))
+    candidate = copy.copy(current)
+    for field_name, value in values.items():
+        setattr(candidate, field_name, value)
+    fields = set(values)
+    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+    with without_commit_drain(), mutation(plan) as writer:
+        writer.save(candidate, update_fields=fields)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
-    return current
+    return candidate
 
 
 def content_bulk_update(instance, **values):
-    """Persist exact rendered fixture DML without firing model signals."""
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    """Persist set-based fixture DML through the production exact writer."""
+    from netbox_nso_plugin.renderer_writer import (
+        RendererMutationPlan,
+        planned_set_update,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
 
-    current = type(instance).objects.get(pk=instance.pk)
-    with without_commit_drain(), intent_transaction(footprint_for_instance(current)):
-        type(current).objects.filter(pk=current.pk).update(**values)
+    model = type(instance)
+    plan = RendererMutationPlan.build(set_updates=(planned_set_update(model.objects.filter(pk=instance.pk), **values),))
+    mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
+    with without_commit_drain(), mutation(plan) as writer:
+        writer.set_update(model, plan.write_set[0], **values)
     for field_name, value in values.items():
         setattr(instance, field_name, value)
     return type(instance).objects.get(pk=instance.pk)
@@ -100,13 +145,17 @@ def content_bulk_update(instance, **values):
 
 def own_vlan(mgmt, vid: int, tag: str):
     """One owned VLAN overlay, which is what a VLAN render puts on the wire."""
-    from ipam.models import VLAN
+    from ipam.models import VLAN, VLANGroup
 
     from netbox_nso_plugin.models import NSOVLANState
     from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
     with without_commit_drain(), transaction.atomic():
-        vlan = VLAN.objects.create(vid=vid, name=f"cl-{tag}-v{vid}")
+        group, _ = VLANGroup.objects.get_or_create(
+            slug=f"nso-{mgmt.device_id}",
+            defaults={"name": f"NSO {mgmt.device.name}"},
+        )
+        vlan = VLAN.objects.create(group=group, vid=vid, name=f"cl-{tag}-v{vid}")
         state = NSOVLANState(management=mgmt, vlan=vlan, status="accepted")
         plan = RendererMutationPlan.build(
             saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),)

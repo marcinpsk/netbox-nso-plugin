@@ -4,29 +4,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
-from contextlib import contextmanager
 
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import adapter_client, delivery, drain, outbox
-from netbox_nso_plugin.deployment import gate_bypass, quiesce, resume
+from netbox_nso_plugin.deployment import gate_bypass, gate_recovery_guidance, quiesce, resume
 from netbox_nso_plugin.restore import advance_static_route_pk
 
 
-@contextmanager
+@contextlib.contextmanager
 def _gate_failure_guidance(*, created):
     """Name the manual recovery for a restore that deliberately fails closed."""
     try:
         yield
     except (CommandError, adapter_client.AdapterError) as exc:
-        if created:
-            recovery = (
-                "Fix the cause, rerun nso_intent_restore, then run nso_intent_deployment_gate --abort "
-                "after the restore succeeds."
-            )
-        else:
-            recovery = "Fix the cause and rerun nso_intent_restore. The gate's owning operation must release it."
+        recovery = gate_recovery_guidance("nso_intent_restore", created=created)
         raise CommandError(f"{exc}. The deployment gate remains closed. {recovery}") from exc
 
 
@@ -182,5 +176,15 @@ class Command(BaseCommand):
                     drain.release_restored_replay(state.device_id, state.scope)
                 self.stdout.write(f"{key_name}: {verdict}")
         if created:
-            resume()
+            try:
+                resume()
+            except BaseException:
+                with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
+                    self.stderr.write(
+                        self.style.ERROR(
+                            "Intent restore completed, but intent work may remain quiesced. "
+                            "Fix the cause and run nso_intent_deployment_gate --abort."
+                        )
+                    )
+                raise
         self.stdout.write(self.style.SUCCESS(f"Restore resolved {len(states)} outstanding claim(s)"))

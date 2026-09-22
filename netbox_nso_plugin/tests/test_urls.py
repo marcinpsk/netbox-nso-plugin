@@ -153,7 +153,7 @@ class TestWarningBadgeContrast(SimpleTestCase):
                 if fname.endswith(".html"):
                     path = os.path.join(dirpath, fname)
                     rel = os.path.relpath(path, _TEMPLATES_DIR)
-                    with open(path) as fh:
+                    with open(path, encoding="utf-8") as fh:
                         results[rel] = fh.read()
         return results
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 from django.conf import settings
@@ -108,7 +109,17 @@ class Command(BaseCommand):
                 raise CommandError("Deployment gate blocked: " + "; ".join(blockers))
         except BaseException:
             if created:
-                resume()
+                try:
+                    resume()
+                except BaseException:
+                    with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
+                        self.stderr.write(
+                            self.style.ERROR(
+                                "Deployment gate preparation failed and intent work may remain quiesced. "
+                                "Fix the cause and run nso_intent_deployment_gate --abort."
+                            )
+                        )
+                    raise
             raise
         self.stdout.write(self.style.SUCCESS("Deployment gate prepared; deploy the adapter, then the plugin"))
 
@@ -164,7 +175,20 @@ class Command(BaseCommand):
         blockers = drain.gate_blockers()
         if blockers:
             raise CommandError("New work appeared during verification: " + "; ".join(blockers))
-        resume()
+        self._resume_after_verification()
+
+    def _resume_after_verification(self):
+        try:
+            resume()
+        except BaseException:
+            with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
+                self.stderr.write(
+                    self.style.ERROR(
+                        "Deployment verification passed, but intent work may remain quiesced. "
+                        "Fix the cause and run nso_intent_deployment_gate --abort."
+                    )
+                )
+            raise
         self.stdout.write(self.style.SUCCESS("Deployment verification passed; normal intent operation resumed"))
 
     @staticmethod

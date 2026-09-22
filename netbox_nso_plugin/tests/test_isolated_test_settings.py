@@ -16,7 +16,7 @@ SETTINGS = Path(__file__).resolve().parents[2] / "isolated_test_settings.py"
 
 class TestIsolatedTestSettings(SimpleTestCase):
     def test_documented_command_uses_a_valid_shell_safe_database_name(self):
-        instructions = SETTINGS.read_text()
+        instructions = SETTINGS.read_text(encoding="utf-8")
 
         self.assertIn(
             "TEST_DB_NAME=test_nso_local PYTHONPATH=/workspaces/nso/netbox-nso-plugin",

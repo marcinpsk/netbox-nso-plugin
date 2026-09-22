@@ -7,6 +7,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from ._ast_scope import resolve_call_target, scope_bindings
+
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _NO_DEFAULT = object()
 
@@ -16,7 +18,7 @@ class _SyntheticSource:
         self.name = name
         self.source = source
 
-    def read_text(self):
+    def read_text(self, encoding=None):
         return self.source
 
     def __str__(self):
@@ -44,7 +46,7 @@ def _module_constants(tree):
 
 
 def _defaulted_constant_lookups(path):
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     constants = _module_constants(tree)
     violations = []
     for node in ast.walk(tree):
@@ -87,23 +89,24 @@ def _defaulted_constant_lookups(path):
     return violations
 
 
-def _raises_adapter_error(node):
+_ADAPTER_ERROR_TARGET = "netbox_nso_plugin.adapter_client.AdapterError"
+
+
+def _raises_adapter_error(node, bindings):
     if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
         return False
-    function = node.exc.func
-    return (isinstance(function, ast.Name) and function.id == "AdapterError") or (
-        isinstance(function, ast.Attribute) and function.attr == "AdapterError"
-    )
+    return resolve_call_target(node.exc, bindings) == _ADAPTER_ERROR_TARGET
 
 
 def _validation_and_skip_loops(path):
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    bindings = scope_bindings(tree)
     violations = []
     for loop in (node for node in ast.walk(tree) if isinstance(node, (ast.For, ast.AsyncFor))):
         descendants = [node for statement in loop.body for node in ast.walk(statement)]
         if not any(isinstance(node, ast.Continue) for node in descendants):
             continue
-        for raised in (node for node in descendants if _raises_adapter_error(node)):
+        for raised in (node for node in descendants if _raises_adapter_error(node, bindings[node])):
             violations.append(
                 f"{path.relative_to(_PACKAGE_ROOT.parent)}:{raised.lineno} "
                 f"shares a loop with continue at line {loop.lineno}"
@@ -143,6 +146,45 @@ def test_defaulted_constant_lookup_allows_a_literal_unmapped_sentinel():
     )
 
     assert _defaulted_constant_lookups(source) == []
+
+
+def test_adapter_error_import_aliases_are_checked_and_guarded_aliases_are_allowed():
+    source = _SyntheticSource(
+        "snippet.py",
+        """\
+import netbox_nso_plugin.adapter_client as client
+from netbox_nso_plugin.adapter_client import AdapterError as PayloadError
+from .adapter_client import AdapterError as RelativePayloadError
+
+def module_alias(items):
+    for item in items:
+        if not item:
+            continue
+        raise client.AdapterError("invalid")
+
+def symbol_alias(items):
+    for item in items:
+        if not item:
+            continue
+        raise PayloadError("invalid")
+
+def relative_alias(items):
+    for item in items:
+        if not item:
+            continue
+        raise RelativePayloadError("invalid")
+
+def guarded_alias(items):
+    for item in items:
+        raise PayloadError("invalid")
+""",
+    )
+
+    assert _validation_and_skip_loops(source) == [
+        "snippet.py:9 shares a loop with continue at line 6",
+        "snippet.py:15 shares a loop with continue at line 12",
+        "snippet.py:21 shares a loop with continue at line 18",
+    ]
 
 
 def test_reconciler_validation_is_separate_from_resolution_skips():

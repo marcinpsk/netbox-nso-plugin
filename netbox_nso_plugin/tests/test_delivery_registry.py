@@ -17,6 +17,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import SimpleTestCase, TestCase
 
+from ._outbox_case import trust_scope
 from .mixins import IntentPushResetMixin
 
 APP = "netbox_nso_plugin"
@@ -29,7 +30,7 @@ def _delivery_keys_at_the_push_sites() -> set[str]:
     A hand-kept list drifts (``ip`` versus ``interface_ip``, O-P12); the compiler's own
     view of the call sites cannot.
     """
-    source = Path(inspect.getsourcefile(__import__(f"{APP}.signals", fromlist=["signals"]))).read_text()
+    source = Path(inspect.getsourcefile(__import__(f"{APP}.signals", fromlist=["signals"]))).read_text(encoding="utf-8")
     keys: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
@@ -127,7 +128,7 @@ class TestDeliveryRegistry(SimpleTestCase):
             scanned.append(relative.as_posix())
             literals = {
                 node.value
-                for node in ast.walk(ast.parse(path.read_text()))
+                for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
             }
             if "interface_config" in literals:
@@ -241,6 +242,7 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
                 nso_next_hop="198.51.100.1",
                 intent_generation=generation,
             )
+        trust_scope(device, mgmt, "static_route")
         echo = {"count": 1, "routes": [{"route_id": route.pk, "generation": generation, "fingerprint": "fp-1"}]}
 
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=echo):
