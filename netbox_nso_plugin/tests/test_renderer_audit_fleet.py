@@ -173,10 +173,11 @@ class TestRendererFleetTombstoneSweep(_FleetCase):
     def _tombstone(self, state, *, netbox_device_id=None):
         from netbox_nso_plugin.models import NSOProvisionTombstone
 
+        device_id = self.device_ids[0] if netbox_device_id is None else netbox_device_id
         return NSOProvisionTombstone.objects.create(
-            netbox_device_id=self.device_ids[0] if netbox_device_id is None else netbox_device_id,
+            netbox_device_id=device_id,
             nso_instance="cl-fleet-inst",
-            nso_device_name="nso-cl-fleet-orphan",
+            nso_device_name=f"nso-cl-fleet-orphan-{device_id}",
             canonical_request={},
             state=state,
         )

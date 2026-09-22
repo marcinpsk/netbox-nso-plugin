@@ -244,6 +244,14 @@ def _provision_conflict(result, *, code="conflict", message, detail=None):
     return result
 
 
+def _provision_attempt_detail(tombstone):
+    """Return the active attempt identifiers needed to correlate a conflict."""
+    detail = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
+    if tombstone.adapter_job_id:
+        detail["job_id"] = tombstone.adapter_job_id
+    return detail
+
+
 def _claim_provision_attempt(locked_device, instance, nso_name, request_body):
     """Reuse one identical open attempt, create one, or return conflict detail."""
     from .models import NSOProvisionTombstone
@@ -268,10 +276,7 @@ def _claim_provision_attempt(locked_device, instance, nso_name, request_body):
         )
         if exact_identity and canonical_body == request_body:
             return tombstone, None
-        detail = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
-        if tombstone.adapter_job_id:
-            detail["job_id"] = tombstone.adapter_job_id
-        return None, detail
+        return None, _provision_attempt_detail(tombstone)
 
     tombstone = NSOProvisionTombstone(
         netbox_device_id=locked_device.pk,
@@ -412,9 +417,15 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         constraint = getattr(getattr(exc.__cause__, "diag", None), "constraint_name", None)
         if constraint != OPEN_PROVISION_NAME_CONSTRAINT:
             raise
+        active = NSOProvisionTombstone.objects.filter(
+            state="open",
+            nso_instance=instance.adapter_instance_id,
+            nso_device_name=nso_name,
+        ).first()
         return _provision_conflict(
             result,
             message="A different provision attempt is already active for this device or NSO name.",
+            detail=_provision_attempt_detail(active) if active is not None else None,
         )
     provision_request = dict(tombstone.canonical_request)
 

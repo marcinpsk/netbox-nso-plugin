@@ -34,6 +34,7 @@ class _PeerProvisionClaim:
         self.instance_id = instance_id
         self.nso_name = nso_name
         self.fired = False
+        self.peer_attempt_id = None
 
     def __call__(self, execute, sql, params, many, context):
         result = execute(sql, params, many, context)
@@ -48,12 +49,14 @@ class _PeerProvisionClaim:
         alias = "onboarding_claim_peer"
         connections[alias] = connection.copy(alias=alias)
         try:
-            NSOProvisionTombstone.objects.using(alias).create(
+            peer = NSOProvisionTombstone.objects.using(alias).create(
                 netbox_device_id=self.device_id,
                 nso_instance=self.instance_id,
                 nso_device_name=self.nso_name,
                 canonical_request={},
+                adapter_job_id="claim-job",
             )
+            self.peer_attempt_id = str(peer.provision_attempt_id)
         finally:
             connections[alias].close()
             del connections[alias]
@@ -83,6 +86,10 @@ class TestConcurrentProvisionClaims(TransactionTestCase):
         self.assertTrue(seam.fired)
         self.assertEqual(result["_http_status"], 409)
         self.assertEqual(result["error"]["code"], "conflict")
+        self.assertEqual(
+            result["error"]["detail"],
+            {"provision_attempt_id": seam.peer_attempt_id, "job_id": "claim-job"},
+        )
         provision.assert_not_called()
         self.assertEqual(
             NSOProvisionTombstone.objects.filter(

@@ -633,7 +633,7 @@ class TestProvisionSweepBudget(TestCase):
         from netbox_nso_plugin.provision_lifecycle import _FLEET_SWEEP_LIMIT, sweep_provision_tombstones
 
         rows = [
-            self._open_tombstone("budget", netbox_device_id=index + 1, age=timedelta(seconds=10_000 - index))
+            self._open_tombstone(f"budget-{index}", netbox_device_id=index + 1, age=timedelta(seconds=10_000 - index))
             for index in range(_FLEET_SWEEP_LIMIT + 2)
         ]
         polled = []
@@ -652,7 +652,7 @@ class TestProvisionSweepBudget(TestCase):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
         rows = [
-            self._open_tombstone("deadline", netbox_device_id=index + 1, age=timedelta(seconds=100 - index))
+            self._open_tombstone(f"deadline-{index}", netbox_device_id=index + 1, age=timedelta(seconds=100 - index))
             for index in range(2)
         ]
         polled = []
@@ -674,7 +674,7 @@ class TestProvisionSweepBudget(TestCase):
         from netbox_nso_plugin.provision_lifecycle import _FLEET_SWEEP_LIMIT, sweep_provision_tombstones
 
         rows = [
-            self._open_tombstone("rotation", netbox_device_id=index + 1, age=timedelta(seconds=10_000 - index))
+            self._open_tombstone(f"rotation-{index}", netbox_device_id=index + 1, age=timedelta(seconds=10_000 - index))
             for index in range(_FLEET_SWEEP_LIMIT + 1)
         ]
         polled = []
