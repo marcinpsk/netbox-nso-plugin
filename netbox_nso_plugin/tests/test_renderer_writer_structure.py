@@ -828,9 +828,56 @@ def _handler_entry_state(body, bound, builders) -> set[str]:
     entry = set(bound)
     current = set(bound)
     for statement in body:
+        for inner_entry in _compound_handler_entry_states(statement, current, builders):
+            entry.intersection_update(inner_entry)
         current = _plan_state_after(statement, current, builders)
         entry.intersection_update(current)
     return entry
+
+
+def _compound_handler_entry_states(statement, bound, builders) -> list[set[str]]:
+    if isinstance(statement, ast.If):
+        tested = _expression_state_after(statement.test, bound, builders)
+        return [
+            _handler_entry_state(statement.body, tested, builders),
+            _handler_entry_state(statement.orelse, tested, builders),
+        ]
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        entered = _with_header_state(statement, bound, builders)
+        return [_handler_entry_state(statement.body, entered, builders)]
+    if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+        entered = _loop_body_entry(statement, bound, builders)
+        return [
+            _handler_entry_state(statement.body, entered, builders),
+            _handler_entry_state(statement.orelse, _loop_no_break_state(statement, bound, builders), builders),
+        ]
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        body_entry = _handler_entry_state(statement.body, bound, builders)
+        normal = _plan_state_after_block(statement.body, bound, builders)
+        orelse_entry = _handler_entry_state(statement.orelse, normal, builders)
+        handler_states = []
+        handler_entries = []
+        for handler in statement.handlers:
+            handler_bound = set(body_entry)
+            if handler.name is not None:
+                handler_bound.discard(handler.name)
+            handler_states.append(_plan_state_after_block(handler.body, handler_bound, builders))
+            handler_entries.append(_handler_entry_state(handler.body, handler_bound, builders))
+        final_bound = _merge_plan_states(
+            [
+                _plan_state_after_block(statement.orelse, normal, builders),
+                *handler_states,
+                body_entry,
+                orelse_entry,
+                *handler_entries,
+            ]
+        )
+        final_entry = _handler_entry_state(statement.finalbody, final_bound, builders)
+        return [body_entry, orelse_entry, *handler_entries, final_entry]
+    if isinstance(statement, ast.Match):
+        case_states, _unmatched = _match_case_states(statement, bound, builders)
+        return [_handler_entry_state(case.body, entered, builders) for case, entered in case_states]
+    return []
 
 
 def _plan_state_after_compound(statement, bound, builders) -> set[str]:
@@ -928,6 +975,7 @@ def _plan_names_before_try(statement, target, builders, bound) -> set[str]:
         return _plan_names_before(statement.orelse, target, builders, normal)
     handler_states = []
     handler_entry = _handler_entry_state(statement.body, bound, builders)
+    exceptional_states = [handler_entry, _handler_entry_state(statement.orelse, normal, builders)]
     for handler in statement.handlers:
         handler_bound = set(handler_entry)
         if handler.name is not None:
@@ -935,7 +983,8 @@ def _plan_names_before_try(statement, target, builders, bound) -> set[str]:
         if _body_contains(handler.body, target):
             return _plan_names_before(handler.body, target, builders, handler_bound)
         handler_states.append(_plan_state_after_block(handler.body, handler_bound, builders))
-    branches = [_plan_state_after_block(statement.orelse, normal, builders), *handler_states]
+        exceptional_states.append(_handler_entry_state(handler.body, handler_bound, builders))
+    branches = [_plan_state_after_block(statement.orelse, normal, builders), *handler_states, *exceptional_states]
     return _plan_names_before(statement.finalbody, target, builders, _merge_plan_states(branches))
 
 
@@ -1388,6 +1437,200 @@ def repair(stale):
             _stale_plan_source(source, "fixture.py"),
             [("fixture.py", "plan", 9)],
         )
+
+    def test_a_finally_consumer_sees_an_exception_after_a_nested_if_binding(self):
+        source = """
+def repair(stale, flag):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            if flag:
+                plan = stale
+                prepare()
+                plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_a_finally_consumer_sees_an_exception_after_a_nested_with_binding(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            with nullcontext():
+                plan = stale
+                prepare()
+                plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_a_finally_consumer_sees_an_exception_after_a_nested_loop_binding(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            for item in items:
+                plan = stale
+                prepare(item)
+                plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_a_handler_consumer_sees_an_exception_after_a_nested_binding(self):
+        source = """
+def repair(stale, flag):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            if flag:
+                plan = stale
+                prepare()
+                plan = RendererMutationPlan.build()
+        except:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 11)],
+        )
+
+    def test_nested_exceptional_paths_accept_a_plan_repaired_before_consumption(self):
+        sources = (
+            """
+def repair(stale, flag):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            if flag:
+                plan = stale
+                prepare()
+                plan = RendererMutationPlan.build()
+        finally:
+            plan = RendererMutationPlan.build()
+            consume_renderer_plan(plan, permit)
+""",
+            """
+def repair(flag):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            if flag:
+                prepare()
+                plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+""",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(_stale_plan_source(source, "fixture.py"), [])
+
+    def test_a_finally_consumer_sees_an_early_try_exception(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = stale
+        try:
+            prepare()
+            plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 9)],
+        )
+
+    def test_a_finally_consumer_sees_an_early_else_exception(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = stale
+        try:
+            prepare_body()
+        except ValueError:
+            plan = RendererMutationPlan.build()
+        else:
+            prepare_else()
+            plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 13)],
+        )
+
+    def test_a_finally_consumer_sees_an_early_exception_group_handler_exception(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = stale
+        try:
+            prepare_body()
+            plan = RendererMutationPlan.build()
+        except* ValueError:
+            prepare_handler()
+            plan = RendererMutationPlan.build()
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(source, "fixture.py"),
+            [("fixture.py", "plan", 12)],
+        )
+
+    def test_a_finally_consumer_accepts_a_plan_valid_on_every_entry(self):
+        sources = (
+            """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            prepare()
+        finally:
+            consume_renderer_plan(plan, permit)
+""",
+            """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = stale
+        try:
+            prepare()
+            plan = RendererMutationPlan.build()
+        finally:
+            plan = RendererMutationPlan.build()
+            consume_renderer_plan(plan, permit)
+""",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(_stale_plan_source(source, "fixture.py"), [])
 
     def test_a_later_loop_iteration_sees_the_previous_non_plan_binding(self):
         source = """
