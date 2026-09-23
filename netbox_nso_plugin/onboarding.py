@@ -359,7 +359,7 @@ def _close_rejected_provision_claim(tombstone):
 
 
 def _reconcile_rejected_provision_claim(tombstone):
-    """Close a reused claim only when the adapter has no earlier admission."""
+    """Close a claim only when the adapter has no earlier admission."""
     from . import adapter_client as client
     from .models import NSOProvisionTombstone
 
@@ -393,6 +393,8 @@ def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new):
         with transaction.atomic():
             locked_device, conflict = _lock_provision_tombstone_identity(device_id, instance, nso_name)
             if conflict is not None:
+                if claim_was_new:
+                    _reconcile_rejected_provision_claim(tombstone)
                 result["error"] = conflict
                 return result
 
@@ -406,10 +408,7 @@ def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new):
             except client.AdapterError as exc:
                 if not exc.definitely_not_enqueued:
                     raise
-                if claim_was_new and exc.status_code != 409:
-                    _close_rejected_provision_claim(tombstone)
-                else:
-                    _reconcile_rejected_provision_claim(tombstone)
+                _reconcile_rejected_provision_claim(tombstone)
                 return _adapter_provision_failure(result, nso_name=nso_name, job_id="", exc=exc)
             job_id = str((prov or {}).get("job_id") or "")
             if not job_id:

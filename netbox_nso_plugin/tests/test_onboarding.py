@@ -65,6 +65,44 @@ class _PeerProvisionClaim:
         return result
 
 
+class _ProvisionAdapterFake:
+    """Keep provision admission evidence outside the database transaction."""
+
+    def __init__(self):
+        self.attempts = {}
+        self.lookup_calls = []
+        self.provision_calls = []
+        self.lookup_error = None
+
+    def provision_device(self, **request):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        self.provision_calls.append(request)
+        attempt_id = str(request["provision_attempt_id"])
+        if attempt_id in self.attempts:
+            raise AdapterError("Authentication failed", code="unauthorized", status_code=401)
+        evidence = {
+            "provision_attempt_id": attempt_id,
+            "job_id": "admitted-job",
+            "status": "running",
+            "error": None,
+            "result": None,
+        }
+        self.attempts[attempt_id] = evidence
+        return evidence
+
+    def get_provision_attempt(self, provision_attempt_id):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        attempt_id = str(provision_attempt_id)
+        self.lookup_calls.append(attempt_id)
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        if attempt_id not in self.attempts:
+            raise AdapterError("not found", code="not_found", status_code=404)
+        return self.attempts[attempt_id]
+
+
 class TestConcurrentProvisionClaims(_CascadeFlushMixin, TransactionTestCase):
     def test_identity_lock_allows_management_foreign_key_check(self):
         from netbox_nso_plugin.models import NSOInstance
@@ -125,6 +163,159 @@ class TestConcurrentProvisionClaims(_CascadeFlushMixin, TransactionTestCase):
             ).count(),
             1,
         )
+
+
+class TestProvisionClaimReconciliation(_CascadeFlushMixin, TransactionTestCase):
+    def setUp(self):
+        from netbox_nso_plugin.models import NSOInstance
+
+        self.instance = NSOInstance.objects.create(
+            name="claim-reconciliation",
+            adapter_instance_id="claim-reconciliation",
+        )
+
+    def _commit_new_claim(self, device):
+        from netbox_nso_plugin.onboarding import (
+            _claim_provision_attempt,
+            _lock_provision_identity,
+            device_mgmt_addresses,
+            normalize_nso_device_name,
+        )
+
+        nso_name = normalize_nso_device_name(device.name)
+        primary_address, oob_address = device_mgmt_addresses(device)
+        request_body = {
+            "nso_instance": self.instance.adapter_instance_id,
+            "device_name": nso_name,
+            "address": primary_address or oob_address,
+            "ned_id": "test-ned:test-ned",
+            "authgroup": "network",
+            "admin_state": "unlocked",
+            "sync": True,
+            "oob_ip": oob_address,
+        }
+        with transaction.atomic():
+            locked_device, conflict = _lock_provision_identity(device.pk, self.instance, nso_name)
+            self.assertEqual(locked_device, device)
+            self.assertIsNone(conflict)
+            tombstone, active_conflict, claim_was_new = _claim_provision_attempt(
+                locked_device,
+                self.instance,
+                nso_name,
+                request_body,
+            )
+            self.assertIsNone(active_conflict)
+            self.assertTrue(claim_was_new)
+        return tombstone
+
+    def _create_management_conflict(self, device):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        return NSODeviceManagement.objects.create(
+            device=device,
+            nso_instance=self.instance,
+            nso_device_name=device.name,
+            onboard_status="provisioning",
+            onboard_job_id="conflicting-job",
+        )
+
+    @staticmethod
+    def _result():
+        return {"ok": False, "error": None, "provisioning": False, "job_id": None, "managed": False}
+
+    def _submit_with_adapter(self, tombstone, adapter):
+        from netbox_nso_plugin.onboarding import _submit_claimed_provision
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.provision_device", adapter.provision_device),
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", adapter.get_provision_attempt),
+        ):
+            return _submit_claimed_provision(
+                self.instance,
+                tombstone,
+                self._result(),
+                claim_was_new=True,
+            )
+
+    def test_new_claim_recovers_an_admission_rolled_back_by_a_reusing_caller(self):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        class RollBackAdmission(Exception):
+            pass
+
+        device = _device("rolled-back-admission", ip="198.18.0.10/32")
+        tombstone = self._commit_new_claim(device)
+        adapter = _ProvisionAdapterFake()
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.provision_device", adapter.provision_device),
+            patch("netbox_nso_plugin.adapter_client.get_provision_attempt", adapter.get_provision_attempt),
+            self.assertRaises(RollBackAdmission),
+        ):
+            with transaction.atomic():
+                caller_b = Device.objects.get(pk=device.pk)
+                response = onboard_candidate(caller_b, self.instance, ned_id="test-ned:test-ned")
+                self.assertTrue(response["ok"])
+                self.assertEqual(response["job_id"], "admitted-job")
+                raise RollBackAdmission
+
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+        response = self._submit_with_adapter(tombstone, adapter)
+
+        self.assertFalse(response["ok"])
+        recovered = NSOProvisionTombstone.objects.get(pk=tombstone.pk)
+        self.assertEqual(recovered.state, "open")
+        self.assertEqual(recovered.adapter_job_id, "admitted-job")
+        self.assertEqual(adapter.lookup_calls, [str(tombstone.provision_attempt_id)])
+
+    def test_identity_conflict_closes_a_new_claim_when_adapter_returns_404(self):
+        device = _device("missing-conflict", ip="198.18.0.11/32")
+        tombstone = self._commit_new_claim(device)
+        self._create_management_conflict(device)
+        adapter = _ProvisionAdapterFake()
+
+        response = self._submit_with_adapter(tombstone, adapter)
+
+        self.assertIn("already managed", response["error"].lower())
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "closed")
+        self.assertEqual(adapter.lookup_calls, [str(tombstone.provision_attempt_id)])
+        self.assertEqual(adapter.provision_calls, [])
+
+    def test_identity_conflict_records_an_admitted_job_on_a_new_claim(self):
+        device = _device("admitted-conflict", ip="198.18.0.12/32")
+        tombstone = self._commit_new_claim(device)
+        self._create_management_conflict(device)
+        adapter = _ProvisionAdapterFake()
+        adapter.attempts[str(tombstone.provision_attempt_id)] = {"job_id": "conflict-job", "status": "running"}
+
+        response = self._submit_with_adapter(tombstone, adapter)
+
+        self.assertIn("already managed", response["error"].lower())
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
+        self.assertEqual(tombstone.adapter_job_id, "conflict-job")
+        self.assertEqual(adapter.lookup_calls, [str(tombstone.provision_attempt_id)])
+        self.assertEqual(adapter.provision_calls, [])
+
+    def test_identity_conflict_keeps_a_new_claim_open_when_evidence_is_unavailable(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+
+        device = _device("unavailable-conflict", ip="198.18.0.13/32")
+        tombstone = self._commit_new_claim(device)
+        self._create_management_conflict(device)
+        adapter = _ProvisionAdapterFake()
+        adapter.lookup_error = AdapterError("adapter unavailable", code="nso_unreachable")
+
+        response = self._submit_with_adapter(tombstone, adapter)
+
+        self.assertIn("already managed", response["error"].lower())
+        tombstone.refresh_from_db()
+        self.assertEqual(tombstone.state, "open")
+        self.assertEqual(tombstone.adapter_job_id, "")
+        self.assertEqual(adapter.lookup_calls, [str(tombstone.provision_attempt_id)])
+        self.assertEqual(adapter.provision_calls, [])
 
 
 class TestOnboardingDashboard(TestCase):
@@ -383,7 +574,7 @@ class TestOnboardCandidate(TestCase):
         self.assertIsNotNone(attempts[0].closed_at)
         self.assertNotEqual(attempts[0].provision_attempt_id, attempts[1].provision_attempt_id)
 
-    def test_new_auth_rejection_releases_claim_when_evidence_uses_the_same_bad_credentials(self):
+    def test_new_auth_rejection_keeps_claim_when_evidence_uses_the_same_bad_credentials(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.models import NSOProvisionTombstone
         from netbox_nso_plugin.onboarding import onboard_candidate
@@ -404,10 +595,11 @@ class TestOnboardCandidate(TestCase):
             second = onboard_candidate(device, self.instance, ned_id="corrected-ned")
 
         self.assertFalse(first["ok"])
-        self.assertTrue(second["ok"])
-        self.assertEqual(provision.call_count, 2)
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["_http_status"], 409)
+        self.assertEqual(provision.call_count, 1)
         attempts = list(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).order_by("created_at"))
-        self.assertEqual([attempt.state for attempt in attempts], ["closed", "open"])
+        self.assertEqual([attempt.state for attempt in attempts], ["open"])
 
     def test_later_rejection_preserves_an_attempt_the_adapter_already_admitted(self):
         from netbox_nso_plugin.adapter_client import AdapterError
