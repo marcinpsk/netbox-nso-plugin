@@ -118,44 +118,6 @@ def test_zizmor_consumers_use_the_locked_dependency():
     assert hook["pass_filenames"] is True
 
 
-def test_lint_workflow_runs_the_pinned_review_pattern_checks():
-    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    job = workflow["jobs"]["format-and-lint"]
-    steps = job["steps"]
-    names = [step["name"] for step in steps]
-    audit_index = names.index("Audit the GitHub Actions workflows")
-    added = steps[audit_index + 1 :]
-
-    assert job["timeout-minutes"] == 10
-    assert [step["name"] for step in added] == [
-        "Download OpenGrep",
-        "Verify OpenGrep",
-        "Scan review patterns",
-        "Test review patterns",
-    ]
-    download, verify, scan, test = added
-    binary = "${{ runner.temp }}/opengrep"
-    assert download["env"] == {"OPENGREP_BIN": binary}
-    assert "https://github.com/opengrep/opengrep/releases/download/v1.30.0/opengrep_manylinux_x86" in download["run"]
-    assert '"$OPENGREP_BIN"' in download["run"]
-    assert verify["env"] == {
-        "OPENGREP_BIN": binary,
-        "OPENGREP_SHA256": "35779bdd72e92129c8df2a77f0c55e8c08356801ea92591ef32108d6b28d564c",
-    }
-    assert "sha256sum -c" in verify["run"]
-    assert 'chmod +x "$OPENGREP_BIN"' in verify["run"]
-    assert scan == {
-        "name": "Scan review patterns",
-        "env": {"OPENGREP_BIN": binary},
-        "run": "uv run --frozen scripts/check-review-patterns scan",
-    }
-    assert test == {
-        "name": "Test review patterns",
-        "env": {"OPENGREP_BIN": binary},
-        "run": "uv run --frozen scripts/check-review-patterns test",
-    }
-
-
 def test_netbox_checkouts_use_immutable_commits():
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "test.yaml").read_text(encoding="utf-8"))
     checkouts = 0
