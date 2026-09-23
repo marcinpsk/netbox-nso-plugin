@@ -20,6 +20,21 @@ PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
 PYPROJECT = ROOT / "pyproject.toml"
 
 
+def test_opengrep_runs_only_in_the_local_pre_commit_hook():
+    forbidden = re.compile(r"opengrep|semgrep|check-review-patterns|pre-commit", re.IGNORECASE)
+    offenders = []
+    for path in sorted(ROOT.joinpath(".github").rglob("*")):
+        if not path.is_file() or path.suffix.casefold() not in {".yml", ".yaml"}:
+            continue
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if forbidden.search(line):
+                offenders.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
+
+    assert not offenders, "OpenGrep runs only in the local pre-commit hook (see .opengrep/README.md).\n" + "\n".join(
+        offenders
+    )
+
+
 def test_packaging_is_a_direct_test_dependency():
     dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["dependency-groups"]["dev"]
 
