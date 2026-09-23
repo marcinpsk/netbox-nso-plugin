@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
-from django.db import connection, connections
+from django.db import connection, connections, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from ipam.models import IPAddress
 from netaddr import IPNetwork
@@ -66,6 +66,30 @@ class _PeerProvisionClaim:
 
 
 class TestConcurrentProvisionClaims(_CascadeFlushMixin, TransactionTestCase):
+    def test_identity_lock_allows_management_foreign_key_check(self):
+        from netbox_nso_plugin.models import NSOInstance
+        from netbox_nso_plugin.onboarding import _lock_provision_identity
+
+        instance = NSOInstance.objects.create(name="claim-instance", adapter_instance_id="claim-instance")
+        device = _device("claim-device")
+        alias = "onboarding_foreign_key_probe"
+        connections[alias] = connection.copy(alias=alias)
+        try:
+            with transaction.atomic():
+                locked_device, conflict = _lock_provision_identity(device.pk, instance, "claim-device")
+                self.assertEqual(locked_device, device)
+                self.assertIsNone(conflict)
+                with transaction.atomic(using=alias), connections[alias].cursor() as cursor:
+                    cursor.execute("SET LOCAL lock_timeout = '1s'")
+                    cursor.execute(
+                        f'SELECT id FROM "{NSOInstance._meta.db_table}" WHERE id = %s FOR KEY SHARE',
+                        [instance.pk],
+                    )
+                    self.assertEqual(cursor.fetchone(), (instance.pk,))
+        finally:
+            connections[alias].close()
+            del connections[alias]
+
     def test_competing_name_claim_returns_conflict_before_adapter_send(self):
         from netbox_nso_plugin.models import NSOInstance, NSOProvisionTombstone
         from netbox_nso_plugin.onboarding import onboard_candidate
@@ -355,6 +379,7 @@ class TestOnboardCandidate(TestCase):
         self.assertEqual(provision.call_count, 2)
         attempts = list(NSOProvisionTombstone.objects.filter(netbox_device_id=device.pk).order_by("created_at"))
         self.assertEqual([attempt.state for attempt in attempts], ["closed", "open"])
+        self.assertEqual([attempt.attempt_sequence for attempt in attempts], [1, 2])
         self.assertIsNotNone(attempts[0].closed_at)
         self.assertNotEqual(attempts[0].provision_attempt_id, attempts[1].provision_attempt_id)
 

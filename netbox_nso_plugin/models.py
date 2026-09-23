@@ -3031,6 +3031,7 @@ class NSOProvisionTombstone(models.Model):
     ]
 
     provision_attempt_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attempt_sequence = models.PositiveBigIntegerField(default=0, editable=False)
     netbox_device_id = models.PositiveBigIntegerField(db_index=True)
     nso_instance = models.CharField(max_length=255)
     nso_device_name = models.CharField(max_length=255)
@@ -3051,6 +3052,11 @@ class NSOProvisionTombstone(models.Model):
                 fields=["nso_instance", "nso_device_name"],
                 condition=models.Q(state="open"),
                 name=OPEN_PROVISION_NAME_CONSTRAINT,
+            ),
+            models.UniqueConstraint(
+                fields=["nso_instance", "nso_device_name", "attempt_sequence"],
+                condition=models.Q(attempt_sequence__gt=0),
+                name="nso_provision_attempt_sequence",
             ),
         ]
         indexes = [

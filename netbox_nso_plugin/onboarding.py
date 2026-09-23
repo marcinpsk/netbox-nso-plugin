@@ -226,6 +226,10 @@ def _provision_identity(device_id, instance, nso_name, *, lock_device):
 
 def _lock_provision_identity(device_id, instance, nso_name):
     """Lock one provision identity, including its NetBox device row."""
+    from .models import NSOInstance
+
+    # Serialize sequence allocation for claims on the same adapter instance.
+    NSOInstance.objects.select_for_update(no_key=True).get(pk=instance.pk)
     return _provision_identity(device_id, instance, nso_name, lock_device=True)
 
 
@@ -279,7 +283,19 @@ def _claim_provision_attempt(locked_device, instance, nso_name, request_body):
             return tombstone, None, False
         return None, _provision_attempt_detail(tombstone), False
 
+    last_sequence = (
+        NSOProvisionTombstone.objects.filter(
+            nso_instance=instance.adapter_instance_id,
+            nso_device_name=nso_name,
+            attempt_sequence__gt=0,
+        )
+        .order_by("-attempt_sequence")
+        .values_list("attempt_sequence", flat=True)
+        .first()
+        or 0
+    )
     tombstone = NSOProvisionTombstone(
+        attempt_sequence=last_sequence + 1,
         netbox_device_id=locked_device.pk,
         nso_instance=instance.adapter_instance_id,
         nso_device_name=nso_name,

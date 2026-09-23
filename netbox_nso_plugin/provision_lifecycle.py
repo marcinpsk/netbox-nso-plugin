@@ -293,11 +293,8 @@ def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
             .exclude(state="closed")
             .filter(
                 Q(state="open")
-                | Q(created_at__gt=tombstone.created_at)
-                | Q(
-                    created_at=tombstone.created_at,
-                    provision_attempt_id__gt=provision_attempt_id,
-                )
+                | Q(attempt_sequence__gte=tombstone.attempt_sequence)
+                | Q(attempt_sequence=0, created_at__gte=tombstone.created_at)
             )
             .exists()
         ):

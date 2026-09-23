@@ -4,6 +4,8 @@
 
 import threading
 from datetime import timedelta
+from importlib import import_module
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -97,7 +99,7 @@ class TestProvisionTombstoneSweep(TestCase):
             plan = "\n".join(row[0] for row in cursor.fetchall())
         self.assertNotIn("Sort", plan)
 
-    def _attempt(self, tag, *, with_management, state="terminal", provision_attempt_id=None):
+    def _attempt(self, tag, *, with_management, state="terminal", provision_attempt_id=None, attempt_sequence=0):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOProvisionTombstone
 
         device = make_device(tag)
@@ -121,6 +123,7 @@ class TestProvisionTombstoneSweep(TestCase):
         }
         tombstone = NSOProvisionTombstone.objects.create(
             provision_attempt_id=provision_attempt_id,
+            attempt_sequence=attempt_sequence,
             netbox_device_id=device.pk,
             nso_instance=instance.adapter_instance_id,
             nso_device_name=f"{tag}-device",
@@ -229,8 +232,11 @@ class TestProvisionTombstoneSweep(TestCase):
         from netbox_nso_plugin.models import NSOProvisionTombstone
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
-        _device, _instance, _management, old = self._attempt("provision-terminal-successor", with_management=False)
+        _device, _instance, _management, old = self._attempt(
+            "provision-terminal-successor", with_management=False, attempt_sequence=1
+        )
         newer = NSOProvisionTombstone.objects.create(
+            attempt_sequence=2,
             netbox_device_id=old.netbox_device_id,
             nso_instance=old.nso_instance,
             nso_device_name=old.nso_device_name,
@@ -250,6 +256,103 @@ class TestProvisionTombstoneSweep(TestCase):
         newer.refresh_from_db()
         self.assertEqual((old.state, newer.state), ("closed", "closed"))
         self.assertEqual([call.args[0] for call in offboard.call_args_list], [702, 701])
+
+    def test_equal_timestamps_do_not_order_attempts_by_uuid(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, old = self._attempt(
+            "provision-equal-timestamp",
+            with_management=False,
+            provision_attempt_id=UUID(int=2),
+            attempt_sequence=1,
+        )
+        newer = NSOProvisionTombstone.objects.create(
+            provision_attempt_id=UUID(int=1),
+            attempt_sequence=2,
+            netbox_device_id=old.netbox_device_id,
+            nso_instance=old.nso_instance,
+            nso_device_name=old.nso_device_name,
+            canonical_request={},
+            adapter_device_id=702,
+            state="terminal",
+            terminal_status="succeeded",
+            terminal_evidence={"status": "succeeded", "result": {"ok": True, "device_id": 702}},
+        )
+        NSOProvisionTombstone.objects.filter(provision_attempt_id=newer.provision_attempt_id).update(
+            created_at=old.created_at
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard:
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 0))
+            self.assertEqual(sweep_provision_tombstones(newer.provision_attempt_id), (1, 1))
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 1))
+
+        self.assertEqual([call.args[0] for call in offboard.call_args_list], [702, 701])
+
+    def test_migration_orders_existing_attempts_with_distinct_timestamps(self):
+        from django.apps import apps
+
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, old = self._attempt("provision-existing", with_management=False)
+        newer = NSOProvisionTombstone.objects.create(
+            netbox_device_id=old.netbox_device_id,
+            nso_instance=old.nso_instance,
+            nso_device_name=old.nso_device_name,
+            canonical_request={},
+            adapter_device_id=702,
+            state="terminal",
+            terminal_status="succeeded",
+            terminal_evidence={"status": "succeeded", "result": {"ok": True, "device_id": 702}},
+        )
+        NSOProvisionTombstone.objects.filter(pk=old.pk).update(created_at=old.created_at - timedelta(days=1))
+
+        migration = import_module("netbox_nso_plugin.migrations.0028_nsoprovisiontombstone_attempt_sequence_and_more")
+        migration.backfill_attempt_sequences(apps, SimpleNamespace(connection=connection))
+        old.refresh_from_db()
+        newer.refresh_from_db()
+        self.assertEqual((old.attempt_sequence, newer.attempt_sequence), (1, 2))
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard:
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 0))
+            self.assertEqual(sweep_provision_tombstones(newer.provision_attempt_id), (1, 1))
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 1))
+        self.assertEqual([call.args[0] for call in offboard.call_args_list], [702, 701])
+
+    def test_migration_quarantines_attempts_with_ambiguous_timestamps(self):
+        from django.apps import apps
+
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, old = self._attempt("provision-ambiguous", with_management=False)
+        tied = [
+            NSOProvisionTombstone.objects.create(
+                netbox_device_id=old.netbox_device_id,
+                nso_instance=old.nso_instance,
+                nso_device_name=old.nso_device_name,
+                canonical_request={},
+                state="terminal",
+                terminal_status="failed",
+                terminal_evidence={"status": "failed", "error": {"code": "provision_failed"}},
+            )
+            for _ in range(2)
+        ]
+        NSOProvisionTombstone.objects.filter(pk=old.pk).update(created_at=old.created_at - timedelta(days=1))
+        NSOProvisionTombstone.objects.filter(pk=tied[1].pk).update(created_at=tied[0].created_at)
+
+        migration = import_module("netbox_nso_plugin.migrations.0028_nsoprovisiontombstone_attempt_sequence_and_more")
+        migration.backfill_attempt_sequences(apps, SimpleNamespace(connection=connection))
+        old.refresh_from_db()
+        for attempt in tied:
+            attempt.refresh_from_db()
+        self.assertEqual((old.attempt_sequence, *[attempt.attempt_sequence for attempt in tied]), (1, 0, 0))
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard:
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 0))
+        offboard.assert_not_called()
 
     def test_terminal_orphan_recovers_the_device_id_from_logical_identity(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones

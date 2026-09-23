@@ -804,7 +804,12 @@ def _loop_body_entry(statement, bound, builders) -> set[str]:
 def _loop_no_break_state(statement, bound, builders) -> set[str]:
     entered = _loop_body_entry(statement, bound, builders)
     flow = _loop_flow_block(statement.body, entered, builders)
-    exits = [entered, *flow.continues]
+    zero_iterations = (
+        _expression_state_after(statement.iter, bound, builders)
+        if isinstance(statement, (ast.For, ast.AsyncFor))
+        else entered
+    )
+    exits = [zero_iterations, *flow.continues]
     if flow.normal is not None:
         exits.append(flow.normal)
     return _merge_plan_states(exits)
@@ -1238,6 +1243,18 @@ def repair(stale):
 """
 
         self.assertEqual(_stale_plan_source(source, "fixture.py"), [("fixture.py", "plan", 5)])
+
+    def test_an_empty_for_iterable_does_not_bind_its_target(self):
+        source = """
+def repair(stale, items):
+    with intent_transaction(footprint):
+        plan = stale
+        for plan in [RendererMutationPlan.build() for _ in items]:
+            pass
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [("fixture.py", "plan", 7)])
 
     def test_a_short_circuited_plan_rebuild_does_not_certify_the_plan(self):
         source = """
