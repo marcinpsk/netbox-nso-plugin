@@ -12,7 +12,7 @@ permissions:
 jobs:
   format-and-lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -35,3 +35,29 @@ jobs:
 
       - name: Audit the GitHub Actions workflows
         run: uv run --frozen zizmor .github/workflows
+
+      - name: Download OpenGrep
+        env:
+          OPENGREP_BIN: ${{ runner.temp }}/opengrep
+        run: |
+          curl --fail --location --show-error --silent \
+            --output "$OPENGREP_BIN" \
+            https://github.com/opengrep/opengrep/releases/download/v1.30.0/opengrep_manylinux_x86
+
+      - name: Verify OpenGrep
+        env:
+          OPENGREP_BIN: ${{ runner.temp }}/opengrep
+          OPENGREP_SHA256: 35779bdd72e92129c8df2a77f0c55e8c08356801ea92591ef32108d6b28d564c
+        run: |
+          printf '%s  %s\n' "$OPENGREP_SHA256" "$OPENGREP_BIN" | sha256sum -c -
+          chmod +x "$OPENGREP_BIN"
+
+      - name: Scan review patterns
+        env:
+          OPENGREP_BIN: ${{ runner.temp }}/opengrep
+        run: uv run --frozen scripts/check-review-patterns scan
+
+      - name: Test review patterns
+        env:
+          OPENGREP_BIN: ${{ runner.temp }}/opengrep
+        run: uv run --frozen scripts/check-review-patterns test
