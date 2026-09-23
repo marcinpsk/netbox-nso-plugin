@@ -719,6 +719,15 @@ def _loop_flow_try(statement, bound, builders) -> _LoopFlow:
     return _flow_through_finally(_merge_loop_flows(flows), statement.finalbody, builders)
 
 
+def _with_header_state(statement, bound, builders) -> set[str]:
+    entered = set(bound)
+    for item in statement.items:
+        entered = _expression_state_after(item.context_expr, entered, builders)
+        if item.optional_vars is not None:
+            entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
+    return entered
+
+
 def _loop_flow_statement(statement, bound, builders) -> _LoopFlow:
     if isinstance(statement, ast.Continue):
         return _LoopFlow(None, continues=[set(bound)])
@@ -736,11 +745,7 @@ def _loop_flow_statement(statement, bound, builders) -> _LoopFlow:
             body.breaks + alternate.breaks,
         )
     if isinstance(statement, (ast.With, ast.AsyncWith)):
-        entered = set(bound)
-        for item in statement.items:
-            if item.optional_vars is not None:
-                entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
-        return _loop_flow_block(statement.body, entered, builders)
+        return _loop_flow_block(statement.body, _with_header_state(statement, bound, builders), builders)
     if isinstance(statement, (ast.Try, ast.TryStar)):
         return _loop_flow_try(statement, bound, builders)
     if isinstance(statement, ast.Match):
@@ -766,12 +771,22 @@ def _loop_flow_block(body, bound, builders) -> _LoopFlow:
     return _LoopFlow(normal, continues, breaks)
 
 
+def _loop_header_state(statement, bound, builders) -> set[str]:
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        evaluated = _expression_state_after(statement.iter, bound, builders)
+        return _bind_plan_value(evaluated, [statement.target], statement.iter, builders)
+    return _expression_state_after(statement.test, bound, builders)
+
+
+def _loop_backedge_state(statement, bound, builders) -> set[str]:
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return _bind_plan_value(bound, [statement.target], statement.iter, builders)
+    return _loop_header_state(statement, bound, builders)
+
+
 def _loop_body_entry(statement, bound, builders) -> set[str]:
     """Definite plan names at the body entry across the first and later iterations."""
-    if isinstance(statement, (ast.For, ast.AsyncFor)):
-        first = _bind_plan_value(bound, [statement.target], statement.iter, builders)
-    else:
-        first = set(bound)
+    first = _loop_header_state(statement, bound, builders)
     entry = set(first)
     while True:
         previous = set(entry)
@@ -779,8 +794,7 @@ def _loop_body_entry(statement, bound, builders) -> set[str]:
         backedges = [*flow.continues]
         if flow.normal is not None:
             backedges.append(flow.normal)
-        if isinstance(statement, (ast.For, ast.AsyncFor)):
-            backedges = [_bind_plan_value(state, [statement.target], statement.iter, builders) for state in backedges]
+        backedges = [_loop_backedge_state(statement, state, builders) for state in backedges]
         if backedges:
             entry.intersection_update(_merge_plan_states(backedges))
         if entry == previous:
@@ -790,7 +804,7 @@ def _loop_body_entry(statement, bound, builders) -> set[str]:
 def _loop_no_break_state(statement, bound, builders) -> set[str]:
     entered = _loop_body_entry(statement, bound, builders)
     flow = _loop_flow_block(statement.body, entered, builders)
-    exits = [set(bound), entered, *flow.continues]
+    exits = [entered, *flow.continues]
     if flow.normal is not None:
         exits.append(flow.normal)
     return _merge_plan_states(exits)
@@ -824,11 +838,7 @@ def _plan_state_after_compound(statement, bound, builders) -> set[str]:
             )
         )
     if isinstance(statement, (ast.With, ast.AsyncWith)):
-        entered = set(bound)
-        for item in statement.items:
-            if item.optional_vars is not None:
-                entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
-        return _plan_state_after_block(statement.body, entered, builders)
+        return _plan_state_after_block(statement.body, _with_header_state(statement, bound, builders), builders)
     if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
         return _loop_state_after(statement, bound, builders)
     if isinstance(statement, (ast.Try, ast.TryStar)):
@@ -930,11 +940,7 @@ def _plan_names_inside(statement, target, builders, bound) -> set[str]:
         tested = _expression_state_after(statement.test, bound, builders)
         return _plan_names_before(branch, target, builders, tested)
     if isinstance(statement, (ast.With, ast.AsyncWith)):
-        entered = set(bound)
-        for item in statement.items:
-            if item.optional_vars is not None:
-                entered = _bind_plan_value(entered, [item.optional_vars], item.context_expr, builders)
-        return _plan_names_before(statement.body, target, builders, entered)
+        return _plan_names_before(statement.body, target, builders, _with_header_state(statement, bound, builders))
     if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
         return _plan_names_before_loop(statement, target, builders, bound)
     if isinstance(statement, (ast.Try, ast.TryStar)):
@@ -1166,6 +1172,72 @@ def repair(stale):
             _stale_plan_source(source, "fixture.py"),
             [("fixture.py", "plan", 6)],
         )
+
+    def test_loop_and_with_headers_invalidate_an_in_lock_plan(self):
+        for header in (
+            "for item in (plan := [stale])",
+            "while (plan := stale)",
+            "with nullcontext(plan := stale)",
+        ):
+            with self.subTest(header=header):
+                source = f"""
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        {header}:
+            consume_renderer_plan(plan, permit)
+"""
+                self.assertEqual(
+                    _stale_plan_source(source, "fixture.py"),
+                    [("fixture.py", "plan", 6)],
+                )
+
+    def test_a_with_header_invalidates_a_plan_used_after_the_body(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        with nullcontext(plan := stale):
+            pass
+        consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [("fixture.py", "plan", 7)])
+
+    def test_a_with_header_in_a_loop_invalidates_a_later_plan_use(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        for item in items:
+            with nullcontext(plan := stale):
+                pass
+            consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [("fixture.py", "plan", 8)])
+
+    def test_a_loop_header_can_build_the_plan_used_in_its_body(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        while (plan := RendererMutationPlan.build()):
+            consume_renderer_plan(plan, permit)
+            break
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [])
+
+    def test_a_for_iterable_does_not_rebuild_the_plan_on_each_iteration(self):
+        source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        for item in (plan := RendererMutationPlan.build(), 1):
+            consume_renderer_plan(plan, permit)
+            plan = stale
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [("fixture.py", "plan", 5)])
 
     def test_a_short_circuited_plan_rebuild_does_not_certify_the_plan(self):
         source = """

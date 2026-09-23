@@ -169,6 +169,27 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertEqual(management.nso_device_name, stored_name)
         sync.assert_called_once_with(type(management), management.pk, False)
 
+    def test_failed_provision_logs_the_attempt_status_and_error_code(self):
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, management, tombstone = self._attempt("provision-failure-log", with_management=True)
+        tombstone.terminal_status = "failed"
+        tombstone.terminal_evidence = {
+            "status": "failed",
+            "error": {"code": "invalid_ned", "message": "private adapter detail"},
+        }
+        tombstone.save(update_fields=["terminal_status", "terminal_evidence"])
+
+        with self.assertLogs("netbox_nso_plugin.provision_lifecycle", level="WARNING") as logs:
+            self.assertEqual(sweep_provision_tombstones(tombstone.provision_attempt_id), (1, 1))
+
+        management.refresh_from_db()
+        self.assertEqual(management.onboard_status, "provision_failed")
+        self.assertIn(str(tombstone.provision_attempt_id), logs.output[0])
+        self.assertIn("failed", logs.output[0])
+        self.assertIn("invalid_ned", logs.output[0])
+        self.assertNotIn("private adapter detail", "\n".join(logs.output))
+
     def test_terminal_orphan_is_offboarded_and_closed(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
 
@@ -181,6 +202,54 @@ class TestProvisionTombstoneSweep(TestCase):
         self.assertEqual(tombstone.state, "closed")
         self.assertIsNotNone(tombstone.closed_at)
         offboard.assert_called_once_with(701)
+
+    def test_terminal_orphan_preserves_a_newer_open_provision(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, old = self._attempt("provision-reonboard", with_management=False)
+        newer = NSOProvisionTombstone.objects.create(
+            netbox_device_id=old.netbox_device_id,
+            nso_instance=old.nso_instance,
+            nso_device_name=old.nso_device_name,
+            canonical_request={},
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard:
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 0))
+
+        old.refresh_from_db()
+        newer.refresh_from_db()
+        self.assertEqual(old.state, "terminal")
+        self.assertTrue(old.offboard_error)
+        self.assertEqual(newer.state, "open")
+        offboard.assert_not_called()
+
+    def test_newer_terminal_orphan_can_retire_before_older_attempt(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones
+
+        _device, _instance, _management, old = self._attempt("provision-terminal-successor", with_management=False)
+        newer = NSOProvisionTombstone.objects.create(
+            netbox_device_id=old.netbox_device_id,
+            nso_instance=old.nso_instance,
+            nso_device_name=old.nso_device_name,
+            canonical_request={},
+            adapter_device_id=702,
+            state="terminal",
+            terminal_status="succeeded",
+            terminal_evidence={"status": "succeeded", "result": {"ok": True, "device_id": 702}},
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.delete_provisioned_device") as offboard:
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 0))
+            self.assertEqual(sweep_provision_tombstones(newer.provision_attempt_id), (1, 1))
+            self.assertEqual(sweep_provision_tombstones(old.provision_attempt_id), (1, 1))
+
+        old.refresh_from_db()
+        newer.refresh_from_db()
+        self.assertEqual((old.state, newer.state), ("closed", "closed"))
+        self.assertEqual([call.args[0] for call in offboard.call_args_list], [702, 701])
 
     def test_terminal_orphan_recovers_the_device_id_from_logical_identity(self):
         from netbox_nso_plugin.provision_lifecycle import sweep_provision_tombstones

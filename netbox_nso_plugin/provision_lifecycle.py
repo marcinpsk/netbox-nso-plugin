@@ -284,6 +284,29 @@ def _complete_terminal_attempt(tombstone, inventory_cache) -> bool:
             )
             return False
 
+        if (
+            NSOProvisionTombstone.objects.filter(
+                nso_instance=tombstone.nso_instance,
+                nso_device_name=tombstone.nso_device_name,
+            )
+            .exclude(provision_attempt_id=provision_attempt_id)
+            .exclude(state="closed")
+            .filter(
+                Q(state="open")
+                | Q(created_at__gt=tombstone.created_at)
+                | Q(
+                    created_at=tombstone.created_at,
+                    provision_attempt_id__gt=provision_attempt_id,
+                )
+            )
+            .exists()
+        ):
+            _record_offboard_error(
+                provision_attempt_id,
+                "Another provision attempt owns this NSO identity.",
+            )
+            return False
+
         # An orphan matches no management row, so the adapter calls below hold the tombstone
         # fence alone. No device, management, or instance row is locked across them.
         adapter_device_id = tombstone.adapter_device_id
@@ -405,6 +428,14 @@ def _apply_terminal_evidence(management, tombstone) -> None:
 
     management.onboard_status = "provision_failed"
     management.onboard_error = "Provisioning failed. See the server log."
+    error = evidence.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    logger.warning(
+        "Provision attempt %s completed with status %s and adapter error code %s",
+        tombstone.provision_attempt_id,
+        tombstone.terminal_status,
+        code,
+    )
     save_management(
         management,
         update_fields=ONBOARD_EVIDENCE_FIELDS,

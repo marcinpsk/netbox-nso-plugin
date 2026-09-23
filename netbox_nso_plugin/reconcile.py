@@ -170,16 +170,18 @@ def _gated(
     value is stored there. A skipped family's ctx entries keep their empty defaults
     (rendering paths fall back to persisted rows) and its overlay rows are untouched.
     """
-    from .read_gate import LEGACY, RAN, gated_family_run
+    from .read_gate import LEGACY, RAN, _is_authoritative, gated_family_run
 
-    validator = _FAMILY_VALIDATORS.get(family)
-    if validator is not None:
-        validator(payload)
     read_state = payload.get("read_state") if isinstance(payload, dict) else None
     if read_state is None and isinstance(payload, dict) and "read_state" in payload:
         # explicit `"read_state": null` — a MALFORMED S4 block, not a pre-S4 adapter:
         # fail closed via the gate's incarnation check (codex B5-F4)
         read_state = {}
+    validator = _FAMILY_VALIDATORS.get(family)
+    if validator is not None and (
+        read_state is None or (isinstance(read_state, dict) and _is_authoritative(read_state))
+    ):
+        validator(payload)
     context_before = dict(ctx)
     try:
         result = gated_family_run(mgmt, family, read_state, body, epoch=epoch, pre_body=pre_body)

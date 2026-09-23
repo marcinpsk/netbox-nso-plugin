@@ -11,6 +11,8 @@ from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from ipam.models import IPAddress
 from netaddr import IPNetwork
 
+from .mixins import _CascadeFlushMixin
+
 
 def _device(name, *, status="active", platform=None, ip=None):
     mfg, _ = Manufacturer.objects.get_or_create(name="OnbMfg", slug="onbmfg")
@@ -63,7 +65,7 @@ class _PeerProvisionClaim:
         return result
 
 
-class TestConcurrentProvisionClaims(TransactionTestCase):
+class TestConcurrentProvisionClaims(_CascadeFlushMixin, TransactionTestCase):
     def test_competing_name_claim_returns_conflict_before_adapter_send(self):
         from netbox_nso_plugin.models import NSOInstance, NSOProvisionTombstone
         from netbox_nso_plugin.onboarding import onboard_candidate
