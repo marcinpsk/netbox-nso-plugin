@@ -313,6 +313,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
         payload = self._payload(
             self._router_payload(
@@ -332,6 +333,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         )
 
         states = _reconcile_bgp_config(self.device, payload)
+        reconcile_scope_ownership(self.device.pk, {"bgp"})
 
         malformed.refresh_from_db()
         valid = NSOBGPPeerState.objects.get(

@@ -5,9 +5,10 @@
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
-from ._outbox_case import make_managed, mirror_update, own_route, own_vlan
+from ._outbox_case import make_device, make_managed, mirror_update, own_route, own_vlan
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestSymmetricOwnershipExecutor(TestCase):
@@ -873,13 +874,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         self.assertIsNone(manifest_binding(state))
 
-    def test_malformed_bgp_identity_refuses_ownership_before_writes(self):
-        from netbox_nso_plugin.models import (
-            NSOBGPPeerState,
-            NSOIntentOutboxEntry,
-            NSOIntentRevision,
-            NSOOwnershipManifest,
-        )
+    def test_malformed_bgp_identity_does_not_abort_ownership(self):
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOOwnershipManifest
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
         malformed_peer, other_peer = self._make_native_bgp_peers(
@@ -908,24 +904,11 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 )
                 malformed.refresh_from_db()
                 row_before = NSOBGPPeerState.objects.values().get(pk=malformed.pk)
-                manifest_count_before = NSOOwnershipManifest.objects.filter(device_id=self.device.pk).count()
-                other_overlays_before = list(
-                    NSOBGPPeerState.objects.filter(bgp_peer=other_peer).order_by("pk").values()
-                )
-                revisions_before = list(
-                    NSOIntentRevision.objects.filter(device=self.device).order_by("scope", "pk").values()
-                )
-                outbox_before = list(NSOIntentOutboxEntry.objects.filter(device=self.device).order_by("pk").values())
 
-                with self.assertRaises(ValueError):
-                    reconcile_scope_ownership(self.device.pk, ["bgp"])
+                reconcile_scope_ownership(self.device.pk, ["bgp"])
 
                 malformed.refresh_from_db()
                 self.assertEqual(NSOBGPPeerState.objects.values().get(pk=malformed.pk), row_before)
-                self.assertEqual(
-                    NSOOwnershipManifest.objects.filter(device_id=self.device.pk).count(),
-                    manifest_count_before,
-                )
                 self.assertFalse(
                     NSOOwnershipManifest.objects.filter(
                         device_id=self.device.pk,
@@ -938,38 +921,120 @@ class TestSymmetricOwnershipExecutor(TestCase):
                         },
                     ).exists()
                 )
-                self.assertEqual(NSOBGPPeerState.objects.filter(bgp_peer=malformed_peer).count(), 1)
-                self.assertFalse(
-                    NSOBGPPeerState.objects.filter(
-                        management=self.management,
-                        asn_str="64520",
-                        vrf_name="",
-                        peer_address_str="198.18.173.2",
-                    )
-                    .exclude(pk=malformed.pk)
-                    .exists()
+                canonical = NSOBGPPeerState.objects.get(
+                    management=self.management,
+                    bgp_peer=malformed_peer,
+                    asn_str="64520",
+                    vrf_name="",
+                    peer_address_str="198.18.173.2",
                 )
+                sibling = NSOBGPPeerState.objects.get(
+                    management=self.management,
+                    bgp_peer=other_peer,
+                    asn_str="64520",
+                    vrf_name="",
+                    peer_address_str="198.18.173.3",
+                )
+                self.assertEqual((canonical.status, sibling.status), ("accepted", "accepted"))
                 self.assertEqual(
-                    list(NSOBGPPeerState.objects.filter(bgp_peer=other_peer).order_by("pk").values()),
-                    other_overlays_before,
+                    NSOOwnershipManifest.objects.filter(
+                        device_id=self.device.pk,
+                        scope="bgp",
+                        ownership_state="owned",
+                    ).count(),
+                    2,
                 )
-                self.assertEqual(
-                    list(NSOIntentRevision.objects.filter(device=self.device).order_by("scope", "pk").values()),
-                    revisions_before,
-                )
-                self.assertEqual(
-                    list(NSOIntentOutboxEntry.objects.filter(device=self.device).order_by("pk").values()),
-                    outbox_before,
-                )
+
+    def test_owned_malformed_bgp_identity_is_demoted_without_blocking_a_valid_sibling(self):
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        nonnumeric_peer, range_peer, address_peer, valid_peer = self._make_native_bgp_peers(
+            "198.18.173.4/32",
+            "198.18.173.6/32",
+            "198.18.173.7/32",
+            "198.18.173.5/32",
+        )
+        malformed = (
+            NSOBGPPeerState.objects.create(
+                management=self.management,
+                bgp_peer=nonnumeric_peer,
+                asn_str="invalid",
+                vrf_name="",
+                peer_address_str="198.18.173.4",
+                status="accepted",
+            ),
+            NSOBGPPeerState.objects.create(
+                management=self.management,
+                bgp_peer=range_peer,
+                asn_str="0",
+                vrf_name="",
+                peer_address_str="198.18.173.6",
+                status="accepted",
+            ),
+            NSOBGPPeerState.objects.create(
+                management=self.management,
+                bgp_peer=address_peer,
+                asn_str="64520",
+                vrf_name="",
+                peer_address_str="not-an-address",
+                status="accepted",
+            ),
+        )
+        valid = NSOBGPPeerState.objects.create(
+            management=self.management,
+            bgp_peer=valid_peer,
+            asn_str="64520",
+            vrf_name="",
+            peer_address_str="198.18.173.5",
+            status="accepted",
+        )
+
+        completed = reconcile_scope_ownership(self.device.pk, ["bgp"])
+
+        for state in malformed:
+            state.refresh_from_db()
+        valid.refresh_from_db()
+        self.assertEqual([state.status for state in malformed], ["imported"] * 3)
+        self.assertEqual(valid.status, "accepted")
+        for state in malformed:
+            self.assertFalse(
+                NSOOwnershipManifest.objects.filter(
+                    device_id=self.device.pk,
+                    state_model_label=state._meta.label_lower,
+                    state_key={
+                        "asn_str": state.asn_str,
+                        "vrf_name": state.vrf_name,
+                        "peer_address_str": state.peer_address_str,
+                    },
+                ).exists()
+            )
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                state_model_label=valid._meta.label_lower,
+                state_key={
+                    "asn_str": "64520",
+                    "vrf_name": "",
+                    "peer_address_str": "198.18.173.5",
+                },
+                ownership_state="owned",
+            ).exists()
+        )
+        for state in malformed:
+            self.assertIn(("bgp", state.pk), completed)
+        self.assertIn(("bgp", valid.pk), completed)
 
     def test_native_routing_graph_creates_every_owned_overlay(self):
         from dcim.models import Device, Interface
         from django.contrib.contenttypes.models import ContentType
+        from django.db import transaction
         from ipam.models import ASN, RIR, IPAddress
         from netbox_routing.models import (
             BGPPeer,
             BGPRouter,
             BGPScope,
+            ISISFlexAlgo,
             ISISInstance,
             ISISInterface,
             OSPFArea,
@@ -980,10 +1045,12 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         from netbox_nso_plugin.models import (
             NSOBGPPeerState,
+            NSOISISFlexAlgoState,
             NSOISISInstanceState,
             NSOISISInterfaceState,
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
+            NSOOwnershipManifest,
             NSORedistributionState,
         )
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
@@ -1017,6 +1084,11 @@ class TestSymmetricOwnershipExecutor(TestCase):
             address_family="ipv4",
             metric=17,
         )
+        flex_algo = ISISFlexAlgo.objects.create(
+            instance=isis_instance,
+            algo_id=173,
+            metric_type="delay-metric",
+        )
         ospf_instance = OSPFInstance.objects.create(
             device=self.device,
             process_id="17",
@@ -1036,16 +1108,89 @@ class TestSymmetricOwnershipExecutor(TestCase):
             source_protocol="static",
         )
 
-        reconcile_scope_ownership(self.device.pk, ["bgp", "isis", "ospf"])
+        reconcile_scope_ownership(self.device.pk, ["bgp", "isis", "isis_flex_algo", "ospf"])
 
         self.assertEqual(NSOBGPPeerState.objects.get(bgp_peer=peer).status, "accepted")
         self.assertEqual(NSOISISInstanceState.objects.get(isis_instance=isis_instance).status, "accepted")
         self.assertEqual(NSOISISInterfaceState.objects.get(isis_interface=isis_interface).metric, 17)
+        self.assertEqual(NSOISISFlexAlgoState.objects.get(isis_flex_algo=flex_algo).status, "accepted")
         ospf_state = NSOOSPFInstanceState.objects.get(ospf_instance=ospf_instance)
         self.assertEqual(ospf_state.router_id, "198.18.173.1")
         self.assertEqual(ospf_state.areas, [{"area-id": "0.0.0.0", "area-type": "standard"}])
         self.assertEqual(NSOOSPFInterfaceState.objects.get(interface=interface).cost, 17)
         self.assertEqual(NSORedistributionState.objects.get(redistribution=redistribution).dest_protocol, "isis")
+
+        cases = (
+            ("BGP peer", NSOBGPPeerState.objects.get(bgp_peer=peer), "bgp_peer", peer, {"bgp"}),
+            (
+                "redistribution",
+                NSORedistributionState.objects.get(redistribution=redistribution),
+                "redistribution",
+                redistribution,
+                {"isis"},
+            ),
+            (
+                "ISIS interface",
+                NSOISISInterfaceState.objects.get(isis_interface=isis_interface),
+                "isis_interface",
+                isis_interface,
+                {"isis"},
+            ),
+            (
+                "ISIS instance",
+                NSOISISInstanceState.objects.get(isis_instance=isis_instance),
+                "isis_instance",
+                isis_instance,
+                {"isis"},
+            ),
+            (
+                "Flex-Algo",
+                NSOISISFlexAlgoState.objects.get(isis_flex_algo=flex_algo),
+                "isis_flex_algo",
+                flex_algo,
+                {"isis_flex_algo"},
+            ),
+            (
+                "OSPF instance",
+                NSOOSPFInstanceState.objects.get(ospf_instance=ospf_instance),
+                "ospf_instance",
+                ospf_instance,
+                {"ospf"},
+            ),
+        )
+        for label, state, native_field, native, scopes in cases:
+            with self.subTest(label=label), transaction.atomic():
+                model = type(state)
+                natural_key = tuple(model._meta.unique_together[0])
+                self.assertNotIn(native_field, natural_key)
+                natural_filter = {
+                    model._meta.get_field(name).attname: getattr(state, model._meta.get_field(name).attname)
+                    for name in natural_key
+                }
+                model.objects.filter(pk=state.pk).update(
+                    status="imported",
+                    accepted_at=None,
+                    **{model._meta.get_field(native_field).attname: None},
+                )
+                NSOOwnershipManifest.objects.filter(
+                    device_id=self.device.pk,
+                    native_id=native.pk,
+                    state_model_label=state._meta.label_lower,
+                ).delete()
+
+                reconcile_scope_ownership(self.device.pk, scopes)
+
+                current = model.objects.get(pk=state.pk)
+                self.assertEqual(current.status, "imported")
+                self.assertIsNone(getattr(current, model._meta.get_field(native_field).attname))
+                self.assertEqual(model.objects.filter(**natural_filter).count(), 1)
+                self.assertFalse(
+                    NSOOwnershipManifest.objects.filter(
+                        device_id=self.device.pk,
+                        native_id=native.pk,
+                        state_model_label=state._meta.label_lower,
+                    ).exists()
+                )
 
     def test_existing_overlay_strategies_require_explicit_owned_state(self):
         from dcim.models import Interface
@@ -1179,3 +1324,242 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(result.unknown, ())
         self.assertEqual((state.status, state.accepted_at), ("imported", None))
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface_mtu").exists())
+
+
+class TestOwnershipActionRecheck(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        self.device = make_device("ownership-recheck")
+        instance = NSOInstance.objects.create(
+            name="ownership-recheck-instance",
+            adapter_instance_id="ownership-recheck-instance",
+        )
+        self.management = NSODeviceManagement.objects.create(
+            device=self.device,
+            nso_instance=instance,
+            nso_device_name="ownership-recheck-device",
+            adapter_device_id=16321,
+            onboard_status="provisioning",
+        )
+        NSODeviceManagement.objects.filter(pk=self.management.pk).update(onboard_status="")
+        self.management.refresh_from_db()
+
+    def _mtu_state(self, *, native_mtu, status, manifest):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.ownership_planner import maintain_manifest
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        with suppress_intent_push():
+            interface = Interface.objects.create(
+                device=self.device,
+                name=f"Ethernet{NSOInterfaceMtuState.objects.count() + 50}",
+                type="1000base-t",
+                mtu=native_mtu,
+            )
+            state = NSOInterfaceMtuState.objects.create(
+                management=self.management,
+                interface=interface,
+                l2_mtu=9216,
+                status=status,
+            )
+        if manifest:
+            maintain_manifest(state)
+        return interface, state
+
+    def _accept_mtu(self, state):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.views import NSOInterfaceMtuStateAcceptView
+
+        current = NSOInterfaceMtuState.objects.select_related("interface", "management").get(pk=state.pk)
+        with suppress_intent_push():
+            NSOInterfaceMtuStateAcceptView._accept(current)
+
+    def _run_after_plan(self, *, planner_name, scope, matches_action, accept):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from django.db import connections
+
+        from netbox_nso_plugin import ownership_planner
+
+        original = getattr(ownership_planner, planner_name)
+        plan_ready = threading.Event()
+        resume_reconciliation = threading.Event()
+
+        def barrier(*args, **kwargs):
+            planned = original(*args, **kwargs)
+            self.assertTrue(any(matches_action(entry) for entry in planned))
+            plan_ready.set()
+            if not resume_reconciliation.wait(30):
+                raise AssertionError("the ownership reconciliation was not released")
+            return planned
+
+        def reconcile():
+            try:
+                ownership_planner.reconcile_scope_ownership(self.device.pk, [scope])
+            finally:
+                connections.close_all()
+
+        with patch.object(ownership_planner, planner_name, new=barrier), ThreadPoolExecutor(max_workers=1) as workers:
+            reconciliation = workers.submit(reconcile)
+            try:
+                self.assertTrue(plan_ready.wait(15), "ownership planning did not reach the barrier")
+                accept()
+            finally:
+                resume_reconciliation.set()
+            reconciliation.result(timeout=30)
+
+    def _assert_mtu_ownership_survives(self, interface, state):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOOwnershipManifest
+        from netbox_nso_plugin.status_machine import is_owned
+
+        interface.refresh_from_db()
+        state.refresh_from_db()
+        manifest = NSOOwnershipManifest.objects.get(
+            device_id=self.device.pk,
+            scope="interface_mtu",
+            state_model_label=state._meta.label_lower,
+        )
+        self.assertEqual(interface.mtu, 9216)
+        self.assertTrue(is_owned(state.status))
+        self.assertEqual(manifest.ownership_state, "owned")
+        self.assertIn(
+            {
+                "interface_name": interface.name,
+                "mtu": 9216,
+                "ip_mtu": None,
+                "mpls_mtu": None,
+            },
+            delivery.render("interface_mtu", self.device.pk, self.management.adapter_device_id).payload,
+        )
+        self.assertFalse(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device,
+                scope="interface_mtu",
+                mark_and=True,
+            ).exists()
+        )
+
+    def test_accept_after_manifest_less_demotion_plan_preserves_ownership(self):
+        from netbox_nso_plugin.ownership_planner import OwnershipAction
+
+        interface, state = self._mtu_state(native_mtu=None, status="accepted", manifest=False)
+
+        self._run_after_plan(
+            planner_name="_manifest_record_actions",
+            scope="interface_mtu",
+            matches_action=lambda entry: entry[0] is OwnershipAction.RETRACT,
+            accept=lambda: self._accept_mtu(state),
+        )
+
+        self._assert_mtu_ownership_survives(interface, state)
+
+    def test_accept_after_retract_plan_preserves_ownership(self):
+        from netbox_nso_plugin.ownership_planner import OwnershipAction
+
+        interface, state = self._mtu_state(native_mtu=9216, status="accepted", manifest=True)
+        type(interface).objects.filter(pk=interface.pk).update(mtu=None)
+
+        self._run_after_plan(
+            planner_name="_manifest_lifecycle_actions",
+            scope="interface_mtu",
+            matches_action=lambda entry: entry[-1] is OwnershipAction.RETRACT,
+            accept=lambda: self._accept_mtu(state),
+        )
+
+        self._assert_mtu_ownership_survives(interface, state)
+
+    def test_accept_after_detach_plan_preserves_ownership(self):
+        from netbox_nso_plugin.ownership_planner import OwnershipAction
+
+        interface, state = self._mtu_state(native_mtu=9216, status="accepted", manifest=True)
+        type(state).objects.filter(pk=state.pk).update(status="imported", accepted_at=None)
+
+        self._run_after_plan(
+            planner_name="_manifest_lifecycle_actions",
+            scope="interface_mtu",
+            matches_action=lambda entry: entry[-1] is OwnershipAction.DETACH,
+            accept=lambda: self._accept_mtu(state),
+        )
+
+        self._assert_mtu_ownership_survives(interface, state)
+
+    def test_accept_after_retire_plan_preserves_recreated_ownership(self):
+        from dcim.models import Interface
+        from django.contrib.messages.storage.fallback import FallbackStorage
+        from django.test import RequestFactory
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOIntentOutboxEntry, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, maintain_manifest
+        from netbox_nso_plugin.signals import suppress_intent_push
+        from netbox_nso_plugin.status_machine import is_owned
+        from netbox_nso_plugin.views import NSOBFDInterfaceStateAcceptView
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet90", type="1000base-t")
+        with suppress_intent_push():
+            state = NSOBFDInterfaceState.objects.create(
+                management=self.management,
+                interface=interface,
+                min_tx=300,
+                min_rx=300,
+                multiplier=3,
+                status="accepted",
+            )
+        maintain_manifest(state)
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="bfd")
+        with suppress_intent_push():
+            NSOBFDInterfaceState.objects.filter(pk=state.pk).delete()
+        replacement = []
+
+        def recreate_and_accept():
+            with suppress_intent_push():
+                current = NSOBFDInterfaceState.objects.create(
+                    management=self.management,
+                    interface=interface,
+                    min_tx=300,
+                    min_rx=300,
+                    multiplier=3,
+                    status="imported",
+                )
+                request = RequestFactory().post("/")
+                request.session = {}
+                request._messages = FallbackStorage(request)
+                response = NSOBFDInterfaceStateAcceptView().post(request, current.pk)
+            self.assertEqual(response.status_code, 302)
+            replacement.append(current.pk)
+
+        self._run_after_plan(
+            planner_name="_manifest_lifecycle_actions",
+            scope="bfd",
+            matches_action=lambda entry: entry[-1] is OwnershipAction.RETIRE,
+            accept=recreate_and_accept,
+        )
+
+        current = NSOBFDInterfaceState.objects.get(pk=replacement[0])
+        manifest.refresh_from_db()
+        self.assertTrue(is_owned(current.status))
+        self.assertEqual(manifest.ownership_state, "owned")
+        self.assertIn(
+            {
+                "interface_name": interface.name,
+                "min_tx": 300,
+                "min_rx": 300,
+                "multiplier": 3,
+                "micro_bfd": False,
+            },
+            delivery.render("bfd", self.device.pk, self.management.adapter_device_id).payload,
+        )
+        self.assertFalse(
+            NSOIntentOutboxEntry.objects.filter(
+                device=self.device,
+                scope="bfd",
+                mark_and=True,
+            ).exists()
+        )

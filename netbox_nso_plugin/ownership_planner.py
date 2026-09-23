@@ -815,27 +815,32 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
     ) = binding
     if scope not in requested or bound_device_id != device_id:
         return None
+    if not is_owned(instance.status):
+        return None
     manifest_state = manifest_states.get(
         _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key)
     )
+    if rule.acquisition_strategy == "existing_overlay":
+        native_qualifies = True
+    else:
+        try:
+            signature = _qualifying_overlay_signature(
+                scope,
+                native_model_label,
+                native_id,
+                state_model_label,
+                state_key,
+            )
+        except ValueError:
+            signature = None
+        native_qualifies = signature is not None and signature in qualifying
     action = plan_ownership(
         rule,
         OwnershipSignature(
             native_present=True,
-            native_qualifies=(
-                is_owned(instance.status)
-                if rule.acquisition_strategy == "existing_overlay"
-                else _qualifying_overlay_signature(
-                    scope,
-                    native_model_label,
-                    native_id,
-                    state_model_label,
-                    state_key,
-                )
-                in qualifying
-            ),
+            native_qualifies=native_qualifies,
             overlay_present=True,
-            overlay_owned=is_owned(instance.status),
+            overlay_owned=True,
             manifest_state=manifest_state,
         ),
     )
@@ -847,6 +852,37 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
     if action is OwnershipAction.RETRACT and manifest_state is None:
         return (action, scope, instance._meta.label_lower, instance.pk)
     return None
+
+
+def _rechecked_record_instance(
+    entry,
+    device_id,
+    requested,
+    *,
+    qualifying=None,
+    natives=None,
+    manifest_states=None,
+):
+    """Reload one planned record action and return its current matching overlay."""
+    if qualifying is None or natives is None:
+        scanned_qualifying, scanned_natives = _scan_context(device_id, requested)
+        qualifying = scanned_qualifying if qualifying is None else qualifying
+        natives = scanned_natives if natives is None else natives
+    if manifest_states is None:
+        manifest_states = _manifest_states(device_id, requested)
+    _action, _scope, model_label, pk = entry
+    instance = apps.get_model(model_label).objects.filter(pk=pk).first()
+    if instance is None:
+        return None
+    current = _record_action_for(
+        instance,
+        device_id,
+        requested,
+        qualifying,
+        manifest_states,
+        natives=natives,
+    )
+    return instance if current == entry else None
 
 
 def _device_overlays(device_id, requested):
@@ -915,11 +951,10 @@ def _demotion_plan(overlay):
     return candidate, update_fields, plan
 
 
-def _demote_overlay(instance, device_id, scope) -> bool:
+def _demote_overlay(instance, device_id, scope, *, entry, requested) -> bool:
     """Demote one owned overlay that carries no deletion authority to demote it with."""
     from .intent_state import MutationFootprint, intent_transaction, reconcile_family_footprint
     from .renderer_writer import consume_renderer_plan
-    from .status_machine import is_owned
 
     # Planned twice on purpose: this pre-pass only derives the lock footprint. The consumed
     # plan is rebuilt below after the transaction re-pends the deploying rows.
@@ -929,8 +964,8 @@ def _demote_overlay(instance, device_id, scope) -> bool:
         footprint_plan.lock_footprint,
     )
     with intent_transaction(footprint) as permit:
-        current = type(instance).objects.filter(pk=instance.pk).first()
-        if current is None or not is_owned(current.status):
+        current = _rechecked_record_instance(entry, device_id, requested)
+        if current is None:
             return False
         candidate, update_fields, plan = _demotion_plan(current)
         with consume_renderer_plan(plan, permit, content=True) as writer:
@@ -1667,6 +1702,23 @@ def _normalized_overlay_filter(model, filters):
     return tuple(normalized)
 
 
+def _overlay_natural_key_filters(model, filters):
+    """Restrict one presence check to the overlay model's declared natural key."""
+    natural_key = next((tuple(fields) for fields in model._meta.unique_together), ())
+    if not natural_key:
+        raise ValueError(f"{model._meta.label_lower} has no declared natural key")
+    presence = {}
+    for name in natural_key:
+        field = model._meta.get_field(name)
+        if name in filters:
+            presence[name] = filters[name]
+        elif field.attname in filters:
+            presence[name] = filters[field.attname]
+        else:
+            raise ValueError(f"{model._meta.label_lower} natural key field {name!r} is unavailable")
+    return presence
+
+
 def _present_overlay_identities(device_id, management, prepared):
     """Read every candidate state model once and return identities that exist."""
     from django.db.models import Q
@@ -1740,7 +1792,7 @@ def _native_create_actions(device_id, requested, *, management=None, bindings=No
         )
         model, filters = _state_filters(signature, rule, native, management)
         candidates.append((identity_key, signature, rule, native))
-        overlay_filters.append((identity_key, model, filters))
+        overlay_filters.append((identity_key, model, _overlay_natural_key_filters(model, filters)))
     present_overlays = _present_overlay_identities(device_id, management, overlay_filters)
 
     planned = []
@@ -1759,7 +1811,7 @@ def _native_create_actions(device_id, requested, *, management=None, bindings=No
     return tuple(planned)
 
 
-def _retract_manifest(manifest, overlay=None) -> bool:
+def _retract_manifest(manifest, overlay=None, *, expected_action, requested) -> bool:
     """Retire one deleted native identity through its scope's authority protocol."""
     from . import outbox
     from .intent_state import (
@@ -1773,14 +1825,6 @@ def _retract_manifest(manifest, overlay=None) -> bool:
     from .signals import _is_intent_push_suppressed, _is_render_request
     from .status_machine import is_owned
 
-    # outbox.enqueue writes nothing while pushes are suppressed. Retiring the manifest anyway
-    # would drop this identity's deletion authority with no error, and plan_ownership never
-    # revisits a retired row, so the retract must refuse instead.
-    if _is_intent_push_suppressed() or _is_render_request():
-        raise IntentMutationProtocolError(
-            f"the {manifest.scope} retract cannot record its deletion authority while intent pushes are suppressed"
-        )
-
     footprint = reconcile_family_footprint(manifest.device_id, [manifest.scope])
     # An anchor that merely stopped qualifying leaves the overlay behind, and the renderer
     # still reads it: without this the contribution authorises a deletion the re-rendered
@@ -1791,65 +1835,152 @@ def _retract_manifest(manifest, overlay=None) -> bool:
         *_, footprint_plan = _demotion_plan(overlay)
         footprint = MutationFootprint.merge(footprint, footprint_plan.lock_footprint)
     with intent_transaction(footprint) as permit:
+        rechecked = _rechecked_manifest_action(manifest, requested, expected_action)
+        if rechecked is None:
+            return False
+        current_manifest, _rule, _native, current, _action = rechecked
+        # A current retract must retain deletion authority when pushes are suppressed.
+        if _is_intent_push_suppressed() or _is_render_request():
+            raise IntentMutationProtocolError(
+                f"the {current_manifest.scope} retract cannot record its deletion authority while intent pushes "
+                "are suppressed"
+            )
         updated = NSOOwnershipManifest.objects.filter(
-            pk=manifest.pk,
+            pk=current_manifest.pk,
             ownership_state="owned",
         ).update(ownership_state="retired")
         if not updated:
             return False
-        current = None if overlay is None else type(overlay).objects.filter(pk=overlay.pk).first()
         if current is not None and is_owned(current.status):
             candidate, update_fields, plan = _demotion_plan(current)
             with consume_renderer_plan(plan, permit, content=True) as writer:
                 writer.save(candidate, update_fields=update_fields)
         transitions = ()
         delete_origin = True
-        if manifest.scope == "static_route":
-            acknowledged = manifest.acknowledged_lineage[-1] if manifest.acknowledged_lineage else None
+        if current_manifest.scope == "static_route":
+            acknowledged = current_manifest.acknowledged_lineage[-1] if current_manifest.acknowledged_lineage else None
             transitions = (
                 outbox.delete_transition(
-                    manifest.native_id,
+                    current_manifest.native_id,
                     last_acked=acknowledged,
                     current=acknowledged,
                 ),
             )
             delete_origin = False
         outbox.enqueue(
-            manifest.device_id,
-            manifest.scope,
+            current_manifest.device_id,
+            current_manifest.scope,
             transitions=transitions,
             delete_origin=delete_origin,
         )
     return True
 
 
-def _detach_manifest(manifest) -> bool:
+def _transition_manifest_ownership(manifest, *, expected_action, requested, ownership_state) -> bool:
+    """Apply one rechecked manifest-only ownership transition."""
+    from .intent_state import mirror_transaction, reconcile_family_footprint
+    from .models import NSOOwnershipManifest
+
+    footprint = reconcile_family_footprint(manifest.device_id, [manifest.scope])
+    with mirror_transaction(footprint):
+        rechecked = _rechecked_manifest_action(manifest, requested, expected_action)
+        if rechecked is None:
+            return False
+        current_manifest = rechecked[0]
+        return bool(
+            NSOOwnershipManifest.objects.filter(
+                pk=current_manifest.pk,
+                ownership_state="owned",
+            ).update(ownership_state=ownership_state)
+        )
+
+
+def _detach_manifest(manifest, *, expected_action, requested) -> bool:
     """Clear durable ownership without granting device deletion authority."""
-    from .models import NSOOwnershipManifest
-
-    return bool(
-        NSOOwnershipManifest.objects.filter(
-            pk=manifest.pk,
-            ownership_state="owned",
-        ).update(ownership_state="detached")
+    return _transition_manifest_ownership(
+        manifest,
+        expected_action=expected_action,
+        requested=requested,
+        ownership_state="detached",
     )
 
 
-def _retire_manifest(manifest) -> bool:
+def _retire_manifest(manifest, *, expected_action, requested) -> bool:
     """Close a durable identity whose only content vanished with its overlay."""
+    return _transition_manifest_ownership(
+        manifest,
+        expected_action=expected_action,
+        requested=requested,
+        ownership_state="retired",
+    )
+
+
+def _manifest_lifecycle_action(manifest, requested, *, management=None, qualifying=None):
+    """Resolve one manifest and return its current lifecycle action."""
+    from .models import NSODeviceManagement
+    from .status_machine import is_owned
+
+    if manifest.scope not in requested or manifest.ownership_state != "owned":
+        return None
+    management = management or NSODeviceManagement.objects.filter(device_id=manifest.device_id).first()
+    if management is None:
+        return None
+    qualifying = (
+        _qualifying_overlay_signatures(manifest.device_id, requested, management=management)
+        if qualifying is None
+        else qualifying
+    )
+    rule = _rule_for_manifest(manifest)
+    if rule is None:
+        return None
+    native = _native_for_manifest(manifest, rule)
+    if native is not None:
+        model, filters = _state_filters(manifest, rule, native, management)
+    else:
+        model, filters = _state_filters_without_native(manifest, rule, management)
+    overlay = model.objects.filter(**filters).first()
+    native_qualifies = native is not None and (
+        rule.acquisition_strategy == "existing_overlay"
+        or _qualifying_overlay_signature(
+            manifest.scope,
+            manifest.native_model_label,
+            native.pk,
+            manifest.state_model_label,
+            manifest.state_key,
+        )
+        in qualifying
+    )
+    action = plan_ownership(
+        rule,
+        OwnershipSignature(
+            native_present=native is not None,
+            native_qualifies=native_qualifies,
+            overlay_present=overlay is not None,
+            overlay_owned=overlay is not None and is_owned(overlay.status),
+            manifest_state=manifest.ownership_state,
+        ),
+    )
+    return manifest, rule, native, overlay, action
+
+
+def _rechecked_manifest_action(manifest, requested, expected_action):
+    """Reload one manifest and return its current matching lifecycle plan."""
     from .models import NSOOwnershipManifest
 
-    return bool(
-        NSOOwnershipManifest.objects.filter(
-            pk=manifest.pk,
-            ownership_state="owned",
-        ).update(ownership_state="retired")
-    )
+    current = NSOOwnershipManifest.objects.filter(
+        pk=manifest.pk,
+        device_id=manifest.device_id,
+        scope__in=requested,
+        ownership_state="owned",
+    ).first()
+    if current is None:
+        return None
+    planned = _manifest_lifecycle_action(current, requested)
+    return planned if planned is not None and planned[-1] is expected_action else None
 
 
 def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
     from .models import NSODeviceManagement, NSOOwnershipManifest
-    from .status_machine import is_owned
 
     management = NSODeviceManagement.objects.filter(device_id=device_id).first()
     if management is None:
@@ -1862,39 +1993,14 @@ def _manifest_lifecycle_actions(device_id, requested, *, qualifying=None):
         ownership_state="owned",
     ).order_by("pk")
     for manifest in manifests:
-        rule = _rule_for_manifest(manifest)
-        if rule is None:
-            continue
-        native = _native_for_manifest(manifest, rule)
-        overlay = None
-        if native is not None:
-            model, filters = _state_filters(manifest, rule, native, management)
-            overlay = model.objects.filter(**filters).first()
-        else:
-            model, filters = _state_filters_without_native(manifest, rule, management)
-            overlay = model.objects.filter(**filters).first()
-        native_qualifies = native is not None and (
-            rule.acquisition_strategy == "existing_overlay"
-            or _qualifying_overlay_signature(
-                manifest.scope,
-                manifest.native_model_label,
-                native.pk,
-                manifest.state_model_label,
-                manifest.state_key,
-            )
-            in qualifying
+        entry = _manifest_lifecycle_action(
+            manifest,
+            requested,
+            management=management,
+            qualifying=qualifying,
         )
-        action = plan_ownership(
-            rule,
-            OwnershipSignature(
-                native_present=native is not None,
-                native_qualifies=native_qualifies,
-                overlay_present=overlay is not None,
-                overlay_owned=overlay is not None and is_owned(overlay.status),
-                manifest_state=manifest.ownership_state,
-            ),
-        )
-        planned.append((manifest, rule, native, overlay, action))
+        if entry is not None:
+            planned.append(entry)
     return tuple(planned)
 
 
@@ -1915,20 +2021,29 @@ def _execute_overlay_records(device_id, requested, *, qualifying=None, natives=N
             qualifying, natives = _scan_context(device_id, requested)
             manifest_states = _manifest_states(device_id, requested)
             for entry in records:
-                _action, scope, model_label, pk = entry
-                instance = apps.get_model(model_label).objects.filter(pk=pk).first()
+                _action, scope, _model_label, pk = entry
+                instance = _rechecked_record_instance(
+                    entry,
+                    device_id,
+                    requested,
+                    qualifying=qualifying,
+                    natives=natives,
+                    manifest_states=manifest_states,
+                )
                 if instance is None:
-                    continue
-                if (
-                    _record_action_for(instance, device_id, requested, qualifying, manifest_states, natives=natives)
-                    != entry
-                ):
                     continue
                 maintain_manifest(instance)
                 completed.append((scope, pk))
-    for _action, scope, model_label, pk in retracts:
+    for entry in retracts:
+        _action, scope, model_label, pk = entry
         instance = apps.get_model(model_label).objects.filter(pk=pk).first()
-        if instance is not None and _demote_overlay(instance, device_id, scope):
+        if instance is not None and _demote_overlay(
+            instance,
+            device_id,
+            scope,
+            entry=entry,
+            requested=requested,
+        ):
             completed.append((scope, pk))
     return completed
 
@@ -1945,13 +2060,18 @@ def _execute_manifest_lifecycle(device_id, requested, *, qualifying=None):
             if replacement is not None:
                 completed.append((manifest.scope, replacement.pk))
         elif action is OwnershipAction.RETRACT:
-            if _retract_manifest(manifest, overlay):
+            if _retract_manifest(
+                manifest,
+                overlay,
+                expected_action=action,
+                requested=requested,
+            ):
                 completed.append((manifest.scope, manifest.pk))
         elif action is OwnershipAction.DETACH:
-            if _detach_manifest(manifest):
+            if _detach_manifest(manifest, expected_action=action, requested=requested):
                 completed.append((manifest.scope, manifest.pk))
         elif action is OwnershipAction.RETIRE:
-            if _retire_manifest(manifest):
+            if _retire_manifest(manifest, expected_action=action, requested=requested):
                 completed.append((manifest.scope, manifest.pk))
     return completed
 
