@@ -763,6 +763,43 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertEqual(NSOLACPBundleState.objects.get(interface=bundle).status, "accepted")
         self.assertEqual(NSOLACPMemberState.objects.get(interface=member).lag_bundle, bundle)
 
+    def test_reowned_interface_overlay_does_not_copy_native_metadata(self):
+        from core.models import ObjectType
+        from dcim.models import Interface
+        from extras.choices import CustomFieldTypeChoices
+        from extras.models import CustomField
+
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        interface = Interface.objects.create(
+            device=self.device,
+            name="Ethernet2.1",
+            type="1000base-t",
+            mtu=9216,
+        )
+        reconcile_scope_ownership(self.device.pk, ["interface_mtu"])
+        original = NSOInterfaceMtuState.objects.get(interface=interface)
+        custom_field = CustomField.objects.create(
+            name="ownership_native_note",
+            label="Ownership native note",
+            type=CustomFieldTypeChoices.TYPE_TEXT,
+        )
+        custom_field.object_types.add(ObjectType.objects.get_for_model(Interface))
+        interface.custom_field_data = {custom_field.name: "native only"}
+        interface.save(update_fields=["custom_field_data"])
+        original.delete()
+
+        completed = reconcile_scope_ownership(self.device.pk, ["interface_mtu"])
+
+        replacement = NSOInterfaceMtuState.objects.get(interface=interface)
+        interface.refresh_from_db()
+        self.assertEqual(interface.custom_field_data, {custom_field.name: "native only"})
+        self.assertEqual(replacement.custom_field_data, {})
+        self.assertEqual((replacement.l2_mtu, replacement.status), (9216, "accepted"))
+        replacement.full_clean()
+        self.assertIn(("interface_mtu", replacement.pk), completed)
+
     def test_assigned_native_ip_creates_an_owned_overlay(self):
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType

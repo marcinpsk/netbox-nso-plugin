@@ -13,6 +13,8 @@ from types import MappingProxyType, SimpleNamespace
 from django.apps import apps
 from django.utils import timezone
 
+from .intent_state import NETBOX_BASE_METADATA_FIELDS
+
 ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
     {
         "prefix_list": "netbox_routing.prefixlist",
@@ -1039,13 +1041,9 @@ def _seed_reowned_state(candidate, native, native_field, manifest):
     candidate.status = "accepted"
     if hasattr(candidate, "accepted_at"):
         candidate.accepted_at = timezone.now()
+    excluded_fields = NETBOX_BASE_METADATA_FIELDS | {"management", "status", "accepted_at", native_field}
     for field in candidate._meta.concrete_fields:
-        if field.primary_key or field.name in {
-            "management",
-            "status",
-            "accepted_at",
-            native_field,
-        }:
+        if field.primary_key or field.name in excluded_fields:
             continue
         if field.name in manifest.state_key:
             setattr(candidate, field.name, manifest.state_key[field.name])

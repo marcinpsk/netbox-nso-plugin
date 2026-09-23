@@ -335,11 +335,16 @@ _FRAGMENT_GATE_FIELDS = {
     "netbox_nso_plugin.nsovlanstate": {"status", "device_name"},
 }
 
-_GLOBAL_LIFECYCLE_FIELDS = frozenset(
+NETBOX_BASE_METADATA_FIELDS = frozenset(
     {
         "created",
         "last_updated",
         "custom_field_data",
+    }
+)
+
+_GLOBAL_LIFECYCLE_FIELDS = NETBOX_BASE_METADATA_FIELDS | frozenset(
+    {
         "status",
         "accepted_at",
         "last_sync_at",
