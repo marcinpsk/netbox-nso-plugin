@@ -131,7 +131,6 @@ class TestIntentRevisionWrites(TestCase):
         )
         candidate = copy.copy(row)
         candidate.status = "in_sync"
-        candidate._nso_explicit_status_update = True
 
         self.assertEqual(
             normalize_overlay_lifecycle(candidate, update_fields=["status"]),

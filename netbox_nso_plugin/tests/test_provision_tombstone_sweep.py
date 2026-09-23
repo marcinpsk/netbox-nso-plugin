@@ -38,7 +38,8 @@ def _in_second_connection(work) -> bool:
     prober = threading.Thread(target=probe)
     prober.start()
     prober.join(timeout=30)
-    return observed.get("free", "probe did not finish")
+    assert not prober.is_alive(), "second-connection probe did not finish within 30 seconds"
+    return observed["free"]
 
 
 def _device_is_editable(device_pk) -> bool:

@@ -222,6 +222,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                                 {
                                     "interface_name": self.interface.name,
                                     "mode": "trunk",
+                                    "untagged_vlan": None,
                                     "tagged_vlans": tagged_vlans,
                                 }
                             ]
