@@ -407,6 +407,7 @@ def _save_owned_overlay_edit():
 _LOCK_CONTEXTS = frozenset({"_intent_transaction", "intent_transaction", "mirror_transaction"})
 #: The seed builder every frozen plan comes from, as written at its call sites.
 _PLAN_BUILDER = "RendererMutationPlan.build"
+_NO_POSITIONAL_PLAN = "<no positional plan>"
 #: A helper may front the seed (``_demotion_plan``) and a local name may alias another
 #: (``plan = plans[scope]``), so both derivations are re-read until they settle.
 
@@ -921,7 +922,17 @@ def _plan_state_after(statement, bound, builders) -> set[str]:
         evaluated = _expression_state_after(statement.value, bound, builders)
         return _bind_plan_value(evaluated, [statement.target], statement.value, builders)
     if isinstance(statement, ast.AugAssign):
-        return set(bound) - _target_names(statement.target)
+        evaluated = _expression_state_after(statement.value, bound, builders)
+        return evaluated - _target_names(statement.target)
+    if isinstance(statement, ast.Assert):
+        return _expression_state_after(statement.test, bound, builders)
+    if isinstance(statement, ast.Return) and statement.value is not None:
+        return _expression_state_after(statement.value, bound, builders)
+    if isinstance(statement, ast.Raise):
+        evaluated = _expression_state_after(statement.exc, bound, builders) if statement.exc is not None else set(bound)
+        return (
+            _expression_state_after(statement.cause, evaluated, builders) if statement.cause is not None else evaluated
+        )
     if isinstance(statement, ast.Delete):
         deleted = set().union(*(_target_names(target) for target in statement.targets))
         return set(bound) - deleted
@@ -1079,7 +1090,7 @@ def _consumers(tree):
     return [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and _dotted(node.func) == "consume_renderer_plan" and node.args
+        if isinstance(node, ast.Call) and _dotted(node.func).rsplit(".", maxsplit=1)[-1] == "consume_renderer_plan"
     ]
 
 
@@ -1105,12 +1116,17 @@ def _stale_plan_source(source, module) -> list:
         inside = set(scoped_walk(statement.body))
         for call in [node for node in pending if node in inside]:
             pending.remove(call)
+            if not call.args:
+                offenders.append((module, _NO_POSITIONAL_PLAN, call.lineno))
+                continue
             plan = call.args[0]
             bound = _plan_names_before(statement.body, call, builders)
             if not _value_holds_plan(plan, bound, builders):
                 offenders.append((module, ast.unparse(plan), call.lineno))
     # A consumer that no lock context encloses at all has no locks to be planned under.
-    offenders.extend((module, ast.unparse(call.args[0]), call.lineno) for call in pending)
+    offenders.extend(
+        (module, ast.unparse(call.args[0]) if call.args else _NO_POSITIONAL_PLAN, call.lineno) for call in pending
+    )
     return offenders
 
 
@@ -1185,6 +1201,54 @@ def repair():
             [("fixture.py", "plan", 5)],
         )
 
+    def test_qualified_consumers_are_checked_inside_and_outside_locks(self):
+        inside_source = """
+def repair():
+    plan = RendererMutationPlan.build()
+    with intent_transaction(footprint):
+        writer.consume_renderer_plan(plan, permit)
+"""
+        outside_source = """
+def repair():
+    plan = RendererMutationPlan.build()
+    writer.consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(inside_source, "fixture.py"), [("fixture.py", "plan", 5)])
+        self.assertEqual(_stale_plan_source(outside_source, "fixture.py"), [("fixture.py", "plan", 4)])
+
+    def test_a_qualified_consumer_accepts_a_plan_built_under_its_lock(self):
+        source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        writer.consume_renderer_plan(plan, permit)
+"""
+
+        self.assertEqual(_stale_plan_source(source, "fixture.py"), [])
+
+    def test_keyword_plan_consumers_report_no_positional_plan(self):
+        inside_source = """
+def repair():
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        consume_renderer_plan(plan=plan, permit=permit)
+"""
+        outside_source = """
+def repair():
+    plan = RendererMutationPlan.build()
+    consume_renderer_plan(plan=plan, permit=permit)
+"""
+
+        self.assertEqual(
+            _stale_plan_source(inside_source, "fixture.py"),
+            [("fixture.py", "<no positional plan>", 5)],
+        )
+        self.assertEqual(
+            _stale_plan_source(outside_source, "fixture.py"),
+            [("fixture.py", "<no positional plan>", 4)],
+        )
+
     def test_a_later_non_plan_binding_invalidates_an_in_lock_plan(self):
         source = """
 def repair(stale):
@@ -1226,6 +1290,65 @@ def repair(stale):
             _stale_plan_source(source, "fixture.py"),
             [("fixture.py", "plan", 6)],
         )
+
+    def test_an_assert_test_updates_the_plan_state(self):
+        stale_source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        assert (plan := stale)
+        consume_renderer_plan(plan, permit)
+"""
+        fresh_source = stale_source.replace("plan := stale", "plan := RendererMutationPlan.build()")
+
+        self.assertEqual(_stale_plan_source(stale_source, "fixture.py"), [("fixture.py", "plan", 6)])
+        self.assertEqual(_stale_plan_source(fresh_source, "fixture.py"), [])
+
+    def test_an_augmented_assignment_value_updates_the_plan_state(self):
+        stale_source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        count += (plan := stale)
+        consume_renderer_plan(plan, permit)
+"""
+        fresh_source = stale_source.replace("plan := stale", "plan := RendererMutationPlan.build()")
+
+        self.assertEqual(_stale_plan_source(stale_source, "fixture.py"), [("fixture.py", "plan", 6)])
+        self.assertEqual(_stale_plan_source(fresh_source, "fixture.py"), [])
+
+    def test_a_return_expression_updates_the_plan_state_seen_by_finally(self):
+        stale_source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            return (plan := stale)
+        finally:
+            consume_renderer_plan(plan, permit)
+"""
+        fresh_source = stale_source.replace("plan := stale", "plan := RendererMutationPlan.build()")
+
+        self.assertEqual(_stale_plan_source(stale_source, "fixture.py"), [("fixture.py", "plan", 8)])
+        self.assertEqual(_stale_plan_source(fresh_source, "fixture.py"), [])
+
+    def test_raise_expressions_update_handler_state_in_evaluation_order(self):
+        stale_source = """
+def repair(stale):
+    with intent_transaction(footprint):
+        plan = RendererMutationPlan.build()
+        try:
+            raise (plan := RendererMutationPlan.build()) from (plan := stale)
+        except Exception:
+            consume_renderer_plan(plan, permit)
+"""
+        fresh_source = stale_source.replace(
+            "raise (plan := RendererMutationPlan.build()) from (plan := stale)",
+            "raise (plan := stale) from (plan := RendererMutationPlan.build())",
+        )
+
+        self.assertEqual(_stale_plan_source(stale_source, "fixture.py"), [("fixture.py", "plan", 8)])
+        self.assertEqual(_stale_plan_source(fresh_source, "fixture.py"), [])
 
     def test_loop_and_with_headers_invalidate_an_in_lock_plan(self):
         for header in (
