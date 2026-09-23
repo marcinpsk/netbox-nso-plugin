@@ -11,6 +11,8 @@ import sys
 from importlib import import_module
 from pathlib import Path
 
+from python_check_paths import scan_python_paths
+
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "netbox_nso_plugin" / "tests"))
 _ast_scope = import_module("_ast_scope")
@@ -165,11 +167,14 @@ def _annotated_lines(path: Path) -> set[int]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("scan", "test"))
-    parser.add_argument("path", nargs="?", type=Path)
+    parser.add_argument("paths", nargs="*", type=Path)
     args = parser.parse_args()
     if args.mode == "test":
-        actual = set(scan(args.path))
-        expected = _annotated_lines(args.path)
+        if len(args.paths) != 1:
+            parser.error("test requires exactly one fixture path")
+        fixture = args.paths[0]
+        actual = set(scan(fixture))
+        expected = _annotated_lines(fixture)
         if actual != expected:
             print(f"{_RULE_ID}: expected lines {sorted(expected)}, got {sorted(actual)}")
             return 1
@@ -177,7 +182,11 @@ def main() -> int:
 
     failed = False
     commands = Path("netbox_nso_plugin/management/commands")
-    for path in sorted(commands.rglob("*.py")):
+    try:
+        paths = scan_python_paths(args.paths, sorted(commands.rglob("*.py")))
+    except ValueError as error:
+        parser.error(str(error))
+    for path in paths:
         for line in scan(path):
             failed = True
             print(f"{path}:{line}: {_RULE_ID}: report the quiesced state and abort recovery, then re-raise")

@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from python_check_paths import scan_python_paths
+
 _RULE_ID = "nso-adapter-error-after-continue"
 _ANNOTATION = re.compile(r"#\s*ast-(finding|clean):\s*" + re.escape(_RULE_ID) + r"\s*$")
 
@@ -172,18 +174,26 @@ def _annotated_lines(path: Path) -> set[int]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("scan", "test"))
-    parser.add_argument("path", nargs="?", type=Path)
+    parser.add_argument("paths", nargs="*", type=Path)
     args = parser.parse_args()
     if args.mode == "test":
-        actual = set(scan(args.path))
-        expected = _annotated_lines(args.path)
+        if len(args.paths) != 1:
+            parser.error("test requires exactly one fixture path")
+        fixture = args.paths[0]
+        actual = set(scan(fixture))
+        expected = _annotated_lines(fixture)
         if actual != expected:
             print(f"{_RULE_ID}: expected lines {sorted(expected)}, got {sorted(actual)}")
             return 1
         return 0
 
     failed = False
-    for path in sorted(Path("netbox_nso_plugin").glob("*_reconciler.py")):
+    defaults = sorted(Path("netbox_nso_plugin").glob("*_reconciler.py"))
+    try:
+        paths = scan_python_paths(args.paths, defaults)
+    except ValueError as error:
+        parser.error(str(error))
+    for path in paths:
         for line in scan(path):
             failed = True
             print(f"{path}:{line}: {_RULE_ID}: validate before the loop can continue")

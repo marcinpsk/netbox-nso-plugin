@@ -8,6 +8,8 @@ import ast
 import importlib.util
 import keyword
 import re
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -15,7 +17,10 @@ import yaml
 from django.test import SimpleTestCase
 
 _RULES_PATH = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
+_ROOT = _RULES_PATH.parents[1]
 _FIXTURE_PATH = Path(__file__).resolve().parents[2] / ".opengrep" / "tests" / "review-patterns.py"
+_ADAPTER_ERROR_CHECKER = _RULES_PATH.parent / "check-adapter-error-continue.py"
+_RESUME_GUIDANCE_CHECKER = _RULES_PATH.parent / "check-resume-failure-guidance.py"
 _MONOTONIC_RULE_ID = "nso-global-monotonic-patch"
 _COVERAGE_PATH = _RULES_PATH.parent / "tests" / "coverage.py"
 _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside"}
@@ -79,6 +84,97 @@ def _scan_rules(rules_path: Path) -> tuple[list[str], set[str]]:
 
 def _rule_violations(rules_path: Path) -> list[str]:
     return _scan_rules(rules_path)[0]
+
+
+def _run_checker(checker: Path, mode: str, *paths: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(checker), mode, *(str(path) for path in paths)],
+        capture_output=True,
+        text=True,
+        cwd=_ROOT,
+        check=False,
+    )
+
+
+_CHECKER_CASES = (
+    (
+        _ADAPTER_ERROR_CHECKER,
+        "nso-adapter-error-after-continue",
+        """from netbox_nso_plugin.adapter_client import AdapterError
+
+def validate(items):
+    for item in items:
+        if item is None:
+            continue
+        raise AdapterError("invalid")
+""",
+    ),
+    (
+        _RESUME_GUIDANCE_CHECKER,
+        "nso-resume-failure-guidance",
+        """from netbox_nso_plugin.deployment import resume
+
+def recover():
+    resume()
+""",
+    ),
+)
+
+
+class TestReviewPatternCheckerPaths(SimpleTestCase):
+    def test_scan_expands_and_deduplicates_explicit_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for checker, rule_id, violation in _CHECKER_CASES:
+                with self.subTest(checker=checker.name):
+                    case_root = root / checker.stem
+                    finding_path = case_root / "nested" / "finding.py"
+                    finding_path.parent.mkdir(parents=True)
+                    finding_path.write_text(violation, encoding="utf-8")
+                    clean_path = case_root / "clean.py"
+                    clean_path.write_text("def clean():\n    return None\n", encoding="utf-8")
+
+                    result = _run_checker(checker, "scan", clean_path, case_root, finding_path)
+
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(str(finding_path), result.stdout)
+                    self.assertEqual(result.stdout.count(rule_id), 1)
+
+                    clean = _run_checker(checker, "scan", clean_path)
+                    self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+    def test_scan_without_paths_keeps_each_default_scope_clean(self):
+        for checker, _rule_id, _violation in _CHECKER_CASES:
+            with self.subTest(checker=checker.name):
+                result = _run_checker(checker, "scan")
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_scan_rejects_invalid_explicit_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing_path = root / "missing"
+            non_python_path = root / "notes.txt"
+            non_python_path.write_text("not Python\n", encoding="utf-8")
+
+            for checker, _rule_id, _violation in _CHECKER_CASES:
+                for invalid_path in (missing_path, non_python_path):
+                    with self.subTest(checker=checker.name, path=invalid_path):
+                        result = _run_checker(checker, "scan", invalid_path)
+
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        self.assertIn(str(invalid_path), result.stderr)
+
+    def test_test_mode_requires_exactly_one_fixture(self):
+        for checker, _rule_id, _violation in _CHECKER_CASES:
+            with self.subTest(checker=checker.name):
+                valid = _run_checker(checker, "test", _FIXTURE_PATH)
+                missing = _run_checker(checker, "test")
+                extra = _run_checker(checker, "test", _FIXTURE_PATH, _FIXTURE_PATH)
+
+                self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+                self.assertEqual(missing.returncode, 2, missing.stdout + missing.stderr)
+                self.assertEqual(extra.returncode, 2, extra.stdout + extra.stderr)
 
 
 class TestOpenGrepRuleStructure(SimpleTestCase):
