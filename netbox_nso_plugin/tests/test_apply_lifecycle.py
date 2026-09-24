@@ -141,6 +141,29 @@ class TestIntentRevisionWrites(TestCase):
         self.assertEqual(row.status, "accepted")
         self.assertEqual(row.apply_attempt_id, attempt_id)
 
+    def test_partial_status_and_attempt_save_clears_the_attempt_inline(self):
+        from netbox_nso_plugin.intent_state import normalize_overlay_lifecycle
+        from netbox_nso_plugin.models import NSOLoggingLevelState
+
+        attempt_id = uuid4()
+        row = NSOLoggingLevelState.objects.create(
+            management=self.management,
+            console_severity="WARNING",
+            status="accepted",
+            apply_attempt_id=attempt_id,
+        )
+        candidate = copy.copy(row)
+        candidate.status = "in_sync"
+
+        self.assertEqual(
+            normalize_overlay_lifecycle(candidate, update_fields=["status", "apply_attempt_id"]),
+            {},
+        )
+        self.assertIsNone(candidate.apply_attempt_id)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "accepted")
+        self.assertEqual(row.apply_attempt_id, attempt_id)
+
     def test_revision_upsert_uses_the_models_table_name(self):
         from unittest.mock import patch
 
