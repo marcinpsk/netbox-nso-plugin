@@ -237,6 +237,33 @@ class TestProvisionClaimReconciliation(_CascadeFlushMixin, TransactionTestCase):
                 claim_was_new=True,
             )
 
+    def test_new_claim_is_committed_before_adapter_send(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+        from netbox_nso_plugin.onboarding import onboard_candidate
+
+        device = _device("durable-new-claim", ip="198.18.0.14/32")
+        alias = "onboarding_durability_probe"
+        connections[alias] = connection.copy(alias=alias)
+
+        def observe_claim(**request):
+            tombstone = NSOProvisionTombstone.objects.using(alias).get(
+                provision_attempt_id=request["provision_attempt_id"]
+            )
+            self.assertEqual(tombstone.state, "open")
+            self.assertEqual(str(tombstone.provision_attempt_id), request["provision_attempt_id"])
+            self.assertEqual(tombstone.canonical_request, request)
+            return {"job_id": "durability-job", "status": "queued"}
+
+        try:
+            with patch("netbox_nso_plugin.adapter_client.provision_device", side_effect=observe_claim):
+                result = onboard_candidate(device, self.instance, ned_id="test-ned:test-ned")
+        finally:
+            connections[alias].close()
+            del connections[alias]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["job_id"], "durability-job")
+
     def test_new_claim_recovers_an_admission_rolled_back_by_a_reusing_caller(self):
         from netbox_nso_plugin.models import NSODeviceManagement, NSOProvisionTombstone
         from netbox_nso_plugin.onboarding import onboard_candidate
