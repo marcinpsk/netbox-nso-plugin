@@ -623,6 +623,10 @@ def maintain_manifest(instance) -> None:
     if binding is None:
         return
     rule, scope, device_id, native_model_label, native_id, native_key, state_model_label, state_key = binding
+    if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
+        signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
+        if signature is None:
+            return
     identity = {
         "device_id": device_id,
         "scope": scope,
@@ -672,36 +676,10 @@ def maintain_manifest(instance) -> None:
         if exact is not None:
             NSOOwnershipManifest.objects.filter(pk=exact.pk).exclude(ownership_state="retired").update(**defaults)
             return
-        if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
-            signature = _qualifying_overlay_signature(
-                scope,
-                native_model_label,
-                native_id,
-                state_model_label,
-                state_key,
-            )
-            candidates = NSOOwnershipManifest.objects.filter(
-                device_id=device_id,
-                scope=scope,
-                native_model_label=native_model_label,
-                native_id=native_id,
-                state_model_label=state_model_label,
-            ).order_by("pk")
-            for candidate in candidates:
-                candidate_signature = _qualifying_overlay_signature(
-                    candidate.scope,
-                    candidate.native_model_label,
-                    candidate.native_id,
-                    candidate.state_model_label,
-                    candidate.state_key,
-                )
-                if candidate_signature != signature:
-                    continue
-                if candidate.ownership_state == "retired":
-                    return
-                if adopt_manifest(candidate.pk, native_key=native_key, state_key=state_key):
-                    return
-                break
+        if state_model_label == "netbox_nso_plugin.nsobgppeerstate" and _reuse_bgp_manifest(
+            identity, native_id, signature, adopt_manifest
+        ):
+            return
         previous = (
             NSOOwnershipManifest.objects.filter(
                 **incarnation,
@@ -775,6 +753,43 @@ def _qualifying_overlay_signature(scope, native_model_label, native_id, state_mo
     )
 
 
+def _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key):
+    """Return None when a persisted BGP identity cannot qualify for ownership."""
+    try:
+        return _qualifying_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
+    except ValueError:
+        return None
+
+
+def _reuse_bgp_manifest(identity, native_id, signature, adopt_manifest):
+    """Reuse one matching BGP manifest when its persisted identity is valid."""
+    from .models import NSOOwnershipManifest
+
+    candidates = NSOOwnershipManifest.objects.filter(
+        device_id=identity["device_id"],
+        scope=identity["scope"],
+        native_model_label=identity["native_model_label"],
+        native_id=native_id,
+        state_model_label=identity["state_model_label"],
+    ).order_by("pk")
+    for candidate in candidates:
+        candidate_signature = _valid_overlay_signature(
+            candidate.scope,
+            candidate.native_model_label,
+            candidate.native_id,
+            candidate.state_model_label,
+            candidate.state_key,
+        )
+        if candidate_signature != signature:
+            continue
+        if candidate.ownership_state == "retired":
+            return True
+        if adopt_manifest(candidate.pk, native_key=identity["native_key"], state_key=identity["state_key"]):
+            return True
+        break
+    return False
+
+
 def _manifest_states(device_id, requested):
     from .models import NSOOwnershipManifest
 
@@ -823,16 +838,7 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
     if rule.acquisition_strategy == "existing_overlay":
         native_qualifies = True
     else:
-        try:
-            signature = _qualifying_overlay_signature(
-                scope,
-                native_model_label,
-                native_id,
-                state_model_label,
-                state_key,
-            )
-        except ValueError:
-            signature = None
+        signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
         native_qualifies = signature is not None and signature in qualifying
     action = plan_ownership(
         rule,
@@ -1941,7 +1947,7 @@ def _manifest_lifecycle_action(manifest, requested, *, management=None, qualifyi
     overlay = model.objects.filter(**filters).first()
     native_qualifies = native is not None and (
         rule.acquisition_strategy == "existing_overlay"
-        or _qualifying_overlay_signature(
+        or _valid_overlay_signature(
             manifest.scope,
             manifest.native_model_label,
             native.pk,

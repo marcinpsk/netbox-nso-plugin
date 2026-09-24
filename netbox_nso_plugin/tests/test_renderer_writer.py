@@ -1507,7 +1507,97 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         assert not CommunityList.objects.filter(pk=community_list_pk).exists()
         assert not CommunityListEntry.objects.filter(pk=entry.pk).exists()
 
-    def test_malformed_bgp_identity_rolls_back_the_writer_plan(self):
+    def _make_linked_bgp_overlay(self, tag, adapter_device_id):
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        device, management = make_managed(tag, adapter_device_id)
+        rir = RIR.objects.create(name=f"{tag} private", slug=f"{tag}-private")
+        local_as = ASN.objects.create(asn=64530, rir=rir)
+        remote_as = ASN.objects.create(asn=64531, rir=rir)
+        router = BGPRouter.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=device.pk,
+            asn=local_as,
+            name="64530",
+        )
+        peer = BGPPeer.objects.create(
+            scope=BGPScope.objects.create(router=router),
+            peer=IPAddress.objects.create(address="198.18.98.2/32"),
+            remote_as=remote_as,
+            enabled=True,
+        )
+        state = NSOBGPPeerState.objects.create(
+            management=management,
+            bgp_peer=peer,
+            asn_str="64530",
+            vrf_name="",
+            peer_address_str="198.18.98.2",
+            status="imported",
+        )
+        return device, state
+
+    def test_malformed_owned_bgp_identity_has_no_manifest_after_writer_save(self):
+        from netbox_nso_plugin.models import NSOBGPPeerState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        device, state = self._make_linked_bgp_overlay("writer-bgp-invalid", 16300)
+        NSOBGPPeerState.objects.filter(pk=state.pk).update(
+            status="in_sync", asn_str="invalid", peer_address_str="not-an-address"
+        )
+        state.refresh_from_db()
+        candidate = copy.copy(state)
+        candidate.last_apply_error = "planned"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").exists())
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(candidate, update_fields=("last_apply_error",))
+
+        state.refresh_from_db()
+        self.assertEqual(state.last_apply_error, "planned")
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").exists())
+
+    def test_malformed_bgp_manifest_candidate_is_skipped_after_writer_save(self):
+        from netbox_nso_plugin.ownership_planner import manifest_binding
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
+
+        device, state = self._make_linked_bgp_overlay("writer-bgp-candidate", 16301)
+        type(state).objects.filter(pk=state.pk).update(status="in_sync")
+        state.refresh_from_db()
+        binding = manifest_binding(state)
+        malformed = NSOOwnershipManifest.objects.create(
+            device_id=binding[2],
+            scope=binding[1],
+            native_model_label=binding[3],
+            native_id=binding[4],
+            native_key=binding[5],
+            state_model_label=binding[6],
+            state_key={"asn_str": "64530", "vrf_name": "", "peer_address_str": "not-an-address"},
+            ownership_state="owned",
+            deletion_authority=True,
+        )
+        candidate = copy.copy(state)
+        candidate.last_apply_error = "planned"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+
+        with renderer_mirror_writes(plan) as writer:
+            writer.save(candidate, update_fields=("last_apply_error",))
+
+        state.refresh_from_db()
+        malformed.refresh_from_db()
+        self.assertEqual(state.last_apply_error, "planned")
+        self.assertEqual(malformed.state_key["peer_address_str"], "not-an-address")
+        self.assertEqual(malformed.ownership_state, "owned")
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp", state_key=binding[7]).exists()
+        )
+
+    def test_save_callback_error_rolls_back_the_writer_plan(self):
         from dcim.models import Device
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import ASN, RIR, IPAddress
@@ -1563,10 +1653,14 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             )
         )
 
-        with self.assertRaises(ValueError), without_commit_drain():
+        def save_then_fail():
+            malformed_candidate.save(update_fields=("last_apply_error",))
+            raise ValueError("save callback failed")
+
+        with self.assertRaisesRegex(ValueError, "save callback failed"), without_commit_drain():
             with renderer_writes(plan) as writer:
                 writer.save(other_candidate, update_fields=("status",))
-                writer.save(malformed_candidate, update_fields=("last_apply_error",))
+                writer.save_via(malformed_candidate, save_then_fail, update_fields=("last_apply_error",))
 
         malformed.refresh_from_db()
         other.refresh_from_db()
