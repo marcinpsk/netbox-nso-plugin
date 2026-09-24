@@ -2390,10 +2390,19 @@ class TestDeleteOriginMarking(_SignalDBBase):
             writer.delete(row)
 
     @staticmethod
-    def _save_with_writer(row):
+    def _delete_native_and_overlay_with_writer(native, state):
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        plan = RendererMutationPlan.build(deletes=(planned_delete(state), planned_delete(native)))
+        with renderer_writes(plan) as writer:
+            writer.delete(state)
+            writer.delete(native)
+
+    @staticmethod
+    def _save_with_writer(row, *, natural_key=()):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
-        plan = RendererMutationPlan.build(saves=(planned_save(row),))
+        plan = RendererMutationPlan.build(saves=(planned_save(row, natural_key=natural_key),))
         with renderer_writes(plan) as writer:
             writer.save(row)
 
@@ -2405,6 +2414,48 @@ class TestDeleteOriginMarking(_SignalDBBase):
         self.assertTrue(
             any(p.get("delete_origin") == "true" for p in params),
             f"delete push must be marked delete_origin; saw params {params}",
+        )
+
+    def test_native_isis_flex_algo_delete_push_is_marked_delete_origin(self):
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin.models import NSOISISFlexAlgoState
+
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        native = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+        mgmt = self._mgmt()
+        state = NSOISISFlexAlgoState(
+            management=mgmt, process_tag="CORE", algo_id=130, isis_flex_algo=native, status="accepted"
+        )
+        with self._arranged():
+            self._save_with_writer(state, natural_key=("management", "process_tag", "algo_id"))
+
+        params = self._recorded_params(lambda: self._delete_native_and_overlay_with_writer(native, state))
+        self.assertTrue(params, "the native delete must push")
+        self.assertTrue(
+            all(p.get("delete_origin") == "true" for p in params),
+            f"the native delete must retract; saw params {params}",
+        )
+
+    def test_native_isis_interface_delete_push_is_marked_delete_origin(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        instance = ISISInstance.objects.create(device=self.device, process_tag="CORE")
+        native = ISISInterface.objects.create(interface=self.iface, address_family="ipv4", instance=instance)
+        mgmt = self._mgmt()
+        state = NSOISISInterfaceState(
+            management=mgmt, interface=self.iface, isis_interface=native, af="ipv4", status="accepted"
+        )
+        with self._arranged():
+            self._save_with_writer(state, natural_key=("management", "interface", "af"))
+
+        params = self._recorded_params(lambda: self._delete_native_and_overlay_with_writer(native, state))
+        self.assertTrue(params, "the native delete must push")
+        self.assertTrue(
+            all(p.get("delete_origin") == "true" for p in params),
+            f"the native delete must retract; saw params {params}",
         )
 
     def test_unown_save_push_is_unmarked(self):
