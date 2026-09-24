@@ -623,10 +623,6 @@ def maintain_manifest(instance) -> None:
     if binding is None:
         return
     rule, scope, device_id, native_model_label, native_id, native_key, state_model_label, state_key = binding
-    if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
-        signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
-        if signature is None:
-            return
     identity = {
         "device_id": device_id,
         "scope": scope,
@@ -636,6 +632,10 @@ def maintain_manifest(instance) -> None:
         "state_key": state_key,
     }
     if sm.is_owned(instance.status):
+        if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
+            signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
+            if signature is None:
+                return
         from django.db import IntegrityError, transaction
 
         lineage = (

@@ -945,6 +945,40 @@ class TestSymmetricOwnershipExecutor(TestCase):
                     2,
                 )
 
+    def test_malformed_persisted_bgp_manifest_retracts_during_ownership_audit(self):
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentOutboxEntry, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import manifest_binding, reconcile_scope_ownership
+
+        (peer,) = self._make_native_bgp_peers("198.18.173.8/32")
+        state = NSOBGPPeerState.objects.create(
+            management=self.management,
+            bgp_peer=peer,
+            asn_str="invalid",
+            vrf_name="",
+            peer_address_str="198.18.173.8",
+            status="imported",
+        )
+        binding = manifest_binding(state)
+        manifest = NSOOwnershipManifest.objects.create(
+            device_id=binding[2],
+            scope=binding[1],
+            native_model_label=binding[3],
+            native_id=binding[4],
+            native_key=binding[5],
+            state_model_label=binding[6],
+            state_key=binding[7],
+            ownership_state="owned",
+            deletion_authority=True,
+        )
+        NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bgp").delete()
+
+        completed = reconcile_scope_ownership(self.device.pk, ["bgp"])
+
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "retired")
+        self.assertIn(("bgp", manifest.pk), completed)
+        self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="bgp", mark_any=True).exists())
+
     def test_owned_malformed_bgp_identity_is_demoted_without_blocking_a_valid_sibling(self):
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOOwnershipManifest
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership

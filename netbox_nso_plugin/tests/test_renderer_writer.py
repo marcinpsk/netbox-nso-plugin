@@ -1562,6 +1562,47 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertEqual(state.last_apply_error, "planned")
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").exists())
 
+    def test_imported_malformed_bgp_overlay_detaches_manifest_after_writer_save(self):
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry
+        from netbox_nso_plugin.ownership_planner import manifest_binding, reconcile_scope_ownership
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        device, state = self._make_linked_bgp_overlay("writer-bgp-detach", 16302)
+        type(state).objects.filter(pk=state.pk).update(
+            status="in_sync", asn_str="invalid", peer_address_str="not-an-address"
+        )
+        state.refresh_from_db()
+        binding = manifest_binding(state)
+        manifest = NSOOwnershipManifest.objects.create(
+            device_id=binding[2],
+            scope=binding[1],
+            native_model_label=binding[3],
+            native_id=binding[4],
+            native_key=binding[5],
+            state_model_label=binding[6],
+            state_key=binding[7],
+            ownership_state="owned",
+            deletion_authority=True,
+        )
+        candidate = copy.copy(state)
+        candidate.status = "imported"
+        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+
+        with renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=("status",))
+
+        state.refresh_from_db()
+        manifest.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(manifest.ownership_state, "detached")
+        NSOIntentOutboxEntry.objects.filter(device=device, scope="bgp").delete()
+
+        reconcile_scope_ownership(device.pk, ["bgp"])
+
+        manifest.refresh_from_db()
+        self.assertEqual(manifest.ownership_state, "detached")
+        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=device, scope="bgp", mark_any=True).exists())
+
     def test_malformed_bgp_manifest_candidate_is_skipped_after_writer_save(self):
         from netbox_nso_plugin.ownership_planner import manifest_binding
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
