@@ -11,6 +11,7 @@ from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from ipam.models import IPAddress
 from netaddr import IPNetwork
 
+from ._outbox_case import open_provision_attempt
 from .mixins import _CascadeFlushMixin
 
 
@@ -931,7 +932,7 @@ class TestAdvanceProvisioning(TestCase):
         cls.instance = NSOInstance.objects.create(name="advP", adapter_instance_id="advP")
 
     def _provisioning(self, tag, *, job_id="99", attempt_job_id="99", with_attempt=True):
-        from netbox_nso_plugin.models import NSODeviceManagement, NSOProvisionTombstone
+        from netbox_nso_plugin.models import NSODeviceManagement
 
         device = _device(tag)
         mgmt = NSODeviceManagement.objects.create(
@@ -943,16 +944,7 @@ class TestAdvanceProvisioning(TestCase):
         )
         if not with_attempt:
             return mgmt, None
-        tombstone = NSOProvisionTombstone(
-            netbox_device_id=device.pk,
-            nso_instance=self.instance.adapter_instance_id,
-            nso_device_name=tag,
-            canonical_request={},
-            adapter_job_id=attempt_job_id,
-        )
-        tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
-        tombstone.save(force_insert=True)
-        return mgmt, tombstone
+        return mgmt, open_provision_attempt(mgmt, job_id=attempt_job_id)
 
     def test_a_row_with_no_provision_attempt_is_terminated(self):
         """Nothing can ever complete this row, so it must not report 'provisioning' forever."""

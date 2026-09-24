@@ -12,8 +12,9 @@ from dcim.models import Device
 from django.test import TestCase
 
 from netbox_nso_plugin.adapter_client import AdapterError
-from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOProvisionTombstone
+from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
+from ._outbox_case import open_provision_attempt
 from .test_django_views import ViewTestBase
 from .test_onboarding import _device
 
@@ -22,19 +23,6 @@ _SUCCEEDED_OK = {
     "status": "succeeded",
     "result": {"ok": True, "steps": [{"step": "sync_from", "status": "ok"}], "device_id": None},
 }
-
-
-def _provision_tombstone(mgmt, job_id):
-    tombstone = NSOProvisionTombstone(
-        netbox_device_id=mgmt.device_id,
-        nso_instance=mgmt.nso_instance.adapter_instance_id,
-        nso_device_name=mgmt.nso_device_name,
-        canonical_request={},
-        adapter_job_id=job_id,
-    )
-    tombstone.canonical_request = {"provision_attempt_id": str(tombstone.provision_attempt_id)}
-    tombstone.save(force_insert=True)
-    return tombstone
 
 
 class TestOnboardTabSelfHeal(ViewTestBase):
@@ -52,7 +40,7 @@ class TestOnboardTabSelfHeal(ViewTestBase):
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
-        return dev, mgmt, _provision_tombstone(mgmt, job_id)
+        return dev, mgmt, open_provision_attempt(mgmt, job_id=job_id)
 
     @patch("netbox_nso_plugin.adapter_client.get_device", side_effect=AdapterError("no adapter"))
     @patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None)
@@ -110,7 +98,7 @@ class TestAdvanceStaleOnboardingSweep(TestCase):
             onboard_status="provisioning",
             onboard_job_id=job_id,
         )
-        return mgmt, _provision_tombstone(mgmt, job_id)
+        return mgmt, open_provision_attempt(mgmt, job_id=job_id)
 
     @patch("netbox_nso_plugin.adapter_client.sync_notify", return_value=None)
     @patch("netbox_nso_plugin.adapter_client.set_scope")
@@ -313,7 +301,7 @@ class TestProvisionTombstoneSweepJob(TestCase):
             onboard_status="provisioning",
             onboard_job_id="J1",
         )
-        tombstone = _provision_tombstone(mgmt, "J1")
+        tombstone = open_provision_attempt(mgmt, job_id="J1")
         with self.captureOnCommitCallbacks(execute=True):
             run_provision_tombstone_sweep(tombstone.provision_attempt_id)
         mgmt.refresh_from_db()
