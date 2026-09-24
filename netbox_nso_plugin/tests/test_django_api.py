@@ -429,6 +429,25 @@ class OnboardAPIConflictTest(APITestCase):
         self.assertEqual(response.data["error"]["detail"]["job_id"], 73)
         self.assertNotIn("_http_status", response.data)
 
+    def test_non_object_body_returns_400_without_provisioning(self):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
+        tombstone_count = NSOProvisionTombstone.objects.count()
+        for body in ([], ["x"]):
+            with (
+                self.subTest(body=body),
+                patch("netbox_nso_plugin.adapter_client.provision_device") as provision,
+            ):
+                response = self.client.post(url, body, format="json", **self.header)
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data["detail"], "request body must be a JSON object")
+                self.assertEqual(NSOProvisionTombstone.objects.count(), tombstone_count)
+                provision.assert_not_called()
+
 
 class OnboardingCandidatesAPITest(APITestCase):
     """The CICD-facing candidates API exposes the management IP + oob_only, and onboardable

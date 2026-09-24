@@ -35,6 +35,11 @@ from .serializers import (
 )
 
 
+def _request_body(request):
+    body = request.data
+    return body if isinstance(body, dict) else None
+
+
 class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):
     """REST API for database-managed derived-intent templates."""
 
@@ -233,14 +238,18 @@ class OnboardView(APIView):
 
         from ..onboarding import onboard_candidate
 
-        device_id = request.data.get("netbox_device_id")
+        body = _request_body(request)
+        if body is None:
+            return Response({"detail": "request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
+
+        device_id = body.get("netbox_device_id")
         if device_id is None:
             return Response({"detail": "netbox_device_id is required"}, status=status.HTTP_400_BAD_REQUEST)
         device = Device.objects.filter(pk=device_id).first()
         if device is None:
             return Response({"detail": f"device {device_id} not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        selected = request.data.get("instance")
+        selected = body.get("instance")
         instance = None
         if selected:
             instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
@@ -278,8 +287,12 @@ class SyncCompleteView(APIView):
         """Resolve the device and enqueue its background reconcile."""
         from ..reconcile import enqueue_device_reconcile
 
-        device_id = request.data.get("netbox_device_id")
-        adapter_device_id = request.data.get("adapter_device_id")
+        body = _request_body(request)
+        if body is None:
+            return Response({"detail": "request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
+
+        device_id = body.get("netbox_device_id")
+        adapter_device_id = body.get("adapter_device_id")
 
         if device_id is None and adapter_device_id is None:
             return Response(
@@ -321,12 +334,16 @@ class ProvisionCompleteView(APIView):
         from ..provision_lifecycle import mark_provision_terminal, validate_provision_evidence
         from ..reconcile import enqueue_provision_tombstone_sweep
 
-        raw_attempt_id = request.data.get("provision_attempt_id")
+        body = _request_body(request)
+        if body is None:
+            return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_attempt_id = body.get("provision_attempt_id")
         if raw_attempt_id in (None, ""):
             return Response({"detail": "provision_attempt_id is required"}, status=status.HTTP_400_BAD_REQUEST)
         try:
             attempt_id = UUID(str(raw_attempt_id))
-            evidence = validate_provision_evidence(dict(request.data), terminal_required=True)
+            evidence = validate_provision_evidence(dict(body), terminal_required=True)
         except (TypeError, ValueError):
             return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
         try:

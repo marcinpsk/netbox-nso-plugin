@@ -319,6 +319,20 @@ class TestSyncCompleteEndpoint(APITestCase):
         response = self.client.post(self._url(), {}, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_non_object_body_returns_400_without_enqueue(self):
+        management_count = NSODeviceManagement.objects.count()
+        for body in ([], ["x"]):
+            with (
+                self.subTest(body=body),
+                patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as enqueue,
+            ):
+                response = self.client.post(self._url(), body, format="json", **self.header)
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data["detail"], "request body must be a JSON object")
+                self.assertEqual(NSODeviceManagement.objects.count(), management_count)
+                enqueue.assert_not_called()
+
     def test_netbox_device_id_enqueues_and_returns_202(self):
         with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as m:
             response = self.client.post(self._url(), {"netbox_device_id": 42}, format="json", **self.header)
@@ -432,6 +446,22 @@ class TestProvisionCompleteEndpoint(APITestCase):
     def test_missing_attempt_id_returns_400(self):
         response = self.client.post(self._url(), {}, format="json", **self.header)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_non_object_body_returns_400_without_enqueue(self):
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        tombstone_count = NSOProvisionTombstone.objects.count()
+        for body in ([], ["x"]):
+            with (
+                self.subTest(body=body),
+                patch("netbox_nso_plugin.reconcile.enqueue_provision_tombstone_sweep") as enqueue,
+            ):
+                response = self.client.post(self._url(), body, format="json", **self.header)
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data["detail"], "invalid provision completion evidence")
+                self.assertEqual(NSOProvisionTombstone.objects.count(), tombstone_count)
+                enqueue.assert_not_called()
 
     def test_unexpected_terminal_write_error_is_not_reported_as_invalid_evidence(self):
         payload = {"provision_attempt_id": str(uuid4()), "status": "failed"}
