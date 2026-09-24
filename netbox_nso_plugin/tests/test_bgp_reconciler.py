@@ -327,6 +327,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         malformed = initial["10.0.0.2"]
         linked_peer_id = malformed.bgp_peer_id
         self.assertIsNotNone(linked_peer_id)
+        NSOBGPPeerState.objects.filter(pk=initial["10.0.0.3"].pk).update(status="in_sync")
         NSOBGPPeerState.objects.filter(pk=malformed.pk).update(
             asn_str="invalid",
             peer_address_str="not-an-address",
@@ -344,7 +345,16 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(malformed.status, "error")
         self.assertEqual(malformed.bgp_peer_id, linked_peer_id)
-        self.assertEqual(valid.status, "imported")
+        self.assertTrue(
+            NSOOwnershipManifest.objects.filter(
+                device_id=self.device.pk,
+                scope="bgp",
+                state_model_label=valid._meta.label_lower,
+                state_key={"asn_str": "65100", "vrf_name": "", "peer_address_str": "10.0.0.3"},
+                ownership_state="owned",
+            ).exists()
+        )
+        self.assertEqual(valid.status, "in_sync")
         self.assertNotEqual(valid.bgp_peer_id, linked_peer_id)
         self.assertIn(malformed, states)
         self.assertIn(valid, states)
@@ -364,6 +374,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             NSOOwnershipManifest.objects.filter(
                 device_id=self.device.pk,
                 state_model_label=malformed._meta.label_lower,
+                native_id=linked_peer_id,
             ).exists()
         )
 
