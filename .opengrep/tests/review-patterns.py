@@ -3,6 +3,7 @@
 """Positive and negative examples for the custom review checks."""
 
 import contextlib
+import django.db.models.signals
 from unittest.mock import patch
 from threading import BrokenBarrierError
 from django.db.models import signals as model_signals
@@ -432,12 +433,39 @@ def wire_signals(handler, sender, custom_signal):
     post_delete_signal.connect(handler, sender=sender)
     # ruleid: nso-signal-connect-without-dispatch-uid
     model_signals.m2m_changed.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.pre_init.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.post_init.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.pre_migrate.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.post_migrate.connect(handler, sender=sender)
+    # ruleid: nso-signal-connect-without-dispatch-uid
+    model_signals.class_prepared.connect(handler, sender=sender)
     # ok: nso-signal-connect-without-dispatch-uid
     post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
     # ok: nso-signal-connect-without-dispatch-uid
     model_signals.post_save.connect(handler, sender=sender, dispatch_uid="nso_plugin_example")
     # ok: nso-signal-connect-without-dispatch-uid
     custom_signal.connect(handler, sender=sender)
+
+
+def wire_delete_signals(sender):
+    # ruleid: nso-delete-signal-without-delete-origin
+    model_signals.pre_delete.connect(_on_delete, sender=sender, dispatch_uid="pre_delete")
+    # ruleid: nso-delete-signal-without-delete-origin
+    post_delete_signal.connect(_on_post_delete, sender=sender, dispatch_uid="post_delete")
+    # ruleid: nso-delete-signal-without-delete-origin
+    django.db.models.signals.post_delete.connect(_on_qualified_delete, sender=sender, dispatch_uid="qualified")
+    # ok: nso-delete-signal-without-delete-origin
+    model_signals.pre_delete.connect(_as_delete_origin(_on_delete), sender=sender, dispatch_uid="wrapped")
+    # ok: nso-delete-signal-without-delete-origin
+    model_signals.post_delete.connect(_as_delete_origin(_on_post_delete), sender=sender, dispatch_uid="wrapped_post")
+    # ok: nso-delete-signal-without-delete-origin
+    model_signals.pre_delete.connect(_validate_explicit_delete, sender=sender, dispatch_uid="validator")
+    # ok: nso-delete-signal-without-delete-origin
+    model_signals.post_save.connect(_on_save, sender=sender, dispatch_uid="save")
 
 
 def unchecked_request_body_shapes(request, self):

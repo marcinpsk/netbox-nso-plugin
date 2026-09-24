@@ -306,10 +306,29 @@ rules:
           - pattern: django.db.models.signals.pre_delete.connect(...)
           - pattern: django.db.models.signals.post_delete.connect(...)
           - pattern: django.db.models.signals.m2m_changed.connect(...)
+          - pattern: django.db.models.signals.pre_init.connect(...)
+          - pattern: django.db.models.signals.post_init.connect(...)
+          - pattern: django.db.models.signals.pre_migrate.connect(...)
+          - pattern: django.db.models.signals.post_migrate.connect(...)
+          - pattern: django.db.models.signals.class_prepared.connect(...)
       - pattern-not: $SIGNAL.connect(..., dispatch_uid=$UID, ...)
     paths:
       exclude:
         # Tests connect a temporary receiver and disconnect it in teardown.
+        - "**/tests/**"
+  - id: nso-delete-signal-without-delete-origin
+    languages: [python]
+    severity: ERROR
+    message: Wrap deletion receivers with _as_delete_origin so intent retractions are marked.
+    patterns:
+      - pattern-either:
+          - pattern: django.db.models.signals.pre_delete.connect($H, ...)
+          - pattern: django.db.models.signals.post_delete.connect($H, ...)
+      - metavariable-regex:
+          metavariable: $H
+          regex: '^(?:[A-Za-z_]\w*\.)*_on_[A-Za-z_]\w*$'
+    paths:
+      exclude:
         - "**/tests/**"
   - id: nso-unchecked-request-body
     languages: [python]
