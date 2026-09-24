@@ -353,6 +353,39 @@ rules:
       exclude:
         - "**/tests/**"
         - "**/migrations/**"
+  - id: nso-unguarded-overlay-signature
+    languages: [python]
+    severity: ERROR
+    message: Validate persisted overlay signatures before using them.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $MODULE.$F(...)
+          - pattern: $ALIAS = $F
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_qualifying_overlay_signature$'
+      - pattern-not-inside:
+          patterns:
+            - pattern-inside: |
+                def $GUARD(...):
+                    ...
+            - metavariable-regex:
+                metavariable: $GUARD
+                regex: '^_valid_overlay_signature$'
+      - pattern-not-inside:
+          patterns:
+            - pattern-inside: |
+                def $NATIVE(...):
+                    ...
+            - metavariable-regex:
+                metavariable: $NATIVE
+                regex: '^_qualifying_overlay_signatures$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
   - id: nso-renderer-writer-single-resolver
     languages: [python]
     severity: ERROR

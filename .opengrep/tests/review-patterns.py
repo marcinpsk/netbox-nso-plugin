@@ -488,6 +488,26 @@ def _request_body(request):
     return request.data.get("device_id")
 
 
+def unguarded_overlay_signature(state_key, planner):
+    # ruleid: nso-unguarded-overlay-signature
+    signature = _qualifying_overlay_signature("device", "model", 1, "state", state_key)
+    # ruleid: nso-unguarded-overlay-signature
+    planner._qualifying_overlay_signature("device", "model", 1, "state", state_key)
+    # ruleid: nso-unguarded-overlay-signature
+    resolver = _qualifying_overlay_signature
+    return signature, resolver
+
+
+def _valid_overlay_signature(state_key):
+    # ok: nso-unguarded-overlay-signature
+    return _qualifying_overlay_signature("device", "model", 1, "state", state_key)
+
+
+def _qualifying_overlay_signatures(state_key):
+    # ok: nso-unguarded-overlay-signature
+    return _qualifying_overlay_signature("device", "model", 1, "state", state_key)
+
+
 # ruleid: nso-renderer-writer-single-resolver
 class RendererWriter:
     def render(self):
