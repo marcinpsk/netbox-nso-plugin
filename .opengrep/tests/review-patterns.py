@@ -440,6 +440,26 @@ def wire_signals(handler, sender, custom_signal):
     custom_signal.connect(handler, sender=sender)
 
 
+def unchecked_request_body_shapes(request, self):
+    # ruleid: nso-unchecked-request-body
+    body = request.data
+    body.get("device_id")
+    # ruleid: nso-unchecked-request-body
+    body = self.request.data
+    body.get("device_id")
+    # ruleid: nso-unchecked-request-body
+    request.data.get("device_id")
+    # ok: nso-unchecked-request-body
+    Serializer(data=request.data)
+    # ok: nso-unchecked-request-body
+    Serializer(data=self.request.data, many=True)
+
+
+def _request_body(request):
+    # ok: nso-unchecked-request-body
+    return request.data.get("device_id")
+
+
 # ruleid: nso-renderer-writer-single-resolver
 class RendererWriter:
     def render(self):

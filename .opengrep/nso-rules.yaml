@@ -311,6 +311,29 @@ rules:
       exclude:
         # Tests connect a temporary receiver and disconnect it in teardown.
         - "**/tests/**"
+  - id: nso-unchecked-request-body
+    languages: [python]
+    severity: ERROR
+    message: Validate the request body before reading it.
+    patterns:
+      - pattern: $R.data
+      - metavariable-regex:
+          metavariable: $R
+          regex: '^(?:request|self\.request)$'
+      - pattern-not-inside:
+          patterns:
+            - pattern-inside: |
+                def $BODYFN(...):
+                    ...
+            - metavariable-regex:
+                metavariable: $BODYFN
+                regex: '^_request_body$'
+      - pattern-not-inside: $CALL(..., data=$R.data, ...)
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
   - id: nso-renderer-writer-single-resolver
     languages: [python]
     severity: ERROR
