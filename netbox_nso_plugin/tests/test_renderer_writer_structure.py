@@ -408,8 +408,6 @@ _LOCK_CONTEXTS = frozenset({"_intent_transaction", "intent_transaction", "mirror
 #: The seed builder every frozen plan comes from, as written at its call sites.
 _PLAN_BUILDER = "RendererMutationPlan.build"
 _NO_POSITIONAL_PLAN = "<no positional plan>"
-#: A helper may front the seed (``_demotion_plan``) and a local name may alias another
-#: (``plan = plans[scope]``), so both derivations are re-read until they settle.
 
 
 def _dotted(node) -> str:
@@ -419,20 +417,6 @@ def _dotted(node) -> str:
     if isinstance(node, ast.Attribute):
         return f"{_dotted(node.value)}.{node.attr}"
     return "?"
-
-
-def _plan_value_nodes(node):
-    # Lambdas are opaque because their expression values are callables, not plans.
-    if isinstance(node, ast.Lambda):
-        return
-    yield node
-    for child in ast.iter_child_nodes(node):
-        yield from _plan_value_nodes(child)
-
-
-def _builds_a_plan(node, builders) -> bool:
-    """Whether *node*'s subtree calls anything that hands back a freshly frozen plan."""
-    return any(isinstance(child, ast.Call) and _dotted(child.func) in builders for child in _plan_value_nodes(node))
 
 
 def _root_name(node):
@@ -481,38 +465,6 @@ def _plan_paths(node, bound, builders) -> frozenset[tuple[int, ...]]:
 
 def _value_holds_plan(node, bound, builders) -> bool:
     return () in _plan_paths(node, bound, builders)
-
-
-def _bindings(node):
-    """Every ``(targets, value)`` pair *node*'s subtree binds, in the three binding forms."""
-    for child in scoped_walk(node):
-        if isinstance(child, ast.Assign):
-            yield child.targets, child.value
-        elif isinstance(child, (ast.For, ast.AsyncFor, ast.comprehension)):
-            yield [child.target], child.iter
-        elif isinstance(child, ast.withitem) and child.optional_vars is not None:
-            yield [child.optional_vars], child.context_expr
-
-
-def _bound_plan_names(nodes, builders, extract) -> set:
-    """The alias fixed point over the bindings *extract* reads out of each node."""
-    bound: set[str] = set()
-    while True:
-        previous_size = len(bound)
-        for node in nodes:
-            for targets, value in extract(node):
-                if not _builds_a_plan(value, builders) and _root_name(value) not in bound:
-                    continue
-                for target in targets:
-                    elements = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
-                    bound.update(element.id for element in elements if isinstance(element, ast.Name))
-        if len(bound) == previous_size:
-            return bound
-
-
-def _plan_names(nodes, builders) -> set:
-    """Every local name *nodes* bind to a plan built there, aliases included."""
-    return _bound_plan_names(nodes, builders, _bindings)
 
 
 def _direct_bindings(node):
@@ -1142,19 +1094,7 @@ class TestPlansAreBuiltUnderTheLocksThatConsumeThem(SimpleTestCase):
 
         self.assertEqual(sorted(offenders), [])
 
-    def test_both_plan_name_collectors_share_one_alias_fixed_point(self):
-        source = """
-def repair():
-    third = second
-    second = first
-    first = RendererMutationPlan.build()
-"""
-        body = ast.parse(source).body[0].body
-
-        self.assertEqual(_plan_names(body, {_PLAN_BUILDER}), {"first", "second", "third"})
-        self.assertEqual(_direct_plan_names(body, {_PLAN_BUILDER}), {"first"})
-
-    def test_reverse_ordered_plan_aliases_reach_their_fixed_point(self):
+    def test_reverse_ordered_plan_aliases_do_not_precede_their_bindings(self):
         source = """
 def repair():
     fourth = third
@@ -1164,8 +1104,6 @@ def repair():
 """
         body = ast.parse(source).body[0].body
 
-        expected = {"first", "second", "third", "fourth"}
-        self.assertEqual(_plan_names(body, {_PLAN_BUILDER}), expected)
         self.assertEqual(_direct_plan_names(body, {_PLAN_BUILDER}), {"first"})
 
     def test_reverse_ordered_plan_builders_reach_their_fixed_point(self):
