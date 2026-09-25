@@ -118,7 +118,7 @@ def trust_scope(device, management, scope):
     return revision
 
 
-def direct_test_selection(device, registry):
+def direct_test_selection(management, registry):
     """Supply unrelated switching selections to a focused promotion transaction."""
     from netbox_nso_plugin.models import NSOIntentRevision
 
@@ -126,7 +126,7 @@ def direct_test_selection(device, registry):
     selections = {}
     sources = {}
     for entry in direct:
-        revision, _ = NSOIntentRevision.objects.get_or_create(device=device, scope=entry.key)
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=management.device, scope=entry.key)
         selections[entry.section] = 1
         sources[entry.key] = revision.revision
     return {"direct_selected": selections, "direct_source_revisions": sources}
@@ -634,12 +634,14 @@ class ReceiptAdapter:
         if isinstance(response, tuple):
             status, payload = response
             return make_response(status, payload)
-        if isinstance(response, dict) and response.get("status") == "prepared":
+        prepared = isinstance(response, dict) and response.get("status") == "prepared"
+        if prepared:
             found = _DEVICE_IN_URL.search(url)
             if found is not None:
                 response = {"device_id": int(found.group(1)), **response}
         self.applied.append((url, body))
-        self._apply_to_device(url, body, params)
+        if not prepared:  # a preparation only stages its snapshot; Apply authorizes it
+            self._apply_to_device(url, body, params)
         if self.drop_response_once:
             self.drop_response_once = False
             raise requests.exceptions.ConnectionError("the preparation was stored but its response was lost")

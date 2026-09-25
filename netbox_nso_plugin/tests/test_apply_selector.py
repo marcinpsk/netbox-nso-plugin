@@ -841,7 +841,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             registry,
             pushed,
             apply_attempt_id=next_attempt_id,
-            **direct_test_selection(self.device, registry),
+            **direct_test_selection(self.mgmt, registry),
             static_route_stored=False,
         )
 
@@ -2602,7 +2602,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=uuid4(),
-                **direct_test_selection(self.device, registry),
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
 
@@ -2661,7 +2661,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=uuid4(),
-                **direct_test_selection(self.device, registry),
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
         finally:
@@ -2699,7 +2699,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=attempt_id,
-                **direct_test_selection(self.device, registry),
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
@@ -2734,7 +2734,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=attempt_id,
-                **direct_test_selection(self.device, registry),
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
@@ -2754,7 +2754,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             registry,
             pushed,
             apply_attempt_id=uuid4(),
-            **direct_test_selection(self.device, registry),
+            **direct_test_selection(self.mgmt, registry),
             static_route_stored=False,
         )
 

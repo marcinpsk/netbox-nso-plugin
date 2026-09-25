@@ -274,7 +274,7 @@ class TestReconcileRoutePolicy(TestCase):
             registry,
             pushed,
             apply_attempt_id=attempt_id,
-            **direct_test_selection(self.device, registry),
+            **direct_test_selection(management, registry),
             static_route_stored=False,
         )
 
@@ -346,13 +346,14 @@ class TestReconcileRoutePolicy(TestCase):
 
         from netbox_nso_plugin import apply_state
 
+        direct_selection = direct_test_selection(prepared.management, prepared.registry)
         with CaptureQueriesContext(connection) as captured:
             apply_state.promote_current_intent(
                 prepared.management,
                 prepared.registry,
                 prepared.pushed,
                 apply_attempt_id=uuid4(),
-                **direct_test_selection(self.device, prepared.registry),
+                **direct_selection,
                 static_route_stored=False,
             )
         return [query["sql"] for query in captured.captured_queries]
@@ -442,7 +443,7 @@ class TestReconcileRoutePolicy(TestCase):
             prepared.registry,
             prepared.pushed,
             apply_attempt_id=uuid4(),
-            **direct_test_selection(self.device, prepared.registry),
+            **direct_test_selection(prepared.management, prepared.registry),
             static_route_stored=False,
         )
 
@@ -494,7 +495,7 @@ class TestReconcileRoutePolicy(TestCase):
             prepared.registry,
             prepared.pushed,
             apply_attempt_id=uuid4(),
-            **direct_test_selection(self.device, prepared.registry),
+            **direct_test_selection(prepared.management, prepared.registry),
             static_route_stored=False,
         )
 
