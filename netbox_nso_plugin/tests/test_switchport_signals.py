@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 """switchport intent push + accept->apply round-trip."""
 
+import contextlib
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
@@ -139,6 +140,65 @@ class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, T
         assert len(self.adapter.requests) == 1
         assert self.adapter.requests[0]["body"]["deleted_roots"] == []
         assert self.adapter.requests[0]["body"]["interfaces"][0]["tagged_vlans"] == [20]
+
+    def _tagged_vlan_management_queries(self, *, suppressed):
+        """Run one tagged-VLAN writer change and return its management-table SQL."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        with without_commit_drain():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            )
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+        config, session = self.adapter.patches()
+        silence = suppress_intent_push() if suppressed else contextlib.nullcontext()
+        with config, session, silence, CaptureQueriesContext(connection) as captured:
+            with renderer_writes(plan) as writer:
+                writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
+        table = NSODeviceManagement._meta.db_table
+        return [
+            query["sql"]
+            for query in captured.captured_queries
+            if table in query["sql"] and "auto_apply" in query["sql"].partition(" WHERE ")[2]
+        ]
+
+    def test_tagged_vlan_auto_apply_lookup_is_scoped_to_the_written_devices(self):
+        _other_device, other = make_managed("switching-writer-other", 4218)
+        other.auto_apply = True
+        other.save(update_fields=["auto_apply"])
+
+        lookups = self._tagged_vlan_management_queries(suppressed=False)
+
+        assert len(lookups) == 1
+        assert f"IN ({self.device.pk})" in lookups[0]
+
+    def test_suppressed_tagged_vlan_change_skips_the_auto_apply_lookup(self):
+        assert self._tagged_vlan_management_queries(suppressed=True) == []
+        assert self.adapter.requests == []
+
+    def test_switchport_preparation_leaves_the_device_unchanged(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+
+        carried = ("vlan_id", 10)
+        self.adapter.place(self.mgmt.adapter_device_id, carried)
+        with without_commit_drain():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            )
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+        config, session = self.adapter.patches()
+        with config, session, renderer_writes(plan) as writer:
+            writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
+
+        assert len(self.adapter.requests) == 1
+        assert self.adapter.on_device[self.mgmt.adapter_device_id] == {carried}
+        assert self.adapter.detached.get(self.mgmt.adapter_device_id, set()) == set()
 
     def test_unown_prepares_detach_without_root_deletion(self):
         from netbox_nso_plugin.models import NSOSwitchingRootDeletion, NSOSwitchportState

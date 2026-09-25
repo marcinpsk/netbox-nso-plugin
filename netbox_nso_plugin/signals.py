@@ -94,7 +94,16 @@ def _schedule_exact_writer_scope(target_scope, *, device_ids=None, auto_only=Fal
     if auto_only:
         from .models import NSODeviceManagement
 
-        enabled = set(NSODeviceManagement.objects.filter(auto_apply=True).values_list("device_id", flat=True))
+        if _intent_push_is_silenced():
+            return
+        candidates = {device_id for device_id, scope in writer.plan.content_keys if scope == target_scope}
+        if not candidates:
+            return
+        enabled = set(
+            NSODeviceManagement.objects.filter(auto_apply=True, device_id__in=candidates).values_list(
+                "device_id", flat=True
+            )
+        )
     for device_id, scope in writer.plan.content_keys:
         if (
             scope == target_scope
@@ -314,6 +323,13 @@ def _clear_management_teardown(sender, instance, **kwargs):
     outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
 
 
+def _intent_push_is_silenced() -> bool:
+    """Return whether this write mirrors the adapter, so it schedules no intent push."""
+    from .intent_state import mirror_refresh_is_active
+
+    return _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active()
+
+
 def _schedule_intent_push(key, transitions=()) -> None:
     """Append this transaction's contribution to *key* and arrange for the key to drain.
 
@@ -331,9 +347,8 @@ def _schedule_intent_push(key, transitions=()) -> None:
     commit to wait for.
     """
     from . import outbox
-    from .intent_state import mirror_refresh_is_active
 
-    if _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active():
+    if _intent_push_is_silenced():
         return  # a reconcile or render write mirrors the adapter; it is not operator intent
     outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
     _schedule_intent_drain(key)
