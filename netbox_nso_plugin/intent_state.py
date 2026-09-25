@@ -718,9 +718,9 @@ def normalize_overlay_lifecycle(instance, update_fields=None):
 def _lacp_bundle_fragment(instance):
     """Use the same pure helper as the nested LACP delivery renderer."""
     from .signals import lacp_bundle_intent_item, lacp_member_intent_item
+    from .status_machine import OWNED_STATES
 
-    owned = ("accepted", "deploying", "in_sync")
-    if instance.status not in owned or instance.vpc_sensitive:
+    if instance.status not in OWNED_STATES or instance.vpc_sensitive:
         return ABSENT
     Member = apps.get_model("netbox_nso_plugin.nsolacpmemberstate")
     members = (
@@ -728,7 +728,7 @@ def _lacp_bundle_fragment(instance):
         for member in Member.objects.filter(
             management_id=instance.management_id,
             lag_bundle_id=instance.interface_id,
-            status__in=owned,
+            status__in=OWNED_STATES,
         ).select_related("interface")
     )
     return _normal(lacp_bundle_intent_item(instance, members))
@@ -736,14 +736,15 @@ def _lacp_bundle_fragment(instance):
 
 def _lacp_member_fragment(instance):
     from .signals import lacp_member_intent_item
+    from .status_machine import OWNED_STATES
 
-    if instance.status not in ("accepted", "deploying", "in_sync"):
+    if instance.status not in OWNED_STATES:
         return ABSENT
     Bundle = apps.get_model("netbox_nso_plugin.nsolacpbundlestate")
     if not Bundle.objects.filter(
         management_id=instance.management_id,
         interface_id=instance.lag_bundle_id,
-        status__in=("accepted", "deploying", "in_sync"),
+        status__in=OWNED_STATES,
         vpc_sensitive=False,
     ).exists():
         return ABSENT
@@ -884,8 +885,9 @@ def _interface_dependencies(before, after, spec):
 
 def _switchport_fragment(instance):
     from .signals import switchport_intent_item
+    from .status_machine import is_owned
 
-    if instance.status not in ("accepted", "deploying", "in_sync"):
+    if not is_owned(instance.status):
         return ABSENT
     tagged = instance.tagged_vlans.values_list("vid", flat=True) if instance.pk else ()
     return _normal(switchport_intent_item(instance, tagged))
@@ -2133,18 +2135,16 @@ def _deploying_scope_rows(footprint: MutationFootprint) -> tuple[SourceRow, ...]
     models_by_scope = deploying_models()
     rows = []
     for device_id, scope in footprint.revision_keys:
-        model = models_by_scope.get(scope)
-        if model is None:
-            continue
-        rows.extend(
-            SourceRow(model._meta.label_lower, pk)
-            for pk in model.objects.filter(
-                management__device_id=device_id,
-                status="deploying",
+        for model in models_by_scope.get(scope, ()):
+            rows.extend(
+                SourceRow(model._meta.label_lower, pk)
+                for pk in model.objects.filter(
+                    management__device_id=device_id,
+                    status="deploying",
+                )
+                .order_by("pk")
+                .values_list("pk", flat=True)
             )
-            .order_by("pk")
-            .values_list("pk", flat=True)
-        )
     return tuple(rows)
 
 

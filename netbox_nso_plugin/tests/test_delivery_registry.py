@@ -53,8 +53,7 @@ class TestDeliveryRegistry(SimpleTestCase):
         assert len(delivery_keys()) == 18
 
     def test_exactly_the_sixteen_mirrored_scopes_are_in_protocol(self):
-        """The two direct-apply keys write to NSO inside the request, so no receipt can be
-        atomic with their effect (O-P12c): they stay out of the sequence path entirely."""
+        """Switching preparations stay outside the receipt and push-sequence path."""
         from netbox_nso_plugin.delivery import delivery_keys
 
         in_protocol = {key for key, entry in delivery_keys().items() if entry.in_protocol}
@@ -62,6 +61,7 @@ class TestDeliveryRegistry(SimpleTestCase):
 
         assert out_of_protocol == {"lacp", "switchport"}
         assert delivery_keys()["switchport"].in_protocol is False
+        assert delivery_keys()["lacp"].section == "lag"
         assert delivery_keys()["vlan"].in_protocol is True
         assert len(in_protocol) == 16
         assert "static_route" in in_protocol
@@ -91,14 +91,17 @@ class TestDeliveryRegistry(SimpleTestCase):
         assert unknown == {}
 
     def test_marking_mode_is_declared_per_key(self):
-        """O3.4: only static routes activate; every other key keeps its query flag."""
-        from netbox_nso_plugin.delivery import MARKING_PER_OBJECT, MARKING_QUERY_FLAG, delivery_keys
+        """Switching roots use their own preparation body, outside both legacy marking modes."""
+        from netbox_nso_plugin.delivery import MARKING_NONE, MARKING_PER_OBJECT, MARKING_QUERY_FLAG, delivery_keys
 
         registry = delivery_keys()
         assert registry["static_route"].marking_mode == MARKING_PER_OBJECT
-        assert {key: entry.marking_mode for key, entry in registry.items() if key != "static_route"} == {
-            key: MARKING_QUERY_FLAG for key in registry if key != "static_route"
-        }
+        assert {registry[key].marking_mode for key in ("lacp", "switchport")} == {MARKING_NONE}
+        assert all(
+            entry.marking_mode == MARKING_QUERY_FLAG
+            for key, entry in registry.items()
+            if key not in {"static_route", "lacp", "switchport"}
+        )
 
     def test_every_entry_names_a_push_that_exists(self):
         """The registry holds names, so a typo has to fail here rather than at push time."""
@@ -128,7 +131,7 @@ class TestDeliveryRegistry(SimpleTestCase):
         registry = delivery_keys()
         assert registry["interface"].section == "interface_config"
         assert {key: entry.section for key, entry in registry.items() if key != "interface"} == {
-            key: key for key in registry if key != "interface"
+            key: "lag" if key == "lacp" else key for key in registry if key != "interface"
         }
 
 
@@ -321,21 +324,13 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         assert rendered.key == (device.pk, "ip")
         assert rendered.payload == []
 
-    def test_an_out_of_protocol_delivery_carries_no_sequence_header(self):
-        """``lacp`` and ``switchport`` keep today's direct client calls (Rev 15 split)."""
+    def test_switching_requires_captured_preparation_and_refuses_store_only(self):
+        """Only the switching module may supply root identity and source revision."""
         from netbox_nso_plugin.delivery import render, send
 
-        from ._adapter_http import make_response, make_session
-
-        device, _mgmt = _fixture("lacp", 7303)
-        session = make_session(response=make_response(200, json_data={"status": "ok"}))
-        with (
-            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=self._CFG),
-            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
-        ):
-            rendered = render("lacp", device.pk, 7303)
+        device, mgmt = _fixture("lacp", 7303)
+        rendered = render("lacp", device.pk, mgmt.adapter_device_id)
+        with self.assertRaisesRegex(ValueError, "captured preparation"):
             send(rendered, rendered.payload, push_seq=17)
-
-        assert session.request.call_count >= 1
-        for call in session.request.call_args_list:
-            assert "X-Push-Seq" not in (call.kwargs.get("headers") or {})
+        with self.assertRaisesRegex(ValueError, "does not support store-only"):
+            send(rendered, rendered.payload, mode="store_only")

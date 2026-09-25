@@ -121,6 +121,30 @@ def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT,
     }
 
 
+def _evidence_generation(generation_id, selected, settled_scopes=()):
+    from netbox_nso_plugin import delivery
+
+    settled = bool(settled_scopes)
+    return {
+        "generation_id": generation_id,
+        "seq": generation_id,
+        "status": "settled" if settled else "running",
+        "sections": sorted(selected),
+        "stream_revisions": selected,
+        "source_push_seq": {
+            stream: None if stream in delivery.direct_streams() else revision for stream, revision in selected.items()
+        },
+        "carrier_job_id": generation_id,
+        "carrier_job_status": "succeeded" if settled else "running",
+        "carrier_job_result": {
+            f"{scope}_count_by_outcome": {"in_sync": 1, "apply_failed": 0} for scope in settled_scopes
+        }
+        or None,
+        "carrier_job_error": None,
+        "updated_at": timezone.now().isoformat(),
+    }
+
+
 def _pending_attempt_evidence(adapter_device_id, requested_ids, settled_scopes=()):
     """Build the adapter's evidence shape for real local attempt records.
 
@@ -136,7 +160,6 @@ def _pending_attempt_evidence(adapter_device_id, requested_ids, settled_scopes=(
     finally:
         # Only this thread can close its own connection, and the worker outlives the request.
         connections.close_all()
-    settled = bool(settled_scopes)
     attempts = []
     unknown = []
     for attempt_id in requested_ids:
@@ -156,23 +179,7 @@ def _pending_attempt_evidence(adapter_device_id, requested_ids, settled_scopes=(
                 "admission_state": "admitted",
                 "http_status": attempt.http_status,
                 "response": response,
-                "generations": [
-                    {
-                        "generation_id": generation_id,
-                        "seq": generation_id,
-                        "status": "settled" if settled else "running",
-                        "sections": sorted(attempt.selected),
-                        "source_push_seq": attempt.selected,
-                        "carrier_job_id": generation_id,
-                        "carrier_job_status": "succeeded" if settled else "running",
-                        "carrier_job_result": {
-                            f"{scope}_count_by_outcome": {"in_sync": 1, "apply_failed": 0} for scope in settled_scopes
-                        }
-                        or None,
-                        "carrier_job_error": None,
-                        "updated_at": timezone.now().isoformat(),
-                    }
-                ],
+                "generations": [_evidence_generation(generation_id, attempt.selected, settled_scopes)],
             }
         )
     return {

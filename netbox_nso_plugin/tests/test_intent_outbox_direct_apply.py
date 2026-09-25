@@ -1,17 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1503 Appendix O (O1), the Rev 15 split: the two direct-apply keys leave the protocol.
+"""Switching snapshots prepare selectable revisions outside the receipt protocol.
 
-``lacp`` and ``switchport`` write to NSO synchronously inside the request and answer a failed
-apply with HTTP 200 and an error envelope (O-P12c, §7.1), so no receipt can be atomic with
-their effect and the generic admission path cannot tell their failure from their success.
-Riding the claim path costs them twice: a lost outcome lets the scavenger replay the body
-into a SECOND device write, and the outcome path retires an error envelope as a success.
-
-So they take no sequence, no lease and no takeover. What survives is the coalescing the
-fleet-wide outbox gives every key: the burst folds into one send, the entries are consumed on
-the attempt, and a failure lands in the push journal alone, exactly as today's direct call
-leaves it. Joining them to the protocol properly is §7.1's own card.
+LACP and switchport preparations carry a content revision and explicit root deletions.
+They do not take a push sequence or lease. Failed preparations retain outbox entries
+and deletion rows for retry. Apply later authorizes the selected revisions.
 """
 
 from __future__ import annotations
@@ -33,10 +26,6 @@ from ._outbox_case import (
     without_commit_drain,
 )
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
-
-
-class _LostOutcome(Exception):
-    """The worker died between the send and the outcome, which is O1.10's crash."""
 
 
 class _DirectApplyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -63,36 +52,30 @@ class _DirectApplyCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTest
         return NSODeviceManagement.objects.get(pk=self.mgmt.pk).intent_push_errors or {}
 
 
-class TestADirectApplyIsNeverReplayed(_DirectApplyCase):
-    """R14-B1, the split's motivating defect: there is no receipt to make a replay safe."""
+class TestASwitchingPreparationIsRetried(_DirectApplyCase):
+    """A lost preparation response leaves its captured work for a later send."""
 
     tag = "replay"
     adapter_device_id = 7801
 
-    def test_a_lost_outcome_never_applies_the_key_a_second_time(self):
-        from netbox_nso_plugin import delivery, drain
+    def test_a_lost_response_reprepares_the_same_snapshot(self):
+        from netbox_nso_plugin import drain
 
         enqueue(self.device, "lacp")
-        real_send = delivery.send
+        self.adapter.drop_response_once = True
+        assert self.drain() == drain.FAILED
+        assert len(self.adapter.applied) == 1
+        assert len(entries(self.device, "lacp")) >= 1
 
-        def lose_the_outcome(*args, **kwargs):
-            """The body reaches the device, and nothing records that it did."""
-            real_send(*args, **kwargs)
-            raise _LostOutcome
-
-        # Not `settle`: this path returns its own outcome and never calls it (drain.py
-        # `_deliver_direct`), so patching `settle` here would fire nothing at all.
-        with patch.object(delivery, "send", side_effect=lose_the_outcome):
-            assert self.drain() == drain.FAILED
-        assert len(self.adapter.applied) == 1, "the body reached the device once"
-
-        assert expire_claim(self.device, "lacp") is False, "a direct-apply key took a lease"
-        self.drain()  # the scavenger's turn
+        assert expire_claim(self.device, "lacp") is False
+        assert self.drain() == drain.SUCCEEDED
         config, session = self.adapter.patches()
         with config, session:
-            drain.drain_intent_outbox()  # and the tick's
+            drain.drain_intent_outbox()
 
-        assert len(self.adapter.applied) == 1, "the receipt-less endpoint applied the same body a second time"
+        assert len(self.adapter.applied) == 2
+        assert self.adapter.applied[0][1] == self.adapter.applied[1][1]
+        assert entries(self.device, "lacp") == []
 
     def test_the_key_takes_no_sequence_at_all(self):
         from netbox_nso_plugin import drain
@@ -109,7 +92,7 @@ class TestADirectApplyIsNeverReplayed(_DirectApplyCase):
 
 
 class TestAnErrorEnvelopeIsAFailure(_DirectApplyCase):
-    """§7.1(2): a failed device write answered with HTTP 200 may never read as a success."""
+    """Only a validated prepared envelope acknowledges a switching snapshot."""
 
     tag = "envelope"
     adapter_device_id = 7802
@@ -123,18 +106,18 @@ class TestAnErrorEnvelopeIsAFailure(_DirectApplyCase):
         assert self.drain("switchport") == drain.FAILED
 
         recorded = self.errors().get("switchport") or {}
-        assert "the device refused the apply" in recorded.get("message", ""), self.errors()
-        assert entries(self.device, "switchport") == [], "the entry is consumed on the attempt, as today"
-        assert state_of(self.device, "switchport").push_seq is None, "nothing is left to replay"
+        assert "not acknowledged" in recorded.get("message", ""), self.errors()
+        assert len(entries(self.device, "switchport")) >= 1
+        assert state_of(self.device, "switchport").push_seq is None
 
-    def test_a_deployed_envelope_still_succeeds(self):
+    def test_a_deployed_envelope_does_not_prove_preparation(self):
         from netbox_nso_plugin import drain
 
         enqueue(self.device, "lacp")
         self.adapter._respond = lambda body: {"status": "deployed", "device": "nso-cl-envelope"}
 
-        assert self.drain() == drain.SUCCEEDED
-        assert self.errors() == {}
+        assert self.drain() == drain.FAILED
+        assert len(entries(self.device, "lacp")) >= 1
 
 
 class TestTheBurstStillCoalesces(_DirectApplyCase):
@@ -143,12 +126,22 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
     tag = "burst"
     adapter_device_id = 7803
 
+    def test_switching_preparation_carries_revision_and_explicit_empty_deletions(self):
+        from netbox_nso_plugin import drain
+
+        enqueue(self.device, "lacp")
+        assert self.drain("lacp") == drain.SUCCEEDED
+        request = self.adapter.requests[-1]
+        assert request["body"]["deleted_roots"] == []
+        assert isinstance(request["body"]["source_revision"], int)
+        assert request["params"].get("delete_origin") is None
+
     def _owned_bundle(self):
         from netbox_nso_plugin.models import NSOLACPBundleState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         with without_commit_drain(), transaction.atomic():
-            # Committing LACP is a device write, so only auto-apply pushes it on save.
+            # Auto mode prepares the LAG snapshot after the writer commits.
             self.mgmt.auto_apply = True
             self.mgmt.save(update_fields=["auto_apply"])
             lag = Interface.objects.create(device=self.device, name="Port-channel1", type="lag")
@@ -179,21 +172,22 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
 
         assert len(self.adapter.requests) == 1, self.adapter.requests
         assert self.adapter.requests[0]["push_seq"] is None
-        assert entries(self.device, "lacp") == [], "the entries are consumed on the attempt"
+        assert entries(self.device, "lacp") == [], "the entries retire after a validated preparation"
 
 
 class TestRepairContributionsAreNeutralForDirectApply(_DirectApplyCase):
     tag = "directrepair"
     adapter_device_id = 7804
 
-    def test_a_repair_cannot_strip_a_lacp_deletion_mark(self):
+    def test_a_repair_cannot_turn_a_legacy_boolean_into_root_identity(self):
         from netbox_nso_plugin import drain, outbox
 
         enqueue(self.device, "lacp", delete_origin=True)
         enqueue(self.device, "lacp", kind=outbox.CONTRIBUTION_KIND_REPAIR)
 
         assert self.drain("lacp") == drain.SUCCEEDED
-        assert self.adapter.requests[-1]["params"].get("delete_origin") == "true"
+        assert self.adapter.requests[-1]["body"]["deleted_roots"] == []
+        assert self.adapter.requests[-1]["params"].get("delete_origin") is None
 
     def test_a_repair_only_switchport_burst_cannot_grant_a_deletion_mark(self):
         from netbox_nso_plugin import drain, outbox

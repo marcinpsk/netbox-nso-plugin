@@ -65,10 +65,15 @@ def _patch_apply_pushes(answers=None):
     ``drain_key`` because its acknowledgement is an outcome. *answers* maps a scope to
     the answer from ``push_now``. Every other required scope succeeds.
     """
+    from netbox_nso_plugin import delivery
     from netbox_nso_plugin.models import NSOIntentRevision
+
+    from ._outbox_case import ReceiptAdapter
 
     answers = answers or {}
     next_push_seq = iter(range(1, 100))
+    real_push_now = drain.push_now
+    adapter = ReceiptAdapter()
 
     def record(device_id, scope):
         captured = drain._SUCCESSFUL_PUSHES.get()
@@ -77,6 +82,8 @@ def _patch_apply_pushes(answers=None):
             captured[scope] = drain.SuccessfulPush(next(next_push_seq), f"test-{scope}", int(revision.revision))
 
     def push_now(device_id, scope, **kwargs):
+        if scope in delivery.direct_keys():
+            return real_push_now(device_id, scope, **kwargs)
         record(device_id, scope)
         return answers.get(scope, {"status": "deployed"})
 
@@ -84,7 +91,10 @@ def _patch_apply_pushes(answers=None):
         record(device_id, scope)
         return drain.SUCCEEDED
 
+    config, session = adapter.patches()
     with (
+        config,
+        session,
         patch("netbox_nso_plugin.drain.push_now", side_effect=push_now) as push,
         patch("netbox_nso_plugin.drain.drain_key", side_effect=drain_key),
     ):
@@ -590,7 +600,7 @@ class TestProvisionCompleteEndpoint(APITestCase):
         enqueue.assert_called_once_with(tombstone.provision_attempt_id)
 
 
-class TestStaticRouteApplySettle(APITestCase):
+class TestStaticRouteApplySettle(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Static routes join the preparation and attempt-addressed settlement flow. Found
     live on rg03: a successfully applied static route stayed 'pending apply' forever —
     _prepare_apply never marked it deploying and never force-pushed its snapshot."""
@@ -651,7 +661,7 @@ class TestStaticRouteApplySettle(APITestCase):
                 self.assertEqual(row.status, "accepted")
 
 
-class TestL2SapApplySettle(APITestCase):
+class TestL2SapApplySettle(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """L2 SAPs join the preparation and attempt-addressed settlement flow.
     Found by the item-12 real-apply scoping on ra1 (Nokia): an accepted SAP would apply
     adapter-side but never read 'deploying' nor flip to apply_failed on a failed scope."""
@@ -690,7 +700,7 @@ class TestL2SapApplySettle(APITestCase):
         self.assertEqual(_forced_scopes(push, mgmt.device_id).count("l2_sap"), 1)
 
 
-class TestRoutePolicyApplySettle(APITestCase):
+class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Route-policy joins the deploying→settle flow: Apply marks accepted→deploying,
     a failed route_policy scope flips the stuck deploying row → apply_failed."""
 
@@ -811,7 +821,7 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertTrue(seen.get("store_only"))
 
 
-class TestApplyRollbackOnAdapterError(APITestCase):
+class TestApplyRollbackOnAdapterError(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     """Apply rollback follows whether the POST definitely failed before enqueue."""
 
     def _setup(self):

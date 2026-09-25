@@ -13,6 +13,19 @@ from ipam.models import VLANGroup
 from netbox_nso_plugin.signals import suppress_intent_push, _schedule_intent_push
 from netbox_nso_plugin import signals
 
+
+def switching_client_ownership(client, device_id, roots):
+    # ruleid: nso-switching-client-single-owner
+    client.apply_lag_config(device_id, [], deleted_roots=roots, source_revision=1)
+    # ruleid: nso-switching-client-single-owner
+    client.apply_switchport_config(device_id, [], deleted_roots=roots, source_revision=1)
+    # ruleid: nso-switching-client-single-owner
+    apply_lag_config(device_id, [], deleted_roots=roots, source_revision=1)
+    # ruleid: nso-switching-client-single-owner
+    apply_switchport_config(device_id, [], deleted_roots=roots, source_revision=1)
+    # ok: nso-switching-client-single-owner
+    client.trigger_apply(device_id, "attempt", {})
+
 # ruleid: nso-retired-push-builder
 from netbox_nso_plugin.delivery import _push_vlan_intent_for_device
 # ruleid: nso-retired-push-builder
@@ -462,6 +475,10 @@ def wire_delete_signals(sender):
     model_signals.pre_delete.connect(_as_delete_origin(_on_delete), sender=sender, dispatch_uid="wrapped")
     # ok: nso-delete-signal-without-delete-origin
     model_signals.post_delete.connect(_as_delete_origin(_on_post_delete), sender=sender, dispatch_uid="wrapped_post")
+    # ok: nso-delete-signal-without-delete-origin
+    model_signals.post_delete.connect(_on_lacp_state_save, sender=sender, dispatch_uid="switching_root")
+    # ok: nso-delete-signal-without-delete-origin
+    model_signals.post_delete.connect(_on_switchport_state_save, sender=sender, dispatch_uid="switching_port")
     # ok: nso-delete-signal-without-delete-origin
     model_signals.pre_delete.connect(_validate_explicit_delete, sender=sender, dispatch_uid="validator")
     # ok: nso-delete-signal-without-delete-origin

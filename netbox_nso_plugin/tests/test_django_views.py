@@ -7859,7 +7859,11 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
             username="applysnmpadmin", password=TEST_PASSWORD, email="applysnmp@test.example"
         )
         self.client.force_login(self.user)
-        self.adapter = ReceiptAdapter(respond=lambda body: {"job_id": 7712, "count": 0})
+        self.adapter = ReceiptAdapter(
+            respond=lambda body: (
+                ReceiptAdapter._default_response(body) if "source_revision" in body else {"job_id": 7712, "count": 0}
+            )
+        )
         self.device, self.mgmt = make_managed("apsnmp", 7790)
 
     def _apply(self):

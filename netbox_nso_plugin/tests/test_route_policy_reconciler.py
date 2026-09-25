@@ -17,6 +17,8 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 from django.urls import reverse
 
+from ._outbox_case import direct_test_selection
+
 
 class TestReconcileRoutePolicy(TestCase):
     def test_object_classification_lookups_are_batched(self):
@@ -272,6 +274,7 @@ class TestReconcileRoutePolicy(TestCase):
             registry,
             pushed,
             apply_attempt_id=attempt_id,
+            **direct_test_selection(self.device, registry),
             static_route_stored=False,
         )
 
@@ -349,6 +352,7 @@ class TestReconcileRoutePolicy(TestCase):
                 prepared.registry,
                 prepared.pushed,
                 apply_attempt_id=uuid4(),
+                **direct_test_selection(self.device, prepared.registry),
                 static_route_stored=False,
             )
         return [query["sql"] for query in captured.captured_queries]
@@ -438,6 +442,7 @@ class TestReconcileRoutePolicy(TestCase):
             prepared.registry,
             prepared.pushed,
             apply_attempt_id=uuid4(),
+            **direct_test_selection(self.device, prepared.registry),
             static_route_stored=False,
         )
 
@@ -489,6 +494,7 @@ class TestReconcileRoutePolicy(TestCase):
             prepared.registry,
             prepared.pushed,
             apply_attempt_id=uuid4(),
+            **direct_test_selection(self.device, prepared.registry),
             static_route_stored=False,
         )
 

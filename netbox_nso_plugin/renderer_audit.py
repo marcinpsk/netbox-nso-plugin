@@ -342,6 +342,19 @@ def _repair_with_retries(device_id, candidates, management, deadline):
     return None
 
 
+def repair_scope(device_id: int, scope: str, *, deadline: float | None = None) -> bool:
+    """Repair one failed capture after its transaction has released every lock."""
+    from .models import NSODeviceManagement
+
+    if deadline is None:
+        deadline = _monotonic() + _DEFAULT_TICK_BUDGET_SECONDS
+    management = NSODeviceManagement.objects.get(device_id=device_id, adapter_device_id__isnull=False)
+    repaired = _repair_with_retries(device_id, (scope,), management, deadline)
+    if repaired is None:
+        raise RendererAuditRepairFailed("switching capture repair exhausted serialization retries")
+    return scope in repaired
+
+
 def audit_renderer_scopes(
     device_id,
     scopes,

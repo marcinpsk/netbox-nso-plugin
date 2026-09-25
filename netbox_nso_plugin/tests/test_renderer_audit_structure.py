@@ -371,11 +371,12 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
                 ("drain.py", "_form_backfill", "delivery.render"),
                 ("drain.py", "_form_store_only", "delivery.render"),
                 ("drain.py", "_sent_wire_digest", "delivery.render"),
-                ("drain.py", "_take_direct_entries", "delivery.render"),
                 ("drain.py", "_takeover", "delivery.render"),
                 ("renderer_audit.py", "_optimistic_candidates", "delivery.render"),
                 ("renderer_audit.py", "_repair_candidates", "delivery.render"),
                 ("renderer_writer.py", "_finalize_fingerprints", "delivery.render"),
+                ("switching_preparation.py", "_capture", "delivery.render"),
+                ("switching_preparation.py", "cancel_if_rendered", "delivery.render"),
             },
         )
 

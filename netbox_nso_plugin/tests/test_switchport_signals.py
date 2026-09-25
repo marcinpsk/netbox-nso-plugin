@@ -5,10 +5,11 @@
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from ipam.models import VLAN, VLANGroup
 
-from .mixins import IntentPushResetMixin
+from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class _SwBase(IntentPushResetMixin, TestCase):
@@ -63,28 +64,21 @@ class _SwBase(IntentPushResetMixin, TestCase):
 
 class TestPushSwitchportIntent(_SwBase):
     def test_pushes_owned_switchports_mapped_to_nso_mode(self):
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
 
         mgmt = self._make_mgmt()
         self._state(mgmt, mode="access", status="accepted")
-        with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
-            deliver("switchport", self.device.pk, mgmt.adapter_device_id)
-        mock_apply.assert_called_once()
-        dev_id, ifaces = mock_apply.call_args[0]
-        assert dev_id == mgmt.adapter_device_id
+        ifaces = render("switchport", self.device.pk, mgmt.adapter_device_id).payload
         assert ifaces[0]["interface_name"] == "GigabitEthernet0/1"
         assert ifaces[0]["mode"] == "access"  # NetBox access -> NSO access
         assert ifaces[0]["untagged_vlan"] == 10
 
     def test_excludes_non_owned(self):
-        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.delivery import render
 
         mgmt = self._make_mgmt()
         self._state(mgmt, status="changed")  # not owned
-        with patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as mock_apply:
-            deliver("switchport", self.device.pk, mgmt.adapter_device_id)
-        mock_apply.assert_called_once()
-        assert mock_apply.call_args[0][1] == []
+        assert render("switchport", self.device.pk, mgmt.adapter_device_id).payload == []
 
     def test_save_no_push_without_auto_apply(self):
         """Deferred flow: a switchport save does not commit to the device unless
@@ -108,6 +102,82 @@ class TestPushSwitchportIntent(_SwBase):
             state.save(update_fields=("mode",))
 
         schedule.assert_not_called()
+
+
+class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.adapter = ReceiptAdapter()
+        self.device, self.mgmt = make_managed("switching-writer", 4217)
+        self.mgmt.auto_apply = True
+        self.mgmt.save(update_fields=["auto_apply"])
+        with without_commit_drain():
+            group = VLANGroup.objects.create(name="switching-writer", slug="switching-writer")
+            self.vlan = VLAN.objects.create(group=group, vid=10, name="MGMT")
+            self.other_vlan = VLAN.objects.create(group=group, vid=20, name="DATA")
+            self.iface = Interface.objects.create(
+                device=self.device,
+                name="Ethernet1",
+                type="1000base-t",
+                mode="access",
+                untagged_vlan=self.vlan,
+            )
+
+    def test_tagged_vlan_writer_change_schedules_switchport_preparation(self):
+        from netbox_nso_plugin.models import NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+
+        with without_commit_drain():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            )
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+        config, session = self.adapter.patches()
+        with config, session, renderer_writes(plan) as writer:
+            writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
+
+        assert len(self.adapter.requests) == 1
+        assert self.adapter.requests[0]["body"]["deleted_roots"] == []
+        assert self.adapter.requests[0]["body"]["interfaces"][0]["tagged_vlans"] == [20]
+
+    def test_unown_prepares_detach_without_root_deletion(self):
+        from netbox_nso_plugin.models import NSOSwitchingRootDeletion, NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        with without_commit_drain():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt, interface=self.iface, mode="access", status="accepted"
+            )
+        state.status = "changed"
+        plan = RendererMutationPlan.build(saves=(planned_save(state, update_fields=("status",)),))
+        config, session = self.adapter.patches()
+        with config, session, renderer_writes(plan) as writer:
+            writer.save(state, update_fields=("status",))
+
+        assert len(self.adapter.requests) == 1
+        assert self.adapter.requests[0]["body"]["interfaces"] == []
+        assert self.adapter.requests[0]["body"]["deleted_roots"] == []
+        assert not NSOSwitchingRootDeletion.objects.filter(management=self.mgmt, scope="switchport").exists()
+
+    def test_tagged_vlan_removal_is_owned_content_without_root_deletion(self):
+        from netbox_nso_plugin.models import NSOSwitchingRootDeletion, NSOSwitchportState
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
+
+        with without_commit_drain():
+            state = NSOSwitchportState.objects.create(
+                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            )
+            plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+            with renderer_writes(plan) as writer:
+                writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
+        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", ()),))
+        config, session = self.adapter.patches()
+        with config, session, renderer_writes(plan) as writer:
+            writer.m2m_set(state, "tagged_vlans", ())
+
+        assert self.adapter.requests[-1]["body"]["deleted_roots"] == []
+        assert self.adapter.requests[-1]["body"]["interfaces"][0]["tagged_vlans"] == []
+        assert not NSOSwitchingRootDeletion.objects.filter(management=self.mgmt, scope="switchport").exists()
 
 
 class TestSwitchportAcceptView(_SwBase):

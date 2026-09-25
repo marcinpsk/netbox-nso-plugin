@@ -2217,8 +2217,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
 
     def test_lacp_bundle_delete_pushes_reduced_snapshot(self):
-        """LACP rides the direct-apply path and is auto_apply-gated on save; deletion
-        retracts under the same gate (matching the save-path semantics)."""
+        """A bundle deletion records its root and queues the reduced LAG snapshot."""
         from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSODeviceManagement, NSOLACPBundleState
@@ -2231,17 +2230,16 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             auto_apply=True,
         )
         lag = Interface.objects.create(device=self.device, name="Port-channel10", type="lag")
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config"), self.captureOnCommitCallbacks(execute=True):
-            row = NSOLACPBundleState.objects.create(
-                management=mgmt,
-                interface=lag,
-                lag_id=10,
-                min_links=2,
-                system_priority=100,
-                timer="fast",
-                status="accepted",
-            )
-        self._delete_pushes(row, "apply_lag_config")
+        row = NSOLACPBundleState.objects.create(
+            management=mgmt,
+            interface=lag,
+            lag_id=10,
+            min_links=2,
+            system_priority=100,
+            timer="fast",
+            status="accepted",
+        )
+        self._delete_switching_overlay(row, "lacp", "Port-channel10")
 
     def test_lacp_member_delete_pushes_reduced_snapshot(self):
         from dcim.models import Interface
@@ -2257,29 +2255,27 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         )
         lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
         member_iface = Interface.objects.create(device=self.device, name="Gi9/1", type="1000base-t")
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config"), self.captureOnCommitCallbacks(execute=True):
-            NSOLACPBundleState.objects.create(
-                management=mgmt,
-                interface=lag,
-                lag_id=11,
-                min_links=1,
-                system_priority=100,
-                timer="fast",
-                status="accepted",
-            )
-            member = NSOLACPMemberState.objects.create(
-                management=mgmt,
-                interface=member_iface,
-                lag_bundle=lag,
-                mode="active",
-                port_priority=128,
-                status="accepted",
-            )
-        self._delete_pushes(member, "apply_lag_config", expect_empty_list=False)
+        NSOLACPBundleState.objects.create(
+            management=mgmt,
+            interface=lag,
+            lag_id=11,
+            min_links=1,
+            system_priority=100,
+            timer="fast",
+            status="accepted",
+        )
+        member = NSOLACPMemberState.objects.create(
+            management=mgmt,
+            interface=member_iface,
+            lag_bundle=lag,
+            mode="active",
+            port_priority=128,
+            status="accepted",
+        )
+        self._delete_switching_overlay(member, "lacp", None)
 
     def test_switchport_delete_pushes_reduced_snapshot(self):
-        """Switchport rides the direct-apply path and is auto_apply-gated on save;
-        deletion retracts under the same gate (matching the save-path semantics)."""
+        """A switchport deletion records its root and queues the reduced snapshot."""
         from netbox_nso_plugin.models import NSODeviceManagement, NSOSwitchportState
 
         mgmt = NSODeviceManagement.objects.create(
@@ -2289,14 +2285,30 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             adapter_device_id=42,
             auto_apply=True,
         )
-        with (
-            patch("netbox_nso_plugin.adapter_client.apply_switchport_config"),
-            self.captureOnCommitCallbacks(execute=True),
-        ):
-            row = NSOSwitchportState.objects.create(
-                management=mgmt, interface=self.iface, mode="trunk", status="accepted"
+        row = NSOSwitchportState.objects.create(management=mgmt, interface=self.iface, mode="trunk", status="accepted")
+        self._delete_switching_overlay(row, "switchport", self.iface.name)
+
+    def _delete_switching_overlay(self, row, scope, root_name):
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOSwitchingRootDeletion
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+        with renderer_writes(plan) as writer:
+            writer.delete(row)
+        roots = set(
+            NSOSwitchingRootDeletion.objects.filter(management=row.management, scope=scope).values_list(
+                "root_name", flat=True
             )
-        self._delete_pushes(row, "apply_switchport_config")
+        )
+        self.assertEqual(roots, {root_name} if root_name else set())
+        self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope=scope).exists())
+        snapshot = delivery.render(scope, self.device.pk, row.management.adapter_device_id).payload
+        if scope == "lacp" and root_name is None:
+            self.assertEqual(len(snapshot), 1)
+            self.assertEqual(snapshot[0]["members"], [])
+        else:
+            self.assertEqual(snapshot, [])
 
 
 class TestDeleteOriginMarking(_SignalDBBase):

@@ -1826,7 +1826,7 @@ def _retract_manifest(manifest, overlay=None, *, expected_action, requested) -> 
         intent_transaction,
         reconcile_family_footprint,
     )
-    from .models import NSOOwnershipManifest
+    from .models import NSODeviceManagement, NSOOwnershipManifest
     from .renderer_writer import consume_renderer_plan
     from .signals import _is_intent_push_suppressed, _is_render_request
     from .status_machine import is_owned
@@ -1863,6 +1863,20 @@ def _retract_manifest(manifest, overlay=None, *, expected_action, requested) -> 
                 writer.save(candidate, update_fields=update_fields)
         transitions = ()
         delete_origin = True
+        from .delivery import direct_keys
+
+        if current_manifest.scope in direct_keys():
+            from .switching_preparation import record
+
+            root_model = (
+                "netbox_nso_plugin.nsolacpbundlestate"
+                if current_manifest.scope == "lacp"
+                else "netbox_nso_plugin.nsoswitchportstate"
+            )
+            if current_manifest.state_model_label == root_model:
+                management = NSODeviceManagement.objects.get(device_id=current_manifest.device_id)
+                record(management, current_manifest.scope, current_manifest.native_key["name"])
+            delete_origin = False
         if current_manifest.scope == "static_route":
             acknowledged = current_manifest.acknowledged_lineage[-1] if current_manifest.acknowledged_lineage else None
             transitions = (

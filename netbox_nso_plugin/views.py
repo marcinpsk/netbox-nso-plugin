@@ -2556,7 +2556,7 @@ class ApplyPreparationRefused(ApplyRefused):
 
 
 class ApplyDirectRefused(ApplyRefused):
-    """One direct-config snapshot did not land, after *applied* already reached the device."""
+    """One switching snapshot was not prepared after earlier slots may have been prepared."""
 
     def __init__(self, key, applied, failure):
         super().__init__()
@@ -2594,7 +2594,7 @@ _APPLY_PROMOTION_MESSAGE = (
 )
 _APPLY_INTENT_CHANGED_MESSAGE = (
     "Apply stopped because NetBox intent changed during preparation. No Apply job was enqueued and no row was "
-    "promoted. Direct configuration snapshots might already have completed. Retry Apply for the current intent."
+    "promoted. Switching snapshots might already be prepared. Retry Apply for the current intent."
 )
 _APPLY_REFUSED_MESSAGE = (
     "Apply stopped before submission because a precondition was unmet. Nothing was applied and no row was promoted."
@@ -2635,14 +2635,14 @@ def _prepare_failure_message(key, failure) -> str:
 
 
 def _direct_prepare_failure_message(key, applied_keys, failure) -> str:
-    """Describe a direct preparation failure without hiding completed device writes."""
+    """Describe a switching preparation failure and any completed snapshots."""
     if applied_keys:
         applied = ", ".join(_delivery_label(applied_key) for applied_key in applied_keys)
-        completed = f"Direct-config snapshots already applied to the device: {applied}."
+        completed = f"Switching snapshots already prepared: {applied}."
     else:
-        completed = "No direct-config snapshot completed before this failure."
+        completed = "No switching snapshot completed before this failure."
     return (
-        f"Apply stopped: {_delivery_label(key)} direct configuration {failure}. {completed} "
+        f"Apply stopped: {_delivery_label(key)} preparation {failure}. {completed} "
         "No Apply job was enqueued and no row was promoted."
     )
 
@@ -2692,15 +2692,13 @@ def _audit_capture(mgmt, scopes, trigger, remaining_budget) -> None:
         raise ApplyRefused from exc
 
 
-def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
-    """Force-push the out-of-protocol device snapshots, last, and abort truthfully.
-
-    These are synchronous device writes with no rollback, so they run only after every
-    store-only push succeeded, and a failure names the snapshots already applied.
-    """
+def _push_direct_snapshots(mgmt, registry, remaining_budget) -> tuple[dict[str, int], dict[str, int]]:
+    """Prepare switching snapshots and return selection and source revisions."""
     from . import delivery, drain
 
     applied_direct_keys = []
+    selected = {}
+    source_revisions = {}
     for entry in (candidate for candidate in registry.values() if not candidate.in_protocol):
         try:
             deadline = remaining_budget()
@@ -2714,20 +2712,29 @@ def _push_direct_snapshots(mgmt, registry, remaining_budget) -> None:
                 force=True,
                 deadline=deadline,
             )
-        except Exception as exc:  # noqa: BLE001 (the direct write may already have happened)
-            logger.warning("Apply direct push failed for device %s: %s", mgmt.device_id, exc)
+        except Exception as exc:  # noqa: BLE001 (a preparation may have reached the adapter)
+            logger.warning("Apply switching preparation failed for device %s: %s", mgmt.device_id, exc)
             raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_FAILED) from exc
         if response is None:
             raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_SETTLED)
+        revision = response.get("selection_revision") if isinstance(response, dict) else None
+        if type(revision) is not int or revision <= 0:
+            raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_SETTLED)
+        source_revision = response.get("source_revision")
+        if type(source_revision) is not int or source_revision < 0:
+            raise ApplyDirectRefused(entry.key, applied_direct_keys, _PREPARE_NOT_SETTLED)
+        selected[entry.section] = revision
+        source_revisions[entry.key] = source_revision
         applied_direct_keys.append(entry.key)
+    return selected, source_revisions
 
 
 def _prepare_apply(mgmt):
     """Pre-Apply bookkeeping for one device's single Apply.
 
-    Refresh every adapter intent mirror with store-only pushes first. LACP and
-    switchport are owned in NetBox, so push their device snapshots only after
-    every store-only push succeeds. Then move owned 'accepted' or 'apply_failed' overlays →
+    Refresh every adapter intent mirror with store-only pushes first. Prepare
+    LACP and switchport snapshots after those pushes succeed. Then move owned
+    'accepted' or 'apply_failed' overlays →
     'deploying' so they read as "applying" and settle to 'in_sync' on the next
     reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
     re-reported). ``.update()`` avoids firing the per-row push signal.
@@ -2736,7 +2743,7 @@ def _prepare_apply(mgmt):
     caller can roll the rows back via :func:`_rollback_prepare_apply` if no job is enqueued.
     Raises :class:`ApplyRefused` when a preparation call escapes or the SNMP refresh is
     refused. Preparation completes before promotion, so an abort leaves no rows to roll back.
-    Completed direct writes cannot be rolled back.
+    Completed switching preparations remain selectable until another preparation replaces them.
     """
     from . import delivery, drain
     from .signals import stored_static_route_count
@@ -2820,17 +2827,11 @@ def _prepare_apply(mgmt):
         if outcome != drain.SUCCEEDED:
             raise ApplyPreparationRefused("snmp", _PREPARE_NOT_SETTLED)
 
-    # A foreign writer can commit after an earlier scope receipt. Audit the complete
-    # selector once more before promotion so that its repair revision invalidates any
-    # receipt captured before that commit. Ahead of the direct pushes: a repair bump that
-    # aborts the Apply after an irreversible device write leaves the device changed.
+    # Audit before switching preparation so a repair invalidates stale receipts without leaving a slot.
     _audit_capture(mgmt, tuple(registry), "views._prepare_apply.finalize", remaining_budget)
 
-    # Direct snapshots do not participate in the adapter selector. Keep them outside
-    # the receipt capture so only in-protocol store-only claims reach promotion.
-    _push_direct_snapshots(mgmt, registry, remaining_budget)
-
-    selected = MappingProxyType({registry[scope].section: successful.push_seq for scope, successful in pushed.items()})
+    # Switching preparations select the exact adapter slot returned by each POST.
+    direct_selected, direct_source_revisions = _push_direct_snapshots(mgmt, registry, remaining_budget)
 
     if not static_route_stored:
         logger.warning(
@@ -2845,6 +2846,8 @@ def _prepare_apply(mgmt):
             mgmt,
             registry,
             pushed,
+            direct_selected=direct_selected,
+            direct_source_revisions=direct_source_revisions,
             apply_attempt_id=uuid4(),
             static_route_stored=static_route_stored,
         )
@@ -2853,7 +2856,8 @@ def _prepare_apply(mgmt):
     except Exception as exc:  # noqa: BLE001 (abort before the adapter can promote a partial local state)
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
         raise ApplyPromotionFailed from exc
-    return PreparedApply(attempt.pk, tuple(moved)), selected
+    attempt.refresh_from_db(fields=["selected"])
+    return PreparedApply(attempt.pk, tuple(moved)), MappingProxyType(attempt.selected)
 
 
 def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
@@ -2974,6 +2978,9 @@ def _validated_unexecutable_reasons(detail) -> dict:
 
 def _promoted_stream_coverage(generations, expected_selected, skipped):
     """Return the promoted stream union when every generation proves its selector."""
+    from .delivery import direct_streams
+
+    switching_streams = direct_streams()
     promoted_streams = set()
     generation_ids = set()
     previous_seq = None
@@ -3008,7 +3015,12 @@ def _promoted_stream_coverage(generations, expected_selected, skipped):
         if streams != set(sources) or not streams.issubset(expected_selected):
             return None, "Adapter returned an invalid Apply generation."
         if any(type(revision) is not int for revision in revisions.values()) or any(
-            type(sources[stream]) is not int or sources[stream] != expected_selected[stream] for stream in streams
+            (
+                revisions[stream] != expected_selected[stream] or sources[stream] is not None
+                if stream in switching_streams
+                else type(sources[stream]) is not int or sources[stream] != expected_selected[stream]
+            )
+            for stream in streams
         ):
             return None, "Adapter returned an invalid Apply generation provenance."
         promoted_streams.update(revisions)
