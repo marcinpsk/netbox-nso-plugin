@@ -2,6 +2,111 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-09-25)
+
+### Bug Fixes
+
+- Cover delivery push definitions in review rule
+  ([`6dbc321`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6dbc32198f90d6449bac20eb804413b4c55c9fa5))
+
+- Fence provision claims and tighten review checks
+  ([`d45f79d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d45f79d236f2d311ebc48d0fb98345392dddd7bd))
+
+- Resolve plugin review findings
+  ([`b4781ca`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b4781cac7e3ce13e2266a707e03decc5e11551a7))
+
+- Resolve plugin review followups
+  ([`b93325c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b93325c1fe9ded1ca43cea77cb517afa7a22ebf1))
+
+- Return competing provision claim details
+  ([`3012d13`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3012d13020ca184fb13bc73e30d59ca1cfda8338))
+
+- Serialize provision attempts and validate renderer loops
+  ([`688e5fb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/688e5fb4bc8bfad80c93c47652cc3d6bd1209590))
+
+- **api**: Reject a non-object request body with HTTP 400
+  ([`318a50f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/318a50f149f2ed9477bf8f6ed480997d656b358d))
+
+- **onboarding**: Ask the adapter before closing a new provision claim
+  ([`7291006`](https://github.com/marcinpsk/netbox-nso-plugin/commit/72910067a05b913dbaba1e54dbbf2dbaae4245f4))
+
+- **ownership**: Detach a malformed BGP manifest when ownership is relinquished
+  ([`7ff49a8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7ff49a80d317b2c6117f35637cac05d6d5ba5dee))
+
+- **ownership**: Keep native NetBox metadata out of reowned overlays
+  ([`2f8ee44`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2f8ee44ea8523e46f133bdf3ac9a321db21740fb))
+
+- **ownership**: Replan lifecycle actions under the lock and match overlays by natural key
+  ([`87288c8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/87288c81895e4c83f94f7eb591739e1c65175c59))
+
+- **ownership**: Skip a malformed BGP identity when maintaining manifests
+  ([`5ad7468`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5ad74683e866d2480d984332799711d7cbe6936b))
+
+- **review-patterns**: Scan explicit paths in the Python checkers
+  ([`eb27ae2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/eb27ae2b9091342b67e972ad99fddb24e6a6922a))
+
+- **scripts**: Expand an empty path array portably under set -u
+  ([`0cf7634`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0cf76347f42f3afce23caf273e438b8a02abad56))
+
+- **signals**: Mark IS-IS flex-algo and interface deletes as deletion origin
+  ([`ae12b7b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ae12b7bd57490f19a76bb5f5fd0e3aa4f142bf5c))
+
+### Chores
+
+- **opengrep**: Guard deletion receivers and cover every model signal
+  ([`1804644`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1804644ec83733a4ab88be2a049693d016ce4816))
+
+- **opengrep**: Report request.data reads outside the body validator
+  ([`65ba668`](https://github.com/marcinpsk/netbox-nso-plugin/commit/65ba668b2661ea81386cd2c5a8f717930d8c4fb4))
+
+- **opengrep**: Require validation before a persisted overlay signature
+  ([`0fffc52`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0fffc52f64f0a331090b73302fcf7b168123c11c))
+
+### Continuous Integration
+
+- Run the OpenGrep review patterns in the lint workflow
+  ([`f73861a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f73861a2fbe893bc8bcb87ecc39c2fd23f726e96))
+
+- **contract**: Give the live adapter its diagnostic key
+  ([`5566188`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5566188c33e28f5cc29358373cfc6b757622cb9e))
+
+### Refactoring
+
+- **intent-state**: Drop a None check that cannot be true
+  ([`0b25373`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0b25373dfe5bfdab0ac6aa208b0168efb4255ba0))
+
+### Revert
+
+- **ci**: Keep OpenGrep out of the GitHub Actions workflows
+  ([`3a35fa2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3a35fa2fefe2d6f92f749847a53f0cae978bfa71))
+
+### Testing
+
+- Tighten three review-flagged fixtures
+  ([`5224192`](https://github.com/marcinpsk/netbox-nso-plugin/commit/52241923c2806afef4d082c16ab0b7b0280932aa))
+
+- **bgp**: Own the valid peer before the malformed-peer ownership audit
+  ([`2a62c0d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2a62c0de9f3f184aa7175f988815d0fe3eeb321d))
+
+- **ci**: Fail when a GitHub workflow runs OpenGrep or pre-commit
+  ([`ade3070`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ade30701ecbc9a130d04115c67ab2f62d661748c))
+
+- **onboarding**: Build provision attempts through one fixture
+  ([`99d72df`](https://github.com/marcinpsk/netbox-nso-plugin/commit/99d72df42aec24b49811e89ed2f11d340b11435b))
+
+- **onboarding**: Prove a new claim is visible to another connection before send
+  ([`bacc440`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bacc440c717e6d1efea5cf7b2560530c6895520d))
+
+- **renderer-writer**: Merge exceptional entry states in the stale-plan guard
+  ([`84cabf4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/84cabf464dbfaa30c34a1d795f5fe0e02d056436))
+
+- **renderer-writer**: Read every expression and consumer form in the stale-plan guard
+  ([`42da375`](https://github.com/marcinpsk/netbox-nso-plugin/commit/42da375b92dccdc6a1de217d19a58145602a7c42))
+
+- **structure**: Remove the unused flow-insensitive plan collectors
+  ([`4956480`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4956480b9186f1480b64731c2d4bad429cdba935))
+
+
 ## v1.4.0 (2026-09-22)
 
 ### Bug Fixes
