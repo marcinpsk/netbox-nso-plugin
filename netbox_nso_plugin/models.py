@@ -2937,7 +2937,10 @@ class NSOOwnershipManifest(models.Model):
     device_id = models.PositiveBigIntegerField(db_column="device_id", db_index=True)
     scope = models.CharField(max_length=32)
     native_model_label = models.CharField(max_length=200)
+    native_id = models.PositiveBigIntegerField()
     native_key = models.JSONField()
+    state_model_label = models.CharField(max_length=200)
+    state_key = models.JSONField(default=dict, blank=True)
     ownership_state = models.CharField(max_length=32, default="owned")
     deletion_authority = models.BooleanField(default=False)
     acknowledged_lineage = models.JSONField(default=list, blank=True)
@@ -2945,7 +2948,12 @@ class NSOOwnershipManifest(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["device_id", "scope", "native_model_label", "native_key"],
+                models.F("device_id"),
+                models.F("scope"),
+                models.F("native_model_label"),
+                models.F("native_key"),
+                models.F("state_model_label"),
+                models.F("state_key"),
                 name="nso_owner_manifest_identity",
             )
         ]
@@ -3007,6 +3015,67 @@ class NSOApplyAttempt(models.Model):
 
     def __str__(self):
         return str(self.pk)
+
+
+OPEN_PROVISION_NAME_CONSTRAINT = "nso_open_provision_name"
+
+
+class NSOProvisionTombstone(models.Model):
+    """Durable identity and completion fence for one provision request."""
+
+    STATE_CHOICES = [
+        ("open", "Open"),
+        ("terminal", "Terminal"),
+        ("offboarded", "Offboarded"),
+        ("closed", "Closed"),
+    ]
+
+    provision_attempt_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attempt_sequence = models.PositiveBigIntegerField(default=0, editable=False)
+    netbox_device_id = models.PositiveBigIntegerField(db_index=True)
+    nso_instance = models.CharField(max_length=255)
+    nso_device_name = models.CharField(max_length=255)
+    canonical_request = models.JSONField()
+    adapter_job_id = models.CharField(max_length=64, blank=True, default="")
+    adapter_device_id = models.BigIntegerField(null=True, blank=True)
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default="open")
+    terminal_status = models.CharField(max_length=32, blank=True, default="")
+    terminal_evidence = models.JSONField(null=True, blank=True)
+    offboard_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(db_default=Now())
+    updated_at = models.DateTimeField(auto_now=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["nso_instance", "nso_device_name"],
+                condition=models.Q(state="open"),
+                name=OPEN_PROVISION_NAME_CONSTRAINT,
+            ),
+            models.UniqueConstraint(
+                fields=["nso_instance", "nso_device_name", "attempt_sequence"],
+                condition=models.Q(attempt_sequence__gt=0),
+                name="nso_provision_attempt_sequence",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["updated_at", "created_at", "provision_attempt_id"],
+                condition=~models.Q(state="closed"),
+                name="nso_provision_sweep",
+            ),
+            models.Index(
+                fields=["netbox_device_id", "nso_instance", "nso_device_name"],
+                name="nso_provision_identity",
+            ),
+        ]
+        ordering = ["created_at", "provision_attempt_id"]
+        verbose_name = "NSO Provision Tombstone"
+        verbose_name_plural = "NSO Provision Tombstones"
+
+    def __str__(self):
+        return f"{self.provision_attempt_id} {self.nso_instance}/{self.nso_device_name} [{self.state}]"
 
 
 class NSOIntentOutboxEntry(models.Model):

@@ -5,6 +5,8 @@
 These tests require the full NetBox/Django stack (run in devcontainer).
 """
 
+from unittest.mock import patch
+
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from rest_framework import status
 from utilities.testing import APITestCase
@@ -383,6 +385,68 @@ class OnboardAPIPermissionTest(APITestCase):
         url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
         resp = self.client.post(url, {"netbox_device_id": self.device.pk}, format="json", **self.header)
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class OnboardAPIConflictTest(APITestCase):
+    """The onboard API preserves an active adapter provision conflict."""
+
+    user_permissions = ("netbox_nso_plugin.change_nsodevicemanagement",)
+
+    @classmethod
+    def setUpTestData(cls):
+        mfg = Manufacturer.objects.create(name="OnbConflictMfg", slug="onbconflictmfg")
+        dt = DeviceType.objects.create(manufacturer=mfg, model="OnbConflictDev", slug="onbconflictdev")
+        role = DeviceRole.objects.create(name="OnbConflictRole", slug="onbconflictrole")
+        site = Site.objects.create(name="OnbConflictSite", slug="onbconflictsite")
+        cls.device = Device.objects.create(name="onb-conflict-rtr", device_type=dt, role=role, site=site)
+        cls.instance = NSOInstance.objects.create(name="onb-conflict", adapter_instance_id="onb-conflict")
+
+    def test_conflict_returns_409_with_the_running_job_id(self):
+        from django.urls import reverse
+
+        result = {
+            "ok": False,
+            "error": {
+                "code": "conflict",
+                "message": "The NSO adapter request failed. See the server log.",
+                "detail": {"job_id": 73},
+            },
+            "provisioning": False,
+            "job_id": None,
+            "managed": False,
+            "_http_status": 409,
+        }
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
+        with patch("netbox_nso_plugin.onboarding.onboard_candidate", return_value=result):
+            response = self.client.post(
+                url,
+                {"netbox_device_id": self.device.pk, "instance": self.instance.adapter_instance_id},
+                format="json",
+                **self.header,
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data["error"]["detail"]["job_id"], 73)
+        self.assertNotIn("_http_status", response.data)
+
+    def test_non_object_body_returns_400_without_provisioning(self):
+        from django.urls import reverse
+
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
+        tombstone_count = NSOProvisionTombstone.objects.count()
+        for body in ([], ["x"]):
+            with (
+                self.subTest(body=body),
+                patch("netbox_nso_plugin.adapter_client.provision_device") as provision,
+            ):
+                response = self.client.post(url, body, format="json", **self.header)
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data["detail"], "request body must be a JSON object")
+                self.assertEqual(NSOProvisionTombstone.objects.count(), tombstone_count)
+                provision.assert_not_called()
 
 
 class OnboardingCandidatesAPITest(APITestCase):

@@ -35,6 +35,11 @@ from .serializers import (
 )
 
 
+def _request_body(request):
+    body = request.data
+    return body if isinstance(body, dict) else None
+
+
 class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):
     """REST API for database-managed derived-intent templates."""
 
@@ -88,8 +93,6 @@ class NSOInterfaceStateViewSet(NetBoxModelViewSet):
         from ..renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         candidate = copy.copy(serializer.instance)
-        if "status" in serializer.validated_data:
-            candidate._nso_explicit_status_update = True
         for field_name, value in serializer.validated_data.items():
             try:
                 field = candidate._meta.get_field(field_name)
@@ -207,6 +210,16 @@ class HasNSOChangePermission(BasePermission):
         return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement"))
 
 
+class HasProvisionTombstoneChangePermission(BasePermission):
+    """Require permission to record terminal provision evidence."""
+
+    message = "This action requires the netbox_nso_plugin.change_nsoprovisiontombstone permission."
+
+    def has_permission(self, request, view):  # noqa: D102
+        user = request.user
+        return bool(user and user.is_authenticated and user.has_perm("netbox_nso_plugin.change_nsoprovisiontombstone"))
+
+
 class OnboardView(APIView):
     """CICD-facing onboard action.
 
@@ -225,14 +238,18 @@ class OnboardView(APIView):
 
         from ..onboarding import onboard_candidate
 
-        device_id = request.data.get("netbox_device_id")
+        body = _request_body(request)
+        if body is None:
+            return Response({"detail": "request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
+
+        device_id = body.get("netbox_device_id")
         if device_id is None:
             return Response({"detail": "netbox_device_id is required"}, status=status.HTTP_400_BAD_REQUEST)
         device = Device.objects.filter(pk=device_id).first()
         if device is None:
             return Response({"detail": f"device {device_id} not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        selected = request.data.get("instance")
+        selected = body.get("instance")
         instance = None
         if selected:
             instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
@@ -244,7 +261,10 @@ class OnboardView(APIView):
             return Response({"detail": "no NSO instance configured"}, status=status.HTTP_404_NOT_FOUND)
 
         result = onboard_candidate(device, instance)
-        code = status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST
+        code = result.pop(
+            "_http_status",
+            status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,
+        )
         return Response(result, status=code)
 
 
@@ -267,8 +287,12 @@ class SyncCompleteView(APIView):
         """Resolve the device and enqueue its background reconcile."""
         from ..reconcile import enqueue_device_reconcile
 
-        device_id = request.data.get("netbox_device_id")
-        adapter_device_id = request.data.get("adapter_device_id")
+        body = _request_body(request)
+        if body is None:
+            return Response({"detail": "request body must be a JSON object"}, status=status.HTTP_400_BAD_REQUEST)
+
+        device_id = body.get("netbox_device_id")
+        adapter_device_id = body.get("adapter_device_id")
 
         if device_id is None and adapter_device_id is None:
             return Response(
@@ -290,36 +314,43 @@ class SyncCompleteView(APIView):
 
 
 class ProvisionCompleteView(APIView):
-    """Adapter → plugin callback: a device-provision job finished, advance its onboarding row.
+    """Adapter callback: record terminal provision evidence for the fenced plugin sweep.
 
-    POSTed by the adapter when a provision job reaches a terminal state (succeeded / failed /
-    timeout). The plugin advances the gated NSODeviceManagement row OFF the request path — flipping
-    it to ready (→ the un-gated signal maps/scopes/syncs) or provision_failed — instead of relying
-    on the dashboard poll being open when the job completes. Enqueues a background advance and
-    returns 202; the device-tab self-heal and hourly sweep remain as backstops for a missed call.
+    The adapter posts this callback when a provision attempt reaches a terminal state. The
+    callback only records the first terminal evidence with compare-and-set. It then enqueues
+    the tombstone sweep, which is the sole owner of management completion and orphan offboarding.
 
     Endpoint: ``POST /api/plugins/nso/provision-complete/``
-    Body: ``{"provision_job_id": <int>}`` — the adapter provision job id (== the row's onboard_job_id).
+    Body includes ``provision_attempt_id`` and the adapter's terminal evidence.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasProvisionTombstoneChangePermission]
 
     def post(self, request):
-        """Resolve the onboarding row by its provision job id and enqueue its advance."""
-        from ..reconcile import enqueue_onboard_advance
+        """CAS-mark terminal evidence and delegate every completion action to the sweep."""
+        from uuid import UUID
 
-        job_id = request.data.get("provision_job_id")
-        if job_id in (None, ""):
-            return Response({"detail": "provision_job_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        from ..adapter_client import AdapterError
+        from ..provision_lifecycle import mark_provision_terminal, validate_provision_evidence
+        from ..reconcile import enqueue_provision_tombstone_sweep
 
-        mgmt = NSODeviceManagement.objects.filter(onboard_job_id=str(job_id)).first()
-        if mgmt is None:
-            # Unknown / untracked provision job (row deleted, or a provision not driven by the
-            # plugin) — ack so the best-effort adapter callback does not treat it as retryable.
-            return Response(
-                {"queued": False, "detail": f"no onboarding row for provision_job_id={job_id}"},
-                status=status.HTTP_202_ACCEPTED,
-            )
+        body = _request_body(request)
+        if body is None:
+            return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
 
-        enqueue_onboard_advance(mgmt.id)
-        return Response({"queued": True, "mgmt_id": mgmt.id}, status=status.HTTP_202_ACCEPTED)
+        raw_attempt_id = body.get("provision_attempt_id")
+        if raw_attempt_id in (None, ""):
+            return Response({"detail": "provision_attempt_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            attempt_id = UUID(str(raw_attempt_id))
+            evidence = validate_provision_evidence(dict(body), terminal_required=True)
+        except (TypeError, ValueError):
+            return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            known = mark_provision_terminal(attempt_id, evidence)
+        except AdapterError:
+            return Response({"detail": "invalid provision completion evidence"}, status=status.HTTP_400_BAD_REQUEST)
+        if not known:
+            return Response({"queued": False}, status=status.HTTP_202_ACCEPTED)
+        enqueue_provision_tombstone_sweep(attempt_id)
+        return Response({"queued": True}, status=status.HTTP_202_ACCEPTED)

@@ -298,6 +298,7 @@ jobs:
             api_token_ref: CONTRACT_NETBOX_TOKEN
           api:
             adapter_token_ref: CONTRACT_ADAPTER_TOKEN
+          diagnostic_key_ref: CONTRACT_DIAGNOSTIC_KEY
           database_url: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
           log_level: WARNING
           log_format: json
@@ -311,6 +312,7 @@ jobs:
             --env DATABASE_URL="$ADAPTER_DATABASE_URL" \
             --env CONTRACT_ADAPTER_TOKEN="$ADAPTER_TOKEN" \
             --env CONTRACT_NETBOX_TOKEN="$NETBOX_TOKEN" \
+            --env CONTRACT_DIAGNOSTIC_KEY=contract-diagnostic-key \
             --env CONTRACT_NSO_USERNAME=contract \
             --env CONTRACT_NSO_PASSWORD=contract \
             --volume "${RUNNER_TEMP}/adapter-contract.yaml:/app/config.contract.yaml:ro" \

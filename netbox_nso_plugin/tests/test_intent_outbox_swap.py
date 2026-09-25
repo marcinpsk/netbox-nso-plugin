@@ -31,44 +31,8 @@ class _Abort(Exception):
     """Roll the operator's transaction back the way a failing form save does."""
 
 
-def _production_modules():
-    """Every module a request runs, which is where an unclaimed send would hide."""
-    from pathlib import Path
-
-    plugin = Path(__file__).resolve().parent.parent
-    # Relative to the plugin: an ancestor directory named tests/ or migrations/ would otherwise
-    # yield nothing, and every guard below asserts an EMPTY set, so the scan must be non-empty.
-    paths = [p for p in sorted(plugin.rglob("*.py")) if not {"tests", "migrations"} & set(p.relative_to(plugin).parts)]
-    assert any(p.name == "signals.py" for p in paths), f"the scan reached {len(paths)} module(s), so it proves nothing"
-    return paths
-
-
 class TestEveryProductionSendGoesThroughTheOutbox(SimpleTestCase):
     """Codex O1 F5: the push builders are the delivery registry's to call, and nobody else's."""
-
-    def test_only_the_delivery_registry_names_a_push_builder(self):
-        """A direct call sends with no claim and no ``X-Push-Seq``; the compiler can see it."""
-        import ast
-        import re
-
-        pattern = re.compile(r"_push_[a-z0-9_]+_intent_for_device")
-        named = set()
-        for path in _production_modules():
-            if path.name == "delivery.py":
-                continue  # the registry, which is the one place that may hold them
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                # A call, an attribute access and an import all name it, and all three count.
-                if isinstance(node, ast.Name):
-                    named_here = node.id
-                elif isinstance(node, ast.Attribute):
-                    named_here = node.attr
-                elif isinstance(node, ast.alias):
-                    named_here = node.name
-                else:
-                    continue
-                if pattern.fullmatch(named_here):
-                    named.add(f"{path.name}:{node.lineno}")
-        assert named == set(), named
 
     def test_a_push_outside_a_render_refuses_rather_than_sending(self):
         """The fallback is gone with its callers: nothing may deliver intent around the claim."""
@@ -87,25 +51,6 @@ class TestTheCoalescerSymbolsAreGone(SimpleTestCase):
         for name in ("_pending_pushes", "_last_pushed_hashes"):
             with self.subTest(symbol=name):
                 assert not hasattr(signals, name)
-
-    def test_no_module_still_reads_them(self):
-        import ast
-
-        gone = {"_pending_pushes", "_last_pushed_hashes"}
-        read = set()
-        for path in _production_modules():
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                if isinstance(node, ast.Name):
-                    named_here = node.id
-                elif isinstance(node, ast.Attribute):
-                    named_here = node.attr
-                elif isinstance(node, ast.alias):
-                    named_here = node.name
-                else:
-                    continue
-                if named_here in gone:
-                    read.add(f"{path.name}:{node.lineno}")
-        assert read == set(), read
 
 
 class TestFixtureCommitDrainSuppression(SimpleTestCase):

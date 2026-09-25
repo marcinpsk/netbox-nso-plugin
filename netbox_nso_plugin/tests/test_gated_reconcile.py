@@ -1110,6 +1110,7 @@ class TestRealBodyGateSweep(TestCase):
                             "mtu": 9100,
                             "ip_mtu": 9000,
                             "mpls_mtu": 9088,
+                            "bound_port": "",
                         }
                     ]
                 elif fetcher == "get_l2_services":
@@ -1655,6 +1656,40 @@ class TestCategoryViewSkipFallback(TestCase):
         self.device, self.mgmt = _make(f"gv{uuid.uuid4().hex[:6]}", manage_l2=True)
         self.user = User.objects.create_superuser(username=f"gv-{uuid.uuid4().hex[:6]}")
         self.client.force_login(self.user)
+
+    def test_unavailable_vlan_document_skips_validation_of_missing_items(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        from ._outbox_case import own_vlan
+
+        state = own_vlan(self.mgmt, 220, "retained-vlan")
+        before = state.status
+        document = {
+            "vlans": None,
+            "read_state": _rs(outcome="unavailable", reason="export_down", result="kept", succeeded=False),
+        }
+        with patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=document):
+            context = reconcile_category(self.device, self.mgmt, "vlan")
+
+        self.assertEqual(context["_gate"]["vlan"], "skipped_unavailable")
+        state.refresh_from_db()
+        self.assertEqual(state.status, before)
+
+    def test_unavailable_switchport_document_skips_validation_of_missing_items(self):
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        vlan_document = {"vlans": [], "read_state": _rs()}
+        switchport_document = {
+            "interfaces": None,
+            "read_state": _rs(outcome="unavailable", reason="export_down", result="kept", succeeded=False),
+        }
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_vlan_database", return_value=vlan_document),
+            patch("netbox_nso_plugin.adapter_client.get_switchport", return_value=switchport_document),
+        ):
+            context = reconcile_category(self.device, self.mgmt, "switchport")
+
+        self.assertEqual(context["_gate"]["switchport"], "skipped_unavailable")
 
     def test_a_vlan_planner_failure_keeps_the_category_available(self):
         from ._outbox_case import own_vlan

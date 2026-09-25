@@ -346,11 +346,18 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
 
     def test_a_restored_database_says_unverified_rather_than_guessing(self):
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.models import NSOIntentOutboxState
+        from netbox_nso_plugin.models import NSOIntentOutboxState, NSOOwnershipManifest
 
         acked = triple("198.51.100.208/28", "198.51.100.30")
         route = own_route(self.mgmt, "198.51.100.208/28", "198.51.100.30")
         self.stamp(route, acked)
+        manifest = NSOOwnershipManifest.objects.get(
+            device_id=self.device.pk,
+            scope="static_route",
+            native_id=route.pk,
+        )
+        manifest.acknowledged_lineage = [acked]
+        manifest.save(update_fields=["acknowledged_lineage"])
         self.clear_entries()
         NSOIntentOutboxState.objects.update_or_create(
             device=self.device,
@@ -360,6 +367,8 @@ class TestTheLineageIsBoundedAndCleared(_LineageCase):
 
         assert drain.clear_acknowledged_lineage() == 1
         assert state_of(self.device, "static_route").lineage_carry == {}
+        manifest.refresh_from_db()
+        assert manifest.acknowledged_lineage == []
         self.unown(route)
 
         [record] = self.records()

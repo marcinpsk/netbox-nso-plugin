@@ -51,6 +51,192 @@ rules:
               ...
           except threading.BrokenBarrierError:
               return
+  - id: nso-unbounded-thread-join
+    languages: [python]
+    severity: ERROR
+    message: Use a bounded timeout for thread joins.
+    patterns:
+      - pattern-either:
+          - pattern: $THREAD.join()
+          - pattern: $THREAD.join(None)
+          - pattern: $THREAD.join(timeout=None)
+          - pattern: $THREAD.join(*$OPTIONS)
+          - pattern: $THREAD.join(**$OPTIONS)
+          - patterns:
+              - pattern: $THREAD.join(**$OPTIONS, ...)
+              - pattern-not: $THREAD.join(..., timeout=$TIMEOUT, ...)
+          - pattern: $THREAD.join(timeout=None, **$OPTIONS)
+          - pattern: $THREAD.join(None, **$OPTIONS)
+          - pattern: $THREAD.join(None, ...)
+          - pattern: $THREAD.join(..., timeout=None, ...)
+          - patterns:
+              - pattern: $THREAD.join(...)
+              - pattern-not: $THREAD.join($ARG, ...)
+              - pattern-not: $THREAD.join(..., timeout=$TIMEOUT, ...)
+      - pattern-either:
+          - pattern-inside: |
+              import threading
+              ...
+          - pattern-inside: |
+              import threading as $T
+              ...
+          - pattern-inside: |
+              from threading import $X
+              ...
+          - pattern-inside: |
+              from threading import $X as $Y
+              ...
+          - pattern-inside: |
+              ...
+              import threading
+          - pattern-inside: |
+              ...
+              import threading as $T
+          - pattern-inside: |
+              ...
+              from threading import $X
+          - pattern-inside: |
+              ...
+              from threading import $X as $Y
+    paths:
+      include: ["netbox_nso_plugin/tests/**"]
+  - id: nso-retired-push-builder
+    languages: [python]
+    severity: ERROR
+    message: Use push builders only through the delivery registry.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $M.$F(...)
+          - pattern: '$F: $T'
+          - patterns:
+              - pattern: $F
+              - pattern-not-inside: $F(...)
+              - pattern-not-inside: $M.$F
+              - pattern-not-inside: from $M import $F
+              - pattern-not-inside: from $M import $F as $A
+              - pattern-not-inside: import $F
+              - pattern-not-inside: import $F as $A
+              - pattern-not-inside: import $M.$F
+          - patterns:
+              - pattern: $M.$F
+              - pattern-not-inside: $M.$F(...)
+              - pattern-not-inside: import $M.$F
+          - pattern: from $M import $F
+          - pattern: from $M import $F as $A
+          - pattern: import $M.$F
+          - pattern: import $F
+          - pattern: import $F as $A
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_push_[a-z0-9_]+_intent_for_device$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/delivery.py"
+  - id: nso-push-builder-definition-outside-signals
+    languages: [python]
+    severity: ERROR
+    message: Define push builders in signals and register them with delivery.
+    patterns:
+      - pattern: |
+          def $F(...):
+              ...
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_push_[a-z0-9_]+_intent_for_device$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/signals.py"
+  - id: nso-retired-coalescer-state
+    languages: [python]
+    severity: ERROR
+    message: Keep intent state in the durable outbox.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $M.$F(...)
+          - pattern: '$F: $T'
+          - patterns:
+              - pattern: $F
+              - pattern-not-inside: $F(...)
+              - pattern-not-inside: $M.$F
+              - pattern-not-inside: from $M import $F
+              - pattern-not-inside: from $M import $F as $A
+              - pattern-not-inside: import $F
+              - pattern-not-inside: import $F as $A
+              - pattern-not-inside: import $M.$F
+          - patterns:
+              - pattern: $M.$F
+              - pattern-not-inside: $M.$F(...)
+              - pattern-not-inside: import $M.$F
+          - pattern: from $M import $F
+          - pattern: from $M import $F as $A
+          - pattern: import $M.$F
+          - pattern: import $F
+          - pattern: import $F as $A
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_(?:pending_pushes|last_pushed_hashes)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+  - id: nso-retired-renderer-writer-symbol
+    languages: [python]
+    severity: ERROR
+    message: Do not restore retired renderer-writer symbols.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $M.$F(...)
+          - pattern: '$F: $T'
+          - pattern: |
+              def $F(...):
+                  ...
+          - patterns:
+              - pattern: $F
+              - pattern-not-inside: $F(...)
+              - pattern-not-inside: $M.$F
+              - pattern-not-inside: from $M import $F
+              - pattern-not-inside: from $M import $F as $A
+              - pattern-not-inside: import $F
+              - pattern-not-inside: import $F as $A
+              - pattern-not-inside: import $M.$F
+          - patterns:
+              - pattern: $M.$F
+              - pattern-not-inside: $M.$F(...)
+              - pattern-not-inside: import $M.$F
+          - pattern: from $M import $F
+          - pattern: from $M import $F as $A
+          - pattern: import $M.$F
+          - pattern: import $F
+          - pattern: import $F as $A
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_(?:IMPLICIT_PERMITS|authorize_dml|begin_delete_implicit|begin_implicit|begin_m2m_implicit|create_greenfield_subif_state|discard_rolled_back_implicit_permit|dml_guard|end_implicit|end_m2m_implicit|install_guard|on_routing_static_route_pre_save|parse_dml_target|remove_static_route_for_device|static_route_content|transition_static_route_content)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "netbox_nso_plugin/tests/**"
+        - "netbox_nso_plugin/migrations/**"
+  - id: nso-retired-interface-config-literal
+    languages: [python]
+    severity: ERROR
+    message: Read the interface receipt section from the delivery registry.
+    pattern: '"interface_config"'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/delivery.py"
   - id: nso-vlan-group-mutable-lookup
     languages: [python]
     severity: ERROR
@@ -109,3 +295,132 @@ rules:
           - pattern-inside: |
               for $ENTRY in entries:
                   ...
+  - id: nso-signal-connect-without-dispatch-uid
+    languages: [python]
+    severity: ERROR
+    message: Connect the signal with dispatch_uid; a re-imported module registers the receiver twice.
+    patterns:
+      - pattern-either:
+          - pattern: django.db.models.signals.pre_save.connect(...)
+          - pattern: django.db.models.signals.post_save.connect(...)
+          - pattern: django.db.models.signals.pre_delete.connect(...)
+          - pattern: django.db.models.signals.post_delete.connect(...)
+          - pattern: django.db.models.signals.m2m_changed.connect(...)
+          - pattern: django.db.models.signals.pre_init.connect(...)
+          - pattern: django.db.models.signals.post_init.connect(...)
+          - pattern: django.db.models.signals.pre_migrate.connect(...)
+          - pattern: django.db.models.signals.post_migrate.connect(...)
+          - pattern: django.db.models.signals.class_prepared.connect(...)
+      - pattern-not: $SIGNAL.connect(..., dispatch_uid=$UID, ...)
+    paths:
+      exclude:
+        # Tests connect a temporary receiver and disconnect it in teardown.
+        - "**/tests/**"
+  - id: nso-delete-signal-without-delete-origin
+    languages: [python]
+    severity: ERROR
+    message: Wrap deletion receivers with _as_delete_origin so intent retractions are marked.
+    patterns:
+      - pattern-either:
+          - pattern: django.db.models.signals.pre_delete.connect($H, ...)
+          - pattern: django.db.models.signals.post_delete.connect($H, ...)
+      - metavariable-regex:
+          metavariable: $H
+          regex: '^(?:[A-Za-z_]\w*\.)*_on_[A-Za-z_]\w*$'
+    paths:
+      exclude:
+        - "**/tests/**"
+  - id: nso-unchecked-request-body
+    languages: [python]
+    severity: ERROR
+    message: Validate the request body before reading it.
+    patterns:
+      - pattern: $R.data
+      - metavariable-regex:
+          metavariable: $R
+          regex: '^(?:request|self\.request)$'
+      - pattern-not-inside:
+          patterns:
+            - pattern-inside: |
+                def $BODYFN(...):
+                    ...
+            - metavariable-regex:
+                metavariable: $BODYFN
+                regex: '^_request_body$'
+      - pattern-not-inside: $CALL(..., data=$R.data, ...)
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+  - id: nso-unguarded-overlay-signature
+    languages: [python]
+    severity: ERROR
+    message: Validate persisted overlay signatures before using them.
+    patterns:
+      - pattern-either:
+          - pattern: $F(...)
+          - pattern: $MODULE.$F(...)
+          - pattern: $ALIAS = $F
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^_qualifying_overlay_signature$'
+      - pattern-not-inside:
+          patterns:
+            - pattern-inside: |
+                def $GUARD(...):
+                    ...
+            - metavariable-regex:
+                metavariable: $GUARD
+                regex: '^_valid_overlay_signature$'
+      - pattern-not-inside:
+          patterns:
+            - pattern-inside: |
+                def $NATIVE(...):
+                    ...
+            - metavariable-regex:
+                metavariable: $NATIVE
+                regex: '^_qualifying_overlay_signatures$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+  - id: nso-renderer-writer-single-resolver
+    languages: [python]
+    severity: ERROR
+    message: RendererWriter must declare exactly one direct _resolve_reference method.
+    # Split declarations so the rule-root check does not treat them as calls.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: |
+                  class $CLASS(...):
+                      ...
+              - metavariable-regex:
+                  metavariable: $CLASS
+                  regex: '^RendererWriter$'
+              - pattern-not: |
+                  class $CLASS(...):
+                      ...
+                      def _resolve_reference\
+                      (...):
+                          ...
+          - patterns:
+              - pattern: |
+                  class $CLASS(...):
+                      ...
+                      def _resolve_reference\
+                      (...):
+                          ...
+                      ...
+                      def _resolve_reference\
+                      (...):
+                          ...
+              - metavariable-regex:
+                  metavariable: $CLASS
+                  regex: '^RendererWriter$'
+      # Match only an unindented class header at module scope.
+      - pattern-regex: '(?m)^class[ \t]+RendererWriter(?:[ \t]*\[|[ \t]*\(|[ \t]*:)'
+    paths:
+      include: ["netbox_nso_plugin/renderer_writer.py"]

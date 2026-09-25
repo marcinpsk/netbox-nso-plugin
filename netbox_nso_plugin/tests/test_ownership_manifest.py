@@ -4,7 +4,10 @@
 
 from unittest.mock import patch
 
-from django.test import SimpleTestCase, TestCase
+from django.db import IntegrityError
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
+
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestOwnershipManifestSchema(SimpleTestCase):
@@ -16,18 +19,35 @@ class TestOwnershipManifestSchema(SimpleTestCase):
         assert not fields["device_id"].is_relation
         assert not fields["native_model_label"].is_relation
         assert not fields["native_key"].is_relation
+        assert not fields["native_id"].is_relation
+        assert not fields["state_model_label"].is_relation
+        assert not fields["state_key"].is_relation
         assert "overlay" not in fields
 
     def test_one_manifest_row_identifies_each_owned_object(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
         constraints = {
-            tuple(constraint.fields)
+            tuple(expression.name for expression in constraint.expressions)
             for constraint in NSOOwnershipManifest._meta.constraints
-            if getattr(constraint, "fields", None)
         }
 
-        assert ("device_id", "scope", "native_model_label", "native_key") in constraints
+        assert (
+            "device_id",
+            "scope",
+            "native_model_label",
+            "native_key",
+            "state_model_label",
+            "state_key",
+        ) in constraints
+
+    def test_native_and_overlay_identity_fields_are_required(self):
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        fields = {field.name: field for field in NSOOwnershipManifest._meta.fields}
+
+        assert fields["native_id"].null is False
+        assert fields["state_model_label"].blank is False
 
     def test_manifest_carries_ownership_and_deletion_evidence(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
@@ -37,6 +57,168 @@ class TestOwnershipManifestSchema(SimpleTestCase):
         assert fields["ownership_state"].get_default() == "owned"
         assert fields["deletion_authority"].get_default() is False
         assert fields["acknowledged_lineage"].get_default() == []
+
+
+_MANIFEST_TABLE = "netbox_nso_plugin_nsoownershipmanifest"
+
+
+class _PeerManifestInsert:
+    """Land a peer audit's identical manifest row in the window this audit leaves open.
+
+    The identity read and the write are separate statements, so a second audit can land the
+    row in the window between them. Reproduce that against the real unique index.
+    """
+
+    def __init__(self, identity, *, seam="select"):
+        self.identity = identity
+        self.seam = seam
+        self.fired = False
+        self.conflicted = False
+
+    def _reached(self, sql):
+        if self.fired or _MANIFEST_TABLE not in sql:
+            return False
+        if self.seam == "update" and '"native_key"' not in sql.partition(" WHERE ")[0]:
+            return False
+        return sql.lstrip().upper().startswith(self.seam.upper())
+
+    def _insert_peer_row(self):
+        """Commit the peer row off this connection, so no savepoint of ours can undo it."""
+        from django.db import connection, connections
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+
+        self.fired = True
+        alias = "ownership_manifest_peer"
+        connections[alias] = connection.copy(alias=alias)
+        try:
+            NSOOwnershipManifest.objects.using(alias).create(
+                **self.identity,
+                native_id=0,
+                ownership_state="owned",
+                deletion_authority=False,
+            )
+        finally:
+            connections[alias].close()
+            del connections[alias]
+
+    def __call__(self, execute, sql, params, many, context):
+        # The write seams fire before their statement; the select seam fires after it.
+        at_seam = self._reached(sql)
+        if self.seam in {"insert", "update"} and at_seam:
+            self._insert_peer_row()
+        try:
+            result = execute(sql, params, many, context)
+        except IntegrityError:
+            if self.seam == "update" and at_seam:
+                self.conflicted = True
+            raise
+        if self.seam == "select" and at_seam:
+            self._insert_peer_row()
+        return result
+
+
+class TestOwnershipManifestConcurrency(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def test_a_peer_insert_does_not_abort_the_recording_transaction(self):
+        from django.db import connection, transaction
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
+        from netbox_nso_plugin.ownership_planner import maintain_manifest, manifest_binding
+
+        from ._outbox_case import make_managed
+
+        device, management = make_managed("ownership-conflict", 16274)
+        group = VLANGroup.objects.create(name="Ownership conflict", slug=f"nso-{device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=1730, name="ownership-conflict")
+        state = NSOVLANState.objects.create(
+            management=management,
+            vlan=vlan,
+            device_name=vlan.name,
+            status="accepted",
+        )
+        (
+            _rule,
+            scope,
+            device_id,
+            native_model_label,
+            _native_id,
+            native_key,
+            state_model_label,
+            state_key,
+        ) = manifest_binding(state)
+        identity = {
+            "device_id": device_id,
+            "scope": scope,
+            "native_model_label": native_model_label,
+            "native_key": native_key,
+            "state_model_label": state_model_label,
+            "state_key": state_key,
+        }
+        peer = _PeerManifestInsert(identity, seam="insert")
+
+        with transaction.atomic():
+            # The wrapper covers only the call under test, so the seam is maintain_manifest's own.
+            with connection.execute_wrapper(peer):
+                maintain_manifest(state)
+            # An aborted transaction would refuse this write instead of committing it.
+            survivor = NSOOwnershipManifest.objects.create(
+                **(identity | {"native_key": identity["native_key"] | {"vid": 1729}}),
+                native_id=vlan.pk,
+            )
+
+        manifest = NSOOwnershipManifest.objects.get(**identity)
+        self.assertTrue(peer.fired)
+        self.assertTrue(NSOOwnershipManifest.objects.filter(pk=survivor.pk).exists())
+        self.assertEqual(NSOOwnershipManifest.objects.filter(**identity).count(), 1)
+        self.assertEqual(manifest.native_id, vlan.pk)
+        self.assertEqual(manifest.ownership_state, "owned")
+        self.assertTrue(manifest.deletion_authority)
+
+    def test_a_peer_insert_does_not_abort_retired_manifest_adoption(self):
+        from django.db import connection, transaction
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
+        from netbox_nso_plugin.ownership_planner import maintain_manifest, manifest_binding
+
+        from ._outbox_case import make_managed
+
+        device, management = make_managed("ownership-retired-conflict", 16275)
+        group = VLANGroup.objects.create(name="Ownership retired conflict", slug=f"nso-{device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=1731, name="ownership-retired-conflict")
+        state = NSOVLANState.objects.create(
+            management=management,
+            vlan=vlan,
+            device_name=vlan.name,
+            status="accepted",
+        )
+        binding = manifest_binding(state)
+        identity = {
+            "device_id": binding[2],
+            "scope": binding[1],
+            "native_model_label": binding[3],
+            "native_key": binding[5],
+            "state_model_label": binding[6],
+            "state_key": binding[7],
+        }
+        previous = NSOOwnershipManifest.objects.create(
+            **(identity | {"native_key": identity["native_key"] | {"vid": 1730}}),
+            native_id=vlan.pk,
+            ownership_state="retired",
+        )
+        peer = _PeerManifestInsert(identity, seam="update")
+
+        with connection.execute_wrapper(peer), transaction.atomic():
+            maintain_manifest(state)
+
+        previous.refresh_from_db()
+        manifest = NSOOwnershipManifest.objects.get(**identity)
+        self.assertTrue(peer.fired)
+        self.assertTrue(peer.conflicted)
+        self.assertEqual(previous.ownership_state, "retired")
+        self.assertEqual(manifest.native_id, vlan.pk)
+        self.assertTrue(manifest.deletion_authority)
 
 
 class TestOwnershipManifestDurability(TestCase):
@@ -54,6 +236,7 @@ class TestOwnershipManifestDurability(TestCase):
             device_id=device_id,
             scope="interface",
             native_model_label="dcim.interface",
+            native_id=device_id,
             native_key={"device_id": device_id, "name": "Ethernet1"},
         )
 
@@ -80,6 +263,7 @@ class TestOwnershipManifestDurability(TestCase):
                 device_id=device.pk,
                 scope=scope,
                 native_model_label="dcim.interface",
+                native_id=0,
                 native_key={"device_id": device.pk, "scope": scope},
             )
 
@@ -90,6 +274,23 @@ class TestOwnershipManifestDurability(TestCase):
             sorted(NSOOwnershipManifest.objects.filter(device_id=device.pk).values_list("scope", "ownership_state")),
             [("interface", "retired"), ("vlan", "retired")],
         )
+
+    def test_bulk_device_deletion_offboards_the_adapter_device(self):
+        from unittest.mock import patch
+
+        from dcim.models import Device
+
+        from ._outbox_case import make_managed
+
+        device, management = make_managed("ownership-bulk-offboard", 16273)
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.delete_device") as delete_device,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            Device.objects.filter(pk=device.pk).delete()
+
+        delete_device.assert_called_once_with(management.adapter_device_id)
 
 
 class TestOwnershipManifestMaintenance(TestCase):
@@ -103,7 +304,7 @@ class TestOwnershipManifestMaintenance(TestCase):
         from django.test.utils import CaptureQueriesContext
 
         from netbox_nso_plugin.models import NSOOwnershipManifest
-        from netbox_nso_plugin.ownership_planner import _manifest_record_actions
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
 
         from ._outbox_case import own_vlan
 
@@ -115,9 +316,227 @@ class TestOwnershipManifestMaintenance(TestCase):
             NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
             with CaptureQueriesContext(connection) as queries:
                 actions = _manifest_record_actions(self.device.pk, frozenset({"vlan"}))
-            self.assertCountEqual(actions, [("vlan", state._meta.label_lower, state.pk) for state in states])
+            self.assertCountEqual(
+                actions,
+                [(OwnershipAction.RECORD_MANIFEST, "vlan", state._meta.label_lower, state.pk) for state in states],
+            )
             counts.append(len(queries))
         self.assertEqual(counts[0], counts[1])
+
+    def test_manifest_scan_query_count_does_not_grow_with_interface_ip_rows(self):
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
+
+        vrf = VRF.objects.create(name="manifest-scan-vrf")
+        # Warm the process-wide content-type cache, so the counts below vary with rows alone.
+        _manifest_record_actions(self.device.pk, frozenset({"ip"}))
+        counts = []
+        states = []
+        for count in (1, 4):
+            while len(states) < count:
+                index = len(states)
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Ethernet1/{index}",
+                    type="1000base-t",
+                )
+                address = IPAddress.objects.create(
+                    address=f"198.18.1.{index}/32",
+                    vrf=vrf,
+                    assigned_object=interface,
+                )
+                states.append(
+                    NSOInterfaceIPState.objects.create(
+                        interface=interface,
+                        address=str(address.address),
+                        vrf=vrf.name,
+                        status="accepted",
+                    )
+                )
+            NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
+            with CaptureQueriesContext(connection) as queries:
+                actions = _manifest_record_actions(self.device.pk, frozenset({"ip"}))
+            self.assertCountEqual(
+                actions,
+                [(OwnershipAction.RECORD_MANIFEST, "ip", state._meta.label_lower, state.pk) for state in states],
+            )
+            counts.append(len(queries))
+        self.assertEqual(counts[0], counts[1])
+
+    def test_manifest_scan_query_count_does_not_grow_with_ospf_interface_rows(self):
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
+
+        ospf_instance = OSPFInstance.objects.create(
+            device=self.device,
+            process_id="1627",
+            name="1627",
+            router_id="198.18.2.1",
+        )
+        area = OSPFArea.objects.create(area_id="0.0.0.0", area_type="standard")
+        # Warm the process-wide content-type cache, so the counts below vary with rows alone.
+        _manifest_record_actions(self.device.pk, frozenset({"ospf"}))
+        counts = []
+        states = []
+        for count in (1, 4):
+            while len(states) < count:
+                index = len(states)
+                interface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Ethernet2/{index}",
+                    type="1000base-t",
+                )
+                OSPFInterface.objects.create(
+                    instance=ospf_instance,
+                    area=area,
+                    interface=interface,
+                    cost=1627,
+                )
+                states.append(
+                    NSOOSPFInterfaceState.objects.create(
+                        management=self.management,
+                        interface=interface,
+                        process_id="1627",
+                        status="accepted",
+                    )
+                )
+            NSOOwnershipManifest.objects.filter(device_id=self.device.pk).delete()
+            with CaptureQueriesContext(connection) as queries:
+                actions = _manifest_record_actions(self.device.pk, frozenset({"ospf"}))
+            self.assertCountEqual(
+                actions,
+                [(OwnershipAction.RECORD_MANIFEST, "ospf", state._meta.label_lower, state.pk) for state in states],
+            )
+            counts.append(len(queries))
+        self.assertEqual(counts[0], counts[1])
+
+    def test_interface_ip_binding_keeps_the_lowest_pk_native_on_a_duplicate_identity(self):
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import _native_bindings, _native_prefetch, manifest_binding
+
+        interface = Interface.objects.create(device=self.device, name="Ethernet3/0", type="1000base-t")
+        vrf = VRF.objects.create(name="manifest-duplicate-vrf")
+        first = IPAddress.objects.create(address="198.18.3.1/32", vrf=vrf, assigned_object=interface)
+        second = IPAddress.objects.create(address="198.18.3.1/32", vrf=vrf, assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(first.address),
+            vrf=vrf.name,
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ip"})))
+
+        self.assertLess(first.pk, second.pk)
+        self.assertEqual(manifest_binding(state)[4], first.pk)
+        self.assertEqual(manifest_binding(state, natives=natives)[4], first.pk)
+
+    def test_owned_ospf_overlay_whose_interface_moved_device_is_still_retracted(self):
+        from dcim.models import Interface
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.models import NSOOSPFInterfaceState
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            _manifest_record_actions,
+            _native_bindings,
+            _native_prefetch,
+            manifest_binding,
+        )
+
+        from ._outbox_case import make_device
+
+        # The overlay stays on this device's management while its interface belongs to another device.
+        other_device = make_device("manifest-maintenance", 2)
+        interface = Interface.objects.create(device=other_device, name="Ethernet4/0", type="1000base-t")
+        OSPFInterface.objects.create(
+            instance=OSPFInstance.objects.create(
+                device=other_device,
+                process_id="1628",
+                name="1628",
+                router_id="198.18.4.1",
+            ),
+            area=OSPFArea.objects.create(area_id="0.0.0.1", area_type="standard"),
+            interface=interface,
+            cost=1628,
+        )
+        state = NSOOSPFInterfaceState.objects.create(
+            management=self.management,
+            interface=interface,
+            process_id="1628",
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ospf"})))
+
+        self.assertIsNotNone(manifest_binding(state))
+        self.assertEqual(manifest_binding(state, natives=natives), manifest_binding(state))
+        self.assertCountEqual(
+            _manifest_record_actions(self.device.pk, frozenset({"ospf"})),
+            [(OwnershipAction.RETRACT, "ospf", state._meta.label_lower, state.pk)],
+        )
+
+    def test_interface_ip_binding_ignores_a_vrf_that_a_same_name_vrf_outranks(self):
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import _native_bindings, _native_prefetch, manifest_binding
+
+        canonical = VRF.objects.create(name="dup", rd="65000:1")
+        outranked = VRF.objects.create(name="dup")
+        interface = Interface.objects.create(device=self.device, name="Ethernet5/0", type="1000base-t")
+        address = IPAddress.objects.create(address="198.18.5.1/32", vrf=outranked, assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(address.address),
+            vrf="dup",
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ip"})))
+
+        # A NULL rd sorts last in the model's ('name', 'rd', 'pk') order, so the rd-bearing VRF is canonical.
+        self.assertEqual(VRF.objects.filter(name="dup").values_list("pk", flat=True).first(), canonical.pk)
+        self.assertIsNone(manifest_binding(state))
+        self.assertIsNone(manifest_binding(state, natives=natives))
+
+    def test_interface_ip_binding_resolves_the_canonical_vrf_on_both_paths(self):
+        from dcim.models import Interface
+        from ipam.models import VRF, IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+        from netbox_nso_plugin.ownership_planner import _native_bindings, _native_prefetch, manifest_binding
+
+        canonical = VRF.objects.create(name="dup", rd="65000:1")
+        VRF.objects.create(name="dup")
+        interface = Interface.objects.create(device=self.device, name="Ethernet5/1", type="1000base-t")
+        address = IPAddress.objects.create(address="198.18.5.2/32", vrf=canonical, assigned_object=interface)
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(address.address),
+            vrf="dup",
+            status="accepted",
+        )
+
+        natives = _native_prefetch(_native_bindings(self.management, frozenset({"ip"})))
+
+        binding = manifest_binding(state)
+        self.assertEqual(binding[4], address.pk)
+        self.assertEqual(manifest_binding(state, natives=natives), binding)
 
     def test_owned_ip_writer_records_the_managed_interfaces_native_identity(self):
         from dcim.models import Interface
@@ -156,7 +575,16 @@ class TestOwnershipManifestMaintenance(TestCase):
 
                 self.assertEqual(
                     manifest_binding(state),
-                    (converted_scope_rules()["ip"], "ip", self.device.pk, "ipam.ipaddress", native_key),
+                    (
+                        converted_scope_rules()["ip"],
+                        "ip",
+                        self.device.pk,
+                        "ipam.ipaddress",
+                        address.pk,
+                        native_key,
+                        state._meta.label_lower,
+                        {},
+                    ),
                 )
                 manifests = NSOOwnershipManifest.objects.filter(
                     device_id=self.device.pk, scope="ip", native_model_label="ipam.ipaddress", native_key=native_key
@@ -205,7 +633,10 @@ class TestOwnershipManifestMaintenance(TestCase):
                 "vlan",
                 self.device.pk,
                 "ipam.vlan",
+                state.vlan.pk,
                 {"group_id": state.vlan.group_id, "vid": state.vlan.vid},
+                "netbox_nso_plugin.nsovlanstate",
+                {},
             ),
         )
 
@@ -285,6 +716,55 @@ class TestOwnershipManifestMaintenance(TestCase):
         self.assertEqual(manifest.ownership_state, "retired")
         self.assertFalse(manifest.deletion_authority)
 
+    def test_a_replacement_logging_host_does_not_reopen_a_retired_identity(self):
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import (
+            maintain_manifest,
+            manifest_binding,
+            reconcile_scope_ownership,
+            retire_overlay_manifest,
+        )
+
+        original = NSOLoggingHostState.objects.create(
+            management=self.management,
+            address="198.18.7.11",
+            severity="informational",
+            status="accepted",
+        )
+        maintain_manifest(original)
+        binding = manifest_binding(original)
+        _rule, scope, device_id, native_model_label, _native_id, native_key, state_model_label, state_key = binding
+        identity = {
+            "device_id": device_id,
+            "scope": scope,
+            "native_model_label": native_model_label,
+            "native_key": native_key,
+            "state_model_label": state_model_label,
+            "state_key": state_key,
+        }
+        self.assertEqual(NSOOwnershipManifest.objects.get(**identity).ownership_state, "owned")
+        retire_overlay_manifest(original)
+        original.delete()
+        # The replacement is a new pk at the same address, so it carries the same pk-free identity.
+        replacement = NSOLoggingHostState.objects.create(
+            management=self.management,
+            address="198.18.7.11",
+            severity="warning",
+            status="accepted",
+        )
+        maintain_manifest(replacement)
+
+        completed = tuple(reconcile_scope_ownership(self.device.pk, {"logging"}) for _ in range(2))
+
+        self.assertEqual(completed, ((), ()))
+        *_, replacement_native_key, _state_model_label, _state_key = manifest_binding(replacement)
+        self.assertEqual(replacement_native_key, native_key)
+        manifests = list(NSOOwnershipManifest.objects.filter(**identity))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(manifests[0].ownership_state, "retired")
+        replacement.refresh_from_db()
+        self.assertEqual(replacement.status, "accepted")
+
     def test_repeated_audits_skip_retired_manifest_with_owned_vlan(self):
         from ipam.models import VLAN
 
@@ -334,12 +814,18 @@ class TestOwnershipManifestMaintenance(TestCase):
                     "_manifest_record_actions",
                     wraps=ownership_planner._manifest_record_actions,
                 ) as record_actions,
+                patch.object(
+                    ownership_planner,
+                    "_manifest_states",
+                    wraps=ownership_planner._manifest_states,
+                ) as manifest_states,
                 CaptureQueriesContext(connection) as queries,
             ):
                 completed = ownership_planner.reconcile_scope_ownership(device.pk, {"vlan"})
 
             self.assertCountEqual(completed, (("vlan", state.pk) for state in states))
-            self.assertEqual(record_actions.call_count, 2)
+            self.assertEqual(record_actions.call_count, 1)
+            self.assertEqual(manifest_states.call_count, 2)
             query_counts.append(len(queries))
 
         self.assertEqual(query_counts[2] - query_counts[1], query_counts[1] - query_counts[0])
