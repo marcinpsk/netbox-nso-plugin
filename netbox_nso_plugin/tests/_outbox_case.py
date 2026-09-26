@@ -642,9 +642,6 @@ class ReceiptAdapter:
         self.applied.append((url, body))
         if not prepared:  # a preparation only stages its snapshot; Apply authorizes it
             self._apply_to_device(url, body, params)
-        if self.drop_response_once:
-            self.drop_response_once = False
-            raise requests.exceptions.ConnectionError("the preparation was stored but its response was lost")
         if seq is not None:
             self.receipts[url] = {
                 "push_seq": seq,
@@ -652,6 +649,9 @@ class ReceiptAdapter:
                 "response": response,
                 "params": dict(params),
             }
+        if self.drop_response_once:  # the receipt commits with the write, so a retry replays it
+            self.drop_response_once = False
+            raise requests.exceptions.ConnectionError("the request was stored but its response was lost")
         return make_response(200, response)
 
     def _serve_receipts(self, params):
