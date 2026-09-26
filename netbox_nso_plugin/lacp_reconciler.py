@@ -75,7 +75,7 @@ def lacp_reconcile_plan(device, payload: dict):
         candidate.admin_key = bundle_data.get("admin_key")
         candidate.vpc_sensitive = bool(bundle_data.get("vpc_sensitive"))
         candidate.last_sync_at = planned_at
-        candidate.status = sm.on_reconcile(candidate.status, matches=None)
+        candidate.status = sm.on_reconcile(candidate.status, matches=None, settles_deploying=False)
         saves.append(
             planned_save(
                 candidate,
@@ -101,7 +101,7 @@ def lacp_reconcile_plan(device, payload: dict):
             member.mode = member_data.get("mode") or ""
             member.port_priority = member_data.get("port_priority")
             member.last_sync_at = planned_at
-            member.status = sm.on_reconcile(member.status, matches=None)
+            member.status = sm.on_reconcile(member.status, matches=None, settles_deploying=False)
             saves.append(
                 planned_save(
                     member,
@@ -137,7 +137,7 @@ def lacp_reconcile_plan(device, payload: dict):
             candidate.last_sync_at = planned_at
             saves.append(planned_save(candidate, update_fields=("status", "last_sync_at")))
 
-    return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    return RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at, settles_deploying=False)
 
 
 def reconcile_lag_config(device, payload: dict) -> list:
@@ -218,7 +218,7 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
         # writer, so the Accept view gates on this and the intent push excludes it.
         state.vpc_sensitive = bool(bundle_data.get("vpc_sensitive"))
         state.last_sync_at = now
-        state.status = sm.on_reconcile(state.status, matches=None)  # mirror overlay
+        state.status = sm.on_reconcile(state.status, matches=None, settles_deploying=False)
         writer.save(state, force_insert=created)
         seen_bundles.add(lag_iface.pk)
 
@@ -241,7 +241,7 @@ def _reconcile_lag_config(device, payload: dict, writer, planned_at) -> list:
             m_state.mode = member_data.get("mode") or ""
             m_state.port_priority = member_data.get("port_priority")
             m_state.last_sync_at = now
-            m_state.status = sm.on_reconcile(m_state.status, matches=None)  # mirror overlay
+            m_state.status = sm.on_reconcile(m_state.status, matches=None, settles_deploying=False)
             writer.save(m_state, force_insert=member_created)
             seen_members.add(member_iface.pk)
 

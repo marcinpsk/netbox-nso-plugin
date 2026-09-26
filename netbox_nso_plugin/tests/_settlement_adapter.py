@@ -24,6 +24,21 @@ from uuid import uuid4
 import requests
 
 STORE_INCARNATION_HEADER = "X-Store-Incarnation"
+GENERATION_RESPONSE_FIELDS = frozenset(
+    {
+        "generation_id",
+        "seq",
+        "status",
+        "job_id",
+        "mode",
+        "settlement_cohort",
+        "digest",
+        "stream_revisions",
+        "source_push_seq",
+        "created_at",
+        "updated_at",
+    }
+)
 
 
 class LoopbackOnlySession(requests.Session):
@@ -168,6 +183,7 @@ class SettlementStore:
             "created_at": "2026-08-12T09:15:00Z",
             "updated_at": "2026-08-12T09:30:00Z",
         }
+        assert set(row) == GENERATION_RESPONSE_FIELDS
         self.generations.setdefault(device_id, []).append(row)
         self.generations[device_id].sort(key=lambda generation: generation["seq"])
         return row

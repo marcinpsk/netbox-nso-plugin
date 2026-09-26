@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-switching-client-single-owner
+    languages: [python]
+    severity: ERROR
+    message: Call switching adapter methods only from switching_preparation.py.
+    pattern-either:
+      - pattern: $CLIENT.apply_lag_config(...)
+      - pattern: $CLIENT.apply_switchport_config(...)
+      - pattern: apply_lag_config(...)
+      - pattern: apply_switchport_config(...)
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/switching_preparation.py"
   - id: nso-push-inside-suppression
     languages: [python]
     severity: ERROR
@@ -319,14 +334,14 @@ rules:
   - id: nso-delete-signal-without-delete-origin
     languages: [python]
     severity: ERROR
-    message: Wrap deletion receivers with _as_delete_origin so intent retractions are marked.
+    message: Wrap deletion receivers with _as_delete_origin unless they record switching roots.
     patterns:
       - pattern-either:
           - pattern: django.db.models.signals.pre_delete.connect($H, ...)
           - pattern: django.db.models.signals.post_delete.connect($H, ...)
       - metavariable-regex:
           metavariable: $H
-          regex: '^(?:[A-Za-z_]\w*\.)*_on_[A-Za-z_]\w*$'
+          regex: '^(?!.*(?:_on_lacp_state_save|_on_switchport_state_save)$)(?:[A-Za-z_]\w*\.)*_on_[A-Za-z_]\w*$'
     paths:
       exclude:
         - "**/tests/**"

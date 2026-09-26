@@ -127,13 +127,14 @@ def sweep_static_route_settlements() -> tuple[int, int]:
             static_route_states__status__in=(sm.ACCEPTED, sm.DEPLOYING),
         ).values_list("pk", flat=True)
     )
-    for model in deploying_models().values():
-        candidate_pks.update(
-            model.objects.filter(
-                status=sm.DEPLOYING,
-                management__adapter_device_id__isnull=False,
-            ).values_list("management_id", flat=True)
-        )
+    for models in deploying_models().values():
+        for model in models:
+            candidate_pks.update(
+                model.objects.filter(
+                    status=sm.DEPLOYING,
+                    management__adapter_device_id__isnull=False,
+                ).values_list("management_id", flat=True)
+            )
     candidates = sorted(candidate_pks)
     polled = 0
     failed = 0

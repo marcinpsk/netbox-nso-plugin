@@ -17,6 +17,7 @@ from ._adapter_http import make_response
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
+    direct_test_selection,
     make_managed,
     mirror_update,
     own_vlan,
@@ -34,6 +35,7 @@ _ADAPTER_STREAMS = {
     "isis",
     "isis_flex_algo",
     "l2_sap",
+    "lag",
     "logging",
     "ospf",
     "route_policy",
@@ -41,6 +43,7 @@ _ADAPTER_STREAMS = {
     "static_route",
     "subinterface",
     "svi",
+    "switchport",
     "vlan",
 }
 
@@ -61,8 +64,13 @@ def _promoted(selected):
                 "seq": 4,
                 "job_id": 501,
                 "mode": "networked",
-                "source_push_seq": selected,
-                "stream_revisions": {stream: 7 for stream in selected},
+                "source_push_seq": {
+                    stream: None if stream in {"lag", "switchport"} else revision
+                    for stream, revision in selected.items()
+                },
+                "stream_revisions": {
+                    stream: selected[stream] if stream in {"lag", "switchport"} else 7 for stream in selected
+                },
                 "digest": "a" * 64,
             },
             {
@@ -70,8 +78,13 @@ def _promoted(selected):
                 "seq": 5,
                 "job_id": None,
                 "mode": "detach",
-                "source_push_seq": selected,
-                "stream_revisions": {stream: 7 for stream in selected},
+                "source_push_seq": {
+                    stream: None if stream in {"lag", "switchport"} else revision
+                    for stream, revision in selected.items()
+                },
+                "stream_revisions": {
+                    stream: selected[stream] if stream in {"lag", "switchport"} else 7 for stream in selected
+                },
                 "digest": "b" * 64,
             },
         ],
@@ -173,11 +186,7 @@ class _ApplyContractAdapter(ReceiptAdapter):
                         "detail": "NSO rejected the snapshot",
                     },
                 )
-            if url.endswith("/lag-config/apply"):
-                # Copied from ../nso-adapter/docs/api-contract.md, lag-config/apply response.
-                return make_response(200, {"status": "deployed", "device": "lab-device", "bundle_count": 0})
-            # Copied from ../nso-adapter/docs/api-contract.md, switchport/apply response.
-            return make_response(200, {"status": "deployed", "device": "lab-device", "interface_count": 0})
+            return super()._handle(method, url, **kwargs)
         if method == "GET" and url.endswith("/api/v1/jobs/900"):
             # Copied from JobOut in ../nso-adapter/tests/api/openapi_snapshot.json.
             return make_response(
@@ -305,6 +314,10 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
         self.assertEqual(set(adapter.apply_requests[0]["selected"]), _ADAPTER_STREAMS)
         self.assertEqual(adapter.apply_requests[0]["selected"]["vlan"], receipt["push_seq"])
+        for stream, path in (("lag", "/lag-config/apply"), ("switchport", "/switchport/apply")):
+            request = next(request for request in adapter.requests if request["url"].endswith(path))
+            self.assertEqual(adapter.apply_requests[0]["selected"][stream], max(1, request["body"]["source_revision"]))
+            self.assertEqual(request["body"]["deleted_roots"], [])
         self.assertEqual(receipt["params"], {"store_only": "true"})
         pushed = next(request for request in adapter.requests if request["url"] == vlan_url)
         self.assertEqual(pushed["push_seq"], receipt["push_seq"])
@@ -350,6 +363,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         attempt = NSOApplyAttempt.objects.get(pk=UUID(request["apply_attempt_id"]))
         self.assertEqual(attempt.selected, request["selected"])
+        self.assertIn("lag", attempt.selected)
+        self.assertIn("switchport", attempt.selected)
         self.assertIsNone(attempt.http_status)
         self.assertIsNone(attempt.response)
         self.vlan_state.refresh_from_db()
@@ -826,6 +841,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             registry,
             pushed,
             apply_attempt_id=next_attempt_id,
+            **direct_test_selection(self.mgmt, registry),
             static_route_stored=False,
         )
 
@@ -2070,7 +2086,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         switchport_state.refresh_from_db()
         self.assertEqual(
             (self.vlan_state.status, svi_state.status, switchport_state.status),
-            ("deploying", "deploying", "accepted"),
+            ("deploying", "deploying", "deploying"),
         )
         with without_commit_drain(), transaction.atomic():
             vlan = self.vlan_state.vlan
@@ -2259,7 +2275,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(prepared[:4], ["deploying"] * 4)
         # Which settled rows the pre-Apply repair demoted is a property of which scopes this
         # fixture left drifted, so it is not asserted; that none of them was PROMOTED is.
-        self.assertNotIn("deploying", prepared[4:])
+        self.assertEqual(prepared[8:10], ["deploying", "deploying"])
+        self.assertNotIn("deploying", prepared[4:8] + prepared[10:])
         indirect_locks = []
 
         def observe_indirect_lock(sender, instance, update_fields=None, **kwargs):
@@ -2276,16 +2293,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertIsInstance(indirect_locks[0], OperationalError)
         after = [type(state).objects.get(pk=state.pk).status for state in states]
         self.assertEqual(after[:4], ["accepted"] * 4)
-        # All eleven, not the promoted four: a rename re-pends what it renamed and may not
-        # flicker the badge of a settled row it did not promote.
-        self.assertEqual(after[4:], prepared[4:])
+        # The renamed switching rows re-pend with the four other promoted rows.
+        self.assertEqual(after[8:10], ["accepted", "accepted"])
+        self.assertEqual(after[4:8] + after[10:], prepared[4:8] + prepared[10:])
 
-    def test_the_finalize_audit_runs_before_the_irreversible_direct_pushes(self):
-        """A finalize repair aborts the Apply, so it may not run after a device write.
+    def test_the_finalize_audit_runs_before_switching_preparations(self):
+        """A finalize repair must run before the Apply selects switching slots.
 
-        ``_push_direct_snapshots`` writes LAG and switchport config straight to the device
-        with no rollback. A finalize audit behind it can bump the revision and abort the
-        Apply with the device already changed and every promoted row stranded.
+        A repair can bump the revision and abort the Apply. The switching slots are
+        prepared after that audit and selected only if promotion succeeds.
         """
         from unittest.mock import patch
 
@@ -2304,7 +2320,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             return real_audit(*args, **kwargs)
 
         def _recording_direct(*args, **kwargs):
-            order.append("direct-push")
+            order.append("switching-preparation")
             return real_direct(*args, **kwargs)
 
         config, session = adapter.patches()
@@ -2316,7 +2332,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         ):
             _prepare_apply(self.mgmt)
 
-        self.assertEqual(order, ["finalize-audit", "direct-push"])
+        self.assertEqual(order, ["finalize-audit", "switching-preparation"])
 
     def test_interface_footprint_refuses_a_move_after_the_device_lock(self):
         from unittest.mock import patch
@@ -2353,9 +2369,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 with intent_transaction(footprint_for_instance(interface)):
                     pass
 
-    def test_interface_rename_does_not_direct_apply_lacp_or_switchport_in_manual_mode(self):
-        from unittest.mock import patch
-
+    def test_interface_rename_does_not_prepare_switching_in_manual_mode(self):
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOSwitchportState
 
         self.assertFalse(self.mgmt.auto_apply)
@@ -2373,15 +2387,14 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 status="in_sync",
             )
 
-        with (
-            patch("netbox_nso_plugin.adapter_client.apply_lag_config") as apply_lag,
-            patch("netbox_nso_plugin.adapter_client.apply_switchport_config") as apply_switchport,
-            transaction.atomic(),
-        ):
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session, transaction.atomic():
             self._rename_interface(interface, "Ethernet9.420")
 
-        apply_lag.assert_not_called()
-        apply_switchport.assert_not_called()
+        self.assertFalse(
+            any(request["url"].endswith(("/lag-config/apply", "/switchport/apply")) for request in adapter.requests)
+        )
         lacp.refresh_from_db()
         switchport.refresh_from_db()
         self.assertEqual((lacp.status, switchport.status), ("in_sync", "in_sync"))
@@ -2589,6 +2602,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=uuid4(),
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
 
@@ -2647,6 +2661,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=uuid4(),
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
         finally:
@@ -2684,6 +2699,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=attempt_id,
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
@@ -2718,6 +2734,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=attempt_id,
+                **direct_test_selection(self.mgmt, registry),
                 static_route_stored=False,
             )
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
@@ -2737,6 +2754,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             registry,
             pushed,
             apply_attempt_id=uuid4(),
+            **direct_test_selection(self.mgmt, registry),
             static_route_stored=False,
         )
 
@@ -2760,7 +2778,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
-    def test_a_direct_push_failure_names_the_snapshot_already_applied(self):
+    def test_a_switching_preparation_failure_names_the_prepared_slot(self):
         adapter = _ApplyContractAdapter(
             lambda selected: (202, _promoted(selected)),
             failed_direct_suffix="/switchport/apply",
@@ -2812,7 +2830,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             self.assertIn(stream, result["message"])
             self.assertIn(reason, result["message"])
         selected_receipts = list(adapter.receipts.values())
-        self.assertEqual(len(selected_receipts), len(adapter.apply_requests[0]["selected"]))
+        self.assertEqual(len(selected_receipts), len(adapter.apply_requests[0]["selected"]) - 2)
         self.assertTrue(all(receipt["params"] == {"store_only": "true"} for receipt in selected_receipts))
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")

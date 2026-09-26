@@ -2262,6 +2262,7 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "interface"]
@@ -2305,6 +2306,7 @@ class NSOLACPMemberState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         ordering = ["management", "interface"]
@@ -2413,6 +2415,7 @@ class NSOSwitchportState(_NSODeviceTabURLMixin, NetBoxModel):
     accepted_at = models.DateTimeField(null=True, blank=True)
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
     # 3-way merge base: hash of the device L2 content at the last agreed sync. Lets the
     # reconciler seed a pristine NetBox interface from the device (read mirror) and then
     # tell an operator edit (freeze) apart from a device-side change (auto-mirror).
@@ -2989,6 +2992,25 @@ class NSOIntentRevision(models.Model):
 
     def __str__(self):
         return f"{self.device_id}/{self.scope} r{self.revision}"
+
+
+class NSOSwitchingRootDeletion(models.Model):
+    """A switching root deleted while owned, independent of its former overlay row."""
+
+    management = models.ForeignKey(to="NSODeviceManagement", on_delete=models.CASCADE)
+    scope = models.CharField(max_length=16)
+    root_name = models.CharField(max_length=255)
+    event_version = models.BigIntegerField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["management", "scope", "root_name"], name="nso_switching_deletion_root"),
+            models.CheckConstraint(
+                condition=models.Q(scope__in=("lacp", "switchport")), name="nso_switching_deletion_scope"
+            ),
+            models.CheckConstraint(condition=~models.Q(root_name=""), name="nso_switching_deletion_name"),
+            models.CheckConstraint(condition=models.Q(event_version__gt=0), name="nso_switching_deletion_version"),
+        ]
 
 
 class NSOApplyAttempt(models.Model):

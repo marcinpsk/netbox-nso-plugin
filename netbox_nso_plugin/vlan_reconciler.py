@@ -435,6 +435,7 @@ def switchport_reconcile_plan(device, payload: dict, interface_pks: dict | None 
         deletes=deletes,
         m2m_writes=m2m_writes,
         planned_at=planned_at,
+        settles_deploying=False,
         additional_footprints=(_device_vlan_group_lock(device),),
         execution=_ReconcileExecution(tuple(operations), tuple(rows), tuple(native_reads)),
     )
@@ -547,7 +548,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         native_tagged = None
 
         if sm.is_owned(state.status):
-            state.status = sm.on_reconcile(state.status, matches=obj_hash == dev_hash)
+            state.status = sm.on_reconcile(state.status, matches=obj_hash == dev_hash, settles_deploying=False)
         elif _switchport_is_pristine(interface):
             native_candidate = copy.copy(interface)
             native_candidate.mode = nso_mode

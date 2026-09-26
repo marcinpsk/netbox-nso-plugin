@@ -546,7 +546,10 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs, before, afte
     )
     dependency_footprint, dependency_changed = _dependencies(before, after, spec)
     footprint = MutationFootprint.merge(base, dependency_footprint)
-    return write, footprint, _changed_keys(before, after, spec, dependency_changed)
+    changed_keys = _changed_keys(before, after, spec, dependency_changed)
+    if label == "ipam.vlan" and before is not None and before.vid == after.vid:
+        changed_keys = {key for key in changed_keys if key[1] not in {"svi", "switchport"}}
+    return write, footprint, changed_keys
 
 
 def _materialize_field_update_rows(rows):
@@ -1179,12 +1182,24 @@ class RendererWriter:
             available.remove(candidate)
         if len(matched) != len(closure) or index not in matched:
             raise IntentPlanStaleError("the planned Collector cascade changed before delete")
+        if current._meta.label_lower == "dcim.interface":
+            from .status_machine import is_owned
+            from .switching_preparation import record
+
+            for overlay in deleted_overlays:
+                scope = {
+                    "netbox_nso_plugin.nsolacpbundlestate": "lacp",
+                    "netbox_nso_plugin.nsoswitchportstate": "switchport",
+                }.get(overlay._meta.label_lower)
+                if scope is not None and is_owned(overlay.status):
+                    record(overlay.management, scope, overlay.interface.name)
         for overlay in deleted_overlays:
             _retire_overlay_manifest(overlay)
-        with self._operation(index):
-            result = instance.delete()
         if current._meta.label_lower not in OVERLAY_MODEL_RANKS:
             _retire_overlay_manifest(current)
+        with self._operation(index):
+            result = current.delete()
+        instance.pk = None
         self._consumed.update(matched)
         return result
 
@@ -1229,6 +1244,10 @@ class RendererWriter:
             getattr(instance, field_name).add(*related)
         _maintain_manifest(instance)
         self._consumed.add(index)
+        if field_name == "tagged_vlans":
+            from .signals import _schedule_exact_writer_scope
+
+            _schedule_exact_writer_scope("switchport", auto_only=True)
 
     def _find_m2m_set(self, instance, field_name, related):
         identity = (("field_name", field_name),)
@@ -1257,6 +1276,10 @@ class RendererWriter:
             getattr(instance, field_name).set(related)
         _maintain_manifest(instance)
         self._consumed.add(index)
+        if field_name == "tagged_vlans":
+            from .signals import _schedule_exact_writer_scope
+
+            _schedule_exact_writer_scope("switchport", auto_only=True)
 
     def set_update(self, model, operation: RendererWrite, **values):
         """Update only the row IDs frozen into one planned set operation."""

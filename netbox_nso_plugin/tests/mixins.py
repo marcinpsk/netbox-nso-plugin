@@ -188,10 +188,13 @@ def isolate_other_scopes(*under_test: str):
 
     from netbox_nso_plugin import delivery, drain
 
+    from ._outbox_case import ReceiptAdapter
+
     keys = delivery.delivery_keys()
     unknown = set(under_test) - set(keys)
     assert not unknown, f"not delivery scopes: {sorted(unknown)}"
     real_push_now, real_drain_key = drain.push_now, drain.drain_key
+    adapter = ReceiptAdapter()
     synthetic_push_seq = iter(range(1_000_000, 1_001_000))
 
     def record(device_id, scope):
@@ -207,7 +210,7 @@ def isolate_other_scopes(*under_test: str):
             )
 
     def push_now(device_id, scope, **kwargs):
-        if scope in under_test:
+        if scope in under_test or scope in delivery.direct_keys():
             return real_push_now(device_id, scope, **kwargs)
         record(device_id, scope)
         return {"status": "deployed", "count": 0}
@@ -219,6 +222,9 @@ def isolate_other_scopes(*under_test: str):
         return drain.SUCCEEDED
 
     with contextlib.ExitStack() as stack:
+        config, session = adapter.patches()
+        stack.enter_context(config)
+        stack.enter_context(session)
         stack.enter_context(patch("netbox_nso_plugin.drain.push_now", side_effect=push_now))
         stack.enter_context(patch("netbox_nso_plugin.drain.drain_key", side_effect=drain_key))
         yield stack

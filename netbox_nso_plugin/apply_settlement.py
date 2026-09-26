@@ -29,6 +29,7 @@ _GENERATION_FIELDS = frozenset(
         "seq",
         "status",
         "sections",
+        "stream_revisions",
         "source_push_seq",
         "carrier_job_id",
         "carrier_job_status",
@@ -78,6 +79,11 @@ def _validate_generation(raw) -> dict:
     if (
         not isinstance(raw["sections"], list)
         or any(type(section) is not str for section in raw["sections"])
+        or not isinstance(raw["stream_revisions"], dict)
+        or any(
+            type(stream) is not str or not _positive_int(revision)
+            for stream, revision in raw["stream_revisions"].items()
+        )
         or not isinstance(raw["source_push_seq"], dict)
         or any(type(stream) is not str for stream in raw["source_push_seq"])
         or any(value is not None and not _positive_int(value) for value in raw["source_push_seq"].values())
@@ -142,6 +148,8 @@ def _validate_attempt(raw, local) -> dict:
 
 
 def _attempt_disposition(attempt: dict, stream: str):
+    from .delivery import direct_streams
+
     response = attempt["response"]
     if attempt["admission_state"] == "rejected" or response.get("outcome") == "no_op":
         return "not_promoted", None
@@ -149,7 +157,13 @@ def _attempt_disposition(attempt: dict, stream: str):
         return "not_promoted", None
     selected_seq = response["selected"].get(stream)
     generations = [
-        generation for generation in attempt["generations"] if generation["source_push_seq"].get(stream) == selected_seq
+        generation
+        for generation in attempt["generations"]
+        if (
+            generation["stream_revisions"].get(stream) == selected_seq
+            if stream in direct_streams()
+            else generation["source_push_seq"].get(stream) == selected_seq
+        )
     ]
     if selected_seq is None or not generations:
         raise EvidenceInvariantError(f"attempt has no generation for selected stream {stream!r}")
@@ -171,12 +185,15 @@ def _attempt_disposition(attempt: dict, stream: str):
 
 
 def _carrier_error(generation, scope: str) -> str:
+    from .delivery import delivery_keys
+
+    stream = delivery_keys()[scope].section
     error = generation.get("carrier_job_error")
     detail = error.get("detail") if isinstance(error, dict) else None
     items = detail.get("items") if isinstance(detail, dict) else None
     messages = []
     for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict) and item.get("type") == scope and item.get("error"):
+        if isinstance(item, dict) and item.get("type") == stream and item.get("error"):
             message = str(item["error"]).strip()
             if message and message not in messages:
                 messages.append(message)
@@ -273,7 +290,7 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
     now = timezone.now()
     grace = _stuck_deploying_grace()
     registry = delivery.delivery_keys()
-    for scope, rows in rows_by_scope.items():
+    for (scope, model), rows in rows_by_scope.items():
         stream = registry[scope].section
         for row in rows:
             if row.apply_attempt_id in unknown_ids:
@@ -285,19 +302,20 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
             if disposition == "waiting":
                 continue
             if disposition == "not_promoted":
-                decisions.append((scope, row, "accepted", "", True))
+                decisions.append((scope, model, row, "accepted", "", True))
                 continue
             if disposition == "settled":
                 if scope == "static_route" and not static_route_feed_drained:
                     continue
-                if scope != "static_route" and _scope_result_is_success(generation, scope):
-                    decisions.append((scope, row, "in_sync", "", False))
+                if scope != "static_route" and _scope_result_is_success(generation, stream):
+                    decisions.append((scope, model, row, "in_sync", "", False))
                     continue
                 if now - _parse_time(generation["updated_at"]) < grace:
                     continue
             decisions.append(
                 (
                     scope,
+                    model,
                     row,
                     "apply_failed",
                     _failure_message(disposition, row.apply_attempt_id, generation, scope),
@@ -328,8 +346,9 @@ def settle_apply_attempts(
     if deployment_evidence["device_id"] != management.adapter_device_id:
         raise EvidenceInvariantError("deployment evidence names another adapter device")
     rows_by_scope = {
-        scope: list(model.objects.filter(management=management, status="deploying"))
-        for scope, model in deploying_models().items()
+        (scope, model): list(model.objects.filter(management=management, status="deploying"))
+        for scope, models in deploying_models().items()
+        for model in models
     }
     local_attempts, validated, unknown_ids = _load_attempts(
         management,
@@ -345,8 +364,7 @@ def settle_apply_attempts(
     )
     now = timezone.now()
 
-    for scope, row, status, error, clear_attempt in decisions:
-        model = deploying_models()[scope]
+    for scope, model, row, status, error, clear_attempt in decisions:
         fields = {
             "status": status,
             "last_apply_error": error,
@@ -390,7 +408,8 @@ def deploying_attempt_ids(management) -> tuple[UUID, ...]:
 
     referenced_ids = {
         attempt_id
-        for model in deploying_models().values()
+        for models in deploying_models().values()
+        for model in models
         for attempt_id in model.objects.filter(
             management=management,
             status="deploying",

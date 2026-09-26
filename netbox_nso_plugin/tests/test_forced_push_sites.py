@@ -36,9 +36,9 @@ FORCED_PUSH_SITES = {
     ("intent_drift.py", "resync_static_route_intent_fleet", "drain.push_now"): 1,
     ("link_role.py", "_push_provisioned", "drain.push_now"): 1,
     ("views.py", "_prepare_apply", "drain.push_now"): 1,
-    # The direct lacp/switchport snapshots push after every store-only push succeeded,
-    # from their own helper so a failure can name what already reached the device.
+    # Switching snapshots prepare after store-only pushes and report any partial failure.
     ("views.py", "_push_direct_snapshots", "drain.push_now"): 1,
+    ("delivery.py", "deliver", "drain.push_now"): 1,
     # The Apply's SNMP refresh reads the OUTCOME rather than the answer: it aborts on a
     # refusal alone, which ``push_now`` reports as the same ``None`` as a failure.
     ("views.py", "_prepare_apply", "drain.drain_key"): 1,
@@ -108,7 +108,7 @@ class TestForcedPushSitesAreEnumerated(SimpleTestCase):
         expected[FORCED_CLAIM_SITE] += 1
         expected[DEPLOYMENT_VERIFICATION_CLAIM_SITE] += 1
         assert _forced_calls() == expected
-        assert sum(FORCED_PUSH_SITES.values()) == 6
+        assert sum(FORCED_PUSH_SITES.values()) == 7
 
     def test_every_forced_site_routes_through_the_claim(self):
         """A forced call is a claim with those flags, never a push around it (§4.2).

@@ -865,8 +865,8 @@ def put_vlan_intent(adapter_device_id, vlans):
     )
 
 
-def apply_switchport_config(adapter_device_id, interfaces):
-    """POST /api/v1/devices/{id}/switchport/apply — push + apply L2 switchport intent.
+def apply_switchport_config(adapter_device_id, interfaces, *, deleted_roots, source_revision):
+    """POST /api/v1/devices/{id}/switchport/apply — prepare L2 switchport intent.
 
     ``interfaces`` is a list of dicts:
       [{"interface_name": "Gi0/1", "mode": "access", "untagged_vlan": 10, "tagged_vlans": []}, ...]
@@ -875,7 +875,7 @@ def apply_switchport_config(adapter_device_id, interfaces):
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/switchport/apply",
-        json={"interfaces": interfaces},
+        json={"interfaces": interfaces, "deleted_roots": deleted_roots, "source_revision": source_revision},
     )
 
 
@@ -1549,8 +1549,8 @@ def put_subinterface_intent(adapter_device_id, interfaces):
     )
 
 
-def apply_lag_config(adapter_device_id, bundles):
-    """POST /api/v1/devices/{id}/lag-config/apply — push + apply full LACP bundle intent.
+def apply_lag_config(adapter_device_id, bundles, *, deleted_roots, source_revision):
+    """POST /api/v1/devices/{id}/lag-config/apply — prepare full LACP bundle intent.
 
     ``bundles`` is a list of dicts:
       [{"name": "Port-channel1", "lag_id": 1, "min_links": 2, "system_priority": 100,
@@ -1562,7 +1562,7 @@ def apply_lag_config(adapter_device_id, bundles):
     return _request(
         "POST",
         f"/api/v1/devices/{adapter_device_id}/lag-config/apply",
-        json={"bundles": bundles},
+        json={"bundles": bundles, "deleted_roots": deleted_roots, "source_revision": source_revision},
     )
 
 
