@@ -83,17 +83,32 @@ def _require_converted_writer(handler):
     return _wrapped
 
 
-def _schedule_exact_writer_scope(target_scope, *, device_ids=None) -> None:
+def _schedule_exact_writer_scope(target_scope, *, device_ids=None, auto_only=False) -> None:
     """Schedule keys for one scope only from its active exact content writer."""
     from .renderer_writer import active_renderer_writer
 
     writer = active_renderer_writer()
     if writer is None:
         return
+    enabled = None
+    if auto_only:
+        from .models import NSODeviceManagement
+
+        if _intent_push_is_silenced():
+            return
+        candidates = {device_id for device_id, scope in writer.plan.content_keys if scope == target_scope}
+        if not candidates:
+            return
+        enabled = set(
+            NSODeviceManagement.objects.filter(auto_apply=True, device_id__in=candidates).values_list(
+                "device_id", flat=True
+            )
+        )
     for device_id, scope in writer.plan.content_keys:
         if (
             scope == target_scope
             and (device_ids is None or device_id in device_ids)
+            and (enabled is None or device_id in enabled)
             and _converted_writer_owns_content(device_id, scope)
         ):
             _schedule_intent_push((device_id, scope))
@@ -308,6 +323,13 @@ def _clear_management_teardown(sender, instance, **kwargs):
     outbox.clear_device_teardown(instance.device_id, outbox.current_txid())
 
 
+def _intent_push_is_silenced() -> bool:
+    """Return whether this write mirrors the adapter, so it schedules no intent push."""
+    from .intent_state import mirror_refresh_is_active
+
+    return _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active()
+
+
 def _schedule_intent_push(key, transitions=()) -> None:
     """Append this transaction's contribution to *key* and arrange for the key to drain.
 
@@ -325,9 +347,8 @@ def _schedule_intent_push(key, transitions=()) -> None:
     commit to wait for.
     """
     from . import outbox
-    from .intent_state import mirror_refresh_is_active
 
-    if _is_intent_push_suppressed() or _is_render_request() or mirror_refresh_is_active():
+    if _intent_push_is_silenced():
         return  # a reconcile or render write mirrors the adapter; it is not operator intent
     outbox.enqueue(key[0], key[1], transitions=transitions, delete_origin=_DELETE_DISPATCH.get())
     _schedule_intent_drain(key)
@@ -1211,7 +1232,7 @@ def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
     """Queue exact-writer scopes whose payload contains a renamed interface."""
     if created:
         return
-    from . import delivery
+    from . import delivery, switching_preparation
     from .models import NSODeviceManagement
 
     targets = getattr(instance, "_intent_rename_targets", set())
@@ -1225,6 +1246,9 @@ def _repend_intent_on_interface_rename(sender, instance, created, **kwargs):
     )
     for key in sorted(targets):
         device_id, scope = key
+        if scope in delivery.direct_keys():
+            management = NSODeviceManagement.objects.get(device_id=device_id)
+            switching_preparation.cancel_if_rendered(management, scope, instance.name)
         if not delivery.delivery_keys()[scope].in_protocol and not auto_apply.get(device_id, False):
             continue
         _schedule_intent_push(key)
@@ -2335,6 +2359,13 @@ def lacp_bundle_intent_item(row, members):
     }
 
 
+def lacp_renderable_bundle_filter():
+    """Select the LACP bundles that the device snapshot can contain."""
+    from .status_machine import OWNED_STATES
+
+    return Q(status__in=OWNED_STATES, vpc_sensitive=False)
+
+
 def _push_lacp_intent_for_device(device_id, adapter_device_id):
     """Build and push (apply) the full LACP bundle intent snapshot for a device.
 
@@ -2342,25 +2373,23 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
     is in auto-apply mode (see _on_lacp_state_save); the manual device Apply forces the
     owned snapshot out as part of the one Apply.
     """
-    from . import adapter_client as client
+    from . import switching_preparation
     from .models import NSOLACPBundleState, NSOLACPMemberState
+    from .status_machine import OWNED_STATES
 
-    _owned = ("accepted", "deploying", "in_sync")
     bundles = []
     # NX-P2 belt-and-suspenders: a vPC-protected bundle can never be owned (the Accept view
     # refuses it), but exclude it here too so it can NEVER enter the write intent — the writer
     # refuses the whole service on a vPC bundle, which would block the legitimate bundles.
-    for b in (
-        NSOLACPBundleState.objects.filter(management__device_id=device_id, status__in=_owned)
-        .exclude(vpc_sensitive=True)
-        .select_related("interface")
-    ):
+    for b in NSOLACPBundleState.objects.filter(
+        lacp_renderable_bundle_filter(), management__device_id=device_id
+    ).select_related("interface"):
         members = (
             lacp_member_intent_item(member)
             for member in NSOLACPMemberState.objects.filter(
                 management__device_id=device_id,
                 lag_bundle=b.interface,
-                status__in=_owned,
+                status__in=OWNED_STATES,
             ).select_related("interface")
         )
         bundles.append(lacp_bundle_intent_item(b, members))
@@ -2368,7 +2397,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
     _push_changed(
         (device_id, "lacp"),
         bundles,
-        lambda body: client.apply_lag_config(adapter_device_id, body),
+        lambda body: switching_preparation.send_lag(adapter_device_id, body),
     )
 
 
@@ -2380,18 +2409,25 @@ def _on_lacp_state_save(sender, instance, **kwargs):
     Without auto-apply this is deferred: accept just marks the rows owned and the
     single device Apply commits them (one flow, matching every other scope).
     """
-    from .models import NSODeviceManagement
+    from . import status_machine as sm
+    from . import switching_preparation
+    from .models import NSODeviceManagement, NSOLACPBundleState
 
     try:
         mgmt = instance.management
     except NSODeviceManagement.DoesNotExist:
         return
 
-    if mgmt.adapter_device_id is None or not mgmt.auto_apply:
-        return
-
     device_id = mgmt.device_id
     if not _converted_writer_owns_content(device_id, "lacp"):
+        return
+    if sender is NSOLACPBundleState:
+        if "created" not in kwargs:
+            if kwargs.get("origin") is instance and sm.is_owned(instance.status):
+                switching_preparation.record(mgmt, "lacp", instance.interface.name)
+        elif sm.is_owned(instance.status) and not instance.vpc_sensitive:
+            switching_preparation.cancel(mgmt, "lacp", instance.interface.name)
+    if mgmt.adapter_device_id is None or not mgmt.auto_apply:
         return
     _schedule_intent_push((device_id, "lacp"))
 
@@ -2416,19 +2452,20 @@ def _push_switchport_intent_for_device(device_id, adapter_device_id):
     A device write, so on accept it only fires in auto-apply mode; the manual
     device Apply forces it out as part of the single Apply.
     """
-    from . import adapter_client as client
+    from . import switching_preparation
     from .models import NSOSwitchportState
+    from .status_machine import OWNED_STATES
 
     interfaces = []
     for st in NSOSwitchportState.objects.filter(
-        management__device_id=device_id, status__in=("accepted", "deploying", "in_sync")
+        management__device_id=device_id, status__in=OWNED_STATES
     ).select_related("interface", "untagged_vlan"):
         interfaces.append(switchport_intent_item(st, (v.vid for v in st.tagged_vlans.all())))
 
     _push_changed(
         (device_id, "switchport"),
         interfaces,
-        lambda body: client.apply_switchport_config(adapter_device_id, body),
+        lambda body: switching_preparation.send_switchport(adapter_device_id, body),
     )
 
 
@@ -2440,21 +2477,37 @@ def _on_switchport_state_save(sender, instance, **kwargs):
     Without auto-apply this is deferred: accept marks the row owned and the single
     device Apply commits it (one flow, matching every other scope).
     """
+    from . import status_machine as sm
+    from . import switching_preparation
     from .models import NSODeviceManagement
 
     try:
         mgmt = instance.management
     except NSODeviceManagement.DoesNotExist:
         return
-    if mgmt.adapter_device_id is None or not mgmt.auto_apply:
-        return
-    from . import status_machine as sm
-
-    if not sm.is_owned(instance.status):
-        return
     device_id = mgmt.device_id
     if not _converted_writer_owns_content(device_id, "switchport"):
         return
+    if "created" not in kwargs:
+        if kwargs.get("origin") is instance and sm.is_owned(instance.status):
+            switching_preparation.record(mgmt, "switchport", instance.interface.name)
+    elif sm.is_owned(instance.status):
+        switching_preparation.cancel(mgmt, "switchport", instance.interface.name)
+    if mgmt.adapter_device_id is None or not mgmt.auto_apply:
+        return
+    if "created" in kwargs and not sm.is_owned(instance.status):
+        from .renderer_writer import active_renderer_writer
+
+        writer = active_renderer_writer()
+        was_owned = any(
+            write.operation == "save"
+            and write.model_label == instance._meta.label_lower
+            and write.pk == instance.pk
+            and sm.is_owned(dict(write.before_values).get("status"))
+            for write in writer.plan.write_set
+        )
+        if not was_owned:
+            return
     _schedule_intent_push((device_id, "switchport"))
 
 
@@ -3884,15 +3937,15 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOLACPMemberState,
         dispatch_uid="nso_plugin_lacp_member_state_post_save",
     )
-    # Direct-apply family: deletion retracts under the same auto_apply gate as saves.
+    # Record root deletion in the exact writer; the adapter authorizes it on Apply.
     post_delete.connect(
-        _as_delete_origin(_on_lacp_state_save),
+        _on_lacp_state_save,
         sender=NSOLACPBundleState,
         dispatch_uid="nso_plugin_lacp_bundle_state_post_delete",
         weak=False,
     )
     post_delete.connect(
-        _as_delete_origin(_on_lacp_state_save),
+        _on_lacp_state_save,
         sender=NSOLACPMemberState,
         dispatch_uid="nso_plugin_lacp_member_state_post_delete",
         weak=False,
@@ -3906,9 +3959,9 @@ def _connect_g_activated():  # pragma: no cover
         sender=NSOSwitchportState,
         dispatch_uid="nso_plugin_switchport_state_post_save",
     )
-    # Direct-apply family: deletion retracts under the same auto_apply gate as saves.
+    # Record root deletion in the exact writer; the adapter authorizes it on Apply.
     post_delete.connect(
-        _as_delete_origin(_on_switchport_state_save),
+        _on_switchport_state_save,
         sender=NSOSwitchportState,
         dispatch_uid="nso_plugin_switchport_state_post_delete",
         weak=False,

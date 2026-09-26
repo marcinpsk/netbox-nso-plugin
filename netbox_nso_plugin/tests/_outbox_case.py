@@ -118,6 +118,20 @@ def trust_scope(device, management, scope):
     return revision
 
 
+def direct_test_selection(management, registry):
+    """Supply unrelated switching selections to a focused promotion transaction."""
+    from netbox_nso_plugin.models import NSOIntentRevision
+
+    direct = (entry for entry in registry.values() if not entry.in_protocol)
+    selections = {}
+    sources = {}
+    for entry in direct:
+        revision, _ = NSOIntentRevision.objects.get_or_create(device=management.device, scope=entry.key)
+        selections[entry.section] = 1
+        sources[entry.key] = revision.revision
+    return {"direct_selected": selections, "direct_source_revisions": sources}
+
+
 def content_update(instance, **values):
     """Persist a fixture change through the production exact writer."""
     from netbox_nso_plugin.renderer_writer import (
@@ -487,6 +501,7 @@ class ReceiptAdapter:
         self.requests: list[dict] = []
         self.replays = 0
         self.fail_with: Exception | None = None
+        self.drop_response_once = False
         #: Adapter device ids whose every request fails, for the replayably failing key.
         self.fail_devices: set[int] = set()
         #: Per adapter device id: what the device carries, and what it no longer owns.
@@ -501,6 +516,13 @@ class ReceiptAdapter:
     @staticmethod
     def _default_response(body):
         """Answer static routes in the landed adapter shape and other scopes by count."""
+        if isinstance(body, dict) and "source_revision" in body:
+            return {
+                "status": "prepared",
+                "stream": "lag" if "bundles" in body else "switchport",
+                "selection_revision": max(1, body["source_revision"]),
+                "unauthorized_deleted_roots": [],
+            }
         if isinstance(body, dict) and "deleted_routes" in body:
             return {
                 **partition(executed=[record["route_id"] for record in body["deleted_routes"]]),
@@ -609,8 +631,17 @@ class ReceiptAdapter:
             return make_response(200, receipt["response"])
 
         response = self._respond(body)
+        if isinstance(response, tuple):
+            status, payload = response
+            return make_response(status, payload)
+        prepared = isinstance(response, dict) and response.get("status") == "prepared"
+        if prepared:
+            found = _DEVICE_IN_URL.search(url)
+            if found is not None:
+                response = {"device_id": int(found.group(1)), **response}
         self.applied.append((url, body))
-        self._apply_to_device(url, body, params)
+        if not prepared:  # a preparation only stages its snapshot; Apply authorizes it
+            self._apply_to_device(url, body, params)
         if seq is not None:
             self.receipts[url] = {
                 "push_seq": seq,
@@ -618,6 +649,9 @@ class ReceiptAdapter:
                 "response": response,
                 "params": dict(params),
             }
+        if self.drop_response_once:  # the receipt commits with the write, so a retry replays it
+            self.drop_response_once = False
+            raise requests.exceptions.ConnectionError("the request was stored but its response was lost")
         return make_response(200, response)
 
     def _serve_receipts(self, params):

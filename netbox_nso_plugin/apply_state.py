@@ -24,6 +24,8 @@ APPLY_DEPLOYING_MODEL_NAMES = {
     "static_route": "NSOStaticRouteState",
     "l2_sap": "NSOL2SapState",
     "logging": "NSOLoggingLevelState",
+    "lacp": ("NSOLACPBundleState", "NSOLACPMemberState"),
+    "switchport": "NSOSwitchportState",
 }
 
 _DEVICE_INTENT_LOCK_NAMESPACE = 1_503_003_007
@@ -160,7 +162,10 @@ def deploying_models() -> dict:
     """Return the delivery scopes whose owned rows carry an Apply-in-flight state."""
     from . import models
 
-    return {scope: getattr(models, name) for scope, name in APPLY_DEPLOYING_MODEL_NAMES.items()}
+    return {
+        scope: tuple(getattr(models, name) for name in (names if isinstance(names, tuple) else (names,)))
+        for scope, names in APPLY_DEPLOYING_MODEL_NAMES.items()
+    }
 
 
 def lock_intent_revisions(device_id: int, scopes) -> dict[str, int]:
@@ -236,17 +241,35 @@ def promote_current_intent(
     registry,
     pushed,
     *,
+    direct_selected,
+    direct_source_revisions,
     apply_attempt_id,
     static_route_stored: bool,
 ):
     """CAS stored receipt revisions, create the attempt, and stamp its rows."""
     from . import status_machine as sm
     from .intent_state import OVERLAY_MODEL_RANKS, mirror_refresh
-    from .models import NSOApplyAttempt, NSODeviceManagement, NSORoutePolicyState, NSOStaticRouteState
-    from .signals import suppress_intent_push
+    from .models import (
+        NSOApplyAttempt,
+        NSODeviceManagement,
+        NSOLACPBundleState,
+        NSOLACPMemberState,
+        NSORoutePolicyState,
+        NSOStaticRouteState,
+    )
+    from .signals import lacp_renderable_bundle_filter, suppress_intent_push
 
     expected_scopes = {entry.key for entry in registry.values() if entry.in_protocol}
-    if set(pushed) != expected_scopes or any(type(snapshot.revision) is not int for snapshot in pushed.values()):
+    expected_direct = {entry.section for entry in registry.values() if not entry.in_protocol}
+    direct_keys = {entry.key for entry in registry.values() if not entry.in_protocol}
+    if (
+        set(pushed) != expected_scopes
+        or any(type(snapshot.revision) is not int for snapshot in pushed.values())
+        or set(direct_selected) != expected_direct
+        or any(type(revision) is not int or revision <= 0 for revision in direct_selected.values())
+        or set(direct_source_revisions) != direct_keys
+        or any(type(revision) is not int or revision < 0 for revision in direct_source_revisions.values())
+    ):
         raise IntentChangedDuringPreparation
 
     with transaction.atomic(), lock_order_scope():
@@ -255,24 +278,34 @@ def promote_current_intent(
         locked = NSODeviceManagement.objects.select_for_update(of=("self",)).order_by().get(pk=management.pk)
         if locked.adapter_device_id != management.adapter_device_id or locked.source_rekey_pending:
             raise IntentChangedDuringPreparation
-        current = lock_intent_revisions(locked.device_id, expected_scopes)
-        if any(current[scope] != snapshot.revision for scope, snapshot in pushed.items()):
+        current = lock_intent_revisions(locked.device_id, expected_scopes | direct_keys)
+        if any(current[scope] != snapshot.revision for scope, snapshot in pushed.items()) or any(
+            current[scope] != revision for scope, revision in direct_source_revisions.items()
+        ):
             raise IntentChangedDuringPreparation
 
         locked_rows: list[tuple] = []
         model_ranks = {label: rank for rank, label in enumerate(OVERLAY_MODEL_RANKS)}
         for scope, model in sorted(
-            deploying_models().items(),
+            ((scope, model) for scope, models in deploying_models().items() for model in models),
             key=lambda item: model_ranks[item[1]._meta.label_lower],
         ):
             if model is NSOStaticRouteState and not static_route_stored:
                 continue
             _enter_level(8, (model_ranks[model._meta.label_lower], 0))
-            locked_statuses = list(
-                model.objects.select_for_update(of=("self",))
-                .filter(management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED))
-                .order_by("pk")
+            candidates = model.objects.select_for_update(of=("self",)).filter(
+                management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED)
             )
+            if model is NSOLACPBundleState:
+                candidates = candidates.filter(lacp_renderable_bundle_filter())
+            if model is NSOLACPMemberState:
+                eligible_bundle_ids = set(
+                    NSOLACPBundleState.objects.filter(lacp_renderable_bundle_filter(), management=locked).values_list(
+                        "interface_id", flat=True
+                    )
+                )
+                candidates = candidates.filter(lag_bundle_id__in=eligible_bundle_ids)
+            locked_statuses = list(candidates.order_by("pk"))
             if model is NSORoutePolicyState:
                 locked_statuses = _promotable_route_policy_rows(locked_statuses)
             locked_rows.append((scope, model, locked_statuses))
@@ -281,6 +314,7 @@ def promote_current_intent(
             registry[scope].section: pushed[scope].push_seq
             for scope in sorted(pushed, key=lambda candidate: registry[candidate].section)
         }
+        selected.update(direct_selected)
         attempt = NSOApplyAttempt.objects.create(
             id=apply_attempt_id,
             management=locked,

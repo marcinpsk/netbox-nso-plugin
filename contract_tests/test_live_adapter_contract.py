@@ -38,6 +38,42 @@ def test_generation_dispositions_match_the_committed_adapter_openapi_enum():
     assert set(GENERATION_DISPOSITIONS) == openapi_statuses
 
 
+def test_generation_wire_keys_match_the_live_adapter_contract():
+    """Keep Apply evidence and the generation fake aligned with real adapter responses."""
+    from netbox_nso_plugin.apply_settlement import _GENERATION_FIELDS
+    from netbox_nso_plugin.tests._settlement_adapter import GENERATION_RESPONSE_FIELDS
+
+    with _live_client() as client, _devices(client, 1) as (device_id,):
+        prepared = client.apply_lag_config(
+            device_id,
+            [{"name": "Port-channel1", "lag_id": 1, "members": []}],
+            deleted_roots=[],
+            source_revision=1,
+        )
+        assert prepared["status"] == "prepared"
+        attempt_id = uuid4()
+        admitted = client.trigger_apply(device_id, attempt_id, {"lag": prepared["selection_revision"]})
+        assert admitted["outcome"] == "promoted"
+
+        evidence = client.get_deployment_evidence(device_id, [attempt_id])
+        assert len(evidence["attempts"]) == 1
+        generations = evidence["attempts"][0]["generations"]
+        assert generations
+        assert all(set(generation) == _GENERATION_FIELDS for generation in generations)
+
+        listed = client.list_device_generations(device_id)
+        assert listed
+        assert all(set(generation) == GENERATION_RESPONSE_FIELDS for generation in listed)
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if all(job["status"] not in {"queued", "running"} for job in client.list_jobs(device_id)):
+                break
+            time.sleep(0.5)
+        else:
+            raise AssertionError("the live adapter did not finish its Apply job within 60s")
+
+
 @contextmanager
 def _live_client():
     """Point the real plugin HTTP client at the live adapter for the block.

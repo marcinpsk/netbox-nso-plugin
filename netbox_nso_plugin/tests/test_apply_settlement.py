@@ -24,12 +24,17 @@ _CLIENT_CONFIG = {
 
 
 def _generation(generation_id, status, selected, *, result=None, error=None):
+    from netbox_nso_plugin import delivery
+
     return {
         "generation_id": generation_id,
         "seq": generation_id,
         "status": status,
         "sections": sorted(selected),
-        "source_push_seq": dict(selected),
+        "stream_revisions": dict(selected),
+        "source_push_seq": {
+            stream: None if stream in delivery.direct_streams() else revision for stream, revision in selected.items()
+        },
         "carrier_job_id": 900 + generation_id,
         "carrier_job_status": "failed" if status in {"failed", "outcome_unknown"} else "succeeded",
         "carrier_job_result": result,
@@ -39,6 +44,8 @@ def _generation(generation_id, status, selected, *, result=None, error=None):
 
 
 def _response(adapter_device_id, generation_id, selected):
+    from netbox_nso_plugin import delivery
+
     return {
         "device_id": adapter_device_id,
         "outcome": "promoted",
@@ -52,8 +59,11 @@ def _response(adapter_device_id, generation_id, selected):
                 "seq": generation_id,
                 "job_id": 900 + generation_id,
                 "mode": "networked",
-                "source_push_seq": dict(selected),
-                "stream_revisions": {stream: 1 for stream in selected},
+                "source_push_seq": {
+                    stream: None if stream in delivery.direct_streams() else revision
+                    for stream, revision in selected.items()
+                },
+                "stream_revisions": dict(selected),
                 "digest": f"{generation_id:064x}",
             }
         ],
@@ -81,6 +91,20 @@ def _payload(adapter_device_id, attempts, *, head=None):
         "attempts": attempts,
         "unknown_apply_attempt_ids": [],
     }
+
+
+def test_evidence_fixture_generations_match_the_adapter_evidence_field_set():
+    from netbox_nso_plugin.apply_settlement import _GENERATION_FIELDS
+
+    from ._settlement_case import _evidence_generation
+
+    selected = {"lag": 7, "switchport": 8, "vlan": 9}
+    for status in ("pending", "running", "settled", "failed", "outcome_unknown", "abandoned"):
+        generation = _generation(73, status, selected, result={})
+        assert set(generation) == _GENERATION_FIELDS
+        assert set(_attempt(uuid4(), 1626, 73, selected, status, result={})["generations"][0]) == _GENERATION_FIELDS
+    for settled_scopes in ((), ("lag", "switchport")):
+        assert set(_evidence_generation(73, selected, settled_scopes)) == _GENERATION_FIELDS
 
 
 class TestAttemptSettlement(TestCase):
@@ -199,6 +223,24 @@ class TestAttemptSettlement(TestCase):
         self.assertEqual(row.status, "in_sync")
         self.assertEqual(row.last_apply_at, last_apply_at)
         self.assertEqual(row.apply_attempt_id, attempt_id)
+
+    def test_settled_lag_generation_correlates_without_a_push_sequence(self):
+        from netbox_nso_plugin.apply_settlement import _attempt_disposition
+
+        attempt_id = uuid4()
+        selected = {"lag": 7}
+        evidence = _attempt(
+            attempt_id,
+            self.adapter_device_id,
+            73,
+            selected,
+            "settled",
+            result={"lag_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+        )
+
+        disposition, generation = _attempt_disposition(evidence, "lag")
+        self.assertEqual(disposition, "settled")
+        self.assertEqual(generation["stream_revisions"]["lag"], 7)
 
     def test_an_aggregate_scope_failure_does_not_fail_unidentified_rows(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
@@ -375,12 +417,17 @@ class TestAttemptSettlement(TestCase):
         self.assertIsNone(latest_route_policy_carrier({"attempts": {"invalid": "shape"}}))
 
     def test_unknown_evidence_replays_the_identical_request_and_normalizes_the_local_attempt(self):
+        import json
+
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence
 
         attempt_id = uuid4()
         self._vlan_row(1630, attempt_id)
-        local = self._local_attempt(attempt_id, 61, {"vlan": 401}, answered=False)
-        known = _attempt(attempt_id, self.adapter_device_id, 61, {"vlan": 401}, "pending")
+        selected = {"vlan": 401, "lag": 7, "switchport": 9}
+        local = self._local_attempt(attempt_id, 61, selected, answered=False)
+        local.refresh_from_db(fields=["selected"])
+        known = _attempt(attempt_id, self.adapter_device_id, 61, selected, "pending")
+        persisted_wire = json.dumps({"apply_attempt_id": str(attempt_id), "selected": local.selected})
         requests = []
         admitted = False
 
@@ -396,8 +443,9 @@ class TestAttemptSettlement(TestCase):
                 self.assertTrue(url.endswith("/actions/apply"))
                 self.assertEqual(
                     body,
-                    {"apply_attempt_id": str(attempt_id), "selected": {"vlan": 401}},
+                    {"apply_attempt_id": str(attempt_id), "selected": selected},
                 )
+                self.assertEqual(json.dumps(body), persisted_wire)
                 admitted = True
                 return make_response(202, known["response"])
 

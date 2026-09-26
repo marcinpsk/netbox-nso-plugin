@@ -370,6 +370,22 @@ class TestCrashedAttemptsReplayAtTheirOwnSequence(_ClaimCase):
 
         self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
 
+    def test_a_lost_response_replays_into_the_stored_receipt(self):
+        from netbox_nso_plugin import drain
+
+        own_vlan(self.mgmt, 864, self.tag)
+        self.adapter.drop_response_once = True
+        assert self.drain() == drain.FAILED
+        failed_seq = self.adapter.sequences[0]
+
+        expire_claim(self.device, "vlan")
+        assert self.drain() == drain.SUCCEEDED
+
+        assert self.adapter.sequences == [failed_seq, failed_seq]
+        assert len(self.adapter.applied) == 1, "the replay must not apply the operation twice"
+        assert self.adapter.replays == 1
+        assert entries(self.device, "vlan") == []
+
     def test_a_crash_after_the_send_replays_into_the_receipt_and_clears_the_authority(self):
         from netbox_nso_plugin import drain
 

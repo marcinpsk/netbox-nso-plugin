@@ -18,6 +18,8 @@ from django.test import TestCase
 from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOLACPBundleState, NSOLACPMemberState
 
+from ._outbox_case import ReceiptAdapter
+
 TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "bundles"}
 BUNDLE_REQUIRED_KEYS = {"name", "lag_id", "members"}
 BUNDLE_OPTIONAL_KEYS = {"min_links", "system_priority", "system_id", "timer", "admin_key"}
@@ -81,3 +83,14 @@ class TestLagContractConsumer(TestCase):
             NSOLACPBundleState.objects.filter(management=self.mgmt, interface__name="Bundle-Ether1").exists()
         )
         self.assertTrue(NSOLACPMemberState.objects.filter(management=self.mgmt, interface__name="GE0/1").exists())
+
+    def test_preparation_post_sends_explicit_deletion_identity_and_revision(self):
+        from netbox_nso_plugin.adapter_client import apply_lag_config
+
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            response = apply_lag_config(self.mgmt.adapter_device_id, [], deleted_roots=[], source_revision=0)
+
+        self.assertEqual(response["status"], "prepared")
+        self.assertEqual(adapter.requests[-1]["body"], {"bundles": [], "deleted_roots": [], "source_revision": 0})

@@ -8,11 +8,9 @@ scope owns — and enumerates sixteen scopes under partly different names (``ip`
 the push sites actually use, and says of each whether it is *in protocol*: whether its
 delivery is a logical operation the adapter admits, receipts and can replay.
 
-``lacp`` and ``switchport`` are **out of protocol**. They are direct-apply endpoints whose
-device write happens synchronously inside the request and which answer a failed apply with
-HTTP 200 and an error envelope, so no receipt can be atomic with their effect and the
-generic admission path cannot tell their success from their failure. They keep today's
-direct client calls; the split card owns their entry.
+``lacp`` and ``switchport`` are **out of protocol**. Their POSTs prepare selectable
+snapshots. The manual Apply authorizes the selected revisions. They carry no push sequence
+or receipt, and their root deletion identity is owned by ``switching_preparation``.
 
 The request mode (normal, store-only) is an argument of :func:`deliver`, never a property of
 a key: one scope is delivered both ways — SNMP normally on save and store-only from the
@@ -40,6 +38,7 @@ _MODES = (MODE_NORMAL, MODE_STORE_ONLY, MODE_BACKFILL_ONLY)
 
 MARKING_QUERY_FLAG = "query_flag"
 MARKING_PER_OBJECT = "per_object"
+MARKING_NONE = "none"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,12 +46,12 @@ class DeliveryKey:
     """One ``(device, scope)`` delivery key: how it is pushed, and under which contract."""
 
     key: str
-    #: The adapter receipt's section vocabulary. Only ``interface`` differs.
+    #: The adapter stream vocabulary. ``interface`` and ``lacp`` differ.
     section: str
     label: str
     #: In protocol: carries ``X-Push-Seq``, is admitted against a receipt and can be replayed.
     in_protocol: bool
-    #: How a deletion is authorized on the wire — a query flag today, per object after O3.
+    #: How the receipt streams carry deletion authority on the wire.
     marking_mode: str
     #: Name of the full-device push in ``signals``, resolved on every call so a test patch
     #: is honored no matter when the registry was built.
@@ -97,10 +96,16 @@ def _build() -> dict[str, DeliveryKey]:
     return {
         key: DeliveryKey(
             key=key,
-            section="interface_config" if key == "interface" else key,
+            section="interface_config" if key == "interface" else "lag" if key == "lacp" else key,
             label=label,
             in_protocol=in_protocol,
-            marking_mode=MARKING_PER_OBJECT if key == "static_route" else MARKING_QUERY_FLAG,
+            marking_mode=(
+                MARKING_PER_OBJECT
+                if key == "static_route"
+                else MARKING_NONE
+                if key in {"lacp", "switchport"}
+                else MARKING_QUERY_FLAG
+            ),
             push_name=push_name,
         )
         for key, label, in_protocol, push_name in keys
@@ -112,6 +117,16 @@ def delivery_keys() -> dict[str, DeliveryKey]:
     if not _REGISTRY:
         _REGISTRY.update(_build())
     return _REGISTRY
+
+
+def direct_keys() -> frozenset[str]:
+    """Return keys whose posts prepare selectable snapshots outside the receipt protocol."""
+    return frozenset(key for key, entry in delivery_keys().items() if not entry.in_protocol)
+
+
+def direct_streams() -> frozenset[str]:
+    """Return the adapter streams selected by direct preparations."""
+    return frozenset(delivery_keys()[key].section for key in direct_keys())
 
 
 # ── Rendering and sending, which the claim protocol must be able to separate ───
@@ -186,7 +201,7 @@ def _wire_deletions(records) -> list[dict]:
 def _resolved_marking_mode(entry: DeliveryKey, marking_mode: str | None) -> str:
     """Return one request's marking mode, with validation at the delivery seam."""
     resolved = entry.marking_mode if marking_mode is None else marking_mode
-    if resolved not in {MARKING_QUERY_FLAG, MARKING_PER_OBJECT}:
+    if resolved not in {MARKING_QUERY_FLAG, MARKING_PER_OBJECT, MARKING_NONE}:
         raise ValueError(f"unknown marking mode {resolved!r}")
     return resolved
 
@@ -313,6 +328,10 @@ def send(
     if mark and mode == MODE_BACKFILL_ONLY:
         raise ValueError("a backfill-only request carries no authority, so it cannot mark a deletion")
     entry = delivery_keys()[rendered.key[1]]
+    if not entry.in_protocol:
+        if mode != MODE_NORMAL:
+            raise ValueError("switching preparation does not support store-only or backfill-only mode")
+        raise ValueError("switching sends require a captured preparation")
     marking_mode = _resolved_marking_mode(entry, marking_mode)
     if mark and marking_mode == MARKING_PER_OBJECT and not deletions:
         raise ValueError("a marked per-object request requires deletion records")
@@ -336,6 +355,16 @@ def deliver(key: str, device_id, adapter_device_id, *, mode: str = MODE_NORMAL, 
     from . import adapter_client
     from .drain import SEND_DEADLINE
     from .renderer_audit import RendererAuditBudgetExceeded, RendererAuditRepairFailed, audit_renderer_scopes
+
+    if key in direct_keys():
+        from . import drain
+
+        if mode != MODE_NORMAL or mark:
+            raise ValueError("switching preparation requires normal unmarked delivery")
+        response = drain.push_now(device_id, key, force=True, deadline=SEND_DEADLINE.total_seconds())
+        if response is None:
+            raise adapter_client.AdapterError("Switching preparation failed.", code="preparation_failed")
+        return response
 
     try:
         audit_renderer_scopes(

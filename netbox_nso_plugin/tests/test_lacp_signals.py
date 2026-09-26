@@ -4,13 +4,15 @@
 
 from unittest.mock import patch
 
+import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
-from .mixins import IntentPushDeliveryMixin
+from ._outbox_case import ReceiptAdapter
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
-class _LacpBase(IntentPushDeliveryMixin, TestCase):
+class _LacpFixtures:
     @classmethod
     def setUpTestData(cls):
         mfg = Manufacturer.objects.create(name="LacpSigMfg", slug="lacpsigmfg")
@@ -71,7 +73,16 @@ class _LacpBase(IntentPushDeliveryMixin, TestCase):
         )
 
 
-class TestPushLacpIntentForDevice(_LacpBase):
+class _LacpBase(_LacpFixtures, IntentPushDeliveryMixin, TestCase):
+    pass
+
+
+class TestPushLacpIntentForDevice(_LacpFixtures, _CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.setUpTestData()
+        self.adapter = ReceiptAdapter()
+
     def test_pushes_accepted_bundle_with_members(self):
         from netbox_nso_plugin.delivery import deliver
 
@@ -79,12 +90,13 @@ class TestPushLacpIntentForDevice(_LacpBase):
         self._bundle(mgmt, status="accepted")
         self._member(mgmt, status="accepted")
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
+        config, session = self.adapter.patches()
+        with config, session:
             deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
-        mock_apply.assert_called_once()
-        dev_id, bundles = mock_apply.call_args[0]
-        assert dev_id == mgmt.adapter_device_id
+        request = self.adapter.requests[-1]
+        bundles = request["body"]["bundles"]
+        assert request["body"]["deleted_roots"] == []
         assert len(bundles) == 1
         b = bundles[0]
         assert b["name"] == "Port-channel1"
@@ -100,11 +112,11 @@ class TestPushLacpIntentForDevice(_LacpBase):
         mgmt = self._make_mgmt()
         self._bundle(mgmt, status="imported")
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
+        config, session = self.adapter.patches()
+        with config, session:
             deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
-        mock_apply.assert_called_once()
-        assert mock_apply.call_args[0][1] == []
+        assert self.adapter.requests[-1]["body"]["bundles"] == []
 
     def test_excludes_vpc_sensitive_bundles(self):
         # NX-P2 belt-and-suspenders: an (impossibly-)accepted vPC bundle is excluded from the
@@ -118,11 +130,11 @@ class TestPushLacpIntentForDevice(_LacpBase):
             management=mgmt, interface=self.lag, lag_id=1, status="accepted", vpc_sensitive=True
         )
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
+        config, session = self.adapter.patches()
+        with config, session:
             deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
-        mock_apply.assert_called_once()
-        assert mock_apply.call_args[0][1] == []  # the vPC bundle never enters the write intent
+        assert self.adapter.requests[-1]["body"]["bundles"] == []  # the vPC bundle never enters the write intent
 
     def test_an_adapter_failure_is_recorded_and_left_for_the_drain_to_isolate(self):
         """The swallow moved to the drain (#1503 Appendix O): the send itself fails fast."""
@@ -132,8 +144,10 @@ class TestPushLacpIntentForDevice(_LacpBase):
         mgmt = self._make_mgmt()
         self._bundle(mgmt, status="accepted")
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config", side_effect=ConnectionError("boom")):
-            with self.assertRaises(ConnectionError):
+        self.adapter.fail_with = requests.exceptions.ConnectionError("lost")
+        config, session = self.adapter.patches()
+        with config, session:
+            with self.assertRaisesRegex(Exception, "Switching preparation failed"):
                 deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
         assert "lacp" in (NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {})
@@ -147,19 +161,21 @@ class TestPushLacpIntentForDevice(_LacpBase):
         self._bundle(mgmt, status="accepted")
         error = AdapterError("rejected", code="validation_error")
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config", side_effect=error):
+        self.adapter.fail_with = error
+        config, session = self.adapter.patches()
+        with config, session:
             with self.assertRaises(AdapterError) as raised:
                 deliver("lacp", self.device.pk, mgmt.adapter_device_id)
 
-        assert raised.exception is error
+        assert raised.exception.code == "preparation_failed"
         errors = NSODeviceManagement.objects.get(pk=mgmt.pk).intent_push_errors or {}
         assert errors["lacp"]["code"] == "validation_error"
 
 
 class TestOnLacpStateSave(_LacpBase):
     def test_writer_save_triggers_intent_push_in_auto_apply(self):
-        """In auto-apply mode, accept commits to the device immediately."""
-        from netbox_nso_plugin.models import NSOLACPBundleState
+        """In auto mode, the writer queues a selectable LAG preparation."""
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOLACPBundleState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         mgmt = self._make_mgmt(auto_apply=True)
@@ -168,12 +184,9 @@ class TestOnLacpStateSave(_LacpBase):
             saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
         )
 
-        with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
-            with self.captureOnCommitCallbacks(execute=True):
-                with renderer_writes(plan) as writer:
-                    writer.save(bundle, force_insert=True)
-            mock_apply.assert_called_once()
-            assert mock_apply.call_args[0][0] == mgmt.adapter_device_id
+        with renderer_writes(plan) as writer:
+            writer.save(bundle, force_insert=True)
+        assert NSOIntentOutboxEntry.objects.filter(device=self.device, scope="lacp").exists()
 
     def test_writer_save_no_push_without_auto_apply(self):
         """Default (deferred) flow: accept marks owned but does NOT commit — the
