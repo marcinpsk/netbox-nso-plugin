@@ -44,7 +44,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "88461e15ffa5d24b6e10f25395e2dfbf9eb97f1bf95eb1d4638b3c200c06c2d1"
+_ADAPTER_RUNTIME_DIGEST = "c5a905fac77477bb17ca96666e20d264f22fab84c04590ca2745868b71c89fea"
 _ADAPTER_ROOT = Path(__file__).resolve().parents[2].parent / ".o3c-adapter"
 _DSN_CREDENTIAL = re.compile(r"(?<=://)[^:/@\s]+:[^@/\s]+(?=@)")
 _SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"
