@@ -363,22 +363,24 @@ def _schedule_intent_drain(key) -> None:
 
 
 def _drain_intent_pushes() -> None:
-    """Drain every key this transaction appended to, isolating failures between them.
-
-    The first callback takes the whole cell and clears it, so callbacks 2..N of a bulk edit
-    are O(1). A per-key failure is data: the claim keeps its rows and its sequence, and the
-    five-minute tick supplies the next attempt.
-    """
+    """Drain committed keys until no new on-commit callback adds a key."""
     from . import drain
 
-    keys = _pending_intent_keys()
-    claimed = sorted(keys)
-    keys.clear()
-    for device_id, scope in claimed:
-        try:
-            drain.drain_key(device_id, scope)
-        except Exception as exc:  # noqa: BLE001 — one key's drain must not abort its siblings
-            logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
+    if getattr(_intent_keys, "draining", False):
+        return
+    _intent_keys.draining = True
+    try:
+        keys = _pending_intent_keys()
+        while keys:
+            claimed = sorted(keys)
+            keys.clear()
+            for device_id, scope in claimed:
+                try:
+                    drain.drain_key(device_id, scope)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
+    finally:
+        _intent_keys.draining = False
 
 
 def _allocate_push_attempt(device_id, scope):
