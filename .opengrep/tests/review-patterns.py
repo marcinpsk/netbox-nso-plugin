@@ -45,6 +45,8 @@ def vlan_identity_from_name(candidate, native, interface):
     match = re.match(r".*\.(\d+)$", interface.name)
     # ruleid: nso-vlan-identity-from-interface-name
     vlan = int(match.group(1))
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(match.group(1))
     # ok: nso-vlan-identity-from-interface-name
     unit = int(interface.name.rsplit(".", 1)[-1])
     # ruleid: nso-vlan-identity-from-interface-name
