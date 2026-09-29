@@ -11,6 +11,22 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _vlan_choices(management, group):
+    """Prefer attached VLANs over device-group fallback candidates."""
+    from ipam.models import VLAN
+
+    from .svi_identity import attached_svi_vlans
+
+    group_vlans = {}
+    if group is not None:
+        for vlan in VLAN.objects.filter(group=group).order_by("pk"):
+            group_vlans.setdefault(vlan.vid, {})[vlan.pk] = vlan
+    attached_vlans = {}
+    for vlan in attached_svi_vlans(management).order_by("pk"):
+        attached_vlans.setdefault(vlan.vid, {})[vlan.pk] = vlan
+    return {vid: attached_vlans.get(vid) or candidates for vid, candidates in group_vlans.items()} | attached_vlans
+
+
 def svi_reconcile_plan(device, payload: dict):
     """Freeze every native interface and SVI overlay write."""
     from django.utils import timezone
@@ -35,7 +51,6 @@ def svi_reconcile_footprint(device, payload: dict):
 def _svi_reconcile_operations(device, payload, planned_at):
     """Build the deterministic SVI writes shared by preflight and apply."""
     from dcim.models import Interface
-    from ipam.models import VLAN
 
     from . import status_machine as sm
     from .adapter_client import AdapterError
@@ -57,7 +72,7 @@ def _svi_reconcile_operations(device, payload, planned_at):
         row.interface.name: row
         for row in NSOSVIState.objects.filter(management=management).select_related("interface", "vlan").order_by("pk")
     }
-    vlans = {row.vid: row for row in VLAN.objects.filter(group=group).order_by("pk")} if group is not None else {}
+    vlans = _vlan_choices(management, group)
     saves = []
     deletes = []
     operations = []
@@ -85,7 +100,9 @@ def _svi_reconcile_operations(device, payload, planned_at):
             else NSOSVIState(management=management, interface=interface, status="unknown")
         )
         vid = item.get("vlan_id")
-        vlan = vlans.get(vid) if vid else None
+        matches_for_vid = vlans.get(vid, {}) if vid else {}
+        ambiguous = len(matches_for_vid) > 1
+        vlan = next(iter(matches_for_vid.values())) if len(matches_for_vid) == 1 else None
         device_type = item.get("type") or "svi"
         device_vrf = item.get("vrf") or ""
         if sm.is_owned(state.status):
@@ -93,10 +110,11 @@ def _svi_reconcile_operations(device, payload, planned_at):
             matches = desired_vid == vid and state.svi_type == device_type and state.vrf == device_vrf
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
-            state.vlan = vlan
+            keep_reference = ambiguous and current is not None and current.vlan is not None and current.vlan.vid == vid
+            state.vlan = current.vlan if keep_reference else vlan
             state.svi_type = device_type
             state.vrf = device_vrf
-            state.status = sm.on_reconcile(state.status, matches=None)
+            state.status = sm.on_reconcile(state.status, matches=None, conflict=ambiguous and not keep_reference)
         state.last_sync_at = planned_at
         created = current is None
         if created:

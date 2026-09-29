@@ -49,6 +49,21 @@ rules:
           - metavariable-regex:
               metavariable: $REGEX_FN
               regex: '^(?:match|search|fullmatch)$'
+      - pattern-either:
+          - pattern: vid = int($INTERFACE.name[4:])
+          - pattern: vlan = int($INTERFACE.name[4:])
+      - patterns:
+          - pattern: return $TYPE, int($NAME[4:])
+          - pattern-either:
+              - pattern-inside: |
+                  $NAME = $INTERFACE.name.lower()
+                  ...
+              - pattern-inside: |
+                  $NAME = ($INTERFACE.name or "").lower()
+                  ...
+          - metavariable-regex:
+              metavariable: $TYPE
+              regex: '^"(?:svi|irb)"$'
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**", "**/migrations/**"]

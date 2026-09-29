@@ -111,15 +111,17 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "svi": ScopeOwnershipRule(
         scope="svi",
-        acquisition_strategy="native",
+        acquisition_strategy="existing_overlay",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsosvistate",),
         overlay_native_fields=(("netbox_nso_plugin.nsosvistate", "interface"),),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            f"Acquire from persisted SVI interface state instead of save-event provenance. {_DIRECT_OVERLAY_EDIT_DELTA}"
+            "Acquire only from an accepted SVI overlay. Native save events are not ownership evidence. "
+            "A foreign overlay delete retires its identity. Native anchor loss retracts with deletion authority. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "switchport": ScopeOwnershipRule(
@@ -825,6 +827,13 @@ def _native_anchor_status(scope, native, device_id, overlay):
             return "lost"
         if overlay is not None and overlay.parent_interface_id != native.parent_id:
             return "mismatch"
+    elif overlay is not None and (
+        overlay.vlan_id is None
+        or not overlay.vlan
+        or overlay.vlan.group is None
+        or overlay.vlan.group.slug != f"nso-{device_id}"
+    ):
+        return "mismatch"
     return "valid"
 
 
@@ -1131,14 +1140,6 @@ def _seed_vlan(candidate, native, _manifest):
     candidate.device_name = native.name
 
 
-def _seed_svi(candidate, native, _manifest):
-    definition = _svi_definition(native)
-    if definition is not None:
-        candidate.svi_type, vlan_id = definition
-        candidate.vlan = _device_vlan(native.device_id, vlan_id, preferred=native.untagged_vlan)
-    candidate.vrf = native.vrf.name if native.vrf_id else ""
-
-
 def _seed_switchport(candidate, native, _manifest):
     candidate.mode = native.mode or ""
     candidate.untagged_vlan = native.untagged_vlan
@@ -1246,7 +1247,6 @@ _STATE_SEEDERS = {
     "netbox_nso_plugin.nsoospfinterfacestate": _seed_ospf_interface,
     "netbox_nso_plugin.nsoredistributionstate": _seed_redistribution,
     "netbox_nso_plugin.nsostaticroutestate": _seed_static_route,
-    "netbox_nso_plugin.nsosvistate": _seed_svi,
     "netbox_nso_plugin.nsoswitchportstate": _seed_switchport,
     "netbox_nso_plugin.nsovlanstate": _seed_vlan,
 }
@@ -1307,25 +1307,6 @@ def _native_identity(rule, native):
     return {name: _json_value(getattr(native, name)) for name in key_fields}
 
 
-def _device_vlan(device_id, vid, *, preferred=None):
-    """Resolve the VLAN carried by one native SVI interface."""
-    if preferred is not None and preferred.vid == vid:
-        return preferred
-    from ipam.models import VLAN
-
-    return VLAN.objects.filter(group__slug=f"nso-{device_id}", vid=vid).first()
-
-
-def _svi_definition(interface):
-    """Return ``(type, vid)`` for a native SVI or IRB interface."""
-    name = (interface.name or "").lower()
-    if name.startswith("vlan") and name[4:].isdigit():
-        return "svi", int(name[4:])
-    if name.startswith("irb.") and name[4:].isdigit():
-        return "irb", int(name[4:])
-    return None
-
-
 def _native_binding(scope, native, state_model_label, state_key=None):
     return scope, native, state_model_label, state_key or {}
 
@@ -1372,20 +1353,6 @@ def _vlan_bindings(management):
         .distinct()
         .order_by("pk")
     )
-
-
-def _svi_bindings(management):
-    from dcim.models import Interface
-
-    bindings = []
-    for interface in Interface.objects.filter(device_id=management.device_id, type="virtual").order_by("pk"):
-        definition = _svi_definition(interface)
-        if definition is None:
-            continue
-        _svi_type, vid = definition
-        if _device_vlan(management.device_id, vid, preferred=interface.untagged_vlan) is not None:
-            bindings.append(_native_binding("svi", interface, "netbox_nso_plugin.nsosvistate"))
-    return tuple(bindings)
 
 
 def _switchport_bindings(management):
@@ -1604,7 +1571,6 @@ _NATIVE_BINDING_BUILDERS = {
     "lacp": _lacp_bindings,
     "ospf": _ospf_bindings,
     "static_route": _static_route_bindings,
-    "svi": _svi_bindings,
     "switchport": _switchport_bindings,
     "vlan": _vlan_bindings,
 }

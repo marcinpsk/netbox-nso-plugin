@@ -59,7 +59,31 @@ def vlan_identity_from_name(candidate, native, interface):
     NSOSubinterfaceState(unit=int(native.name.rsplit(".", 1)[-1]), dot1q_vlan=100)
     # ok: nso-vlan-identity-from-interface-name
     payload = {"unit": int(native.name.split(".")[-1]), "dot1q_vlan": 100}
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(interface.name[4:])
+    # ruleid: nso-vlan-identity-from-interface-name
+    vlan = int(interface.name[4:])
+    name = interface.name.lower()
+    # ruleid: nso-vlan-identity-from-interface-name
+    return "svi", int(name[4:])
     return candidate, vid, vlan, unit
+
+
+def irb_vlan_identity_from_name(interface):
+    name = interface.name.lower()
+    # ruleid: nso-vlan-identity-from-interface-name
+    return "irb", int(name[4:])
+
+
+def native_svi_definition_from_name(interface):
+    name = (interface.name or "").lower()
+    if name.startswith("vlan") and name[4:].isdigit():
+        # ruleid: nso-vlan-identity-from-interface-name
+        return "svi", int(name[4:])
+    if name.startswith("irb.") and name[4:].isdigit():
+        # ruleid: nso-vlan-identity-from-interface-name
+        return "irb", int(name[4:])
+    return None
 
 
 def switching_client_ownership(client, device_id, roots):

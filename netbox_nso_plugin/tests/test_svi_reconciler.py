@@ -317,7 +317,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         from dcim.models import Interface
         from ipam.models import VLAN
 
-        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.models import NSOSVIState, NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
         in_flight_rows = tuple(
@@ -328,6 +328,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         )
         iface = Interface.objects.create(device=self.device, name=name, type="virtual")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
+        NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
         state = NSOSVIState.objects.create(
             management=self.management,
             interface=iface,
