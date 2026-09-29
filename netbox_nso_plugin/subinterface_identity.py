@@ -19,6 +19,10 @@ def subinterface_parent_errors(management, parent):
         return identity_errors
     if parent.name.lower().startswith(("lo", "irb")):
         return ["Loopback and IRB interfaces cannot be subinterface parents."]
+    if parent.parent_id is not None:
+        return ["A subinterface cannot be a subinterface parent."]
+    if parent.name.lower().startswith("vlan"):
+        return ["An SVI cannot be a subinterface parent."]
     if parent.mode or NSOSwitchportState.objects.filter(management=management, interface=parent).exists():
         return ["A switchport cannot be a subinterface parent."]
     return []

@@ -267,6 +267,22 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
         }
         self.assertEqual(names, {"GigabitEthernet0/1.300": 300, "ae99.7": 100})
 
+    def test_create_view_rejects_subinterface_and_svi_parents(self):
+        self.client.force_login(get_user_model().objects.create_user("subif-parent-admin", is_superuser=True))
+        url = reverse("plugins:netbox_nso_plugin:subinterface_add", kwargs={"device_pk": self.device.pk})
+        child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
+        svi = Interface.objects.create(device=self.device, name="Vlan10", type="virtual")
+        for parent, message in (
+            (child, "A subinterface cannot be a subinterface parent."),
+            (svi, "An SVI cannot be a subinterface parent."),
+        ):
+            with self.subTest(parent=parent.name):
+                response = self.client.post(url, {"parent": parent.pk, "unit": 5, "dot1q_vlan": 200, "vrf": ""})
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(message, response.context["form"].errors["parent"])
+        self.assertFalse(Interface.objects.filter(device=self.device, name__in=("ae99.7.5", "Vlan10.5")).exists())
+        self.assertFalse(NSOSubinterfaceState.objects.filter(management=self.mgmt).exists())
+
     def test_create_rejects_bad_tag_unit_and_parent(self):
         from netbox_nso_plugin.subinterface_create import create_subinterface
 
