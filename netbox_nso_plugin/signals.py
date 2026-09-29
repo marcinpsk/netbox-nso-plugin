@@ -1672,12 +1672,10 @@ def _on_svi_state_save(sender, instance, **kwargs):
 
 
 def subinterface_intent_item(row):
-    """Return one dot1q subinterface in its exact wire shape, or None when unkeyed."""
-    if row.dot1q_vlan is None or row.parent_interface is None:
-        return None
+    """Return the row's wire fields for valid delivery or invalid-state fingerprinting."""
     return {
         "interface_name": row.interface.name,
-        "parent_interface": row.parent_interface.name,
+        "parent_interface": row.parent_interface.name if row.parent_interface else None,
         "dot1q_vlan": row.dot1q_vlan,
         "type": "subinterface",
         "vrf": row.vrf or "",
@@ -1692,19 +1690,38 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOSubinterfaceState
+    from .subinterface_identity import subinterface_errors
 
     interfaces = []
+    blocked = []
     for row in NSOSubinterfaceState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface", "parent_interface"):
-        if item := subinterface_intent_item(row):
-            interfaces.append(item)
+    ).select_related("management", "management__device", "interface", "parent_interface"):
+        errors = subinterface_errors(row)
+        if errors:
+            reason = ", ".join(f"{field}: {'; '.join(messages)}" for field, messages in errors.items())
+            blocked.append(f"{row.management.device.name} {row.interface.name}: {reason}")
+        else:
+            interfaces.append(subinterface_intent_item(row))
+
+    payload = {"blocked": blocked} if blocked else interfaces
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            from .adapter_client import AdapterError
+
+            raise AdapterError(
+                f"Subinterface snapshot is blocked: {'; '.join(body['blocked'])}",
+                code="validation_error",
+                detail={"reason": "blocked_owned_row"},
+            )
+        return client.put_subinterface_intent(adapter_device_id, body)
 
     _push_changed(
         (device_id, "subinterface"),
-        interfaces,
-        lambda body: client.put_subinterface_intent(adapter_device_id, body),
+        payload,
+        push,
     )
 
 

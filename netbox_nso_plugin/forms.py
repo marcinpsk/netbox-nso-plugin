@@ -28,6 +28,19 @@ from .models import (
 from .vault_refs import VaultRefError, parse_vault_ref, qualify_snmp_ref, secret_fingerprint
 
 
+class NSOSubinterfaceCreateForm(forms.Form):
+    """Collect an explicit parent, unit, and dot1q tag for one managed device."""
+
+    parent = forms.ModelChoiceField(queryset=Interface.objects.none())
+    unit = forms.IntegerField(min_value=0)
+    dot1q_vlan = forms.IntegerField(min_value=1, max_value=4094, label="dot1q VLAN")
+    vrf = forms.CharField(max_length=128, required=False)
+
+    def __init__(self, *args, device, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["parent"].queryset = Interface.objects.filter(device=device).order_by("name")
+
+
 def _vault_settings_layout():
     """Return (kv_mount, base_path) from the enabled NSOVaultSettings singleton, else (None, None)."""
     settings_obj = NSOVaultSettings.objects.first()

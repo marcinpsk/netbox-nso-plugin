@@ -3,6 +3,7 @@
 """Positive and negative examples for the custom review checks."""
 
 import contextlib
+import re
 import django.db.models.signals
 from unittest.mock import patch
 from threading import BrokenBarrierError
@@ -12,6 +13,53 @@ from django.db.models.signals import post_save, pre_save
 from ipam.models import VLANGroup
 from netbox_nso_plugin.signals import suppress_intent_push, _schedule_intent_push
 from netbox_nso_plugin import signals
+
+
+def vlan_identity_from_name(candidate, native, interface):
+    # ruleid: nso-vlan-identity-from-interface-name
+    candidate.dot1q_vlan = int(native.name.rsplit(".", 1)[-1])
+    # ruleid: nso-vlan-identity-from-interface-name
+    dot1q_vlan = int(native.name.rsplit(".", 1)[-1])
+    suffix = native.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-from-interface-name
+    candidate.dot1q_vlan = int(suffix) if suffix.isdigit() else None
+    tail = interface.name.partition(".")[2]
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(tail)
+    match = re.match(r".*\.(\d+)$", interface.name)
+    # ruleid: nso-vlan-identity-from-interface-name
+    vlan = int(match.group(1))
+    # ok: nso-vlan-identity-from-interface-name
+    unit = int(interface.name.rsplit(".", 1)[-1])
+    # ruleid: nso-vlan-identity-from-interface-name
+    NSOSubinterfaceState(dot1q_vlan=int(native.name.rsplit(".", 1)[-1]))
+    # ruleid: nso-vlan-identity-from-interface-name
+    payload = {"unit": 7, "dot1q_vlan": int(native.name.split(".")[-1])}
+    suffix = native.name.removeprefix("ae99.")
+    # ruleid: nso-vlan-identity-from-interface-name
+    candidate.dot1q_vlan = int(suffix)
+    # ruleid: nso-vlan-identity-from-interface-name
+    dot1q_vlan = int(suffix)
+    # ruleid: nso-vlan-identity-from-interface-name
+    NSOSubinterfaceState(dot1q_vlan=int(suffix))
+    partitioned = native.name.partition(".")[2]
+    # ruleid: nso-vlan-identity-from-interface-name
+    payload = {"dot1q_vlan": int(partitioned)}
+    matched = re.match(r".*\.(\d+)$", native.name)
+    # ruleid: nso-vlan-identity-from-interface-name
+    candidate.dot1q_vlan = int(matched.group(1))
+    # ruleid: nso-vlan-identity-from-interface-name
+    NSOSubinterfaceState(dot1q_vlan=int(matched.group(1)))
+    # ruleid: nso-vlan-identity-from-interface-name
+    payload = {"dot1q_vlan": int(matched.group(1))}
+    searched = re.search(r"\.(\d+)$", native.name)
+    # ruleid: nso-vlan-identity-from-interface-name
+    NSOSubinterfaceState(dot1q_vlan=int(searched.group(1)), status="accepted")
+    # ok: nso-vlan-identity-from-interface-name
+    NSOSubinterfaceState(unit=int(native.name.rsplit(".", 1)[-1]), dot1q_vlan=100)
+    # ok: nso-vlan-identity-from-interface-name
+    payload = {"unit": int(native.name.split(".")[-1]), "dot1q_vlan": 100}
+    return candidate, vid, vlan, unit
 
 
 def switching_client_ownership(client, device_id, roots):

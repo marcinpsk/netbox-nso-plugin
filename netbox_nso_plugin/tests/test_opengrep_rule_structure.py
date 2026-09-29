@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib.util
 import keyword
 import re
@@ -26,8 +27,8 @@ _COVERAGE_PATH = _RULES_PATH.parent / "tests" / "coverage.py"
 _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside"}
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
 _ROOT_NAME = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)(?=\s*[.(])")
-# opengrep matches the method receiver literally, so "self" is never an import root.
-_ALLOWED_ROOT_NAMES = frozenset({"self"})
+# opengrep matches the method receiver and builtin calls literally; neither is an import root.
+_ALLOWED_ROOT_NAMES = frozenset({"self"}) | frozenset(dir(builtins))
 
 _COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
 assert _COVERAGE_SPEC is not None
