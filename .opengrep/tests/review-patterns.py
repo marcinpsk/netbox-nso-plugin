@@ -332,6 +332,60 @@ def vlan_suffix_concatenated_from_clean_value(candidate, interface):
     candidate.dot1q_vlan = int(suffix)
 
 
+def vlan_tuple_suffix_from_explicit_field(interface):
+    tail, suffix = interface.name.rsplit(".", 1)[-1], interface.cf["vlan"]
+    # ok: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_tuple_suffix_from_name(interface):
+    suffix, tail = interface.name.rsplit(".", 1)[-1], interface.cf["vlan"]
+    # ruleid: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_list_suffix_from_explicit_field(interface):
+    [tail, suffix] = [interface.name.rsplit(".", 1)[-1], interface.cf["vlan"]]
+    # ok: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_list_suffix_from_name(interface):
+    [suffix, tail] = [interface.name.rsplit(".", 1)[-1], interface.cf["vlan"]]
+    # ruleid: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_suffix_from_nonliteral_unpacking(interface):
+    values = interface.name.rsplit(".", 1)[-1], interface.cf["vlan"]
+    tail, suffix = values
+    # ruleid: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_suffix_from_starred_target(interface):
+    *tail, suffix = interface.name.rsplit(".", 1)[-1], interface.cf["vlan"]
+    # ruleid: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_suffix_from_starred_value(interface):
+    tail, suffix = *interface.name.rsplit(".", 1), interface.cf["vlan"]
+    # ruleid: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_suffix_from_mismatched_unpacking(interface):
+    tail, suffix = interface.name.rsplit(".", 1)[-1], interface.cf["vlan"], "100"
+    # ruleid: nso-vlan-identity-flow
+    return dict(dot1q_vlan=int(suffix))
+
+
+def vlan_suffix_from_comprehension_unpacking(interface):
+    # ruleid: nso-vlan-identity-flow
+    return [dict(dot1q_vlan=int(suffix)) for tail, suffix in [(interface.name.rsplit(".", 1)[-1], interface.cf["vlan"])]]
+
+
 def vlan_suffix_in_comprehensions(interface, candidates):
     suffix = interface.name.rsplit(".", 1)[-1]
     # ruleid: nso-vlan-identity-flow

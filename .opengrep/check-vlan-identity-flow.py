@@ -142,6 +142,17 @@ def _sources(node, visited: set) -> set[str]:
             statement = assignment.assign_type()
             if isinstance(statement, (nodes.Assign, nodes.AnnAssign)):
                 value = assignment if statement.value is None else statement.value
+                target = assignment.parent
+                if (
+                    isinstance(statement, nodes.Assign)
+                    and isinstance(target, (nodes.Tuple, nodes.List))
+                    and target in statement.targets
+                    and all(isinstance(element, nodes.AssignName) for element in target.elts)
+                    and isinstance(value, (nodes.Tuple, nodes.List))
+                    and len(target.elts) == len(value.elts)
+                    and not any(isinstance(element, nodes.Starred) for element in value.elts)
+                ):
+                    value = value.elts[target.elts.index(assignment)]
                 sources.update(_sources(value, visited | {assignment}))
             elif isinstance(statement, nodes.AugAssign):
                 sources.update(_sources(assignment, visited | {assignment}))
