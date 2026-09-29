@@ -152,6 +152,56 @@ class TestSviReconciler(TestCase):
         )
         self.assertEqual(rows[0].vlan.vid, 150)
 
+    def test_reconcile_clears_imported_vlan_when_detached_vid_becomes_ambiguous(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        original_vlan = VLAN.objects.create(group=group, vid=10, name="Original")
+        attachment = NSOVLANState.objects.create(management=self.management, vlan=original_vlan, status="imported")
+        payload = {"interfaces": [{"interface_name": "Vlan10", "vlan_id": 10, "type": "svi"}]}
+        state = reconcile_svi(self.device, payload)[0]
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.vlan_id, original_vlan.pk)
+
+        attachment.delete()
+        for label in ("second", "third"):
+            shared = VLANGroup.objects.create(name=f"SVI {label}", slug=f"svi-{label}")
+            vlan = VLAN.objects.create(group=shared, vid=10, name=label)
+            NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
+
+        rows = reconcile_svi(self.device, payload)
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertIsNone(state.vlan)
+
+    def test_reconcile_keeps_imported_vlan_when_attached_vid_becomes_ambiguous(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        original_vlan = VLAN.objects.create(group=group, vid=10, name="Original")
+        NSOVLANState.objects.create(management=self.management, vlan=original_vlan, status="imported")
+        payload = {"interfaces": [{"interface_name": "Vlan10", "vlan_id": 10, "type": "svi"}]}
+        state = reconcile_svi(self.device, payload)[0]
+        shared = VLANGroup.objects.create(name="Later SVI VLANs", slug="later-svi-vlans")
+        second_vlan = VLAN.objects.create(group=shared, vid=10, name="Later")
+        NSOVLANState.objects.create(management=self.management, vlan=second_vlan, status="imported")
+
+        reconcile_svi(self.device, payload)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.vlan_id, original_vlan.pk)
+
     def test_existing_interface_is_reused_not_duplicated(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 

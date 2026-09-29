@@ -110,7 +110,9 @@ def _svi_reconcile_operations(device, payload, planned_at):
             matches = desired_vid == vid and state.svi_type == device_type and state.vrf == device_vrf
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
-            keep_reference = ambiguous and current is not None and current.vlan is not None and current.vlan.vid == vid
+            keep_reference = (
+                ambiguous and current is not None and current.vlan_id is not None and current.vlan_id in matches_for_vid
+            )
             state.vlan = current.vlan if keep_reference else vlan
             state.svi_type = device_type
             state.vrf = device_vrf
