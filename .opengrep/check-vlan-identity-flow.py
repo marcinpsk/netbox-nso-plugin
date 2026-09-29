@@ -13,7 +13,6 @@ from python_check_paths import scan_python_paths
 try:
     import astroid
     from astroid import nodes
-    from astroid.filter_statements import _filter_stmts
 except ImportError as error:
     raise SystemExit("nso-vlan-identity-flow: astroid 4.x is required; install it for python3") from error
 
@@ -45,7 +44,7 @@ def _lower_source(node) -> bool:
 
 def _branch_assigns(body, name: str) -> bool:
     for statement in body:
-        if isinstance(statement, (nodes.Assign, nodes.AnnAssign, nodes.AugAssign)):
+        if isinstance(statement, (nodes.Assign, nodes.AnnAssign)):
             if isinstance(statement, nodes.AnnAssign) and statement.value is None:
                 continue
             targets = statement.targets if isinstance(statement, nodes.Assign) else [statement.target]
@@ -68,20 +67,42 @@ def _overwritten(assignment, use) -> bool:
     child = use
     while child is not use.scope():
         parent = child.parent
-        for field in ("body", "orelse"):
+        for field in ("body", "orelse", "finalbody"):
             body = getattr(parent, field, None)
             if not isinstance(body, list) or child not in body:
                 continue
             for statement in body[: body.index(child)]:
-                if (
-                    isinstance(statement, nodes.If)
-                    and assignment.lineno < statement.lineno
-                    and _branch_assigns(statement.body, use.name)
-                    and _branch_assigns(statement.orelse, use.name)
-                ):
+                if (assignment.lineno, assignment.col_offset) < (
+                    statement.lineno,
+                    statement.col_offset,
+                ) and _branch_assigns([statement], use.name):
                     return True
         child = parent
     return False
+
+
+def _reaching_bindings(node, scope):
+    loop_body = []
+    child = node
+    while child is not scope:
+        parent = child.parent
+        if isinstance(parent, (nodes.For, nodes.AsyncFor, nodes.While)) and child in parent.body:
+            loop_body.extend(parent.body)
+        child = parent
+    bindings = []
+    for binding in scope.locals.get(node.name, []):
+        statement = binding.assign_type() if isinstance(binding, nodes.AssignName) else binding
+        if (
+            isinstance(statement, (nodes.Assign, nodes.AnnAssign, nodes.NamedExpr))
+            and statement.value is not None
+            and (statement.value is node or statement.value.parent_of(node))
+        ):
+            continue
+        if (binding.lineno, binding.col_offset) < (node.lineno, node.col_offset) or any(
+            statement is binding or statement.parent_of(binding) for statement in loop_body
+        ):
+            bindings.append(binding)
+    return bindings
 
 
 def _lookup_name(node):
@@ -111,24 +132,8 @@ def _lookup_name(node):
             end_lineno=inner.end_lineno,
             end_col_offset=inner.end_col_offset,
         )
-    scope, assignments = node.lookup(node.name)
-    if scope is node.scope() and any(
-        isinstance(binding.assign_type(), nodes.NamedExpr)
-        and (binding.assign_type().value is node or binding.assign_type().value.parent_of(node))
-        for binding in assignments
-        if isinstance(binding, nodes.AssignName)
-    ):
-        bindings = [
-            binding
-            for binding in scope.locals.get(node.name, [])
-            if not (
-                isinstance(binding, nodes.AssignName)
-                and isinstance(binding.assign_type(), nodes.NamedExpr)
-                and (binding.assign_type().value is node or binding.assign_type().value.parent_of(node))
-            )
-        ]
-        assignments = _filter_stmts(node, bindings, scope, 0)
-    return node, scope, assignments
+    scope = node.scope()
+    return node, scope, _reaching_bindings(node, scope) if isinstance(scope, nodes.FunctionDef) else []
 
 
 def _source(node) -> set[str]:
@@ -198,7 +203,9 @@ def _sources(node, visited: set) -> set[str]:
                 continue
             statement = assignment.assign_type() if isinstance(assignment, nodes.AssignName) else assignment
             if isinstance(statement, (nodes.Assign, nodes.AnnAssign, nodes.NamedExpr)):
-                value = assignment if statement.value is None else statement.value
+                if statement.value is None:
+                    continue
+                value = statement.value
                 target = assignment.parent
                 if (
                     isinstance(statement, nodes.Assign)
