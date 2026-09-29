@@ -26,6 +26,22 @@ def vlan_identity_from_name(candidate, native, interface):
     tail = interface.name.partition(".")[2]
     # ruleid: nso-vlan-identity-from-interface-name
     vid = int(tail)
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(interface.name.rsplit(".", 1)[-1])
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(interface.name.split(".")[-1])
+    vid_tail = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(vid_tail)
+    vid_part = interface.name.split(".")[1]
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(vid_part)
+    vid_stripped = interface.name.removeprefix("irb.")
+    # ruleid: nso-vlan-identity-from-interface-name
+    vid = int(vid_stripped)
+    vid_field = interface.cf["vlan"]
+    # ok: nso-vlan-identity-from-interface-name
+    vid = int(vid_field)
     match = re.match(r".*\.(\d+)$", interface.name)
     # ruleid: nso-vlan-identity-from-interface-name
     vlan = int(match.group(1))

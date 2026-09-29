@@ -10,6 +10,7 @@ rules:
           - pattern-either:
               - pattern: $OBJECT.dot1q_vlan = int($EXPR)
               - pattern: dot1q_vlan = int($EXPR)
+              - pattern: vid = int($EXPR)
               - pattern: $CALL(..., dot1q_vlan=int($EXPR), ...)
               - pattern: '{..., "dot1q_vlan": int($EXPR), ...}'
           - metavariable-regex:
@@ -20,6 +21,7 @@ rules:
               - pattern: $OBJECT.dot1q_vlan = int($SUFFIX)
               - pattern: dot1q_vlan = int($SUFFIX)
               - pattern: $OBJECT.dot1q_vlan = int($SUFFIX) if ... else ...
+              - pattern: vid = int($SUFFIX)
               - pattern: $CALL(..., dot1q_vlan=int($SUFFIX), ...)
               - pattern: '{..., "dot1q_vlan": int($SUFFIX), ...}'
           - pattern-either:
@@ -32,11 +34,6 @@ rules:
           - metavariable-regex:
               metavariable: $METHOD
               regex: '^(?:rsplit|split|partition|removeprefix)$'
-      - patterns:
-          - pattern: vid = int($SUFFIX)
-          - pattern-inside: |
-              $SUFFIX = $INTERFACE.name.partition(".")[$INDEX]
-              ...
       - patterns:
           - pattern-either:
               - pattern: vlan = int($MATCH.group($INDEX))
