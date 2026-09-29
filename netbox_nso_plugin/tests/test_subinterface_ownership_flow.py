@@ -119,6 +119,80 @@ class TestSubinterfaceCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, Tran
         self.assertFalse(NSOSubinterfaceState.objects.filter(management=self.management).exists())
         self.assertFalse(Interface.objects.filter(device=self.device, name="ae99.7").exists())
 
+    def test_parent_rename_while_accept_waits_refuses_ownership(self):
+        user = get_user_model().objects.create_user("subif-accept-race-admin", is_superuser=True)
+        child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
+        state = NSOSubinterfaceState.objects.create(
+            management=self.management,
+            interface=child,
+            parent_interface=self.parent,
+            dot1q_vlan=100,
+            status="imported",
+        )
+        url = reverse("plugins:netbox_nso_plugin:subinterface_accept", args=[state.pk])
+
+        def accept():
+            client = Client()
+            client.force_login(get_user_model().objects.get(pk=user.pk))
+            return client.post(url)
+
+        result = self._overlapping_create(
+            lambda: Interface.objects.filter(pk=self.parent.pk).update(name="ae50"), attempt=accept
+        )
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["value"].status_code, 302)
+        self.assertEqual(NSOSubinterfaceState.objects.get(pk=state.pk).status, "imported")
+
+    def test_parent_rename_while_inline_edit_waits_refuses_ownership(self):
+        user = get_user_model().objects.create_user("subif-edit-race-admin", is_superuser=True)
+        child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
+        state = NSOSubinterfaceState.objects.create(
+            management=self.management,
+            interface=child,
+            parent_interface=self.parent,
+            dot1q_vlan=100,
+            status="imported",
+        )
+        url = reverse("plugins:netbox_nso_plugin:overlay_field_edit", kwargs={"key": "subinterface", "pk": state.pk})
+
+        def edit():
+            client = Client()
+            client.force_login(get_user_model().objects.get(pk=user.pk))
+            return client.post(url, {"vrf": "BLUE"})
+
+        result = self._overlapping_create(
+            lambda: Interface.objects.filter(pk=self.parent.pk).update(name="ae50"), attempt=edit
+        )
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["value"].status_code, 400)
+        state.refresh_from_db()
+        self.assertEqual((state.status, state.vrf), ("imported", ""))
+
+    def test_native_parent_change_while_accept_waits_refuses_ownership(self):
+        user = get_user_model().objects.create_user("subif-link-race-admin", is_superuser=True)
+        other_parent = Interface.objects.create(device=self.device, name="ae50", type="lag")
+        child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
+        state = NSOSubinterfaceState.objects.create(
+            management=self.management,
+            interface=child,
+            parent_interface=self.parent,
+            dot1q_vlan=100,
+            status="imported",
+        )
+        url = reverse("plugins:netbox_nso_plugin:subinterface_accept", args=[state.pk])
+
+        def accept():
+            client = Client()
+            client.force_login(get_user_model().objects.get(pk=user.pk))
+            return client.post(url)
+
+        result = self._overlapping_create(
+            lambda: Interface.objects.filter(pk=child.pk).update(parent=other_parent), attempt=accept
+        )
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["value"].status_code, 302)
+        self.assertEqual(NSOSubinterfaceState.objects.get(pk=state.pk).status, "imported")
+
     def test_parent_becomes_switchport_after_validation_refuses_create(self):
         result = self._overlapping_create(lambda: Interface.objects.filter(pk=self.parent.pk).update(mode="access"))
         self.assertIsInstance(result.get("error"), ValidationError, result)

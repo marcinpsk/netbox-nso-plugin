@@ -1632,6 +1632,14 @@ def put_route_policy_intent(adapter_device_id, objects):
     )
 
 
+def get_device_ned(adapter_device_id):
+    """Read the NED stored on the adapter device record without hiding errors."""
+    result = _document(_request("GET", f"/api/v1/devices/{adapter_device_id}/capability"), "capability document")
+    if result.get("known") is not True:
+        return None
+    return result.get("ned_id")
+
+
 def get_device_capability(adapter_device_id, refresh=False):
     """GET /api/v1/devices/{id}/capability — the route-policy capability verdict for this device.
 

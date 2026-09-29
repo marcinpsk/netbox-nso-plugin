@@ -52,6 +52,7 @@ from .forms import (
     NSOSnmpSystemInfoStateForm,
     NSOSnmpV3UserStateForm,
     NSOSubinterfaceCreateForm,
+    NSOSVICreateForm,
     NSOVaultSettingsForm,
 )
 from .intent_state import IntentTransactionNoOp as _IntentTransactionNoOp
@@ -496,7 +497,7 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 # Grid category → the intent-push scope whose rejection record belongs on its banner.
 # Only the scopes whose push failures are persisted appear here (see
 # signals._record_push_outcome); a category with no entry simply renders no banner.
-_CATEGORY_PUSH_SCOPES = {"static": "static_route", "subinterface": "subinterface"}
+_CATEGORY_PUSH_SCOPES = {"static": "static_route", "subinterface": "subinterface", "svi": "svi"}
 _PUBLIC_STATIC_ROUTE_PUSH_REASONS = frozenset(
     {
         "backfill_carries_deletions",
@@ -4448,6 +4449,51 @@ def _subinterface_errors(obj):
     return subinterface_errors(obj)
 
 
+def _svi_errors(obj):
+    """Validate one SVI with the shared identity contract."""
+    from .svi_identity import svi_errors
+
+    return svi_errors(obj)
+
+
+def _overlay_identity_plan(key, candidate):
+    """Freeze identity inputs and validate their current values under the writer lock."""
+    if key not in ("svi", "subinterface"):
+        return (), None
+
+    from dcim.models import Interface
+    from ipam.models import VLAN
+
+    dependencies = [candidate.interface]
+    if key == "svi":
+        if candidate.vlan_id is not None:
+            dependencies.append(candidate.vlan)
+            attachment = NSOVLANState.objects.filter(
+                management_id=candidate.management_id, vlan_id=candidate.vlan_id
+            ).first()
+            if attachment is not None:
+                dependencies.append(attachment)
+    elif candidate.parent_interface_id is not None:
+        dependencies.append(candidate.parent_interface)
+
+    def validate_after_acquire():
+        fresh = copy.copy(candidate)
+        interface = Interface.objects.filter(pk=candidate.interface_id).first()
+        if interface is None:
+            raise _IntentTransactionNoOp({"interface": ["Interface no longer exists."]})
+        fresh.interface = interface
+        if key == "svi" and candidate.vlan_id is not None:
+            fresh.vlan = VLAN.objects.filter(pk=candidate.vlan_id).first()
+            fresh.status = NSOSVIState.objects.filter(pk=candidate.pk).values_list("status", flat=True).first()
+        if key == "subinterface" and candidate.parent_interface_id is not None:
+            fresh.parent_interface = Interface.objects.filter(pk=candidate.parent_interface_id).first()
+        errors = _overlay_family_errors(key, fresh, {})
+        if errors:
+            raise _IntentTransactionNoOp(errors)
+
+    return dependencies, validate_after_acquire
+
+
 def _save_owned_bfd_edit(obj, old_values):
     """Claim one BFD edit and apply its exact native and overlay write set."""
     import copy
@@ -4805,7 +4851,7 @@ def _clear_apply_attempt(obj, update_fields) -> None:
     update_fields.add("apply_attempt_id")
 
 
-def _save_owned_overlay_only_edit(obj, old_values):
+def _save_owned_overlay_only_edit(obj, key, old_values):
     """Claim one edited overlay that has no matching native write."""
     import copy
 
@@ -4824,13 +4870,20 @@ def _save_owned_overlay_only_edit(obj, old_values):
     _clear_apply_attempt(candidate, update_fields)
     if candidate.accepted_at is not None:
         update_fields.add("accepted_at")
+    dependencies, validate_after_acquire = _overlay_identity_plan(key, candidate)
     plan = RendererMutationPlan.build(
         saves=(planned_save(candidate, update_fields=update_fields),),
+        read_dependencies=dependencies,
+        validate_after_acquire=validate_after_acquire,
         planned_at=planned_at,
     )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
-        writer.save(candidate, update_fields=update_fields)
+    try:
+        with mutation as writer:
+            writer.save(candidate, update_fields=update_fields)
+    except _IntentTransactionNoOp as exc:
+        return exc.result
+    return None
 
 
 def _write_owned_interface_mtu(
@@ -4939,29 +4992,28 @@ def _save_owned_overlay_edit(obj, key, old_values):
         "svi",
         "subinterface",
     }:
-        _save_owned_overlay_only_edit(obj, old_values)
-        return
+        return _save_owned_overlay_only_edit(obj, key, old_values)
     if key == "bfd":
         _save_owned_bfd_edit(obj, old_values)
-        return
+        return None
     if key == "static_route":
         _save_owned_static_route_edit(obj, old_values)
-        return
+        return None
     if key == "redistribution":
         _save_owned_redistribution_edit(obj, old_values)
-        return
+        return None
     if key in {"ospf_instance", "ospf_interface"}:
         _save_owned_ospf_edit(obj, key, old_values)
-        return
+        return None
     if key in {"isis_instance", "isis_interface"}:
         _save_owned_isis_edit(obj, key, old_values)
-        return
+        return None
     if key == "bgp_peer":
         _save_owned_bgp_edit(obj, old_values)
-        return
+        return None
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
-        return
+        return None
     raise ValueError(f"unsupported owned overlay edit family: {key}")
 
 
@@ -5363,6 +5415,8 @@ def _overlay_family_errors(key, obj, old_values):
         "logging_host": _logging_host_errors,
         "snmp_community": _snmp_community_errors,
         "snmp_host": _snmp_host_errors,
+        "svi": _svi_errors,
+        "subinterface": _subinterface_errors,
     }.get(key)
     if simple_validator is not None:
         return simple_validator(obj)
@@ -5388,8 +5442,6 @@ def _overlay_family_errors(key, obj, old_values):
         return _lacp_errors(key, obj)
     if key == "vlan_name":
         return _vlan_name_errors(obj)
-    if key == "subinterface":
-        return _subinterface_errors(obj)
     if key == "route_map_name":
         return _route_map_name_errors(obj, old_values["object_name"])
     return {}
@@ -5404,7 +5456,7 @@ def _save_overlay_edit(obj, key, old_values):
     elif key == "vlan_name":
         return _save_vlan_name_edit(obj)
     else:
-        _save_owned_overlay_edit(obj, key, old_values)
+        return _save_owned_overlay_edit(obj, key, old_values)
     return None
 
 
@@ -7177,15 +7229,23 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             candidate = copy.copy(current)
             candidate.status = _status_after_accept(current.status)
             candidate.accepted_at = timezone.now()
+            dependencies, validate_after_acquire = _overlay_identity_plan(self.renderer_scope, candidate)
             try:
                 plan = RendererMutationPlan.build(
                     saves=(planned_save(candidate, update_fields=fields),),
+                    read_dependencies=dependencies,
+                    validate_after_acquire=validate_after_acquire,
                     planned_at=candidate.accepted_at,
                 )
                 mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
                 with mutation as writer:
                     writer.save(candidate, update_fields=fields)
                 break
+            except _IntentTransactionNoOp as exc:
+                errors = exc.result
+                blocker = " ".join(dict.fromkeys(message for messages in errors.values() for message in messages))
+                messages.error(request, f"Cannot accept {current}: {blocker}")
+                return redirect(_device_nso_tab_url(current.management.device_id))
             except IntentMutationProtocolError:
                 if attempt:
                     messages.error(request, "Configuration state changed. Refresh the page and try again.")
@@ -7434,6 +7494,12 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
 class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
     model_class = NSOSVIState
     renderer_scope = "svi"
+
+    def push_blocker(self, state):
+        """Refuse ownership when the SVI identity is incomplete."""
+        from .svi_identity import svi_errors
+
+        return " ".join(dict.fromkeys(message for messages in svi_errors(state).values() for message in messages))
 
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
@@ -7746,6 +7812,52 @@ class NSOSubinterfaceCreateView(NSOActionPermissionMixin, View):
                 messages.success(request, "Subinterface created. Apply to write it to the device.")
                 return redirect(_device_nso_tab_url(device_pk))
         return render(request, "netbox_nso_plugin/subinterface_form.html", {"form": form, "object": management.device})
+
+
+class NSOSVICreateView(NSOActionPermissionMixin, View):
+    """Create a device-scoped owned SVI."""
+
+    required_permission = (
+        "netbox_nso_plugin.change_nsodevicemanagement",
+        "netbox_nso_plugin.add_nsosvistate",
+        "dcim.add_interface",
+    )
+
+    def get(self, request, device_pk):
+        management = get_object_or_404(
+            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
+        )
+        form = NSOSVICreateForm(management=management)
+        return render(request, "netbox_nso_plugin/svi_form.html", {"form": form, "object": management.device})
+
+    def post(self, request, device_pk):
+        from django.core.exceptions import ValidationError
+
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import IntentPlanStaleError
+        from .svi_create import create_svi
+
+        management = get_object_or_404(
+            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
+        )
+        form = NSOSVICreateForm(request.POST, management=management)
+        if form.is_valid():
+            try:
+                create_svi(management, **form.cleaned_data)
+            except ValidationError as exc:
+                if hasattr(exc, "message_dict"):
+                    for field, errors in exc.message_dict.items():
+                        for error in errors:
+                            form.add_error(field if field in form.fields else None, error)
+                else:
+                    for error in exc.messages:
+                        form.add_error(None, error)
+            except (IntentPlanStaleError, RendererTargetsChanged):
+                form.add_error(None, "SVI state changed. Refresh the page and try again.")
+            else:
+                messages.success(request, "SVI created. Apply to write it to the device.")
+                return redirect(_device_nso_tab_url(device_pk))
+        return render(request, "netbox_nso_plugin/svi_form.html", {"form": form, "object": management.device})
 
 
 class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):

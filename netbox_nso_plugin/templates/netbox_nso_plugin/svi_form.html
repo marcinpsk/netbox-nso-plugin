@@ -1,0 +1,22 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba #}
+{% extends 'base/layout.html' %}
+{% load form_helpers %}
+
+{% block title %}Add SVI: {{ object }}{% endblock %}
+
+{% block content %}
+<div class="row"><div class="col col-md-8 offset-md-2"><div class="card">
+  <h5 class="card-header">Add SVI to {{ object }}</h5>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {% render_form form %}
+      <div class="text-end">
+        <a href="{% url 'dcim:device_nso' pk=object.pk %}" class="btn btn-outline-secondary">Cancel</a>
+        <button type="submit" class="btn btn-primary">Create SVI</button>
+      </div>
+    </form>
+  </div>
+</div></div></div>
+{% endblock %}

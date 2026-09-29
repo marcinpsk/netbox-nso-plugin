@@ -1615,14 +1615,11 @@ def _on_logging_state_save(sender, instance, **kwargs):
 
 
 def svi_intent_item(row):
-    """Return one SVI in the adapter's exact wire shape, or None when unkeyed."""
-    vid = row.vlan.vid if row.vlan else None
-    if vid is None:
-        return None
+    """Return one SVI in the adapter's exact wire shape."""
     return {
         "interface_name": row.interface.name,
-        "vlan_id": vid,
-        "type": row.svi_type or "svi",
+        "vlan_id": row.vlan.vid if row.vlan else None,
+        "type": row.svi_type,
         "vrf": row.vrf or "",
     }
 
@@ -1635,19 +1632,38 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOSVIState
+    from .svi_identity import svi_errors
 
     interfaces = []
+    blocked = []
     for row in NSOSVIState.objects.filter(
         management__device_id=device_id,
         status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface", "vlan"):
-        if item := svi_intent_item(row):
-            interfaces.append(item)
+    ).select_related("management", "management__device", "interface", "vlan", "vlan__group"):
+        errors = svi_errors(row)
+        if errors:
+            reason = ", ".join(f"{field}: {'; '.join(messages)}" for field, messages in errors.items())
+            blocked.append(f"{row.management.device.name} {row.interface.name}: {reason}")
+        else:
+            interfaces.append(svi_intent_item(row))
+
+    payload = {"blocked": blocked} if blocked else interfaces
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            from .adapter_client import AdapterError
+
+            raise AdapterError(
+                f"SVI snapshot is blocked: {'; '.join(body['blocked'])}",
+                code="validation_error",
+                detail={"reason": "blocked_owned_row"},
+            )
+        return client.put_svi_intent(adapter_device_id, body)
 
     _push_changed(
         (device_id, "svi"),
-        interfaces,
-        lambda body: client.put_svi_intent(adapter_device_id, body),
+        payload,
+        push,
     )
 
 
