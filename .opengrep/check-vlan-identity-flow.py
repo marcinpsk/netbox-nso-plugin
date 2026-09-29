@@ -13,6 +13,7 @@ from python_check_paths import scan_python_paths
 try:
     import astroid
     from astroid import nodes
+    from astroid.filter_statements import _filter_stmts
 except ImportError as error:
     raise SystemExit("nso-vlan-identity-flow: astroid 4.x is required; install it for python3") from error
 
@@ -48,7 +49,12 @@ def _branch_assigns(body, name: str) -> bool:
             if isinstance(statement, nodes.AnnAssign) and statement.value is None:
                 continue
             targets = statement.targets if isinstance(statement, nodes.Assign) else [statement.target]
-            if any(isinstance(target, nodes.AssignName) and target.name == name for target in targets):
+            if any(
+                binding.name == name
+                for target in targets
+                if isinstance(target, (nodes.AssignName, nodes.Tuple, nodes.List))
+                for binding in target.nodes_of_class(nodes.AssignName)
+            ):
                 return True
         if isinstance(statement, nodes.If):
             if _branch_assigns(statement.body, name) and _branch_assigns(statement.orelse, name):
@@ -106,6 +112,22 @@ def _lookup_name(node):
             end_col_offset=inner.end_col_offset,
         )
     scope, assignments = node.lookup(node.name)
+    if scope is node.scope() and any(
+        isinstance(binding.assign_type(), nodes.NamedExpr)
+        and (binding.assign_type().value is node or binding.assign_type().value.parent_of(node))
+        for binding in assignments
+        if isinstance(binding, nodes.AssignName)
+    ):
+        bindings = [
+            binding
+            for binding in scope.locals.get(node.name, [])
+            if not (
+                isinstance(binding, nodes.AssignName)
+                and isinstance(binding.assign_type(), nodes.NamedExpr)
+                and (binding.assign_type().value is node or binding.assign_type().value.parent_of(node))
+            )
+        ]
+        assignments = _filter_stmts(node, bindings, scope, 0)
     return node, scope, assignments
 
 
@@ -130,6 +152,41 @@ def _source(node) -> set[str]:
     return set()
 
 
+def _binding_expressions(statement, assignment):
+    if isinstance(statement, (nodes.Comprehension, nodes.For, nodes.AsyncFor)):
+        return [statement.iter]
+    if isinstance(statement, (nodes.With, nodes.AsyncWith)):
+        return [
+            context
+            for context, target in statement.items
+            if target is not None and (target is assignment or target.parent_of(assignment))
+        ]
+    if isinstance(statement, (nodes.MatchAs, nodes.MatchStar, nodes.MatchMapping)):
+        match = statement.parent
+        while not isinstance(match, nodes.Match):
+            match = match.parent
+        return [match.subject]
+    if isinstance(
+        statement,
+        (
+            nodes.Arguments,
+            nodes.Import,
+            nodes.ImportFrom,
+            nodes.ExceptHandler,
+            nodes.Global,
+            nodes.Nonlocal,
+            nodes.FunctionDef,
+            nodes.ClassDef,
+        ),
+    ):
+        return []
+    return [
+        child
+        for child in statement.get_children()
+        if not child.is_statement and not isinstance(child, (nodes.AssignName, nodes.AssignAttr))
+    ]
+
+
 def _sources(node, visited: set) -> set[str]:
     if isinstance(node, (nodes.Name, nodes.AssignName)):
         use, scope, assignments = _lookup_name(node)
@@ -137,10 +194,10 @@ def _sources(node, visited: set) -> set[str]:
             return set()
         sources = set()
         for assignment in assignments:
-            if assignment in visited or not isinstance(assignment, nodes.AssignName) or _overwritten(assignment, use):
+            if assignment in visited or _overwritten(assignment, use):
                 continue
-            statement = assignment.assign_type()
-            if isinstance(statement, (nodes.Assign, nodes.AnnAssign)):
+            statement = assignment.assign_type() if isinstance(assignment, nodes.AssignName) else assignment
+            if isinstance(statement, (nodes.Assign, nodes.AnnAssign, nodes.NamedExpr)):
                 value = assignment if statement.value is None else statement.value
                 target = assignment.parent
                 if (
@@ -157,8 +214,9 @@ def _sources(node, visited: set) -> set[str]:
             elif isinstance(statement, nodes.AugAssign):
                 sources.update(_sources(assignment, visited | {assignment}))
                 sources.update(_sources(statement.value, visited | {assignment}))
-            elif isinstance(statement, nodes.Comprehension):
-                sources.update(_sources(statement.iter, visited | {assignment}))
+            else:
+                for value in _binding_expressions(statement, assignment):
+                    sources.update(_sources(value, visited | {assignment}))
         return sources
     sources = _source(node)
     for child in node.get_children():

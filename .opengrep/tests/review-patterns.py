@@ -148,6 +148,91 @@ def vlan_suffix_augmented_repeatedly(candidate, interface):
     candidate.dot1q_vlan = int(suffix)
 
 
+def vlan_suffix_through_walrus(candidate, interface):
+    suffix = interface.name.split(".")[-1]
+    if suffix := suffix.strip():
+        # ruleid: nso-vlan-identity-flow
+        candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_explicit_suffix_through_walrus(candidate, interface):
+    if suffix := interface.cf["vlan"]:
+        # ok: nso-vlan-identity-flow
+        candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_from_loop_target(candidate, interface):
+    for suffix in [interface.name.rsplit(".", 1)[-1]]:
+        # ruleid: nso-vlan-identity-flow
+        candidate.dot1q_vlan = int(suffix)
+
+
+async def vlan_suffix_from_async_loop_target(candidate, interface):
+    async for suffix in interface.name.rsplit(".", 1):
+        # ruleid: nso-vlan-identity-flow
+        candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_from_context_target(candidate, interface):
+    with contextlib.nullcontext(interface.name.split(".")[-1]) as suffix:
+        # ruleid: nso-vlan-identity-flow
+        candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_explicit_suffix_from_context_target(candidate, interface):
+    with contextlib.nullcontext(interface.name.split(".")[-1]) as other:
+        with contextlib.nullcontext(interface.cf["vlan"]) as suffix:
+            # ok: nso-vlan-identity-flow
+            candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_from_match_capture(candidate, interface):
+    match interface.name.split(".")[-1]:
+        case suffix:
+            # ruleid: nso-vlan-identity-flow
+            candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_from_parameter(candidate, suffix=interface.name.split(".")[-1]):
+    # ok: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_from_exception_name(candidate, interface):
+    try:
+        int(interface.name.split(".")[-1])
+    except ValueError as suffix:
+        # ok: nso-vlan-identity-flow
+        candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_from_import_alias(candidate):
+    from placeholder import suffix
+
+    # ok: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_overwritten_through_tuple(candidate, interface, flag):
+    suffix = interface.name.split(".")[-1]
+    if flag:
+        suffix, other = interface.cf["vlan"], "x"
+    else:
+        suffix, other = interface.cf["vlan"], "x"
+    # ok: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_overwritten_through_list(candidate, interface, flag):
+    suffix = interface.name.split(".")[-1]
+    if flag:
+        [suffix, *other] = [interface.cf["vlan"], "x"]
+    else:
+        [suffix, *other] = [interface.cf["vlan"], "x"]
+    # ok: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+
+
 def vlan_suffix_overwritten_in_both_branches(candidate, interface, flag):
     suffix = interface.name.rsplit(".", 1)[-1]
     if flag:
