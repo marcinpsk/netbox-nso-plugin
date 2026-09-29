@@ -296,6 +296,148 @@ def vlan_suffix_rederived_from_name(candidate, native):
     candidate.dot1q_vlan = int(suffix)
 
 
+def vlan_suffix_through_expressions(candidate, interface, values):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    suffix = suffix + "0"
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = suffix * 2
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = f"{suffix}0"
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = str(suffix)
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = "{}".format(suffix)
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = values[suffix]
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = suffix == "100"
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+    suffix = "100" if suffix else "200"
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_concatenated_from_clean_value(candidate, interface):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    other = interface.cf["vlan"]
+    suffix = other + "0"
+    # ok: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(suffix)
+
+
+def vlan_suffix_in_comprehensions(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates]
+
+
+def vlan_clean_suffix_in_comprehension(interface, candidates):
+    suffix = interface.cf["vlan"]
+    # ok: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates]
+
+
+def vlan_suffix_in_generator(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    return (NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates)
+
+
+def vlan_suffix_in_lambda(interface):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    return lambda: NSOSubinterfaceState(dot1q_vlan=int(suffix))
+
+
+def vlan_lambda_argument_shadows_suffix(interface):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ok: nso-vlan-identity-flow
+    return lambda suffix: NSOSubinterfaceState(dot1q_vlan=int(suffix))
+
+
+def vlan_comprehension_target_from_name(interface):
+    suffixes = interface.name.rsplit(".", 1)
+    # ruleid: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for suffix in suffixes]
+
+
+def vlan_comprehension_target_shadows_suffix(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ok: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for suffix in candidates]
+
+
+def vlan_comprehension_target_reuses_suffix(interface):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for suffix in [suffix]]
+
+
+def vlan_comprehension_target_overwritten_by_clean_iterable(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ok: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(value)) for value in [suffix] for value in candidates]
+
+
+def vlan_comprehension_filter_uses_current_target(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    return [value for value in [suffix] if NSOSubinterfaceState(dot1q_vlan=int(value)) for value in candidates]
+
+
+def vlan_comprehension_unpacking_from_name(interface):
+    suffixes = [interface.name.rsplit(".", 1)]
+    # ruleid: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for _, suffix in suffixes]
+
+
+def vlan_suffix_in_nested_comprehension(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    return [[NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in group] for group in candidates]
+
+
+def vlan_comprehension_uses_current_suffix(interface, candidates):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    # ruleid: nso-vlan-identity-flow
+    states = [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates]
+    suffix = interface.cf["vlan"]
+    return states
+
+
+def vlan_comprehension_precedes_name_source(interface, candidates):
+    suffix = interface.cf["vlan"]
+    # ok: nso-vlan-identity-flow
+    states = [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates]
+    suffix = interface.name.rsplit(".", 1)[-1]
+    return states
+
+
+def vlan_comprehension_follows_complete_overwrite(interface, candidates, flag):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    if flag:
+        suffix = interface.cf["vlan"]
+    else:
+        suffix = "100"
+    # ok: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates]
+
+
+def vlan_comprehension_follows_incomplete_overwrite(interface, candidates, flag):
+    suffix = interface.name.rsplit(".", 1)[-1]
+    if flag:
+        suffix = interface.cf["vlan"]
+    # ruleid: nso-vlan-identity-flow
+    return [NSOSubinterfaceState(dot1q_vlan=int(suffix)) for candidate in candidates]
+
+
 def vlan_suffix_from_explicit_field(candidate, interface):
     suffix = interface.name.rsplit(".", 1)[-1]
     suffix = interface.cf["vlan"]

@@ -22,6 +22,7 @@ _SUFFIX_METHODS = {"rsplit", "split", "partition", "removeprefix"}
 _REGEX_METHODS = {"match", "search", "fullmatch"}
 _SUFFIX_TARGETS = {"vid", "dot1q_vlan", "attribute", "keyword", "dict", "conditional"}
 _REGEX_TARGETS = {"vid", "vlan", "attribute", "keyword", "dict"}
+_COMPREHENSIONS = (nodes.ListComp, nodes.SetComp, nodes.DictComp, nodes.GeneratorExp)
 
 
 def _interface_name(node) -> bool:
@@ -77,25 +78,38 @@ def _overwritten(assignment, use) -> bool:
     return False
 
 
-def _sources(node, visited: set) -> set[str]:
-    if isinstance(node, (nodes.Name, nodes.AssignName)):
+def _lookup_name(node):
+    while isinstance(node.scope(), (*_COMPREHENSIONS, nodes.Lambda)):
+        inner = node.scope()
         scope, assignments = node.lookup(node.name)
-        if scope is not node.scope() or not isinstance(scope, nodes.FunctionDef):
-            return set()
-        sources = set()
-        for assignment in assignments:
-            if assignment in visited or not isinstance(assignment, nodes.AssignName) or _overwritten(assignment, node):
-                continue
-            statement = assignment.parent
-            if isinstance(statement, (nodes.Assign, nodes.AnnAssign)):
-                value = assignment if statement.value is None else statement.value
-                sources.update(_sources(value, visited | {assignment}))
-            elif isinstance(statement, nodes.AugAssign):
-                sources.update(_sources(assignment, visited | {assignment}))
-                sources.update(_sources(statement.value, visited | {assignment}))
-        return sources
-    if isinstance(node, nodes.Subscript):
-        return _sources(node.value, visited)
+        if isinstance(inner, _COMPREHENSIONS):
+            assignments = []
+            for generator in inner.generators:
+                if generator.iter is node or generator.iter.parent_of(node):
+                    break
+                targets = [
+                    target for target in generator.target.nodes_of_class(nodes.AssignName) if target.name == node.name
+                ]
+                if targets:
+                    assignments = targets
+                if any(condition is node or condition.parent_of(node) for condition in generator.ifs):
+                    break
+            scope = inner if assignments else None
+        if scope is inner:
+            return node, scope, assignments
+        node = nodes.Name(
+            node.name,
+            inner.lineno,
+            inner.col_offset,
+            inner.parent,
+            end_lineno=inner.end_lineno,
+            end_col_offset=inner.end_col_offset,
+        )
+    scope, assignments = node.lookup(node.name)
+    return node, scope, assignments
+
+
+def _source(node) -> set[str]:
     if not isinstance(node, nodes.Call) or not isinstance(node.func, nodes.Attribute):
         return set()
     method = node.func.attrname
@@ -113,7 +127,32 @@ def _sources(node, visited: set) -> set[str]:
         and not node.keywords
     ):
         return {"regex"}
-    return _sources(receiver, visited)
+    return set()
+
+
+def _sources(node, visited: set) -> set[str]:
+    if isinstance(node, (nodes.Name, nodes.AssignName)):
+        use, scope, assignments = _lookup_name(node)
+        if scope is not use.scope() or not isinstance(scope, (nodes.FunctionDef, *_COMPREHENSIONS, nodes.Lambda)):
+            return set()
+        sources = set()
+        for assignment in assignments:
+            if assignment in visited or not isinstance(assignment, nodes.AssignName) or _overwritten(assignment, use):
+                continue
+            statement = assignment.assign_type()
+            if isinstance(statement, (nodes.Assign, nodes.AnnAssign)):
+                value = assignment if statement.value is None else statement.value
+                sources.update(_sources(value, visited | {assignment}))
+            elif isinstance(statement, nodes.AugAssign):
+                sources.update(_sources(assignment, visited | {assignment}))
+                sources.update(_sources(statement.value, visited | {assignment}))
+            elif isinstance(statement, nodes.Comprehension):
+                sources.update(_sources(statement.iter, visited | {assignment}))
+        return sources
+    sources = _source(node)
+    for child in node.get_children():
+        sources.update(_sources(child, visited))
+    return sources
 
 
 def _assignment_target(node) -> str | None:
