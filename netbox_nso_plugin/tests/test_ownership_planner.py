@@ -263,6 +263,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "bfd",
             "ospf",
             "route_policy",
+            "subinterface",
         }
         assert {scope for scope, rule in rules.items() if rule.acquisition_strategy == "existing_overlay"} == {
             "bfd",
@@ -270,7 +271,10 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "logging",
             "route_policy",
             "snmp",
+            "subinterface",
         }
+        assert "subinterface" not in _NATIVE_BINDING_BUILDERS
+        assert rules["subinterface"].deletion_authority
         assert set(_NATIVE_BINDING_BUILDERS) == {
             scope
             for scope, rule in rules.items()

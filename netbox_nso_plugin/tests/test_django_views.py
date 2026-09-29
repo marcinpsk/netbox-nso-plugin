@@ -5760,7 +5760,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(duplicate.status_code, 400)
         self.assertIn("dot1q_vlan", duplicate.json()["errors"])
         self.assertEqual(missing_parent.status_code, 400)
-        self.assertIn("vrf", missing_parent.json()["errors"])
+        self.assertIn("parent_interface", missing_parent.json()["errors"])
         state.refresh_from_db()
         orphan.refresh_from_db()
         self.assertEqual((state.dot1q_vlan, state.status), (200, "imported"))
