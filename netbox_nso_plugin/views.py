@@ -7843,7 +7843,7 @@ class NSOSVICreateView(NSOActionPermissionMixin, View):
         form = NSOSVICreateForm(request.POST, management=management)
         if form.is_valid():
             try:
-                create_svi(management, **form.cleaned_data)
+                create_svi(management, **form.cleaned_data, svi_type=form.svi_type)
             except ValidationError as exc:
                 if hasattr(exc, "message_dict"):
                     for field, errors in exc.message_dict.items():

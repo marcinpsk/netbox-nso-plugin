@@ -31,9 +31,8 @@ def svi_type_for_device(management):
     raise ValidationError("The adapter device NED does not support SVI creation.")
 
 
-def create_svi(management, vlan, unit, vrf):
+def create_svi(management, vlan, unit, vrf, *, svi_type):
     """Create the native interface and accepted overlay as one planned mutation."""
-    svi_type = svi_type_for_device(management)
     if not attached_svi_vlans(management).filter(pk=vlan.pk).exists() or not 1 <= vlan.vid <= 4094:
         raise ValidationError({"vlan": "Choose a VLAN on this managed device with VID 1 through 4094."})
     if svi_type == "irb":
