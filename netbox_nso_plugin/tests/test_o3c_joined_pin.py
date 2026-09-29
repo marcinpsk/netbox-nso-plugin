@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from copy import deepcopy
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,8 +48,8 @@ def _adapter_commit_from_workflow() -> str:
 _ADAPTER_RUNTIME_DIGEST = "c5a905fac77477bb17ca96666e20d264f22fab84c04590ca2745868b71c89fea"
 _ADAPTER_ROOT = Path(__file__).resolve().parents[2].parent / ".o3c-adapter"
 _DSN_CREDENTIAL = re.compile(r"(?<=://)[^:/@\s]+:[^@/\s]+(?=@)")
-_SR_PATH = "/restconf/data/static-route-reconciler:static-route-config"
-_SR_ROOT = "static-route-reconciler:static-route-config"
+_DEVICE_INTENT_ROOT = "device-intent:device-intent"
+_DEVICE_INTENT_PATH = f"/restconf/data/{_DEVICE_INTENT_ROOT}"
 _STATE_READ_PATH = "/restconf/data/network-state-export:device-state-read/run"
 _NSO_DEVICE_PATH = "/restconf/data/tailf-ncs:devices/device="
 _PROVISION_COMPLETE_PATH = "/api/plugins/nso/provision-complete/"
@@ -122,11 +123,11 @@ class _AdapterWireSession(LoopbackOnlySession):
 
 
 class _RestconfState:
-    """Stateful static-route service and device views at the NSO boundary."""
+    """Stateful device-intent service and device views at the NSO boundary."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.service: dict[str, list[dict]] = {}
+        self.service: dict[str, dict] = {}
         self.device: dict[str, list[dict]] = {}
         self.calls: list[dict] = []
         self.held_device: str | None = None
@@ -139,26 +140,22 @@ class _RestconfState:
     def key(entry: dict) -> tuple[str, str, str]:
         return (entry.get("vrf") or "", entry.get("prefix") or "", entry.get("next-hop") or "")
 
-    def seed(self, device_name: str, routes: list[dict]) -> None:
-        with self.lock:
-            self.service[device_name] = [dict(route) for route in routes]
-            self.device[device_name] = [dict(route) for route in routes]
-
     def hold_removal_for(self, device_name: str) -> None:
         self.held_device = device_name
         self.removal_read_started.clear()
         self.allow_removal.clear()
 
-    def service_document(self, device_name: str) -> dict:
+    def service_document(self, device_name: str) -> dict | None:
         with self.lock:
-            routes = [dict(route) for route in self.service.get(device_name, [])]
-        return {_SR_ROOT: [{"device": device_name, "route": routes}]}
+            entry = deepcopy(self.service.get(device_name))
+        return {_DEVICE_INTENT_ROOT: [entry]} if entry is not None else None
 
-    def write(self, method: str, device_name: str, routes: list[dict], *, dry_run: bool, query: str) -> None:
+    def write(self, device_name: str, document: dict, *, dry_run: bool, no_networking: bool, query: str) -> None:
+        routes = document.get("static-route", {}).get("route", [])
         record = {
-            "method": method,
+            "method": "PUT",
             "device": device_name,
-            "routes": [dict(route) for route in routes],
+            "document": deepcopy(document),
             "dry_run": dry_run,
             "query": query,
         }
@@ -166,17 +163,19 @@ class _RestconfState:
             self.calls.append(record)
             if dry_run:
                 return
-            owned = {self.key(route) for route in self.service.get(device_name, [])}
+            previous = self.service.get(device_name, {})
+            owned = {self.key(route) for route in previous.get("static-route", {}).get("route", [])}
             replacement = {self.key(route) for route in routes}
-            by_key = {
-                self.key(route): dict(route)
-                for route in self.device.get(device_name, [])
-                if self.key(route) not in owned - replacement
-            }
-            for route in routes:
-                by_key[self.key(route)] = dict(route)
-            self.service[device_name] = [dict(route) for route in routes]
-            self.device[device_name] = list(by_key.values())
+            if not no_networking:
+                by_key = {
+                    self.key(route): dict(route)
+                    for route in self.device.get(device_name, [])
+                    if self.key(route) not in owned - replacement
+                }
+                for route in routes:
+                    by_key[self.key(route)] = dict(route)
+                self.device[device_name] = list(by_key.values())
+            self.service[device_name] = deepcopy(document)
 
     def device_section(self, device_name: str) -> dict:
         with self.lock:
@@ -225,9 +224,10 @@ class _RestconfHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _service_device(path: str) -> str | None:
-        if not path.startswith(f"{_SR_PATH}="):
+        if not path.startswith(f"{_DEVICE_INTENT_PATH}="):
             return None
-        return unquote(path.removeprefix(f"{_SR_PATH}="))
+        encoded_name = path.removeprefix(f"{_DEVICE_INTENT_PATH}=")
+        return unquote(encoded_name) if encoded_name and "/" not in encoded_name else None
 
     @staticmethod
     def _nso_device(path: str) -> tuple[str, str] | None:
@@ -251,14 +251,16 @@ class _RestconfHandler(BaseHTTPRequestHandler):
             known = name in self.state.nso_devices
         if not known:
             self._send_json(404, {"errors": "unknown device"})
-        elif method == "GET":
+        elif method == "GET" and not action:
             self._send_json(200, {"tailf-ncs:device": [{"name": name}]})
         elif method == "POST" and action == "ssh/fetch-host-keys":
             self._send_json(200, {"tailf-ncs:output": {"result": "updated", "fingerprint": [{"value": "o3c"}]}})
         elif method == "POST" and action == "sync-from":
             self._send_json(200, {"tailf-ncs:output": {"result": True}})
-        else:
+        elif method in ("PUT", "PATCH") and not action:
             self._send_empty(204)
+        else:
+            self._send_json(404, {"errors": "unsupported device operation"})
         return True
 
     def do_GET(self):  # noqa: N802
@@ -272,34 +274,63 @@ class _RestconfHandler(BaseHTTPRequestHandler):
         if device_name == self.state.held_device and not self.state.allow_removal.is_set():
             self.state.removal_read_started.set()
             self.state.allow_removal.wait(45)
-        self._send_json(200, self.state.service_document(device_name))
+        document = self.state.service_document(device_name)
+        if document is None:
+            self._send_json(404, {"errors": "unknown service instance"})
+        else:
+            self._send_json(200, document)
 
-    def _write_service(self, method: str) -> None:
+    def _write_service(self) -> None:
         parsed = urlparse(self.path)
-        body = self._json_body()
-        entries = body.get(_SR_ROOT) or []
-        if not entries:
+        device_name = self._service_device(parsed.path)
+        if device_name is None:
             self._send_json(404, {"errors": "unsupported test surface"})
             return
-        device_name = entries[0]["device"]
-        dry_run = "dry-run=" in parsed.query
-        routes = entries[0].get("route") or []
-        self.state.write(method, device_name, routes, dry_run=dry_run, query=parsed.query)
+        body = self._json_body()
+        entries = body.get(_DEVICE_INTENT_ROOT)
+        if (
+            not isinstance(entries, list)
+            or len(entries) != 1
+            or not isinstance(entries[0], dict)
+            or entries[0].get("device") != device_name
+        ):
+            self._send_json(400, {"errors": "invalid device-intent document"})
+            return
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        dry_run = "dry-run" in query
+        self.state.write(
+            device_name,
+            entries[0],
+            dry_run=dry_run,
+            no_networking="no-networking" in query,
+            query=parsed.query,
+        )
         if dry_run:
-            self._send_json(
-                200,
-                {"dry-run-result": {"native": {"device": [{"name": device_name, "data": ""}]}}},
+            result = (
+                {"cli": {"local-node": {"data": ""}}}
+                if query["dry-run"] == ["cli"]
+                else {"native": {"device": [{"name": device_name, "data": ""}]}}
             )
+            self._send_json(200, {"dry-run-result": result})
             return
         self._send_empty(204)
 
     def do_PUT(self):  # noqa: N802
         if not self._nso_device_node("PUT"):
-            self._write_service("PUT")
+            self._write_service()
 
     def do_PATCH(self):  # noqa: N802
         if not self._nso_device_node("PATCH"):
-            self._write_service("PATCH")
+            self._send_json(404, {"errors": "unsupported test surface"})
+
+    def do_DELETE(self):  # noqa: N802
+        self._send_json(404, {"errors": "unsupported test surface"})
+
+    def do_OPTIONS(self):  # noqa: N802
+        self._send_json(404, {"errors": "unsupported test surface"})
+
+    def do_HEAD(self):  # noqa: N802
+        self._send_empty(404)
 
     def do_POST(self):  # noqa: N802
         if self._nso_device_node("POST"):
@@ -327,7 +358,7 @@ class _RestconfHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if parsed.path.startswith("/api/plugins/"):
+        if parsed.path == _PROVISION_COMPLETE_PATH:
             body = self._json_body()
             with self.state.lock:
                 self.state.plugin_callbacks.append((parsed.path, body))
@@ -678,11 +709,11 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         NSODeviceManagement.objects.filter(pk=management.pk).update(auto_apply=True, sync_before_apply=False)
         management.refresh_from_db()
 
-    def _terminal_job(self, adapter_device_id: int, job_type: str):
+    def _terminal_job(self, adapter_device_id: int, job_type: str, *, after_id: int = 0):
         from netbox_nso_plugin import adapter_client
 
         jobs = adapter_client.list_jobs(adapter_device_id)
-        matches = [job for job in jobs if job.get("type") == job_type]
+        matches = [job for job in jobs if job.get("type") == job_type and job["id"] > after_id]
         terminal = [job for job in matches if job.get("status") in _TERMINAL_JOB_STATUSES]
         return terminal[0] if terminal else None
 
@@ -758,12 +789,28 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         assert management.onboard_status == ""
         assert management.onboard_steps == evidence["result"]["steps"]
 
+        host, port = self.environment.restconf_server.server_address[:2]
+        device_path = f"{_NSO_DEVICE_PATH}{quote(management.nso_device_name, safe='')}"
+        for method, path in (
+            ("GET", f"{device_path}/unsupported"),
+            ("PATCH", f"{device_path}/sync-from"),
+            ("POST", device_path),
+            ("DELETE", device_path),
+        ):
+            client = HTTPConnection(host, port, timeout=5)
+            try:
+                client.request(method, path)
+                response = client.getresponse()
+                response.read()
+                assert response.status == 404, (method, path, response.status)
+            finally:
+                client.close()
+
     def test_one_joined_edit_retracts_only_the_removed_device_and_settles_the_retained_device(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOStaticRouteState
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        from ._outbox_case import mirror_update
         from ._static_route_case import _assign_and_accept
 
         instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
@@ -776,16 +823,50 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         with without_commit_drain(), transaction.atomic():
             _assign_and_accept(route, retained_device)
 
-        assert drain.drain_key(removed_device.pk, "static_route", chain=0) == drain.SUCCEEDED
-        assert drain.drain_key(retained_device.pk, "static_route", chain=0) == drain.SUCCEEDED
-        for state in NSOStaticRouteState.objects.filter(static_route=route):
-            mirror_update(state, status="in_sync")
         self._enable_auto_apply(removed)
         self._enable_auto_apply(retained)
+        assert drain.drain_key(removed_device.pk, "static_route", chain=0) == drain.SUCCEEDED
+        assert drain.drain_key(retained_device.pk, "static_route", chain=0) == drain.SUCCEEDED
+        initial_removed_job = _wait_until(
+            lambda: self._terminal_job(removed.adapter_device_id, "apply"),
+            "the removed device's initial apply did not finish",
+        )
+        initial_retained_job = _wait_until(
+            lambda: self._terminal_job(retained.adapter_device_id, "apply"),
+            "the retained device's initial apply did not finish",
+        )
+        assert initial_removed_job["status"] == "succeeded", (initial_removed_job, self.environment.log_text())
+        assert initial_retained_job["status"] == "succeeded", (initial_retained_job, self.environment.log_text())
 
-        old_route = {"vrf": "", "prefix": "198.18.3.0/28", "next-hop": "198.18.3.1", "metric": 1}
-        self.environment.restconf.seed(removed.nso_device_name, [old_route])
-        self.environment.restconf.seed(retained.nso_device_name, [old_route])
+        deployed_keys = self.environment.query_store(
+            """
+            SELECT device.netbox_device_id, route.deployed_key
+            FROM static_route_intent AS route
+            JOIN devices AS device ON device.id = route.device_id
+            WHERE device.netbox_device_id IN (%s, %s)
+            ORDER BY device.netbox_device_id
+            """,
+            [removed_device.pk, retained_device.pk],
+        )
+        old_key = ["", "198.18.3.0/28", "198.18.3.1"]
+        assert [(device_id, json.loads(key)) for device_id, key in deployed_keys] == [
+            (removed_device.pk, old_key),
+            (retained_device.pk, old_key),
+        ], (deployed_keys, self.environment.log_text())
+
+        consume_static_route_settlements(removed)
+        consume_static_route_settlements(retained)
+        assert set(NSOStaticRouteState.objects.filter(static_route=route).values_list("status", flat=True)) == {
+            "in_sync"
+        }
+
+        initial_removed_commits = self.environment.restconf.retractions(removed.nso_device_name)
+        initial_retained_commits = self.environment.restconf.retractions(retained.nso_device_name)
+        assert len(initial_removed_commits) == len(initial_retained_commits) == 1
+        for commit in (initial_removed_commits[0], initial_retained_commits[0]):
+            assert commit["document"]["static-route"]["route"][0]["next-hop"] == "198.18.3.1"
+            assert parse_qs(commit["query"]) == {"reconcile": ["keep-non-service-config"]}
+
         self.environment.restconf.hold_removal_for(removed.nso_device_name)
         _AdapterWireSession.reset(self.environment.adapter_port)
 
@@ -825,18 +906,18 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
 
         self.environment.restconf.allow_removal.set()
         retraction = _wait_until(
-            lambda: self.environment.restconf.retractions(removed.nso_device_name),
+            lambda: self.environment.restconf.retractions(removed.nso_device_name)[len(initial_removed_commits) :],
             "the removal never reached the RESTCONF PUT boundary",
         )[0]
-        assert retraction["routes"] == []
-        assert "no-networking" not in retraction["query"]
+        assert retraction["document"]["static-route"]["route"] == []
+        assert parse_qs(retraction["query"]) == {"reconcile": ["keep-non-service-config"]}
 
         removed_job = _wait_until(
             lambda: self._terminal_job(removed.adapter_device_id, "removal"),
             "the real adapter removal job did not finish",
         )
         retained_job = _wait_until(
-            lambda: self._terminal_job(retained.adapter_device_id, "apply"),
+            lambda: self._terminal_job(retained.adapter_device_id, "apply", after_id=initial_retained_job["id"]),
             "the retained device's real adapter apply did not finish",
         )
         assert removed_job["status"] == "succeeded", removed_job
@@ -875,6 +956,22 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         assert retained_pushes[0]["body"]["deleted_routes"] == []
         assert [entry["route_id"] for entry in retained_pushes[0]["body"]["routes"]] == [route.pk]
         assert retained_pushes[0]["body"]["routes"][0]["next_hop"] == "198.18.3.2"
+        retained_commits = self.environment.restconf.retractions(retained.nso_device_name)[
+            len(initial_retained_commits) :
+        ]
+        assert len(retained_commits) == 1, retained_commits
+        assert retained_commits[0]["document"]["static-route"]["route"][0]["next-hop"] == "198.18.3.2"
+        assert parse_qs(retained_commits[0]["query"]) == {"reconcile": ["keep-non-service-config"]}
+        assert self.environment.restconf.service_document(removed.nso_device_name) == {
+            _DEVICE_INTENT_ROOT: [retraction["document"]]
+        }
+        assert self.environment.restconf.device_section(removed.nso_device_name)["route"] == []
+        assert self.environment.restconf.service_document(retained.nso_device_name) == {
+            _DEVICE_INTENT_ROOT: [retained_commits[0]["document"]]
+        }
+        assert [
+            route["next-hop"] for route in self.environment.restconf.device_section(retained.nso_device_name)["route"]
+        ] == ["198.18.3.2"]
         assert NSODeviceManagement.objects.get(pk=removed.pk).adapter_device_id == removed.adapter_device_id
 
 
