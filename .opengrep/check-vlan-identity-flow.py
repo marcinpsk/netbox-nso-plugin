@@ -41,6 +41,42 @@ def _lower_source(node) -> bool:
     )
 
 
+def _branch_assigns(body, name: str) -> bool:
+    for statement in body:
+        if isinstance(statement, (nodes.Assign, nodes.AnnAssign, nodes.AugAssign)):
+            if isinstance(statement, nodes.AnnAssign) and statement.value is None:
+                continue
+            targets = statement.targets if isinstance(statement, nodes.Assign) else [statement.target]
+            if any(isinstance(target, nodes.AssignName) and target.name == name for target in targets):
+                return True
+        if isinstance(statement, nodes.If):
+            if _branch_assigns(statement.body, name) and _branch_assigns(statement.orelse, name):
+                return True
+        elif isinstance(statement, (nodes.Return, nodes.Raise, nodes.Break, nodes.Continue)):
+            return False
+    return False
+
+
+def _overwritten(assignment, use) -> bool:
+    child = use
+    while child is not use.scope():
+        parent = child.parent
+        for field in ("body", "orelse"):
+            body = getattr(parent, field, None)
+            if not isinstance(body, list) or child not in body:
+                continue
+            for statement in body[: body.index(child)]:
+                if (
+                    isinstance(statement, nodes.If)
+                    and assignment.lineno < statement.lineno
+                    and _branch_assigns(statement.body, use.name)
+                    and _branch_assigns(statement.orelse, use.name)
+                ):
+                    return True
+        child = parent
+    return False
+
+
 def _sources(node, visited: set) -> set[str]:
     if isinstance(node, (nodes.Name, nodes.AssignName)):
         scope, assignments = node.lookup(node.name)
@@ -48,12 +84,15 @@ def _sources(node, visited: set) -> set[str]:
             return set()
         sources = set()
         for assignment in assignments:
-            if assignment in visited or not isinstance(assignment, nodes.AssignName):
+            if assignment in visited or not isinstance(assignment, nodes.AssignName) or _overwritten(assignment, node):
                 continue
             statement = assignment.parent
             if isinstance(statement, (nodes.Assign, nodes.AnnAssign)):
                 value = assignment if statement.value is None else statement.value
                 sources.update(_sources(value, visited | {assignment}))
+            elif isinstance(statement, nodes.AugAssign):
+                sources.update(_sources(assignment, visited | {assignment}))
+                sources.update(_sources(statement.value, visited | {assignment}))
         return sources
     if isinstance(node, nodes.Subscript):
         return _sources(node.value, visited)
