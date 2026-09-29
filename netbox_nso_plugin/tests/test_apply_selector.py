@@ -2049,8 +2049,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.views import _prepare_apply
         from netbox_nso_plugin.vlan_reconciler import save_vlan_content
 
-        # The SVI anchor is its NAME: `_svi_bindings` reads the vid out of it and looks that
-        # vid up in the device's VLAN group, so a name naming no device VLAN never qualifies.
+        # The SVI overlay links the device VLAN whose VID change repends this scope.
         interface = self._create_interface(device=self.device, name="Vlan1558", type="virtual")
         switchport_interface = self._create_interface(
             device=self.device,
