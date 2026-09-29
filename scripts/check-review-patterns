@@ -18,17 +18,22 @@ case "$mode" in
     "$scan_bin" scan --no-git-ignore --include '*.py' --max-target-bytes 0 --config .opengrep/nso-rules.yaml --error -- "$@"
     python3 .opengrep/check-adapter-error-continue.py scan ${explicit_paths[@]+"${explicit_paths[@]}"}
     python3 .opengrep/check-resume-failure-guidance.py scan ${explicit_paths[@]+"${explicit_paths[@]}"}
+    python3 .opengrep/check-vlan-identity-flow.py scan ${explicit_paths[@]+"${explicit_paths[@]}"}
     ;;
   test)
     if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi
     staging_dir="$(mktemp -d)"
     trap 'rm -rf "$staging_dir"' EXIT
     cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"
-    cp .opengrep/tests/review-patterns.py "$staging_dir/review-patterns.py"
+    sed -e 's/# ruleid: nso-vlan-identity-flow/# ast-finding: nso-vlan-identity-flow/' \
+      -e 's/# ok: nso-vlan-identity-flow/# ast-clean: nso-vlan-identity-flow/' \
+      -e 's/, nso-vlan-identity-flow//g' \
+      .opengrep/tests/review-patterns.py > "$staging_dir/review-patterns.py"
     "$scan_bin" test "$staging_dir"
     python3 .opengrep/tests/coverage.py --opengrep-bin "$scan_bin"
     python3 .opengrep/check-adapter-error-continue.py test .opengrep/tests/review-patterns.py
     python3 .opengrep/check-resume-failure-guidance.py test .opengrep/tests/review-patterns.py
+    python3 .opengrep/check-vlan-identity-flow.py test .opengrep/tests/review-patterns.py
     ;;
   *) echo "Usage: $0 [scan [path ...] | test]" >&2; exit 2 ;;
 esac
