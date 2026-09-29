@@ -63,6 +63,7 @@ class NSOSVICreateForm(forms.Form):
             svi_type = svi_type_for_device(self.management)
         except forms.ValidationError as exc:
             raise forms.ValidationError(exc.messages) from exc
+        self.svi_type = svi_type
         if svi_type == "irb" and values.get("unit") is None:
             self.add_error("unit", "Junos IRB unit is required.")
         if svi_type == "svi" and values.get("unit") is not None:

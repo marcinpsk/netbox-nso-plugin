@@ -79,6 +79,15 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
             )
         )
 
+    def test_create_reads_the_adapter_ned_once_per_post(self):
+        vlan = self._vlan(11)
+        url = reverse("plugins:netbox_nso_plugin:svi_add", kwargs={"device_pk": self.device.pk})
+        capability = ("GET", f"{CFG['url']}/api/v1/devices/{self.management.adapter_device_id}/capability")
+        with without_commit_drain(), adapter_device_ned("juniper-junos-nc-test") as session:
+            response = self.client.post(url, {"vlan": vlan.pk, "unit": 11, "vrf": ""})
+        self.assertEqual(response.status_code, 302, response.content)
+        self.assertEqual([call.args[:2] for call in session.request.call_args_list].count(capability), 1)
+
     def test_adapter_unreachable_refuses_create(self):
         self._ned("cisco-ios-cli")
         vlan = self._vlan(10)
@@ -620,7 +629,7 @@ class TestSviCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             close_old_connections()
             try:
                 with transaction.atomic():
-                    result["value"] = create_svi(self.management, self.vlan, 7, "")
+                    result["value"] = create_svi(self.management, self.vlan, 7, "", svi_type="irb")
             except Exception as exc:
                 result["error"] = exc
             finally:
@@ -822,7 +831,7 @@ class TestSviCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                 with connection.cursor() as cursor:
                     cursor.execute("SELECT pg_backend_pid()")
                     result["pid"] = cursor.fetchone()[0]
-                result["value"] = create_svi(self.management, self.vlan, 7, "")
+                result["value"] = create_svi(self.management, self.vlan, 7, "", svi_type="irb")
             except Exception as exc:
                 result["error"] = exc
             finally:
@@ -888,7 +897,7 @@ class TestSviCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         ):
             try:
                 with transaction.atomic():
-                    create_svi(self.management, self.vlan, 7, "")
+                    create_svi(self.management, self.vlan, 7, "", svi_type="irb")
                     worker.start()
                     self.assertTrue(plan_ready.wait(20), "the writer did not finish planning")
                     wait_until_postgres_blocks(result["pid"], "SVI create", timeout=20)
