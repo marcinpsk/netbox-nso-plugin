@@ -37,6 +37,7 @@ rules:
       - patterns:
           - pattern-either:
               - pattern: vlan = int($MATCH.group($INDEX))
+              - pattern: vid = int($MATCH.group($INDEX))
               - pattern: $OBJECT.dot1q_vlan = int($MATCH.group($INDEX))
               - pattern: $CALL(..., dot1q_vlan=int($MATCH.group($INDEX)), ...)
               - pattern: '{..., "dot1q_vlan": int($MATCH.group($INDEX)), ...}'
