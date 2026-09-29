@@ -798,21 +798,21 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert ifaces[0]["parent_interface"] == "ge-0/0/0"
         assert ifaces[0]["vrf"] == "MTI"
 
-    def test_push_skips_rows_without_dot1q(self):
+    def test_push_blocks_scope_for_owned_row_without_dot1q(self):
         from unittest.mock import patch
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
-        # Owned but no dot1q tag → the reconciler can't key it; must be excluded.
+        # An owned row without a tag blocks the full snapshot.
         self._state(name="ge-0/0/0.110", dot1q=None, status="accepted")
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
-            deliver("subinterface", self.device.pk, 42)
-        mock_put.assert_called_once()
-        ifaces = mock_put.call_args[0][1]
-        assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
+            with self.assertRaisesRegex(AdapterError, "dot1q_vlan"):
+                deliver("subinterface", self.device.pk, 42)
+        mock_put.assert_not_called()
 
     def test_accept_marks_owned(self):
         from unittest.mock import patch

@@ -235,9 +235,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
     def test_a_retract_takes_the_object_out_of_the_scope_render(self):
         """Every scope whose overlay can outlive its native anchor must stop rendering it.
 
-        The ``existing_overlay`` scopes are not fixtured here: their overlay either IS the
-        native row (l2_sap/logging/snmp) or cascades with it (bfd), so a retract leaves
-        nothing to render. ``route_policy`` is the one exception and is reported separately.
+        The subinterface overlay survives a native parent loss and must be demoted.
+        Other existing-overlay scopes use separate lifecycle fixtures.
         """
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
@@ -706,7 +705,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
             2,
         )
 
-    def test_native_interface_topology_creates_every_owned_overlay(self):
+    def test_native_interface_topology_does_not_acquire_subinterface(self):
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
 
@@ -758,7 +757,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         self.assertEqual(NSOVLANState.objects.get(vlan=vlan).status, "accepted")
         self.assertEqual(NSOSVIState.objects.get(interface=svi).vlan, vlan)
-        self.assertEqual(NSOSubinterfaceState.objects.get(interface=subinterface).dot1q_vlan, 1724)
+        self.assertFalse(NSOSubinterfaceState.objects.filter(interface=subinterface).exists())
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=parent).l2_mtu, 9216)
         self.assertEqual(NSOSwitchportState.objects.get(interface=switchport).untagged_vlan, vlan)
         self.assertEqual(NSOLACPBundleState.objects.get(interface=bundle).status, "accepted")

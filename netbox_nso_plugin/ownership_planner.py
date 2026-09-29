@@ -149,15 +149,16 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "subinterface": ScopeOwnershipRule(
         scope="subinterface",
-        acquisition_strategy="native",
+        acquisition_strategy="existing_overlay",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsosubinterfacestate",),
         overlay_native_fields=(("netbox_nso_plugin.nsosubinterfacestate", "interface"),),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence. "
+            "Acquire only from an accepted subinterface overlay. Native save events are not ownership evidence. "
+            "A foreign overlay delete retires its identity. Native anchor loss retracts with deletion authority. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
@@ -811,6 +812,22 @@ def _manifest_states(device_id, requested):
     }
 
 
+def _native_anchor_status(scope, native, device_id, overlay):
+    """Classify native anchor loss separately from malformed overlay linkage."""
+    if scope not in {"subinterface", "svi"}:
+        return "valid"
+    if native is None or native.device_id != device_id:
+        return "lost"
+    if scope == "subinterface":
+        from dcim.models import Interface
+
+        if native.parent_id is None or not Interface.objects.filter(pk=native.parent_id, device_id=device_id).exists():
+            return "lost"
+        if overlay is not None and overlay.parent_interface_id != native.parent_id:
+            return "mismatch"
+    return "valid"
+
+
 def _record_action_for(instance, device_id, requested, qualifying, manifest_states, *, natives=None):
     """Return one overlay's planned record action, or ``None`` when it needs no work."""
     from .status_machine import is_owned
@@ -836,7 +853,15 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
         _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key)
     )
     if rule.acquisition_strategy == "existing_overlay":
-        native_qualifies = True
+        native_qualifies = (
+            _native_anchor_status(
+                scope,
+                _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label], natives=natives),
+                device_id,
+                instance,
+            )
+            != "lost"
+        )
     else:
         signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
         native_qualifies = signature is not None and signature in qualifying
@@ -1141,13 +1166,6 @@ def _seed_interface_ip(candidate, native, _manifest):
     candidate.vrf = native.vrf.name if native.vrf_id else ""
 
 
-def _seed_subinterface(candidate, native, _manifest):
-    candidate.parent_interface = native.parent
-    suffix = native.name.rsplit(".", 1)[-1]
-    candidate.dot1q_vlan = int(suffix) if suffix.isdigit() else None
-    candidate.vrf = native.vrf.name if native.vrf_id else ""
-
-
 def _seed_interface_mtu(candidate, native, _manifest):
     candidate.l2_mtu = native.mtu
 
@@ -1228,7 +1246,6 @@ _STATE_SEEDERS = {
     "netbox_nso_plugin.nsoospfinterfacestate": _seed_ospf_interface,
     "netbox_nso_plugin.nsoredistributionstate": _seed_redistribution,
     "netbox_nso_plugin.nsostaticroutestate": _seed_static_route,
-    "netbox_nso_plugin.nsosubinterfacestate": _seed_subinterface,
     "netbox_nso_plugin.nsosvistate": _seed_svi,
     "netbox_nso_plugin.nsoswitchportstate": _seed_switchport,
     "netbox_nso_plugin.nsovlanstate": _seed_vlan,
@@ -1390,16 +1407,6 @@ def _interface_mtu_bindings(management):
     return tuple(
         _native_binding("interface_mtu", row, "netbox_nso_plugin.nsointerfacemtustate")
         for row in Interface.objects.filter(device_id=management.device_id, mtu__isnull=False).order_by("pk")
-    )
-
-
-def _subinterface_bindings(management):
-    from dcim.models import Interface
-
-    return tuple(
-        _native_binding("subinterface", row, "netbox_nso_plugin.nsosubinterfacestate")
-        for row in Interface.objects.filter(device_id=management.device_id, parent_id__isnull=False).order_by("pk")
-        if "." in row.name and row.name.rsplit(".", 1)[-1].isdigit()
     )
 
 
@@ -1597,7 +1604,6 @@ _NATIVE_BINDING_BUILDERS = {
     "lacp": _lacp_bindings,
     "ospf": _ospf_bindings,
     "static_route": _static_route_bindings,
-    "subinterface": _subinterface_bindings,
     "svi": _svi_bindings,
     "switchport": _switchport_bindings,
     "vlan": _vlan_bindings,
@@ -1960,7 +1966,10 @@ def _manifest_lifecycle_action(manifest, requested, *, management=None, qualifyi
         model, filters = _state_filters_without_native(manifest, rule, management)
     overlay = model.objects.filter(**filters).first()
     native_qualifies = native is not None and (
-        rule.acquisition_strategy == "existing_overlay"
+        (
+            rule.acquisition_strategy == "existing_overlay"
+            and _native_anchor_status(manifest.scope, native, management.device_id, overlay) != "lost"
+        )
         or _valid_overlay_signature(
             manifest.scope,
             manifest.native_model_label,

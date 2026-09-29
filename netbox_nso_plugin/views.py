@@ -51,6 +51,7 @@ from .forms import (
     NSOSnmpHostStateForm,
     NSOSnmpSystemInfoStateForm,
     NSOSnmpV3UserStateForm,
+    NSOSubinterfaceCreateForm,
     NSOVaultSettingsForm,
 )
 from .intent_state import IntentTransactionNoOp as _IntentTransactionNoOp
@@ -495,7 +496,7 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 # Grid category → the intent-push scope whose rejection record belongs on its banner.
 # Only the scopes whose push failures are persisted appear here (see
 # signals._record_push_outcome); a category with no entry simply renders no banner.
-_CATEGORY_PUSH_SCOPES = {"static": "static_route"}
+_CATEGORY_PUSH_SCOPES = {"static": "static_route", "subinterface": "subinterface"}
 _PUBLIC_STATIC_ROUTE_PUSH_REASONS = frozenset(
     {
         "backfill_carries_deletions",
@@ -1006,6 +1007,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             "placeholder": spec["ph"],
             "category_has_unowned": has_unowned,
             "adapter_error": adapter_error,
+            "push_error": _category_push_error(key, mgmt),
             "paged": True,
         }
         _annotate_residue_rows(ctx, key, mgmt)
@@ -4440,33 +4442,10 @@ def _vlan_name_errors(obj):
 
 
 def _subinterface_errors(obj):
-    """Validate inline L3 values before owning a pushable subinterface row."""
-    errors = {}
-    tag = obj.dot1q_vlan
-    if tag is None:
-        errors["dot1q_vlan"] = ["A dot1q VLAN tag is required."]
-    elif not 1 <= tag <= 4094:
-        errors["dot1q_vlan"] = ["Must be between 1 and 4094."]
+    """Validate one subinterface with the shared identity contract."""
+    from .subinterface_identity import subinterface_errors
 
-    parent = obj.parent_interface
-    if parent is None or parent.device_id != obj.management.device_id:
-        message = "A parent interface on this managed device is required before this row can be owned."
-        errors.setdefault("dot1q_vlan", []).append(message)
-        errors.setdefault("vrf", []).append(message)
-    elif tag is not None and (
-        type(obj)
-        .objects.filter(
-            management=obj.management,
-            parent_interface=parent,
-            dot1q_vlan=tag,
-        )
-        .exclude(pk=obj.pk)
-        .exists()
-    ):
-        errors.setdefault("dot1q_vlan", []).append(
-            f"dot1q VLAN {tag} is already used by another subinterface on {parent.name}."
-        )
-    return errors
+    return subinterface_errors(obj)
 
 
 def _save_owned_bfd_edit(obj, old_values):
@@ -7725,6 +7704,48 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
         return client.preflight_route_policy(
             mgmt.adapter_device_id, community_members, set_keys, match_keys, aspath_names, refresh=True
         )
+
+
+class NSOSubinterfaceCreateView(NSOActionPermissionMixin, View):
+    """Create a device-scoped owned dot1q subinterface."""
+
+    required_permission = (
+        "netbox_nso_plugin.change_nsodevicemanagement",
+        "netbox_nso_plugin.add_nsosubinterfacestate",
+        "dcim.add_interface",
+    )
+
+    def get(self, request, device_pk):
+        management = get_object_or_404(
+            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
+        )
+        form = NSOSubinterfaceCreateForm(device=management.device)
+        return render(request, "netbox_nso_plugin/subinterface_form.html", {"form": form, "object": management.device})
+
+    def post(self, request, device_pk):
+        from django.core.exceptions import ValidationError
+
+        from .intent_state import RendererTargetsChanged
+        from .renderer_writer import IntentPlanStaleError
+        from .subinterface_create import create_subinterface
+
+        management = get_object_or_404(
+            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
+        )
+        form = NSOSubinterfaceCreateForm(request.POST, device=management.device)
+        if form.is_valid():
+            try:
+                create_subinterface(management, **form.cleaned_data)
+            except ValidationError as exc:
+                for field, errors in exc.message_dict.items():
+                    for error in errors:
+                        form.add_error(field if field in form.fields else None, error)
+            except (IntentPlanStaleError, RendererTargetsChanged):
+                form.add_error(None, "Subinterface state changed. Refresh the page and try again.")
+            else:
+                messages.success(request, "Subinterface created. Apply to write it to the device.")
+                return redirect(_device_nso_tab_url(device_pk))
+        return render(request, "netbox_nso_plugin/subinterface_form.html", {"form": form, "object": management.device})
 
 
 class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):

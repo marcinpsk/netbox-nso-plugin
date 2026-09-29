@@ -1,6 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-vlan-identity-from-interface-name
+    languages: [python]
+    severity: ERROR
+    message: Take VLAN identity from an explicit field, not an interface name.
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJECT.dot1q_vlan = int($EXPR)
+              - pattern: dot1q_vlan = int($EXPR)
+              - pattern: $CALL(..., dot1q_vlan=int($EXPR), ...)
+              - pattern: '{..., "dot1q_vlan": int($EXPR), ...}'
+          - metavariable-regex:
+              metavariable: $EXPR
+              regex: '.*\.name\.(?:rsplit|split|partition|removeprefix)\('
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJECT.dot1q_vlan = int($SUFFIX)
+              - pattern: dot1q_vlan = int($SUFFIX)
+              - pattern: $OBJECT.dot1q_vlan = int($SUFFIX) if ... else ...
+              - pattern: $CALL(..., dot1q_vlan=int($SUFFIX), ...)
+              - pattern: '{..., "dot1q_vlan": int($SUFFIX), ...}'
+          - pattern-either:
+              - pattern-inside: |
+                  $SUFFIX = $INTERFACE.name.$METHOD(...)
+                  ...
+              - pattern-inside: |
+                  $SUFFIX = $INTERFACE.name.$METHOD(...)[$INDEX]
+                  ...
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: '^(?:rsplit|split|partition|removeprefix)$'
+      - patterns:
+          - pattern: vid = int($SUFFIX)
+          - pattern-inside: |
+              $SUFFIX = $INTERFACE.name.partition(".")[$INDEX]
+              ...
+      - patterns:
+          - pattern-either:
+              - pattern: vlan = int($MATCH.group($INDEX))
+              - pattern: $OBJECT.dot1q_vlan = int($MATCH.group($INDEX))
+              - pattern: $CALL(..., dot1q_vlan=int($MATCH.group($INDEX)), ...)
+              - pattern: '{..., "dot1q_vlan": int($MATCH.group($INDEX)), ...}'
+          - pattern-inside: |
+              $MATCH = re.$REGEX_FN(..., $INTERFACE.name)
+              ...
+          - metavariable-regex:
+              metavariable: $REGEX_FN
+              regex: '^(?:match|search|fullmatch)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**", "**/migrations/**"]
   - id: nso-switching-client-single-owner
     languages: [python]
     severity: ERROR
