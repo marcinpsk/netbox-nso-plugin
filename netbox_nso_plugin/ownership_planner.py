@@ -814,27 +814,18 @@ def _manifest_states(device_id, requested):
     }
 
 
-def _native_anchor_status(scope, native, device_id, overlay):
-    """Classify native anchor loss separately from malformed overlay linkage."""
+def _native_anchor_lost(scope, native, device_id) -> bool:
+    """Return whether an owned overlay has lost its native anchor."""
     if scope not in {"subinterface", "svi"}:
-        return "valid"
+        return False
     if native is None or native.device_id != device_id:
-        return "lost"
+        return True
     if scope == "subinterface":
         from dcim.models import Interface
 
         if native.parent_id is None or not Interface.objects.filter(pk=native.parent_id, device_id=device_id).exists():
-            return "lost"
-        if overlay is not None and overlay.parent_interface_id != native.parent_id:
-            return "mismatch"
-    elif overlay is not None and (
-        overlay.vlan_id is None
-        or not overlay.vlan
-        or overlay.vlan.group is None
-        or overlay.vlan.group.slug != f"nso-{device_id}"
-    ):
-        return "mismatch"
-    return "valid"
+            return True
+    return False
 
 
 def _record_action_for(instance, device_id, requested, qualifying, manifest_states, *, natives=None):
@@ -862,14 +853,10 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
         _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key)
     )
     if rule.acquisition_strategy == "existing_overlay":
-        native_qualifies = (
-            _native_anchor_status(
-                scope,
-                _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label], natives=natives),
-                device_id,
-                instance,
-            )
-            != "lost"
+        native_qualifies = not _native_anchor_lost(
+            scope,
+            _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label], natives=natives),
+            device_id,
         )
     else:
         signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
@@ -1934,7 +1921,7 @@ def _manifest_lifecycle_action(manifest, requested, *, management=None, qualifyi
     native_qualifies = native is not None and (
         (
             rule.acquisition_strategy == "existing_overlay"
-            and _native_anchor_status(manifest.scope, native, management.device_id, overlay) != "lost"
+            and not _native_anchor_lost(manifest.scope, native, management.device_id)
         )
         or _valid_overlay_signature(
             manifest.scope,

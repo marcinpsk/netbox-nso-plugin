@@ -524,6 +524,35 @@ class TestSymmetricOwnershipExecutor(TestCase):
         # per extra owned overlay is constant. A per-row re-scan makes it grow.
         self.assertEqual(four - three, three - two)
 
+    def test_recording_missing_svi_manifests_does_not_read_vlans_per_row(self):
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
+
+        def measure(rows):
+            device, management = make_managed(f"sviscan{rows}", 16290 + rows, index=rows)
+            group = VLANGroup.objects.create(name=f"SVI scan {rows}", slug=f"nso-{device.pk}")
+            for index in range(rows):
+                vlan = VLAN.objects.create(group=group, vid=1760 + index, name=f"svi-scan-{rows}-{index}")
+                NSOSVIState.objects.create(
+                    management=management,
+                    interface=Interface.objects.create(device=device, name=f"Vlan{vlan.vid}", type="virtual"),
+                    vlan=vlan,
+                    svi_type="svi",
+                    status="accepted",
+                )
+            with CaptureQueriesContext(connection) as captured:
+                actions = _manifest_record_actions(device.pk, frozenset({"svi"}), qualifying=frozenset(), natives={})
+            self.assertEqual(len(actions), rows)
+            self.assertTrue(all(action[0] is OwnershipAction.RECORD_MANIFEST for action in actions))
+            return len(captured.captured_queries)
+
+        self.assertEqual(measure(1), measure(3))
+
     def test_native_create_planning_batches_manifest_and_overlay_reads(self):
         from cProfile import Profile
 
