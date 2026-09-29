@@ -88,6 +88,15 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         self.assertEqual(response.status_code, 302, response.content)
         self.assertEqual([call.args[:2] for call in session.request.call_args_list].count(capability), 1)
 
+    def test_invalid_vlan_does_not_read_adapter_capability(self):
+        url = reverse("plugins:netbox_nso_plugin:svi_add", kwargs={"device_pk": self.device.pk})
+        capability = ("GET", f"{CFG['url']}/api/v1/devices/{self.management.adapter_device_id}/capability")
+        with without_commit_drain(), adapter_device_ned("juniper-junos-nc-test") as session:
+            response = self.client.post(url, {"vlan": "invalid", "unit": "", "vrf": ""})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("vlan", response.context["form"].errors)
+        self.assertNotIn(capability, [call.args[:2] for call in session.request.call_args_list])
+
     def test_adapter_unreachable_refuses_create(self):
         self._ned("cisco-ios-cli")
         vlan = self._vlan(10)

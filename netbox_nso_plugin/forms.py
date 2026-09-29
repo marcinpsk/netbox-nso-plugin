@@ -59,6 +59,8 @@ class NSOSVICreateForm(forms.Form):
         from .svi_create import svi_type_for_device
 
         values = super().clean()
+        if self.errors:
+            return values
         try:
             svi_type = svi_type_for_device(self.management)
         except forms.ValidationError as exc:
