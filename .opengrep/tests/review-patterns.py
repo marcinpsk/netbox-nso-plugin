@@ -928,6 +928,25 @@ def tautological_assertions(self, value, read):
     self.assertEqual(read(), read())
 
 
+class ResetMixinWithoutChain(IntentPushResetMixin, TransactionTestCase):
+    # ruleid: nso-intent-push-reset-setup-chain
+    def setUp(self):
+        self.device = make_device()
+
+
+class ResetMixinWithChain(IntentPushResetMixin, TransactionTestCase):
+    # ok: nso-intent-push-reset-setup-chain
+    def setUp(self):
+        super().setUp()
+        self.device = make_device()
+
+
+class PlainCaseWithoutChain(TransactionTestCase):
+    # ok: nso-intent-push-reset-setup-chain
+    def setUp(self):
+        self.device = make_device()
+
+
 def patch_clock():
     # ruleid: nso-global-monotonic-patch
     patch("time.monotonic", return_value=0)

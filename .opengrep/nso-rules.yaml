@@ -67,6 +67,22 @@ rules:
       - metavariable-regex:
           metavariable: $VALUE
           regex: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+  - id: nso-intent-push-reset-setup-chain
+    languages: [python]
+    severity: ERROR
+    message: Call super().setUp() so IntentPushResetMixin clears pending intent pushes.
+    patterns:
+      - pattern-inside: |
+          class $CLASS(..., IntentPushResetMixin, ...):
+              ...
+      - pattern: |
+          def setUp(self):
+              ...
+      - pattern-not: |
+          def setUp(self):
+              ...
+              super().setUp()
+              ...
   - id: nso-global-monotonic-patch
     languages: [python]
     severity: ERROR
