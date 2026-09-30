@@ -1632,15 +1632,19 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOSVIState
-    from .svi_identity import svi_errors
+    from .svi_identity import svi_errors, svi_identity_index
 
     interfaces = []
     blocked = []
-    for row in NSOSVIState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management", "management__device", "interface", "vlan", "vlan__group"):
-        errors = svi_errors(row)
+    rows = list(
+        NSOSVIState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management", "management__device", "interface", "vlan", "vlan__group")
+    )
+    index = svi_identity_index(rows[0].management, NSOSVIState) if rows else None
+    for row in rows:
+        errors = svi_errors(row, index=index)
         if errors:
             reason = ", ".join(f"{field}: {'; '.join(messages)}" for field, messages in errors.items())
             blocked.append(f"{row.management.device.name} {row.interface.name}: {reason}")
@@ -1706,15 +1710,19 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOSubinterfaceState
-    from .subinterface_identity import subinterface_errors
+    from .subinterface_identity import subinterface_errors, subinterface_identity_index
 
     interfaces = []
     blocked = []
-    for row in NSOSubinterfaceState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("management", "management__device", "interface", "parent_interface"):
-        errors = subinterface_errors(row)
+    rows = list(
+        NSOSubinterfaceState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management", "management__device", "interface", "parent_interface")
+    )
+    index = subinterface_identity_index(rows[0].management, NSOSubinterfaceState) if rows else None
+    for row in rows:
+        errors = subinterface_errors(row, index=index)
         if errors:
             reason = ", ".join(f"{field}: {'; '.join(messages)}" for field, messages in errors.items())
             blocked.append(f"{row.management.device.name} {row.interface.name}: {reason}")

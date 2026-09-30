@@ -28,7 +28,17 @@ def subinterface_parent_errors(management, parent):
     return []
 
 
-def subinterface_errors(row):
+def subinterface_identity_index(management, model):
+    """Return parent and tag conflict indexes across all management rows."""
+    index = {}
+    for parent_id, tag, pk in (
+        model.objects.filter(management=management).order_by().values_list("parent_interface_id", "dot1q_vlan", "pk")
+    ):
+        index.setdefault((parent_id, tag), set()).add(pk)
+    return index
+
+
+def subinterface_errors(row, index=None):
     """Return field errors for a subinterface overlay or proposed overlay."""
     errors = {}
     interface = row.interface
@@ -51,17 +61,11 @@ def subinterface_errors(row):
         errors["dot1q_vlan"] = ["A dot1q VLAN tag is required."]
     elif not 1 <= tag <= 4094:
         errors["dot1q_vlan"] = ["Must be between 1 and 4094."]
-    if (
-        parent is not None
-        and tag is not None
-        and (
-            type(row)
-            .objects.filter(management=row.management, parent_interface=parent, dot1q_vlan=tag)
-            .exclude(pk=row.pk)
-            .exists()
-        )
-    ):
-        errors.setdefault("dot1q_vlan", []).append(
-            f"dot1q VLAN {tag} is already used by another subinterface on {parent.name}."
-        )
+    if parent is not None and tag is not None:
+        if index is None:
+            index = subinterface_identity_index(row.management, type(row))
+        if index.get((parent.pk, tag), set()) - {row.pk}:
+            errors.setdefault("dot1q_vlan", []).append(
+                f"dot1q VLAN {tag} is already used by another subinterface on {parent.name}."
+            )
     return errors

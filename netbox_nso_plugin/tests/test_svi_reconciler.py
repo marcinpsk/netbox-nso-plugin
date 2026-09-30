@@ -526,6 +526,67 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         assert [i["interface_name"] for i in ifaces] == ["Vlan100"]
         assert ifaces[0]["vlan_id"] == 100 and ifaces[0]["vrf"] == "MGMT"
 
+    def test_owned_snapshot_query_count_does_not_grow_with_rows(self):
+        from unittest.mock import patch
+
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.delivery import render
+
+        query_counts = []
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            for vid in (100, 200, 300, 400):
+                self._state(name=f"Vlan{vid}", vid=vid, status="accepted")
+                if vid in (100, 400):
+                    with CaptureQueriesContext(connection) as queries:
+                        rendered = render("svi", self.device.pk, 42)
+                    query_counts.append(len(queries))
+                    self.assertEqual(
+                        [item["vlan_id"] for item in rendered.payload],
+                        list(range(100, vid + 1, 100)),
+                    )
+                    rendered.do_push(rendered.payload)
+                    self.assertEqual(mock_put.call_args.args, (42, rendered.payload))
+
+        self.assertEqual(mock_put.call_count, 2)
+        self.assertEqual(query_counts[0], query_counts[1])
+
+    def test_owned_snapshot_blocks_conflicting_owned_vid(self):
+        from unittest.mock import patch
+
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import render
+        from netbox_nso_plugin.models import NSOVLANState
+
+        self._state(name="Vlan100", vid=100, status="accepted")
+        group = VLANGroup.objects.create(name="Shared VLANs", slug="shared-snapshot-vlans")
+        vlan = VLAN.objects.create(group=group, vid=100, name="Duplicate VID")
+        NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
+        interface = Interface.objects.create(device=self.device, name="irb.200", type="virtual")
+        NSOSVIState.objects.create(
+            management=self.management,
+            interface=interface,
+            vlan=vlan,
+            svi_type="irb",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            rendered = render("svi", self.device.pk, 42)
+            self.assertEqual(len(rendered.payload["blocked"]), 2)
+            for reason in rendered.payload["blocked"]:
+                self.assertIn("VLAN VID is already bound to an owned SVI on this device.", reason)
+                self.assertNotIn("VLAN VID is ambiguous", reason)
+            with self.assertRaisesRegex(AdapterError, "SVI snapshot is blocked") as raised:
+                rendered.do_push(rendered.payload)
+
+        self.assertEqual(raised.exception.code, "validation_error")
+        self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+        mock_put.assert_not_called()
+
     def test_foreign_overlay_save_does_not_schedule_svi_behavior(self):
         from unittest.mock import patch
 

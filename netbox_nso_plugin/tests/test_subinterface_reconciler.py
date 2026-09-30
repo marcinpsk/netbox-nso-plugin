@@ -798,6 +798,54 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert ifaces[0]["parent_interface"] == "ge-0/0/0"
         assert ifaces[0]["vrf"] == "MTI"
 
+    def test_owned_snapshot_query_count_does_not_grow_with_rows(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.delivery import render
+
+        query_counts = []
+        with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+            for tag in (100, 200, 300, 400):
+                self._state(name=f"ge-0/0/0.{tag}", dot1q=tag, status="accepted")
+                if tag in (100, 400):
+                    with CaptureQueriesContext(connection) as queries:
+                        rendered = render("subinterface", self.device.pk, 42)
+                    query_counts.append(len(queries))
+                    self.assertEqual(
+                        [item["dot1q_vlan"] for item in rendered.payload],
+                        list(range(100, tag + 1, 100)),
+                    )
+                    rendered.do_push(rendered.payload)
+                    self.assertEqual(mock_put.call_args.args, (42, rendered.payload))
+
+        self.assertEqual(mock_put.call_count, 2)
+        self.assertEqual(query_counts[0], query_counts[1])
+
+    def test_owned_snapshot_blocks_duplicate_parent_and_tag_in_all_statuses(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import render
+
+        self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+
+        for name, status, blocked in (("ge-0/0/0.200", "imported", 1), ("ge-0/0/0.300", "accepted", 2)):
+            with self.subTest(status=status):
+                self._state(name=name, dot1q=100, status=status)
+                with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+                    rendered = render("subinterface", self.device.pk, 42)
+                    self.assertEqual(len(rendered.payload["blocked"]), blocked)
+                    for reason in rendered.payload["blocked"]:
+                        self.assertIn(
+                            "dot1q VLAN 100 is already used by another subinterface on ge-0/0/0.",
+                            reason,
+                        )
+                    with self.assertRaisesRegex(AdapterError, "Subinterface snapshot is blocked") as raised:
+                        rendered.do_push(rendered.payload)
+
+                self.assertEqual(raised.exception.code, "validation_error")
+                self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+                mock_put.assert_not_called()
+
     def test_push_blocks_scope_for_owned_row_without_dot1q(self):
         from unittest.mock import patch
 

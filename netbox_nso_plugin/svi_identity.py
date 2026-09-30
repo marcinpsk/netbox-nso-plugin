@@ -12,7 +12,24 @@ def attached_svi_vlans(management):
     return VLAN.objects.filter(nso_vlan_states__management=management)
 
 
-def svi_errors(row):
+def svi_identity_index(management, model):
+    """Return attached VLAN and owned VID indexes for one management."""
+    attached_vlan_pks = set()
+    attached_vids = {}
+    for pk, vid in attached_svi_vlans(management).order_by().values_list("pk", "vid").distinct():
+        attached_vlan_pks.add(pk)
+        attached_vids.setdefault(vid, set()).add(pk)
+    owned_vids = {}
+    for vid, pk in (
+        model.objects.filter(management_id=management.pk, status__in=OWNED_STATES)
+        .order_by()
+        .values_list("vlan__vid", "pk")
+    ):
+        owned_vids.setdefault(vid, set()).add(pk)
+    return attached_vlan_pks, attached_vids, owned_vids
+
+
+def svi_errors(row, index=None):
     """Return field errors for an SVI overlay or proposed overlay."""
     errors = {}
     interface = row.interface
@@ -23,20 +40,16 @@ def svi_errors(row):
     if vlan is None:
         errors["vlan"] = ["A device VLAN is required."]
     else:
+        if index is None:
+            index = svi_identity_index(row.management, type(row))
+        attached_vlan_pks, attached_vids, owned_vids = index
         if not 1 <= vlan.vid <= 4094:
             errors["vlan"] = ["VLAN VID must be between 1 and 4094."]
-        if not attached_svi_vlans(row.management).filter(pk=vlan.pk).exists():
+        if vlan.pk not in attached_vlan_pks:
             errors.setdefault("vlan", []).append("VLAN must be attached to this managed device.")
-        if (row.pk is None or row.status not in OWNED_STATES) and attached_svi_vlans(row.management).filter(
-            vid=vlan.vid
-        ).values("pk").distinct().count() > 1:
+        if (row.pk is None or row.status not in OWNED_STATES) and len(attached_vids.get(vlan.vid, set())) > 1:
             errors.setdefault("vlan", []).append("VLAN VID is ambiguous on this managed device.")
-        if (
-            type(row)
-            .objects.filter(management_id=row.management_id, vlan__vid=vlan.vid, status__in=OWNED_STATES)
-            .exclude(pk=row.pk)
-            .exists()
-        ):
+        if owned_vids.get(vlan.vid, set()) - {row.pk}:
             errors.setdefault("vlan", []).append("VLAN VID is already bound to an owned SVI on this device.")
     name = interface.name
     if row.svi_type == "irb":
