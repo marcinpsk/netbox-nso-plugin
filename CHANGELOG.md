@@ -2,6 +2,91 @@
 
 <!-- version list -->
 
+## v1.6.1 (2026-09-30)
+
+### Bug Fixes
+
+- **opengrep**: Carry VLAN name provenance through any expression and nested scopes
+  ([`1333f90`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1333f90de399a9dad20fc63a4c559ee8b3f2154a))
+
+- **opengrep**: Check one VLAN destination set for suffix and regex provenance
+  ([`85f2f6a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/85f2f6aae434bac65bb7851ba2f0f1c0169d531c))
+
+- **opengrep**: Fail closed on every binding kind in the VLAN flow check
+  ([`be0e5e0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/be0e5e03cd24737976979668c1436faac8be1e8c))
+
+- **opengrep**: Follow augmented assignments and complete if/else overwrites in the VLAN flow check
+  ([`7921c58`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7921c587438c31896fe5be1fefc82c4531dfba96))
+
+- **opengrep**: Kill VLAN name provenance only on a dominating overwrite
+  ([`cfd8956`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cfd895678edda74f7beec6b43e47433672d3c254))
+
+- **opengrep**: Match tuple-unpacked VLAN provenance element by element
+  ([`c7eaa55`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c7eaa559a37bb7806e69520686d9d78310e457f5))
+
+- **opengrep**: Memoize VLAN flow provenance and resolve defaults in the enclosing scope
+  ([`1e5e341`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1e5e341b19128329cc967176097f04550ddb9900))
+
+- **opengrep**: Resolve VLAN flow names through nested defaults and comprehensions in any order
+  ([`34f7ce2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/34f7ce264bca34ac0aa26918c681a90ad57b446c))
+
+- **svi**: Keep an imported SVI VLAN link only while that VLAN is a candidate
+  ([`e8a7e75`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e8a7e75427624cd280003397b9b099234965939a))
+
+- **svi**: Skip the adapter NED lookup when SVI form fields are invalid
+  ([`a6ecd87`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a6ecd8732ebf995327e67acd0d042337f12ad69c))
+
+- **views**: Report a blocked SVI or subinterface snapshot as unsent
+  ([`78c30d6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/78c30d656a7650a4de89db47e6430b133f7aeef4))
+
+### Chores
+
+- **ci**: Bump the actions group with 2 updates
+  ([`cf96fd3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cf96fd344d86109f386db87c74ee81affbfd30ec))
+
+- **deps**: Bump jsdom in the js-minor-patch group
+  ([`1b105b9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1b105b915ed6a1d9652cb02e1e819bd639749e06))
+
+- **opengrep**: Require setUp to chain to IntentPushResetMixin
+  ([`5f627fb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5f627fba49b3ef0dc68167e85e1c191ab9a92fbd))
+
+- **opengrep**: Track VLAN identity through reassignment with an astroid check
+  ([`176f35e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/176f35ec349bde7d9a7547a6edd4bd71fc85fca6))
+
+### Documentation
+
+- **opengrep**: State the loop back-edge limit of the VLAN flow check
+  ([`ddff24e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ddff24eb6caffc994a6eff0ee1c81c57c59cf261))
+
+- **opengrep**: State the real loop limit of nso-vlan-identity-flow
+  ([`c1cef6e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c1cef6e5a5739297b1608f084008ce5b2e98ab18))
+
+### Performance Improvements
+
+- Validate owned SVI and subinterface snapshots against one identity index per device
+  ([`aae311a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aae311ab326db05708ffa5163a6e821e57228245))
+
+- **opengrep**: Resolve VLAN flow provenance as a per-module fixpoint
+  ([`138cf57`](https://github.com/marcinpsk/netbox-nso-plugin/commit/138cf571c13d96e144a38765ee2f2fc105227baa))
+
+- **ownership**: Check only native anchor loss for owned SVIs and subinterfaces
+  ([`c300a72`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c300a725f2b2cdc91826200852b91092fe9a94aa))
+
+### Testing
+
+- Chain setUp to IntentPushResetMixin in SVI and subinterface flow tests
+  ([`07f3417`](https://github.com/marcinpsk/netbox-nso-plugin/commit/07f34177c06e12bdeb2353d91d7f910533f472ac))
+
+- **opengrep**: Allow only the builtin rule roots the rules use
+  ([`eec8d33`](https://github.com/marcinpsk/netbox-nso-plugin/commit/eec8d33dd63499b16972a49ba4a0205dc651f0fb))
+
+- **opengrep**: Bound VLAN flow chain resolutions instead of wall-clock time
+  ([`ebb2a03`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ebb2a03c47e6fc79f07b10dee8ddd19cb5e5ecd1))
+
+- **opengrep**: Skip defined method names and allow super as rule roots
+  ([`d6e98c9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d6e98c96ceb397deddfa7ce0f764f96ab7a6114b))
+
+
 ## v1.6.0 (2026-09-26)
 
 
