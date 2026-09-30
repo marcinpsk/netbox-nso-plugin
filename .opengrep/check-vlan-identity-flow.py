@@ -23,8 +23,7 @@ _RULE_ID = "nso-vlan-identity-flow"
 _ANNOTATION = re.compile(r"#\s*(ruleid|ok):\s*(.+?)\s*$")
 _SUFFIX_METHODS = {"rsplit", "split", "partition", "removeprefix"}
 _REGEX_METHODS = {"match", "search", "fullmatch"}
-_SUFFIX_TARGETS = {"vid", "dot1q_vlan", "attribute", "keyword", "dict", "conditional"}
-_REGEX_TARGETS = {"vid", "vlan", "attribute", "keyword", "dict"}
+_VLAN_TARGETS = {"vid", "vlan", "dot1q_vlan", "attribute", "keyword", "dict", "conditional"}
 _COMPREHENSIONS = (nodes.ListComp, nodes.SetComp, nodes.DictComp, nodes.GeneratorExp)
 
 
@@ -364,7 +363,7 @@ def scan(path: Path) -> list[int]:
             continue
         kind, name = argument
         targets = _targets(call)
-        allowed = _SUFFIX_TARGETS if kind == "suffix" else _REGEX_TARGETS if kind == "regex" else {"return"}
+        allowed = {"return"} if kind == "lower" else _VLAN_TARGETS
         if targets & allowed:
             candidates.append((call, kind, name))
     sources = _sources(name for _, _, name in candidates)

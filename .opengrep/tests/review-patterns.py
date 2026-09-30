@@ -30,6 +30,8 @@ def vlan_identity_from_name(candidate, native, interface):
     vid = int(interface.name.rsplit(".", 1)[-1])
     # ruleid: nso-vlan-identity-from-interface-name
     vid = int(interface.name.split(".")[-1])
+    # ruleid: nso-vlan-identity-from-interface-name
+    vlan = int(interface.name.rsplit(".", 1)[-1])
     vid_tail = interface.name.rsplit(".", 1)[-1]
     # ruleid: nso-vlan-identity-flow
     vid = int(vid_tail)
@@ -792,7 +794,7 @@ def vlan_flow_through_type_declaration(candidate, interface):
 
 def vlan_flow_target_limits(candidate, interface):
     suffix = interface.name.rsplit(".", 1)[-1]
-    # ok: nso-vlan-identity-flow
+    # ruleid: nso-vlan-identity-flow
     vlan = int(suffix)
     # ok: nso-vlan-identity-flow
     unit = int(suffix)
@@ -801,8 +803,10 @@ def vlan_flow_target_limits(candidate, interface):
     # ok: nso-vlan-identity-flow
     payload = {"unit": int(suffix), "dot1q_vlan": 100}
     match = re.match(r".*\.(\d+)$", interface.name)
-    # ok: nso-vlan-identity-flow
+    # ruleid: nso-vlan-identity-flow
     dot1q_vlan = int(match.group(1))
+    # ruleid: nso-vlan-identity-flow
+    candidate.dot1q_vlan = int(match.group(1)) if match else None
     name = interface.name.lower()
     # ok: nso-vlan-identity-flow
     vid = int(name)

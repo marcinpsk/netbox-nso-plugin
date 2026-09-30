@@ -11,6 +11,7 @@ rules:
               - pattern: $OBJECT.dot1q_vlan = int($EXPR)
               - pattern: dot1q_vlan = int($EXPR)
               - pattern: vid = int($EXPR)
+              - pattern: vlan = int($EXPR)
               - pattern: $CALL(..., dot1q_vlan=int($EXPR), ...)
               - pattern: '{..., "dot1q_vlan": int($EXPR), ...}'
           - metavariable-regex:
