@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections import defaultdict, deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
@@ -65,9 +66,9 @@ def _branch_assigns(body, name: str) -> bool:
     return False
 
 
-def _overwrite_position(use) -> tuple[int, int]:
+def _overwrite_position(use, anchor) -> tuple[int, int]:
     position = (-1, -1)
-    child = use
+    child = anchor
     while child is not use.scope():
         parent = child.parent
         for field in ("body", "orelse", "finalbody"):
@@ -81,13 +82,13 @@ def _overwrite_position(use) -> tuple[int, int]:
     return position
 
 
-def _reaching_bindings(node, scope):
-    loop_body = []
-    child = node
+def _reaching_bindings(node, scope, anchor):
+    loop_body = set()
+    child = anchor
     while child is not scope:
         parent = child.parent
         if isinstance(parent, (nodes.For, nodes.AsyncFor, nodes.While)) and child in parent.body:
-            loop_body.extend(parent.body)
+            loop_body.update(parent.body)
         child = parent
     bindings = []
     for binding in scope.locals.get(node.name, []):
@@ -98,14 +99,17 @@ def _reaching_bindings(node, scope):
             and (statement.value is node or statement.value.parent_of(node))
         ):
             continue
-        if (binding.lineno, binding.col_offset) < (node.lineno, node.col_offset) or any(
-            statement is binding or statement.parent_of(binding) for statement in loop_body
+        if (
+            (binding.lineno, binding.col_offset) < (node.lineno, node.col_offset)
+            or binding in loop_body
+            or not loop_body.isdisjoint(binding.node_ancestors())
         ):
             bindings.append(binding)
     return bindings
 
 
 def _lookup_name(node):
+    anchor = node
     inner = node.scope()
     while isinstance(inner, (nodes.Lambda, nodes.FunctionDef)):
         expressions = [*inner.args.defaults, *inner.args.kw_defaults]
@@ -113,6 +117,7 @@ def _lookup_name(node):
             expressions.append(inner.decorators)
         if not any(value is not None and (value is node or value.parent_of(node)) for value in expressions):
             break
+        anchor = inner
         node = nodes.Name(
             node.name,
             inner.lineno,
@@ -139,7 +144,8 @@ def _lookup_name(node):
                     break
             scope = inner if assignments else None
         if scope is inner:
-            return node, scope, assignments
+            return node, scope, assignments, anchor
+        anchor = inner
         node = nodes.Name(
             node.name,
             inner.lineno,
@@ -149,7 +155,8 @@ def _lookup_name(node):
             end_col_offset=inner.end_col_offset,
         )
     scope = node.scope()
-    return node, scope, _reaching_bindings(node, scope) if isinstance(scope, nodes.FunctionDef) else []
+    assignments = _reaching_bindings(node, scope, anchor) if isinstance(scope, nodes.FunctionDef) else []
+    return node, scope, assignments, anchor
 
 
 def _source(node) -> set[str]:
@@ -224,49 +231,66 @@ def _assignment_value(statement, node):
     return value
 
 
-def _sources(node, cache: dict, incomplete: set, *, binding: bool = False) -> set[str]:
-    key = (binding, node)
-    if key in cache:
-        if cache[key] is None:
-            incomplete.update(active for active, result in cache.items() if result is None)
-            return set()
-        return cache[key]
-    cache[key] = None
+def _source_dependencies(node, *, binding: bool):
     sources = set()
+    dependencies = set()
     if binding:
         statement = node.assign_type() if isinstance(node, nodes.AssignName) else node
         if isinstance(statement, (nodes.Assign, nodes.AnnAssign, nodes.NamedExpr)):
             value = _assignment_value(statement, node)
             if value is not None:
-                sources.update(_sources(value, cache, incomplete))
+                dependencies.add((False, value))
         elif isinstance(statement, nodes.AugAssign):
-            sources.update(_sources(node, cache, incomplete))
-            sources.update(_sources(statement.value, cache, incomplete))
+            dependencies.add((False, node))
+            dependencies.add((False, statement.value))
         else:
             for value in _binding_expressions(statement, node):
-                sources.update(_sources(value, cache, incomplete))
+                dependencies.add((False, value))
     elif isinstance(node, (nodes.Name, nodes.AssignName)):
-        use, scope, assignments = _lookup_name(node)
+        use, scope, assignments, anchor = _lookup_name(node)
         if scope is use.scope() and isinstance(scope, (nodes.FunctionDef, *_COMPREHENSIONS, nodes.Lambda)):
-            overwrite = _overwrite_position(use)
+            overwrite = _overwrite_position(use, anchor)
             for assignment in assignments:
                 if (assignment.lineno, assignment.col_offset) >= overwrite:
-                    sources.update(_sources(assignment, cache, incomplete, binding=True))
+                    dependencies.add((True, assignment))
     else:
         pending = [node]
         while pending:
             child = pending.pop()
             if isinstance(child, (nodes.Name, nodes.AssignName)):
-                sources.update(_sources(child, cache, incomplete))
+                dependencies.add((False, child))
             else:
                 sources.update(_source(child))
                 pending.extend(child.get_children())
-    # A cycle cut makes every active result path-dependent.
-    if key in incomplete:
-        incomplete.remove(key)
-        del cache[key]
-    else:
-        cache[key] = sources
+    return sources, dependencies
+
+
+def _sources(names) -> dict:
+    sources = {}
+    dependents = defaultdict(set)
+    pending = [(False, name) for name in names]
+    while pending:
+        key = pending.pop()
+        if key in sources:
+            continue
+        binding, node = key
+        sources[key], dependencies = _source_dependencies(node, binding=binding)
+        for dependency in dependencies:
+            dependents[dependency].add(key)
+            if dependency not in sources:
+                pending.append(dependency)
+    worklist = deque(key for key, value in sources.items() if value)
+    queued = set(worklist)
+    while worklist:
+        key = worklist.popleft()
+        queued.remove(key)
+        for dependent in dependents[key]:
+            if sources[key] <= sources[dependent]:
+                continue
+            sources[dependent].update(sources[key])
+            if dependent not in queued:
+                worklist.append(dependent)
+                queued.add(dependent)
     return sources
 
 
@@ -337,8 +361,7 @@ def _name_argument(node) -> tuple[str, nodes.Name] | None:
 def scan(path: Path) -> list[int]:
     module = astroid.parse(path.read_text(encoding="utf-8"), path=str(path))
     findings = set()
-    cache = {}
-    incomplete = set()
+    candidates = []
     for call in module.nodes_of_class(nodes.Call):
         if not isinstance(call.func, nodes.Name) or call.func.name != "int" or len(call.args) != 1 or call.keywords:
             continue
@@ -348,7 +371,11 @@ def scan(path: Path) -> list[int]:
         kind, name = argument
         targets = _targets(call)
         allowed = _SUFFIX_TARGETS if kind == "suffix" else _REGEX_TARGETS if kind == "regex" else {"return"}
-        if targets & allowed and kind in _sources(name, cache, incomplete):
+        if targets & allowed:
+            candidates.append((call, kind, name))
+    sources = _sources(name for _, _, name in candidates)
+    for call, kind, name in candidates:
+        if kind in sources[(False, name)]:
             findings.add(call.statement().lineno)
     return sorted(findings)
 
@@ -375,18 +402,22 @@ def _annotated_lines(path: Path) -> set[int]:
 def _test_long_chains() -> None:
     with TemporaryDirectory() as directory:
         path = Path(directory) / "chain.py"
-        for source, expected in (("interface.cf['vlan']", []), ("interface.name.split('.')[-1]", [203])):
-            path.write_text(
-                f"def chain(interface):\n    suffix = {source}\n"
-                + '    suffix = suffix.strip() if suffix else "100"\n' * 200
-                + "    vid = int(suffix)\n",
-                encoding="utf-8",
-            )
-            started = perf_counter()
-            actual = scan(path)
-            elapsed = perf_counter() - started
-            assert actual == expected, (source, actual)
-            assert elapsed < 0.5, f"{source}: scan took {elapsed:.3f}s"
+        for loop in (False, True):
+            indent = "        " if loop else "    "
+            for source in ("interface.cf['vlan']", "interface.name.split('.')[-1]"):
+                path.write_text(
+                    f"def chain(interface):\n    suffix = {source}\n"
+                    + ("    for item in interface.items:\n" if loop else "")
+                    + f'{indent}suffix = suffix.strip() if suffix else "100"\n' * 200
+                    + f"{indent}vid = int(suffix)\n",
+                    encoding="utf-8",
+                )
+                expected = [] if source == "interface.cf['vlan']" else [204 if loop else 203]
+                started = perf_counter()
+                actual = scan(path)
+                elapsed = perf_counter() - started
+                assert actual == expected, (source, loop, actual)
+                assert elapsed < 0.5, f"{source}, loop={loop}: scan took {elapsed:.3f}s"
 
 
 def main() -> int:

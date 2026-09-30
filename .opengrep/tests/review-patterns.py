@@ -560,7 +560,7 @@ def vlan_suffix_from_starred_target(interface):
 
 
 def vlan_suffix_from_starred_value(interface):
-    tail, suffix = *interface.name.rsplit(".", 1), interface.cf["vlan"]
+    tail, suffix = (*interface.name.rsplit(".", 1), interface.cf["vlan"])
     # ruleid: nso-vlan-identity-flow
     return dict(dot1q_vlan=int(suffix))
 
@@ -2251,6 +2251,29 @@ def vlan_function_default_identity(interface):
         return suffix
 
     # ruleid: nso-vlan-identity-flow
+    @decorate(dict(dot1q_vlan=int(suffix)))
+    def decorated(suffix):
+        return suffix
+
+
+def vlan_defaults_after_clean_overwrite(interface):
+    suffix = interface.name.split(".")[-1]
+    suffix = interface.cf["vlan"]
+
+    # ok: nso-vlan-identity-flow
+    def nested(suffix=dict(dot1q_vlan=int(suffix))):
+        return suffix
+
+    # ok: nso-vlan-identity-flow
+    def keyword_default(*, suffix=dict(dot1q_vlan=int(suffix))):
+        return suffix
+
+    # ok: nso-vlan-identity-flow
+    (lambda suffix=dict(dot1q_vlan=int(suffix)): suffix)()
+    # ok: nso-vlan-identity-flow
+    (lambda *, suffix=dict(dot1q_vlan=int(suffix)): suffix)()
+
+    # ok: nso-vlan-identity-flow
     @decorate(dict(dot1q_vlan=int(suffix)))
     def decorated(suffix):
         return suffix
