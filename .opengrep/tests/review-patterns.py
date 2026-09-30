@@ -2279,6 +2279,77 @@ def vlan_defaults_after_clean_overwrite(interface):
         return suffix
 
 
+def vlan_composed_default_identity(interface):
+    suffix = interface.name.split(".")[-1]
+
+    # ruleid: nso-vlan-identity-flow
+    def nested(x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]):
+        return x
+
+    # ruleid: nso-vlan-identity-flow
+    def keyword_default(*, x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]):
+        return x
+
+    # ruleid: nso-vlan-identity-flow
+    def invoked_lambda(x=(lambda: dict(dot1q_vlan=int(suffix)))()):
+        return x
+
+    # ruleid: nso-vlan-identity-flow
+    @decorate([dict(dot1q_vlan=int(suffix)) for _ in [1]])
+    def decorated(x):
+        return x
+
+    # ruleid: nso-vlan-identity-flow
+    @decorate((lambda: dict(dot1q_vlan=int(suffix)))())
+    def lambda_decorated(x):
+        return x
+
+    # ruleid: nso-vlan-identity-flow
+    (lambda x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]: x)()
+    # ruleid: nso-vlan-identity-flow
+    (lambda *, x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]: x)()
+    # ruleid: nso-vlan-identity-flow
+    [(lambda x=dict(dot1q_vlan=int(suffix)): x)() for _ in [1]]
+    # ruleid: nso-vlan-identity-flow
+    [suffix for suffix in (lambda x=dict(dot1q_vlan=int(suffix)): [x])()]
+
+
+def vlan_composed_defaults_after_clean_overwrite(interface):
+    suffix = interface.name.split(".")[-1]
+    suffix = interface.cf["vlan"]
+
+    # ok: nso-vlan-identity-flow
+    def nested(x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]):
+        return x
+
+    # ok: nso-vlan-identity-flow
+    def keyword_default(*, x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]):
+        return x
+
+    # ok: nso-vlan-identity-flow
+    def invoked_lambda(x=(lambda: dict(dot1q_vlan=int(suffix)))()):
+        return x
+
+    # ok: nso-vlan-identity-flow
+    @decorate([dict(dot1q_vlan=int(suffix)) for _ in [1]])
+    def decorated(x):
+        return x
+
+    # ok: nso-vlan-identity-flow
+    @decorate((lambda: dict(dot1q_vlan=int(suffix)))())
+    def lambda_decorated(x):
+        return x
+
+    # ok: nso-vlan-identity-flow
+    (lambda x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]: x)()
+    # ok: nso-vlan-identity-flow
+    (lambda *, x=[dict(dot1q_vlan=int(suffix)) for _ in [1]]: x)()
+    # ok: nso-vlan-identity-flow
+    [(lambda x=dict(dot1q_vlan=int(suffix)): x)() for _ in [1]]
+    # ok: nso-vlan-identity-flow
+    [suffix for suffix in (lambda x=dict(dot1q_vlan=int(suffix)): [x])()]
+
+
 def vlan_flow_cyclic_bindings(interface, items):
     for item in items:
         left = right

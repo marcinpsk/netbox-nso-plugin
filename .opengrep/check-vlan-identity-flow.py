@@ -110,41 +110,35 @@ def _reaching_bindings(node, scope, anchor):
 
 def _lookup_name(node):
     anchor = node
-    inner = node.scope()
-    while isinstance(inner, (nodes.Lambda, nodes.FunctionDef)):
-        expressions = [*inner.args.defaults, *inner.args.kw_defaults]
-        if isinstance(inner, nodes.FunctionDef) and inner.decorators is not None:
-            expressions.append(inner.decorators)
-        if not any(value is not None and (value is node or value.parent_of(node)) for value in expressions):
+    while True:
+        inner = node.scope()
+        expressions = []
+        if isinstance(inner, (nodes.Lambda, nodes.FunctionDef)):
+            expressions = [*inner.args.defaults, *inner.args.kw_defaults]
+            if isinstance(inner, nodes.FunctionDef) and inner.decorators is not None:
+                expressions.append(inner.decorators)
+        in_default = any(value is not None and (value is anchor or value.parent_of(anchor)) for value in expressions)
+        if not in_default and isinstance(inner, (*_COMPREHENSIONS, nodes.Lambda)):
+            scope, assignments = node.lookup(node.name)
+            if isinstance(inner, _COMPREHENSIONS):
+                assignments = []
+                for generator in inner.generators:
+                    if generator.iter is node or generator.iter.parent_of(node):
+                        break
+                    targets = [
+                        target
+                        for target in generator.target.nodes_of_class(nodes.AssignName)
+                        if target.name == node.name
+                    ]
+                    if targets:
+                        assignments = targets
+                    if any(condition is node or condition.parent_of(node) for condition in generator.ifs):
+                        break
+                scope = inner if assignments else None
+            if scope is inner:
+                return node, scope, assignments, anchor
+        elif not in_default:
             break
-        anchor = inner
-        node = nodes.Name(
-            node.name,
-            inner.lineno,
-            inner.col_offset,
-            inner.parent,
-            end_lineno=inner.end_lineno,
-            end_col_offset=inner.end_col_offset,
-        )
-        inner = node.scope()
-    while isinstance(node.scope(), (*_COMPREHENSIONS, nodes.Lambda)):
-        inner = node.scope()
-        scope, assignments = node.lookup(node.name)
-        if isinstance(inner, _COMPREHENSIONS):
-            assignments = []
-            for generator in inner.generators:
-                if generator.iter is node or generator.iter.parent_of(node):
-                    break
-                targets = [
-                    target for target in generator.target.nodes_of_class(nodes.AssignName) if target.name == node.name
-                ]
-                if targets:
-                    assignments = targets
-                if any(condition is node or condition.parent_of(node) for condition in generator.ifs):
-                    break
-            scope = inner if assignments else None
-        if scope is inner:
-            return node, scope, assignments, anchor
         anchor = inner
         node = nodes.Name(
             node.name,
