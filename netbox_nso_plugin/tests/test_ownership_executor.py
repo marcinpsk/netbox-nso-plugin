@@ -245,6 +245,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.models import (
             NSOInterfaceMtuState,
+            NSOInterfaceState,
             NSOOwnershipManifest,
             NSOSubinterfaceState,
             NSOSwitchportState,
@@ -300,17 +301,17 @@ class TestSymmetricOwnershipExecutor(TestCase):
         def build_interface_attribute(device, management):
             type(management).objects.filter(pk=management.pk).update(manage_description=True)
             management.refresh_from_db()
-            Interface.objects.create(
+            interface = Interface.objects.create(
                 device=device,
                 name="Ethernet23",
                 type="1000base-t",
                 description="managed uplink",
             )
+            NSOInterfaceState.objects.create(interface=interface, attribute="description", status="accepted")
             return lambda: type(management).objects.filter(pk=management.pk).update(manage_description=False)
 
-        def build_static_route(device, _management):
-            route = StaticRoute.objects.create(prefix="198.18.175.0/24", next_hop="198.18.0.175", metric=1)
-            route.devices.add(device)
+        def build_static_route(device, management):
+            route = own_route(management, "198.18.175.0/24", "198.18.0.175", device=device)
             return lambda: StaticRoute.objects.filter(pk=route.pk).update(next_hop=None)
 
         scenarios = (
@@ -492,7 +493,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         from django.test.utils import CaptureQueriesContext
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
         def measure(rows):
@@ -506,15 +507,19 @@ class TestSymmetricOwnershipExecutor(TestCase):
                     device_name=vlan.name,
                     status="accepted",
                 )
+            manifests = NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="vlan")
+            self.assertFalse(manifests.exists())
             with CaptureQueriesContext(connection) as captured:
                 reconcile_scope_ownership(device.pk, ["vlan"])
+            self.assertEqual(manifests.filter(ownership_state="owned").count(), rows)
             table = NSOVLANState._meta.db_table
             selects = [
                 query["sql"]
                 for query in captured.captured_queries
                 if query["sql"].lstrip().upper().startswith("SELECT") and f'FROM "{table}"' in query["sql"]
             ]
-            self.assertEqual(len(selects), 3 * rows + 3)
+            # Native-only acquisition no longer adds a separate overlay scan.
+            self.assertEqual(len(selects), 3 * rows + 2)
             return len(captured.captured_queries)
 
         measure(1)
@@ -553,27 +558,24 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         self.assertEqual(measure(1), measure(3))
 
-    def test_native_create_planning_batches_manifest_and_overlay_reads(self):
-        from cProfile import Profile
-
+    def test_native_only_vlan_audit_cost_is_independent_of_row_count(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin.ownership_planner import _native_create_actions, converted_scope_rules
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOVLANState
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
         def measure(rows):
-            device, _management = make_managed(f"owncreate{rows}", 16300 + rows, index=rows)
-            group = VLANGroup.objects.create(name=f"Ownership create {rows}", slug=f"nso-{device.pk}")
+            device, management = make_managed(f"native-audit-{rows}", 16300 + rows, index=rows)
+            group = VLANGroup.objects.create(name=f"Native audit {rows}", slug=f"nso-{device.pk}")
             for index in range(rows):
-                VLAN.objects.create(group=group, vid=1760 + index, name=f"ownership-create-{rows}-{index}")
-            with Profile() as profile, CaptureQueriesContext(connection) as captured:
-                planned = _native_create_actions(device.pk, frozenset({"vlan"}))
-            self.assertEqual(len(planned), rows)
-            rule_calls = sum(
-                entry.callcount for entry in profile.getstats() if entry.code is converted_scope_rules.__code__
-            )
-            self.assertEqual(rule_calls, 1)
+                VLAN.objects.create(group=group, vid=1760 + index, name=f"native-audit-{rows}-{index}")
+            with CaptureQueriesContext(connection) as captured:
+                completed = reconcile_scope_ownership(device.pk, ("vlan",))
+            self.assertEqual(completed, ())
+            self.assertFalse(NSOVLANState.objects.filter(management=management).exists())
+            self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk).exists())
             return len(captured.captured_queries)
 
         self.assertEqual(measure(2), measure(4))
@@ -622,7 +624,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         self.assertTrue(contribution.transitions[0]["unverified"])
         self.assertIn(("static_route", manifest.pk), completed)
 
-    def test_assigned_native_static_route_creates_an_owned_overlay(self):
+    def test_assigned_native_static_route_does_not_acquire_an_overlay(self):
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOOwnershipManifest, NSOStaticRouteState
@@ -637,14 +639,11 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         completed = reconcile_scope_ownership(self.device.pk, ["static_route"])
 
-        state = NSOStaticRouteState.objects.get(management=self.management, static_route=route)
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="static_route")
-        self.assertEqual(state.status, "accepted")
-        self.assertGreater(state.intent_generation, 0)
-        self.assertEqual(manifest.native_id, route.pk)
-        self.assertIn(("static_route", state.pk), completed)
+        self.assertFalse(NSOStaticRouteState.objects.filter(management=self.management, static_route=route).exists())
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="static_route").exists())
+        self.assertEqual(completed, ())
 
-    def test_native_create_that_renders_nothing_is_a_mirror_write(self):
+    def test_native_member_with_an_imported_bundle_does_not_acquire(self):
         from dcim.models import Interface
 
         from netbox_nso_plugin import delivery
@@ -657,8 +656,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         bundle = Interface.objects.create(device=self.device, name="Port-channel19", type="lag")
         member = Interface.objects.create(device=self.device, name="Ethernet11", type="1000base-t", lag=bundle)
-        # The bundle overlay is device-read state, so the LACP document owns nothing and the
-        # member overlay this create seeds renders nothing either.
+        # An imported bundle does not authorize member acquisition.
         NSOLACPBundleState.objects.create(
             management=self.management,
             interface=bundle,
@@ -668,20 +666,48 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         completed = reconcile_scope_ownership(self.device.pk, ["lacp"])
 
-        state = NSOLACPMemberState.objects.get(interface=member)
         payload = delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload
-        self.assertEqual(state.lag_bundle, bundle)
-        self.assertIn(("lacp", state.pk), completed)
+        self.assertFalse(NSOLACPMemberState.objects.filter(interface=member).exists())
+        self.assertEqual(completed, ())
         self.assertEqual(payload, [])
-        self.assertTrue(
-            NSOOwnershipManifest.objects.filter(
-                device_id=self.device.pk,
-                scope="lacp",
-                state_model_label="netbox_nso_plugin.nsolacpmemberstate",
-            ).exists()
-        )
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="lacp").exists())
 
-    def test_native_flex_algo_creates_an_owned_overlay(self):
+    def test_owned_member_with_an_imported_bundle_is_reowned_without_rendering(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin import delivery
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        bundle = Interface.objects.create(device=self.device, name="Port-channel19", type="lag")
+        member = Interface.objects.create(device=self.device, name="Ethernet11", type="1000base-t", lag=bundle)
+        bundle_state = NSOLACPBundleState.objects.create(
+            management=self.management, interface=bundle, lag_id=19, status="imported"
+        )
+        original = NSOLACPMemberState.objects.create(
+            management=self.management, interface=member, lag_bundle=bundle, status="accepted"
+        )
+        reconcile_scope_ownership(self.device.pk, ["lacp"])
+        manifest = NSOOwnershipManifest.objects.get(
+            device_id=self.device.pk, scope="lacp", state_model_label=original._meta.label_lower, native_id=member.pk
+        )
+        self.assertEqual(manifest.ownership_state, "owned")
+        NSOLACPMemberState.objects.filter(pk=original.pk).delete()
+
+        completed = reconcile_scope_ownership(self.device.pk, ["lacp"])
+
+        replacement = NSOLACPMemberState.objects.get(management=self.management, interface=member)
+        manifest.refresh_from_db()
+        bundle_state.refresh_from_db()
+        self.assertNotEqual(replacement.pk, original.pk)
+        self.assertEqual(replacement.status, "accepted")
+        self.assertEqual(replacement.lag_bundle_id, bundle.pk)
+        self.assertEqual(manifest.ownership_state, "owned")
+        self.assertEqual(bundle_state.status, "imported")
+        self.assertIn(("lacp", replacement.pk), completed)
+        self.assertEqual(delivery.render("lacp", self.device.pk, self.management.adapter_device_id).payload, [])
+
+    def test_native_flex_algo_does_not_acquire_an_overlay(self):
         from netbox_routing.models import ISISFlexAlgo, ISISInstance
 
         from netbox_nso_plugin.models import NSOISISFlexAlgoState, NSOOwnershipManifest
@@ -697,14 +723,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         completed = reconcile_scope_ownership(self.device.pk, ["isis_flex_algo"])
 
-        state = NSOISISFlexAlgoState.objects.get(management=self.management, isis_flex_algo=flex_algo)
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="isis_flex_algo")
-        self.assertEqual(state.status, "accepted")
-        self.assertEqual((state.process_tag, state.algo_id), ("CORE", 172))
-        self.assertEqual(manifest.native_id, flex_algo.pk)
-        self.assertIn(("isis_flex_algo", state.pk), completed)
+        self.assertFalse(
+            NSOISISFlexAlgoState.objects.filter(management=self.management, isis_flex_algo=flex_algo).exists()
+        )
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="isis_flex_algo").exists())
+        self.assertEqual(completed, ())
 
-    def test_native_interface_attributes_create_owned_overlays(self):
+    def test_native_interface_attributes_do_not_acquire_overlays(self):
         from dcim.models import Interface
 
         from netbox_nso_plugin.models import NSOInterfaceState, NSOOwnershipManifest
@@ -724,16 +749,10 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         reconcile_scope_ownership(self.device.pk, ["interface"])
 
-        states = NSOInterfaceState.objects.filter(interface=interface).order_by("attribute")
-        self.assertEqual(
-            list(states.values_list("attribute", "status")), [("description", "accepted"), ("enabled", "accepted")]
-        )
-        self.assertEqual(
-            NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface").count(),
-            2,
-        )
+        self.assertFalse(NSOInterfaceState.objects.filter(interface=interface).exists())
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="interface").exists())
 
-    def test_native_interface_topology_does_not_acquire_subinterface_or_svi(self):
+    def test_native_interface_topology_does_not_acquire_any_overlay(self):
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
 
@@ -783,13 +802,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
             ["vlan", "svi", "subinterface", "interface_mtu", "switchport", "lacp"],
         )
 
-        self.assertEqual(NSOVLANState.objects.get(vlan=vlan).status, "accepted")
+        self.assertFalse(NSOVLANState.objects.filter(vlan=vlan).exists())
         self.assertFalse(NSOSVIState.objects.filter(interface=svi).exists())
         self.assertFalse(NSOSubinterfaceState.objects.filter(interface=subinterface).exists())
-        self.assertEqual(NSOInterfaceMtuState.objects.get(interface=parent).l2_mtu, 9216)
-        self.assertEqual(NSOSwitchportState.objects.get(interface=switchport).untagged_vlan, vlan)
-        self.assertEqual(NSOLACPBundleState.objects.get(interface=bundle).status, "accepted")
-        self.assertEqual(NSOLACPMemberState.objects.get(interface=member).lag_bundle, bundle)
+        self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=parent).exists())
+        self.assertFalse(NSOSwitchportState.objects.filter(interface=switchport).exists())
+        self.assertFalse(NSOLACPBundleState.objects.filter(interface=bundle).exists())
+        self.assertFalse(NSOLACPMemberState.objects.filter(interface=member).exists())
 
     def test_reowned_interface_overlay_does_not_copy_native_metadata(self):
         from core.models import ObjectType
@@ -806,8 +825,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
             type="1000base-t",
             mtu=9216,
         )
+        original = NSOInterfaceMtuState.objects.create(
+            management=self.management,
+            interface=interface,
+            l2_mtu=9216,
+            status="accepted",
+        )
         reconcile_scope_ownership(self.device.pk, ["interface_mtu"])
-        original = NSOInterfaceMtuState.objects.get(interface=interface)
         custom_field = CustomField.objects.create(
             name="ownership_native_note",
             label="Ownership native note",
@@ -828,7 +852,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
         replacement.full_clean()
         self.assertIn(("interface_mtu", replacement.pk), completed)
 
-    def test_assigned_native_ip_creates_an_owned_overlay(self):
+    def test_assigned_native_ip_does_not_acquire_an_overlay(self):
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import IPAddress
@@ -845,10 +869,10 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         reconcile_scope_ownership(self.device.pk, ["ip"])
 
-        state = NSOInterfaceIPState.objects.get(interface=interface, address=str(address.address), vrf="")
-        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="ip")
-        self.assertEqual(state.status, "accepted")
-        self.assertEqual(manifest.native_id, address.pk)
+        self.assertFalse(NSOInterfaceIPState.objects.filter(interface=interface).exists())
+        self.assertFalse(
+            NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="ip", native_id=address.pk).exists()
+        )
 
     def test_deleted_native_ip_demotes_its_surviving_owned_overlay(self):
         from dcim.models import Interface
@@ -865,8 +889,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
             assigned_object_type=ContentType.objects.get_for_model(Interface),
             assigned_object_id=interface.pk,
         )
+        state = NSOInterfaceIPState.objects.create(
+            interface=interface,
+            address=str(address.address),
+            vrf="",
+            status="accepted",
+        )
         reconcile_scope_ownership(self.device.pk, ["ip"])
-        state = NSOInterfaceIPState.objects.get(interface=interface, address=str(address.address), vrf="")
         manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="ip")
 
         IPAddress.objects.filter(pk=address.pk).delete()
@@ -948,28 +977,31 @@ class TestSymmetricOwnershipExecutor(TestCase):
                         },
                     ).exists()
                 )
-                canonical = NSOBGPPeerState.objects.get(
-                    management=self.management,
-                    bgp_peer=malformed_peer,
-                    asn_str="64520",
-                    vrf_name="",
-                    peer_address_str="198.18.173.2",
+                self.assertFalse(
+                    NSOBGPPeerState.objects.filter(
+                        management=self.management,
+                        bgp_peer=malformed_peer,
+                        asn_str="64520",
+                        vrf_name="",
+                        peer_address_str="198.18.173.2",
+                    ).exists()
                 )
-                sibling = NSOBGPPeerState.objects.get(
-                    management=self.management,
-                    bgp_peer=other_peer,
-                    asn_str="64520",
-                    vrf_name="",
-                    peer_address_str="198.18.173.3",
+                self.assertFalse(
+                    NSOBGPPeerState.objects.filter(
+                        management=self.management,
+                        bgp_peer=other_peer,
+                        asn_str="64520",
+                        vrf_name="",
+                        peer_address_str="198.18.173.3",
+                    ).exists()
                 )
-                self.assertEqual((canonical.status, sibling.status), ("accepted", "accepted"))
                 self.assertEqual(
                     NSOOwnershipManifest.objects.filter(
                         device_id=self.device.pk,
                         scope="bgp",
                         ownership_state="owned",
                     ).count(),
-                    2,
+                    0,
                 )
 
     def test_malformed_persisted_bgp_manifest_retracts_during_ownership_audit(self):
@@ -1086,7 +1118,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
             self.assertIn(("bgp", state.pk), completed)
         self.assertIn(("bgp", valid.pk), completed)
 
-    def test_native_routing_graph_creates_every_owned_overlay(self):
+    def test_native_routing_graph_does_not_acquire_and_unlinked_mirrors_stay_unowned(self):
         from dcim.models import Device, Interface
         from django.contrib.contenttypes.models import ContentType
         from django.db import transaction
@@ -1171,15 +1203,58 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
         reconcile_scope_ownership(self.device.pk, ["bgp", "isis", "isis_flex_algo", "ospf"])
 
-        self.assertEqual(NSOBGPPeerState.objects.get(bgp_peer=peer).status, "accepted")
-        self.assertEqual(NSOISISInstanceState.objects.get(isis_instance=isis_instance).status, "accepted")
-        self.assertEqual(NSOISISInterfaceState.objects.get(isis_interface=isis_interface).metric, 17)
-        self.assertEqual(NSOISISFlexAlgoState.objects.get(isis_flex_algo=flex_algo).status, "accepted")
-        ospf_state = NSOOSPFInstanceState.objects.get(ospf_instance=ospf_instance)
-        self.assertEqual(ospf_state.router_id, "198.18.173.1")
-        self.assertEqual(ospf_state.areas, [{"area-id": "0.0.0.0", "area-type": "standard"}])
-        self.assertEqual(NSOOSPFInterfaceState.objects.get(interface=interface).cost, 17)
-        self.assertEqual(NSORedistributionState.objects.get(redistribution=redistribution).dest_protocol, "isis")
+        for model in (
+            NSOBGPPeerState,
+            NSOISISInstanceState,
+            NSOISISInterfaceState,
+            NSOISISFlexAlgoState,
+            NSOOSPFInstanceState,
+            NSOOSPFInterfaceState,
+            NSORedistributionState,
+        ):
+            self.assertFalse(model.objects.filter(management=self.management).exists())
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk).exists())
+        NSOBGPPeerState.objects.create(
+            management=self.management,
+            bgp_peer=peer,
+            asn_str="64520",
+            peer_address_str="198.18.173.2",
+            status="imported",
+        )
+        NSOISISInstanceState.objects.create(
+            management=self.management,
+            isis_instance=isis_instance,
+            process_tag="CORE",
+            status="imported",
+        )
+        NSOISISInterfaceState.objects.create(
+            management=self.management,
+            isis_interface=isis_interface,
+            interface=interface,
+            af="ipv4",
+            status="imported",
+        )
+        NSOISISFlexAlgoState.objects.create(
+            management=self.management,
+            isis_flex_algo=flex_algo,
+            process_tag="CORE",
+            algo_id=173,
+            status="imported",
+        )
+        NSOOSPFInstanceState.objects.create(
+            management=self.management,
+            ospf_instance=ospf_instance,
+            process_id="17",
+            status="imported",
+        )
+        NSORedistributionState.objects.create(
+            management=self.management,
+            redistribution=redistribution,
+            dest_protocol="isis",
+            dest_ref="CORE",
+            source_protocol="static",
+            status="imported",
+        )
 
         cases = (
             ("BGP peer", NSOBGPPeerState.objects.get(bgp_peer=peer), "bgp_peer", peer, {"bgp"}),
