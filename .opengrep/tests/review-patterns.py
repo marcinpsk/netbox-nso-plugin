@@ -2229,6 +2229,57 @@ def adapter_error_grandparent_module_alias(items):
         raise client.AdapterError("invalid")
 
 
+def vlan_lambda_default_identity(interface):
+    suffix = interface.name.split(".")[-1]
+    # ruleid: nso-vlan-identity-flow
+    (lambda suffix=dict(dot1q_vlan=int(suffix)): suffix)()
+    # ok: nso-vlan-identity-flow
+    (lambda suffix=interface.cf["vlan"]: int(suffix))()
+    # ok: nso-vlan-identity-flow
+    (lambda suffix=interface.cf["vlan"]: dict(dot1q_vlan=int(suffix)))()
+
+
+def vlan_function_default_identity(interface):
+    suffix = interface.name.split(".")[-1]
+
+    # ruleid: nso-vlan-identity-flow
+    def nested(suffix=dict(dot1q_vlan=int(suffix))):
+        return suffix
+
+    # ruleid: nso-vlan-identity-flow
+    def keyword_default(*, suffix=dict(dot1q_vlan=int(suffix))):
+        return suffix
+
+    # ruleid: nso-vlan-identity-flow
+    @decorate(dict(dot1q_vlan=int(suffix)))
+    def decorated(suffix):
+        return suffix
+
+
+def vlan_flow_cyclic_bindings(interface, items):
+    for item in items:
+        left = right
+        right = left
+        if item:
+            right = interface.name.split(".")[-1]
+        # ruleid: nso-vlan-identity-flow
+        vid = int(left)
+        # ruleid: nso-vlan-identity-flow
+        dot1q_vlan = int(right)
+
+
+def vlan_flow_clean_cyclic_bindings(interface, items):
+    for item in items:
+        left = right
+        right = left
+        if item:
+            right = interface.cf["vlan"]
+        # ok: nso-vlan-identity-flow
+        vid = int(left)
+        # ok: nso-vlan-identity-flow
+        dot1q_vlan = int(right)
+
+
 def adapter_error_absolute_module(items):
     from netbox_nso_plugin import adapter_client
 
