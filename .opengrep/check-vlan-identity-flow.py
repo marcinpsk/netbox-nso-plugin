@@ -9,7 +9,6 @@ import re
 from collections import defaultdict, deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import perf_counter
 
 from python_check_paths import scan_python_paths
 
@@ -393,24 +392,38 @@ def _annotated_lines(path: Path) -> set[int]:
 
 
 def _test_long_chains() -> None:
-    with TemporaryDirectory() as directory:
-        path = Path(directory) / "chain.py"
-        for loop in (False, True):
-            indent = "        " if loop else "    "
-            for source in ("interface.cf['vlan']", "interface.name.split('.')[-1]"):
-                path.write_text(
-                    f"def chain(interface):\n    suffix = {source}\n"
-                    + ("    for item in interface.items:\n" if loop else "")
-                    + f'{indent}suffix = suffix.strip() if suffix else "100"\n' * 200
-                    + f"{indent}vid = int(suffix)\n",
-                    encoding="utf-8",
-                )
-                expected = [] if source == "interface.cf['vlan']" else [204 if loop else 203]
-                started = perf_counter()
-                actual = scan(path)
-                elapsed = perf_counter() - started
-                assert actual == expected, (source, loop, actual)
-                assert elapsed < 0.5, f"{source}, loop={loop}: scan took {elapsed:.3f}s"
+    global _source_dependencies
+    resolve = _source_dependencies
+    calls = 0
+
+    def counted(node, *, binding):
+        nonlocal calls
+        calls += 1
+        return resolve(node, binding=binding)
+
+    _source_dependencies = counted
+    try:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "chain.py"
+            for loop in (False, True):
+                indent = "        " if loop else "    "
+                for source in ("interface.cf['vlan']", "interface.name.split('.')[-1]"):
+                    text = (
+                        f"def chain(interface):\n    suffix = {source}\n"
+                        + ("    for item in interface.items:\n" if loop else "")
+                        + f'{indent}suffix = suffix.strip() if suffix else "100"\n' * 200
+                        + f"{indent}vid = int(suffix)\n"
+                    )
+                    path.write_text(text, encoding="utf-8")
+                    expected = [] if source == "interface.cf['vlan']" else [204 if loop else 203]
+                    calls = 0
+                    actual = scan(path)
+                    assert actual == expected, (source, loop, actual)
+                    # Each binding and expression resolves once, so the count grows linearly with the chain.
+                    bound = 5 * len(text.splitlines())
+                    assert calls <= bound, f"{source}, loop={loop}: {calls} resolutions, bound {bound}"
+    finally:
+        _source_dependencies = resolve
 
 
 def main() -> int:
