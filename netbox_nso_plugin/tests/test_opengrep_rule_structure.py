@@ -25,9 +25,9 @@ _MONOTONIC_RULE_ID = "nso-global-monotonic-patch"
 _COVERAGE_PATH = _RULES_PATH.parent / "tests" / "coverage.py"
 _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside"}
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
-_ROOT_NAME = re.compile(r"(?<![\w.$])([A-Za-z_]\w*)(?=\s*[.(])")
-# opengrep matches the method receiver literally, so "self" is never an import root.
-_ALLOWED_ROOT_NAMES = frozenset({"self"})
+_ROOT_NAME = re.compile(r"(?<![\w.$])(?<!\bdef )([A-Za-z_]\w*)(?=\s*[.(])")
+# These literal rule roots are not imported modules.
+_ALLOWED_ROOT_NAMES = frozenset({"self", "int", "open", "super"})
 
 _COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
 assert _COVERAGE_SPEC is not None
@@ -187,6 +187,13 @@ class TestOpenGrepRuleStructure(SimpleTestCase):
         _, scanned_names = _scan_rules(_RULES_PATH)
 
         self.assertGreaterEqual(len(scanned_names), 4)
+
+    def test_rule_scan_skips_defined_method_names(self):
+        rule = {"id": "definition-shape", "pattern": "def setUp(self):\n    helper.call()\n"}
+
+        names = _root_names(list(_pattern_texts(rule)))
+
+        self.assertEqual(names, {"helper"})
 
     def test_rule_scan_reaches_names_nested_under_a_negative_pattern(self):
         rule = {

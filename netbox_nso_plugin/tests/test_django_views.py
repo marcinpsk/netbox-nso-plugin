@@ -5631,11 +5631,12 @@ class TestOverlayFieldEditView(ViewTestBase):
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOSVIState
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipManifest, NSOSVIState, NSOVLANState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan
 
-        group = VLANGroup.objects.create(name="Inline SVI VLANs", slug="inline-svi-vlans")
+        group = VLANGroup.objects.create(name="Inline SVI VLANs", slug=f"nso-{self.device.pk}")
         vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="imported")
         interface = Interface.objects.create(device=self.device, name="Vlan220", type="virtual")
         state = NSOSVIState.objects.create(
             management=self.mgmt,
@@ -5760,7 +5761,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual(duplicate.status_code, 400)
         self.assertIn("dot1q_vlan", duplicate.json()["errors"])
         self.assertEqual(missing_parent.status_code, 400)
-        self.assertIn("vrf", missing_parent.json()["errors"])
+        self.assertIn("parent_interface", missing_parent.json()["errors"])
         state.refresh_from_db()
         orphan.refresh_from_db()
         self.assertEqual((state.dot1q_vlan, state.status), (200, "imported"))
@@ -6164,11 +6165,16 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         )
 
     def test_svi_edit_refuses_a_plan_staled_after_planning(self):
-        from netbox_nso_plugin.models import NSOSVIState
+        from ipam.models import VLAN, VLANGroup
 
+        from netbox_nso_plugin.models import NSOSVIState, NSOVLANState
+
+        group = VLANGroup.objects.create(name="Stale SVI VLANs", slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=841, name="Stale SVI VLAN")
+        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="imported")
         interface = Interface.objects.create(device=self.device, name="Vlan841", type="virtual")
         state = NSOSVIState.objects.create(
-            management=self.mgmt, interface=interface, svi_type="svi", vrf="", status="imported"
+            management=self.mgmt, interface=interface, vlan=vlan, svi_type="svi", vrf="", status="imported"
         )
 
         def competing():

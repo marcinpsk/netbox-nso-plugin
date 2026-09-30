@@ -1,6 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-vlan-identity-from-interface-name
+    languages: [python]
+    severity: ERROR
+    message: Take VLAN identity from an explicit field, not an interface name.
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $OBJECT.dot1q_vlan = int($EXPR)
+              - pattern: dot1q_vlan = int($EXPR)
+              - pattern: vid = int($EXPR)
+              - pattern: vlan = int($EXPR)
+              - pattern: $CALL(..., dot1q_vlan=int($EXPR), ...)
+              - pattern: '{..., "dot1q_vlan": int($EXPR), ...}'
+          - metavariable-regex:
+              metavariable: $EXPR
+              regex: '.*\.name\.(?:rsplit|split|partition|removeprefix)\('
+      - pattern-either:
+          - pattern: vid = int($INTERFACE.name[4:])
+          - pattern: vlan = int($INTERFACE.name[4:])
+          - pattern: $OBJECT.dot1q_vlan = int($INTERFACE.name[4:])
+          - pattern: dot1q_vlan = int($INTERFACE.name[4:])
+          - pattern: $CALL(..., dot1q_vlan=int($INTERFACE.name[4:]), ...)
+          - pattern: '{..., "dot1q_vlan": int($INTERFACE.name[4:]), ...}'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**", "**/migrations/**"]
   - id: nso-switching-client-single-owner
     languages: [python]
     severity: ERROR
@@ -42,6 +68,22 @@ rules:
       - metavariable-regex:
           metavariable: $VALUE
           regex: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+  - id: nso-intent-push-reset-setup-chain
+    languages: [python]
+    severity: ERROR
+    message: Call super().setUp() so IntentPushResetMixin clears pending intent pushes.
+    patterns:
+      - pattern-inside: |
+          class $CLASS(..., IntentPushResetMixin, ...):
+              ...
+      - pattern: |
+          def setUp(self):
+              ...
+      - pattern-not: |
+          def setUp(self):
+              ...
+              super().setUp()
+              ...
   - id: nso-global-monotonic-patch
     languages: [python]
     severity: ERROR

@@ -152,6 +152,56 @@ class TestSviReconciler(TestCase):
         )
         self.assertEqual(rows[0].vlan.vid, 150)
 
+    def test_reconcile_clears_imported_vlan_when_detached_vid_becomes_ambiguous(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        original_vlan = VLAN.objects.create(group=group, vid=10, name="Original")
+        attachment = NSOVLANState.objects.create(management=self.management, vlan=original_vlan, status="imported")
+        payload = {"interfaces": [{"interface_name": "Vlan10", "vlan_id": 10, "type": "svi"}]}
+        state = reconcile_svi(self.device, payload)[0]
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.vlan_id, original_vlan.pk)
+
+        attachment.delete()
+        for label in ("second", "third"):
+            shared = VLANGroup.objects.create(name=f"SVI {label}", slug=f"svi-{label}")
+            vlan = VLAN.objects.create(group=shared, vid=10, name=label)
+            NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
+
+        rows = reconcile_svi(self.device, payload)
+
+        self.assertEqual([row.pk for row in rows], [state.pk])
+        state.refresh_from_db()
+        self.assertEqual(state.status, "conflict")
+        self.assertIsNone(state.vlan)
+
+    def test_reconcile_keeps_imported_vlan_when_attached_vid_becomes_ambiguous(self):
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOVLANState
+        from netbox_nso_plugin.svi_reconciler import reconcile_svi
+        from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
+
+        group = _device_vlan_group(self.device)
+        original_vlan = VLAN.objects.create(group=group, vid=10, name="Original")
+        NSOVLANState.objects.create(management=self.management, vlan=original_vlan, status="imported")
+        payload = {"interfaces": [{"interface_name": "Vlan10", "vlan_id": 10, "type": "svi"}]}
+        state = reconcile_svi(self.device, payload)[0]
+        shared = VLANGroup.objects.create(name="Later SVI VLANs", slug="later-svi-vlans")
+        second_vlan = VLAN.objects.create(group=shared, vid=10, name="Later")
+        NSOVLANState.objects.create(management=self.management, vlan=second_vlan, status="imported")
+
+        reconcile_svi(self.device, payload)
+
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.vlan_id, original_vlan.pk)
+
     def test_existing_interface_is_reused_not_duplicated(self):
         from netbox_nso_plugin.svi_reconciler import reconcile_svi
 
@@ -317,7 +367,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         from dcim.models import Interface
         from ipam.models import VLAN
 
-        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.models import NSOSVIState, NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
         in_flight_rows = tuple(
@@ -328,6 +378,7 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         )
         iface = Interface.objects.create(device=self.device, name=name, type="virtual")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
+        NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
         state = NSOSVIState.objects.create(
             management=self.management,
             interface=iface,
@@ -474,6 +525,127 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         ifaces = mock_put.call_args[0][1]
         assert [i["interface_name"] for i in ifaces] == ["Vlan100"]
         assert ifaces[0]["vlan_id"] == 100 and ifaces[0]["vrf"] == "MGMT"
+
+    def test_owned_snapshot_query_count_does_not_grow_with_rows(self):
+        from unittest.mock import patch
+
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.delivery import render
+
+        query_counts = []
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            for vid in (100, 200, 300, 400):
+                self._state(name=f"Vlan{vid}", vid=vid, status="accepted")
+                if vid in (100, 400):
+                    with CaptureQueriesContext(connection) as queries:
+                        rendered = render("svi", self.device.pk, 42)
+                    query_counts.append(len(queries))
+                    self.assertEqual(
+                        [item["vlan_id"] for item in rendered.payload],
+                        list(range(100, vid + 1, 100)),
+                    )
+                    rendered.do_push(rendered.payload)
+                    self.assertEqual(mock_put.call_args.args, (42, rendered.payload))
+
+        self.assertEqual(mock_put.call_count, 2)
+        self.assertEqual(query_counts[0], query_counts[1])
+
+    def test_owned_snapshot_blocks_conflicting_owned_vid(self):
+        from unittest.mock import patch
+
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import render
+        from netbox_nso_plugin.models import NSOVLANState
+
+        self._state(name="Vlan100", vid=100, status="accepted")
+        group = VLANGroup.objects.create(name="Shared VLANs", slug="shared-snapshot-vlans")
+        vlan = VLAN.objects.create(group=group, vid=100, name="Duplicate VID")
+        NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
+        interface = Interface.objects.create(device=self.device, name="irb.200", type="virtual")
+        NSOSVIState.objects.create(
+            management=self.management,
+            interface=interface,
+            vlan=vlan,
+            svi_type="irb",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            rendered = render("svi", self.device.pk, 42)
+            self.assertEqual(len(rendered.payload["blocked"]), 2)
+            for reason in rendered.payload["blocked"]:
+                self.assertIn("VLAN VID is already bound to an owned SVI on this device.", reason)
+                self.assertNotIn("VLAN VID is ambiguous", reason)
+            with self.assertRaisesRegex(AdapterError, "SVI snapshot is blocked") as raised:
+                rendered.do_push(rendered.payload)
+
+        self.assertEqual(raised.exception.code, "validation_error")
+        self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+        mock_put.assert_not_called()
+
+    def test_blocked_owned_snapshot_banner_reports_unsent(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOVLANState
+
+        self._state(name="Vlan100", vid=100, status="accepted")
+        group = VLANGroup.objects.create(name="Shared VLANs", slug="shared-snapshot-vlans")
+        vlan = VLAN.objects.create(group=group, vid=100, name="Duplicate VID")
+        NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
+        interface = Interface.objects.create(device=self.device, name="irb.200", type="virtual")
+        NSOSVIState.objects.create(
+            management=self.management,
+            interface=interface,
+            vlan=vlan,
+            svi_type="irb",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            with self.assertRaises(AdapterError) as raised:
+                deliver("svi", self.device.pk, self.management.adapter_device_id)
+        mock_put.assert_not_called()
+        self.assertEqual(raised.exception.code, "validation_error")
+        self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.intent_push_errors["svi"]["code"], "validation_error")
+
+        admin = get_user_model().objects.create_superuser(
+            username="svi-banner-admin",
+            password="pw",  # noqa: S106
+            email="banner@test.example",
+        )
+        self.client.force_login(admin)
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "svi"},
+        )
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        push_error = response.context["push_error"]
+        self.assertEqual(push_error["kind"], "unsent")
+        self.assertEqual(
+            push_error["headline"],
+            "An owned row fails identity validation, so NetBox did not send the snapshot.",
+        )
+        self.assertEqual(push_error["detail"], {"reason": "blocked_owned_row"})
+        self.assertEqual(push_error["message"], "The server log names the row and the failed check.")
+        self.assertNotIn("adapter", push_error["message"].lower())
+        self.assertNotIn(raised.exception.args[0], str(push_error))
+        html = response.content.decode()
+        self.assertIn("An owned row fails identity validation, so NetBox did not send the snapshot.", html)
+        self.assertIn("blocked_owned_row", html)
+        self.assertNotIn("The adapter rejected", html)
 
     def test_foreign_overlay_save_does_not_schedule_svi_behavior(self):
         from unittest.mock import patch

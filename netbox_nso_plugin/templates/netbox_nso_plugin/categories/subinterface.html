@@ -6,8 +6,10 @@
      data-q="{{ q }}" data-page="{{ page.number }}">
   <div class="nso-cat-results">
     {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
+    {% include "netbox_nso_plugin/categories/_push_error.html" %}
     <div class="nso-cat-msg"></div>
     {% include "netbox_nso_plugin/categories/_cat_search.html" with placeholder=placeholder q=q %}
+    <a class="btn btn-sm btn-primary mb-2" href="{% url 'plugins:netbox_nso_plugin:subinterface_add' device_pk=object.pk %}">Add subinterface</a>
     {% if subinterface_states %}
     <p class="text-muted small mb-2">Edit dot1q encapsulation and VRF inline. Interface and parent form the structural identity; IP addresses remain on the linked interface.</p>
     <div class="table-responsive">

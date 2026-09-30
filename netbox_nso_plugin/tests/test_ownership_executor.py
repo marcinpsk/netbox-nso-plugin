@@ -235,9 +235,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
     def test_a_retract_takes_the_object_out_of_the_scope_render(self):
         """Every scope whose overlay can outlive its native anchor must stop rendering it.
 
-        The ``existing_overlay`` scopes are not fixtured here: their overlay either IS the
-        native row (l2_sap/logging/snmp) or cascades with it (bfd), so a retract leaves
-        nothing to render. ``route_policy`` is the one exception and is reported separately.
+        The subinterface overlay survives a native parent loss and must be demoted.
+        Other existing-overlay scopes use separate lifecycle fixtures.
         """
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
@@ -338,15 +337,14 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 self.assertEqual(manifest.ownership_state, "retired")
                 self.assertEqual(delivery.render(scope, device.pk, management.adapter_device_id).payload, [])
 
-    def test_owned_overlay_with_a_qualifying_anchor_is_never_demoted(self):
+    def test_owned_svi_with_native_anchor_is_not_demoted_for_missing_vlan(self):
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOOwnershipManifest, NSOSVIState
         from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
-        # An SVI qualifies when its interface name resolves a VLAN of the device's group:
-        # a Vlan<vid> interface whose vid names no device VLAN is not a qualifying anchor.
+        # An owned SVI uses its linked device VLAN as ownership evidence.
         group = VLANGroup.objects.create(name="Ownership svi anchor", slug=f"nso-{self.device.pk}")
         vlan = VLAN.objects.create(group=group, vid=1731, name="ownership-svi-anchor")
         anchored = NSOSVIState.objects.create(
@@ -356,10 +354,10 @@ class TestSymmetricOwnershipExecutor(TestCase):
             svi_type="svi",
             status="accepted",
         )
-        unanchored = NSOSVIState.objects.create(
+        malformed = NSOSVIState.objects.create(
             management=self.management,
             interface=Interface.objects.create(device=self.device, name="Vlan2213", type="virtual"),
-            vlan=vlan,
+            vlan=None,
             svi_type="svi",
             status="accepted",
         )
@@ -367,10 +365,10 @@ class TestSymmetricOwnershipExecutor(TestCase):
         reconcile_scope_ownership(self.device.pk, ["svi"])
 
         anchored.refresh_from_db()
-        unanchored.refresh_from_db()
+        malformed.refresh_from_db()
         self.assertEqual(anchored.status, "accepted")
-        self.assertEqual(unanchored.status, "imported")
-        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="svi").count(), 1)
+        self.assertEqual(malformed.status, "accepted")
+        self.assertEqual(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="svi").count(), 2)
 
     def test_foreign_overlay_delete_retires_a_scope_with_no_native_content(self):
         from dcim.models import Interface
@@ -525,6 +523,35 @@ class TestSymmetricOwnershipExecutor(TestCase):
         # One device scan builds the plan; revalidating a planned row is O(1), so the cost
         # per extra owned overlay is constant. A per-row re-scan makes it grow.
         self.assertEqual(four - three, three - two)
+
+    def test_recording_missing_svi_manifests_does_not_read_vlans_per_row(self):
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.models import NSOSVIState
+        from netbox_nso_plugin.ownership_planner import OwnershipAction, _manifest_record_actions
+
+        def measure(rows):
+            device, management = make_managed(f"sviscan{rows}", 16290 + rows, index=rows)
+            group = VLANGroup.objects.create(name=f"SVI scan {rows}", slug=f"nso-{device.pk}")
+            for index in range(rows):
+                vlan = VLAN.objects.create(group=group, vid=1760 + index, name=f"svi-scan-{rows}-{index}")
+                NSOSVIState.objects.create(
+                    management=management,
+                    interface=Interface.objects.create(device=device, name=f"Vlan{vlan.vid}", type="virtual"),
+                    vlan=vlan,
+                    svi_type="svi",
+                    status="accepted",
+                )
+            with CaptureQueriesContext(connection) as captured:
+                actions = _manifest_record_actions(device.pk, frozenset({"svi"}), qualifying=frozenset(), natives={})
+            self.assertEqual(len(actions), rows)
+            self.assertTrue(all(action[0] is OwnershipAction.RECORD_MANIFEST for action in actions))
+            return len(captured.captured_queries)
+
+        self.assertEqual(measure(1), measure(3))
 
     def test_native_create_planning_batches_manifest_and_overlay_reads(self):
         from cProfile import Profile
@@ -706,7 +733,7 @@ class TestSymmetricOwnershipExecutor(TestCase):
             2,
         )
 
-    def test_native_interface_topology_creates_every_owned_overlay(self):
+    def test_native_interface_topology_does_not_acquire_subinterface_or_svi(self):
         from dcim.models import Interface
         from ipam.models import VLAN, VLANGroup
 
@@ -757,8 +784,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
         )
 
         self.assertEqual(NSOVLANState.objects.get(vlan=vlan).status, "accepted")
-        self.assertEqual(NSOSVIState.objects.get(interface=svi).vlan, vlan)
-        self.assertEqual(NSOSubinterfaceState.objects.get(interface=subinterface).dot1q_vlan, 1724)
+        self.assertFalse(NSOSVIState.objects.filter(interface=svi).exists())
+        self.assertFalse(NSOSubinterfaceState.objects.filter(interface=subinterface).exists())
         self.assertEqual(NSOInterfaceMtuState.objects.get(interface=parent).l2_mtu, 9216)
         self.assertEqual(NSOSwitchportState.objects.get(interface=switchport).untagged_vlan, vlan)
         self.assertEqual(NSOLACPBundleState.objects.get(interface=bundle).status, "accepted")

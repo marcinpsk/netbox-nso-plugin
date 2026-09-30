@@ -111,15 +111,17 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "svi": ScopeOwnershipRule(
         scope="svi",
-        acquisition_strategy="native",
+        acquisition_strategy="existing_overlay",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsosvistate",),
         overlay_native_fields=(("netbox_nso_plugin.nsosvistate", "interface"),),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            f"Acquire from persisted SVI interface state instead of save-event provenance. {_DIRECT_OVERLAY_EDIT_DELTA}"
+            "Acquire only from an accepted SVI overlay. Native save events are not ownership evidence. "
+            "A foreign overlay delete retires its identity. Native anchor loss retracts with deletion authority. "
+            f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "switchport": ScopeOwnershipRule(
@@ -149,15 +151,16 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "subinterface": ScopeOwnershipRule(
         scope="subinterface",
-        acquisition_strategy="native",
+        acquisition_strategy="existing_overlay",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsosubinterfacestate",),
         overlay_native_fields=(("netbox_nso_plugin.nsosubinterfacestate", "interface"),),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted parent and dot1q state. Native save events are not ownership evidence. "
+            "Acquire only from an accepted subinterface overlay. Native save events are not ownership evidence. "
+            "A foreign overlay delete retires its identity. Native anchor loss retracts with deletion authority. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
@@ -811,6 +814,20 @@ def _manifest_states(device_id, requested):
     }
 
 
+def _native_anchor_lost(scope, native, device_id) -> bool:
+    """Return whether an owned overlay has lost its native anchor."""
+    if scope not in {"subinterface", "svi"}:
+        return False
+    if native is None or native.device_id != device_id:
+        return True
+    if scope == "subinterface":
+        from dcim.models import Interface
+
+        if native.parent_id is None or not Interface.objects.filter(pk=native.parent_id, device_id=device_id).exists():
+            return True
+    return False
+
+
 def _record_action_for(instance, device_id, requested, qualifying, manifest_states, *, natives=None):
     """Return one overlay's planned record action, or ``None`` when it needs no work."""
     from .status_machine import is_owned
@@ -836,7 +853,11 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
         _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key)
     )
     if rule.acquisition_strategy == "existing_overlay":
-        native_qualifies = True
+        native_qualifies = not _native_anchor_lost(
+            scope,
+            _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label], natives=natives),
+            device_id,
+        )
     else:
         signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
         native_qualifies = signature is not None and signature in qualifying
@@ -1106,14 +1127,6 @@ def _seed_vlan(candidate, native, _manifest):
     candidate.device_name = native.name
 
 
-def _seed_svi(candidate, native, _manifest):
-    definition = _svi_definition(native)
-    if definition is not None:
-        candidate.svi_type, vlan_id = definition
-        candidate.vlan = _device_vlan(native.device_id, vlan_id, preferred=native.untagged_vlan)
-    candidate.vrf = native.vrf.name if native.vrf_id else ""
-
-
 def _seed_switchport(candidate, native, _manifest):
     candidate.mode = native.mode or ""
     candidate.untagged_vlan = native.untagged_vlan
@@ -1138,13 +1151,6 @@ def _seed_interface_attribute(candidate, native, _manifest):
 
 def _seed_interface_ip(candidate, native, _manifest):
     candidate.family = f"ipv{native.address.version}"
-    candidate.vrf = native.vrf.name if native.vrf_id else ""
-
-
-def _seed_subinterface(candidate, native, _manifest):
-    candidate.parent_interface = native.parent
-    suffix = native.name.rsplit(".", 1)[-1]
-    candidate.dot1q_vlan = int(suffix) if suffix.isdigit() else None
     candidate.vrf = native.vrf.name if native.vrf_id else ""
 
 
@@ -1228,8 +1234,6 @@ _STATE_SEEDERS = {
     "netbox_nso_plugin.nsoospfinterfacestate": _seed_ospf_interface,
     "netbox_nso_plugin.nsoredistributionstate": _seed_redistribution,
     "netbox_nso_plugin.nsostaticroutestate": _seed_static_route,
-    "netbox_nso_plugin.nsosubinterfacestate": _seed_subinterface,
-    "netbox_nso_plugin.nsosvistate": _seed_svi,
     "netbox_nso_plugin.nsoswitchportstate": _seed_switchport,
     "netbox_nso_plugin.nsovlanstate": _seed_vlan,
 }
@@ -1290,25 +1294,6 @@ def _native_identity(rule, native):
     return {name: _json_value(getattr(native, name)) for name in key_fields}
 
 
-def _device_vlan(device_id, vid, *, preferred=None):
-    """Resolve the VLAN carried by one native SVI interface."""
-    if preferred is not None and preferred.vid == vid:
-        return preferred
-    from ipam.models import VLAN
-
-    return VLAN.objects.filter(group__slug=f"nso-{device_id}", vid=vid).first()
-
-
-def _svi_definition(interface):
-    """Return ``(type, vid)`` for a native SVI or IRB interface."""
-    name = (interface.name or "").lower()
-    if name.startswith("vlan") and name[4:].isdigit():
-        return "svi", int(name[4:])
-    if name.startswith("irb.") and name[4:].isdigit():
-        return "irb", int(name[4:])
-    return None
-
-
 def _native_binding(scope, native, state_model_label, state_key=None):
     return scope, native, state_model_label, state_key or {}
 
@@ -1357,20 +1342,6 @@ def _vlan_bindings(management):
     )
 
 
-def _svi_bindings(management):
-    from dcim.models import Interface
-
-    bindings = []
-    for interface in Interface.objects.filter(device_id=management.device_id, type="virtual").order_by("pk"):
-        definition = _svi_definition(interface)
-        if definition is None:
-            continue
-        _svi_type, vid = definition
-        if _device_vlan(management.device_id, vid, preferred=interface.untagged_vlan) is not None:
-            bindings.append(_native_binding("svi", interface, "netbox_nso_plugin.nsosvistate"))
-    return tuple(bindings)
-
-
 def _switchport_bindings(management):
     from dcim.models import Interface
     from django.db.models import Q
@@ -1390,16 +1361,6 @@ def _interface_mtu_bindings(management):
     return tuple(
         _native_binding("interface_mtu", row, "netbox_nso_plugin.nsointerfacemtustate")
         for row in Interface.objects.filter(device_id=management.device_id, mtu__isnull=False).order_by("pk")
-    )
-
-
-def _subinterface_bindings(management):
-    from dcim.models import Interface
-
-    return tuple(
-        _native_binding("subinterface", row, "netbox_nso_plugin.nsosubinterfacestate")
-        for row in Interface.objects.filter(device_id=management.device_id, parent_id__isnull=False).order_by("pk")
-        if "." in row.name and row.name.rsplit(".", 1)[-1].isdigit()
     )
 
 
@@ -1597,8 +1558,6 @@ _NATIVE_BINDING_BUILDERS = {
     "lacp": _lacp_bindings,
     "ospf": _ospf_bindings,
     "static_route": _static_route_bindings,
-    "subinterface": _subinterface_bindings,
-    "svi": _svi_bindings,
     "switchport": _switchport_bindings,
     "vlan": _vlan_bindings,
 }
@@ -1960,7 +1919,10 @@ def _manifest_lifecycle_action(manifest, requested, *, management=None, qualifyi
         model, filters = _state_filters_without_native(manifest, rule, management)
     overlay = model.objects.filter(**filters).first()
     native_qualifies = native is not None and (
-        rule.acquisition_strategy == "existing_overlay"
+        (
+            rule.acquisition_strategy == "existing_overlay"
+            and not _native_anchor_lost(manifest.scope, native, management.device_id)
+        )
         or _valid_overlay_signature(
             manifest.scope,
             manifest.native_model_label,

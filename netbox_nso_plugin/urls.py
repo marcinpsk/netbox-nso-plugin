@@ -574,6 +574,16 @@ urlpatterns = [
         name="subinterface_accept",
     ),
     path(
+        "devices/<int:device_pk>/svi/add/",
+        views.NSOSVICreateView.as_view(),
+        name="svi_add",
+    ),
+    path(
+        "devices/<int:device_pk>/subinterface/add/",
+        views.NSOSubinterfaceCreateView.as_view(),
+        name="subinterface_add",
+    ),
+    path(
         "interface-mtu/state/<int:pk>/accept/",
         views.NSOInterfaceMtuStateAcceptView.as_view(),
         name="interface_mtu_accept",

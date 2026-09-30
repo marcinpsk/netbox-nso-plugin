@@ -363,22 +363,24 @@ def _schedule_intent_drain(key) -> None:
 
 
 def _drain_intent_pushes() -> None:
-    """Drain every key this transaction appended to, isolating failures between them.
-
-    The first callback takes the whole cell and clears it, so callbacks 2..N of a bulk edit
-    are O(1). A per-key failure is data: the claim keeps its rows and its sequence, and the
-    five-minute tick supplies the next attempt.
-    """
+    """Drain committed keys until no new on-commit callback adds a key."""
     from . import drain
 
-    keys = _pending_intent_keys()
-    claimed = sorted(keys)
-    keys.clear()
-    for device_id, scope in claimed:
-        try:
-            drain.drain_key(device_id, scope)
-        except Exception as exc:  # noqa: BLE001 — one key's drain must not abort its siblings
-            logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
+    if getattr(_intent_keys, "draining", False):
+        return
+    _intent_keys.draining = True
+    try:
+        keys = _pending_intent_keys()
+        while keys:
+            claimed = sorted(keys)
+            keys.clear()
+            for device_id, scope in claimed:
+                try:
+                    drain.drain_key(device_id, scope)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Intent outbox drain failed for %s/%s: %s", device_id, scope, exc)
+    finally:
+        _intent_keys.draining = False
 
 
 def _allocate_push_attempt(device_id, scope):
@@ -1613,14 +1615,11 @@ def _on_logging_state_save(sender, instance, **kwargs):
 
 
 def svi_intent_item(row):
-    """Return one SVI in the adapter's exact wire shape, or None when unkeyed."""
-    vid = row.vlan.vid if row.vlan else None
-    if vid is None:
-        return None
+    """Return one SVI in the adapter's exact wire shape."""
     return {
         "interface_name": row.interface.name,
-        "vlan_id": vid,
-        "type": row.svi_type or "svi",
+        "vlan_id": row.vlan.vid if row.vlan else None,
+        "type": row.svi_type,
         "vrf": row.vrf or "",
     }
 
@@ -1633,19 +1632,42 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOSVIState
+    from .svi_identity import svi_errors, svi_identity_index
 
     interfaces = []
-    for row in NSOSVIState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface", "vlan"):
-        if item := svi_intent_item(row):
-            interfaces.append(item)
+    blocked = []
+    rows = list(
+        NSOSVIState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management", "management__device", "interface", "vlan", "vlan__group")
+    )
+    index = svi_identity_index(rows[0].management, NSOSVIState) if rows else None
+    for row in rows:
+        errors = svi_errors(row, index=index)
+        if errors:
+            reason = ", ".join(f"{field}: {'; '.join(messages)}" for field, messages in errors.items())
+            blocked.append(f"{row.management.device.name} {row.interface.name}: {reason}")
+        else:
+            interfaces.append(svi_intent_item(row))
+
+    payload = {"blocked": blocked} if blocked else interfaces
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            from .adapter_client import AdapterError
+
+            raise AdapterError(
+                f"SVI snapshot is blocked: {'; '.join(body['blocked'])}",
+                code="validation_error",
+                detail={"reason": "blocked_owned_row"},
+            )
+        return client.put_svi_intent(adapter_device_id, body)
 
     _push_changed(
         (device_id, "svi"),
-        interfaces,
-        lambda body: client.put_svi_intent(adapter_device_id, body),
+        payload,
+        push,
     )
 
 
@@ -1670,12 +1692,10 @@ def _on_svi_state_save(sender, instance, **kwargs):
 
 
 def subinterface_intent_item(row):
-    """Return one dot1q subinterface in its exact wire shape, or None when unkeyed."""
-    if row.dot1q_vlan is None or row.parent_interface is None:
-        return None
+    """Return the row's wire fields for valid delivery or invalid-state fingerprinting."""
     return {
         "interface_name": row.interface.name,
-        "parent_interface": row.parent_interface.name,
+        "parent_interface": row.parent_interface.name if row.parent_interface else None,
         "dot1q_vlan": row.dot1q_vlan,
         "type": "subinterface",
         "vrf": row.vrf or "",
@@ -1690,19 +1710,42 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
     """
     from . import adapter_client as client
     from .models import NSOSubinterfaceState
+    from .subinterface_identity import subinterface_errors, subinterface_identity_index
 
     interfaces = []
-    for row in NSOSubinterfaceState.objects.filter(
-        management__device_id=device_id,
-        status__in=_OWNED_PUSH_STATUSES,
-    ).select_related("interface", "parent_interface"):
-        if item := subinterface_intent_item(row):
-            interfaces.append(item)
+    blocked = []
+    rows = list(
+        NSOSubinterfaceState.objects.filter(
+            management__device_id=device_id,
+            status__in=_OWNED_PUSH_STATUSES,
+        ).select_related("management", "management__device", "interface", "parent_interface")
+    )
+    index = subinterface_identity_index(rows[0].management, NSOSubinterfaceState) if rows else None
+    for row in rows:
+        errors = subinterface_errors(row, index=index)
+        if errors:
+            reason = ", ".join(f"{field}: {'; '.join(messages)}" for field, messages in errors.items())
+            blocked.append(f"{row.management.device.name} {row.interface.name}: {reason}")
+        else:
+            interfaces.append(subinterface_intent_item(row))
+
+    payload = {"blocked": blocked} if blocked else interfaces
+
+    def push(body):
+        if isinstance(body, dict) and body.get("blocked"):
+            from .adapter_client import AdapterError
+
+            raise AdapterError(
+                f"Subinterface snapshot is blocked: {'; '.join(body['blocked'])}",
+                code="validation_error",
+                detail={"reason": "blocked_owned_row"},
+            )
+        return client.put_subinterface_intent(adapter_device_id, body)
 
     _push_changed(
         (device_id, "subinterface"),
-        interfaces,
-        lambda body: client.put_subinterface_intent(adapter_device_id, body),
+        payload,
+        push,
     )
 
 

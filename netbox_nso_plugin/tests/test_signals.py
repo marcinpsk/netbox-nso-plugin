@@ -2378,12 +2378,15 @@ class TestDeleteOriginMarking(_SignalDBBase):
         )
 
     def _owned_svi(self, mgmt):
-        from ipam.models import VLAN
+        from dcim.models import Interface
+        from ipam.models import VLAN, VLANGroup
 
         from netbox_nso_plugin.models import NSOSVIState
 
-        vlan = VLAN.objects.create(vid=444, name="do-v444")
-        state = NSOSVIState(management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted")
+        group = VLANGroup.objects.create(name="SVI device VLANs", slug=f"nso-{self.device.pk}")
+        vlan = VLAN.objects.create(group=group, vid=444, name="do-v444")
+        interface = Interface.objects.create(device=self.device, name="irb.7", type="virtual")
+        state = NSOSVIState(management=mgmt, interface=interface, vlan=vlan, svi_type="irb", status="accepted")
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         plan = RendererMutationPlan.build(

@@ -66,6 +66,88 @@ class _DrainCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
         NSOIntentOutboxEntry.objects.all().delete()
 
 
+class TestCommitDrainReentrancy(_DrainCase):
+    def test_claim_commits_drain_following_keys_without_recursion(self):
+        import sys
+
+        from django.db.models.signals import post_save
+
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        managed = [self.managed(f"reentry{index}", 7750 + index, index=index, vid=1000 + index) for index in range(24)]
+        self.clear_entries()
+        for _device, management in managed:
+            self.edit(management)
+        signals.reset_intent_push_state()
+        devices = [device for device, _management in managed]
+        next_by_device = dict(zip((device.pk for device in devices), devices[1:], strict=False))
+
+        def schedule_from_claim(sender, instance, **kwargs):
+            if next_device := next_by_device.pop(instance.device_id, None):
+                signals._schedule_intent_drain((next_device.pk, "vlan"))
+
+        config, session = self.adapter.patches()
+        old_limit = sys.getrecursionlimit()
+        post_save.connect(schedule_from_claim, sender=NSOIntentOutboxState, weak=False)
+        try:
+            sys.setrecursionlimit(300)
+            with (
+                config,
+                session,
+                self.assertNoLogs("netbox_nso_plugin.signals", level="WARNING"),
+                self.assertNoLogs("netbox_nso_plugin.drain", level="WARNING"),
+                transaction.atomic(),
+            ):
+                signals._schedule_intent_drain((devices[0].pk, "vlan"))
+        finally:
+            sys.setrecursionlimit(old_limit)
+            post_save.disconnect(schedule_from_claim, sender=NSOIntentOutboxState)
+
+        self.assertEqual(len(self.adapter.requests), len(devices))
+        self.assertTrue(all(not entries(device, "vlan", unconsumed=True) for device in devices))
+
+    def test_failed_key_does_not_block_siblings_new_keys_or_later_commits(self):
+        from netbox_nso_plugin import signals
+        from netbox_nso_plugin.intent_state import content_mutation
+
+        broken, _ = self.managed("isolatebroken", 7780, index=1, vid=1080)
+        sibling, _ = self.managed("isolatesibling", 7781, index=2, vid=1081)
+        queued, _ = self.managed("isolatequeued", 7782, index=3, vid=1082)
+        later, _ = self.managed("isolatelater", 7783, index=4, vid=1083)
+        self.clear_entries()
+        signals.reset_intent_push_state()
+
+        def respond(body):
+            if len(self.adapter.requests) == 1:
+                with transaction.atomic():
+                    with content_mutation({(queued.pk, "vlan")}):
+                        signals._schedule_intent_push((queued.pk, "vlan"))
+            return self.adapter._default_response(body)
+
+        self.adapter._respond = respond
+        config, session = self.adapter.patches()
+        with config, session:
+            with self.assertLogs("netbox_nso_plugin.signals", level="WARNING") as logged, transaction.atomic():
+                signals._schedule_intent_drain((broken.pk, "invalid_scope"))
+                with content_mutation({(sibling.pk, "vlan")}):
+                    signals._schedule_intent_push((sibling.pk, "vlan"))
+
+            self.assertEqual(len(logged.output), 1)
+            self.assertIn("invalid_scope", logged.output[0])
+            self.assertEqual(len(self.adapter.requests), 2)
+            self.assertFalse(entries(sibling, "vlan", unconsumed=True))
+            self.assertFalse(entries(queued, "vlan", unconsumed=True))
+            self.assertFalse(signals._intent_keys.draining)
+
+            with transaction.atomic():
+                with content_mutation({(later.pk, "vlan")}):
+                    signals._schedule_intent_push((later.pk, "vlan"))
+
+        self.assertEqual(len(self.adapter.requests), 3)
+        self.assertFalse(entries(later, "vlan", unconsumed=True))
+
+
 class TestTheTickDrainsTheTail(_DrainCase):
     """O1.23 (R4-B3, R5-M3): the pass the synchronous chain leaves its tail to."""
 

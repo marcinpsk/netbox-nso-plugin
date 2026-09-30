@@ -798,21 +798,116 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert ifaces[0]["parent_interface"] == "ge-0/0/0"
         assert ifaces[0]["vrf"] == "MTI"
 
-    def test_push_skips_rows_without_dot1q(self):
+    def test_owned_snapshot_query_count_does_not_grow_with_rows(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.delivery import render
+
+        query_counts = []
+        with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+            for tag in (100, 200, 300, 400):
+                self._state(name=f"ge-0/0/0.{tag}", dot1q=tag, status="accepted")
+                if tag in (100, 400):
+                    with CaptureQueriesContext(connection) as queries:
+                        rendered = render("subinterface", self.device.pk, 42)
+                    query_counts.append(len(queries))
+                    self.assertEqual(
+                        [item["dot1q_vlan"] for item in rendered.payload],
+                        list(range(100, tag + 1, 100)),
+                    )
+                    rendered.do_push(rendered.payload)
+                    self.assertEqual(mock_put.call_args.args, (42, rendered.payload))
+
+        self.assertEqual(mock_put.call_count, 2)
+        self.assertEqual(query_counts[0], query_counts[1])
+
+    def test_owned_snapshot_blocks_duplicate_parent_and_tag_in_all_statuses(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import render
+
+        self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+
+        for name, status, blocked in (("ge-0/0/0.200", "imported", 1), ("ge-0/0/0.300", "accepted", 2)):
+            with self.subTest(status=status):
+                self._state(name=name, dot1q=100, status=status)
+                with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+                    rendered = render("subinterface", self.device.pk, 42)
+                    self.assertEqual(len(rendered.payload["blocked"]), blocked)
+                    for reason in rendered.payload["blocked"]:
+                        self.assertIn(
+                            "dot1q VLAN 100 is already used by another subinterface on ge-0/0/0.",
+                            reason,
+                        )
+                    with self.assertRaisesRegex(AdapterError, "Subinterface snapshot is blocked") as raised:
+                        rendered.do_push(rendered.payload)
+
+                self.assertEqual(raised.exception.code, "validation_error")
+                self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+                mock_put.assert_not_called()
+
+    def test_blocked_owned_snapshot_banner_reports_unsent(self):
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+        self._state(name="ge-0/0/0.200", dot1q=100, status="imported")
+        self._state(name="ge-0/0/0.300", dot1q=100, status="accepted")
+
+        with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+            with self.assertRaises(AdapterError) as raised:
+                deliver("subinterface", self.device.pk, self.management.adapter_device_id)
+        mock_put.assert_not_called()
+        self.assertEqual(raised.exception.code, "validation_error")
+        self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.intent_push_errors["subinterface"]["code"], "validation_error")
+
+        admin = get_user_model().objects.create_superuser(
+            username="subinterface-banner-admin",
+            password="pw",  # noqa: S106
+            email="banner@test.example",
+        )
+        self.client.force_login(admin)
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "subinterface"},
+        )
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        push_error = response.context["push_error"]
+        self.assertEqual(push_error["kind"], "unsent")
+        self.assertEqual(
+            push_error["headline"],
+            "An owned row fails identity validation, so NetBox did not send the snapshot.",
+        )
+        self.assertEqual(push_error["detail"], {"reason": "blocked_owned_row"})
+        self.assertEqual(push_error["message"], "The server log names the row and the failed check.")
+        self.assertNotIn("adapter", push_error["message"].lower())
+        self.assertNotIn(raised.exception.args[0], str(push_error))
+        html = response.content.decode()
+        self.assertIn("An owned row fails identity validation, so NetBox did not send the snapshot.", html)
+        self.assertIn("blocked_owned_row", html)
+        self.assertNotIn("The adapter rejected", html)
+
+    def test_push_blocks_scope_for_owned_row_without_dot1q(self):
         from unittest.mock import patch
 
+        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.delivery import deliver
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
-        # Owned but no dot1q tag → the reconciler can't key it; must be excluded.
+        # An owned row without a tag blocks the full snapshot.
         self._state(name="ge-0/0/0.110", dot1q=None, status="accepted")
         reset_intent_push_state()
         with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
-            deliver("subinterface", self.device.pk, 42)
-        mock_put.assert_called_once()
-        ifaces = mock_put.call_args[0][1]
-        assert [i["interface_name"] for i in ifaces] == ["ge-0/0/0.100"]
+            with self.assertRaisesRegex(AdapterError, "dot1q_vlan"):
+                deliver("subinterface", self.device.pk, 42)
+        mock_put.assert_not_called()
 
     def test_accept_marks_owned(self):
         from unittest.mock import patch

@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from dcim.models import Cable, Interface
 from django import forms
-from ipam.models import ASN, VRF, IPAddress, Prefix
+from ipam.models import ASN, VLAN, VRF, IPAddress, Prefix
 from netbox.forms import NetBoxModelForm
 from utilities.forms.fields import DynamicModelChoiceField, SlugField
 from utilities.forms.rendering import FieldSet
@@ -26,6 +26,51 @@ from .models import (
     NSOVaultSettings,
 )
 from .vault_refs import VaultRefError, parse_vault_ref, qualify_snmp_ref, secret_fingerprint
+
+
+class NSOSubinterfaceCreateForm(forms.Form):
+    """Collect an explicit parent, unit, and dot1q tag for one managed device."""
+
+    parent = forms.ModelChoiceField(queryset=Interface.objects.none())
+    unit = forms.IntegerField(min_value=0)
+    dot1q_vlan = forms.IntegerField(min_value=1, max_value=4094, label="dot1q VLAN")
+    vrf = forms.CharField(max_length=128, required=False)
+
+    def __init__(self, *args, device, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["parent"].queryset = Interface.objects.filter(device=device).order_by("name")
+
+
+class NSOSVICreateForm(forms.Form):
+    """Collect a device VLAN and a Junos IRB unit when required."""
+
+    vlan = forms.ModelChoiceField(queryset=VLAN.objects.none(), label="Device VLAN")
+    unit = forms.IntegerField(min_value=0, required=False, label="IRB unit")
+    vrf = forms.CharField(max_length=128, required=False)
+
+    def __init__(self, *args, management, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .svi_identity import attached_svi_vlans
+
+        self.management = management
+        self.fields["vlan"].queryset = attached_svi_vlans(management).order_by("vid")
+
+    def clean(self):
+        from .svi_create import svi_type_for_device
+
+        values = super().clean()
+        if self.errors:
+            return values
+        try:
+            svi_type = svi_type_for_device(self.management)
+        except forms.ValidationError as exc:
+            raise forms.ValidationError(exc.messages) from exc
+        self.svi_type = svi_type
+        if svi_type == "irb" and values.get("unit") is None:
+            self.add_error("unit", "Junos IRB unit is required.")
+        if svi_type == "svi" and values.get("unit") is not None:
+            self.add_error("unit", "Cisco SVI names come from the selected VLAN.")
+        return values
 
 
 def _vault_settings_layout():
