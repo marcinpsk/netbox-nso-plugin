@@ -34,6 +34,7 @@ def adapter_device_ned(ned_id):
 
 class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
+        super().setUp()
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
         self.device, self.management = make_managed("svidelivery", 17543)
@@ -603,6 +604,7 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
 
 class TestSviCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
+        super().setUp()
         from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
         self.device, self.management = make_managed("svirace", 17544)

@@ -49,6 +49,7 @@ class TestUnitZeroSwitchportOwnership(_CascadeFlushMixin, IntentPushResetMixin, 
 
 class TestSubinterfaceCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
+        super().setUp()
         self.device, self.management = make_managed("subifrace", 17541)
         with without_commit_drain(), transaction.atomic():
             self.parent = Interface.objects.create(device=self.device, name="ae99", type="lag")
@@ -226,6 +227,7 @@ class TestSubinterfaceCreateRaces(_CascadeFlushMixin, IntentPushResetMixin, Tran
 
 class TestOwnedSubinterfaceDelivery(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
+        super().setUp()
         self.device, self.management = make_managed("subifdelivery", 17542)
         self.client.force_login(get_user_model().objects.create_user("subif-delivery-admin", is_superuser=True))
 
