@@ -498,11 +498,12 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 # Only the scopes whose push failures are persisted appear here (see
 # signals._record_push_outcome); a category with no entry simply renders no banner.
 _CATEGORY_PUSH_SCOPES = {"static": "static_route", "subinterface": "subinterface", "svi": "svi"}
-_PUBLIC_STATIC_ROUTE_PUSH_REASONS = frozenset(
+_PUBLIC_PUSH_REASONS = frozenset(
     {
         "backfill_carries_deletions",
         "backfill_missing_route_id",
         "backfill_only_unsupported",
+        "blocked_owned_row",
         "device_claimed",
         "duplicate_deleted_route_id",
         "duplicate_route_id",
@@ -518,18 +519,20 @@ _PUBLIC_STATIC_ROUTE_PUSH_REASONS = frozenset(
 # including a socket that drops after the body went out, and `nso_timeout` likewise leaves
 # a PUT that may have committed and auto-applied. Both are unknown, not unsent — claiming
 # either way would state an outcome nobody observed.
+# A `validation_error` with reason `blocked_owned_row` is raised in signals.py before any request, so it is unsent too.
 _PUSH_UNSENT_CODES = frozenset({"configuration_error"})
 _PUSH_UNKNOWN_CODES = frozenset({"nso_unreachable", "nso_timeout", ""})
 _PUSH_HEADLINES = {
+    "blocked_owned_row": "An owned row fails identity validation, so NetBox did not send the snapshot.",
     "rejected": "The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.",
     "unsent": "The last intent push for this category never reached the adapter — NetBox holds the edit, the device does not.",
     "unknown": "The last intent push for this category did not complete — whether the adapter stored it is unknown.",
 }
 
 
-def _push_error_kind(code):
+def _push_error_kind(code, reason):
     """Classify a recorded push failure as rejected / unsent / unknown."""
-    if code in _PUSH_UNSENT_CODES:
+    if code in _PUSH_UNSENT_CODES or (code == "validation_error" and reason == "blocked_owned_row"):
         return "unsent"
     if code in _PUSH_UNKNOWN_CODES:
         return "unknown"
@@ -552,16 +555,21 @@ def _category_push_error(key, mgmt):
     if not isinstance(entry, dict):
         return None
     code = entry.get("code") if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", str(entry.get("code") or "")) else ""
-    kind = _push_error_kind(code)
     detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
     reason = detail.get("reason")
-    public_detail = {"reason": reason} if type(reason) is str and reason in _PUBLIC_STATIC_ROUTE_PUSH_REASONS else {}
+    kind = _push_error_kind(code, reason)
+    headline_key = reason if kind == "unsent" and code == "validation_error" else kind
+    public_detail = {"reason": reason} if type(reason) is str and reason in _PUBLIC_PUSH_REASONS else {}
     result = {
         "code": code,
-        "message": public_error_message(AdapterError("", code=code)),
+        "message": (
+            "The server log names the row and the failed check."
+            if headline_key == "blocked_owned_row"
+            else public_error_message(AdapterError("", code=code))
+        ),
         "detail": public_detail,
         "kind": kind,
-        "headline": _PUSH_HEADLINES[kind],
+        "headline": _PUSH_HEADLINES[headline_key],
     }
     if type(entry.get("attempt")) is int and entry["attempt"] >= 0:
         result["attempt"] = entry["attempt"]

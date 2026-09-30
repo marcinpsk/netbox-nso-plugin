@@ -595,16 +595,18 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         rejected this' states an outcome nobody observed."""
         from netbox_nso_plugin.views import _category_push_error
 
-        def _kind(code):
-            self.mgmt.intent_push_errors = {"static_route": {"code": code, "message": "x"}}
+        def _kind(code, reason=None):
+            self.mgmt.intent_push_errors = {
+                "static_route": {"code": code, "message": "x", "detail": {"reason": reason}}
+            }
             self.mgmt.save(update_fields=["intent_push_errors"])
             return _category_push_error("static", self.mgmt)
 
         self.assertEqual(_kind("validation_error")["kind"], "rejected")
         self.assertEqual(_kind("conflict")["kind"], "rejected")
-        # Only configuration_error is raised before a request is ever built, so it is the
-        # ONE code that proves nothing was sent. nso_unreachable is every generic
-        # RequestException — including a socket dropping after the body went out.
+        self.assertEqual(_kind("validation_error", "blocked_owned_row")["kind"], "unsent")
+        self.assertEqual(_kind("conflict", "blocked_owned_row")["kind"], "rejected")
+        # A configuration error proves that NetBox sent no request.
         self.assertEqual(_kind("configuration_error")["kind"], "unsent")
         self.assertEqual(_kind("nso_unreachable")["kind"], "unknown")
         self.assertEqual(_kind("nso_timeout")["kind"], "unknown")

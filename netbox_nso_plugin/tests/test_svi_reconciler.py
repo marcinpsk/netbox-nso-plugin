@@ -587,6 +587,66 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
         mock_put.assert_not_called()
 
+    def test_blocked_owned_snapshot_banner_reports_unsent(self):
+        from unittest.mock import patch
+
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+        from ipam.models import VLAN, VLANGroup
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+        from netbox_nso_plugin.models import NSOVLANState
+
+        self._state(name="Vlan100", vid=100, status="accepted")
+        group = VLANGroup.objects.create(name="Shared VLANs", slug="shared-snapshot-vlans")
+        vlan = VLAN.objects.create(group=group, vid=100, name="Duplicate VID")
+        NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
+        interface = Interface.objects.create(device=self.device, name="irb.200", type="virtual")
+        NSOSVIState.objects.create(
+            management=self.management,
+            interface=interface,
+            vlan=vlan,
+            svi_type="irb",
+            status="accepted",
+        )
+
+        with patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put:
+            with self.assertRaises(AdapterError) as raised:
+                deliver("svi", self.device.pk, self.management.adapter_device_id)
+        mock_put.assert_not_called()
+        self.assertEqual(raised.exception.code, "validation_error")
+        self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.intent_push_errors["svi"]["code"], "validation_error")
+
+        admin = get_user_model().objects.create_superuser(
+            username="svi-banner-admin",
+            password="pw",  # noqa: S106
+            email="banner@test.example",
+        )
+        self.client.force_login(admin)
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "svi"},
+        )
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        push_error = response.context["push_error"]
+        self.assertEqual(push_error["kind"], "unsent")
+        self.assertEqual(
+            push_error["headline"],
+            "An owned row fails identity validation, so NetBox did not send the snapshot.",
+        )
+        self.assertEqual(push_error["detail"], {"reason": "blocked_owned_row"})
+        self.assertEqual(push_error["message"], "The server log names the row and the failed check.")
+        self.assertNotIn("adapter", push_error["message"].lower())
+        self.assertNotIn(raised.exception.args[0], str(push_error))
+        html = response.content.decode()
+        self.assertIn("An owned row fails identity validation, so NetBox did not send the snapshot.", html)
+        self.assertIn("blocked_owned_row", html)
+        self.assertNotIn("The adapter rejected", html)
+
     def test_foreign_overlay_save_does_not_schedule_svi_behavior(self):
         from unittest.mock import patch
 

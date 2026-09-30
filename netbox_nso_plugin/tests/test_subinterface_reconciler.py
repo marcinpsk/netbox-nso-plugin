@@ -846,6 +846,53 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
                 self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
                 mock_put.assert_not_called()
 
+    def test_blocked_owned_snapshot_banner_reports_unsent(self):
+        from django.contrib.auth import get_user_model
+        from django.urls import reverse
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.delivery import deliver
+
+        self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
+        self._state(name="ge-0/0/0.200", dot1q=100, status="imported")
+        self._state(name="ge-0/0/0.300", dot1q=100, status="accepted")
+
+        with patch("netbox_nso_plugin.adapter_client.put_subinterface_intent") as mock_put:
+            with self.assertRaises(AdapterError) as raised:
+                deliver("subinterface", self.device.pk, self.management.adapter_device_id)
+        mock_put.assert_not_called()
+        self.assertEqual(raised.exception.code, "validation_error")
+        self.assertEqual(raised.exception.detail, {"reason": "blocked_owned_row"})
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.intent_push_errors["subinterface"]["code"], "validation_error")
+
+        admin = get_user_model().objects.create_superuser(
+            username="subinterface-banner-admin",
+            password="pw",  # noqa: S106
+            email="banner@test.example",
+        )
+        self.client.force_login(admin)
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category",
+            kwargs={"pk": self.device.pk, "key": "subinterface"},
+        )
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        push_error = response.context["push_error"]
+        self.assertEqual(push_error["kind"], "unsent")
+        self.assertEqual(
+            push_error["headline"],
+            "An owned row fails identity validation, so NetBox did not send the snapshot.",
+        )
+        self.assertEqual(push_error["detail"], {"reason": "blocked_owned_row"})
+        self.assertEqual(push_error["message"], "The server log names the row and the failed check.")
+        self.assertNotIn("adapter", push_error["message"].lower())
+        self.assertNotIn(raised.exception.args[0], str(push_error))
+        html = response.content.decode()
+        self.assertIn("An owned row fails identity validation, so NetBox did not send the snapshot.", html)
+        self.assertIn("blocked_owned_row", html)
+        self.assertNotIn("The adapter rejected", html)
+
     def test_push_blocks_scope_for_owned_row_without_dot1q(self):
         from unittest.mock import patch
 
