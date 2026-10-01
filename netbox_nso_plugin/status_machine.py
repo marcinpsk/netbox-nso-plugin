@@ -75,13 +75,6 @@ LEGACY_STATES: frozenset[str] = frozenset()
 #: re-introducing a legacy state is a visible diff.
 LEGACY_VOCAB_BY_MODEL: dict[str, frozenset[str]] = {}
 
-#: Overlays whose status the plugin does NOT compute via on_reconcile. Only
-#: ``NSOInterfaceState`` remains: interface-attribute status is *adapter-driven* (the
-#: plugin copies the string the adapter computes; ``drifted`` is normalised to
-#: ``changed`` at ingest so the vocabulary is aligned). Fully routing it through this
-#: machine requires the adapter (nso-adapter) to adopt it — a cross-repo change.
-NOT_YET_UNIFIED: frozenset[str] = frozenset({"NSOInterfaceState"})
-
 #: Overlays that deliberately omit the ``changed`` (value-diff drift) state: the
 #: EAV / secret-style mirrors (SNMP, logging) signal divergence via ``conflict``
 #: instead of a value diff. Pinned so a *new* overlay forgetting ``changed`` fails.

@@ -8,7 +8,7 @@ from django.test import SimpleTestCase, TestCase
 
 
 class TestOwnershipStateSignatures(SimpleTestCase):
-    def test_greenfield_native_state_creates_an_overlay_but_never_promotes_one(self):
+    def test_native_only_state_never_acquires_or_promotes_an_overlay(self):
         from netbox_nso_plugin.ownership_planner import (
             OwnershipAction,
             OwnershipSignature,
@@ -23,10 +23,9 @@ class TestOwnershipStateSignatures(SimpleTestCase):
                 rule,
                 OwnershipSignature(native_present=True, native_qualifies=True),
             )
-            is OwnershipAction.CREATE
+            is OwnershipAction.NONE
         )
-        # An imported/unknown/changed overlay is device-read state, not operator intent:
-        # the operator Accept is the only entry into ownership.
+        # Only an explicit operation acquires an unowned overlay.
         assert (
             plan_ownership(
                 rule,
@@ -38,6 +37,29 @@ class TestOwnershipStateSignatures(SimpleTestCase):
             )
             is OwnershipAction.NONE
         )
+
+    def test_every_rule_refuses_native_only_acquisition_without_an_owned_manifest(self):
+        from netbox_nso_plugin.ownership_planner import (
+            OwnershipAction,
+            OwnershipSignature,
+            converted_scope_rules,
+            plan_ownership,
+        )
+
+        for scope, rule in converted_scope_rules().items():
+            for manifest_state in (None, "detached", "retired"):
+                with self.subTest(scope=scope, manifest_state=manifest_state):
+                    self.assertIs(
+                        plan_ownership(
+                            rule,
+                            OwnershipSignature(
+                                native_present=True,
+                                native_qualifies=True,
+                                manifest_state=manifest_state,
+                            ),
+                        ),
+                        OwnershipAction.NONE,
+                    )
 
     def test_manifest_distinguishes_native_deletion_from_foreign_overlay_deletion(self):
         from netbox_nso_plugin.ownership_planner import (
@@ -224,7 +246,7 @@ class TestManifestRetirement(TestCase):
 
 
 class TestConvertedScopeRuleTable(SimpleTestCase):
-    def test_converted_scopes_have_reviewed_acquisition_and_retirement_entries(self):
+    def test_converted_scopes_have_reviewed_qualification_and_retirement_entries(self):
         from netbox_nso_plugin.ownership_planner import _NATIVE_BINDING_BUILDERS, converted_scope_rules
 
         rules = converted_scope_rules()
@@ -257,7 +279,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             assert rule.deletion_authority
             assert rule.intentional_semantic_delta
             assert rule.foreign_overlay_delete in {"reown", "retire"}
-            assert rule.acquisition_strategy in {"native", "existing_overlay"}
+            assert rule.qualification in {"native_binding", "overlay_anchor"}
 
         assert {scope for scope, rule in rules.items() if rule.foreign_overlay_delete == "retire"} == {
             "bfd",
@@ -266,7 +288,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             "subinterface",
             "svi",
         }
-        assert {scope for scope, rule in rules.items() if rule.acquisition_strategy == "existing_overlay"} == {
+        assert {scope for scope, rule in rules.items() if rule.qualification == "overlay_anchor"} == {
             "bfd",
             "l2_sap",
             "logging",
@@ -281,7 +303,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
         assert set(_NATIVE_BINDING_BUILDERS) == {
             scope
             for scope, rule in rules.items()
-            if rule.acquisition_strategy == "native" and scope != "redistribution"
+            if rule.qualification == "native_binding" and scope != "redistribution"
         }
         assert len(set(rules) - {"redistribution"}) == 18
 

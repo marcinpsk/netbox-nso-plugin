@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""Pure acquisition and retirement rules for converted delivery scopes."""
+"""Ownership maintenance and retirement rules for converted delivery scopes."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import copy
 import json
 from dataclasses import dataclass
 from enum import Enum
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 
 from django.apps import apps
 from django.utils import timezone
@@ -29,7 +29,6 @@ class OwnershipAction(str, Enum):
     """One state-derived ownership transition."""
 
     NONE = "none"
-    CREATE = "create"
     RECORD_MANIFEST = "record_manifest"
     REOWN = "reown"
     RETRACT = "retract"
@@ -57,7 +56,7 @@ class ScopeOwnershipRule:
     """Reviewed ownership policy and native identity for one converted scope."""
 
     scope: str
-    acquisition_strategy: str
+    qualification: str
     native_model_labels: tuple[str, ...]
     native_key_fields: tuple[str, ...]
     overlay_model_labels: tuple[str, ...]
@@ -78,7 +77,7 @@ _DIRECT_OVERLAY_EDIT_DELTA = (
 _CONVERTED_SCOPE_RULES = {
     "lacp": ScopeOwnershipRule(
         scope="lacp",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=(
@@ -92,12 +91,12 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted bundle and member topology instead of save-event provenance."
+            "Native bundle and member topology qualifies existing ownership. Acquisition requires an explicit operation."
         ),
     ),
     "vlan": ScopeOwnershipRule(
         scope="vlan",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("ipam.vlan",),
         native_key_fields=("group_id", "vid"),
         overlay_model_labels=("netbox_nso_plugin.nsovlanstate",),
@@ -105,13 +104,13 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            f"Acquire from persisted VLAN attachment state. Canceling edits need not acquire. "
+            f"Native VLAN attachment qualifies existing ownership. Acquisition requires an explicit operation. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "svi": ScopeOwnershipRule(
         scope="svi",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsosvistate",),
@@ -119,25 +118,27 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire only from an accepted SVI overlay. Native save events are not ownership evidence. "
+            "An owned SVI overlay qualifies existing ownership. Acquisition requires an explicit operation. "
             "A foreign overlay delete retires its identity. Native anchor loss retracts with deletion authority. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "switchport": ScopeOwnershipRule(
         scope="switchport",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsoswitchportstate",),
         overlay_native_fields=(("netbox_nso_plugin.nsoswitchportstate", "interface"),),
         foreign_overlay_delete="reown",
         deletion_authority=True,
-        intentional_semantic_delta=("Acquire from current L2 state. M2M edit events are not ownership evidence."),
+        intentional_semantic_delta=(
+            "Native L2 state qualifies existing ownership. Acquisition requires an explicit operation."
+        ),
     ),
     "interface_mtu": ScopeOwnershipRule(
         scope="interface_mtu",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsointerfacemtustate",),
@@ -145,13 +146,13 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted per-interface MTU state. A save event is not ownership evidence. "
+            "Native interface MTU qualifies existing ownership. Acquisition requires an explicit operation. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "subinterface": ScopeOwnershipRule(
         scope="subinterface",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsosubinterfacestate",),
@@ -159,14 +160,14 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire only from an accepted subinterface overlay. Native save events are not ownership evidence. "
+            "An owned subinterface overlay qualifies existing ownership. Acquisition requires an explicit operation. "
             "A foreign overlay delete retires its identity. Native anchor loss retracts with deletion authority. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "bfd": ScopeOwnershipRule(
         scope="bfd",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsobfdinterfacestate",),
@@ -174,7 +175,7 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from persisted per-interface BFD state. Save events are not ownership evidence. "
+            "An owned BFD overlay qualifies existing ownership. Acquisition requires an explicit operation. "
             "The BFD timers live only on the overlay, so a foreign overlay delete retires the identity "
             "instead of re-owning it from a native row that carries no BFD content. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
@@ -182,7 +183,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "bgp": ScopeOwnershipRule(
         scope="bgp",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("netbox_routing.bgppeer",),
         native_key_fields=("scope_id", "peer_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsobgppeerstate",),
@@ -190,7 +191,7 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted BGP peer and linked overlay. Native and overlay save events are not ownership "
+            "A native BGP peer qualifies existing ownership. Acquisition requires an explicit operation. Save events are not ownership "
             "evidence. Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot "
             "synchronously. Greenfield acceptance uses exact acquisition planning and outbox delivery instead of "
             "accepting and pushing directly. Routers, scopes, address families, peer templates, ASNs, and peer IPs "
@@ -201,7 +202,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "interface": ScopeOwnershipRule(
         scope="interface",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("dcim.interface",),
         native_key_fields=("device_id", "name"),
         overlay_model_labels=("netbox_nso_plugin.nsointerfacestate",),
@@ -209,13 +210,13 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire description and enabled intent from explicit persisted state changes. "
+            "Native description and enabled values qualify existing ownership. Acquisition requires an explicit operation. "
             "Native interface and cable events are not ownership evidence and do not recompute derived values."
         ),
     ),
     "ip": ScopeOwnershipRule(
         scope="ip",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("ipam.ipaddress",),
         native_key_fields=("address", "vrf_id", "assigned_object_type_id", "assigned_object_id"),
         overlay_model_labels=("netbox_nso_plugin.nsointerfaceipstate",),
@@ -223,13 +224,13 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from an exact persisted IPAddress and interface-IP state pair. "
+            "An exact native IPAddress binding qualifies existing ownership. Acquisition requires an explicit operation. "
             "Native IP save and delete events are not ownership evidence. Reconcile activation and unassignment are atomic."
         ),
     ),
     "l2_sap": ScopeOwnershipRule(
         scope="l2_sap",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=("netbox_nso_plugin.nsol2sapstate",),
         native_key_fields=("management_id", "service_name", "sap_id"),
         overlay_model_labels=("netbox_nso_plugin.nsol2sapstate",),
@@ -237,14 +238,14 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted SAP overlay because the rendered SAP values live on that row. "
+            "An owned SAP overlay qualifies existing ownership. Acquisition requires an explicit operation. "
             "VPN and termination mirrors do not establish ownership, and save events are not ownership evidence. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "logging": ScopeOwnershipRule(
         scope="logging",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=(
             "netbox_nso_plugin.nsologginghoststate",
             "netbox_nso_plugin.nsologginglevelstate",
@@ -265,12 +266,12 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            f"Acquire from persisted logging rows. Save events are not ownership evidence. {_DIRECT_OVERLAY_EDIT_DELTA}"
+            f"Owned logging overlays qualify existing ownership. Acquisition requires an explicit operation. {_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
     ),
     "snmp": ScopeOwnershipRule(
         scope="snmp",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=(
             "netbox_nso_plugin.nsosnmpcommunitystate",
             "netbox_nso_plugin.nsosnmpv3userstate",
@@ -298,11 +299,13 @@ _CONVERTED_SCOPE_RULES = {
         ),
         foreign_overlay_delete="reown",
         deletion_authority=True,
-        intentional_semantic_delta=("Acquire from persisted SNMP rows. Save events are not ownership evidence."),
+        intentional_semantic_delta=(
+            "Owned SNMP overlays qualify existing ownership. Acquisition requires an explicit operation."
+        ),
     ),
     "static_route": ScopeOwnershipRule(
         scope="static_route",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("netbox_routing.staticroute",),
         native_key_fields=("vrf_id", "prefix", "next_hop", "interface_next_hop"),
         overlay_model_labels=("netbox_nso_plugin.nsostaticroutestate",),
@@ -310,7 +313,7 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted route assignment and overlay. Native route and assignment events are not "
+            "A native route assignment qualifies existing ownership. Acquisition requires an explicit operation. Save events are not "
             "ownership evidence. Deletion authority carries only the adapter-acknowledged route triple. "
             f"{_DIRECT_OVERLAY_EDIT_DELTA}"
         ),
@@ -318,7 +321,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "isis_flex_algo": ScopeOwnershipRule(
         scope="isis_flex_algo",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("netbox_routing.isisflexalgo",),
         native_key_fields=("instance_id", "algo_id"),
         overlay_model_labels=("netbox_nso_plugin.nsoisisflexalgostate",),
@@ -326,13 +329,13 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted Flex-Algo and linked overlay. Native Flex-Algo save and delete events are not "
+            "A native Flex-Algo qualifies existing ownership. Acquisition requires an explicit operation. Save events are not "
             "ownership evidence."
         ),
     ),
     "redistribution": ScopeOwnershipRule(
         scope="redistribution",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=("netbox_routing.redistribution",),
         native_key_fields=(
             "destination_type_id",
@@ -345,14 +348,14 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted destination-specific redistribution and linked overlay. Native and overlay "
+            "Native destination-specific redistribution qualifies existing ownership. Acquisition requires an explicit operation. Native and overlay "
             "save events are not ownership evidence. The manifest delivery scope comes from the destination protocol."
         ),
         manifest_scope_field="dest_protocol",
     ),
     "route_policy": ScopeOwnershipRule(
         scope="route_policy",
-        acquisition_strategy="existing_overlay",
+        qualification="overlay_anchor",
         native_model_labels=tuple(ROUTE_POLICY_NATIVE_MODEL_LABELS.values()),
         native_key_fields=("name",),
         overlay_model_labels=("netbox_nso_plugin.nsoroutepolicystate",),
@@ -360,7 +363,7 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted named policy root and its linked device overlay. Native root, entry, M2M, "
+            "An owned device policy overlay qualifies existing ownership. Acquisition requires an explicit operation. Native root, entry, M2M, "
             "and through-row events are not ownership evidence. Native policy deletes no longer delete per-device "
             "overlays and push reduced snapshots synchronously. Acceptance and contributor cascades use exact "
             "acquisition planning and outbox delivery instead of owning and pushing directly. Entries and references "
@@ -371,7 +374,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "isis": ScopeOwnershipRule(
         scope="isis",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=(
             "netbox_routing.isisinstance",
             "netbox_routing.isisinterface",
@@ -392,7 +395,7 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted native process or interface and its linked overlay. Native and overlay save "
+            "A native ISIS process or interface qualifies existing ownership. Acquisition requires an explicit operation. Native and overlay save "
             "events are not ownership evidence. Native interface edits no longer refresh owned overlays. Native "
             "interface deletes no longer delete overlays and push retirement synchronously. ISISLevel edits and "
             "deletes no longer re-push immediately. Reconciliation and ownership audits handle these changes. "
@@ -402,7 +405,7 @@ _CONVERTED_SCOPE_RULES = {
     ),
     "ospf": ScopeOwnershipRule(
         scope="ospf",
-        acquisition_strategy="native",
+        qualification="native_binding",
         native_model_labels=(
             "netbox_routing.ospfinstance",
             "netbox_routing.ospfinterface",
@@ -423,7 +426,7 @@ _CONVERTED_SCOPE_RULES = {
         foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
-            "Acquire from a persisted native process or interface and its overlay. Native and overlay save events "
+            "A native OSPF process or interface qualifies existing ownership. Acquisition requires an explicit operation. Native and overlay save events "
             "are not ownership evidence and no longer create or refresh owned overlays. Native process and interface "
             "deletes no longer delete overlays and push retirement synchronously. Reconciliation and ownership "
             "audits handle these changes. A shared OSPF area is a dependency, not a device-owned object. Process "
@@ -457,13 +460,7 @@ def plan_ownership(rule: ScopeOwnershipRule, signature: OwnershipSignature) -> O
         if signature.native_present and signature.native_qualifies:
             return OwnershipAction.RECORD_MANIFEST
         return OwnershipAction.RETRACT
-    if not signature.native_present or not signature.native_qualifies:
-        return OwnershipAction.NONE
-    # An unowned overlay is the device read the operator has not accepted yet. Only the
-    # operator Accept enters ownership, so a qualifying native anchor never promotes it.
-    if signature.overlay_present:
-        return OwnershipAction.NONE
-    return OwnershipAction.CREATE
+    return OwnershipAction.NONE
 
 
 def retire_manifest_identity(*, device_ids, scope, native_model_label, native_key) -> None:
@@ -852,7 +849,7 @@ def _record_action_for(instance, device_id, requested, qualifying, manifest_stat
     manifest_state = manifest_states.get(
         _manifest_state_lookup_key(scope, native_model_label, native_key, state_model_label, state_key)
     )
-    if rule.acquisition_strategy == "existing_overlay":
+    if rule.qualification == "overlay_anchor":
         native_qualifies = not _native_anchor_lost(
             scope,
             _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label], natives=natives),
@@ -1239,7 +1236,7 @@ _STATE_SEEDERS = {
 }
 
 
-def _reown_manifest(manifest, rule, native, *, revoke=True):
+def _reown_manifest(manifest, rule, native):
     from .models import NSODeviceManagement
     from .renderer_writer import (
         RendererMutationPlan,
@@ -1274,7 +1271,7 @@ def _reown_manifest(manifest, rule, native, *, revoke=True):
         writer.save(candidate, force_insert=True)
         if m2m_writes:
             writer.m2m_set(candidate, "tagged_vlans", tuple(native.tagged_vlans.all()))
-        if revoke and manifest.scope == "static_route":
+        if manifest.scope == "static_route":
             from . import outbox
 
             carried = manifest.acknowledged_lineage[-1] if manifest.acknowledged_lineage else None
@@ -1284,14 +1281,6 @@ def _reown_manifest(manifest, rule, native, *, revoke=True):
                 transitions=[outbox.revoke_transition(manifest.native_id, carried_triple=carried)],
             )
     return candidate
-
-
-def _native_identity(rule, native):
-    key_fields = dict(rule.native_key_fields_by_model).get(
-        native._meta.label_lower,
-        rule.native_key_fields,
-    )
-    return {name: _json_value(getattr(native, name)) for name in key_fields}
 
 
 def _native_binding(scope, native, state_model_label, state_key=None):
@@ -1644,138 +1633,6 @@ def _qualifying_overlay_signatures(device_id, requested, *, management=None, bin
     )
 
 
-def _manifest_lookup_key(identity):
-    """Return one hashable manifest identity."""
-    return (
-        identity["device_id"],
-        identity["scope"],
-        identity["native_model_label"],
-        json.dumps(identity["native_key"], sort_keys=True),
-        identity["state_model_label"],
-        json.dumps(identity["state_key"], sort_keys=True),
-    )
-
-
-def _normalized_overlay_filter(model, filters):
-    """Return database field names and values for one exact overlay filter."""
-    normalized = []
-    for name, value in sorted(filters.items()):
-        field = model._meta.get_field(name)
-        if field.is_relation and hasattr(value, "pk"):
-            value = value.pk
-        normalized.append((field.attname, value))
-    return tuple(normalized)
-
-
-def _overlay_natural_key_filters(model, filters):
-    """Restrict one presence check to the overlay model's declared natural key."""
-    natural_key = next((tuple(fields) for fields in model._meta.unique_together), ())
-    if not natural_key:
-        raise ValueError(f"{model._meta.label_lower} has no declared natural key")
-    presence = {}
-    for name in natural_key:
-        field = model._meta.get_field(name)
-        if name in filters:
-            presence[name] = filters[name]
-        elif field.attname in filters:
-            presence[name] = filters[field.attname]
-        else:
-            raise ValueError(f"{model._meta.label_lower} natural key field {name!r} is unavailable")
-    return presence
-
-
-def _present_overlay_identities(device_id, management, prepared):
-    """Read every candidate state model once and return identities that exist."""
-    from django.db.models import Q
-
-    grouped = {}
-    for identity_key, model, filters in prepared:
-        group = grouped.setdefault(model, {"filters": Q(), "expected": {}})
-        group["filters"] |= Q(**filters)
-        normalized = _normalized_overlay_filter(model, filters)
-        fields = tuple(name for name, _value in normalized)
-        values = tuple(value for _name, value in normalized)
-        group["expected"].setdefault(fields, {}).setdefault(values, set()).add(identity_key)
-
-    present = set()
-    for model, group in grouped.items():
-        field_names = {field.name for field in model._meta.concrete_fields}
-        queryset = model.objects.all()
-        if "management" in field_names:
-            queryset = queryset.filter(management=management)
-        elif "interface" in field_names:
-            queryset = queryset.filter(interface__device_id=device_id)
-        else:
-            queryset = queryset.filter(group["filters"])
-        selected = sorted({name for fields in group["expected"] for name in fields})
-        for row in queryset.values(*selected):
-            for fields, expected in group["expected"].items():
-                present.update(expected.get(tuple(row[name] for name in fields), ()))
-    return present
-
-
-def _native_create_actions(device_id, requested, *, management=None, bindings=None):
-    """Return native-only objects whose reviewed rule can construct an overlay."""
-    from .models import NSODeviceManagement, NSOOwnershipManifest
-
-    management = management or NSODeviceManagement.objects.filter(device_id=device_id).first()
-    if management is None:
-        return ()
-    bindings = _native_bindings(management, requested) if bindings is None else bindings
-    manifests = {
-        _manifest_lookup_key(
-            {
-                "device_id": manifest.device_id,
-                "scope": manifest.scope,
-                "native_model_label": manifest.native_model_label,
-                "native_key": manifest.native_key,
-                "state_model_label": manifest.state_model_label,
-                "state_key": manifest.state_key,
-            }
-        ): manifest.ownership_state
-        for manifest in NSOOwnershipManifest.objects.filter(device_id=device_id, scope__in=requested)
-    }
-    candidates = []
-    overlay_filters = []
-    rules = converted_scope_rules()
-    for scope, native, state_model_label, state_key in bindings:
-        rule_key = "redistribution" if native._meta.label_lower == "netbox_routing.redistribution" else scope
-        rule = rules[rule_key]
-        identity = {
-            "device_id": device_id,
-            "scope": scope,
-            "native_model_label": native._meta.label_lower,
-            "native_key": _native_identity(rule, native),
-            "state_model_label": state_model_label,
-            "state_key": state_key,
-        }
-        identity_key = _manifest_lookup_key(identity)
-        signature = SimpleNamespace(
-            **identity,
-            native_id=native.pk,
-            acknowledged_lineage=[],
-        )
-        model, filters = _state_filters(signature, rule, native, management)
-        candidates.append((identity_key, signature, rule, native))
-        overlay_filters.append((identity_key, model, _overlay_natural_key_filters(model, filters)))
-    present_overlays = _present_overlay_identities(device_id, management, overlay_filters)
-
-    planned = []
-    for identity_key, signature, rule, native in candidates:
-        action = plan_ownership(
-            rule,
-            OwnershipSignature(
-                native_present=True,
-                native_qualifies=True,
-                overlay_present=identity_key in present_overlays,
-                manifest_state=manifests.get(identity_key),
-            ),
-        )
-        if action is OwnershipAction.CREATE:
-            planned.append((signature, rule, native))
-    return tuple(planned)
-
-
 def _retract_manifest(manifest, overlay=None, *, expected_action, requested) -> bool:
     """Retire one deleted native identity through its scope's authority protocol."""
     from . import outbox
@@ -1920,7 +1777,7 @@ def _manifest_lifecycle_action(manifest, requested, *, management=None, qualifyi
     overlay = model.objects.filter(**filters).first()
     native_qualifies = native is not None and (
         (
-            rule.acquisition_strategy == "existing_overlay"
+            rule.qualification == "overlay_anchor"
             and not _native_anchor_lost(manifest.scope, native, management.device_id)
         )
         or _valid_overlay_signature(
@@ -2058,20 +1915,6 @@ def _execute_manifest_lifecycle(device_id, requested, *, qualifying=None):
     return completed
 
 
-def _execute_native_creates(device_id, requested, *, management=None, bindings=None):
-    completed = []
-    for signature, rule, native in _native_create_actions(
-        device_id,
-        requested,
-        management=management,
-        bindings=bindings,
-    ):
-        created = _reown_manifest(signature, rule, native, revoke=False)
-        if created is not None:
-            completed.append((signature.scope, created.pk))
-    return completed
-
-
 def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object], ...]:
     """Run the state-derived ownership planner before a renderer audit."""
     requested = frozenset(str(scope) for scope in scopes)
@@ -2096,12 +1939,4 @@ def reconcile_scope_ownership(device_id: int, scopes) -> tuple[tuple[str, object
         natives=_native_prefetch(bindings),
     )
     completed.extend(_execute_manifest_lifecycle(device_id, requested, qualifying=qualifying))
-    completed.extend(
-        _execute_native_creates(
-            device_id,
-            requested,
-            management=management,
-            bindings=bindings,
-        )
-    )
     return tuple(completed)

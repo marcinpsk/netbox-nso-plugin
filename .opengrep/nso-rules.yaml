@@ -481,3 +481,143 @@ rules:
       - pattern-regex: '(?m)^class[ \t]+RendererWriter(?:[ \t]*\[|[ \t]*\(|[ \t]*:)'
     paths:
       include: ["netbox_nso_plugin/renderer_writer.py"]
+  - id: nso-ownership-grant-literal
+    languages: [python]
+    severity: ERROR
+    message: Use a literal operation from ownership_grants.GRANTS.
+    patterns:
+      - pattern-either:
+          - pattern-either:
+              - pattern: netbox_nso_plugin.ownership_grants.OwnershipGrant($K, ...)
+              - pattern: netbox_nso_plugin.ownership_grants.OwnershipGrant(..., kind=$K, ...)
+          - patterns:
+              - pattern-inside: |
+                  from .ownership_grants import OwnershipGrant
+                  ...
+              - pattern-either:
+                  - pattern: OwnershipGrant($K, ...)
+                  - pattern: OwnershipGrant(..., kind=$K, ...)
+          - patterns:
+              - pattern-inside: |
+                  from .ownership_grants import OwnershipGrant as $ALIAS
+                  ...
+              - pattern-either:
+                  - pattern: $ALIAS($K, ...)
+                  - pattern: $ALIAS(..., kind=$K, ...)
+          - patterns:
+              - pattern-inside: |
+                  from . import ownership_grants as $MODULE
+                  ...
+              - pattern-either:
+                  - pattern: $MODULE.OwnershipGrant($K, ...)
+                  - pattern: $MODULE.OwnershipGrant(..., kind=$K, ...)
+          - patterns:
+              - pattern-either:
+                  - pattern: $MODULE.OwnershipGrant($K, ...)
+                  - pattern: $MODULE.OwnershipGrant(..., kind=$K, ...)
+              - metavariable-regex:
+                  metavariable: $MODULE
+                  regex: '^(?:\.?ownership_grants|netbox_nso_plugin\.ownership_grants)$'
+      - metavariable-regex:
+          metavariable: $K
+          regex: '^(?!["\x27](?:accept|create|intend|autoassign|link_role|operator_edit|manifest_reown)["\x27]$)'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**", "**/migrations/**"]
+  - id: nso-ownership-grant-passive
+    languages: [python]
+    severity: ERROR
+    message: Passive reconcile, audit, drain, delivery and Apply cannot construct grants.
+    patterns:
+      - pattern-either:
+          - pattern: netbox_nso_plugin.ownership_grants.OwnershipGrant(...)
+          - patterns:
+              - pattern-inside: |
+                  from .ownership_grants import OwnershipGrant
+                  ...
+              - pattern: OwnershipGrant(...)
+          - patterns:
+              - pattern-inside: |
+                  from .ownership_grants import OwnershipGrant as $ALIAS
+                  ...
+              - pattern: $ALIAS(...)
+          - patterns:
+              - pattern-inside: |
+                  from . import ownership_grants as $MODULE
+                  ...
+              - pattern: $MODULE.OwnershipGrant(...)
+          - patterns:
+              - pattern: $MODULE.OwnershipGrant(...)
+              - metavariable-regex:
+                  metavariable: $MODULE
+                  regex: '^(?:\.?ownership_grants|netbox_nso_plugin\.ownership_grants)$'
+    paths:
+      include:
+        - "netbox_nso_plugin/*reconcil*.py"
+        - "netbox_nso_plugin/*audit*.py"
+        - "netbox_nso_plugin/drain.py"
+        - "netbox_nso_plugin/delivery.py"
+        - "netbox_nso_plugin/apply*.py"
+        - "netbox_nso_plugin/settlement.py"
+  - id: nso-ownership-grant-planner
+    languages: [python]
+    severity: ERROR
+    message: The ownership planner may construct only manifest_reown grants.
+    patterns:
+      - pattern-either:
+          - pattern: netbox_nso_plugin.ownership_grants.OwnershipGrant(...)
+          - patterns:
+              - pattern-inside: |
+                  from .ownership_grants import OwnershipGrant
+                  ...
+              - pattern: OwnershipGrant(...)
+          - patterns:
+              - pattern-inside: |
+                  from .ownership_grants import OwnershipGrant as $ALIAS
+                  ...
+              - pattern: $ALIAS(...)
+          - patterns:
+              - pattern-inside: |
+                  from . import ownership_grants as $MODULE
+                  ...
+              - pattern: $MODULE.OwnershipGrant(...)
+          - patterns:
+              - pattern: $MODULE.OwnershipGrant(...)
+              - metavariable-regex:
+                  metavariable: $MODULE
+                  regex: '^(?:\.?ownership_grants|netbox_nso_plugin\.ownership_grants)$'
+      - pattern-not: $CONSTRUCTOR("manifest_reown", ...)
+      - pattern-not: $CONSTRUCTOR(..., kind="manifest_reown", ...)
+    paths:
+      include: ["netbox_nso_plugin/ownership_planner.py"]
+  - id: nso-overlay-raw-sql-dml
+    languages: [python]
+    severity: ERROR
+    message: Plugin overlay DML must use the guarded ORM ownership seam.
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $CURSOR.execute($SQL, ...)
+              - pattern: $CURSOR.executemany($SQL, ...)
+              - pattern: $QUERY.raw($SQL, ...)
+              - pattern: RawSQL($SQL, ...)
+              - pattern: $MODULE.RawSQL($SQL, ...)
+          - metavariable-regex:
+              metavariable: $SQL
+              regex: '(?is).*\b(?:insert\s+into|update|delete\s+from)\s+(?:"?[a-z_][a-z_0-9]*"?\.)?"?netbox_nso_plugin_nso[a-z_0-9]*state\b'
+      - patterns:
+          - pattern-inside: |
+              $QUERY = $SQL
+              ...
+          - pattern-either:
+              - pattern: $CURSOR.execute($QUERY, ...)
+              - pattern: $CURSOR.executemany($QUERY, ...)
+              - pattern: $ROWS.raw($QUERY, ...)
+              - pattern: RawSQL($QUERY, ...)
+              - pattern: $MODULE.RawSQL($QUERY, ...)
+          - metavariable-regex:
+              metavariable: $SQL
+              regex: '(?is).*\b(?:insert\s+into|update|delete\s+from)\s+(?:"?[a-z_][a-z_0-9]*"?\.)?"?netbox_nso_plugin_nso[a-z_0-9]*state\b'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**", "**/migrations/**"]

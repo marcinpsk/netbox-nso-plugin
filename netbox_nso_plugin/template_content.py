@@ -67,61 +67,30 @@ def _adapter_setting(name: str, default: bool = False) -> bool:
     return bool(getattr(cfg, f"_{name}", default))
 
 
-def _resolve_interface_attr_status(state, *, created, attr_name, iface, nso_value, adapter_status, derived_templates):
-    """Resolve the next status for one interface-attr row (ownership-aware).
-
-    Returns ``(new_status, promote)``:
-
-    - An EXISTING operator-owned row settles by device value and is NEVER clobbered to the
-      adapter's unowned status (the owned-guard every other reconciler has).
-    - A derived (topology-computed) description is NetBox intent BY DEFINITION, so it is
-      owned even when the adapter reports ``imported`` (``promote=True`` → caller stamps
-      ``accepted_at``) — matches device → ``in_sync``, differs → ``accepted`` (pending).
-    - Otherwise the adapter's status is mirrored verbatim (unowned mirror / fresh import).
-    """
-    from . import status_machine as sm
-    from .derived_intent import is_managed_description
+def _resolve_interface_attr_status(state, *, attr_name, iface, nso_value, adapter_status):
+    """Derive lifecycle locally without acquiring an unowned observation."""
     from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
 
-    if not created and sm.is_owned(state.status):
+    if sm.is_owned(state.status):
         matches = (
             matches_device_value(attr_name, _netbox_value_for(attr_name, iface), nso_value)
             if attr_name in _COMPARABLE_IFACE_ATTRS
             else None
         )
-        return sm.on_reconcile(state.status, matches=matches), False
-    if attr_name == "description" and is_managed_description(iface.description or "", derived_templates):
-        matches = matches_device_value("description", iface.description, nso_value)
-        return ("in_sync" if matches else "accepted"), True
-    return adapter_status, False
+        return sm.on_reconcile(state.status, matches=matches)
+    return sm.on_reconcile(
+        state.status,
+        matches=False if adapter_status == sm.CHANGED else None,
+        conflict=adapter_status == sm.CONFLICT,
+    )
 
 
 def _interface_reconcile_operations(device, interfaces, planned_at):
-    """Build the exact interface-attribute writes used by preflight and apply.
-
-    Returns a dict keyed by (interface_name, attribute) → NSOInterfaceState instance.
-    Only updates fields that come from the adapter; never overwrites accepted_at.
-
-    Owned rows (status in OWNED_STATES, set by the operator's accept/edit) are NOT
-    clobbered back to the adapter's unowned status — the same owned-guard every other
-    overlay reconciler uses (see ``interface_mtu_reconciler``). Without it, an adapter
-    sync that reports ``imported`` for an attribute the operator owns would silently
-    drop ownership, and the now status-based intent push would stop re-applying it. The
-    owned row instead settles by device-vs-NetBox value (``deploying``/``accepted`` →
-    ``in_sync`` once the device reflects the operator's value). A freshly imported row
-    (created this sync) or an unowned row tracks the adapter status verbatim.
-    """
+    """Build exact observation writes while preserving existing ownership."""
     from dcim.models import Interface
 
-    from .derived_intent import get_sentinel_templates
     from .models import NSOInterfaceState
     from .renderer_writer import planned_save
-
-    # Derived-intent templates (e.g. description-from-cable). A description whose NetBox
-    # value matches one is NetBox intent BY DEFINITION (the plugin computes it from
-    # topology), so it must be owned even if the adapter reads it as imported — see
-    # _resolve_interface_attr_status.
-    derived_templates = get_sentinel_templates()
 
     # Build name → Interface map for this device's interfaces in the DB
     iface_map = {i.name: i for i in Interface.objects.filter(device=device)}
@@ -152,27 +121,22 @@ def _interface_reconcile_operations(device, interfaces, planned_at):
             current = current_by_key.get((iface.pk, attr_name))
             created = current is None
             state = (
-                NSOInterfaceState(interface=iface, attribute=attr_name, status=status, nso_value=nso_value)
+                NSOInterfaceState(interface=iface, attribute=attr_name, status=sm.INITIAL, nso_value=nso_value)
                 if created
                 else copy.copy(current)
             )
             # Resolve the next status BEFORE overwriting it (ownership-aware — see helper).
             update_fields = []
-            new_status, promote = _resolve_interface_attr_status(
+            new_status = _resolve_interface_attr_status(
                 state,
-                created=created,
                 attr_name=attr_name,
                 iface=iface,
                 nso_value=nso_value,
                 adapter_status=status,
-                derived_templates=derived_templates,
             )
             if state.status != new_status:
                 state.status = new_status
                 update_fields.append("status")
-            if promote and state.accepted_at is None:
-                state.accepted_at = planned_at
-                update_fields.append("accepted_at")
             if state.nso_value != nso_value:
                 state.nso_value = nso_value
                 update_fields.append("nso_value")

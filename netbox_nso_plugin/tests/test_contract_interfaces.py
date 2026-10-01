@@ -1,19 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Contract test — consumer side of GET /api/v1/devices/{id}/interfaces.
-
-Pins the JSON shape the plugin CONSUMES in
-``template_content._upsert_interface_states`` against the documented adapter contract.
-The adapter is the producer; if it renames/removes a key the plugin depends on, the
-plugin silently degrades (missing ``status`` -> ``"unknown"``) — exactly the device-27
-class of "looks fine, is wrong" bug. This test plus its adapter mirror make that break
-visible on at least one side.
-
-Canonical contract: ``nso-adapter/docs/api-contract.md`` §
-"GET /api/v1/devices/{id}/interfaces".
-Mirror (producer side): ``nso-adapter/tests/api/test_contract_interfaces.py`` — the
-``EXPECTED_*_KEYS`` sets MUST stay identical across both files.
-"""
+"""Consume interface observations without acquiring ownership from adapter status."""
 
 from __future__ import annotations
 
@@ -99,7 +86,7 @@ class TestInterfacesContractConsumer(TestCase):
         result = _upsert_interface_states(self.device, CONTRACT_PAYLOAD)
 
         desc = result[("GE0/0", "description")]
-        self.assertEqual(desc.status, "apply_failed")
+        self.assertEqual(desc.status, "imported")
         self.assertEqual(desc.nso_value, "uplink to spine-1")
         self.assertIsNotNone(desc.last_apply_at)
         # The "Z"-suffixed UTC timestamp is parsed tz-aware, not naive (no RuntimeWarning).
@@ -107,11 +94,15 @@ class TestInterfacesContractConsumer(TestCase):
         self.assertEqual(desc.last_apply_error, {"code": "nso_error", "message": "boom"})
 
         enabled = result[("GE0/0", "enabled")]
-        self.assertEqual(enabled.status, "in_sync")
+        self.assertEqual(enabled.status, "imported")
         self.assertEqual(enabled.nso_value, "true")
 
         # Persisted, not just returned.
         self.assertTrue(NSOInterfaceState.objects.filter(interface=self.iface, attribute="description").exists())
+        self.assertEqual(
+            set(NSOInterfaceState.objects.filter(interface=self.iface).values_list("status", flat=True)),
+            {"imported"},
+        )
 
     def test_reconcile_preflight_is_an_exact_renderer_plan(self):
         """Preflight freezes the two overlay creations before the read-side write."""
@@ -174,8 +165,8 @@ class TestInterfacesContractConsumer(TestCase):
         result = _upsert_interface_states(self.device, payload)
         self.assertEqual(result[("GE0/0", "description")].status, "in_sync")
 
-    def test_unowned_row_tracks_adapter_status(self):
-        """An unowned (imported) row still mirrors the adapter status verbatim (drift visible)."""
+    def test_unowned_row_keeps_reported_drift_without_acquiring(self):
+        """Reported drift stays visible on an unowned row."""
         NSOInterfaceState.objects.create(
             interface=self.iface, attribute="description", status="imported", nso_value="old"
         )
@@ -204,16 +195,12 @@ class TestInterfacesContractConsumer(TestCase):
             Interface.objects.filter(pk=self.iface.pk).update(description=value)
         self.iface.description = value
 
-    def test_derived_managed_description_is_owned_pending(self):
-        """A derived-managed description is NetBox intent BY DEFINITION: the reconciler owns
-        it even when the adapter reports 'imported', so it pushes instead of reading as drift
-        and never reaching the device (the device-27 ae2.0 recovery). Device empty + NetBox
-        derived value differs → accepted (pending apply)."""
+    def test_derived_managed_description_stays_unowned_when_device_differs(self):
+        """A derived description requires explicit acquisition."""
         from netbox_nso_plugin.derived_intent import SentinelTemplate
 
         self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
-        # Set via queryset update (no post_save) so the degenerate test template's recompute
-        # doesn't rewrite the value — we isolate the reconciler's ownership logic here.
+        # Keep the native value without triggering description generation.
         self._set_description_without_signals("[auto] prod - Core Link - unit")
         payload = [
             {
@@ -223,11 +210,11 @@ class TestInterfacesContractConsumer(TestCase):
             }
         ]
         row = _upsert_interface_states(self.device, payload)[("GE0/0", "description")]
-        self.assertEqual(row.status, "accepted")  # owned, pending apply (device lacks it)
-        self.assertIsNotNone(row.accepted_at)
+        self.assertEqual(row.status, "imported")
+        self.assertIsNone(row.accepted_at)
 
-    def test_derived_managed_description_matching_device_is_in_sync(self):
-        """A derived description the device already holds → owned + in_sync (nothing to push)."""
+    def test_derived_managed_description_matching_device_stays_unowned(self):
+        """Matching a derived description does not acquire it."""
         from netbox_nso_plugin.derived_intent import SentinelTemplate
 
         self._inject_templates([SentinelTemplate(sentinel="[auto]", template="[auto] x")])
@@ -240,7 +227,8 @@ class TestInterfacesContractConsumer(TestCase):
             }
         ]
         row = _upsert_interface_states(self.device, payload)[("GE0/0", "description")]
-        self.assertEqual(row.status, "in_sync")
+        self.assertEqual(row.status, "imported")
+        self.assertIsNone(row.accepted_at)
 
     def test_non_derived_description_stays_unowned(self):
         """A plain (non-derived) description is NOT auto-owned — only operator action owns it."""
@@ -259,23 +247,27 @@ class TestInterfacesContractConsumer(TestCase):
         self.assertEqual(row.status, "imported")
         self.assertIsNone(row.accepted_at)
 
-    def test_missing_status_key_silently_degrades_to_unknown(self):
-        """The consumer does NOT validate the contract at runtime — by decision.
-
-        If the producer ever stops sending ``status`` the plugin stores ``"unknown"``.
-        We deliberately keep it this way: the cross-repo contract test (this file + the
-        adapter's producer mirror) guards the seam in CI, so a rename fails a test rather
-        than slipping to prod; runtime per-row validation would be redundant overhead.
-        And ``unknown`` no longer hides anyway — it now surfaces as needs-attention in
-        the counts (see summary._status_breakdown). This test pins the documented
-        behavior so any future move to hard validation is a visible change.
-        """
+    def test_missing_status_key_uses_the_local_observation_lifecycle(self):
+        """A reported value is imported without adapter lifecycle metadata."""
         payload = [
             {
                 "name": "GE0/0",
                 "netbox_interface_id": 1000,
-                "attrs": {"description": {"nso_value": "x"}},  # no "status" key
+                "attrs": {"description": {"nso_value": "x"}},
             }
         ]
         result = _upsert_interface_states(self.device, payload)
-        self.assertEqual(result[("GE0/0", "description")].status, "unknown")
+        self.assertEqual(result[("GE0/0", "description")].status, "imported")
+        self.assertIsNone(result[("GE0/0", "description")].accepted_at)
+
+    def test_unowned_row_keeps_reported_conflict(self):
+        NSOInterfaceState.objects.create(interface=self.iface, attribute="description", status="imported")
+        payload = [
+            {
+                "name": "GE0/0",
+                "attrs": {"description": {"nso_value": "observed", "status": "conflict"}},
+            }
+        ]
+        result = _upsert_interface_states(self.device, payload)
+        self.assertEqual(result[("GE0/0", "description")].status, "conflict")
+        self.assertIsNone(result[("GE0/0", "description")].accepted_at)
