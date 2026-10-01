@@ -11,6 +11,7 @@ from django.test import TestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_update
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -327,7 +328,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         malformed = initial["10.0.0.2"]
         linked_peer_id = malformed.bgp_peer_id
         self.assertIsNotNone(linked_peer_id)
-        NSOBGPPeerState.objects.filter(pk=initial["10.0.0.3"].pk).update(status="in_sync")
+        content_update(initial["10.0.0.3"], status="in_sync")
         NSOBGPPeerState.objects.filter(pk=malformed.pk).update(
             asn_str="invalid",
             peer_address_str="not-an-address",
@@ -973,7 +974,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
         identity = _reconcile_bgp_config(self.device, payload)[0]
         content_update(identity, status="accepted")
-        duplicate = NSOBGPPeerState.objects.create(
+        duplicate = acquire_overlay(
+            NSOBGPPeerState,
             management=mgmt,
             asn_str="065100",
             vrf_name=identity.vrf_name,
@@ -1002,7 +1004,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
         identity = _reconcile_bgp_config(self.device, payload)[0]
         content_update(identity, asn_str="065100", status="accepted")
-        duplicate = NSOBGPPeerState.objects.create(
+        duplicate = acquire_overlay(
+            NSOBGPPeerState,
             management=mgmt,
             asn_str="65100",
             vrf_name=identity.vrf_name,
@@ -1062,7 +1065,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         payload = self._payload(self._router_payload(peers=[self._peer_entry(canonical)]))
         identity = _reconcile_bgp_config(self.device, payload)[0]
         content_update(identity, status="in_sync")
-        duplicate = NSOBGPPeerState.objects.create(
+        duplicate = acquire_overlay(
+            NSOBGPPeerState,
             management=mgmt,
             asn_str=identity.asn_str,
             vrf_name=identity.vrf_name,
@@ -1093,7 +1097,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         payload = self._payload(self._router_payload(peers=[self._peer_entry(canonical)]))
         identity = _reconcile_bgp_config(self.device, payload)[0]
         content_update(identity, status="in_sync", peer_address_str=expanded)
-        duplicate = NSOBGPPeerState.objects.create(
+        duplicate = acquire_overlay(
+            NSOBGPPeerState,
             management=mgmt,
             asn_str=identity.asn_str,
             vrf_name=identity.vrf_name,
@@ -1187,7 +1192,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(row.bgp_peer.source)  # source resolved to the IPAddress on import
         # Make the row operator-owned so the intent push picks it up.
         row.status = "in_sync"
-        row.save(update_fields=["status"])
+        save_overlay_fixture(row, update_fields=["status"])
 
         captured = {}
 
@@ -1239,7 +1244,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(row.bgp_peer.peer_group.name, "EDGE")
         # Own the row so the intent push picks it up.
         row.status = "in_sync"
-        row.save(update_fields=["status"])
+        save_overlay_fixture(row, update_fields=["status"])
 
         captured = {}
 
@@ -1312,7 +1317,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         )
         row = result[0]
         row.status = "in_sync"  # own it so the push picks up the router
-        row.save(update_fields=["status"])
+        save_overlay_fixture(row, update_fields=["status"])
 
         captured = {}
 
@@ -1621,7 +1626,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertIsNone(row.bgp_peer.source_id)
         # Make the row operator-owned so the intent push picks it up.
         row.status = "in_sync"
-        row.save(update_fields=["status"])
+        save_overlay_fixture(row, update_fields=["status"])
 
         captured = {}
 
@@ -2001,7 +2006,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         _reconcile_bgp_config(self.device, initial)
         peer_state = NSOBGPPeerState.objects.get(peer_address_str="198.18.0.2")
         peer_state.status = "accepted"
-        peer_state.save(update_fields=["status"])
+        save_overlay_fixture(peer_state, update_fields=["status"])
 
         reordered_low_router = self._scope_with_peer_groups([low], asn="65100")["routers"][0]
         reordered_low_router["scopes"][0]["peers"] = [peer]
@@ -2034,7 +2039,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         _reconcile_bgp_config(self.device, initial)
         peer_state = NSOBGPPeerState.objects.get(peer_address_str="198.18.0.3")
         peer_state.status = "accepted"
-        peer_state.save(update_fields=["status"])
+        save_overlay_fixture(peer_state, update_fields=["status"])
         changed = self._payload(
             self._router_payload(
                 peers=[

@@ -16,9 +16,18 @@ from django.urls import reverse
 from ipam.models import VLAN
 
 from netbox_nso_plugin.models import NSOPlatformNedMapping, NSOSVIState, NSOVLANState
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_session
-from ._outbox_case import CFG, ReceiptAdapter, make_managed, wait_until_postgres_blocks, without_commit_drain
+from ._outbox_case import (
+    CFG,
+    ReceiptAdapter,
+    content_update,
+    make_managed,
+    wait_until_postgres_blocks,
+    without_commit_drain,
+)
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -226,7 +235,11 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         )
         shared = VLANGroup.objects.create(name="Shared SVI VLANs", slug="shared-svi-vlans")
         with without_commit_drain():
-            action, surviving = rescope_vlan(NSOVLANState.objects.get(management=self.management, vlan=vlan), shared)
+            action, surviving = rescope_vlan(
+                NSOVLANState.objects.get(management=self.management, vlan=vlan),
+                shared,
+                grant=OwnershipGrant("operator_edit"),
+            )
             response = self.client.post(reverse("plugins:netbox_nso_plugin:svi_accept", args=[state.pk]))
         self.assertEqual(action, "moved")
         self.assertEqual(surviving.pk, vlan.pk)
@@ -248,7 +261,11 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         vlan = self._vlan(10)
         shared = VLANGroup.objects.create(name="Shared import VLANs", slug="shared-import-vlans")
         with without_commit_drain():
-            rescope_vlan(NSOVLANState.objects.get(management=self.management, vlan=vlan), shared)
+            rescope_vlan(
+                NSOVLANState.objects.get(management=self.management, vlan=vlan),
+                shared,
+                grant=OwnershipGrant("operator_edit"),
+            )
             rows = reconcile_svi(
                 self.device, {"interfaces": [{"interface_name": "irb.8", "vlan_id": 10, "type": "irb"}]}
             )
@@ -326,7 +343,7 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         self.assertEqual((imported.status, imported.vrf), ("imported", ""))
 
         with without_commit_drain():
-            NSOSVIState.objects.filter(pk=imported.pk).update(status="accepted")
+            content_update(imported, status="accepted")
         adapter = ReceiptAdapter()
         config, session = adapter.patches()
         with config, session:
@@ -367,7 +384,7 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         self.assertEqual(accepted.status_code, 302)
         self.assertEqual(NSOSVIState.objects.get(pk=imported.pk).status, "imported")
 
-        NSOSVIState.objects.filter(pk=imported.pk).update(status="accepted")
+        content_update(imported, status="accepted")
         adapter = ReceiptAdapter()
         config, session = adapter.patches()
         with config, session:
@@ -384,10 +401,16 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         other_vlan = self._vlan(1723)
         with without_commit_drain(), transaction.atomic():
             interface = Interface.objects.create(device=self.device, name="irb.7", type="virtual")
-            state = NSOSVIState.objects.create(
-                management=self.management, interface=interface, vlan=vlan, svi_type="irb", status="accepted"
+            state = acquire_overlay(
+                NSOSVIState,
+                management=self.management,
+                interface=interface,
+                vlan=vlan,
+                svi_type="irb",
+                status="accepted",
             )
-            NSOSVIState.objects.create(
+            acquire_overlay(
+                NSOSVIState,
                 management=self.management,
                 interface=Interface.objects.create(device=self.device, name="Vlan1723", type="virtual"),
                 vlan=other_vlan,
@@ -585,7 +608,8 @@ class TestOwnedSviDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transaction
 
         vlan = self._vlan(10)
         with without_commit_drain(), transaction.atomic():
-            state = NSOSVIState.objects.create(
+            state = acquire_overlay(
+                NSOSVIState,
                 management=self.management,
                 interface=Interface.objects.create(device=self.device, name="irb.7", type="virtual"),
                 vlan=vlan,

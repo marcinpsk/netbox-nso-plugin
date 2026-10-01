@@ -6,6 +6,7 @@ from django.db import connection, transaction
 from django.test import TransactionTestCase
 
 from ._outbox_case import make_managed, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -16,7 +17,8 @@ class TestDeliveryRenderPurity(_CascadeFlushMixin, IntentPushResetMixin, Transac
         from netbox_nso_plugin.models import NSOSnmpV3UserState
 
         with without_commit_drain(), transaction.atomic():
-            NSOSnmpV3UserState.objects.create(
+            acquire_overlay(
+                NSOSnmpV3UserState,
                 management=self.management,
                 username="legacy-user",
                 has_auth_secret=True,

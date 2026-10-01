@@ -19,6 +19,7 @@ from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
 from netbox_nso_plugin import adapter_client as _adapter_client
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import trust_scope
 from ._static_route_case import PUT, _fixtures, _make_device, _make_mgmt, _own, _route
@@ -682,7 +683,9 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             second = _own(route, self.mgmt2, status="in_sync")
         candidate = copy.copy(route)
         candidate.metric = 51
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("metric",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("metric",)),)
+        )
         overlay_label = NSOStaticRouteState._meta.label_lower
         expected_pks = tuple(row.pk for row in plan.lock_footprint.overlay_rows if row.model_label == overlay_label)
         self.assertEqual(set(expected_pks), {first.pk, second.pk})

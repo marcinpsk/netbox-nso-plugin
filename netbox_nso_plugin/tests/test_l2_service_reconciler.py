@@ -12,6 +12,8 @@ from vpn.models import L2VPN, L2VPNTermination
 from netbox_nso_plugin.l2_service_reconciler import reconcile_l2_services
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
 
+from ._ownership_case import save_overlay_fixture
+
 
 def _payload(services):
     return {"device_id": 1, "services": services}
@@ -501,7 +503,7 @@ class TestReconcileL2Services(TestCase):
         state = NSOL2SapState.objects.get(management=self.mgmt, service_name="701")
         state.status = "accepted"
         state.service_type = "epipe"
-        state.save(update_fields=["status", "service_type"])
+        save_overlay_fixture(state, update_fields=["status", "service_type"])
 
         reconcile_l2_services(
             self.device,

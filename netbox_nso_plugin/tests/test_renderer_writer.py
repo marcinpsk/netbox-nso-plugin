@@ -19,8 +19,10 @@ from netbox_nso_plugin.models import (
     NSOSwitchportState,
     NSOVLANState,
 )
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
-from ._outbox_case import make_managed, mirror_update, own_vlan, without_commit_drain
+from ._outbox_case import content_update, make_managed, mirror_update, own_vlan, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 from .strict_writer import strict_writer_harness
 
@@ -50,12 +52,13 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
             status="imported",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             set_updates=(
                 planned_set_update(
                     NSOVLANState.objects.filter(management=first_management),
                     status="accepted",
                 ),
-            )
+            ),
         )
         with transaction.atomic(), offline_mutation():
             NSOVLANState.objects.filter(pk=state.pk).update(management_id=second_management.pk)
@@ -89,7 +92,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
             NSOVLANState.objects.filter(pk=state.pk).update(management_id=second_management.pk)
 
         with self.assertRaises(IntentPlanStaleError):
-            RendererMutationPlan.build(set_updates=(proposed,))
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), set_updates=(proposed,))
 
         state.refresh_from_db()
         self.assertEqual(state.management_id, second_management.pk)
@@ -105,13 +108,14 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "persisted update target"):
             RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
                 saves=(
                     planned_save(
                         candidate,
                         update_fields={"status"},
                         expected_before=expected,
                     ),
-                )
+                ),
             )
 
     def test_raced_unregistered_creation_is_consumed_from_its_full_plan(self):
@@ -120,7 +124,9 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         group = VLANGroup(name="Writer raced group", slug="writer-raced-group")
-        plan = RendererMutationPlan.build(saves=(planned_save(group, force_insert=True, natural_key=("slug",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(group, force_insert=True, natural_key=("slug",)),)
+        )
         raced = VLANGroup.objects.create(name=group.name, slug=group.slug)
 
         with renderer_mirror_writes(plan) as writer:
@@ -143,7 +149,8 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         vlan = VLAN.objects.create(group=group, vid=1627, name="Writer raced overlay")
         planned = NSOVLANState(management=management, vlan=vlan, device_name=vlan.name, status="accepted")
         plan = RendererMutationPlan.build(
-            saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),),
         )
         mirror_update(
             NSOVLANState.objects.create(management=management, vlan=vlan, device_name=vlan.name),
@@ -175,7 +182,8 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
                 values = {"management": management, "vlan": vlan, "status": "imported"}
                 planned = NSOVLANState(**values, **{field_name: planned_at})
                 plan = RendererMutationPlan.build(
-                    saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),)
+                    grant=OwnershipGrant("create"),
+                    saves=(planned_save(planned, force_insert=True, natural_key=("management", "vlan")),),
                 )
                 winner = NSOVLANState.objects.create(**values)
                 mirror_update(winner, **{field_name: planned_at + timedelta(seconds=1)})
@@ -198,6 +206,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "planned later"):
             RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
                 saves=(
                     planned_save(
                         state,
@@ -206,7 +215,7 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
                     ),
                     planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
                     planned_save(group, force_insert=True, natural_key=("slug",)),
-                )
+                ),
             )
 
     def test_opt_in_harness_records_the_real_consumed_write_set(self):
@@ -219,12 +228,13 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         _device, management = make_managed("writer-harness", 16270)
         row = own_vlan(management, 1626, "writer-harness")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             set_updates=(
                 planned_set_update(
                     NSOVLANState.objects.filter(pk=row.pk),
                     last_apply_error="recorded",
                 ),
-            )
+            ),
         )
 
         with strict_writer_harness() as records:
@@ -245,12 +255,13 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         _device, management = make_managed("writer-set", 16271)
         planned_row = own_vlan(management, 1627, "writer-set")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             set_updates=(
                 planned_set_update(
                     NSOVLANState.objects.filter(management=management),
                     last_apply_error="planned",
                 ),
-            )
+            ),
         )
         late_row = own_vlan(management, 1628, "writer-set-late")
 
@@ -273,12 +284,13 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
         _device, management = make_managed("writer-set-stale", 16272)
         row = own_vlan(management, 1629, "writer-set-stale")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             set_updates=(
                 planned_set_update(
                     NSOVLANState.objects.filter(pk=row.pk),
                     last_apply_error="planned",
                 ),
-            )
+            ),
         )
         mirror_update(row, last_apply_error="raced")
 
@@ -290,6 +302,23 @@ class TestRendererSetUpdate(IntentPushResetMixin, TestCase):
 
 
 class TestRendererContentWriter(IntentPushResetMixin, TestCase):
+    def test_finalization_refuses_a_locked_key_that_was_not_bumped(self):
+        from netbox_nso_plugin.intent_state import MutationFootprint, _intent_transaction
+        from netbox_nso_plugin.renderer_writer import finalize_renderer_fingerprints
+
+        device, _management = make_managed("unbumped-finalization", 17594)
+        revision, _created = NSOIntentRevision.objects.update_or_create(
+            device=device,
+            scope="bgp",
+            defaults={"revision": 7, "verified_revision": None, "verified_fingerprint": None, "verified_at": None},
+        )
+        with _intent_transaction(MutationFootprint.for_keys(((device.pk, "bgp"),)), bump_keys=()):
+            with self.assertRaisesRegex(IntentMutationProtocolError, "not bumped"):
+                finalize_renderer_fingerprints(((device.pk, "bgp"),))
+        revision.refresh_from_db()
+        self.assertEqual(revision.revision, 7)
+        self.assertIsNone(revision.verified_revision)
+
     def test_effective_after_clears_a_stale_relation_cache(self):
         from netbox_nso_plugin.intent_state import _effective_after
         from netbox_nso_plugin.models import NSOLoggingHostState
@@ -323,7 +352,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             assigned_object_type=ContentType.objects.get_for_model(Interface),
             assigned_object_id=interface.pk,
         )
-        state = NSOInterfaceIPState.objects.create(
+        state = acquire_overlay(
+            NSOInterfaceIPState,
             interface=interface,
             address="198.18.97.1/32",
             vrf="missing-vrf",
@@ -366,7 +396,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-route-map-scope", 16291)
         route_map = RouteMap.objects.create(name="RM-WRITER-SCOPE")
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=management,
             dest_protocol="undeclared",
             source_protocol="static",
@@ -398,7 +429,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         planned._location = device.location
         planned._rack = device.rack
         plan = RendererMutationPlan.build(
-            saves=(planned_save(planned, force_insert=True, natural_key=("device", "name")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(planned, force_insert=True, natural_key=("device", "name")),),
         )
         self.assertFalse(plan.changes_content)
         existing = Interface.objects.create(device=device, name="Loopback1627", type="virtual")
@@ -421,7 +453,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         candidate.adapter_link_error = "planned"
 
         with CaptureQueriesContext(connection) as captured:
-            RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("adapter_link_error",)),)
+            )
 
         baseline_queries = [
             query
@@ -454,7 +488,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(state)
         candidate.status = "accepted"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+        )
 
         with renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("status",))
@@ -504,16 +540,18 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 natural_key = ("management", *identity_fields)
                 original = model(management=management, status="accepted", **values)
                 plan = RendererMutationPlan.build(
-                    saves=(planned_save(original, force_insert=True, natural_key=natural_key),)
+                    grant=OwnershipGrant("create"),
+                    saves=(planned_save(original, force_insert=True, natural_key=natural_key),),
                 )
                 execute(plan, lambda writer: writer.save(original, force_insert=True))
 
-                plan = RendererMutationPlan.build(deletes=(planned_delete(original),))
+                plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(original),))
                 execute(plan, lambda writer: writer.delete(original))
 
                 replacement = model(management=management, status="accepted", **values)
                 plan = RendererMutationPlan.build(
-                    saves=(planned_save(replacement, force_insert=True, natural_key=natural_key),)
+                    grant=OwnershipGrant("create"),
+                    saves=(planned_save(replacement, force_insert=True, natural_key=natural_key),),
                 )
                 execute(plan, lambda writer: writer.save(replacement, force_insert=True))
 
@@ -526,12 +564,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 )
                 self.assertEqual(
                     list(manifests.values_list("native_key", "ownership_state")),
-                    [(native_key, "retired")],
+                    [(native_key, "owned")],
                 )
 
-    def test_reowned_static_route_clears_retired_unacknowledged_lineage(self):
+    def test_static_route_acquisition_does_not_inherit_retired_lineage(self):
         from netbox_routing.models import StaticRoute
 
+        from netbox_nso_plugin.models import NSOOwnershipAcquisition
         from netbox_nso_plugin.ownership_planner import manifest_binding
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
@@ -555,6 +594,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             "next_hop": "198.18.0.88",
         }
         retired = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             device_id=binding[2],
             scope=binding[1],
             native_model_label=binding[3],
@@ -568,15 +608,30 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(state)
         candidate.status = "accepted"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+        )
 
         with renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("status",))
 
         retired.refresh_from_db()
-        self.assertEqual(retired.ownership_state, "owned")
-        self.assertEqual(retired.native_key, binding[5])
-        self.assertEqual(retired.acknowledged_lineage, [])
+        self.assertEqual(retired.ownership_state, "retired")
+        self.assertEqual(retired.native_key, retired_key)
+        self.assertEqual(retired.acknowledged_lineage, [retired_lineage])
+        current = NSOOwnershipManifest.objects.get(
+            device_id=device.pk, scope="static_route", native_key=binding[5], ownership_state="owned"
+        )
+        self.assertNotEqual(current.pk, retired.pk)
+        self.assertEqual(current.native_id, route.pk)
+        self.assertEqual(current.grant_kind, "create")
+        self.assertTrue(current.deletion_authority)
+        self.assertEqual(current.acknowledged_lineage, [])
+        self.assertFalse(
+            NSOOwnershipAcquisition.objects.filter(
+                state_model_label=state._meta.label_lower, state_id=state.pk
+            ).exists()
+        )
 
     def test_one_plan_can_create_unregistered_native_rows_and_registered_overlay(self):
         from netbox_routing.models import BFDInterface, BFDProfile
@@ -601,11 +656,12 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             status="imported",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(profile, force_insert=True, natural_key=("name",)),
                 planned_save(native, force_insert=True, natural_key=("interface",)),
                 planned_save(state, force_insert=True, natural_key=("management", "interface")),
-            )
+            ),
         )
 
         with renderer_mirror_writes(plan) as writer:
@@ -629,7 +685,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
         native = BFDInterface.objects.create(interface=interface, enabled=True)
         native_pk = native.pk
-        plan = RendererMutationPlan.build(deletes=(planned_delete(native),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(native),))
 
         with renderer_mirror_writes(plan) as writer:
             writer.delete(native)
@@ -655,10 +711,11 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         state_pk = state.pk
         native_pk = native.pk
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             deletes=(
                 planned_delete(state),
                 planned_delete(native),
-            )
+            ),
         )
 
         with renderer_mirror_writes(plan) as writer:
@@ -687,6 +744,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             status="imported",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
                 planned_save(
@@ -694,7 +752,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                     force_insert=True,
                     natural_key=("management", "vlan"),
                 ),
-            )
+            ),
         )
 
         with renderer_mirror_writes(plan) as writer:
@@ -716,10 +774,11 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         tenant = Tenant(name="Writer support tenant", slug="writer-support-tenant")
         vlan = VLAN(tenant=tenant, vid=1638, name="writer-support-vlan")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(tenant, force_insert=True, natural_key=("slug",)),
                 planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
-            )
+            ),
         )
 
         with renderer_mirror_writes(plan) as writer:
@@ -740,10 +799,11 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         group = VLANGroup(name="Writer raced support group", slug="writer-raced-support-group")
         vlan = VLAN(group=group, vid=1644, name="writer-raced-support-vlan")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(group, force_insert=True, natural_key=("slug",)),
                 planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
-            )
+            ),
         )
         winner = VLANGroup.objects.create(name=group.name, slug=group.slug)
         vlan.group = winner
@@ -764,6 +824,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "references a row planned after it"):
             RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
                 saves=(
                     planned_save(
                         vlan,
@@ -772,7 +833,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                         references=(("group", group),),
                     ),
                     planned_save(group, force_insert=True, natural_key=("slug",)),
-                )
+                ),
             )
 
     def test_plan_rejects_an_unplanned_unsaved_explicit_reference(self):
@@ -785,6 +846,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "unsaved row outside the plan"):
             RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
                 saves=(
                     planned_save(
                         vlan,
@@ -792,7 +854,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                         natural_key=("group", "vid"),
                         references=(("tenant", tenant),),
                     ),
-                )
+                ),
             )
 
     def test_plan_rejects_an_unplanned_unsaved_implicit_reference(self):
@@ -804,7 +866,10 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         vlan = VLAN(group=group, vid=1647, name="writer-missing-implicit-reference")
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "unsaved row outside the plan"):
-            RendererMutationPlan.build(saves=(planned_save(vlan, force_insert=True, natural_key=("group", "vid")),))
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(vlan, force_insert=True, natural_key=("group", "vid")),),
+            )
 
     def test_writer_rejects_an_explicit_reference_to_a_deleted_row(self):
         from django.db import IntegrityError, connection, transaction
@@ -820,6 +885,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         vlan = VLAN(tenant=tenant, vid=1646, name="writer-deleted-reference")
 
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     vlan,
@@ -827,7 +893,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                     natural_key=("group", "vid"),
                     references=(("tenant", tenant),),
                 ),
-            )
+            ),
         )
         with self.assertRaises(IntegrityError), transaction.atomic(), renderer_mirror_writes(plan) as writer:
             writer.save(vlan, force_insert=True)
@@ -842,7 +908,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         tenant = Tenant(name="Writer unreferenced tenant", slug="writer-unreferenced-tenant")
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "not a registered renderer input"):
-            RendererMutationPlan.build(saves=(planned_save(tenant, force_insert=True, natural_key=("slug",)),))
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), saves=(planned_save(tenant, force_insert=True, natural_key=("slug",)),)
+            )
 
     def test_one_plan_can_create_an_owner_related_row_and_m2m_edge(self):
         from netbox_nso_plugin.renderer_writer import (
@@ -862,6 +930,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             status="imported",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(vlan, force_insert=True, natural_key=("group", "vid")),
                 planned_save(
@@ -891,7 +960,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         device, management = make_managed("writer-m2m", 16277)
         mirror_update(management, auto_apply=True)
         interface = Interface.objects.create(device=device, name="Ethernet1/7", type="1000base-t")
-        state = NSOSwitchportState.objects.create(
+        state = acquire_overlay(
+            NSOSwitchportState,
             management=management,
             interface=interface,
             mode="tagged",
@@ -902,7 +972,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         NSOIntentOutboxEntry.objects.filter(device=device, scope="switchport").delete()
         revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope="switchport")
         before = revision.revision
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tagged_vlans", (planned_vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_add(state, "tagged_vlans", (planned_vlan,)),)
+        )
 
         with self.assertRaises(IntentMutationProtocolError):
             with renderer_writes(plan) as writer:
@@ -938,7 +1010,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             status="imported",
         )
         vlan = VLAN.objects.create(vid=1637, name="writer-reverse-m2m")
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),)
+        )
 
         with renderer_mirror_writes(plan) as writer:
             with self.assertRaisesRegex(IntentMutationProtocolError, "reverse M2M"), transaction.atomic():
@@ -961,7 +1035,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         tag = Tag.objects.create(name="unregistered renderer relation", slug="unregistered-renderer-relation")
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "unregistered.*related"):
-            RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tags", (tag,)),))
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_add(state, "tags", (tag,)),)
+            )
 
     def test_m2m_add_rejects_an_edge_added_after_planning(self):
         from netbox_nso_plugin.renderer_writer import (
@@ -973,11 +1049,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-m2m-race", 16289)
         interface = Interface.objects.create(device=device, name="Ethernet1/9", type="1000base-t")
-        state = NSOSwitchportState.objects.create(
-            management=management, interface=interface, mode="tagged", status="accepted"
+        state = acquire_overlay(
+            NSOSwitchportState, management=management, interface=interface, mode="tagged", status="accepted"
         )
         vlan = VLAN.objects.create(vid=1637, name="writer-m2m-race")
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_add(state, "tagged_vlans", (vlan,)),)
+        )
         with without_commit_drain(), renderer_writes(plan) as writer:
             writer.m2m_add(state, "tagged_vlans", (vlan,))
         revision = NSOIntentRevision.objects.get(device=device, scope="switchport")
@@ -1007,7 +1085,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         state.tags.add(tag)
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "unregistered.*related"):
-            RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tags", ()),))
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tags", ()),))
 
     def test_an_unchanged_m2m_set_is_content_neutral_across_digit_widths(self):
         from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow, mirror_transaction
@@ -1016,7 +1094,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-m2m-order", 16289)
         interface = Interface.objects.create(device=device, name="Ethernet1/10", type="1000base-t")
-        state = NSOSwitchportState.objects.create(
+        state = acquire_overlay(
+            NSOSwitchportState,
             management=management,
             interface=interface,
             mode="tagged",
@@ -1026,11 +1105,15 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         with mirror_transaction(footprint), suppress_intent_push():
             lower = VLAN.objects.create(pk=2_000_000, vid=1641, name="writer-m2m-lower")
             higher = VLAN.objects.create(pk=10_000_000, vid=1642, name="writer-m2m-higher")
-        seed = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),))
+        seed = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),)
+        )
         with renderer_writes(seed) as writer:
             writer.m2m_set(state, "tagged_vlans", (lower, higher))
 
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (lower, higher)),)
+        )
 
         self.assertFalse(plan.changes_content)
         self.assertEqual(plan.write_set[0].selected_pks, (lower.pk, higher.pk))
@@ -1057,7 +1140,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         candidate = copy.copy(target)
         candidate.status = "accepted"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+        )
         with without_commit_drain(), renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("status",))
 
@@ -1095,7 +1180,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         other_row = own_vlan(management, 1631, "writer-exact-other")
         candidate = copy.copy(planned_row)
         candidate.last_apply_error = "planned"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("last_apply_error",)),)
+        )
 
         with self.assertRaises(IntentMutationProtocolError), renderer_mirror_writes(plan):
             other_row.last_apply_error = "outside"
@@ -1120,7 +1207,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         before = (revision.revision, revision.verified_revision, revision.verified_fingerprint)
         candidate = copy.copy(row)
         candidate.last_apply_error = "mirror-only"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("last_apply_error",)),)
+        )
 
         with renderer_mirror_writes(plan) as writer:
             writer.save(candidate, update_fields=("last_apply_error",))
@@ -1139,7 +1228,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         _device, management = make_managed("writer-stale-management", 16280)
         candidate = copy.copy(management)
         candidate.adapter_link_error = "planned"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("adapter_link_error",)),)
+        )
         mirror_update(management, adapter_link_error="concurrent")
 
         with self.assertRaisesRegex(IntentMutationProtocolError, "changed after planning") as caught:
@@ -1162,7 +1253,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         _device, management = make_managed("writer-pre-save-mutation", 16285)
         candidate = copy.copy(management)
         candidate.adapter_link_error = "planned"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("adapter_link_error",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("adapter_link_error",)),)
+        )
         model_save = candidate.save
 
         def mutate_before_pre_save(*args, **kwargs):
@@ -1189,12 +1282,13 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-cascade", 16275)
         route = StaticRoute.objects.create(prefix="198.18.44.0/24", next_hop="198.18.44.1", metric=1)
-        state = NSOStaticRouteState.objects.create(
+        state = acquire_overlay(
+            NSOStaticRouteState,
             management=management,
             static_route=route,
             status="accepted",
         )
-        complete = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        complete = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(management),))
         incomplete = dataclasses.replace(
             complete,
             write_set=tuple(
@@ -1220,12 +1314,14 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-complete-cascade", 16287)
         route = StaticRoute.objects.create(prefix="198.18.87.0/24", next_hop="198.18.0.87", metric=1)
-        state = NSOStaticRouteState.objects.create(
+        state = acquire_overlay(
+            NSOStaticRouteState,
             management=management,
             static_route=route,
             status="accepted",
         )
         manifest = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             device_id=device.pk,
             scope="static_route",
             native_model_label=route._meta.label_lower,
@@ -1237,7 +1333,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
                 "interface_next_hop": None,
             },
         )
-        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(management),))
 
         with renderer_writes(plan) as writer:
             writer.delete(management)
@@ -1257,6 +1353,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         device, management = make_managed("writer-queryset-delete", 16293)
         route = StaticRoute.objects.create(prefix="198.18.93.0/24", next_hop="198.18.0.93", metric=1)
         manifest = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             device_id=device.pk,
             scope="static_route",
             native_model_label=route._meta.label_lower,
@@ -1318,6 +1415,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             metric=1,
         )
         manifest = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             device_id=device_id,
             scope="static_route",
             native_model_label=route._meta.label_lower,
@@ -1411,7 +1509,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             for route in reversed(routes)
         ]
 
-        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(management),))
         state_pks = [
             write.pk
             for write in plan.write_set
@@ -1434,7 +1532,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             status="imported",
         )
 
-        plan = RendererMutationPlan.build(deletes=(planned_delete(vlan),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(vlan),))
 
         self.assertIn(
             ("set_update", state._meta.label_lower, state.pk, ("vlan",), (("vlan_id", None),)),
@@ -1449,14 +1547,15 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-owned-cascade", 16291)
         interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
-        NSOSwitchportState.objects.create(
+        acquire_overlay(
+            NSOSwitchportState,
             management=management,
             interface=interface,
             mode="access",
             status="accepted",
         )
 
-        plan = RendererMutationPlan.build(deletes=(planned_delete(interface),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(interface),))
 
         self.assertTrue(plan.changes_content)
         self.assertIn((device.pk, "switchport"), plan.content_keys)
@@ -1470,7 +1569,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         _device, management = make_managed("writer-renamed-cascade", 16288)
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.88", metric=1)
-        state = NSOStaticRouteState.objects.create(
+        state = acquire_overlay(
+            NSOStaticRouteState,
             management=management,
             static_route=route,
             status="accepted",
@@ -1478,7 +1578,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         maintain_manifest(state)
         manifest = NSOOwnershipManifest.objects.get(state_model_label=state._meta.label_lower)
         StaticRoute.objects.filter(pk=route.pk).update(prefix="198.18.89.0/24")
-        plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(management),))
 
         with renderer_writes(plan) as writer:
             writer.delete(management)
@@ -1499,7 +1599,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             community=community,
         )
         community_list_pk = community_list.pk
-        plan = RendererMutationPlan.build(deletes=(planned_delete(community_list),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(community_list),))
 
         with renderer_mirror_writes(plan) as writer:
             writer.delete(community_list)
@@ -1542,17 +1642,16 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         return device, state
 
     def test_malformed_owned_bgp_identity_has_no_manifest_after_writer_save(self):
-        from netbox_nso_plugin.models import NSOBGPPeerState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         device, state = self._make_linked_bgp_overlay("writer-bgp-invalid", 16300)
-        NSOBGPPeerState.objects.filter(pk=state.pk).update(
-            status="in_sync", asn_str="invalid", peer_address_str="not-an-address"
-        )
+        content_update(state, status="in_sync", asn_str="invalid", peer_address_str="not-an-address")
         state.refresh_from_db()
         candidate = copy.copy(state)
         candidate.last_apply_error = "planned"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("last_apply_error",)),)
+        )
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").exists())
 
         with renderer_mirror_writes(plan) as writer:
@@ -1568,12 +1667,11 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         device, state = self._make_linked_bgp_overlay("writer-bgp-detach", 16302)
-        type(state).objects.filter(pk=state.pk).update(
-            status="in_sync", asn_str="invalid", peer_address_str="not-an-address"
-        )
+        content_update(state, status="in_sync", asn_str="invalid", peer_address_str="not-an-address")
         state.refresh_from_db()
         binding = manifest_binding(state)
         manifest = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             device_id=binding[2],
             scope=binding[1],
             native_model_label=binding[3],
@@ -1586,7 +1684,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(state)
         candidate.status = "imported"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+        )
 
         with renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("status",))
@@ -1608,10 +1708,11 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         device, state = self._make_linked_bgp_overlay("writer-bgp-candidate", 16301)
-        type(state).objects.filter(pk=state.pk).update(status="in_sync")
+        content_update(state, status="in_sync")
         state.refresh_from_db()
         binding = manifest_binding(state)
         malformed = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             device_id=binding[2],
             scope=binding[1],
             native_model_label=binding[3],
@@ -1624,7 +1725,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         candidate = copy.copy(state)
         candidate.last_apply_error = "planned"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("last_apply_error",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("last_apply_error",)),)
+        )
 
         with renderer_mirror_writes(plan) as writer:
             writer.save(candidate, update_fields=("last_apply_error",))
@@ -1672,7 +1775,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             peer_address_str="198.18.98.2",
             status="imported",
         )
-        NSOBGPPeerState.objects.filter(pk=malformed.pk).update(status="accepted", asn_str="invalid")
+        content_update(malformed, status="accepted", asn_str="invalid")
         malformed.refresh_from_db()
         other = NSOVLANState.objects.create(
             management=management,
@@ -1688,10 +1791,11 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         malformed_candidate = copy.copy(malformed)
         malformed_candidate.last_apply_error = "planned"
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(other_candidate, update_fields=("status",)),
                 planned_save(malformed_candidate, update_fields=("last_apply_error",)),
-            )
+            ),
         )
 
         def save_then_fail():
@@ -1737,7 +1841,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         before = (revision.revision, revision.verified_revision, revision.verified_fingerprint)
         candidate = copy.copy(target)
         candidate.status = "accepted"
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("status",)),)
+        )
 
         with self.assertRaisesRegex(RuntimeError, "rollback"), without_commit_drain():
             with renderer_writes(plan) as writer:
@@ -1765,6 +1871,7 @@ class TestContentOwnershipComesFromThePlan(IntentPushResetMixin, TestCase):
         candidate = copy.copy(NSOVLANState.objects.get(pk=row.pk))
         candidate.last_apply_error = "lifecycle only"
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(planned_save(candidate, update_fields=("last_apply_error",)),),
             validate_after_acquire=validate_after_acquire,
         )

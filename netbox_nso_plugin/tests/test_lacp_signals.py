@@ -8,7 +8,10 @@ import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from django.test import TestCase, TransactionTestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import ReceiptAdapter
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -48,7 +51,8 @@ class _LacpFixtures:
     def _bundle(self, mgmt, status="accepted", **fields):
         from netbox_nso_plugin.models import NSOLACPBundleState
 
-        return NSOLACPBundleState.objects.create(
+        return acquire_overlay(
+            NSOLACPBundleState,
             management=mgmt,
             interface=self.lag,
             lag_id=1,
@@ -62,7 +66,8 @@ class _LacpFixtures:
     def _member(self, mgmt, status="accepted", **fields):
         from netbox_nso_plugin.models import NSOLACPMemberState
 
-        return NSOLACPMemberState.objects.create(
+        return acquire_overlay(
+            NSOLACPMemberState,
             management=mgmt,
             interface=self.m1,
             lag_bundle=self.lag,
@@ -126,8 +131,8 @@ class TestPushLacpIntentForDevice(_LacpFixtures, _CascadeFlushMixin, IntentPushR
         from netbox_nso_plugin.models import NSOLACPBundleState
 
         mgmt = self._make_mgmt()
-        NSOLACPBundleState.objects.create(
-            management=mgmt, interface=self.lag, lag_id=1, status="accepted", vpc_sensitive=True
+        acquire_overlay(
+            NSOLACPBundleState, management=mgmt, interface=self.lag, lag_id=1, status="accepted", vpc_sensitive=True
         )
 
         config, session = self.adapter.patches()
@@ -181,7 +186,8 @@ class TestOnLacpStateSave(_LacpBase):
         mgmt = self._make_mgmt(auto_apply=True)
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
         plan = RendererMutationPlan.build(
-            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),
         )
 
         with renderer_writes(plan) as writer:
@@ -197,7 +203,8 @@ class TestOnLacpStateSave(_LacpBase):
         mgmt = self._make_mgmt(auto_apply=False)
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
         plan = RendererMutationPlan.build(
-            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),
         )
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
@@ -208,10 +215,13 @@ class TestOnLacpStateSave(_LacpBase):
 
     def test_foreign_save_does_not_trigger_lacp_behavior(self):
         from netbox_nso_plugin.models import NSOLACPBundleState
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._make_mgmt(auto_apply=True)
         bundle = NSOLACPBundleState(management=mgmt, interface=self.lag, lag_id=1, status="accepted")
 
+        with suppress_intent_push():
+            save_overlay_fixture(bundle)
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:
             with self.captureOnCommitCallbacks(execute=True):
                 bundle.save()
@@ -238,7 +248,8 @@ class TestOnLacpStateSave(_LacpBase):
         )
         bundle = NSOLACPBundleState(management=mgmt, interface=lag, lag_id=1, status="accepted")
         plan = RendererMutationPlan.build(
-            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),
         )
 
         with patch("netbox_nso_plugin.adapter_client.apply_lag_config") as mock_apply:

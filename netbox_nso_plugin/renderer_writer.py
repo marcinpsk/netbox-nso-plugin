@@ -33,6 +33,7 @@ from .intent_state import (
     mirror_transaction,
     renderer_input_specs,
 )
+from .ownership_grants import OwnershipGrant, validate_acquisition
 
 
 class IntentPlanStaleError(IntentMutationProtocolError):
@@ -150,6 +151,8 @@ def planned_delete(instance) -> RendererDelete:
 def planned_set_update(queryset, **values) -> RendererSetUpdate:
     """Freeze one queryset and its exact set-based update values."""
     model = queryset.model
+    if model._meta.label_lower in OVERLAY_MODEL_RANKS and "status" in values and not isinstance(values["status"], str):
+        raise IntentMutationProtocolError(f"{model._meta.label_lower} row set requires an exact target status")
     selected = tuple(queryset.order_by("pk"))
     normalized = tuple(
         sorted(
@@ -187,6 +190,7 @@ class RendererMutationPlan:
     lock_footprint: MutationFootprint
     content_keys: tuple[tuple[int, str], ...]
     planned_at: Any
+    grant: OwnershipGrant | None = None
     validate_after_acquire: Callable[[], None] | None = dataclass_field(default=None, compare=False, repr=False)
     settles_deploying: bool = True
     execution: Any = dataclass_field(default=None, compare=False, repr=False)
@@ -209,8 +213,11 @@ class RendererMutationPlan:
         validate_after_acquire=None,
         settles_deploying=True,
         execution=None,
+        grant=None,
     ) -> RendererMutationPlan:
         """Freeze proposed writes and derive every lock and revision dependency."""
+        if grant is not None and not isinstance(grant, OwnershipGrant):
+            raise IntentMutationProtocolError("the renderer grant must be an OwnershipGrant")
         planned_at = planned_at or timezone.now()
         saves = tuple(saves)
         save_states = tuple((proposed, _save_before(proposed)) for proposed in saves)
@@ -227,6 +234,7 @@ class RendererMutationPlan:
         effective_saves = []
 
         for proposed, before, after in effective_save_states:
+            validate_acquisition(before, after, grant)
             write, footprint, changed_keys = _plan_save(
                 proposed,
                 creation_refs,
@@ -244,7 +252,7 @@ class RendererMutationPlan:
             footprints.append(footprint)
             content_keys.update(changed_keys)
         for proposed in set_updates:
-            write, footprint, changed_keys = _plan_set_update(proposed)
+            write, footprint, changed_keys = _plan_set_update(proposed, grant=grant)
             writes.append(write)
             footprints.append(footprint)
             content_keys.update(changed_keys)
@@ -278,6 +286,7 @@ class RendererMutationPlan:
             lock_footprint=lock_footprint,
             content_keys=tuple(sorted(content_keys)),
             planned_at=planned_at,
+            grant=grant,
             validate_after_acquire=validate_after_acquire,
             settles_deploying=settles_deploying,
             execution=execution,
@@ -474,6 +483,15 @@ def _changed_keys(before, after, spec, dependency_changed):
     for candidate in (before, after):
         if candidate is not None:
             keys.update(spec.resolver(candidate, spec))
+    if spec.model_label == "dcim.interface" and before is not None and after is not None and not dependency_changed:
+        changed_fields = {
+            name
+            for name in spec.content_fields
+            if getattr(before, before._meta.get_field(name).attname)
+            != getattr(after, after._meta.get_field(name).attname)
+        }
+        if changed_fields == {"description"}:
+            keys = {key for key in keys if key[1] == "interface"}
     return keys
 
 
@@ -716,7 +734,7 @@ def _load_frozen_set_rows(model, operation):
     return selected_rows
 
 
-def _plan_set_update(proposed: RendererSetUpdate):
+def _plan_set_update(proposed: RendererSetUpdate, *, grant=None):
     model = apps.get_model(proposed.model_label)
     spec = renderer_input_specs().get(proposed.model_label)
     if spec is None:
@@ -729,6 +747,7 @@ def _plan_set_update(proposed: RendererSetUpdate):
         after = copy.copy(before)
         for attname, value in values.items():
             setattr(after, attname, value)
+        validate_acquisition(before, after, grant)
         dependency_footprint, dependency_changed = _dependencies(before, after, spec)
         footprints.extend((footprint_for_instance(before, spec), footprint_for_instance(after, spec)))
         footprints.append(dependency_footprint)
@@ -898,10 +917,19 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
     return write, footprint, keys
 
 
-def _maintain_manifest(instance):
+def _maintain_manifest(instance, *, grant=None, acquisition=False, previous_binding=None):
     from .ownership_planner import maintain_manifest
 
-    maintain_manifest(instance)
+    maintain_manifest(instance, grant=grant, acquisition=acquisition, previous_binding=previous_binding)
+
+
+def _owned_binding(instance):
+    from .ownership_planner import manifest_binding
+    from .status_machine import is_owned
+
+    if instance._meta.label_lower in OVERLAY_MODEL_RANKS and is_owned(instance.status):
+        return manifest_binding(instance)
+    return None
 
 
 def _retire_overlay_manifest(instance):
@@ -917,9 +945,37 @@ class RendererWriter:
         self.plan = plan
         self.content = content
         self.permit = permit
+        self.grant = plan.grant
         self._consumed: set[int] = set()
         self._active_operation: int | None = None
         self._active_instance = None
+
+    def _acquired(self, index, pk=None):
+        from .status_machine import OWNED_STATES
+
+        write = self.plan.write_set[index]
+        before = dict(write.before_values)
+        if write.operation == "set_update":
+            before = dict(next(values for selected_pk, values in write.selected_before_values if selected_pk == pk))
+        return (
+            write.model_label in OVERLAY_MODEL_RANKS
+            and dict(write.values).get("status") in OWNED_STATES
+            and (before.get("status") not in OWNED_STATES or (self.grant is not None and self.grant.kind == "accept"))
+        )
+
+    def queryset_update_is_authorized(self, queryset, values, rows):
+        if self._active_operation is None:
+            return False
+        operation = self.plan.write_set[self._active_operation]
+        normalized = tuple(
+            sorted((queryset.model._meta.get_field(name).attname, _normal(value)) for name, value in values.items())
+        )
+        return (
+            operation.operation == "set_update"
+            and operation.model_label == queryset.model._meta.label_lower
+            and operation.selected_pks == tuple(row.pk for row in rows)
+            and operation.values == normalized
+        )
 
     def _reference_matches(self, reference, related):
         if related is None or related._meta.label_lower != reference.model_label:
@@ -1111,6 +1167,12 @@ class RendererWriter:
     def save_via(self, instance, save, *, update_fields=None, force_insert=False):
         """Execute one exact planned save through a model-aware callback."""
         index = self._find_save(instance, update_fields, force_insert)
+        write = self.plan.write_set[index]
+        previous_binding = (
+            _owned_binding(type(instance)(pk=write.pk, **dict(write.before_values)))
+            if write.before_values and write.model_label in OVERLAY_MODEL_RANKS
+            else None
+        )
         with self._operation(index, instance):
             if not force_insert:
                 result = save()
@@ -1133,7 +1195,9 @@ class RendererWriter:
                     result = None
         if result is not None and result is not instance:
             raise IntentMutationProtocolError("a planned save callback returned a different instance")
-        _maintain_manifest(instance)
+        _maintain_manifest(
+            instance, grant=self.grant, acquisition=self._acquired(index), previous_binding=previous_binding
+        )
         self._consumed.add(index)
         return instance
 
@@ -1301,10 +1365,24 @@ class RendererWriter:
             or operation.values != normalized
         ):
             raise IntentMutationProtocolError("set-based update is outside the frozen write set")
-        _load_frozen_set_rows(model, operation)
-        updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
+        before_rows = _load_frozen_set_rows(model, operation)
+        previous_bindings = {before.pk: _owned_binding(before) for before in before_rows}
+        for before in before_rows:
+            after = copy.copy(before)
+            for name, value in values.items():
+                setattr(after, name, value)
+            validate_acquisition(before, after, self.grant)
+        with self._operation(index):
+            updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")
+        for instance in model._default_manager.filter(pk__in=operation.selected_pks):
+            _maintain_manifest(
+                instance,
+                grant=self.grant,
+                acquisition=self._acquired(index, instance.pk),
+                previous_binding=previous_bindings[instance.pk],
+            )
         self._consumed.add(index)
         return updated
 
@@ -1427,26 +1505,46 @@ def require_planned_m2m_signal(instance, action, field_name, pk_set) -> None:
         )
 
 
-def _finalize_fingerprints(plan):
+def finalize_renderer_fingerprints(revision_keys, *, unchanged_only=False):
+    """Record the rendered content after a locked content mutation."""
     from . import delivery
+    from .intent_state import _ACTIVE_PERMIT
     from .models import NSODeviceManagement, NSOIntentRevision
 
+    revision_keys = set(revision_keys)
+    permit = _ACTIVE_PERMIT.get()
+    if permit is None or not revision_keys <= permit.bumped:
+        raise IntentMutationProtocolError("renderer fingerprint keys were not bumped by the active permit")
     verified_at = timezone.now()
-    for device_id, scope in plan.content_keys:
+    for device_id, scope in sorted(revision_keys):
         adapter_device_id = (
             NSODeviceManagement.objects.filter(device_id=device_id).values_list("adapter_device_id", flat=True).first()
         )
         rendered = delivery.render(scope, device_id, adapter_device_id)
         revision = NSOIntentRevision.objects.get(device_id=device_id, scope=scope)
+        fingerprint = delivery.canonical_fingerprint(rendered.payload)
+        if unchanged_only and (
+            revision.verified_revision != revision.revision - 1 or revision.verified_fingerprint != fingerprint
+        ):
+            continue
         revision.verified_revision = revision.revision
-        revision.verified_fingerprint = delivery.canonical_fingerprint(rendered.payload)
+        revision.verified_fingerprint = fingerprint
         revision.verified_at = verified_at
         revision.save(update_fields=["verified_revision", "verified_fingerprint", "verified_at", "updated_at"])
 
 
+def _with_grant(plan, grant):
+    if grant is None:
+        return plan
+    if not isinstance(grant, OwnershipGrant) or (plan.grant is not None and plan.grant != grant):
+        raise IntentMutationProtocolError("the writer grant differs from the frozen plan")
+    return replace(plan, grant=grant)
+
+
 @contextlib.contextmanager
-def renderer_writes(plan: RendererMutationPlan):
+def renderer_writes(plan: RendererMutationPlan, *, grant=None):
     """Execute one content plan and atomically finalize every bumped fingerprint."""
+    plan = _with_grant(plan, grant)
     if not plan.content_keys:
         raise IntentMutationProtocolError("renderer_writes requires a content-changing plan")
     if active_renderer_writer() is not None:
@@ -1465,20 +1563,23 @@ def renderer_writes(plan: RendererMutationPlan):
                 plan.lock_footprint,
                 bump_keys=plan.content_keys,
             )
+        if not set(plan.content_keys) <= permit.bumped:
+            raise IntentMutationProtocolError("renderer content keys were not bumped by the active permit")
         writer = RendererWriter(plan, content=True, permit=permit)
         writer.validate_dependencies()
         token = _ACTIVE_WRITER.set(writer)
         try:
             yield writer
             writer.assert_complete()
-            _finalize_fingerprints(plan)
+            finalize_renderer_fingerprints(plan.content_keys)
         finally:
             _ACTIVE_WRITER.reset(token)
 
 
 @contextlib.contextmanager
-def renderer_mirror_writes(plan: RendererMutationPlan):
+def renderer_mirror_writes(plan: RendererMutationPlan, *, grant=None):
     """Execute one exact lifecycle/mirror plan without changing trusted fingerprints."""
+    plan = _with_grant(plan, grant)
     if plan.content_keys:
         raise IntentMutationProtocolError("renderer_mirror_writes cannot execute a content-changing plan")
     if active_renderer_writer() is not None:
@@ -1514,7 +1615,7 @@ def renderer_writes_replanning_once(plan_fn):
             )
             for write in plan.write_set
         )
-        return writes, plan.lock_footprint, plan.content_keys, plan.settles_deploying
+        return writes, plan.lock_footprint, plan.content_keys, plan.settles_deploying, plan.grant
 
     planned_at_marker = object()
     plan = plan_fn()

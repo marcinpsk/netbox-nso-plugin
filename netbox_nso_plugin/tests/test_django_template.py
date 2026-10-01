@@ -14,6 +14,8 @@ from django.test import RequestFactory, SimpleTestCase, TestCase
 
 from netbox_nso_plugin.models import NSODerivedIntentTemplate, NSOInterfaceState
 
+from ._ownership_case import acquire_overlay
+
 
 class TestTemplateCommentSyntax(SimpleTestCase):
     """Guard against multiline Django constructs, which the lexer renders literally."""
@@ -224,7 +226,8 @@ class TestUpsertInterfaceStates(TestCase):
 
         NSOInterfaceState.objects.filter(interface=self.interface, attribute="description").delete()
         # Start with no last_apply_at
-        NSOInterfaceState.objects.create(
+        acquire_overlay(
+            NSOInterfaceState,
             interface=self.interface,
             attribute="description",
             status="in_sync",
@@ -283,8 +286,8 @@ class TestInterfaceNSOBadge(TestCase):
         """right_page() passes all interface states keyed by attribute."""
         from netbox_nso_plugin.template_content import InterfaceNSOBadge
 
-        NSOInterfaceState.objects.create(
-            interface=self.interface, attribute="enabled", status="in_sync", nso_value="true"
+        acquire_overlay(
+            NSOInterfaceState, interface=self.interface, attribute="enabled", status="in_sync", nso_value="true"
         )
 
         badge = object.__new__(InterfaceNSOBadge)

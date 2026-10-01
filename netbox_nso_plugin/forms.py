@@ -25,6 +25,7 @@ from .models import (
     NSOSnmpV3UserState,
     NSOVaultSettings,
 )
+from .ownership_grants import OwnershipGrant
 from .vault_refs import VaultRefError, parse_vault_ref, qualify_snmp_ref, secret_fingerprint
 
 
@@ -321,13 +322,14 @@ class _ExactOverlayFormMixin:
 
         def build_plan():
             return RendererMutationPlan.build(
+                grant=OwnershipGrant("operator_edit"),
                 saves=(
                     planned_save(
                         obj,
                         force_insert=created,
                         natural_key=self._NATURAL_KEYS[obj._meta.label_lower],
                     ),
-                )
+                ),
             )
 
         plan = build_plan()
@@ -475,7 +477,7 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
                         update_fields.append("status")
                     host_candidates.append((candidate, tuple(update_fields)))
                     saves.append(planned_save(candidate, update_fields=update_fields))
-            plan = RendererMutationPlan.build(saves=saves)
+            plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             with mutation as writer:
                 writer.save(obj, force_insert=created)

@@ -21,6 +21,8 @@ from django.template.loader import render_to_string
 from django.test import TestCase
 from extras.models import JournalEntry
 
+from ._ownership_case import save_overlay_fixture
+
 
 def _job(job_id, *, in_sync=0, apply_failed=0, status="succeeded", errors=None):
     job = {
@@ -114,11 +116,9 @@ class TestAppliedToDevicesPanel(_RoutePolicyFixture):
         ct = ContentType.objects.get_for_model(cl)
         # Operator owns it → status accepted (so the panel shows a non-import badge).
         state = NSORoutePolicyState.objects.get(content_type=ct, object_id=cl.pk)
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
-        with intent_transaction(footprint_for_instance(state)):
-            state.status = "accepted"
-            state.save(update_fields=["status"])
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=["status"])
         states = list(NSORoutePolicyState.objects.filter(content_type=ct, object_id=cl.pk).select_related("management"))
 
         html = render_to_string("netbox_nso_plugin/route_policy_nso_devices.html", {"nso_states": states})
@@ -139,13 +139,9 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
 
         self._reconcile()
         states = list(NSORoutePolicyState.objects.filter(management__device=self.device))
-        from netbox_nso_plugin.intent_state import MutationFootprint, footprint_for_instance, intent_transaction
-
-        footprint = MutationFootprint.merge(*(footprint_for_instance(state) for state in states))
-        with intent_transaction(footprint):
-            for state in states:
-                state.status = "accepted"
-                state.save(update_fields=["status"])
+        for state in states:
+            state.status = "accepted"
+            save_overlay_fixture(state, update_fields=["status"])
 
     def _entries_for(self, name, model):
         ct = ContentType.objects.get_for_model(model)
@@ -166,9 +162,8 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
 
         @contextmanager
         def acquire_after_acceptance(footprint):
-            with intent_state.intent_transaction(intent_state.footprint_for_instance(late)):
-                late.status = "accepted"
-                late.save(update_fields=["status"])
+            late.status = "accepted"
+            save_overlay_fixture(late, update_fields=["status"])
             with original_transaction(footprint) as permit:
                 yield permit
 
@@ -227,14 +222,12 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
             "as_paths": [],
             "route_maps": [],
         }
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
         reconcile_route_policy(self.device, route_policy_payload)
         row = NSORoutePolicyState.objects.get(management=mgmt, family="prefix_list", object_name="PL-STABLE")
-        with intent_transaction(footprint_for_instance(row)):
-            row.status = "accepted"
-            row.save(update_fields=["status"])
+        row.status = "accepted"
+        save_overlay_fixture(row, update_fields=["status"])
         attempt_id = uuid4()
         mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
         row.refresh_from_db()

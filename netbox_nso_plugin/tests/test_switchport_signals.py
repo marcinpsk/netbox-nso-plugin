@@ -9,7 +9,10 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase, TransactionTestCase
 from ipam.models import VLAN, VLANGroup
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -54,7 +57,8 @@ class _SwBase(IntentPushResetMixin, TestCase):
     def _state(self, mgmt, mode="access", status="changed"):
         from netbox_nso_plugin.models import NSOSwitchportState
 
-        return NSOSwitchportState.objects.create(
+        return acquire_overlay(
+            NSOSwitchportState,
             management=mgmt,
             interface=self.iface,
             mode=mode,
@@ -129,10 +133,12 @@ class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, T
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
 
         with without_commit_drain():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            state = acquire_overlay(
+                NSOSwitchportState, management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
             )
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),)
+        )
         config, session = self.adapter.patches()
         with config, session, renderer_writes(plan) as writer:
             writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
@@ -151,10 +157,12 @@ class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, T
         from netbox_nso_plugin.signals import suppress_intent_push
 
         with without_commit_drain():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            state = acquire_overlay(
+                NSOSwitchportState, management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
             )
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),)
+        )
         config, session = self.adapter.patches()
         silence = suppress_intent_push() if suppressed else contextlib.nullcontext()
         with config, session, silence, CaptureQueriesContext(connection) as captured:
@@ -188,10 +196,12 @@ class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, T
         carried = ("vlan_id", 10)
         self.adapter.place(self.mgmt.adapter_device_id, carried)
         with without_commit_drain():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            state = acquire_overlay(
+                NSOSwitchportState, management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
             )
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),)
+        )
         config, session = self.adapter.patches()
         with config, session, renderer_writes(plan) as writer:
             writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
@@ -205,11 +215,13 @@ class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, T
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         with without_commit_drain():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt, interface=self.iface, mode="access", status="accepted"
+            state = acquire_overlay(
+                NSOSwitchportState, management=self.mgmt, interface=self.iface, mode="access", status="accepted"
             )
         state.status = "changed"
-        plan = RendererMutationPlan.build(saves=(planned_save(state, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(state, update_fields=("status",)),)
+        )
         config, session = self.adapter.patches()
         with config, session, renderer_writes(plan) as writer:
             writer.save(state, update_fields=("status",))
@@ -224,13 +236,17 @@ class TestSwitchportWriterScheduling(_CascadeFlushMixin, IntentPushResetMixin, T
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_m2m_set, renderer_writes
 
         with without_commit_drain():
-            state = NSOSwitchportState.objects.create(
-                management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
+            state = acquire_overlay(
+                NSOSwitchportState, management=self.mgmt, interface=self.iface, mode="tagged", status="accepted"
             )
-            plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),))
+            plan = RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (self.other_vlan,)),)
+            )
             with renderer_writes(plan) as writer:
                 writer.m2m_set(state, "tagged_vlans", (self.other_vlan,))
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", ()),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", ()),)
+        )
         config, session = self.adapter.patches()
         with config, session, renderer_writes(plan) as writer:
             writer.m2m_set(state, "tagged_vlans", ())

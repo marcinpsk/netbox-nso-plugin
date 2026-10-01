@@ -7,6 +7,9 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin
 
 
@@ -44,7 +47,8 @@ class TestPushIsisFlexAlgoIntent(_FlexAlgoBase):
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
 
         mgmt = self._mgmt()
-        NSOISISFlexAlgoState.objects.create(
+        acquire_overlay(
+            NSOISISFlexAlgoState,
             management=mgmt,
             process_tag="CORE",
             algo_id=130,
@@ -97,7 +101,8 @@ class TestFlexAlgoOwnershipSignals(_FlexAlgoBase):
         inst = self._isis_instance(process_tag="CORE")
 
         fa = ISISFlexAlgo.objects.create(instance=inst, algo_id=130)
-        NSOISISFlexAlgoState.objects.create(
+        acquire_overlay(
+            NSOISISFlexAlgoState,
             management=self._mgmt(),
             process_tag="CORE",
             algo_id=130,
@@ -129,13 +134,14 @@ class TestFlexAlgoOwnershipSignals(_FlexAlgoBase):
             status="accepted",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     state,
                     force_insert=True,
                     natural_key=("management", "process_tag", "algo_id"),
                 ),
-            )
+            ),
         )
 
         with patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent") as mock_put:

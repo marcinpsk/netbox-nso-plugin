@@ -374,7 +374,7 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
                 ("drain.py", "_takeover", "delivery.render"),
                 ("renderer_audit.py", "_optimistic_candidates", "delivery.render"),
                 ("renderer_audit.py", "_repair_candidates", "delivery.render"),
-                ("renderer_writer.py", "_finalize_fingerprints", "delivery.render"),
+                ("renderer_writer.py", "finalize_renderer_fingerprints", "delivery.render"),
                 ("switching_preparation.py", "_capture", "delivery.render"),
                 ("switching_preparation.py", "cancel_if_rendered", "delivery.render"),
             },

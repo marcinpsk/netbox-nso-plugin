@@ -133,12 +133,15 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     defers pushes to after an atomic commit). Returns ``{interface, changed,
     description, skipped, error}``.
     """
+    import copy
+
     from django.utils import timezone
 
     from .derived_intent import render_template
-    from .intent_state import MutationFootprint, SourceRow, intent_transaction
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOInterfaceState
+    from .ownership_grants import OwnershipGrant
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
     from .signals import _schedule_intent_push, suppress_intent_push
 
     result = {"interface": str(interface), "changed": False, "description": None, "skipped": None, "error": None}
@@ -156,23 +159,31 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
     new_value = render_template(role.description_template, self_iface=interface, peer_iface=other_end)
     changed = interface.description != new_value
 
-    footprint = MutationFootprint.for_keys(
-        {(mgmt.device_id, "interface")},
-        source_rows=(SourceRow("dcim.interface", interface.pk),),
-        overlay_rows=(SourceRow(NSOInterfaceState._meta.label_lower, None),),
+    now = timezone.now()
+    native = copy.copy(interface)
+    native.description = new_value
+    current = NSOInterfaceState.objects.filter(interface=interface, attribute="description").first()
+    state = (
+        copy.copy(current) if current is not None else NSOInterfaceState(interface=interface, attribute="description")
     )
-    with intent_transaction(footprint):
+    state.status = "accepted"
+    state.accepted_at = now
+    fields = None if current is None else ("status", "accepted_at")
+    saves = [
+        planned_save(state, update_fields=fields, force_insert=current is None, natural_key=("interface", "attribute"))
+    ]
+    if changed:
+        saves.insert(0, planned_save(native, update_fields=("description",)))
+    plan = RendererMutationPlan.build(saves=saves, planned_at=now, grant=OwnershipGrant("link_role"))
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
         with suppress_intent_push():
             if changed:
-                interface.description = new_value
-                interface.save(update_fields=["description"])
-            NSOInterfaceState.objects.update_or_create(
-                interface=interface,
-                attribute="description",
-                defaults={"status": "accepted", "accepted_at": timezone.now()},
-            )
+                writer.save(native, update_fields=("description",))
+            writer.save(state, update_fields=fields, force_insert=current is None)
         if push:
             _schedule_intent_push((mgmt.device_id, "interface"))
+    interface.description = new_value
 
     result["changed"] = changed
     result["description"] = new_value
@@ -194,11 +205,14 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     ``{interface, igp, enabled, skipped, error}``. One end only; the orchestrator
     runs it on both.
     """
+    import copy
+
     from django.utils import timezone
 
-    from .intent_state import MutationFootprint, SourceRow, intent_transaction
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOISISInterfaceState, NSOOSPFInterfaceState
+    from .ownership_grants import OwnershipGrant
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
     from .signals import _schedule_intent_push, suppress_intent_push
 
     result = {"interface": str(interface), "igp": role.igp, "enabled": False, "skipped": None, "error": None}
@@ -220,44 +234,39 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     else:
         scope = "ospf"
         state_model = NSOOSPFInterfaceState
-    footprint = MutationFootprint.for_keys(
-        {(mgmt.device_id, scope)},
-        overlay_rows=(SourceRow(state_model._meta.label_lower, None),),
+    lookup = {"management": mgmt, "interface": interface}
+    if scope == "isis":
+        lookup["af"] = "ipv4"
+        values = {
+            "process_tag": role.isis_process_tag,
+            "circuit_type": role.isis_circuit_type,
+            "metric": role.isis_metric,
+            "passive": role.isis_passive,
+        }
+    else:
+        values = {
+            "process_id": role.ospf_process_id or None,
+            "area_id": role.ospf_area,
+            "network_type": role.ospf_network_type,
+            "passive": role.ospf_passive,
+            "cost": role.ospf_cost,
+        }
+    values.update(status="accepted", accepted_at=now)
+    current = state_model.objects.filter(**lookup).first()
+    state = copy.copy(current) if current is not None else state_model(**lookup)
+    for name, value in values.items():
+        setattr(state, name, value)
+    fields = None if current is None else tuple(values)
+    plan = RendererMutationPlan.build(
+        saves=(planned_save(state, update_fields=fields, force_insert=current is None, natural_key=tuple(lookup)),),
+        planned_at=now,
+        grant=OwnershipGrant("link_role"),
     )
-    with intent_transaction(footprint):
-        if scope == "isis":
-            with suppress_intent_push():
-                NSOISISInterfaceState.objects.update_or_create(
-                    management=mgmt,
-                    interface=interface,
-                    af="ipv4",
-                    defaults={
-                        "process_tag": role.isis_process_tag,
-                        "circuit_type": role.isis_circuit_type,
-                        "metric": role.isis_metric,
-                        "passive": role.isis_passive,
-                        "status": "accepted",
-                        "accepted_at": now,
-                    },
-                )
-        else:  # ospf
-            with suppress_intent_push():
-                NSOOSPFInterfaceState.objects.update_or_create(
-                    management=mgmt,
-                    interface=interface,
-                    defaults={
-                        "process_id": role.ospf_process_id or None,
-                        "area_id": role.ospf_area,
-                        "network_type": role.ospf_network_type,
-                        "passive": role.ospf_passive,
-                        "cost": role.ospf_cost,
-                        "status": "accepted",
-                        "accepted_at": now,
-                    },
-                )
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
+        with suppress_intent_push():
+            writer.save(state, update_fields=fields, force_insert=current is None)
         if push:
-            # Appended, never pushed around the outbox: an in-protocol send is a claimed,
-            # sequenced operation, and the drain runs on this transaction's commit.
             _schedule_intent_push((mgmt.device_id, scope))
 
     result["enabled"] = True
@@ -315,8 +324,11 @@ def _enqueue_provisioned(role, device_ids) -> None:
 
 def _provision_link_footprint(role, pairs, device_ids):
     """Return the complete renderer footprint for one link-role provision."""
-    from .intent_state import MutationFootprint, SourceRow
+    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance, renderer_input_specs
 
+    native_footprints = [footprint_for_instance(end) for end, _peer in pairs]
+    spec = renderer_input_specs()["dcim.interface"]
+    native_footprints.extend(spec.dependency_resolver(end, end, spec)[0] for end, _peer in pairs)
     source_rows = [SourceRow("dcim.interface", end.pk) for end, _peer in pairs]
     overlay_rows = []
     if role.assign_ipv4 or role.assign_ipv6:
@@ -328,10 +340,13 @@ def _provision_link_footprint(role, pairs, device_ids):
         overlay_rows.append(SourceRow("netbox_nso_plugin.nsoisisinterfacestate", None))
     elif role.igp == "ospf":
         overlay_rows.append(SourceRow("netbox_nso_plugin.nsoospfinterfacestate", None))
-    return MutationFootprint.for_keys(
-        {(device_id, scope) for device_id in device_ids for scope in _provisioned_scopes(role)},
-        source_rows=source_rows,
-        overlay_rows=overlay_rows,
+    return MutationFootprint.merge(
+        *native_footprints,
+        MutationFootprint.for_keys(
+            {(device_id, scope) for device_id in device_ids for scope in _provisioned_scopes(role)},
+            source_rows=source_rows,
+            overlay_rows=overlay_rows,
+        ),
     )
 
 
@@ -353,7 +368,7 @@ def provision_link_role(interface) -> dict:
     from django.db import transaction
     from ipam.models import Prefix
 
-    from .intent_state import intent_transaction
+    from .intent_state import _intent_transaction
     from .ip_autoassign import _resolve_role_pool, assign_ips_for_role
     from .signals import suppress_intent_push
 
@@ -425,7 +440,10 @@ def provision_link_role(interface) -> dict:
                 .order_by("pk")
             }
             resolved_pools = {family: locked_pools.get(pool_id) for family, pool_id in resolved_pool_ids.items()}
-            with intent_transaction(_provision_link_footprint(role, pairs, device_ids)):
+            with _intent_transaction(
+                _provision_link_footprint(role, pairs, device_ids),
+                bump_keys={(device_id, scope) for device_id in device_ids for scope in _provisioned_scopes(role)},
+            ):
                 with suppress_intent_push():
                     ip_res = assign_ips_for_role(
                         interface,

@@ -24,6 +24,7 @@ from ipam.models import Prefix, Role
 from netbox_nso_plugin.ip_autoassign import assign_ips_for_role, rollback_auto_assigned
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState, NSOLinkRole
 
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -118,8 +119,13 @@ class TestAssignP2PForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="c5", slug="c5", link_type="p2p", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        NSOInterfaceIPState.objects.create(
-            interface=self.if_a, address="198.18.14.100/31", family="ipv4", status="accepted", auto_assigned=True
+        acquire_overlay(
+            NSOInterfaceIPState,
+            interface=self.if_a,
+            address="198.18.14.100/31",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
         )
         result = assign_ips_for_role(self.if_a, role, other_end=self.if_b)
         self.assertEqual(len(result["allocated"]), 0)
@@ -207,8 +213,13 @@ class TestAssignSingleForRole(_Base):
         role = NSOLinkRole.objects.create(
             name="s3", slug="s3", link_type="single", assign_ipv4=True, ipv4_pool_prefix=pool
         )
-        NSOInterfaceIPState.objects.create(
-            interface=self.lo_a, address="198.18.22.9/32", family="ipv4", status="accepted", auto_assigned=True
+        acquire_overlay(
+            NSOInterfaceIPState,
+            interface=self.lo_a,
+            address="198.18.22.9/32",
+            family="ipv4",
+            status="accepted",
+            auto_assigned=True,
         )
         result = assign_ips_for_role(self.lo_a, role)
         self.assertEqual(len(result["allocated"]), 0)

@@ -17,7 +17,7 @@ from typing import Any
 
 from django.apps import apps
 from django.db import connections, transaction
-from django.db.models.signals import m2m_changed, pre_delete, pre_save
+from django.db.models.signals import m2m_changed, post_save, pre_delete, pre_save
 
 logger = logging.getLogger(__name__)
 
@@ -2563,11 +2563,49 @@ def mirror_refresh_is_active() -> bool:
 
 
 def _validate_explicit_write(sender, instance, update_fields=None, **kwargs):
-    """Validate a registered save only while an explicit writer is active."""
+    """Validate every ownership start and each active writer operation."""
+    from .ownership_grants import validate_acquisition
     from .renderer_writer import active_renderer_writer, require_planned_signal_write
 
-    if active_renderer_writer() is not None:
+    writer = active_renderer_writer()
+    if sender._meta.label_lower in OVERLAY_MODEL_RANKS:
+        from .models import NSOOwnershipAcquisition
+        from .status_machine import is_owned
+
+        before = None
+        instance._nso_released_acquisition_pk = None
+        if instance.pk is not None and not instance._state.adding:
+            using = kwargs.get("using") or instance._state.db or "default"
+            rows = sender._default_manager.using(using).filter(pk=instance.pk)
+            if connections[using].in_atomic_block:
+                rows = rows.select_for_update(of=("self",))
+            before = rows.first()
+        after = _effective_after(instance, before, update_fields)
+        validate_acquisition(before, after, writer.grant if writer is not None else None)
+        if before is not None and not is_owned(after.status):
+            instance._nso_released_acquisition_pk = (
+                NSOOwnershipAcquisition.objects.using(using)
+                .filter(state_model_label=sender._meta.label_lower, state_id=instance.pk)
+                .values_list("pk", flat=True)
+                .first()
+            )
+    if writer is not None:
         require_planned_signal_write(instance, update_fields=update_fields)
+
+
+def _discard_released_acquisition(sender, instance, update_fields=None, using=None, **kwargs):
+    """End pending acquisition evidence when a persisted overlay releases ownership."""
+    if sender._meta.label_lower not in OVERLAY_MODEL_RANKS:
+        return
+
+    from .ownership_planner import discard_acquisition
+    from .status_machine import is_owned
+
+    if update_fields is not None and "status" not in update_fields:
+        return
+    acquisition_pk = getattr(instance, "_nso_released_acquisition_pk", None)
+    if not is_owned(instance.status) and acquisition_pk is not None:
+        discard_acquisition(instance, using=using, acquisition_pk=acquisition_pk)
 
 
 def _delete_origin_label(origin) -> str | None:
@@ -2618,6 +2656,10 @@ def _validate_explicit_delete(sender, instance, origin=None, **kwargs):
     if active_renderer_writer() is not None:
         require_planned_signal_write(instance, deleting=True)
     _lock_management_delete(instance, origin)
+    if sender._meta.label_lower in OVERLAY_MODEL_RANKS:
+        from .ownership_planner import discard_acquisition
+
+        discard_acquisition(instance, using=kwargs.get("using"))
     permit = _ACTIVE_PERMIT.get()
     # The repend runs after the block's writes: this is what tells it which of the rows it
     # captured as deploying were consumed by a delete rather than lost.
@@ -2697,6 +2739,8 @@ def register_renderer_input(spec: RendererInputSpec) -> None:
     uid = f"nso_renderer_writer_{label}"
     pre_save.connect(_validate_explicit_write, sender=model, dispatch_uid=f"{uid}_pre_save", weak=False)
     pre_delete.connect(_validate_explicit_delete, sender=model, dispatch_uid=f"{uid}_pre_delete", weak=False)
+    if label in OVERLAY_MODEL_RANKS:
+        post_save.connect(_discard_released_acquisition, sender=model, dispatch_uid=f"{uid}_release", weak=False)
     if model._meta.auto_created:
         m2m_changed.connect(_validate_explicit_m2m, sender=model, dispatch_uid=f"{uid}_m2m", weak=False)
 

@@ -8,10 +8,12 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
 from django.test import TestCase, TransactionTestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.vault_refs import secret_fingerprint
 
 from ._adapter_http import make_session
 from ._outbox_case import without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _BASE_CFG = {
@@ -56,8 +58,13 @@ class _SnmpBase(IntentPushDeliveryMixin, TestCase):
     def _community(self, mgmt, status="imported", vault_ref=""):
         from netbox_nso_plugin.models import NSOSnmpCommunityState
 
-        return NSOSnmpCommunityState.objects.create(
-            management=mgmt, community_hash="abcd1234abcd1234", access="RO", status=status, vault_ref=vault_ref
+        return acquire_overlay(
+            NSOSnmpCommunityState,
+            management=mgmt,
+            community_hash="abcd1234abcd1234",
+            access="RO",
+            status=status,
+            vault_ref=vault_ref,
         )
 
 
@@ -157,7 +164,9 @@ class TestSnmpAcceptView(_SnmpBase):
         candidate.status = "in_sync"
         candidate.accepted_at = timezone.now()
         fields = ("status", "accepted_at")
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
+        )
         # Creating the row already fired the real signal (coalesced on the rolled-back
         # test txn); clear that stale coalescing state before the assertion run.
         reset_intent_push_state()
@@ -217,7 +226,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
             "status": "imported",
         }
         fields.update(kwargs)
-        return NSOSnmpV3UserState.objects.create(**fields)
+        return acquire_overlay(NSOSnmpV3UserState, **fields)
 
     def _host(self, mgmt, **kwargs):
         from netbox_nso_plugin.models import NSOSnmpHostState
@@ -230,7 +239,7 @@ class TestSnmpUnpushableRowsAreRefusedNotDowngraded(_SnmpBase):
             "status": "imported",
         }
         fields.update(kwargs)
-        return NSOSnmpHostState.objects.create(**fields)
+        return acquire_overlay(NSOSnmpHostState, **fields)
 
     def test_accepting_a_v3_user_without_its_protocols_is_refused(self):
         """The read mirror reports only THAT the device holds auth/priv secrets, never which
@@ -555,7 +564,8 @@ class TestCommunityRekeyReReadsTrapHostsUnderTheLock(_CascadeFlushMixin, IntentP
                 access="RO",
                 status="imported",
             )
-            NSOSnmpHostState.objects.create(
+            acquire_overlay(
+                NSOSnmpHostState,
                 management=self.mgmt,
                 address="198.51.100.1",
                 version="v2c",
@@ -597,7 +607,8 @@ class TestCommunityRekeyReReadsTrapHostsUnderTheLock(_CascadeFlushMixin, IntentP
             try:
                 gap_open.wait(timeout=30)
                 with transaction.atomic():
-                    NSOSnmpHostState.objects.create(
+                    acquire_overlay(
+                        NSOSnmpHostState,
                         management=self.mgmt,
                         address="198.51.100.2",
                         version="v2c",
@@ -655,7 +666,8 @@ class TestCommunityRekeyReReadsTrapHostsUnderTheLock(_CascadeFlushMixin, IntentP
         from netbox_nso_plugin.models import NSOSnmpHostState
 
         with without_commit_drain(), transaction.atomic():
-            NSOSnmpHostState.objects.create(
+            acquire_overlay(
+                NSOSnmpHostState,
                 management=self.mgmt,
                 address="198.51.100.3",
                 version="v2c",

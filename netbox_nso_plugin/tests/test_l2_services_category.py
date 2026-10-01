@@ -15,6 +15,7 @@ from django.utils import timezone
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
 
 from ._outbox_case import content_update, mirror_update
+from ._ownership_case import acquire_overlay
 
 User = get_user_model()
 
@@ -213,7 +214,8 @@ class TestL2ServicesCategoryViewAndAccept(TestCase):
     def test_reaccept_in_sync_sap_is_a_noop(self):
         self.client.force_login(self.user)
         accepted_at = timezone.now() - timezone.timedelta(days=3)
-        state = NSOL2SapState.objects.create(
+        state = acquire_overlay(
+            NSOL2SapState,
             management=self.mgmt,
             service_name="ALREADY-SYNCED",
             service_type="epipe",

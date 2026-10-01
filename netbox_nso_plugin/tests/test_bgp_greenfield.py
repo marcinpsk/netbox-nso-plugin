@@ -20,8 +20,10 @@ from ipam.models import ASN, RIR, IPAddress
 from netbox_routing.models import BGPPeer, BGPRouter, BGPScope
 
 from netbox_nso_plugin.models import NSOBGPPeerState, NSODeviceManagement, NSOInstance
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import enqueue, entries, make_managed, state_of, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -112,7 +114,8 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
                 scope,
                 self._ip(f"198.18.0.{host}/32"),
             )
-            NSOBGPPeerState.objects.create(
+            acquire_overlay(
+                NSOBGPPeerState,
                 management=management,
                 asn_str=str(self.asn.asn),
                 peer_address_str=f"198.18.0.{host}",
@@ -154,13 +157,14 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
             peer_address_str="198.18.0.31",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     state,
                     force_insert=True,
                     natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
                 ),
-            )
+            ),
         )
         with renderer_mirror_writes(plan) as writer, suppress_intent_push():
             writer.save(state, force_insert=True)
@@ -194,7 +198,8 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         scope = self._scope(self._router())
         ip = self._ip("10.0.0.3/32")
         peer, _ = self._create_peer(scope, ip)
-        state = NSOBGPPeerState.objects.create(
+        state = acquire_overlay(
+            NSOBGPPeerState,
             management=mgmt,
             asn_str="65100",
             vrf_name="",
@@ -388,13 +393,14 @@ class TestBgpIncompleteSnapshotDrain(_CascadeFlushMixin, IntentPushResetMixin, T
             status="in_sync",
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     self.state,
                     force_insert=True,
                     natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
                 ),
-            )
+            ),
         )
         with renderer_mirror_writes(plan) as writer:
             writer.save(self.state, force_insert=True)
@@ -435,7 +441,8 @@ class TestBgpPeerDeleteAfterOwnership(BgpGreenfieldBase):
         scope = self._scope(self._router())
         ip = self._ip("198.18.0.4/32")
         peer, _mock_put = self._create_peer(scope, ip)
-        state = NSOBGPPeerState.objects.create(
+        state = acquire_overlay(
+            NSOBGPPeerState,
             management=mgmt,
             asn_str="65100",
             vrf_name="",

@@ -7,6 +7,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from .models import NSOSubinterfaceState
+from .ownership_grants import OwnershipGrant
 from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 from .signals import _schedule_intent_push, suppress_intent_push
 from .subinterface_identity import subinterface_errors, subinterface_parent_errors
@@ -54,6 +55,7 @@ def create_subinterface(management, parent, unit, dot1q_vlan, vrf):
             raise ValidationError({"dot1q_vlan": "This tag is already used on the parent."})
 
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"),
         saves=(
             planned_save(interface, force_insert=True, natural_key=("device", "name")),
             planned_save(

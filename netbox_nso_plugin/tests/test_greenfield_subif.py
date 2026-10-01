@@ -18,6 +18,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSubinterfaceState
 
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -77,7 +78,7 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
                 parent=parent,
                 mode="access",
             )
-            NSOSwitchportState.objects.create(management=self.mgmt, interface=child, mode="access", status="accepted")
+            acquire_overlay(NSOSwitchportState, management=self.mgmt, interface=child, mode="access", status="accepted")
         loopback = Interface.objects.create(device=self.device, name="lo0", type="virtual")
         Interface.objects.create(device=self.device, name="lo0.0", type="virtual", parent=loopback)
         true_states = []
@@ -91,8 +92,13 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
                 device=self.device, name=f"{parent_name}.99", type="virtual", parent=parent
             )
             true_states.append(
-                NSOSubinterfaceState.objects.create(
-                    management=self.mgmt, interface=child, parent_interface=parent, dot1q_vlan=99, status="accepted"
+                acquire_overlay(
+                    NSOSubinterfaceState,
+                    management=self.mgmt,
+                    interface=child,
+                    parent_interface=parent,
+                    dot1q_vlan=99,
+                    status="accepted",
                 )
             )
         reconcile_scope_ownership(self.device.pk, ["subinterface"])
@@ -184,8 +190,13 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.delivery import deliver, render
 
         child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
-        state = NSOSubinterfaceState.objects.create(
-            management=self.mgmt, interface=child, parent_interface=self.parent, dot1q_vlan=0, status="accepted"
+        state = acquire_overlay(
+            NSOSubinterfaceState,
+            management=self.mgmt,
+            interface=child,
+            parent_interface=self.parent,
+            dot1q_vlan=0,
+            status="accepted",
         )
         rendered = render("subinterface", self.device.pk, self.mgmt.adapter_device_id)
         self.assertIn("dot1q_vlan", rendered.payload["blocked"][0])
@@ -205,8 +216,13 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
 
         other = Interface.objects.create(device=self.device, name="ae50", type="lag")
         child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
-        state = NSOSubinterfaceState.objects.create(
-            management=self.mgmt, interface=child, parent_interface=self.parent, dot1q_vlan=100, status="accepted"
+        state = acquire_overlay(
+            NSOSubinterfaceState,
+            management=self.mgmt,
+            interface=child,
+            parent_interface=self.parent,
+            dot1q_vlan=100,
+            status="accepted",
         )
         reconcile_scope_ownership(self.device.pk, ["subinterface"])
         NSOSubinterfaceState.objects.filter(pk=state.pk).update(parent_interface=other)
@@ -227,8 +243,13 @@ class TestGreenfieldSubinterfaceState(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOSwitchportState
 
         child = Interface.objects.create(device=self.device, name="ae99.7", type="virtual", parent=self.parent)
-        NSOSubinterfaceState.objects.create(
-            management=self.mgmt, interface=child, parent_interface=self.parent, dot1q_vlan=100, status="accepted"
+        acquire_overlay(
+            NSOSubinterfaceState,
+            management=self.mgmt,
+            interface=child,
+            parent_interface=self.parent,
+            dot1q_vlan=100,
+            status="accepted",
         )
         Interface.objects.filter(pk=self.parent.pk).update(mode="access")
         rendered = render("subinterface", self.device.pk, self.mgmt.adapter_device_id)

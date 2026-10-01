@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from ._adapter_http import make_response
 from ._outbox_case import make_managed, mirror_update, own_vlan
+from ._ownership_case import acquire_overlay
 
 _CLIENT_CONFIG = {
     "url": "http://adapter.local",
@@ -185,7 +186,8 @@ class TestAttemptSettlement(TestCase):
         attempt_id = uuid4()
         last_apply_at = timezone.now()
         interface = Interface.objects.create(device=self.device, name="Port-channel1626", type="lag")
-        row = NSOInterfaceMtuState.objects.create(
+        row = acquire_overlay(
+            NSOInterfaceMtuState,
             management=self.management,
             interface=interface,
             l2_mtu=9000,
@@ -321,9 +323,9 @@ class TestAttemptSettlement(TestCase):
 
         interface = Interface.objects.create(device=self.device, name="Vlan220", type="virtual")
         rows = [
-            NSOSVIState.objects.create(management=self.management, interface=interface, status="accepted"),
-            NSOLoggingLevelState.objects.create(
-                management=self.management, console_severity="WARNING", status="accepted"
+            acquire_overlay(NSOSVIState, management=self.management, interface=interface, status="accepted"),
+            acquire_overlay(
+                NSOLoggingLevelState, management=self.management, console_severity="WARNING", status="accepted"
             ),
         ]
         attempt_id = uuid4()
@@ -645,7 +647,8 @@ class TestAttemptSettlement(TestCase):
         attempt_id = uuid4()
         selected = {"interface_mtu": 505}
         interface = Interface.objects.create(device=self.device, name="Port-channel1642", type="lag")
-        row = NSOInterfaceMtuState.objects.create(
+        row = acquire_overlay(
+            NSOInterfaceMtuState,
             management=self.management,
             interface=interface,
             l2_mtu=9000,

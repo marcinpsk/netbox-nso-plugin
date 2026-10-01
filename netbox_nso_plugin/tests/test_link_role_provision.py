@@ -39,6 +39,7 @@ from netbox_nso_plugin.models import (
 )
 
 from ._outbox_case import without_commit_drain
+from ._ownership_case import update_or_acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _PUSH = "netbox_nso_plugin.drain.push_now"
@@ -114,6 +115,12 @@ class TestProvisionP2P(_Base):
         return NSOLinkRole.objects.create(**data)
 
     def test_happy_path_all_three_both_ends(self):
+        from netbox_nso_plugin.models import NSOIntentRevision, NSOOwnershipAcquisition, NSOOwnershipManifest
+
+        revisions = [
+            NSOIntentRevision.objects.update_or_create(device=device, scope="bfd", defaults={"revision": 9})[0]
+            for device in (self.dev_a, self.dev_b)
+        ]
         role = self._p2p_role()
         NSOLinkRoleAssignment.objects.create(role=role, cable=self.cable)
         summary, _push = self._provision(self.if_a)
@@ -131,6 +138,31 @@ class TestProvisionP2P(_Base):
         # IGP: both ends
         self.assertTrue(NSOISISInterfaceState.objects.filter(interface=self.if_a).exists())
         self.assertTrue(NSOISISInterfaceState.objects.filter(interface=self.if_b).exists())
+        self.assertEqual(
+            set(NSOOwnershipAcquisition.objects.values_list("state_model_label", "state_id", "grant_kind")),
+            {
+                (NSOISISInterfaceState._meta.label_lower, state.pk, "link_role")
+                for state in NSOISISInterfaceState.objects.filter(interface__in=(self.if_a, self.if_b))
+            },
+        )
+        self.assertEqual(
+            set(
+                NSOOwnershipManifest.objects.filter(ownership_state="owned").values_list(
+                    "device_id", "scope", "state_model_label", "grant_kind"
+                )
+            ),
+            {
+                (device.pk, scope, model._meta.label_lower, grant_kind)
+                for device in (self.dev_a, self.dev_b)
+                for scope, model, grant_kind in (
+                    ("interface", NSOInterfaceState, "link_role"),
+                    ("ip", NSOInterfaceIPState, "autoassign"),
+                )
+            },
+        )
+        for revision in revisions:
+            revision.refresh_from_db()
+            self.assertEqual(revision.revision, 9)
 
     def test_summary_reports_both_ends(self):
         """The summary lists both interface pks (the batch view dedups a link on it)."""
@@ -317,7 +349,8 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             self.iface = Interface.objects.create(
                 device=self.dev_a, name="Gi1/1", type="1000base-t", description="to-peer"
             )
-            NSOInterfaceState.objects.update_or_create(
+            update_or_acquire_overlay(
+                NSOInterfaceState,
                 interface=self.iface,
                 attribute="description",
                 defaults={"status": "accepted", "nso_value": ""},

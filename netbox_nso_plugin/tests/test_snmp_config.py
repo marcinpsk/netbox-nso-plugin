@@ -10,6 +10,7 @@ from django.test import TestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -229,13 +230,15 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
         mgmt = self._create_mgmt()
-        NSOSnmpCommunityState.objects.create(
+        acquire_overlay(
+            NSOSnmpCommunityState,
             management=mgmt,
             community_hash="abcd1234abcd1234",
             vault_secret_hash="abcd1234abcd1234",
             status="deploying",
         )
-        NSOSnmpV3UserState.objects.create(
+        acquire_overlay(
+            NSOSnmpV3UserState,
             management=mgmt,
             username="nms-user",
             has_auth_secret=True,
@@ -245,7 +248,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             vault_ref="network/netbox/snmp/v3/nms-user",
             status="deploying",
         )
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="10.0.0.100",
             version="v2c",
@@ -253,7 +257,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
             community_hash="abcd1234abcd1234",
             status="deploying",
         )
-        NSOSnmpSystemInfoState.objects.create(
+        acquire_overlay(
+            NSOSnmpSystemInfoState,
             management=mgmt,
             location="DC-01 Rack A",
             contact="noc@example.com",
@@ -283,7 +288,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
         mgmt = self._create_mgmt()
-        row = NSOSnmpSystemInfoState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpSystemInfoState,
             management=mgmt,
             location="Test rack",
             contact="noc@example.invalid",
@@ -320,7 +326,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
         mgmt = self._create_mgmt()
-        row = NSOSnmpSystemInfoState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpSystemInfoState,
             management=mgmt,
             location="Test rack",
             contact="noc@example.invalid",
@@ -359,7 +366,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.30",
             version="v2c",
@@ -394,7 +402,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.32",
             version="v2c",
@@ -433,7 +442,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.33",
             version="v2c",
@@ -489,7 +499,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.35",
             version="v2c",
@@ -536,7 +547,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.34",
             version="v2c",
@@ -569,7 +581,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("timos-nc-23.10")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.35",
             version="snmpv3",
@@ -604,7 +617,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("arcos-v8.1.2X-nc-1.0")
         mgmt = self._create_mgmt()
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.31",
             version="v2c",
@@ -626,7 +640,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("cisco-iosxe-cli-6.114")
         mgmt = self._create_mgmt()
-        row = NSOSnmpHostState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.33",
             version="v2c",
@@ -662,7 +677,8 @@ class TestReconcileSnmpConfig(IntentPushResetMixin, TestCase):
 
         self._set_ned("juniper-junos-nc-4.19")
         mgmt = self._create_mgmt()
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="198.18.0.32",
             version="v2c",
