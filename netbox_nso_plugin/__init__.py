@@ -2,7 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 from netbox.plugins import PluginConfig
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 
 class NSOPluginConfig(PluginConfig):

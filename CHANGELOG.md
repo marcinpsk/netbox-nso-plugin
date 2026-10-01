@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.6.2 (2026-10-01)
+
+### Bug Fixes
+
+- **ownership**: Never acquire a NetBox-only row without an operator action
+  ([`ed7c5ba`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ed7c5baac8b661e758dcedef1763d02200cabbdf))
+
+### Chores
+
+- **opengrep**: Pin explicit ownership grants and forbid raw overlay DML
+  ([`d667441`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d667441f94c8dce77bb97fdef5cfe2453e778d67))
+
+
 ## v1.6.1 (2026-09-30)
 
 ### Bug Fixes
