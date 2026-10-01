@@ -2637,3 +2637,162 @@ def adapter_error_unrelated_exception(items):
             continue
         # ast-clean: nso-adapter-error-after-continue
         raise ValueError("invalid")
+
+
+# Ownership grants use a literal operation from the registry.
+def ownership_grants(kind):
+    from netbox_nso_plugin.ownership_grants import OwnershipGrant
+    from netbox_nso_plugin.ownership_grants import OwnershipGrant as Grant
+    import netbox_nso_plugin.ownership_grants as grants
+
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant(kind)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    Grant("description_generation")
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    grants.OwnershipGrant(kind)
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant("accept")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    Grant("create")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    grants.OwnershipGrant("operator_edit")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant("intend")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant("autoassign")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant("link_role")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive
+    OwnershipGrant("manifest_reown", manifest_pk=1)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant(kind=kind)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    Grant(kind="description_generation")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    grants.OwnershipGrant(kind="operator_edit")
+    # ok: nso-ownership-grant-literal, nso-ownership-grant-planner
+    # ruleid: nso-ownership-grant-passive
+    OwnershipGrant(kind="manifest_reown", manifest_pk=1)
+
+
+def forbidden_ownership_grants():
+    from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant("accept")
+    # ruleid: nso-ownership-grant-planner, nso-ownership-grant-passive
+    OwnershipGrant("create")
+    # ok: nso-ownership-grant-planner
+    # ruleid: nso-ownership-grant-passive
+    OwnershipGrant("manifest_reown", manifest_pk=1)
+
+
+def relative_ownership_grants(kind):
+    from .ownership_grants import OwnershipGrant
+    from .ownership_grants import OwnershipGrant as RelativeGrant
+    from . import ownership_grants as relative_grants
+
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    OwnershipGrant(kind)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    RelativeGrant(kind=kind)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    relative_grants.OwnershipGrant("unclassified")
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    RelativeGrant("create")
+    # ok: nso-ownership-grant-literal, nso-ownership-grant-planner
+    # ruleid: nso-ownership-grant-passive
+    OwnershipGrant(kind="manifest_reown", manifest_pk=1)
+
+
+def relative_ownership_grant_module(kind):
+    from . import ownership_grants
+
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    ownership_grants.OwnershipGrant(kind)
+    # ok: nso-ownership-grant-literal, nso-ownership-grant-planner
+    # ruleid: nso-ownership-grant-passive
+    ownership_grants.OwnershipGrant("manifest_reown", manifest_pk=1)
+
+
+def nested_ownership_grants(writer, row, kind):
+    from .ownership_grants import OwnershipGrant
+    from .ownership_grants import OwnershipGrant as RelativeGrant
+    from . import ownership_grants as relative_grants
+    from . import ownership_grants
+
+    # ok: nso-ownership-grant-literal
+    # ruleid: nso-ownership-grant-passive, nso-ownership-grant-planner
+    writer.execute(row, grant=OwnershipGrant("accept"))
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    writer.execute(row, grant=OwnershipGrant(kind=kind))
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    RelativeGrant(kind)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    relative_grants.OwnershipGrant(kind=kind)
+    # ruleid: nso-ownership-grant-literal, nso-ownership-grant-passive, nso-ownership-grant-planner
+    ownership_grants.OwnershipGrant(kind=kind)
+
+
+def raw_overlay_dml(cursor, model, value):
+    from django.db.models.expressions import RawSQL
+
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.execute("INSERT INTO netbox_nso_plugin_nsointerfacestate (status) VALUES (%s)", [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.execute('UPDATE "netbox_nso_plugin_nsovlanstate" SET status = %s', [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    model.objects.raw('DELETE FROM public.netbox_nso_plugin_nsol2sapstate WHERE id = %s', [1])
+    # ruleid: nso-overlay-raw-sql-dml
+    RawSQL('UPDATE netbox_nso_plugin_nsoospfinterfacestate SET status = %s', [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    expressions.RawSQL('DELETE FROM "public"."netbox_nso_plugin_nsosnmpv3userstate"', [])
+    sql = "UPDATE netbox_nso_plugin_nsologginglevelstate SET status = %s"
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.execute(sql, [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    model.objects.raw(sql, [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    RawSQL(sql, [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    expressions.RawSQL(sql, [value])
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.executemany("UPDATE netbox_nso_plugin_nsointerfacestate SET status=%s WHERE id=%s", [(value, 1)])
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.executemany('INSERT INTO "public"."netbox_nso_plugin_nsovlanstate" (status) VALUES (%s)', [(value,)])
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.executemany(sql, [(value,)])
+    delete_sql = "DELETE FROM netbox_nso_plugin_nsologginglevelstate WHERE id = %s"
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.executemany(delete_sql, [(1,)])
+    # ok: nso-overlay-raw-sql-dml
+    cursor.executemany("SELECT status FROM netbox_nso_plugin_nsointerfacestate WHERE id=%s", [(1,)])
+    # ok: nso-overlay-raw-sql-dml
+    cursor.executemany("UPDATE ipam_vlan SET name=%s WHERE id=%s", [("placeholder", 1)])
+    select_sql = "SELECT status FROM netbox_nso_plugin_nsointerfacestate WHERE id=%s"
+    # ok: nso-overlay-raw-sql-dml
+    cursor.executemany(select_sql, [(1,)])
+    native_sql = "UPDATE ipam_vlan SET name=%s WHERE id=%s"
+    # ok: nso-overlay-raw-sql-dml
+    cursor.executemany(native_sql, [("placeholder", 1)])
+    # ruleid: nso-overlay-raw-sql-dml
+    cursor.execute("""insert into
+        netbox_nso_plugin_nsointerfaceipstate (status) values ('accepted')""")
+    # ok: nso-overlay-raw-sql-dml
+    cursor.execute('SELECT status FROM netbox_nso_plugin_nsointerfacestate')
+    # ok: nso-overlay-raw-sql-dml
+    model.objects.raw('SELECT * FROM netbox_nso_plugin_nsovlanstate')
+    # ok: nso-overlay-raw-sql-dml
+    RawSQL('SELECT status FROM netbox_nso_plugin_nsointerfacestate', [])
+    # ok: nso-overlay-raw-sql-dml
+    cursor.execute('UPDATE ipam_vlan SET name = %s', ['placeholder'])
