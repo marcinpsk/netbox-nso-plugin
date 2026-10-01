@@ -82,9 +82,12 @@ References checked on 2026-09-12:
 | Raw SQL or ORM bypass leaves stale rendered intent | `test_renderer_audit.py` and `test_intent_outbox_claim.py` | Real database assertions cover drift, repair, and claim interleavings. |
 | Frozen identity, timestamp, or pre-image lost during replay | `test_gated_reconcile.py`, `test_renderer_writer.py`, and reconcile tests | Real state changes prove refusal and replay behaviour. |
 | Lock order, lifecycle transitions, ownership, permissions, malformed responses, and retry boundaries | Existing integration suites | Requires behavioural assertions. A syntax rule cannot establish these contracts. |
+| Unclassified ownership acquisition | `nso-ownership-grant-literal`, `nso-ownership-grant-passive`, `nso-ownership-grant-planner` | Constructors use literal grant kinds. Passive modules cannot construct grants. The ownership planner can construct only `manifest_reown`. Import aliases are resolved; dynamic constructor lookup is not followed. |
 
 No finite ruleset catches every review finding. These rules reject concrete,
 repeated source patterns. Keep integration tests for stateful contracts and add
 a fixture before adding a new rule. Include both a defect and a valid nearby
 shape. First confirm that the defect is missed, then implement the rule and run
 both commands above. Do not add a broad suppression to make the tree pass.
+
+The `nso-overlay-raw-sql-dml` rule blocks INSERT, UPDATE, and DELETE against overlay tables in production cursor, raw queryset, and RawSQL calls. Tests and migrations are exempt. Overlay writes must use the guarded ORM seam.
