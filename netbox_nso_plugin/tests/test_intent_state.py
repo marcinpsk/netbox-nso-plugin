@@ -30,9 +30,11 @@ from netbox_nso_plugin.intent_state import (
     renderer_query_trace,
 )
 from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOVLANState
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.signals import suppress_intent_push
 
 from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _WORKER_JOIN_SECONDS = 30
@@ -359,7 +361,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.models import NSOSwitchportState
 
         interface = Interface.objects.create(device=self.device, name="Ethernet1623/2", type="1000base-t")
-        state = NSOSwitchportState.objects.create(
+        state = acquire_overlay(
+            NSOSwitchportState,
             management=self.management,
             interface=interface,
             mode="tagged",
@@ -574,7 +577,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         before = revision.revision
         other_before = other_revision.revision
         self.state.status = "imported"
-        plan = RendererMutationPlan.build(saves=(planned_save(self.state, update_fields=("status",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(self.state, update_fields=("status",)),)
+        )
         footprint = MutationFootprint.merge(plan.lock_footprint, footprint_for_instance(other))
         self.assertEqual(set(plan.content_keys), {(self.device.pk, "vlan")})
         self.assertEqual(set(footprint.revision_keys), {(self.device.pk, "vlan"), (other_device.pk, "vlan")})
@@ -1026,20 +1031,23 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
             lag = Interface.objects.create(device=self.device, name="Bundle-Ether1", type="lag")
             member = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
-            NSOLACPBundleState.objects.create(
+            acquire_overlay(
+                NSOLACPBundleState,
                 management=self.management,
                 interface=lag,
                 lag_id=1,
                 status="accepted",
             )
-            NSOLACPMemberState.objects.create(
+            acquire_overlay(
+                NSOLACPMemberState,
                 management=self.management,
                 interface=member,
                 lag_bundle=lag,
                 mode="active",
                 status="accepted",
             )
-            switchport = NSOSwitchportState.objects.create(
+            switchport = acquire_overlay(
+                NSOSwitchportState,
                 management=self.management,
                 interface=member,
                 mode="tagged",
@@ -1053,7 +1061,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 net="49.0001.0000.0000.0001.00",
             )
             ISISLevel.objects.create(instance=isis_instance, level=2, wide_metrics_only=True)
-            NSOISISInstanceState.objects.create(
+            acquire_overlay(
+                NSOISISInstanceState,
                 management=self.management,
                 process_tag="TRACE",
                 net=isis_instance.net,
@@ -1085,7 +1094,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 enabled=True,
             )
             peer.refresh_from_db()
-            NSOBGPPeerState.objects.create(
+            acquire_overlay(
+                NSOBGPPeerState,
                 management=self.management,
                 asn_str=str(local_as.asn),
                 peer_address_str=str(peer.peer.address).split("/")[0],
@@ -1141,7 +1151,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 ("as_path", as_path),
                 ("route_map", route_map),
             ):
-                NSORoutePolicyState.objects.create(
+                acquire_overlay(
+                    NSORoutePolicyState,
                     management=self.management,
                     family=family,
                     object_name=obj.name,

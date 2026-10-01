@@ -26,8 +26,10 @@ from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOL2SapState
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import content_update, mirror_update
+from ._ownership_case import acquire_overlay
 
 User = get_user_model()
 
@@ -1166,7 +1168,8 @@ class TestDefaultPlanContentMutation(TestCase):
         device, mgmt = _make(f"gl{uuid.uuid4().hex[:6]}", manage_routing=True, manage_bgp=True)
         deploying_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
         confirmed_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
-        deploying = NSOBFDInterfaceState.objects.create(
+        deploying = acquire_overlay(
+            NSOBFDInterfaceState,
             management=mgmt,
             interface=deploying_interface,
             min_tx=300,
@@ -1174,7 +1177,8 @@ class TestDefaultPlanContentMutation(TestCase):
             multiplier=3,
             status="accepted",
         )
-        confirmed = NSOBFDInterfaceState.objects.create(
+        confirmed = acquire_overlay(
+            NSOBFDInterfaceState,
             management=mgmt,
             interface=confirmed_interface,
             min_tx=300,
@@ -1212,7 +1216,8 @@ class TestDefaultPlanContentMutation(TestCase):
         device, mgmt = _make(f"gd{uuid.uuid4().hex[:6]}", manage_routing=True, manage_bgp=True)
         confirmed_interface = Interface.objects.create(device=device, name="Ethernet2", type="1000base-t")
         deploying_interface = Interface.objects.create(device=device, name="Ethernet3", type="1000base-t")
-        confirmed = NSOBFDInterfaceState.objects.create(
+        confirmed = acquire_overlay(
+            NSOBFDInterfaceState,
             management=mgmt,
             interface=confirmed_interface,
             min_tx=300,
@@ -1220,7 +1225,8 @@ class TestDefaultPlanContentMutation(TestCase):
             multiplier=3,
             status="in_sync",
         )
-        deploying = NSOBFDInterfaceState.objects.create(
+        deploying = acquire_overlay(
+            NSOBFDInterfaceState,
             management=mgmt,
             interface=deploying_interface,
             min_tx=300,
@@ -1344,7 +1350,9 @@ class TestStalePlanRace(TestCase):
         def stale_plan(device, payload):
             frozen = l2_service_reconcile_plan(device, payload)
             state.status = "changed"
-            mutation = RendererMutationPlan.build(saves=(planned_save(state, update_fields=("status",)),))
+            mutation = RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), saves=(planned_save(state, update_fields=("status",)),)
+            )
             with renderer_mirror_writes(mutation) as writer:
                 writer.save(state, update_fields=("status",))
             return frozen
@@ -1478,7 +1486,9 @@ class TestSwitchportCascadeRace(TestCase):
             renderer_writes,
         )
 
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(state, "tagged_vlans", (vlan,)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(state, "tagged_vlans", (vlan,)),)
+        )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
             writer.m2m_set(state, "tagged_vlans", (vlan,))

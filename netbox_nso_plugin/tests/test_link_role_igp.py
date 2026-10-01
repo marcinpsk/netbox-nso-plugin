@@ -125,6 +125,60 @@ class TestEnableIgpForRole(IntentPushResetMixin, TestCase):
         state = NSOOSPFInterfaceState.objects.get(management=self.mgmt_a, interface=self.lo_a)
         self.assertTrue(state.passive)
 
+    def test_ospf_acquisition_records_link_role_before_a_later_edit(self):
+        import copy
+
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOOwnershipAcquisition, NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_grants import OwnershipGrant
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+        role = NSOLinkRole.objects.create(
+            name="ospf-manifest",
+            slug="ospf-manifest",
+            link_type="single",
+            assign_ipv4=False,
+            assign_ipv6=False,
+            igp="ospf",
+            ospf_process_id="1",
+            ospf_area="0",
+        )
+        with patch(_SCHEDULE):
+            enable_igp_for_role(self.if_a, role, push=False)
+        state = NSOOSPFInterfaceState.objects.get(management=self.mgmt_a, interface=self.if_a)
+        evidence = NSOOwnershipAcquisition.objects.get(state_model_label=state._meta.label_lower, state_id=state.pk)
+        self.assertEqual(evidence.grant_kind, "link_role")
+        native = OSPFInterface.objects.create(
+            interface=self.if_a,
+            instance=OSPFInstance.objects.create(device=self.dev_a, name="1", process_id="1", router_id="198.18.0.1"),
+            area=OSPFArea.objects.create(area_id="0", area_type="standard"),
+        )
+        from netbox_nso_plugin.ownership_planner import maintain_manifest
+
+        maintain_manifest(state)
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.dev_a.pk, scope="ospf", native_id=native.pk)
+        self.assertEqual(manifest.grant_kind, "link_role")
+        self.assertFalse(NSOOwnershipAcquisition.objects.filter(pk=evidence.pk).exists())
+
+        candidate = copy.copy(state)
+        candidate.cost = 42
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, update_fields=("cost",)),),
+            grant=OwnershipGrant("operator_edit"),
+        )
+        with patch(_SCHEDULE), renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=("cost",))
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.dev_a.pk, scope="ospf", native_id=native.pk)
+        self.assertEqual(manifest.grant_kind, "link_role")
+        self.assertFalse(NSOOwnershipAcquisition.objects.filter(pk=evidence.pk).exists())
+
+        manifest.delete()
+        with self.assertRaises(IntentMutationProtocolError):
+            maintain_manifest(candidate)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.dev_a.pk, scope="ospf").exists())
+
     def test_igp_none_is_noop(self):
         role = NSOLinkRole.objects.create(
             name="g-noigp",

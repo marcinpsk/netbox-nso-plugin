@@ -14,6 +14,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
+from ._ownership_case import acquire_overlay, save_overlay_fixture
+
 
 class TestReconcileRedistribution(TestCase):
     @classmethod
@@ -217,7 +221,7 @@ class TestReconcileRedistribution(TestCase):
         state.metric_type = "internal"
         state.status = "accepted"
         state.accepted_at = timezone.now()
-        state.save(update_fields=["route_map", "metric", "metric_type", "status", "accepted_at"])
+        save_overlay_fixture(state, update_fields=["route_map", "metric", "metric_type", "status", "accepted_at"])
 
         footprint = deletion_footprint_for_instance(state.redistribution)
         with transaction.atomic(), intent_transaction(footprint), suppress_intent_push():
@@ -347,16 +351,17 @@ class TestReconcileRedistribution(TestCase):
         assert plan.content_keys == ()
 
     def test_foreign_overlay_save_is_neutral(self):
-        mgmt = self._make_mgmt()
         from netbox_nso_plugin.models import NSORedistributionState
 
+        state = acquire_overlay(
+            NSORedistributionState,
+            management=self._make_mgmt(),
+            dest_protocol="isis",
+            source_protocol="static",
+            status="accepted",
+        )
         with patch("netbox_nso_plugin.signals._schedule_redistribution_push") as schedule:
-            NSORedistributionState.objects.create(
-                management=mgmt,
-                dest_protocol="isis",
-                source_protocol="static",
-                status="accepted",
-            )
+            state.save()
 
         schedule.assert_not_called()
 
@@ -373,7 +378,8 @@ class TestReconcileRedistribution(TestCase):
         )
         from netbox_nso_plugin.models import NSORedistributionState
 
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=mgmt,
             dest_protocol="isis",
             source_protocol="static",
@@ -410,7 +416,7 @@ class TestReconcileRedistribution(TestCase):
         state = NSORedistributionState.objects.get()
         state.metric = 20
         state.status = "accepted"
-        state.save(update_fields=["metric", "status"])
+        save_overlay_fixture(state, update_fields=["metric", "status"])
 
         state = reconcile_redistribution(self.device, {"entries": [self._entry(metric=30)]})[0]
 
@@ -554,7 +560,9 @@ class TestReconcileRedistribution(TestCase):
             if plan_calls == 1:
                 native.metric = 20
                 fields = ("route_map", "metric", "metric_type")
-                competing = RendererMutationPlan.build(saves=[planned_save(native, update_fields=fields)])
+                competing = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=[planned_save(native, update_fields=fields)]
+                )
                 with renderer_mirror_writes(competing) as writer:
                     writer.save(native, update_fields=fields)
             return waiting
@@ -634,13 +642,14 @@ class TestReconcileRedistribution(TestCase):
                     last_sync_at=waiting.planned_at,
                 )
                 competing = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"),
                     saves=[
                         planned_save(
                             state,
                             force_insert=True,
                             natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
                         )
-                    ]
+                    ],
                 )
                 with renderer_mirror_writes(competing) as writer:
                     writer.save(state, force_insert=True)
@@ -684,7 +693,9 @@ class TestReconcileRedistribution(TestCase):
         native = Redistribution.objects.get(source_protocol="static")
         native.metric = 20
         fields = ("route_map", "metric", "metric_type")
-        competing = RendererMutationPlan.build(saves=[planned_save(native, update_fields=fields)])
+        competing = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=[planned_save(native, update_fields=fields)]
+        )
         with renderer_mirror_writes(competing) as writer:
             writer.save(native, update_fields=fields)
 
@@ -746,13 +757,14 @@ class TestReconcileRedistribution(TestCase):
             last_sync_at=waiting.planned_at,
         )
         competing = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=[
                 planned_save(
                     state,
                     force_insert=True,
                     natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
                 )
-            ]
+            ],
         )
         with renderer_mirror_writes(competing) as writer:
             writer.save(state, force_insert=True)
@@ -790,7 +802,8 @@ class TestReconcileRedistribution(TestCase):
             nso_instance=management.nso_instance,
             nso_device_name=other_device.name,
         )
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=other_management,
             dest_protocol="isis",
             source_protocol="static",
@@ -838,7 +851,8 @@ class TestReconcileRedistribution(TestCase):
             nso_instance=management.nso_instance,
             nso_device_name=other_device.name,
         )
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=other_management,
             dest_protocol="isis",
             source_protocol="static",
@@ -1031,7 +1045,7 @@ class TestReconcileRedistribution(TestCase):
         reconcile_redistribution(self.device, {"entries": [self._entry(metric_type="external")]})
         state = NSORedistributionState.objects.get()
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         corrected = self._entry()
         corrected.pop("metric_type")
 
@@ -1059,7 +1073,7 @@ class TestReconcileRedistribution(TestCase):
             state.redistribution.save(update_fields=["metric_type"])
         state.metric_type = "internal"
         state.status = "accepted"
-        state.save(update_fields=["metric_type", "status"])
+        save_overlay_fixture(state, update_fields=["metric_type", "status"])
         corrected = self._entry()
         corrected.pop("metric_type")
 
@@ -1205,7 +1219,7 @@ class TestReconcileRedistribution(TestCase):
         s = NSORedistributionState.objects.get(management__device=self.device)
         s.status = "accepted"
         s.accepted_at = timezone.now()
-        s.save(update_fields=["status", "accepted_at"])
+        save_overlay_fixture(s, update_fields=["status", "accepted_at"])
 
         reconcile_redistribution(self.device, {"entries": []})  # device removed it
         s.refresh_from_db()

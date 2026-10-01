@@ -20,9 +20,11 @@ from netbox_nso_plugin.models import (
     NSOInterfaceState,
     NSOLoggingHostState,
 )
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_CFG = {
@@ -64,11 +66,11 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
     def test_not_flagged_when_owned_matches_adapter_count(self, mock_sum):
         mock_sum.return_value = self._SUMMARY
-        NSOInterfaceIPState.objects.create(
-            interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
+        acquire_overlay(
+            NSOInterfaceIPState, interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
         )
-        NSOInterfaceIPState.objects.create(
-            interface=self.iface, address="10.0.0.2/32", vrf="", family="ipv4", status="in_sync"
+        acquire_overlay(
+            NSOInterfaceIPState, interface=self.iface, address="10.0.0.2/32", vrf="", family="ipv4", status="in_sync"
         )
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertNotIn("interface_ip", {d["key"] for d in drift})
@@ -78,8 +80,13 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # Push-time skips can leave the adapter with FEWER rows than NetBox owns — healthy.
         mock_sum.return_value = self._SUMMARY
         for i in (1, 2, 3):
-            NSOInterfaceIPState.objects.create(
-                interface=self.iface, address=f"10.0.1.{i}/32", vrf="", family="ipv4", status="accepted"
+            acquire_overlay(
+                NSOInterfaceIPState,
+                interface=self.iface,
+                address=f"10.0.1.{i}/32",
+                vrf="",
+                family="ipv4",
+                status="accepted",
             )
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertNotIn("interface_ip", {d["key"] for d in drift})
@@ -87,8 +94,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
     @patch("netbox_nso_plugin.adapter_client.get_intent_summary")
     def test_partial_when_adapter_holds_more_than_owned(self, mock_sum):
         mock_sum.return_value = self._SUMMARY
-        NSOInterfaceIPState.objects.create(
-            interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
+        acquire_overlay(
+            NSOInterfaceIPState, interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
         )
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         entry = next(d for d in drift if d["key"] == "interface_ip")
@@ -101,8 +108,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # 1 bgp_router_intent row legitimately covers N owned peers — counts aren't 1:1,
         # so any owned > 0 must suppress the scope regardless of count comparison.
         mock_sum.return_value = {"scopes": {"bgp_router_intent": {"count": 3, "applied": 0, "failed": 0}}}
-        NSOBGPPeerState.objects.create(
-            management=self.mgmt, asn_str="65000", peer_address_str="192.0.2.1", status="accepted"
+        acquire_overlay(
+            NSOBGPPeerState, management=self.mgmt, asn_str="65000", peer_address_str="192.0.2.1", status="accepted"
         )
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertNotIn("bgp", {d["key"] for d in drift})
@@ -119,8 +126,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # as owned even with a stale accepted_at set — so the adapter's 1 intent row reads
         # as orphaned and the scope is flagged.
         mock_sum.return_value = {"scopes": {"interface_intent": {"count": 1, "applied": 0, "failed": 0}}}
-        state = NSOInterfaceState.objects.create(
-            interface=self.iface, attribute="description", status="accepted", accepted_at=None
+        state = acquire_overlay(
+            NSOInterfaceState, interface=self.iface, attribute="description", status="accepted", accepted_at=None
         )
         drift = intent_drift.compute_intent_drift(self.device, self.mgmt)
         self.assertNotIn("interface", {d["key"] for d in drift})
@@ -173,8 +180,8 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.delivery import MODE_STORE_ONLY
 
         mock_sum.return_value = self._SUMMARY
-        NSOInterfaceIPState.objects.create(
-            interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
+        acquire_overlay(
+            NSOInterfaceIPState, interface=self.iface, address="10.0.0.1/32", vrf="", family="ipv4", status="accepted"
         )
         done, failed = intent_drift.resync_intent(self.device, self.mgmt)
         self.assertIn("interface_ip", done)
@@ -210,7 +217,7 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
             self.mgmt = NSODeviceManagement.objects.create(
                 device=self.device, nso_instance=inst, nso_device_name="so-rtr", adapter_device_id=91
             )
-            NSOLoggingHostState.objects.create(management=self.mgmt, address="10.0.0.5", status="accepted")
+            acquire_overlay(NSOLoggingHostState, management=self.mgmt, address="10.0.0.5", status="accepted")
 
     def _recorded_requests(self, run):
         session = make_session(json_data={})
@@ -284,7 +291,7 @@ class TestResyncStoreOnly(_CascadeFlushMixin, IntentPushResetMixin, TransactionT
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         rows = tuple(NSOLoggingHostState.objects.filter(management=self.mgmt).order_by("pk"))
-        plan = RendererMutationPlan.build(deletes=(planned_delete(row) for row in rows))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row) for row in rows))
         with without_commit_drain(), renderer_writes(plan) as writer:
             for row in rows:
                 writer.delete(row)

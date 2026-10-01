@@ -11,8 +11,10 @@ from django.test import TestCase
 from ipam.models import VLAN
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSubinterfaceState
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import content_update, mirror_update
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -223,7 +225,9 @@ class TestSubinterfaceReconciler(TestCase):
             if plan_calls == 1:
                 candidate = Interface.objects.get(pk=interface.pk)
                 candidate.parent = new_parent
-                competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=("parent",))])
+                competing = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=[planned_save(candidate, update_fields=("parent",))]
+                )
                 with renderer_mirror_writes(competing) as writer:
                     writer.save(candidate, update_fields=("parent",))
             return waiting
@@ -282,7 +286,8 @@ class TestSubinterfaceReconciler(TestCase):
                     last_sync_at=waiting.planned_at,
                 )
                 competing = RendererMutationPlan.build(
-                    saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))]
+                    grant=OwnershipGrant("create"),
+                    saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))],
                 )
                 with renderer_mirror_writes(competing) as writer:
                     writer.save(state, force_insert=True)
@@ -333,7 +338,9 @@ class TestSubinterfaceReconciler(TestCase):
         waiting = subinterface_reconcile_plan(self.device, payload)
         candidate = Interface.objects.get(pk=interface.pk)
         candidate.parent = new_parent
-        competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=("parent",))])
+        competing = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=[planned_save(candidate, update_fields=("parent",))]
+        )
         with renderer_mirror_writes(competing) as writer:
             writer.save(candidate, update_fields=("parent",))
 
@@ -416,7 +423,8 @@ class TestSubinterfaceReconciler(TestCase):
             last_sync_at=waiting.planned_at,
         )
         competing = RendererMutationPlan.build(
-            saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))]
+            grant=OwnershipGrant("create"),
+            saves=[planned_save(state, force_insert=True, natural_key=("management", "interface"))],
         )
         with renderer_mirror_writes(competing) as writer:
             writer.save(state, force_insert=True)
@@ -566,7 +574,8 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         from uuid import uuid4
 
         iface = Interface.objects.create(device=self.device, name=name, type="virtual", parent=self.parent)
-        return NSOSubinterfaceState.objects.create(
+        return acquire_overlay(
+            NSOSubinterfaceState,
             management=self.management,
             interface=iface,
             parent_interface=self.parent,

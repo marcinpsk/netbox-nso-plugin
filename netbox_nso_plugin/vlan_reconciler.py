@@ -695,7 +695,7 @@ def _validate_rescope_managed_device_ids(old_vlan, locked_device_ids) -> None:
         raise VLANRescopeConflict("a managed device attached to the VLAN while the rescope request waited")
 
 
-def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
+def _vlan_repoint_plan(old_vlan, target_vlan, *, grant):  # noqa: C901
     """Freeze all native and overlay references moved by one VLAN merge."""
     from dcim.models import Interface
     from django.db.models import Prefetch, Q
@@ -803,11 +803,11 @@ def _vlan_repoint_plan(old_vlan, target_vlan):  # noqa: C901
         if was_owned and rendered_name_changed and source.management.adapter_device_id is not None:
             push_targets.add((source.management.device_id, "vlan"))
 
-    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, m2m_writes=m2m_writes)
+    plan = RendererMutationPlan.build(grant=grant, saves=saves, deletes=deletes, m2m_writes=m2m_writes)
     return plan, save_operations, m2m_operations, delete_operations, push_targets, device_ids
 
 
-def rescope_vlan(state, target_group, *, _retry_on_stale=True):
+def rescope_vlan(state, target_group, *, grant, _retry_on_stale=True):
     """Re-scope this device's VLAN into *target_group*, keeping it synced.
 
     The device↔VLAN link is the ``NSOVLANState`` FK (see module docstring), so re-scoping
@@ -863,7 +863,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
                     overlay.vlan = candidate
                     overlay_candidates.append(overlay)
                     saves.append(planned_save(overlay, update_fields=("status",)))
-                plan = _rescope_plan_ready(RendererMutationPlan.build(saves=saves))
+                plan = _rescope_plan_ready(RendererMutationPlan.build(grant=grant, saves=saves))
                 with renderer_mirror_writes(plan) as writer, suppress_intent_push():
                     current_identity = VLAN.objects.filter(pk=old_vlan.pk).values_list("vid", "group_id").first()
                     if current_identity != source_identity:
@@ -880,7 +880,9 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
                 )
                 return "moved", candidate
 
-            plan, saves, m2m_sets, deletes, push_targets, device_ids = _vlan_repoint_plan(old_vlan, existing)
+            plan, saves, m2m_sets, deletes, push_targets, device_ids = _vlan_repoint_plan(
+                old_vlan, existing, grant=grant
+            )
             plan = _rescope_plan_ready(plan)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             with mutation as writer:
@@ -909,7 +911,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
                 native_model_label="ipam.vlan",
                 native_key=old_key,
             )
-            delete_plan = RendererMutationPlan.build(deletes=(planned_delete(old_vlan),))
+            delete_plan = RendererMutationPlan.build(grant=grant, deletes=(planned_delete(old_vlan),))
             delete_mutation = (
                 renderer_writes(delete_plan) if delete_plan.changes_content else renderer_mirror_writes(delete_plan)
             )
@@ -923,7 +925,7 @@ def rescope_vlan(state, target_group, *, _retry_on_stale=True):
             if not _retry_on_stale or not retryable:
                 raise VLANRescopeConflict("the VLAN membership changed while the rescope request waited") from exc
             transaction.set_rollback(True)
-    return rescope_vlan(state, target_group, _retry_on_stale=False)
+    return rescope_vlan(state, target_group, grant=grant, _retry_on_stale=False)
 
 
 def reconcile_vlan_database(device, payload: dict) -> list:

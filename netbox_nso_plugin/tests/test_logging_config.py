@@ -8,6 +8,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, 
 from django.test import TestCase
 
 from ._outbox_case import content_bulk_update
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -90,7 +91,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.20",
             port=514,
@@ -108,7 +110,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.template_content import _reconcile_logging_config
 
         mgmt = self._mgmt()
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.19",
             status="deploying",
@@ -128,7 +131,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.21",
             facility="local7",
@@ -151,7 +155,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="cisco-nx-cli-5.32")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.22",
             facility="local7",
@@ -185,7 +190,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.25",
             port=514,
@@ -230,7 +236,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.26",
             port=514,
@@ -267,7 +274,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.24",
             severity="INFORMATIONAL",
@@ -301,7 +309,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.25",
             severity="INFORMATIONAL",
@@ -333,7 +342,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="arcos-cli-6.2")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        row = NSOLoggingHostState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.26",
             severity="informational",
@@ -373,7 +383,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
                 NSOPlatformNedMapping.objects.create(platform=platform, ned_id=ned_id)
                 self.device.platform = platform
                 self.device.save(update_fields=["platform"])
-                row = NSOLoggingHostState.objects.create(
+                row = acquire_overlay(
+                    NSOLoggingHostState,
                     management=mgmt,
                     address=f"198.18.1.{10 if suffix == 'ios' else 11}",
                     severity="INFORMATIONAL",
@@ -410,7 +421,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        NSOLoggingHostState.objects.create(
+        acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.22",
             port=514,
@@ -432,7 +444,8 @@ class TestReconcileLoggingConfig(IntentPushResetMixin, TestCase):
         NSOPlatformNedMapping.objects.create(platform=platform, ned_id="juniper-junos-nc-4.19")
         self.device.platform = platform
         self.device.save(update_fields=["platform"])
-        NSOLoggingHostState.objects.create(
+        acquire_overlay(
+            NSOLoggingHostState,
             management=mgmt,
             address="198.18.0.23",
             port=514,

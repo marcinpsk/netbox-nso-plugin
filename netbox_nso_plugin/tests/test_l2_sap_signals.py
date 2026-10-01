@@ -7,6 +7,7 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin
 
 
@@ -41,7 +42,8 @@ class TestPushL2SapIntentForDevice(IntentPushResetMixin, TestCase):
     def _make_state(self, mgmt, service_name="TL", sap_id="lag-60:3999", status="accepted"):
         from netbox_nso_plugin.models import NSOL2SapState
 
-        return NSOL2SapState.objects.create(
+        return acquire_overlay(
+            NSOL2SapState,
             management=mgmt,
             service_name=service_name,
             service_type="epipe",
@@ -147,18 +149,21 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
     def test_foreign_save_does_not_trigger_intent_push(self):
         """A foreign overlay save is not ownership evidence."""
         from netbox_nso_plugin.models import NSOL2SapState
+        from netbox_nso_plugin.signals import suppress_intent_push
 
         mgmt = self._make_mgmt()
 
+        state = NSOL2SapState(
+            management=mgmt,
+            service_name="TL",
+            service_type="epipe",
+            sap_id="lag-60:3999",
+            port="lag-60",
+            status="accepted",
+        )
+        with suppress_intent_push():
+            save_overlay_fixture(state)
         with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as mock_push:
-            state = NSOL2SapState(
-                management=mgmt,
-                service_name="TL",
-                service_type="epipe",
-                sap_id="lag-60:3999",
-                port="lag-60",
-                status="accepted",
-            )
             with self.captureOnCommitCallbacks(execute=True):
                 state.save()
             mock_push.assert_not_called()
@@ -185,5 +190,5 @@ class TestOnL2SapStateSave(IntentPushDeliveryMixin, TestCase):
 
         with patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent") as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
-                state.save()
+                save_overlay_fixture(state)
             mock_push.assert_not_called()

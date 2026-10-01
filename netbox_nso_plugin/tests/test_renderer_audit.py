@@ -10,6 +10,8 @@ from django.db.utils import OperationalError
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext, override_settings
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._adapter_http import patch_matching_control_state
 from ._outbox_case import (
     ReceiptAdapter,
@@ -21,6 +23,7 @@ from ._outbox_case import (
     reset_renderer_audit_rotation,
     without_commit_drain,
 )
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -38,13 +41,14 @@ def own_redistribution(management, dest_protocol, source_protocol):
         status="accepted",
     )
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"),
         saves=(
             planned_save(
                 state,
                 force_insert=True,
                 natural_key=("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref"),
             ),
-        )
+        ),
     )
     with without_commit_drain(), renderer_writes(plan) as writer:
         writer.save(state, force_insert=True)
@@ -190,15 +194,16 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
 
         route_map = RouteMap.objects.create(name="renderer-audit-wrong-family")
-        state = NSORoutePolicyState(
+        state = acquire_overlay(
+            NSORoutePolicyState,
             management=self.management,
             content_type=ContentType.objects.get_for_model(RouteMap),
             object_id=route_map.pk,
-            family="prefix_list",
+            family="route_map",
             object_name=route_map.name,
             status="accepted",
         )
-        NSORoutePolicyState.objects.bulk_create([state])
+        NSORoutePolicyState.objects.filter(pk=state.pk).update(family="prefix_list")
 
         with self.assertRaises(AdapterError) as error:
             deliver("route_policy", self.device.pk, self.management.adapter_device_id)
@@ -210,7 +215,8 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         from netbox_nso_plugin.models import NSOBGPPeerTemplateState
         from netbox_nso_plugin.renderer_audit import _repair_plan
 
-        state = NSOBGPPeerTemplateState.objects.create(
+        state = acquire_overlay(
+            NSOBGPPeerTemplateState,
             management=self.management,
             template_name="AUDIT-PEERS",
             status="deploying",
@@ -249,15 +255,11 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
             ).exists()
         )
 
-    def test_signal_less_owned_creation_is_acquired_before_drift_repair(self):
+    def test_signal_less_owned_creation_is_refused_before_drift_repair(self):
         from ipam.models import VLAN
 
-        from netbox_nso_plugin.models import (
-            NSOIntentOutboxEntry,
-            NSOIntentRevision,
-            NSOOwnershipManifest,
-            NSOVLANState,
-        )
+        from netbox_nso_plugin.intent_state import IntentMutationProtocolError
+        from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOOwnershipManifest, NSOVLANState
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         baseline = own_vlan(self.management, 1629, "renderer-audit-baseline")
@@ -266,33 +268,17 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").delete()
         vlan = VLAN(group=baseline.vlan.group, vid=1630, name="renderer-audit-created")
         VLAN.objects.bulk_create([vlan])
-        state = NSOVLANState(
-            management=self.management,
-            vlan=vlan,
-            device_name=vlan.name,
-            status="accepted",
-        )
-        NSOVLANState.objects.bulk_create([state])
+        state = NSOVLANState(management=self.management, vlan=vlan, device_name=vlan.name, status="accepted")
 
-        result = audit_renderer_scopes(
-            self.device.pk,
-            ["vlan"],
-            trigger="test",
-            pre_capture=True,
-        )
+        with self.assertRaises(IntentMutationProtocolError):
+            NSOVLANState.objects.bulk_create([state])
+        result = audit_renderer_scopes(self.device.pk, ["vlan"], trigger="test", pre_capture=True)
 
         revision.refresh_from_db()
-        self.assertEqual(result.repaired, ("vlan",))
-        self.assertEqual(revision.revision, before_revision + 1)
-        self.assertTrue(
-            NSOOwnershipManifest.objects.filter(
-                device_id=self.device.pk,
-                scope="vlan",
-                native_model_label="ipam.vlan",
-                native_key={"group_id": baseline.vlan.group_id, "vid": 1630},
-                ownership_state="owned",
-            ).exists()
-        )
+        self.assertEqual(result.repaired, ())
+        self.assertEqual(revision.revision, before_revision)
+        self.assertFalse(NSOVLANState.objects.filter(vlan=vlan).exists())
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, native_id=vlan.pk).exists())
 
     def test_static_route_repair_allocates_a_fresh_intent_generation(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOIntentRevision, NSOStaticRouteState

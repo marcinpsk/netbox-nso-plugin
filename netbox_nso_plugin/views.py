@@ -88,6 +88,7 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
+from .ownership_grants import OwnershipGrant
 from .signals import _STATIC_ROUTE_ARMED_FIELDS, _schedule_intent_push
 from .tables import (
     NSODerivedIntentTemplateTable,
@@ -4063,6 +4064,7 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         candidate.accepted_at = timezone.now()
         fields = ("status", "accepted_at")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
             saves=(planned_save(candidate, update_fields=fields),),
             planned_at=candidate.accepted_at,
         )
@@ -4107,7 +4109,9 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
         state_candidate.accepted_at = timezone.now()
         state_fields = ("status", "accepted_at")
         saves.append(planned_save(state_candidate, update_fields=state_fields))
-        plan = RendererMutationPlan.build(saves=saves, planned_at=state_candidate.accepted_at)
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"), saves=saves, planned_at=state_candidate.accepted_at
+        )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer, suppress_intent_push():
             if state.attribute in {"description", "enabled"}:
@@ -4170,6 +4174,7 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
             state_candidate.accepted_at = timezone.now()
         state_fields = ("status", "accepted_at")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("operator_edit"),
             saves=(
                 planned_save(iface_candidate, update_fields=(attribute,)),
                 planned_save(state_candidate, update_fields=state_fields),
@@ -4568,7 +4573,7 @@ def _save_owned_bfd_edit(obj, old_values):
     saves.append(planned_save(state, update_fields=state_fields))
     operations.append((state, state_fields, False))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=planned_at)
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
@@ -4601,7 +4606,7 @@ def _save_owned_static_route_edit(obj, old_values):
         saves.append(planned_save(candidate, update_fields=fields))
         operations.append((candidate, fields))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at, grant=OwnershipGrant("operator_edit"))
     with renderer_writes(plan) as writer:
         for instance, update_fields in operations:
             writer.save(instance, update_fields=update_fields)
@@ -4632,6 +4637,7 @@ def _save_owned_redistribution_edit(obj, old_values):
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("operator_edit"),
         saves=(
             planned_save(native, update_fields=native_fields),
             planned_save(candidate, update_fields=state_fields),
@@ -4703,7 +4709,7 @@ def _save_owned_ospf_edit(obj, key, old_values):
     saves.append(planned_save(candidate, update_fields=state_fields))
     operations.append((candidate, state_fields, False))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=planned_at)
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(
@@ -4767,6 +4773,7 @@ def _save_owned_isis_edit(obj, key, old_values):
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("operator_edit"),
         saves=(
             planned_save(native, update_fields=native_fields),
             planned_save(candidate, update_fields=state_fields),
@@ -4822,7 +4829,7 @@ def _save_owned_bgp_edit(obj, old_values):
     saves.append(planned_save(candidate, update_fields=state_fields))
     operations.append((candidate, state_fields, False))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=planned_at)
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
@@ -4880,6 +4887,7 @@ def _save_owned_overlay_only_edit(obj, key, old_values):
         update_fields.add("accepted_at")
     dependencies, validate_after_acquire = _overlay_identity_plan(key, candidate)
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("operator_edit"),
         saves=(planned_save(candidate, update_fields=update_fields),),
         read_dependencies=dependencies,
         validate_after_acquire=validate_after_acquire,
@@ -4901,6 +4909,7 @@ def _write_owned_interface_mtu(
     planned_at,
     expected_state_values,
     expected_interface_mtu,
+    grant,
 ):
     """Write one MTU ownership claim and its native interface value."""
     import copy
@@ -4926,7 +4935,7 @@ def _write_owned_interface_mtu(
     saves.append(planned_save(candidate, update_fields=state_fields))
     operations.append((candidate, state_fields))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+    plan = RendererMutationPlan.build(grant=grant, saves=saves, planned_at=planned_at)
     expected_before = {
         (candidate._meta.label_lower, candidate.pk): expected_state_values,
     }
@@ -4975,6 +4984,7 @@ def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
         _write_owned_interface_mtu(
             candidate,
             state_fields,
+            grant=OwnershipGrant("operator_edit"),
             planned_at=planned_at,
             expected_state_values=expected_state_values,
             expected_interface_mtu=obj.interface.mtu,
@@ -5192,6 +5202,7 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
             raise _IntentTransactionNoOp(errors)
 
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("operator_edit"),
         saves=(planned_save(candidate, update_fields=fields) for candidate, fields in operations),
         planned_at=planned_at,
         validate_after_acquire=validate_after_acquire,
@@ -5322,7 +5333,7 @@ def _save_lacp_edit(obj, key, old_values):
     candidates.append((bundle_candidate, bundle_update_fields))
     saves.append(planned_save(bundle_candidate, update_fields=bundle_update_fields))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=now)
+    plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=now)
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         for candidate, update_fields in candidates:
@@ -5378,7 +5389,7 @@ def _save_vlan_name_edit(obj):
     saves = [planned_save(vlan, update_fields=("name",))]
     saves.extend(planned_save(candidate, update_fields=fields) for candidate, fields in candidates)
     try:
-        plan = RendererMutationPlan.build(saves=saves, planned_at=now)
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=now)
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
             writer.save(vlan, update_fields=("name",))
@@ -5647,6 +5658,7 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
                 fields = ("status", "accepted_at")
             planned_candidates.append((candidate, fields))
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
             saves=(planned_save(candidate, update_fields=fields) for candidate, fields in planned_candidates),
             planned_at=now,
         )
@@ -6103,6 +6115,7 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         self._arm_accept(candidate)
         fields = ("status", "accepted_at", *self.accept_extra_fields)
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
             saves=(planned_save(candidate, update_fields=fields),),
             planned_at=candidate.accepted_at,
         )
@@ -6138,7 +6151,9 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
         if candidate.accepted_at is None:
             candidate.accepted_at = timezone.now()
         fields = ("status", "accepted_at")
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"), saves=(planned_save(candidate, update_fields=fields),)
+        )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
             writer.save(candidate, update_fields=fields)
@@ -6196,6 +6211,7 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
                     bundle_candidate.accepted_at = now
                 candidates.append(bundle_candidate)
                 plan = RendererMutationPlan.build(
+                    grant=OwnershipGrant("accept"),
                     saves=(
                         planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates
                     ),
@@ -6232,6 +6248,7 @@ def _switchport_accept_plan(state):
     if candidate.accepted_at is None:
         candidate.accepted_at = now
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("accept"),
         saves=(
             planned_save(interface, update_fields=("mode", "untagged_vlan")),
             planned_save(candidate, update_fields=("status", "accepted_at")),
@@ -6450,7 +6467,11 @@ def _ip_edit_plan_and_operations(updates, planned_at):
         fields = tuple(sorted(state_fields[state_id]))
         saves.append(planned_save(candidate, update_fields=fields))
         state_operations.append((candidate, fields))
-    return RendererMutationPlan.build(saves=saves, planned_at=planned_at), native_operations, state_operations
+    return (
+        RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=planned_at),
+        native_operations,
+        state_operations,
+    )
 
 
 class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
@@ -6585,6 +6606,7 @@ class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
         state_fields = ("status", "accepted_at")
         created = current_native is None
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
             saves=(
                 planned_save(native, force_insert=created, natural_key=("address", "vrf")),
                 planned_save(candidate, update_fields=state_fields),
@@ -6651,6 +6673,7 @@ class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
         candidate.accepted_at = timezone.now()
         fields = ("status", "accepted_at")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
             saves=(planned_save(candidate, update_fields=fields),),
             planned_at=candidate.accepted_at,
         )
@@ -6709,6 +6732,7 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
         )
         plan, operations, cascade = _route_policy_acquisition_plan(
             candidate.management,
+            grant=OwnershipGrant("accept"),
             primary_operations=((candidate, fields, False),),
             route_maps=route_maps,
         )
@@ -7003,7 +7027,9 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         """Build the family-specific exact plan and replay operations."""
         from .renderer_writer import RendererMutationPlan
 
-        return RendererMutationPlan.build(saves=saves), [(*operation, False) for operation in accepted]
+        return RendererMutationPlan.build(grant=OwnershipGrant("accept"), saves=saves), [
+            (*operation, False) for operation in accepted
+        ]
 
     def post(self, request, device_pk):  # noqa: D102
         import copy
@@ -7125,6 +7151,7 @@ class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
         )
         return _route_policy_acquisition_plan(
             mgmt,
+            grant=OwnershipGrant("accept"),
             primary_operations=tuple((candidate, fields, False) for candidate, fields in accepted),
             route_maps=route_maps,
         )[:2]
@@ -7191,29 +7218,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
     def post(self, request, pk):  # noqa: D102
         state = get_object_or_404(self.model_class, pk=pk)
-        if self.renderer_scope is not None:
-            return self._post_with_renderer_writer(request, state)
-        from .intent_state import footprint_for_instance, intent_transaction
-
-        blocker = self.push_blocker(state)
-        if blocker:
-            messages.error(request, f"Cannot accept {state}: {blocker}")
-            return redirect(_device_nso_tab_url(state.management.device_id))
-        footprint = footprint_for_instance(state)
-        try:
-            with intent_transaction(footprint):
-                state = get_object_or_404(self.model_class, pk=state.pk)
-                blocker = self.push_blocker(state)
-                if blocker:
-                    raise _IntentTransactionNoOp(blocker)
-                state.status = _status_after_accept(state.status)
-                state.accepted_at = timezone.now()
-                state.save(update_fields=["status", "accepted_at"])
-        except _IntentTransactionNoOp as exc:
-            messages.error(request, f"Cannot accept {state}: {exc.result}")
-            return redirect(_device_nso_tab_url(state.management.device_id))
-        messages.success(request, f"Accepted {state}.")
-        return redirect(_device_nso_tab_url(state.management.device_id))
+        return self._post_with_renderer_writer(request, state)
 
     def _post_with_renderer_writer(self, request, state):
         """Accept one converted overlay through its exact renderer plan."""
@@ -7240,6 +7245,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             dependencies, validate_after_acquire = _overlay_identity_plan(self.renderer_scope, candidate)
             try:
                 plan = RendererMutationPlan.build(
+                    grant=OwnershipGrant("accept"),
                     saves=(planned_save(candidate, update_fields=fields),),
                     read_dependencies=dependencies,
                     validate_after_acquire=validate_after_acquire,
@@ -7552,6 +7558,7 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
             _write_owned_interface_mtu(
                 candidate,
                 fields,
+                grant=OwnershipGrant("accept"),
                 planned_at=candidate.accepted_at,
                 expected_state_values=expected_state_values,
                 expected_interface_mtu=state.interface.mtu,
@@ -7614,7 +7621,7 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
         group = get_object_or_404(VLANGroup, pk=request.POST.get("group"))
         device_id = state.management.device_id
         try:
-            action, vlan = rescope_vlan(state, group)
+            action, vlan = rescope_vlan(state, group, grant=OwnershipGrant("operator_edit"))
         # rescope_vlan converts every acquisition-time protocol error into this refusal.
         except VLANRescopeConflict:
             messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
@@ -7743,6 +7750,7 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
             fields = tuple(sorted(fields_set))
         plan, operations, cascade = _route_policy_acquisition_plan(
             mgmt,
+            grant=OwnershipGrant("create"),
             primary_operations=((candidate, fields, created),),
             route_maps=(obj,) if family == "route_map" else (),
         )
@@ -8034,7 +8042,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             force_insert=True,
             natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
         )
-        plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at)
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), saves=saves, planned_at=planned_at)
         with renderer_writes(plan) as writer:
             with suppress_intent_push():
                 for instance, force_insert, references in operations:
@@ -8182,6 +8190,7 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
 
         update_fields = None if created else ("status", "accepted_at", "last_sync_at")
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     state,

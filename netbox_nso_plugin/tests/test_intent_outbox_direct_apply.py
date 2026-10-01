@@ -16,6 +16,8 @@ from dcim.models import Interface
 from django.db import transaction
 from django.test import TransactionTestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import (
     ReceiptAdapter,
     enqueue,
@@ -149,7 +151,8 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
                 management=self.mgmt, interface=lag, lag_id=1, min_links=2, timer="fast", status="accepted"
             )
             plan = RendererMutationPlan.build(
-                saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(bundle, force_insert=True, natural_key=("management", "interface")),),
             )
             with renderer_writes(plan) as writer:
                 writer.save(bundle, force_insert=True)
@@ -165,7 +168,9 @@ class TestTheBurstStillCoalesces(_DirectApplyCase):
             for min_links in (3, 4, 5):
                 candidate = copy.copy(bundle)
                 candidate.min_links = min_links
-                plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("min_links",)),))
+                plan = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("min_links",)),)
+                )
                 with renderer_writes(plan) as writer:
                     writer.save(candidate, update_fields=("min_links",))
                 bundle.min_links = min_links

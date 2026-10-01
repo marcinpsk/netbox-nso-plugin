@@ -17,6 +17,7 @@ from netbox_nso_plugin.models import (
 )
 
 from ._outbox_case import content_update
+from ._ownership_case import save_overlay_fixture
 
 
 def _payload(bundles):
@@ -124,9 +125,9 @@ class TestReconcileLagConfig(TestCase):
         bundle = NSOLACPBundleState.objects.get(interface=self.lag)
         member = NSOLACPMemberState.objects.get(interface=self.m1)
         bundle.status = "accepted"
-        bundle.save(update_fields=["status"])
+        save_overlay_fixture(bundle, update_fields=["status"])
         member.status = "accepted"
-        member.save(update_fields=["status"])
+        save_overlay_fixture(member, update_fields=["status"])
         before = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
 
         moved = self._bundle(
@@ -262,7 +263,7 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
         state = NSOLACPBundleState.objects.get(interface=self.lag)
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         # identical re-read must not revert accepted → imported
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
         state.refresh_from_db()
@@ -441,7 +442,7 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([self._bundle(min_links=2)]))
         state = NSOLACPBundleState.objects.get(interface=self.lag)
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         reconcile_lag_config(self.device, _payload([]))
         state.refresh_from_db()
         assert state.status == "accepted"

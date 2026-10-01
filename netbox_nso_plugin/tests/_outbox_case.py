@@ -28,6 +28,7 @@ from django.db import transaction
 
 from netbox_nso_plugin.adapter_client import AdapterError
 from netbox_nso_plugin.outbox import CONTRIBUTION_KIND_ORDINARY
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import _REAL_SESSION, make_response
 
@@ -85,7 +86,10 @@ def make_managed(tag: str, adapter_device_id: int, index: int = 1):
 def mirror_update(instance, **values):
     """Persist lifecycle-only fixture fields through the production mirror permit."""
     from netbox_nso_plugin.intent_state import update_mirror_fields
+    from netbox_nso_plugin.status_machine import OWNED_STATES
 
+    if values.get("status") in OWNED_STATES and instance.status not in OWNED_STATES:
+        return content_update(instance, **values)
     return update_mirror_fields(instance, **values)
 
 
@@ -146,7 +150,9 @@ def content_update(instance, **values):
     for field_name, value in values.items():
         setattr(candidate, field_name, value)
     fields = set(values)
-    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
+    )
     mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
     with without_commit_drain(), mutation(plan) as writer:
         writer.save(candidate, update_fields=fields)
@@ -165,7 +171,10 @@ def content_bulk_update(instance, **values):
     )
 
     model = type(instance)
-    plan = RendererMutationPlan.build(set_updates=(planned_set_update(model.objects.filter(pk=instance.pk), **values),))
+    plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"),
+        set_updates=(planned_set_update(model.objects.filter(pk=instance.pk), **values),),
+    )
     mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
     with without_commit_drain(), mutation(plan) as writer:
         writer.set_update(model, plan.write_set[0], **values)
@@ -189,7 +198,8 @@ def own_vlan(mgmt, vid: int, tag: str):
         vlan = VLAN.objects.create(group=group, vid=vid, name=f"cl-{tag}-v{vid}")
         state = NSOVLANState(management=mgmt, vlan=vlan, status="accepted")
         plan = RendererMutationPlan.build(
-            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),),
         )
         with renderer_writes(plan) as writer:
             writer.save(state, force_insert=True)
@@ -211,7 +221,9 @@ def write_vlan_state(state, **values):
     for field_name, value in values.items():
         setattr(candidate, field_name, value)
     fields = tuple(sorted(values))
-    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
+    )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         writer.save(candidate, update_fields=fields)
@@ -225,7 +237,7 @@ def delete_vlan_state(state):
     from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
     current = type(state).objects.get(pk=state.pk)
-    plan = RendererMutationPlan.build(deletes=(planned_delete(current),))
+    plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(current),))
     with renderer_writes(plan) as writer:
         return writer.delete(current)
 

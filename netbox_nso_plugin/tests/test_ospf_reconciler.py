@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from ._outbox_case import content_update
+from ._ownership_case import acquire_overlay
 
 
 def _make_ospf_device(suffix="ospf"):
@@ -276,7 +277,8 @@ class TestReconcileOspfFill(TestCase):
         from netbox_nso_plugin.signals import ospf_instance_intent_item
 
         operator_areas = [{"area-id": "0.0.0.1", "area-type": "stub"}]
-        state = NSOOSPFInstanceState.objects.create(
+        state = acquire_overlay(
+            NSOOSPFInstanceState,
             management=self._make_mgmt(),
             process_id="10",
             router_id="198.18.0.1",
@@ -516,7 +518,8 @@ class TestReconcileOspfFill(TestCase):
         self._make_mgmt()
         from netbox_nso_plugin.models import NSOOSPFInterfaceState
 
-        state = NSOOSPFInterfaceState.objects.create(
+        state = acquire_overlay(
+            NSOOSPFInterfaceState,
             management=self._make_mgmt(),
             interface=self.tun,
             process_id="10",

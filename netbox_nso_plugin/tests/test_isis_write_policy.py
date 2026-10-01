@@ -18,6 +18,7 @@ from django.test import TestCase
 
 from netbox_nso_plugin.isis_write_policy import ISIS_CHILD_NOTES, ISIS_PUSHED_FIELDS, ISIS_READ_ONLY_FIELDS
 
+from ._ownership_case import update_or_acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -54,7 +55,6 @@ class TestRegistryMatchesRealPush(_IsisPolicyBase):
 
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.delivery import deliver
-        from netbox_nso_plugin.intent_state import SourceRow, content_mutation
         from netbox_nso_plugin.models import NSOISISInstanceState, NSOISISInterfaceState
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -72,22 +72,15 @@ class TestRegistryMatchesRealPush(_IsisPolicyBase):
             reference_bandwidth=100000,
         )
         ISISLevel.objects.create(instance=fork, level=2, wide_metrics_only=True, default_metric=10, preference=18)
-        with (
-            content_mutation(
-                {(self.device.pk, "isis")},
-                overlay_rows=(
-                    SourceRow(NSOISISInstanceState._meta.label_lower, None),
-                    SourceRow(NSOISISInterfaceState._meta.label_lower, None),
-                ),
-            ),
-            suppress_intent_push(),
-        ):
-            NSOISISInstanceState.objects.update_or_create(
+        with suppress_intent_push():
+            update_or_acquire_overlay(
+                NSOISISInstanceState,
                 management=mgmt,
                 process_tag="",
                 defaults={"net": "49.0001.00", "is_type": "level-2-only", "status": "in_sync", "isis_instance": fork},
             )
-            NSOISISInterfaceState.objects.update_or_create(
+            update_or_acquire_overlay(
+                NSOISISInterfaceState,
                 management=mgmt,
                 interface=self.iface,
                 af="ipv4",

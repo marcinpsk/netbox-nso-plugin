@@ -24,6 +24,7 @@ from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
 from ._outbox_case import content_bulk_update, mirror_update, wait_until_postgres_blocks, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_sync_cache import _SyncCacheTestBase
 
@@ -68,7 +69,8 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         _assign_without_push(self.route, self.device)
         attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
         with patch(PUT), without_commit_drain(), transaction.atomic():
-            self.state = NSOStaticRouteState.objects.create(
+            self.state = acquire_overlay(
+                NSOStaticRouteState,
                 management=self.mgmt,
                 static_route=self.route,
                 status="deploying",

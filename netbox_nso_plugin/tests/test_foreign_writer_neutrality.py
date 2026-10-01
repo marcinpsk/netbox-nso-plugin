@@ -15,6 +15,7 @@ from django.db.migrations.state import ProjectState
 from django.test import TransactionTestCase
 
 from ._outbox_case import make_managed, mirror_update, own_vlan
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -271,9 +272,9 @@ class TestForeignWriterNeutrality(_CascadeFlushMixin, IntentPushResetMixin, Tran
 
         interface = Interface.objects.create(device=self.device, name="et-0/0/9", type="1000base-t")
         address = IPAddress.objects.create(address="198.18.177.1/31", assigned_object=interface)
-        attribute = NSOInterfaceState.objects.create(interface=interface, attribute="description", status="in_sync")
-        overlay_ip = NSOInterfaceIPState.objects.create(
-            interface=interface, address="198.18.177.1/31", status="in_sync"
+        attribute = acquire_overlay(NSOInterfaceState, interface=interface, attribute="description", status="in_sync")
+        overlay_ip = acquire_overlay(
+            NSOInterfaceIPState, interface=interface, address="198.18.177.1/31", status="in_sync"
         )
         revision = self.baseline()
 

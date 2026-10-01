@@ -3443,7 +3443,7 @@ def _route_map_contributors(route_maps):
     return referenced
 
 
-def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()):
+def _route_policy_acquisition_plan(mgmt, *, grant, primary_operations=(), route_maps=()):
     """Freeze explicit root acquisitions and eligible route-map contributors."""
     from django.contrib.contenttypes.models import ContentType
 
@@ -3515,7 +3515,7 @@ def _route_policy_acquisition_plan(mgmt, *, primary_operations=(), route_maps=()
         operations.append((candidate, fields, created))
         staged.add(key)
     return (
-        RendererMutationPlan.build(saves=saves, planned_at=planned_at),
+        RendererMutationPlan.build(grant=grant, saves=saves, planned_at=planned_at),
         operations,
         CascadeResult(drifted=drifted, cross_device=cross_device),
     )

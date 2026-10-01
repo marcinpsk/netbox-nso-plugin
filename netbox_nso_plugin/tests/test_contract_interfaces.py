@@ -10,6 +10,8 @@ from django.test import TestCase
 from netbox_nso_plugin.models import NSODerivedIntentTemplate, NSOInterfaceState
 from netbox_nso_plugin.template_content import _upsert_interface_states, interface_reconcile_plan
 
+from ._ownership_case import acquire_overlay
+
 # Must match nso-adapter/tests/api/test_contract_interfaces.py exactly.
 # M27R added the logical-interface modeling keys (NULL for physical ports / Cisco / Junos).
 EXPECTED_IFACE_KEYS = {
@@ -129,8 +131,8 @@ class TestInterfacesContractConsumer(TestCase):
         """
         self.iface.description = "operator-desc"
         self.iface.save(update_fields=["description"])
-        NSOInterfaceState.objects.create(
-            interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
+        acquire_overlay(
+            NSOInterfaceState, interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
         )
         # Adapter still reads the OLD device value (operator's value not applied yet) + imported.
         payload = [
@@ -151,8 +153,8 @@ class TestInterfacesContractConsumer(TestCase):
         """Owned-guard settles the row by value: accepted → in_sync once the device catches up."""
         self.iface.description = "operator-desc"
         self.iface.save(update_fields=["description"])
-        NSOInterfaceState.objects.create(
-            interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
+        acquire_overlay(
+            NSOInterfaceState, interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
         )
         # Adapter now reads the operator's value on the device → settle accepted → in_sync.
         payload = [

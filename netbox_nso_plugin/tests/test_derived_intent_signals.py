@@ -28,6 +28,7 @@ from netbox_nso_plugin.derived_intent import (
     SentinelTemplate,
 )
 from netbox_nso_plugin.models import NSODerivedIntentTemplate
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.signals import (
     _affected_interfaces,
     _recompute_on_cable_change,
@@ -35,6 +36,8 @@ from netbox_nso_plugin.signals import (
     _recompute_one,
     _templates,
 )
+
+from ._ownership_case import acquire_overlay
 
 SENTINEL_AUTO = SentinelTemplate(
     sentinel="[auto]",
@@ -116,7 +119,9 @@ class TestRecomputeOne(TestCase):
         iface1_fresh = Interface.objects.get(pk=iface1.pk)
         planned = copy.copy(iface1_fresh)
         planned.description = "[auto] to rcp-dev2:Gi0/2-rcp"
-        plan = RendererMutationPlan.build(saves=(planned_save(planned, update_fields=("description",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(planned, update_fields=("description",)),)
+        )
         mutation = renderer_writes if plan.changes_content else renderer_mirror_writes
         with without_commit_drain(), mutation(plan):
             _recompute_one(iface1_fresh, TEMPLATES)
@@ -136,7 +141,7 @@ class TestRecomputeOne(TestCase):
         iface1.description = "[auto]"
         iface1.save(update_fields=["description"])
 
-        with without_commit_drain(), renderer_mirror_writes(RendererMutationPlan.build()):
+        with without_commit_drain(), renderer_mirror_writes(RendererMutationPlan.build(grant=OwnershipGrant("create"))):
             with self.assertRaisesRegex(IntentMutationProtocolError, "outside the frozen write set"):
                 _recompute_one(Interface.objects.get(pk=iface1.pk), TEMPLATES)
 
@@ -336,7 +341,8 @@ class TestInterfaceSaveHandler(TestCase):
             nso_device_name=self.dev1.name,
             adapter_device_id=16234,
         )
-        NSOInterfaceState.objects.create(
+        acquire_overlay(
+            NSOInterfaceState,
             interface=iface1,
             attribute="enabled",
             status="accepted",
@@ -345,7 +351,9 @@ class TestInterfaceSaveHandler(TestCase):
         _configure_templates(TEMPLATES)
         candidate = copy.copy(Interface.objects.get(pk=iface1.pk))
         candidate.enabled = False
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("enabled",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("enabled",)),)
+        )
 
         with self.assertRaises(IntentMutationProtocolError), without_commit_drain(), renderer_writes(plan) as writer:
             writer.save(candidate, update_fields=("enabled",))

@@ -13,9 +13,11 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.vault_refs import secret_fingerprint
 
 from ._adapter_http import make_session
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin
 
 _BASE_CFG = {
@@ -66,7 +68,7 @@ class _SecretBase(IntentPushDeliveryMixin, TestCase):
 
         defaults = {"access": "RO", "status": "imported"}
         defaults.update(kwargs)
-        return NSOSnmpCommunityState.objects.create(management=mgmt, community_hash=community_hash, **defaults)
+        return acquire_overlay(NSOSnmpCommunityState, management=mgmt, community_hash=community_hash, **defaults)
 
 
 class TestVaultSettingsSingleton(TestCase):
@@ -670,7 +672,7 @@ class TestDeletePropagation(_SecretBase):
             with self.captureOnCommitCallbacks(execute=True):
                 from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
-                plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+                plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row),))
                 with renderer_writes(plan) as writer:
                     writer.delete(row)
         mock_put.assert_called_once()
@@ -685,7 +687,8 @@ class TestV3PushDerivation(_SecretBase):
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         mgmt = self._make_mgmt(adapter_device_id=4203)
-        NSOSnmpV3UserState.objects.create(
+        acquire_overlay(
+            NSOSnmpV3UserState,
             management=mgmt,
             username="monitor",
             status="accepted",
@@ -694,7 +697,8 @@ class TestV3PushDerivation(_SecretBase):
             auth_protocol="sha-256",
             priv_protocol="",  # no priv protocol → priv ref must be withheld
         )
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="10.0.0.5",
             version="v3",
@@ -702,7 +706,8 @@ class TestV3PushDerivation(_SecretBase):
             username="monitor",
             status="accepted",
         )
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=mgmt,
             address="10.0.0.6",
             version="v2c",

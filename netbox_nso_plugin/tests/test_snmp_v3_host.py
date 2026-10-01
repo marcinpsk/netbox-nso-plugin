@@ -29,6 +29,7 @@ from netbox_nso_plugin.delivery import deliver
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSnmpHostState
 from netbox_nso_plugin.signals import snmp_host_push_blocker
 
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -69,7 +70,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
     def test_push_uses_current_management_adapter_device_id(self):
         self.mgmt.adapter_device_id = 43
         self.mgmt.save(update_fields=["adapter_device_id"])
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=self.mgmt,
             address="198.18.0.5",
             version="3",
@@ -82,7 +84,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
 
     def test_a_v3_host_WITH_a_user_name_is_pushed(self):
         """The feature. The user name goes into community_or_user — the field both writers key on."""
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=self.mgmt,
             address="10.0.0.5",
             version="3",
@@ -99,7 +102,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
     def test_an_owned_blocker_aborts_the_full_snapshot(self):
         from netbox_nso_plugin.adapter_client import AdapterError
 
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=self.mgmt,
             address="198.18.0.5",
             version="2c",
@@ -107,7 +111,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
             community_hash="abc123def456",
             status="accepted",
         )
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=self.mgmt,
             address="198.18.0.6",
             version="3",
@@ -128,8 +133,13 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.template_content import _reconcile_snmp_config
 
-        row = NSOSnmpHostState.objects.create(
-            management=self.mgmt, address="198.18.0.7", version="3", notify_type="trap", status="accepted"
+        row = acquire_overlay(
+            NSOSnmpHostState,
+            management=self.mgmt,
+            address="198.18.0.7",
+            version="3",
+            notify_type="trap",
+            status="accepted",
         )
         _reconcile_snmp_config(
             self.device,
@@ -180,7 +190,8 @@ class TestSnmpV3HostPush(IntentPushResetMixin, _HostBase):
         community reference — if the v3 branch leaked into it, the host would be bound to a
         community that does not exist.
         """
-        NSOSnmpHostState.objects.create(
+        acquire_overlay(
+            NSOSnmpHostState,
             management=self.mgmt,
             address="10.0.0.6",
             version="2c",

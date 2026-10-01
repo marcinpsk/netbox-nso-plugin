@@ -19,6 +19,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import SimpleTestCase, TestCase
 
 from ._outbox_case import trust_scope
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 APP = "netbox_nso_plugin"
@@ -237,7 +238,8 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         _assign_without_push(route, device)
         generation = allocate_intent_generation()
         with patch("netbox_nso_plugin.adapter_client.put_static_route_intent"):
-            state = NSOStaticRouteState.objects.create(
+            state = acquire_overlay(
+                NSOStaticRouteState,
                 management=mgmt,
                 static_route=route,
                 status="accepted",
@@ -260,7 +262,8 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
 
         device, mgmt = _fixture("rp", 7302)
         with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent"):
-            row = NSORoutePolicyState.objects.create(
+            row = acquire_overlay(
+                NSORoutePolicyState,
                 management=mgmt,
                 family="community_list",
                 object_name="dr-cl-1",

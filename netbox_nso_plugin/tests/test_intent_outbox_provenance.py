@@ -21,7 +21,10 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import marking_mode, without_commit_drain
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from ._static_route_case import _assign_and_accept, _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -104,7 +107,7 @@ class TestOutboxSuppression(IntentPushResetMixin, TestCase):
 
         vlan = VLAN.objects.create(vid=701, name="ob-sup-v701")
         with patch(PUT_VLAN), self.captureOnCommitCallbacks(execute=True):
-            return NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="accepted")
+            return acquire_overlay(NSOVLANState, management=self.mgmt, vlan=vlan, status="accepted")
 
     def test_a_save_under_suppression_writes_no_entry(self):
         from django.utils import timezone
@@ -155,7 +158,7 @@ class TestOutboxSuppression(IntentPushResetMixin, TestCase):
         token = current_request.set(self._request("post"))
         try:
             with patch(PUT_VLAN), self.captureOnCommitCallbacks(execute=True):
-                plan = RendererMutationPlan.build(saves=(planned_save(state),))
+                plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), saves=(planned_save(state),))
                 with renderer_writes(plan) as writer:
                     writer.save(state)
         finally:
@@ -444,14 +447,13 @@ class TestOutboxTeardown(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
     def test_device_delete_suppresses_a_cascaded_svi_overlay_append(self):
         from dcim.models import Interface
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOSVIState
         from netbox_nso_plugin.signals import suppress_intent_push
 
         interface = Interface.objects.create(device=self.device, name="Vlan444", type="virtual")
         state = NSOSVIState(management=self.mgmt, interface=interface, status="accepted")
-        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+        with suppress_intent_push():
+            save_overlay_fixture(state)
         NSOIntentOutboxEntry.objects.all().delete()
         device_id = self.device.pk
 

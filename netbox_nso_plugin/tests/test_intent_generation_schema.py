@@ -15,6 +15,9 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 APP = "netbox_nso_plugin"
@@ -54,7 +57,7 @@ class TestIntentGenerationMigration(IntentPushResetMixin, TestCase):
         device = _make_device("def")
         mgmt = _make_mgmt(device, "def", 9101)
         sr = StaticRoute.objects.create(prefix="10.9.0.0/16", next_hop="10.9.0.1", metric=1)
-        row = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+        row = acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
 
         row.refresh_from_db()
         assert row.intent_generation == UNALLOCATED == 0
@@ -194,9 +197,11 @@ class TestIntentGenerationAllocator(TestCase):
         mgmt = _make_mgmt(device, "recr", 9104)
         sr = StaticRoute.objects.create(prefix="10.10.0.0/16", next_hop="10.10.0.1", metric=1)
         first = allocate_intent_generation()
-        NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted", intent_generation=first)
+        acquire_overlay(
+            NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted", intent_generation=first
+        )
 
-        delete_plan = RendererMutationPlan.build(deletes=(planned_delete(mgmt),))
+        delete_plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(mgmt),))
         with renderer_writes(delete_plan) as writer:
             writer.delete(mgmt)
         assert not NSOStaticRouteState.objects.filter(static_route=sr).exists()
@@ -208,13 +213,13 @@ class TestIntentGenerationAllocator(TestCase):
             adapter_device_id=mgmt.adapter_device_id,
         )
         create_plan = RendererMutationPlan.build(
-            saves=(planned_save(mgmt2, force_insert=True, natural_key=("device",)),)
+            grant=OwnershipGrant("create"), saves=(planned_save(mgmt2, force_insert=True, natural_key=("device",)),)
         )
         with renderer_writes(create_plan) as writer:
             writer.save(mgmt2, force_insert=True)
         second = allocate_intent_generation()
-        NSOStaticRouteState.objects.create(
-            management=mgmt2, static_route=sr, status="accepted", intent_generation=second
+        acquire_overlay(
+            NSOStaticRouteState, management=mgmt2, static_route=sr, status="accepted", intent_generation=second
         )
 
         assert second > first
@@ -237,14 +242,15 @@ class TestIntentGenerationAllocator(TestCase):
         management = _make_mgmt(device, "writer-recr", 9105)
         route = StaticRoute.objects.create(prefix="198.18.40.0/24", next_hop="198.18.40.1", metric=1)
         first = allocate_intent_generation()
-        state = NSOStaticRouteState.objects.create(
+        state = acquire_overlay(
+            NSOStaticRouteState,
             management=management,
             static_route=route,
             status="accepted",
             intent_generation=first,
         )
 
-        delete_plan = RendererMutationPlan.build(deletes=(planned_delete(management),))
+        delete_plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(management),))
         with renderer_writes(delete_plan) as writer:
             writer.delete(management)
 
@@ -258,7 +264,8 @@ class TestIntentGenerationAllocator(TestCase):
             adapter_device_id=management.adapter_device_id,
         )
         create_plan = RendererMutationPlan.build(
-            saves=(planned_save(replacement, force_insert=True, natural_key=("device",)),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(replacement, force_insert=True, natural_key=("device",)),),
         )
         with renderer_writes(create_plan) as writer:
             writer.save(replacement, force_insert=True)
@@ -271,13 +278,14 @@ class TestIntentGenerationAllocator(TestCase):
             intent_generation=second,
         )
         state_plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     replacement_state,
                     force_insert=True,
                     natural_key=("management", "static_route"),
                 ),
-            )
+            ),
         )
         with renderer_writes(state_plan) as writer:
             writer.save(replacement_state, force_insert=True)

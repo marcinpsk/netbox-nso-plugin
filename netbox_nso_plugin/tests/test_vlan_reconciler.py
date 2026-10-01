@@ -17,9 +17,11 @@ from netbox_nso_plugin.models import (
     NSOSwitchportState,
     NSOVLANState,
 )
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
 from ._outbox_case import without_commit_drain
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
@@ -1175,12 +1177,10 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         (row,) = reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 5, "name": ""}]})
         row.vlan.name = "STORAGE"
         row.vlan.save()
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
         row.refresh_from_db()
-        with intent_transaction(footprint_for_instance(row)):
-            row.status = "accepted"
-            row.save(update_fields=["status"])
+        row.status = "accepted"
+        save_overlay_fixture(row, update_fields=["status"])
 
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent") as mock_put:
             deliver("vlan", self.device.pk, 42)
@@ -1407,7 +1407,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         vlan = state.vlan
         site = VLANGroup.objects.create(name="Site Wide", slug="site-wide")
 
-        action, surviving = rescope_vlan(state, site)
+        action, surviving = rescope_vlan(state, site, grant=OwnershipGrant("operator_edit"))
         self.assertEqual(action, "moved")
         self.assertEqual(surviving.pk, vlan.pk)
         vlan.refresh_from_db()
@@ -1445,7 +1445,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         content_update(state, status="in_sync")
         state.refresh_from_db()
         with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
-            action, surviving = rescope_vlan(state, site)
+            action, surviving = rescope_vlan(state, site, grant=OwnershipGrant("operator_edit"))
         self.assertEqual(action, "merged")
         self.assertEqual(surviving.pk, shared.pk)
         # Overlay + native interface re-pointed onto the shared VLAN; duplicate gone.
@@ -1487,7 +1487,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         source_state.refresh_from_db()
         target_group = VLANGroup.objects.create(name="Rendered Name Target", slug="rendered-name-target")
         target_vlan = VLAN.objects.create(group=target_group, vid=41, name=source_state.vlan.name)
-        target_state = NSOVLANState.objects.create(
+        target_state = acquire_overlay(
+            NSOVLANState,
             management=self.management,
             vlan=target_vlan,
             device_name=target_vlan.name,
@@ -1498,7 +1499,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         mirror_update(self.management, adapter_device_id=41)
 
         with patch("netbox_nso_plugin.signals._schedule_intent_push") as schedule:
-            action, surviving = rescope_vlan(source_state, target_group)
+            action, surviving = rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
         self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
         target_state.refresh_from_db()
@@ -1510,7 +1511,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 42, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.management, vlan__vid=42)
-        action, _ = rescope_vlan(state, state.vlan.group)
+        action, _ = rescope_vlan(state, state.vlan.group, grant=OwnershipGrant("operator_edit"))
         self.assertEqual(action, "noop")
 
     def test_rescope_merge_transfers_ownership_to_a_same_name_duplicate(self):
@@ -1531,7 +1532,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             status="imported",
         )
 
-        action, surviving_vlan = rescope_vlan(source_state, target_group)
+        action, surviving_vlan = rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
         self.assertEqual((action, surviving_vlan.pk), ("merged", target_vlan.pk))
         surviving_state.refresh_from_db()
@@ -1557,7 +1558,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         )
         switchport.tagged_vlans.set((source_vlan, target_vlan))
 
-        action, surviving = rescope_vlan(source_state, target_group)
+        action, surviving = rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
         self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
         self.assertEqual(list(self.interface.tagged_vlans.values_list("pk", flat=True)), [target_vlan.pk])
@@ -1592,7 +1593,9 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         vlan_table = connection.ops.quote_name(VLAN._meta.db_table)
 
         with CaptureQueriesContext(connection) as queries:
-            _plan, _saves, m2m_sets, _deletes, _push_targets, _device_ids = _vlan_repoint_plan(source_vlan, target_vlan)
+            _plan, _saves, m2m_sets, _deletes, _push_targets, _device_ids = _vlan_repoint_plan(
+                source_vlan, target_vlan, grant=OwnershipGrant("operator_edit")
+            )
 
         self.assertCountEqual(
             [
@@ -1613,7 +1616,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         for table in through_tables:
             self.assertEqual(sum(table in sql for sql in row_loads), 1)
 
-        action, surviving = rescope_vlan(source_state, target_group)
+        action, surviving = rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
         self.assertEqual((action, surviving.pk), ("merged", target_vlan.pk))
         for owner in owners:
@@ -1648,7 +1651,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
             side_effect=change_source_before_native_lock,
         ):
-            action, vlan = rescope_vlan(source_state, target_group)
+            action, vlan = rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
         self.assertTrue(changed)
         self.assertEqual((action, vlan.pk), ("merged", target_vlan.pk))
@@ -1678,7 +1681,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
             side_effect=change_source_before_native_lock,
         ):
-            action, vlan = rescope_vlan(source_state, target_group)
+            action, vlan = rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
         self.assertTrue(changed)
         self.assertEqual(action, "moved")
@@ -1727,7 +1730,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
             ),
             self.assertRaisesRegex(VLANRescopeConflict, "membership changed"),
         ):
-            rescope_vlan(source_state, target_group)
+            rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 
     def test_switchport_seeded_when_pristine(self):
         """A pristine NetBox interface is SEEDED from the device (read mirror) → imported, no drift.
@@ -1858,7 +1861,8 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         )
         target = tuple(VLAN.objects.filter(group__slug=f"nso-{self.device.pk}", vid__in=(10, 20)).order_by("pk"))
         competing = RendererMutationPlan.build(
-            m2m_writes=tuple(planned_m2m_set(owner, "tagged_vlans", target) for owner in owners)
+            grant=OwnershipGrant("create"),
+            m2m_writes=tuple(planned_m2m_set(owner, "tagged_vlans", target) for owner in owners),
         )
         # The last point production allows: the competing writer commits before the frozen plan acquires.
         with acquire(competing) as writer:
@@ -2088,8 +2092,8 @@ class TestVlanWritePath(IntentPushResetMixin, TestCase):
     def _state(self, vid=2213, name="OLD", status="imported", device_name="OLD"):
         group = _device_vlan_group(self.device)
         vlan = VLAN.objects.create(group=group, vid=vid, name=name)
-        return NSOVLANState.objects.create(
-            management=self.management, vlan=vlan, device_name=device_name, status=status
+        return acquire_overlay(
+            NSOVLANState, management=self.management, vlan=vlan, device_name=device_name, status=status
         )
 
     def test_push_builds_owned_snapshot_with_live_name(self):
@@ -2182,8 +2186,8 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
                 device=self.device, nso_instance=instance, nso_device_name="vlan-router-vap", adapter_device_id=77
             )
             vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2213, name="OLD")
-            self.state = NSOVLANState.objects.create(
-                management=self.management, vlan=vlan, device_name="OLD", status="in_sync"
+            self.state = acquire_overlay(
+                NSOVLANState, management=self.management, vlan=vlan, device_name="OLD", status="in_sync"
             )
 
     def test_prepare_apply_pushes_vlan_intent(self):
@@ -2221,6 +2225,9 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
     def test_foreign_vlan_rename_commits_without_plugin_bookkeeping(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
+        entries = NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan")
+        before = list(entries.values())
+
         vlan = self.state.vlan
         vlan.name = "UNTRANSACTIONAL"
 
@@ -2228,7 +2235,7 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
 
         vlan.refresh_from_db()
         self.assertEqual(vlan.name, "UNTRANSACTIONAL")
-        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="vlan").exists())
+        self.assertEqual(list(entries.values()), before)
 
     def test_unmanaged_vlan_rename_uses_the_shared_dependency_transaction(self):
         with transaction.atomic():

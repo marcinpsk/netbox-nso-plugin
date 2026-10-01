@@ -8,7 +8,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase
 
+from netbox_nso_plugin.models import NSOStaticRouteState
+
 from ._adapter_http import make_session
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 
 _BASE_CFG = {
     "url": "http://adapter.local",
@@ -247,7 +250,8 @@ class TestReconcileStaticRoutes(TestCase):
 
         for route in routes:
             _assign_without_push(route, self.device)
-            NSOStaticRouteState.objects.create(
+            acquire_overlay(
+                NSOStaticRouteState,
                 management=management,
                 static_route=route,
                 status="in_sync",
@@ -267,7 +271,7 @@ class TestReconcileStaticRoutes(TestCase):
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-membership")
         route = StaticRoute.objects.create(prefix="198.18.44.0/24", next_hop="198.18.0.44", metric=1)
-        NSOStaticRouteState.objects.create(management=management, static_route=route, status="in_sync")
+        acquire_overlay(NSOStaticRouteState, management=management, static_route=route, status="in_sync")
         payload = self._route_payload(self._route_entry(str(route.prefix), str(route.next_hop)))
 
         with self._auto_create_ctx(True):
@@ -286,7 +290,8 @@ class TestReconcileStaticRoutes(TestCase):
         from ._static_route_case import _assign_without_push
 
         _assign_without_push(route, self.device)
-        NSOStaticRouteState.objects.create(
+        acquire_overlay(
+            NSOStaticRouteState,
             management=management,
             static_route=route,
             status="in_sync",
@@ -464,7 +469,9 @@ class TestReconcileStaticRoutes(TestCase):
             with self.subTest(status=owned):
                 route = self._tagged_route(f"198.18.6{i}.0/24", f"198.18.1.{i + 1}", tag=None)
                 attempt = NSOApplyAttempt.objects.create(management=mgmt) if owned == "deploying" else None
-                state = route.nso_states.create(
+                state = acquire_overlay(
+                    NSOStaticRouteState,
+                    static_route=route,
                     management=mgmt,
                     status=owned,
                     apply_attempt_id=attempt.pk if attempt else None,
@@ -582,7 +589,7 @@ class TestReconcileStaticRoutes(TestCase):
         sr = StaticRoute.objects.get(prefix="10.77.0.0/16")
         state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=sr)
         state.status = "in_sync"  # operator owns it
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
         before = revision.revision
 
@@ -626,9 +633,9 @@ class TestReconcileStaticRoutes(TestCase):
             management__device=self.device, static_route=StaticRoute.objects.get(prefix="10.77.0.0/16")
         )
         deploying.status = "accepted"
-        deploying.save(update_fields=["status"])
+        save_overlay_fixture(deploying, update_fields=["status"])
         confirmed.status = "in_sync"
-        confirmed.save(update_fields=["status"])
+        save_overlay_fixture(confirmed, update_fields=["status"])
         attempt_id = uuid4()
         # Marked LAST, and lifecycle-only: the Apply this row waits on is already in flight.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt_id)
@@ -667,10 +674,12 @@ class TestReconcileStaticRoutes(TestCase):
         mgmt = self._make_mgmt(self.device, nso_device_name="sr-drift-sibling")
         confirmed = self._tagged_route("198.18.80.0/24", "198.18.2.1", tag=None)
         pending = self._tagged_route("198.18.81.0/24", "198.18.2.2", tag=None)
-        confirmed_state = confirmed.nso_states.create(management=mgmt, status="in_sync")
+        confirmed_state = acquire_overlay(
+            NSOStaticRouteState, static_route=confirmed, management=mgmt, status="in_sync"
+        )
         attempt_id = uuid4()
         pending_state = mirror_update(
-            pending.nso_states.create(management=mgmt, status="accepted"),
+            acquire_overlay(NSOStaticRouteState, static_route=pending, management=mgmt, status="accepted"),
             status="deploying",
             apply_attempt_id=attempt_id,
         )
@@ -722,7 +731,7 @@ class TestReconcileStaticRoutes(TestCase):
         route = StaticRoute.objects.get(prefix="198.18.76.0/24")
         state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=route)
         state.status = "in_sync"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
         before = revision.revision
 
@@ -801,7 +810,7 @@ class TestReconcileStaticRoutes(TestCase):
         # Simulate operator accepting
         state = NSOStaticRouteState.objects.get(management__device=self.device)
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         with self._auto_create_ctx(True):
             result = _reconcile_static_routes(self.device, payload)

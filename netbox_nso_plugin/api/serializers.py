@@ -142,6 +142,11 @@ class NSOInterfaceStateSerializer(NetBoxModelSerializer):
 
     intent_value = serializers.SerializerMethodField()
 
+    def to_internal_value(self, data):
+        if "status" in data:
+            raise serializers.ValidationError({"status": "Ownership requires an explicit operation."})
+        return super().to_internal_value(data)
+
     def get_intent_value(self, obj) -> str | None:
         """Return the current dcim.Interface field value for this attribute."""
         iface = obj.interface
@@ -155,6 +160,7 @@ class NSOInterfaceStateSerializer(NetBoxModelSerializer):
 
     class Meta:
         model = NSOInterfaceState
+        read_only_fields = ["status"]
         fields = [
             "id",
             "url",
@@ -284,65 +290,76 @@ class NSOInterfaceIPStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOInterfaceIPState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSnmpCommunityStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSnmpCommunityState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSnmpV3UserStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSnmpV3UserState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSnmpHostStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSnmpHostState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSnmpSystemInfoStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSnmpSystemInfoState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOLoggingHostStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOLoggingHostState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOLoggingLevelStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOLoggingLevelState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOStaticRouteStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOStaticRouteState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOL2SapStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOL2SapState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOISISInterfaceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOISISInterfaceState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOISISInstanceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOISISInstanceState
+        read_only_fields = ["status"]
         # area_auth_key / domain_auth_key are plaintext IS-IS auth keys — never serialize
         # them (they would land in ObjectChange/webhook payloads). Mirrors the netbox-routing
         # GraphQL exclusion; the area/domain auth_type fields still report that auth is set.
@@ -353,81 +370,95 @@ class NSOISISFlexAlgoStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOISISFlexAlgoState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOBGPPeerStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOBGPPeerState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOBGPPeerTemplateStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOBGPPeerTemplateState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSORoutePolicyStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSORoutePolicyState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOOSPFInstanceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOOSPFInstanceState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOOSPFInterfaceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOOSPFInterfaceState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSORedistributionStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSORedistributionState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOLACPBundleStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOLACPBundleState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOLACPMemberStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOLACPMemberState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOVLANStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOVLANState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSwitchportStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSwitchportState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSVIStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSVIState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOSubinterfaceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOSubinterfaceState
         fields = "__all__"
+        read_only_fields = ["status"]
 
 
 class NSOBFDInterfaceStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOBFDInterfaceState
         fields = "__all__"
+        read_only_fields = ["status"]

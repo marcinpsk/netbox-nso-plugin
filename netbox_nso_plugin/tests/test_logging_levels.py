@@ -21,8 +21,11 @@ from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update, mirror_update, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 User = get_user_model()
@@ -73,7 +76,7 @@ class LevelsTestBase(IntentPushDeliveryMixin, TestCase):
     def _row(self, **kwargs):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
-        return NSOLoggingLevelState.objects.create(management=self.mgmt, **kwargs)
+        return acquire_overlay(NSOLoggingLevelState, management=self.mgmt, **kwargs)
 
 
 class TestReconcileLoggingLevels(LevelsTestBase):
@@ -309,7 +312,9 @@ class TestLoggingLevelsPush(LevelsTestBase):
             status="accepted",
             accepted_at=timezone.now(),
         )
-        plan = RendererMutationPlan.build(saves=(planned_save(row, force_insert=True, natural_key=("management",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(row, force_insert=True, natural_key=("management",)),)
+        )
         with (
             patch("netbox_nso_plugin.adapter_client.put_logging_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
@@ -322,7 +327,8 @@ class TestLoggingLevelsPush(LevelsTestBase):
     def test_foreign_levels_save_does_not_schedule_logging_behavior(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
-        row = NSOLoggingLevelState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingLevelState,
             management=self.mgmt,
             console_severity="ERROR",
             status="accepted",
@@ -346,7 +352,7 @@ class TestLoggingLevelsPush(LevelsTestBase):
         ):
             from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
-            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row),))
             with renderer_writes(plan) as writer:
                 writer.delete(row)
         mock_put.assert_called_once()
@@ -611,7 +617,7 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
         from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
 
-        host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.9", status="in_sync")
+        host = acquire_overlay(NSOLoggingHostState, management=self.mgmt, address="198.18.0.9", status="in_sync")
         row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
         attempt_id = uuid4()
         # Marked LAST, and lifecycle-only: only the read under test can move the row.
@@ -643,7 +649,7 @@ class TestLoggingLevelsApplyLifecycle(LevelsTestBase):
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingHostState
         from netbox_nso_plugin.template_content import _reconcile_logging_config, logging_reconcile_plan
 
-        host = NSOLoggingHostState.objects.create(management=self.mgmt, address="198.18.0.10", status="in_sync")
+        host = acquire_overlay(NSOLoggingHostState, management=self.mgmt, address="198.18.0.10", status="in_sync")
         row = self._row(console_severity="CRITICAL", status="accepted", accepted_at=timezone.now())
         attempt_id = uuid4()
         # Marked LAST, and lifecycle-only: only the read under test can move the row.
@@ -752,8 +758,8 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 adapter_device_id=self.device.pk,
                 manage_logging=True,
             )
-            self.row = NSOLoggingLevelState.objects.create(
-                management=self.mgmt, status="accepted", accepted_at=timezone.now()
+            self.row = acquire_overlay(
+                NSOLoggingLevelState, management=self.mgmt, status="accepted", accepted_at=timezone.now()
             )
 
     def test_apply_sends_an_owned_logging_retraction_and_the_read_keeps_it_deploying(self):

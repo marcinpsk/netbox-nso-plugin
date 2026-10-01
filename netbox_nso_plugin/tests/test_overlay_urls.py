@@ -10,6 +10,8 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 from django.urls import reverse
 
+from ._ownership_case import acquire_overlay
+
 
 class TestOverlayGetAbsoluteUrl(TestCase):
     @classmethod
@@ -30,7 +32,7 @@ class TestOverlayGetAbsoluteUrl(TestCase):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         sr = StaticRoute.objects.create(prefix="10.2.2.2/32", next_hop="192.0.0.30", metric=1)
-        state = NSOStaticRouteState.objects.create(management=self.mgmt, static_route=sr, status="accepted")
+        state = acquire_overlay(NSOStaticRouteState, management=self.mgmt, static_route=sr, status="accepted")
         # Must not raise NoReverseMatch and must point at the device's NSO tab.
         assert state.get_absolute_url() == reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
 
@@ -51,8 +53,8 @@ class TestOverlayGetAbsoluteUrl(TestCase):
 
         from netbox_nso_plugin.models import NSOISISFlexAlgoState
 
-        state = NSOISISFlexAlgoState.objects.create(
-            management=self.mgmt, process_tag="CORE", algo_id=130, status="accepted"
+        state = acquire_overlay(
+            NSOISISFlexAlgoState, management=self.mgmt, process_tag="CORE", algo_id=130, status="accepted"
         )
         assert state.get_absolute_url() == reverse("dcim:device_nso", kwargs={"pk": self.device.pk})
         data = serialize_for_event(state)  # must not raise (was: Could not determine serializer)
@@ -78,7 +80,7 @@ class TestOverlayEventSerialization(TestCase):
         inst = NSOInstance.objects.create(name="ev-inst", adapter_instance_id="ev-inst")
         mgmt = NSODeviceManagement.objects.create(device=dev, nso_instance=inst, nso_device_name="nso-ev")
         sr = StaticRoute.objects.create(prefix="10.3.3.3/32", next_hop="192.0.0.40", metric=1)
-        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+        state = acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
 
         data = serialize_for_event(state)  # must not raise (was: Could not determine serializer)
         assert data["id"] == state.pk

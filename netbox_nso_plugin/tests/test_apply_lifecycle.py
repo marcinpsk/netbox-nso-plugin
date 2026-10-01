@@ -11,6 +11,7 @@ from django.db import IntegrityError, models, transaction
 from django.test import SimpleTestCase, TestCase
 
 from ._outbox_case import make_managed, mirror_update, trust_scope, without_commit_drain
+from ._ownership_case import acquire_overlay
 
 PROMOTED_MODEL_NAMES = (
     "NSOVLANState",
@@ -83,7 +84,8 @@ class TestDeployingAttemptConstraint(TestCase):
         _device, management = make_managed("apply-identity-constraint", 1623)
 
         with self.assertRaises(IntegrityError), transaction.atomic():
-            NSOLoggingLevelState.objects.create(
+            acquire_overlay(
+                NSOLoggingLevelState,
                 management=management,
                 console_severity="WARNING",
                 status="deploying",
@@ -102,7 +104,8 @@ class TestIntentRevisionWrites(TestCase):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         attempt_id = uuid4()
-        row = NSOLoggingLevelState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingLevelState,
             management=self.management,
             console_severity="WARNING",
             status="accepted",
@@ -123,7 +126,8 @@ class TestIntentRevisionWrites(TestCase):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         attempt_id = uuid4()
-        row = NSOLoggingLevelState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingLevelState,
             management=self.management,
             console_severity="WARNING",
             status="accepted",
@@ -146,7 +150,8 @@ class TestIntentRevisionWrites(TestCase):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         attempt_id = uuid4()
-        row = NSOLoggingLevelState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingLevelState,
             management=self.management,
             console_severity="WARNING",
             status="accepted",
@@ -199,7 +204,8 @@ class TestIntentRevisionWrites(TestCase):
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingLevelState
 
-        row = NSOLoggingLevelState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingLevelState,
             management=self.management,
             console_severity="WARNING",
             status="accepted",
@@ -226,12 +232,14 @@ class TestIntentRevisionWrites(TestCase):
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
 
         with without_commit_drain(), transaction.atomic():
-            host = NSOLoggingHostState.objects.create(
+            host = acquire_overlay(
+                NSOLoggingHostState,
                 management=self.management,
                 address="198.18.0.10",
                 status="accepted",
             )
-            level = NSOLoggingLevelState.objects.create(
+            level = acquire_overlay(
+                NSOLoggingLevelState,
                 management=self.management,
                 console_severity="WARNING",
                 status="accepted",

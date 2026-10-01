@@ -32,6 +32,8 @@ from netbox_nso_plugin.summary import (
     matches_device_value,
 )
 
+from ._ownership_case import acquire_overlay
+
 
 def _state(*, status="imported", accepted_at=None, attribute="description", nso_value=""):
     """Build a stand-in for an NSOInterfaceState row (only the fields the model reads)."""
@@ -285,7 +287,8 @@ class TestStatusBreakdown(TestCase):
         NSOInterfaceState.objects.all().delete()
         for n, (status, owned) in enumerate(rows):
             iface = self.Interface.objects.create(device=self.device, name=f"if{n}", type="virtual")
-            NSOInterfaceState.objects.create(
+            acquire_overlay(
+                NSOInterfaceState,
                 interface=iface,
                 attribute="description",
                 status=status,

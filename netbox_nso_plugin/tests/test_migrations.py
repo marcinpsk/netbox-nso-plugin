@@ -18,6 +18,7 @@ from django.db import connection, transaction
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
+from ._ownership_case import acquire_overlay
 from .mixins import _CascadeFlushMixin
 
 APP = "netbox_nso_plugin"
@@ -200,7 +201,8 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
 
         _device, management = make_managed("apply-migration", 1625)
         with without_commit_drain(), transaction.atomic():
-            row = NSOLoggingLevelState.objects.create(
+            row = acquire_overlay(
+                NSOLoggingLevelState,
                 management=management,
                 console_severity="WARNING",
                 status="accepted",

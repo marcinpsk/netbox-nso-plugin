@@ -11,6 +11,7 @@ from django.db import OperationalError
 from django.test import TestCase
 
 from ._adapter_http import make_session
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin
 
 _BASE_CFG = {
@@ -504,7 +505,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             instance=instance,
             circuit_type="level-1-2",
         )
-        state = NSOISISInterfaceState.objects.create(
+        state = acquire_overlay(
+            NSOISISInterfaceState,
             management=mgmt,
             interface=self.iface_ge0,
             af="ipv4",
@@ -530,7 +532,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         from netbox_nso_plugin.models import NSOISISInstanceState
 
         management = self._make_mgmt()
-        process_state = NSOISISInstanceState.objects.create(
+        process_state = acquire_overlay(
+            NSOISISInstanceState,
             management=management,
             process_tag="CORE",
             status="accepted",
@@ -569,7 +572,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             network_type="point-to-point",
             circuit_type="level-2-only",
         )
-        state = NSOISISInterfaceState.objects.create(
+        state = acquire_overlay(
+            NSOISISInterfaceState,
             management=mgmt,
             interface=self.iface_ge0,
             af="ipv4",
@@ -811,7 +815,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             instance=inst,
             bfd_enabled=True,
         )
-        NSOISISInterfaceState.objects.create(
+        acquire_overlay(
+            NSOISISInterfaceState,
             management=mgmt,
             interface=self.iface_ge1,
             af="ipv4",
@@ -850,7 +855,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             instance=inst,
             bfd_enabled=True,
         )
-        state = NSOISISInterfaceState.objects.create(
+        state = acquire_overlay(
+            NSOISISInterfaceState,
             management=mgmt,
             interface=self.iface_ge1,
             af="ipv4",
@@ -881,7 +887,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             instance=inst,
             bfd_enabled=True,
         )
-        state = NSOISISInterfaceState.objects.create(
+        state = acquire_overlay(
+            NSOISISInterfaceState,
             management=mgmt,
             interface=self.iface_ge0,
             af="ipv4",
@@ -1098,7 +1105,8 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
         # Pre-create a state row in 'accepted' status
-        NSOISISInterfaceState.objects.create(
+        acquire_overlay(
+            NSOISISInterfaceState,
             management=mgmt,
             interface=self.iface_ge0,
             af="ipv4",
@@ -1213,7 +1221,7 @@ class TestReconcileIsisProcess(TestCase):
             "processes"
         ][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": "CORE"}]})["processes"][0]
 
@@ -1260,7 +1268,7 @@ class TestReconcileIsisProcess(TestCase):
             "processes"
         ][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": "CORE"}]})["processes"][0]
 
@@ -1285,7 +1293,7 @@ class TestReconcileIsisProcess(TestCase):
             0
         ]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": ""}]})["processes"][0]
 
@@ -1321,7 +1329,7 @@ class TestReconcileIsisProcess(TestCase):
         inst.save(update_fields=["is_type"])
         state.is_type = "level-1-2"
         state.status = "accepted"
-        state.save(update_fields=["is_type", "status"])
+        save_overlay_fixture(state, update_fields=["is_type", "status"])
 
         # 3. The device still omits is-type — absence is not confirmation, nor permission to erase.
         state = reconcile_isis(self.device, {"processes": [{"process_tag": ""}]})["processes"][0]
@@ -1359,7 +1367,7 @@ class TestReconcileIsisProcess(TestCase):
             },
         )["processes"][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": "CORE"}]})["processes"][0]
 
@@ -1388,7 +1396,7 @@ class TestReconcileIsisProcess(TestCase):
             self.device, {"processes": [{"process_tag": "CORE", "levels": [{"level": 2, "wide_metrics_only": False}]}]}
         )["processes"][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": "CORE"}]})["processes"][0]
 
@@ -1404,7 +1412,7 @@ class TestReconcileIsisProcess(TestCase):
             self.device, {"processes": [{"process_tag": "CORE", "levels": [{"level": 2, "wide_metrics_only": False}]}]}
         )["processes"][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": "CORE", "levels": [{"level": 2}]}]})[
             "processes"
@@ -1420,7 +1428,7 @@ class TestReconcileIsisProcess(TestCase):
             "processes"
         ][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"processes": [{"process_tag": "CORE"}]})["processes"][0]
 
@@ -1452,7 +1460,7 @@ class TestReconcileIsisProcess(TestCase):
             "processes"
         ][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         corrected = dict(locator)
         corrected.pop("node_length")
         corrected.pop("function_length")
@@ -2118,7 +2126,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         }
         state = reconcile_isis(self.device, {"interfaces": [initial]})["interfaces"][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         corrected = {
             "interface_name": iface.name,
@@ -2160,7 +2168,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         }
         state = reconcile_isis(self.device, {"interfaces": [reported]})["interfaces"][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         state = reconcile_isis(self.device, {"interfaces": [reported]})["interfaces"][0]
 
@@ -2184,7 +2192,7 @@ class TestReconcileIsisInterfaceLevels(TestCase):
         }
         state = reconcile_isis(self.device, {"interfaces": [initial]})["interfaces"][0]
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         reported = dict(initial)
         reported["levels"] = [{"level": 2}]

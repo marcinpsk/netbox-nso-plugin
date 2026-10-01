@@ -18,6 +18,7 @@ from django.test import TestCase
 from django.urls import reverse
 
 from ._outbox_case import direct_test_selection
+from ._ownership_case import save_overlay_fixture
 
 
 class TestReconcileRoutePolicy(TestCase):
@@ -184,7 +185,7 @@ class TestReconcileRoutePolicy(TestCase):
         attempt_id = uuid4()
         st.status = "deploying"
         st.apply_attempt_id = attempt_id
-        st.save(update_fields=["status", "apply_attempt_id"])
+        save_overlay_fixture(st, update_fields=["status", "apply_attempt_id"])
 
         reconcile_route_policy(self.device, payload)
         st.refresh_from_db()
@@ -214,7 +215,7 @@ class TestReconcileRoutePolicy(TestCase):
         attempt_id = uuid4()
         state.status = "deploying"
         state.apply_attempt_id = attempt_id
-        state.save(update_fields=["status", "apply_attempt_id"])
+        save_overlay_fixture(state, update_fields=["status", "apply_attempt_id"])
 
         reconcile_route_policy(self.device, payload)
 
@@ -228,7 +229,6 @@ class TestReconcileRoutePolicy(TestCase):
         from uuid import uuid4
 
         from netbox_nso_plugin import apply_state, delivery
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
@@ -255,9 +255,8 @@ class TestReconcileRoutePolicy(TestCase):
             mode="local",
         )
         for row in (master, local, attached_local):
-            with intent_transaction(footprint_for_instance(row)):
-                row.status = "accepted"
-                row.save(update_fields=["status"])
+            row.status = "accepted"
+            save_overlay_fixture(row, update_fields=["status"])
 
         registry = delivery.delivery_keys()
         pushed = {}
@@ -292,7 +291,6 @@ class TestReconcileRoutePolicy(TestCase):
         """Accept one LOCAL route-policy row per name and return the promotion inputs."""
         from types import SimpleNamespace
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
@@ -314,9 +312,8 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(len(rows), len(names))
         for row in rows:
             self.assertEqual(row.object_id is not None, materialized)
-            with intent_transaction(footprint_for_instance(row)):
-                row.status = "accepted"
-                row.save(update_fields=["status"])
+            row.status = "accepted"
+            save_overlay_fixture(row, update_fields=["status"])
         prepared = SimpleNamespace(management=management, rows=rows)
         self._refresh_pushed_snapshot(prepared, device)
         return prepared
@@ -472,7 +469,6 @@ class TestReconcileRoutePolicy(TestCase):
         from uuid import uuid4
 
         from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
 
@@ -484,9 +480,8 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(_group_mode(row.family, row.object_name), "local")
         self.assertEqual(row.classification_mode, "local")
         self.assertIsNone(row.object_id)
-        with intent_transaction(footprint_for_instance(row)):
-            row.status = "accepted"
-            row.save(update_fields=["status"])
+        row.status = "accepted"
+        save_overlay_fixture(row, update_fields=["status"])
         prepared = SimpleNamespace(management=management, rows=[row])
         self._refresh_pushed_snapshot(prepared, self.device)
 
@@ -1550,7 +1545,7 @@ class TestReconcileRoutePolicy(TestCase):
         st = NSORoutePolicyState.objects.get(family="prefix_list", object_name="PL-OWN")
         st.status = "accepted"
         st.accepted_at = timezone.now()
-        st.save(update_fields=["status", "accepted_at"])
+        save_overlay_fixture(st, update_fields=["status", "accepted_at"])
 
         reconcile_route_policy(
             self.device,
@@ -1608,7 +1603,7 @@ class TestReconcileRoutePolicy(TestCase):
         st = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-KEEP")
         st.status = "accepted"
         st.accepted_at = timezone.now()
-        st.save(update_fields=["status", "accepted_at"])
+        save_overlay_fixture(st, update_fields=["status", "accepted_at"])
 
         reconcile_route_policy(self.device, {"route_maps": []})  # device removed it
         st.refresh_from_db()
@@ -1647,7 +1642,6 @@ class TestReconcileRoutePolicy(TestCase):
         """in_sync -> changed drops the owned group from the wire, so the plan must bump."""
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
@@ -1655,9 +1649,8 @@ class TestReconcileRoutePolicy(TestCase):
         seeded = {"route_maps": [{"name": "RM-SYNCED", "entries": [{"sequence": 10, "action": "permit"}]}]}
         reconcile_route_policy(self.device, seeded)
         state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-SYNCED")
-        with intent_transaction(footprint_for_instance(state)):
-            state.status = "in_sync"
-            state.save(update_fields=["status"])
+        state.status = "in_sync"
+        save_overlay_fixture(state, update_fields=["status"])
         before = self._rp_revision()
 
         empty = {"route_maps": []}
@@ -1675,7 +1668,6 @@ class TestReconcileRoutePolicy(TestCase):
         """An accepted row keeps its status on absence: flags only, no bump."""
         from netbox_routing.models import RouteMap
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy, route_policy_reconcile_plan
 
@@ -1683,9 +1675,8 @@ class TestReconcileRoutePolicy(TestCase):
         seeded = {"route_maps": [{"name": "RM-ACCEPTED", "entries": [{"sequence": 10, "action": "permit"}]}]}
         reconcile_route_policy(self.device, seeded)
         state = NSORoutePolicyState.objects.get(family="route_map", object_name="RM-ACCEPTED")
-        with intent_transaction(footprint_for_instance(state)):
-            state.status = "accepted"
-            state.save(update_fields=["status"])
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=["status"])
         before = self._rp_revision()
 
         empty = {"route_maps": []}
@@ -1833,7 +1824,7 @@ class TestDeviceCaughtUpSettle(TestCase):
         st = NSORoutePolicyState.objects.get(family=family, object_name=name)
         st.status = "accepted"
         st.accepted_at = timezone.now()
-        st.save(update_fields=["status", "accepted_at"])
+        save_overlay_fixture(st, update_fields=["status", "accepted_at"])
         return st
 
     def test_accepted_settles_when_device_matches_current_object(self):

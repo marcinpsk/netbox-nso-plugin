@@ -19,6 +19,7 @@ from netbox_nso_plugin.models import (
 )
 
 from ._outbox_case import content_update, mirror_update
+from ._ownership_case import acquire_overlay
 
 
 class NSOInstanceAPITest(APITestCase):
@@ -254,8 +255,8 @@ class NSOInterfaceStateAPITest(APITestCase):
     def test_status_filter_applies(self):
         """?status= must actually filter — the viewset now declares filterset_class. Before, an
         unrecognized filter param was silently ignored and every row was returned."""
-        other = NSOInterfaceState.objects.create(
-            interface=self.state.interface, attribute="enabled", status="accepted", nso_value="true"
+        other = acquire_overlay(
+            NSOInterfaceState, interface=self.state.interface, attribute="enabled", status="accepted", nso_value="true"
         )
         response = self.client.get(f"{self._get_list_url()}?status=accepted", **self.header)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -263,13 +264,8 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.assertIn(other.pk, ids)
         self.assertNotIn(self.state.pk, ids)  # the 'changed' row is filtered out
 
-    def test_accepting_through_the_api_enqueues_exactly_one_push(self):
-        """The API write and its outbox enqueue land together, or neither does.
-
-        NetBoxModelViewSet saves inside a transaction and the enqueue rides the same
-        post_save signal the UI uses, so the REST path owes the same guarantee as the tab:
-        an accepted overlay the adapter is never told about is silent drift.
-        """
+    def test_accepting_through_the_api_is_refused(self):
+        """Refuse REST ownership and enqueue no delivery."""
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
 
         self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
@@ -287,10 +283,10 @@ class NSOInterfaceStateAPITest(APITestCase):
             self._get_detail_url(self.state), {"status": "accepted"}, format="json", **self.header
         )
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.state.refresh_from_db()
-        self.assertEqual(self.state.status, "accepted")
-        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=device, scope="interface").count(), 1)
+        self.assertNotEqual(self.state.status, "accepted")
+        self.assertEqual(NSOIntentOutboxEntry.objects.filter(device=device, scope="interface").count(), 0)
 
     def test_content_edit_through_the_api_reopens_an_owned_row(self):
         self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
@@ -308,7 +304,7 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.assertEqual(self.state.attribute, "enabled")
         self.assertEqual(self.state.status, "accepted")
 
-    def test_content_edit_through_the_api_preserves_an_explicit_status(self):
+    def test_content_edit_with_a_status_is_refused(self):
         self.add_permissions("netbox_nso_plugin.change_nsointerfacestate")
         content_update(self.state, status="in_sync")
 
@@ -319,9 +315,9 @@ class NSOInterfaceStateAPITest(APITestCase):
             **self.header,
         )
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.state.refresh_from_db()
-        self.assertEqual(self.state.attribute, "enabled")
+        self.assertNotEqual(self.state.attribute, "enabled")
         self.assertEqual(self.state.status, "in_sync")
 
     def test_patch_preserves_serializer_tag_and_custom_field_handling(self):

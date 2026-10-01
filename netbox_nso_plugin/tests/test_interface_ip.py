@@ -12,6 +12,7 @@ from django.test import TestCase, TransactionTestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_bulk_update
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _BASE_CFG = {
@@ -408,7 +409,8 @@ class TestReconcileInterfaceIps(TestCase):
             assigned_object_id=self.iface2.pk,
         )
 
-        NSOInterfaceIPState.objects.create(
+        acquire_overlay(
+            NSOInterfaceIPState,
             interface=self.iface2,
             address="10.50.0.1/24",
             vrf="",
@@ -710,7 +712,8 @@ class TestInterfaceIPReassignment(IntentPushDeliveryMixin, TestCase):
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
         ip = IPAddress.objects.create(address="10.44.0.1/24", assigned_object=self.if_a)
-        NSOInterfaceIPState.objects.create(
+        acquire_overlay(
+            NSOInterfaceIPState,
             interface=self.if_a,
             address="10.44.0.1/24",
             status="accepted",

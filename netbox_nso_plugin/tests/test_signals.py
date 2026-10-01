@@ -20,7 +20,10 @@ from django.db import connections, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
@@ -48,7 +51,9 @@ def _invoke_push_intent_on_accept(state):
     candidate = copy.copy(state)
     candidate.accepted_at = (candidate.accepted_at or timezone.now()) + timedelta(microseconds=1)
     fields = ("accepted_at",)
-    plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+    plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
+    )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         writer.save(candidate, update_fields=fields)
@@ -1868,8 +1873,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_svi_intent") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOSVIState.objects.create(
-                management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
+            row = acquire_overlay(
+                NSOSVIState, management=mgmt, interface=self.iface, vlan=vlan, svi_type="irb", status="accepted"
             )
         mock_put = self._delete_pushes(row, "put_svi_intent")
         _dev, interfaces = mock_put.call_args[0]
@@ -1886,8 +1891,13 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_subinterface_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOSubinterfaceState.objects.create(
-                management=mgmt, interface=child, parent_interface=self.iface, dot1q_vlan=99, status="accepted"
+            row = acquire_overlay(
+                NSOSubinterfaceState,
+                management=mgmt,
+                interface=child,
+                parent_interface=self.iface,
+                dot1q_vlan=99,
+                status="accepted",
             )
         self._delete_pushes(row, "put_subinterface_intent")
 
@@ -1899,7 +1909,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_logging_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOLoggingHostState.objects.create(management=mgmt, address="198.51.100.7", status="accepted")
+            row = acquire_overlay(NSOLoggingHostState, management=mgmt, address="198.51.100.7", status="accepted")
         mock_put = self._delete_pushes(row, "put_logging_intent")
         self.assertEqual(mock_put.call_args[0][1], [])
 
@@ -1911,8 +1921,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOInterfaceMtuState.objects.create(
-                management=mgmt, interface=self.iface, l2_mtu=9000, status="accepted"
+            row = acquire_overlay(
+                NSOInterfaceMtuState, management=mgmt, interface=self.iface, l2_mtu=9000, status="accepted"
             )
         self._delete_pushes(row, "put_interface_mtu_intent")
 
@@ -1929,7 +1939,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch(f"netbox_nso_plugin.adapter_client.{patch_target}") as mock_put,
             self.captureOnCommitCallbacks(execute=True),
         ):
-            plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+            plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row),))
             with renderer_writes(plan) as writer:
                 writer.delete(row)
         mock_put.assert_called_once()
@@ -1951,7 +1961,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOInterfaceState.objects.create(
+            row = acquire_overlay(
+                NSOInterfaceState,
                 interface=self.iface,
                 attribute="description",
                 nso_value="owned-by-nso",
@@ -1968,7 +1979,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         mgmt = self._mgmt()
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=105, name="del-v105")
         with patch("netbox_nso_plugin.adapter_client.put_vlan_intent"), self.captureOnCommitCallbacks(execute=True):
-            row = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="del-v105", status="accepted")
+            row = acquire_overlay(NSOVLANState, management=mgmt, vlan=vlan, device_name="del-v105", status="accepted")
         self._delete_pushes(row, "put_vlan_intent")
 
     def test_bfd_delete_pushes_reduced_snapshot(self):
@@ -1976,8 +1987,14 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_bfd_intent"), self.captureOnCommitCallbacks(execute=True):
-            row = NSOBFDInterfaceState.objects.create(
-                management=mgmt, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
+            row = acquire_overlay(
+                NSOBFDInterfaceState,
+                management=mgmt,
+                interface=self.iface,
+                min_tx=300,
+                min_rx=300,
+                multiplier=3,
+                status="accepted",
             )
         self._delete_pushes(row, "put_bfd_intent")
 
@@ -1995,8 +2012,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOStaticRouteState.objects.create(
-                management=mgmt, static_route=route, nso_prefix="198.18.99.0/24", status="accepted"
+            row = acquire_overlay(
+                NSOStaticRouteState, management=mgmt, static_route=route, nso_prefix="198.18.99.0/24", status="accepted"
             )
         self._delete_pushes(row, "put_static_route_intent")
 
@@ -2008,18 +2025,20 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.98.0/24", next_hop="198.18.0.1", metric=1)
-        row = NSOStaticRouteState.objects.create(
+        row = acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=route,
             nso_prefix="198.18.98.0/24",
             status="accepted",
         )
-        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+        baseline_entries = set(NSOIntentOutboxEntry.objects.values_list("pk", flat=True))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row),))
 
         with self.captureOnCommitCallbacks(execute=False), renderer_writes(plan) as writer:
             writer.delete(row)
 
-        entry = NSOIntentOutboxEntry.objects.get(
+        entry = NSOIntentOutboxEntry.objects.exclude(pk__in=baseline_entries).get(
             device=self.device,
             scope="static_route",
             consumed_by_push_seq__isnull=True,
@@ -2045,7 +2064,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOL2SapState.objects.create(
+            row = acquire_overlay(
+                NSOL2SapState,
                 management=mgmt,
                 service_name="TL",
                 service_type="epipe",
@@ -2069,7 +2089,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_l2_sap_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOL2SapState.objects.create(
+            row = acquire_overlay(
+                NSOL2SapState,
                 management=mgmt,
                 service_name="TL",
                 service_type="epipe",
@@ -2088,8 +2109,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_isis_flex_algo_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOISISFlexAlgoState.objects.create(
-                management=mgmt, process_tag="CORE", algo_id=130, status="accepted"
+            row = acquire_overlay(
+                NSOISISFlexAlgoState, management=mgmt, process_tag="CORE", algo_id=130, status="accepted"
             )
         self._delete_pushes(row, "put_isis_flex_algo_intent")
 
@@ -2101,8 +2122,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOISISInterfaceState.objects.create(
-                management=mgmt, interface=self.iface, af="ipv4", status="accepted"
+            row = acquire_overlay(
+                NSOISISInterfaceState, management=mgmt, interface=self.iface, af="ipv4", status="accepted"
             )
         self._delete_pushes(row, "put_isis_interface_intent")
 
@@ -2116,7 +2137,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_isis_interface_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSOISISInstanceState.objects.create(management=mgmt, process_tag="CORE", status="accepted")
+            row = acquire_overlay(NSOISISInstanceState, management=mgmt, process_tag="CORE", status="accepted")
         mock_put = self._delete_pushes(row, "put_isis_interface_intent")
         self.assertEqual(mock_put.call_args.kwargs.get("processes"), [])
 
@@ -2147,7 +2168,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 remote_as=remote_as,
                 enabled=True,
             )
-            row = NSOBGPPeerState.objects.create(
+            row = acquire_overlay(
+                NSOBGPPeerState,
                 management=mgmt,
                 bgp_peer=peer,
                 asn_str=str(local_as.asn),
@@ -2164,7 +2186,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
-            row = NSORedistributionState.objects.create(
+            row = acquire_overlay(
+                NSORedistributionState,
                 management=mgmt,
                 dest_protocol="bgp",
                 dest_ref="65100::ipv4-unicast",
@@ -2186,7 +2209,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             patch("netbox_nso_plugin.adapter_client.put_route_policy_intent"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            row = NSORoutePolicyState.objects.create(
+            row = acquire_overlay(
+                NSORoutePolicyState,
                 management=mgmt,
                 family="prefix_list",
                 object_name=pl.name,
@@ -2201,8 +2225,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_ospf_intent"), self.captureOnCommitCallbacks(execute=True):
-            row = NSOOSPFInstanceState.objects.create(
-                management=mgmt, process_id="999", ospf_instance=None, status="accepted"
+            row = acquire_overlay(
+                NSOOSPFInstanceState, management=mgmt, process_id="999", ospf_instance=None, status="accepted"
             )
         self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
 
@@ -2211,8 +2235,13 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_ospf_intent"), self.captureOnCommitCallbacks(execute=True):
-            row = NSOOSPFInterfaceState.objects.create(
-                management=mgmt, interface=self.iface, process_id="10", area_id="0.0.0.0", status="accepted"
+            row = acquire_overlay(
+                NSOOSPFInterfaceState,
+                management=mgmt,
+                interface=self.iface,
+                process_id="10",
+                area_id="0.0.0.0",
+                status="accepted",
             )
         self._delete_pushes(row, "put_ospf_intent", expect_empty_list=False)
 
@@ -2230,7 +2259,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             auto_apply=True,
         )
         lag = Interface.objects.create(device=self.device, name="Port-channel10", type="lag")
-        row = NSOLACPBundleState.objects.create(
+        row = acquire_overlay(
+            NSOLACPBundleState,
             management=mgmt,
             interface=lag,
             lag_id=10,
@@ -2255,7 +2285,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         )
         lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
         member_iface = Interface.objects.create(device=self.device, name="Gi9/1", type="1000base-t")
-        NSOLACPBundleState.objects.create(
+        acquire_overlay(
+            NSOLACPBundleState,
             management=mgmt,
             interface=lag,
             lag_id=11,
@@ -2264,7 +2295,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             timer="fast",
             status="accepted",
         )
-        member = NSOLACPMemberState.objects.create(
+        member = acquire_overlay(
+            NSOLACPMemberState,
             management=mgmt,
             interface=member_iface,
             lag_bundle=lag,
@@ -2285,7 +2317,9 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             adapter_device_id=42,
             auto_apply=True,
         )
-        row = NSOSwitchportState.objects.create(management=mgmt, interface=self.iface, mode="trunk", status="accepted")
+        row = acquire_overlay(
+            NSOSwitchportState, management=mgmt, interface=self.iface, mode="trunk", status="accepted"
+        )
         self._delete_switching_overlay(row, "switchport", self.iface.name)
 
     def _delete_switching_overlay(self, row, scope, root_name):
@@ -2293,7 +2327,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry, NSOSwitchingRootDeletion
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
-        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row),))
         with renderer_writes(plan) as writer:
             writer.delete(row)
         roots = set(
@@ -2390,7 +2424,8 @@ class TestDeleteOriginMarking(_SignalDBBase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         plan = RendererMutationPlan.build(
-            saves=(planned_save(state, natural_key=("management", "interface", "vlan", "svi_type")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(state, natural_key=("management", "interface", "vlan", "svi_type")),),
         )
         with self._arranged(), renderer_writes(plan) as writer:
             writer.save(state)
@@ -2400,7 +2435,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
     def _delete_with_writer(row):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
-        plan = RendererMutationPlan.build(deletes=(planned_delete(row),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row),))
         with renderer_writes(plan) as writer:
             writer.delete(row)
 
@@ -2408,7 +2443,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
     def _delete_native_and_overlay_with_writer(native, state):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
-        plan = RendererMutationPlan.build(deletes=(planned_delete(state), planned_delete(native)))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), deletes=(planned_delete(state), planned_delete(native))
+        )
         with renderer_writes(plan) as writer:
             writer.delete(state)
             writer.delete(native)
@@ -2417,7 +2454,9 @@ class TestDeleteOriginMarking(_SignalDBBase):
     def _save_with_writer(row, *, natural_key=()):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
-        plan = RendererMutationPlan.build(saves=(planned_save(row, natural_key=natural_key),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(row, natural_key=natural_key),)
+        )
         with renderer_writes(plan) as writer:
             writer.save(row)
 
@@ -2635,7 +2674,7 @@ class TestDeleteOriginMarking(_SignalDBBase):
             status="accepted",
         )
         with self._arranged(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+            save_overlay_fixture(state)
         device_id = self.device.pk
 
         calls = self._recorded_calls(self.device.delete)
@@ -2850,7 +2889,7 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
         other = self._second_managed_device()
         state = NSOISISFlexAlgoState(management=management, process_tag="CORE", algo_id=133, status="accepted")
         with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+            save_overlay_fixture(state)
 
         footprint = MutationFootprint.for_keys(
             {(other.pk, "isis_flex_algo")},
@@ -2887,7 +2926,7 @@ class TestOwnedWriteOutsideThePermitFootprint(_SignalDBBase):
         management = self._make_mgmt(adapter_device_id=42)
         state = NSOISISFlexAlgoState(management=management, process_tag="CORE", algo_id=134, status="accepted")
         with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+            save_overlay_fixture(state)
         revision, _ = NSOIntentRevision.objects.get_or_create(device=self.device, scope="isis_flex_algo")
         before = revision.revision
 
@@ -2979,7 +3018,7 @@ class TestOwnedRemovalIsDerivedUnderTheLocks(_CascadeFlushMixin, IntentPushReset
                 state.status = "accepted"
                 state.accepted_at = timezone.now()
                 with without_commit_drain(), transaction.atomic():
-                    state.save(update_fields=["status", "accepted_at"])
+                    save_overlay_fixture(state, update_fields=["status", "accepted_at"])
                 revision = NSOIntentRevision.objects.get(device=self.device, scope="isis_flex_algo")
                 accepted_revision = revision.revision
             finally:
