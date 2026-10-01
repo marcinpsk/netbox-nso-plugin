@@ -78,6 +78,7 @@ SOURCE_MODEL_RANKS = (
     "netbox_nso_plugin.nsoroutepolicyobjectclass",
     "netbox_nso_plugin.nsoplatformnedmapping",
     "netbox_nso_plugin.nsoswitchportstate_tagged_vlans",
+    "netbox_nso_plugin.nsoownershipmanifest",
 )
 OVERLAY_MODEL_RANKS = (
     "netbox_nso_plugin.nsointerfacestate",
@@ -259,7 +260,6 @@ _PROMOTED_CONTENT_FIELDS = {
     "netbox_nso_plugin.nsolacpmemberstate": {
         "management",
         "interface",
-        "lag_bundle",
         "mode",
         "port_priority",
     },
@@ -716,92 +716,69 @@ def normalize_overlay_lifecycle(instance, update_fields=None):
 
 
 def _lacp_bundle_fragment(instance):
-    """Use the same pure helper as the nested LACP delivery renderer."""
+    """Use native topology and the nested LACP delivery serializer."""
+    from .lacp_topology import is_bundle, member_states
     from .signals import lacp_bundle_intent_item, lacp_member_intent_item
     from .status_machine import OWNED_STATES
 
-    if instance.status not in OWNED_STATES or instance.vpc_sensitive:
+    if (
+        instance.status not in OWNED_STATES
+        or instance.vpc_sensitive
+        or not is_bundle(instance.interface, instance.management.device_id)
+    ):
         return ABSENT
-    Member = apps.get_model("netbox_nso_plugin.nsolacpmemberstate")
-    members = (
-        lacp_member_intent_item(member)
-        for member in Member.objects.filter(
-            management_id=instance.management_id,
-            lag_bundle_id=instance.interface_id,
-            status__in=OWNED_STATES,
-        ).select_related("interface")
-    )
+    members = (lacp_member_intent_item(member) for member in member_states(instance).filter(status__in=OWNED_STATES))
     return _normal(lacp_bundle_intent_item(instance, members))
 
 
 def _lacp_member_fragment(instance):
+    from .lacp_topology import bundle_of
     from .signals import lacp_member_intent_item
     from .status_machine import OWNED_STATES
 
     if instance.status not in OWNED_STATES:
         return ABSENT
+    bundle = bundle_of(instance.interface)
+    if bundle is None or instance.interface.device_id != instance.management.device_id:
+        return ABSENT
     Bundle = apps.get_model("netbox_nso_plugin.nsolacpbundlestate")
     if not Bundle.objects.filter(
-        management_id=instance.management_id,
-        interface_id=instance.lag_bundle_id,
-        status__in=OWNED_STATES,
-        vpc_sensitive=False,
+        management_id=instance.management_id, interface_id=bundle.pk, status__in=OWNED_STATES, vpc_sensitive=False
     ).exists():
         return ABSENT
     return _normal(lacp_member_intent_item(instance))
 
 
 def _lacp_bundle_dependencies(before, after, spec):
-    """Resolve the member rows nested below a proposed LACP bundle write."""
-    Member = apps.get_model("netbox_nso_plugin.nsolacpmemberstate")
-    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
-    pairs = {(row.management_id, row.interface_id) for row in candidates}
-    member_rows = tuple(
-        member
-        for management_id, interface_id in sorted(pairs)
-        for member in Member.objects.filter(
-            management_id=management_id,
-            lag_bundle_id=interface_id,
-        ).order_by("pk")
-    )
-    interface_ids = {
-        interface_id for row in candidates for interface_id in (row.interface_id,) if interface_id is not None
-    }
-    interface_ids.update(member.interface_id for member in member_rows)
+    """Lock the native members and their overlays for both bundle pre-images."""
+    from .lacp_topology import member_states
+
+    candidates = tuple(row for row in (before, after) if row is not None)
+    members = {(row._meta.label_lower, row.pk): row for candidate in candidates for row in member_states(candidate)}
+    interface_ids = {row.interface_id for row in candidates} | {row.interface_id for row in members.values()}
     return MutationFootprint.for_keys(
         (key for row in candidates for key in spec.resolver(row, spec)),
-        source_rows=(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
-        overlay_rows=(SourceRow(member._meta.label_lower, member.pk) for member in member_rows),
+        source_rows=(SourceRow("dcim.interface", pk) for pk in interface_ids),
+        overlay_rows=(SourceRow(label, pk) for label, pk in members),
     ), False
 
 
 def _lacp_member_dependencies(before, after, spec):
-    """Resolve both containing bundles for a proposed LACP member write."""
+    """Lock the native member and its containing bundle overlays."""
+    from .lacp_topology import bundle_of
+
     Bundle = apps.get_model("netbox_nso_plugin.nsolacpbundlestate")
-    candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
-    management_ids = {row.management_id for row in candidates}
-    interface_ids = {
-        interface_id
-        for row in candidates
-        for interface_id in (row.interface_id, row.lag_bundle_id)
-        if interface_id is not None
-    }
-    bundles = tuple(
-        Bundle.objects.filter(
-            management_id__in=management_ids,
-            interface_id__in=interface_ids,
-        ).order_by("pk")
-    )
-    before_fragment = ABSENT if before is None else _lacp_member_fragment(before)
-    after_fragment = ABSENT if after is None else _lacp_member_fragment(after)
-    placement_changed = (None if before is None else (before.management_id, before.lag_bundle_id)) != (
-        None if after is None else (after.management_id, after.lag_bundle_id)
+    candidates = tuple(row for row in (before, after) if row is not None)
+    parents = {bundle.pk for row in candidates if (bundle := bundle_of(row.interface)) is not None}
+    interfaces = {row.interface_id for row in candidates} | parents
+    bundles = Bundle.objects.filter(
+        management_id__in={row.management_id for row in candidates}, interface_id__in=parents
     )
     return MutationFootprint.for_keys(
         (key for row in candidates for key in spec.resolver(row, spec)),
-        source_rows=(SourceRow("dcim.interface", interface_id) for interface_id in interface_ids),
-        overlay_rows=(SourceRow(bundle._meta.label_lower, bundle.pk) for bundle in bundles),
-    ), placement_changed and (before_fragment != ABSENT or after_fragment != ABSENT)
+        source_rows=(SourceRow("dcim.interface", pk) for pk in interfaces),
+        overlay_rows=(SourceRow(row._meta.label_lower, row.pk) for row in bundles),
+    ), False
 
 
 def _vlan_state_dependencies(before, after, spec):
@@ -834,9 +811,12 @@ def _svi_dependencies(before, after, spec):
     candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
     interface_ids = {row.interface_id for row in candidates if row.interface_id is not None}
     vlan_ids = {row.vlan_id for row in candidates if row.vlan_id is not None}
+    Interface = apps.get_model("dcim.interface")
+    native_device_ids = set(Interface.objects.filter(pk__in=interface_ids).values_list("device_id", flat=True))
     return MutationFootprint.for_keys(
         (
             *(key for row in candidates for key in spec.resolver(row, spec)),
+            *_management_keys(native_device_ids, spec.scopes),
             *_vlan_anchor_keys(vlan_ids, spec.scopes),
         ),
         shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
@@ -870,16 +850,37 @@ def _switchport_dependencies(before, after, spec):
 
 
 def _interface_dependencies(before, after, spec):
-    """Lock VLAN anchors read by an exact native interface write."""
+    """Lock VLAN anchors and LACP overlays for a native interface write."""
     candidates = tuple(candidate for candidate in (before, after) if candidate is not None)
     vlan_ids = {row.untagged_vlan_id for row in candidates if row.untagged_vlan_id is not None}
     for row in candidates:
         if row.pk is not None and not row._state.adding:
             vlan_ids.update(row.tagged_vlans.values_list("pk", flat=True))
-    return MutationFootprint.for_keys(
-        _vlan_anchor_keys(vlan_ids, spec.scopes),
-        shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
-        source_rows=(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+    from .lacp_topology import interface_overlay_querysets
+
+    parents = {row.lag_id for row in candidates if row.lag_id is not None}
+    overlays = {
+        (row._meta.label_lower, row.pk): row
+        for interface_id in {candidate.pk for candidate in candidates if candidate.pk is not None}
+        for queryset in interface_overlay_querysets(interface_id, lag_ids=parents)
+        for row in queryset
+    }
+    topology = MutationFootprint.for_keys(
+        (
+            (row.management.device_id, scope)
+            for row in overlays.values()
+            for scope in _REGISTRY[row._meta.label_lower].scopes
+        ),
+        source_rows=(SourceRow("dcim.interface", pk) for pk in parents),
+        overlay_rows=(SourceRow(label, pk) for label, pk in overlays),
+    )
+    return MutationFootprint.merge(
+        topology,
+        MutationFootprint.for_keys(
+            _vlan_anchor_keys(vlan_ids, spec.scopes),
+            shared_keys=(("vlan", str(vlan_id)) for vlan_id in vlan_ids),
+            source_rows=(SourceRow("ipam.vlan", vlan_id) for vlan_id in vlan_ids),
+        ),
     ), False
 
 
@@ -1639,6 +1640,7 @@ def _interface_overlay_querysets(interface_id):
     """Return each overlay query whose renderer reads this interface's name."""
     from django.db.models import Q
 
+    from .lacp_topology import interface_overlay_querysets
     from .models import (
         NSOBFDInterfaceState,
         NSOBGPPeerState,
@@ -1646,8 +1648,6 @@ def _interface_overlay_querysets(interface_id):
         NSOInterfaceMtuState,
         NSOInterfaceState,
         NSOISISInterfaceState,
-        NSOLACPBundleState,
-        NSOLACPMemberState,
         NSOOSPFInterfaceState,
         NSOSubinterfaceState,
         NSOSVIState,
@@ -1664,8 +1664,7 @@ def _interface_overlay_querysets(interface_id):
         NSOISISInterfaceState.objects.filter(interface_id=interface_id),
         NSOBGPPeerState.objects.filter(bgp_peer__update_source_id=interface_id),
         NSOOSPFInterfaceState.objects.filter(interface_id=interface_id),
-        NSOLACPBundleState.objects.filter(interface_id=interface_id),
-        NSOLACPMemberState.objects.filter(Q(interface_id=interface_id) | Q(lag_bundle_id=interface_id)),
+        *interface_overlay_querysets(interface_id),
         NSOSwitchportState.objects.filter(interface_id=interface_id),
     )
 
@@ -2884,7 +2883,7 @@ def register_builtin_renderer_inputs() -> None:
         if label == "dcim.device":
             content_fields = {"platform"}
         elif label == "dcim.interface":
-            content_fields = {"device", "name", "description", "enabled", "parent"}
+            content_fields = {"device", "name", "description", "enabled", "parent", "type", "lag"}
         else:
             content_fields = _PROMOTED_CONTENT_FIELDS.get(label)
         _register(

@@ -621,3 +621,18 @@ rules:
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**", "**/migrations/**"]
+  - id: nso-lacp-observation-is-not-intent
+    languages: [python]
+    severity: ERROR
+    message: Read reported LACP members only in the LACP reconciler, topology, or view code.
+    pattern-either:
+      - pattern: $OBJECT.observed_members
+      - pattern: getattr($OBJECT, "observed_members", ...)
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/lacp_reconciler.py"
+        - "**/lacp_topology.py"
+        - "**/views.py"

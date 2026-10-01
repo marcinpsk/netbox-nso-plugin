@@ -156,6 +156,10 @@ def apply_description_for_role(interface, role, other_end=None, push=True, *, mg
             result["error"] = reason
             return result
 
+    if "description" not in mgmt.managed_attributes:
+        result["skipped"] = "device does not manage descriptions"
+        return result
+
     new_value = render_template(role.description_template, self_iface=interface, peer_iface=other_end)
     changed = interface.description != new_value
 
@@ -212,6 +216,7 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     from .ip_autoassign import _resolve_managed_mgmt
     from .models import NSOISISInterfaceState, NSOOSPFInterfaceState
     from .ownership_grants import OwnershipGrant
+    from .ownership_planner import OwnershipNotQualified, require_qualifying_ownership
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
     from .signals import _schedule_intent_push, suppress_intent_push
 
@@ -256,6 +261,12 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     state = copy.copy(current) if current is not None else state_model(**lookup)
     for name, value in values.items():
         setattr(state, name, value)
+
+    try:
+        require_qualifying_ownership(state)
+    except OwnershipNotQualified as exc:
+        result["error"] = str(exc)
+        return result
     fields = None if current is None else tuple(values)
     plan = RendererMutationPlan.build(
         saves=(planned_save(state, update_fields=fields, force_insert=current is None, natural_key=tuple(lookup)),),

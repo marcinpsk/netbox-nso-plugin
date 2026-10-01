@@ -103,6 +103,14 @@ class TestOwnershipGrants(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(manifest.ownership_state, "owned")
         self.assertEqual(manifest.grant_kind, kind)
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        with without_commit_drain():
+            self.assertEqual(reconcile_scope_ownership(device_id, (scope,)), (), self._testMethodName)
+        row.refresh_from_db()
+        manifest.refresh_from_db()
+        self.assertIn(row.status, sm.OWNED_STATES)
+        self.assertEqual(manifest.ownership_state, "owned")
 
     def test_unclassified_owned_insert_is_refused(self):
         for status in sm.OWNED_STATES:

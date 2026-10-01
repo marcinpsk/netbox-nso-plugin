@@ -89,6 +89,7 @@ from .models import (
     NSOVLANState,
 )
 from .ownership_grants import OwnershipGrant
+from .ownership_planner import OwnershipNotQualified
 from .signals import _STATIC_ROUTE_ARMED_FIELDS, _schedule_intent_push
 from .tables import (
     NSODerivedIntentTemplateTable,
@@ -188,7 +189,14 @@ class NSOActionPermissionMixin(LoginRequiredMixin):
             required = (required,)
         if request.user.is_authenticated and not all(request.user.has_perm(perm) for perm in required):
             raise PermissionDenied
-        return super().dispatch(request, *args, **kwargs)
+        try:
+            return super().dispatch(request, *args, **kwargs)
+        except OwnershipNotQualified as exc:
+            is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            if is_ajax or "key" in kwargs or exc.device_id is None:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=400)
+            messages.error(request, str(exc))
+            return redirect(_device_nso_tab_url(exc.device_id))
 
 
 # ── Device NSO Tab (registered into dcim.Device detail) ──────────────────────
@@ -393,14 +401,7 @@ def _persisted_category_context(device, mgmt, key: str) -> dict:
         return {"interface_mtu_states": by_mgmt(NSOInterfaceMtuState, "interface")}
     if key == "lacp":
         bundles = (
-            []
-            if mgmt is None
-            else list(
-                NSOLACPBundleState.objects.filter(management=mgmt)
-                .select_related("interface")
-                # The template lists members via bundle.interface.nso_lacp_member_bundles.
-                .prefetch_related("interface__nso_lacp_member_bundles__interface")
-            )
+            [] if mgmt is None else list(NSOLACPBundleState.objects.filter(management=mgmt).select_related("interface"))
         )
         return {"lacp_bundle_states": bundles}
     if key == "logging":
@@ -1227,11 +1228,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
             ]
 
         def lacp_member_states(state):
-            return [
-                member
-                for member in state.interface.nso_lacp_member_bundles.all()
-                if member.management_id == state.management_id
-            ]
+            from .lacp_topology import member_states
+
+            return list(member_states(state))
 
         def lacp_members(state):
             return [
@@ -1250,11 +1249,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "sections": {
                     None: dict(
                         ctx="lacp_bundle_states",
-                        qs=lambda d: (
-                            by_device(NSOLACPBundleState, d, "interface")
-                            .prefetch_related("interface__nso_lacp_member_bundles__interface")
-                            .order_by("interface__name")
-                        ),
+                        qs=lambda d: by_device(NSOLACPBundleState, d, "interface").order_by("interface__name"),
                         accept=r + "lacp_accept_bundle",
                         related=lacp_member_states,
                         fields={
@@ -1269,6 +1264,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             # bundles are not onboardable (Accept is refused for them).
                             "vpc_sensitive": lambda st: st.vpc_sensitive,
                             "members": lacp_members,
+                            "observed_members": lambda st: st.observed_members,
+                            "device_present": lambda st: st.device_present,
                             "edit_url": lambda st: reverse(r + "overlay_field_edit", args=["lacp_bundle", st.pk]),
                         },
                     )
@@ -4418,6 +4415,8 @@ def _static_route_errors(obj):
 
 def _lacp_errors(key, obj):
     """Validate LACP knobs against the uint16/string contract exposed by NSO."""
+    from .lacp_topology import bundle_acquisition_blockers, bundle_of
+
     errors = {}
     if key == "lacp_bundle":
         for field in ("min_links", "system_priority", "admin_key"):
@@ -4426,15 +4425,19 @@ def _lacp_errors(key, obj):
                 errors[field] = ["Enter a value between 0 and 65535."]
         if obj.timer not in ("", "fast", "slow"):
             errors["timer"] = ["Timer must be fast, slow, or default."]
+        blockers = bundle_acquisition_blockers(obj)
+        if blockers:
+            errors.setdefault("timer", []).extend(blockers)
         return errors
 
     from .models import NSOLACPBundleState
 
-    if (
-        obj.lag_bundle_id is None
-        or not NSOLACPBundleState.objects.filter(management=obj.management, interface=obj.lag_bundle).exists()
-    ):
+    bundle = bundle_of(obj.interface)
+    tracked = NSOLACPBundleState.objects.filter(management=obj.management, interface=bundle).first() if bundle else None
+    if tracked is None:
         errors["mode"] = ["This member is not linked to a tracked LACP bundle."]
+    elif blockers := bundle_acquisition_blockers(tracked):
+        errors.setdefault("mode", []).extend(blockers)
     if obj.mode not in ("", "active", "passive", "on"):
         errors["mode"] = ["Mode must be active, passive, on, or default."]
     if obj.port_priority is not None and not 0 <= obj.port_priority <= 65_535:
@@ -4582,7 +4585,13 @@ def _save_owned_bfd_edit(obj, old_values):
 def _save_owned_static_route_edit(obj, old_values):
     """Apply one shared static-route edit and re-arm its owned overlays exactly."""
     from . import status_machine as sm
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .renderer_writer import (
+        RendererMutationPlan,
+        planned_m2m_add,
+        planned_save,
+        renderer_mirror_writes,
+        renderer_writes,
+    )
     from .signals import _STATIC_ROUTE_TRANSITION_FIELDS, _arm_static_route_generation
 
     route = obj.static_route
@@ -4606,10 +4615,17 @@ def _save_owned_static_route_edit(obj, old_values):
         saves.append(planned_save(candidate, update_fields=fields))
         operations.append((candidate, fields))
 
-    plan = RendererMutationPlan.build(saves=saves, planned_at=planned_at, grant=OwnershipGrant("operator_edit"))
-    with renderer_writes(plan) as writer:
+    device = obj.management.device
+    assignments = () if route.devices.filter(pk=device.pk).exists() else (planned_m2m_add(route, "devices", (device,)),)
+    plan = RendererMutationPlan.build(
+        saves=saves, m2m_writes=assignments, planned_at=planned_at, grant=OwnershipGrant("operator_edit")
+    )
+    mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+    with mutation as writer:
         for instance, update_fields in operations:
             writer.save(instance, update_fields=update_fields)
+        if assignments:
+            writer.m2m_add(route, "devices", (device,))
 
 
 def _save_owned_redistribution_edit(obj, old_values):
@@ -5279,20 +5295,23 @@ def _save_lacp_edit(obj, key, old_values):
     import copy
 
     from . import status_machine as sm
-    from .models import NSOLACPBundleState, NSOLACPMemberState
+    from .intent_state import reconcile_family_footprint
+    from .lacp_topology import acquisition_validator, bundle_of, member_states
+    from .models import NSOLACPBundleState
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
     bundle = (
         obj
         if key == "lacp_bundle"
-        else NSOLACPBundleState.objects.get(management=obj.management, interface=obj.lag_bundle)
+        else NSOLACPBundleState.objects.get(management=obj.management, interface=bundle_of(obj.interface))
     )
-    members = list(
-        NSOLACPMemberState.objects.filter(
-            management=bundle.management,
-            lag_bundle=bundle.interface,
+    validate = acquisition_validator(bundle)
+    members = list(member_states(bundle))
+    if key == "lacp_member" and obj.pk not in {member.pk for member in members}:
+        raise OwnershipNotQualified(
+            f"{obj.interface.name} is no longer a member of LACP bundle {bundle.interface.name}. Refresh and retry.",
+            device_id=bundle.interface.device_id,
         )
-    )
     changed_values = {
         field_name: getattr(obj, field_name)
         for field_name, old_value in old_values.items()
@@ -5318,7 +5337,7 @@ def _save_lacp_edit(obj, key, old_values):
         if member.pk == getattr(obj, "pk", None) and key == "lacp_member":
             update_fields.update(changed_values)
         candidates.append((candidate, update_fields))
-        saves.append(planned_save(candidate, update_fields=update_fields))
+        saves.append(planned_save(candidate, update_fields=update_fields, expected_before=member))
 
     bundle_candidate = copy.copy(bundle)
     if key == "lacp_bundle":
@@ -5331,9 +5350,19 @@ def _save_lacp_edit(obj, key, old_values):
     if key == "lacp_bundle":
         bundle_update_fields.update(changed_values)
     candidates.append((bundle_candidate, bundle_update_fields))
-    saves.append(planned_save(bundle_candidate, update_fields=bundle_update_fields))
+    bundle_before = copy.copy(bundle)
+    if key == "lacp_bundle":
+        for name, value in old_values.items():
+            setattr(bundle_before, name, value)
+    saves.append(planned_save(bundle_candidate, update_fields=bundle_update_fields, expected_before=bundle_before))
 
-    plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=now)
+    plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("operator_edit"),
+        saves=saves,
+        planned_at=now,
+        validate_after_acquire=validate,
+        additional_footprints=(reconcile_family_footprint(bundle.management.device_id, ("lacp",)),),
+    )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         for candidate, update_fields in candidates:
@@ -6172,8 +6201,9 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         import copy
 
-        from .intent_state import IntentMutationProtocolError
-        from .models import NSOLACPBundleState, NSOLACPMemberState
+        from .intent_state import IntentMutationProtocolError, reconcile_family_footprint
+        from .lacp_topology import acquisition_validator, member_states
+        from .models import NSOLACPBundleState
         from .renderer_writer import (
             RendererMutationPlan,
             planned_save,
@@ -6184,22 +6214,12 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
         for attempt in range(2):
             try:
                 state = get_object_or_404(NSOLACPBundleState, pk=pk)
-                # NX-P2 vPC preserve/REFUSE: a vPC-protected bundle cannot be onboarded — the
-                # lag-reconciler refuses it zero-write (a retract of an adopted vPC peer-link would
-                # delete it → dual-active split-brain). Refuse Accept so it never becomes owned/writable.
-                if state.vpc_sensitive:
-                    messages.error(
-                        request,
-                        f"LACP bundle {state.interface.name} is vPC-protected (a vPC member/peer-link/"
-                        f"orphan port) — NSO refuses to write it, so it cannot be onboarded. Left unmanaged.",
-                    )
-                    return redirect(_device_nso_tab_url(state.management.device_id))
+                validate = acquisition_validator(state)
                 now = timezone.now()
                 candidates = []
-                for member in NSOLACPMemberState.objects.filter(
-                    management=state.management,
-                    lag_bundle=state.interface,
-                ).order_by("pk"):
+                originals = {}
+                for member in member_states(state):
+                    originals[(member._meta.label_lower, member.pk)] = member
                     candidate = copy.copy(member)
                     candidate.status = _status_after_accept(member.status)
                     if candidate.accepted_at is None:
@@ -6210,17 +6230,27 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
                 if bundle_candidate.accepted_at is None:
                     bundle_candidate.accepted_at = now
                 candidates.append(bundle_candidate)
+                originals[(state._meta.label_lower, state.pk)] = state
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("accept"),
                     saves=(
-                        planned_save(candidate, update_fields=("status", "accepted_at")) for candidate in candidates
+                        planned_save(
+                            candidate,
+                            update_fields=("status", "accepted_at"),
+                            expected_before=originals[(candidate._meta.label_lower, candidate.pk)],
+                        )
+                        for candidate in candidates
                     ),
                     planned_at=now,
+                    validate_after_acquire=validate,
+                    additional_footprints=(reconcile_family_footprint(state.management.device_id, ("lacp",)),),
                 )
                 mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
                 with mutation as writer:
                     for candidate in candidates:
                         writer.save(candidate, update_fields=("status", "accepted_at"))
+            except OwnershipNotQualified:
+                raise
             except IntentMutationProtocolError:
                 if attempt == 0:
                     continue
@@ -6284,6 +6314,8 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
                     writer.save(interface, update_fields=("mode", "untagged_vlan"))
                     writer.save(candidate, update_fields=("status", "accepted_at"))
                     writer.m2m_set(interface, "tagged_vlans", tagged)
+            except OwnershipNotQualified:
+                raise
             except IntentMutationProtocolError:
                 continue
             state = candidate
@@ -7084,6 +7116,8 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
                         writer.save(candidate, update_fields=fields, force_insert=created)
                     if mgmt.adapter_device_id is not None:
                         self._push(mgmt)
+            except OwnershipNotQualified:
+                raise
             except IntentMutationProtocolError:
                 continue
             break
@@ -7260,6 +7294,8 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
                 blocker = " ".join(dict.fromkeys(message for messages in errors.values() for message in messages))
                 messages.error(request, f"Cannot accept {current}: {blocker}")
                 return redirect(_device_nso_tab_url(current.management.device_id))
+            except OwnershipNotQualified:
+                raise
             except IntentMutationProtocolError:
                 if attempt:
                     messages.error(request, "Configuration state changed. Refresh the page and try again.")

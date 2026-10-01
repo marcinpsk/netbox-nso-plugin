@@ -57,6 +57,9 @@ class TestIntentGenerationMigration(IntentPushResetMixin, TestCase):
         device = _make_device("def")
         mgmt = _make_mgmt(device, "def", 9101)
         sr = StaticRoute.objects.create(prefix="10.9.0.0/16", next_hop="10.9.0.1", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(sr, device)
         row = acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
 
         row.refresh_from_db()
@@ -196,6 +199,9 @@ class TestIntentGenerationAllocator(TestCase):
         device = _make_device("recr")
         mgmt = _make_mgmt(device, "recr", 9104)
         sr = StaticRoute.objects.create(prefix="10.10.0.0/16", next_hop="10.10.0.1", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(sr, device)
         first = allocate_intent_generation()
         acquire_overlay(
             NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted", intent_generation=first
@@ -241,6 +247,9 @@ class TestIntentGenerationAllocator(TestCase):
         device = _make_device("writer-recr")
         management = _make_mgmt(device, "writer-recr", 9105)
         route = StaticRoute.objects.create(prefix="198.18.40.0/24", next_hop="198.18.40.1", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, device)
         first = allocate_intent_generation()
         state = acquire_overlay(
             NSOStaticRouteState,

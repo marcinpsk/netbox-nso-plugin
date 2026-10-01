@@ -59,6 +59,7 @@ class _LacpFixtures:
             min_links=2,
             system_priority=100,
             timer="fast",
+            observed_members=[self.m1.name],
             status=status,
             **fields,
         )
@@ -70,7 +71,6 @@ class _LacpFixtures:
             NSOLACPMemberState,
             management=mgmt,
             interface=self.m1,
-            lag_bundle=self.lag,
             mode="active",
             port_priority=128,
             status=status,

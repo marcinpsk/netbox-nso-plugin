@@ -48,7 +48,11 @@ class TestApplyDescriptionForRole(IntentPushResetMixin, TestCase):
     def setUp(self):
         super().setUp()
         self.mgmt_a = NSODeviceManagement.objects.create(
-            device=self.dev_a, nso_instance=self.inst, nso_device_name="ld-a", adapter_device_id=self.dev_a.pk
+            device=self.dev_a,
+            nso_instance=self.inst,
+            nso_device_name="ld-a",
+            adapter_device_id=self.dev_a.pk,
+            manage_description=True,
         )
         self.if_a = Interface.objects.create(device=self.dev_a, name="Gi0/0", type="1000base-t")
         self.if_b = Interface.objects.create(device=self.dev_b, name="Gi1/0", type="1000base-t")
@@ -79,6 +83,18 @@ class TestApplyDescriptionForRole(IntentPushResetMixin, TestCase):
         apply_description_for_role(self.lo_a, role)
         self.lo_a.refresh_from_db()
         self.assertEqual(self.lo_a.description, "ld-a Loopback0 loopback")
+
+    def test_device_that_does_not_manage_descriptions_skips_acquisition(self):
+        self.mgmt_a.manage_description = False
+        self.mgmt_a.save(update_fields=("manage_description",))
+        role = self._role("to {peer_host}:{peer_iface}")
+        result = apply_description_for_role(self.if_a, role, other_end=self.if_b)
+        self.if_a.refresh_from_db()
+        self.assertEqual(result["skipped"], "device does not manage descriptions")
+        self.assertFalse(result["changed"])
+        self.assertEqual(self.if_a.description, "")
+        self.assertFalse(NSOInterfaceState.objects.filter(interface=self.if_a).exists())
+        self.assertFalse(entries(self.dev_a, "interface", unconsumed=True))
 
     def test_blank_template_is_noop(self):
         role = NSOLinkRole.objects.create(

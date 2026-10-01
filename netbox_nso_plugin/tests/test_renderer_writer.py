@@ -959,7 +959,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-m2m", 16277)
         mirror_update(management, auto_apply=True)
-        interface = Interface.objects.create(device=device, name="Ethernet1/7", type="1000base-t")
+        interface = Interface.objects.create(device=device, name="Ethernet1/7", type="1000base-t", mode="tagged")
         state = acquire_overlay(
             NSOSwitchportState,
             management=management,
@@ -1048,7 +1048,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
 
         device, management = make_managed("writer-m2m-race", 16289)
-        interface = Interface.objects.create(device=device, name="Ethernet1/9", type="1000base-t")
+        interface = Interface.objects.create(device=device, name="Ethernet1/9", type="1000base-t", mode="tagged")
         state = acquire_overlay(
             NSOSwitchportState, management=management, interface=interface, mode="tagged", status="accepted"
         )
@@ -1093,7 +1093,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.signals import suppress_intent_push
 
         device, management = make_managed("writer-m2m-order", 16289)
-        interface = Interface.objects.create(device=device, name="Ethernet1/10", type="1000base-t")
+        interface = Interface.objects.create(device=device, name="Ethernet1/10", type="1000base-t", mode="tagged")
         state = acquire_overlay(
             NSOSwitchportState,
             management=management,
@@ -1282,6 +1282,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-cascade", 16275)
         route = StaticRoute.objects.create(prefix="198.18.44.0/24", next_hop="198.18.44.1", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, device)
         state = acquire_overlay(
             NSOStaticRouteState,
             management=management,
@@ -1314,6 +1317,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         device, management = make_managed("writer-complete-cascade", 16287)
         route = StaticRoute.objects.create(prefix="198.18.87.0/24", next_hop="198.18.0.87", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, device)
         state = acquire_overlay(
             NSOStaticRouteState,
             management=management,
@@ -1546,7 +1552,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete
 
         device, management = make_managed("writer-owned-cascade", 16291)
-        interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t")
+        interface = Interface.objects.create(device=device, name="Ethernet1/11", type="1000base-t", mode="access")
         acquire_overlay(
             NSOSwitchportState,
             management=management,
@@ -1569,6 +1575,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
 
         _device, management = make_managed("writer-renamed-cascade", 16288)
         route = StaticRoute.objects.create(prefix="198.18.88.0/24", next_hop="198.18.0.88", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, management.device)
         state = acquire_overlay(
             NSOStaticRouteState,
             management=management,
@@ -1645,7 +1654,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
         device, state = self._make_linked_bgp_overlay("writer-bgp-invalid", 16300)
-        content_update(state, status="in_sync", asn_str="invalid", peer_address_str="not-an-address")
+        content_update(state, status="in_sync")
+        NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").delete()
+        type(state).objects.filter(pk=state.pk).update(asn_str="invalid", peer_address_str="not-an-address")
         state.refresh_from_db()
         candidate = copy.copy(state)
         candidate.last_apply_error = "planned"
@@ -1667,7 +1678,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
         device, state = self._make_linked_bgp_overlay("writer-bgp-detach", 16302)
-        content_update(state, status="in_sync", asn_str="invalid", peer_address_str="not-an-address")
+        content_update(state, status="in_sync")
+        NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").delete()
+        type(state).objects.filter(pk=state.pk).update(asn_str="invalid", peer_address_str="not-an-address")
         state.refresh_from_db()
         binding = manifest_binding(state)
         manifest = NSOOwnershipManifest.objects.create(
@@ -1775,7 +1788,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             peer_address_str="198.18.98.2",
             status="imported",
         )
-        content_update(malformed, status="accepted", asn_str="invalid")
+        content_update(malformed, status="accepted")
+        type(malformed).objects.filter(pk=malformed.pk).update(asn_str="invalid")
         malformed.refresh_from_db()
         other = NSOVLANState.objects.create(
             management=management,
@@ -1784,6 +1798,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         malformed_before = NSOBGPPeerState.objects.values().get(pk=malformed.pk)
         other_before = NSOVLANState.objects.values().get(pk=other.pk)
+        manifests_before = list(NSOOwnershipManifest.objects.filter(device_id=device.pk).order_by("pk").values())
         revisions_before = list(NSOIntentRevision.objects.filter(device=device).order_by("scope", "pk").values())
         outbox_before = list(NSOIntentOutboxEntry.objects.filter(device=device).order_by("scope", "pk").values())
         other_candidate = copy.copy(other)
@@ -1811,7 +1826,9 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         other.refresh_from_db()
         self.assertEqual(NSOBGPPeerState.objects.values().get(pk=malformed.pk), malformed_before)
         self.assertEqual(NSOVLANState.objects.values().get(pk=other.pk), other_before)
-        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=device.pk).exists())
+        self.assertEqual(
+            list(NSOOwnershipManifest.objects.filter(device_id=device.pk).order_by("pk").values()), manifests_before
+        )
         self.assertEqual(
             list(NSOIntentRevision.objects.filter(device=device).order_by("scope", "pk").values()),
             revisions_before,

@@ -2729,7 +2729,7 @@ class TestSwitchportStateAcceptView(ViewTestBase):
     def _switchport(self, name, **values):
         from netbox_nso_plugin.models import NSOSwitchportState
 
-        interface = Interface.objects.create(device=self.device, name=name, type="1000base-t")
+        interface = Interface.objects.create(device=self.device, name=name, type="1000base-t", mode="access")
         return acquire_overlay(NSOSwitchportState, management=self.mgmt, interface=interface, mode="access", **values)
 
     def _preview_switchport_rows(self):
@@ -4122,6 +4122,7 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         """The interface render includes 'enabled' attribute states."""
         from netbox_nso_plugin.delivery import deliver
 
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(manage_enabled=True)
         # Create an 'enabled' interface state in accepted status
         enabled_state = acquire_overlay(
             NSOInterfaceState,
@@ -4170,14 +4171,18 @@ class TestInterfaceIntentDelivery(ViewTestBase):
 
         content_bulk_update(self.iface_state, status="accepted")
         self.addCleanup(content_bulk_update, self.iface_state, status="changed")
-        # Create a state with an unknown attribute — should be skipped
+        # Acquire a supported attribute before foreign identity drift.
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(manage_enabled=True)
         unknown_state = acquire_overlay(
             NSOInterfaceState,
             interface=self.interface,
-            attribute="mtu",
+            attribute="enabled",
             status="accepted",
             nso_value="1500",
         )
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(manage_enabled=False)
+        NSOInterfaceState.objects.filter(pk=unknown_state.pk).update(attribute="mtu")  # Model foreign identity drift.
+        unknown_state.refresh_from_db()
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 22
         mgmt.save(update_fields=["adapter_device_id"])
@@ -4701,6 +4706,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_mtu_keeps_owned_status(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
+        self.interface.mtu = 9214
+        self.interface.save(update_fields=("mtu",))
         row = acquire_overlay(
             NSOInterfaceMtuState, management=self.mgmt, interface=self.interface, l2_mtu=9214, status="accepted"
         )
@@ -5362,7 +5369,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_static_route_updates_native_policy_and_takes_ownership(self):
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOStaticRouteState
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
 
         native = StaticRoute.objects.create(
             prefix="198.51.100.0/24",
@@ -5377,6 +5385,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             nso_next_hop=str(native.next_hop),
             status="imported",
         )
+        self.assertFalse(native.devices.filter(pk=self.device.pk).exists())
 
         response = self.client.post(
             self._url("static_route", row.pk),
@@ -5389,6 +5398,36 @@ class TestOverlayFieldEditView(ViewTestBase):
         self.assertEqual((native.metric, native.permanent, native.tag), (25, True, 120))
         self.assertEqual(row.status, "accepted")
         self.assertIsNotNone(row.accepted_at)
+        self.assertTrue(native.devices.filter(pk=self.device.pk).exists())
+        self.assertEqual(reconcile_scope_ownership(self.device.pk, ("static_route",)), ())
+        manifest = NSOOwnershipManifest.objects.get(device_id=self.device.pk, scope="static_route")
+        self.assertEqual((manifest.ownership_state, manifest.grant_kind), ("owned", "operator_edit"))
+
+    def test_edit_static_route_rolls_back_nonqualifying_assignment(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOOwnershipManifest, NSOStaticRouteState
+
+        native = StaticRoute.objects.create(prefix="198.18.0.0/24", interface_next_hop=self.interface.name, metric=10)
+        row = NSOStaticRouteState.objects.create(
+            management=self.mgmt,
+            static_route=native,
+            nso_prefix=str(native.prefix),
+            nso_next_hop="",
+            status="imported",
+        )
+
+        response = self.client.post(self._url("static_route", row.pk), {"metric": "25"})
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("does not qualify", response.json()["message"])
+        native.refresh_from_db()
+        row.refresh_from_db()
+        self.assertEqual(native.metric, 10)
+        self.assertFalse(native.devices.exists())
+        self.assertEqual(row.status, "imported")
+        self.assertIsNone(row.accepted_at)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="static_route").exists())
 
     def test_edit_static_route_rejects_metric_above_device_model_limit(self):
         from netbox_routing.models import StaticRoute
@@ -5422,7 +5461,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
 
         lag = Interface.objects.create(device=self.device, name="Port-channel10", type="lag")
-        member = Interface.objects.create(device=self.device, name="GigabitEthernet0/10", type="1000base-t")
+        member = Interface.objects.create(device=self.device, name="GigabitEthernet0/10", type="1000base-t", lag=lag)
         bundle = NSOLACPBundleState.objects.create(
             management=self.mgmt,
             interface=lag,
@@ -5431,11 +5470,11 @@ class TestOverlayFieldEditView(ViewTestBase):
             system_priority=32768,
             timer="slow",
             status="imported",
+            observed_members=[member.name],
         )
         member_state = NSOLACPMemberState.objects.create(
             management=self.mgmt,
             interface=member,
-            lag_bundle=lag,
             mode="active",
             port_priority=32768,
             status="imported",
@@ -5460,18 +5499,18 @@ class TestOverlayFieldEditView(ViewTestBase):
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
 
         lag = Interface.objects.create(device=self.device, name="ae10", type="lag")
-        member = Interface.objects.create(device=self.device, name="ge-0/0/10", type="1000base-t")
+        member = Interface.objects.create(device=self.device, name="ge-0/0/10", type="1000base-t", lag=lag)
         bundle = NSOLACPBundleState.objects.create(
             management=self.mgmt,
             interface=lag,
             lag_id=10,
             min_links=1,
             status="imported",
+            observed_members=[member.name],
         )
         member_state = NSOLACPMemberState.objects.create(
             management=self.mgmt,
             interface=member,
-            lag_bundle=lag,
             mode="active",
             port_priority=100,
             status="imported",
@@ -5501,8 +5540,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
 
         lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
-        edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/11", type="1000base-t")
-        sibling = Interface.objects.create(device=self.device, name="GigabitEthernet0/12", type="1000base-t")
+        edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/11", type="1000base-t", lag=lag)
+        sibling = Interface.objects.create(device=self.device, name="GigabitEthernet0/12", type="1000base-t", lag=lag)
         bundle = acquire_overlay(
             NSOLACPBundleState,
             management=self.mgmt,
@@ -5510,12 +5549,12 @@ class TestOverlayFieldEditView(ViewTestBase):
             lag_id=11,
             min_links=1,
             status="deploying",
+            observed_members=[edited.name, sibling.name],
         )
         edited_state = acquire_overlay(
             NSOLACPMemberState,
             management=self.mgmt,
             interface=edited,
-            lag_bundle=lag,
             mode="active",
             port_priority=100,
             status="deploying",
@@ -5524,7 +5563,6 @@ class TestOverlayFieldEditView(ViewTestBase):
             NSOLACPMemberState,
             management=self.mgmt,
             interface=sibling,
-            lag_bundle=lag,
             mode="active",
             port_priority=200,
             status="deploying",
@@ -6226,12 +6264,19 @@ class TestOverlayFieldEditStalePlan(ViewTestBase):
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
 
         lag = Interface.objects.create(device=self.device, name="Port-channel84", type="lag")
-        member_interface = Interface.objects.create(device=self.device, name="GigabitEthernet0/84", type="1000base-t")
+        member_interface = Interface.objects.create(
+            device=self.device, name="GigabitEthernet0/84", type="1000base-t", lag=lag
+        )
         bundle = NSOLACPBundleState.objects.create(
-            management=self.mgmt, interface=lag, lag_id=84, min_links=1, status="imported"
+            management=self.mgmt,
+            interface=lag,
+            lag_id=84,
+            min_links=1,
+            status="imported",
+            observed_members=[member_interface.name],
         )
         member = NSOLACPMemberState.objects.create(
-            management=self.mgmt, interface=member_interface, lag_bundle=lag, mode="active", status="imported"
+            management=self.mgmt, interface=member_interface, mode="active", status="imported"
         )
 
         def competing():
@@ -7477,16 +7522,19 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
             NSOSwitchportState,
         )
 
-        cls.gi = Interface.objects.create(device=cls.device, name="Gi0/11", type="1000base-t")
         cls.lag = Interface.objects.create(device=cls.device, name="Po1", type="lag")
+        cls.gi = Interface.objects.create(device=cls.device, name="Gi0/11", type="1000base-t", lag=cls.lag)
         NSOInterfaceIPState.objects.create(interface=cls.gi, address="192.0.2.5/30", family="ipv4", status="imported")
         NSOInterfaceMtuState.objects.create(management=cls.mgmt, interface=cls.gi, l2_mtu=9111, status="imported")
         NSOLACPBundleState.objects.create(
-            management=cls.mgmt, interface=cls.lag, lag_id=1, min_links=2, status="imported"
+            management=cls.mgmt,
+            interface=cls.lag,
+            lag_id=1,
+            min_links=2,
+            status="imported",
+            observed_members=[cls.gi.name],
         )
-        NSOLACPMemberState.objects.create(
-            management=cls.mgmt, interface=cls.gi, lag_bundle=cls.lag, mode="active", status="imported"
-        )
+        NSOLACPMemberState.objects.create(management=cls.mgmt, interface=cls.gi, mode="active", status="imported")
         NSOLoggingHostState.objects.create(
             management=cls.mgmt, address="192.0.2.99", severity="warning", status="imported"
         )
@@ -7525,7 +7573,7 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
             NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag),
             status="in_sync",
         )
-        for member in NSOLACPMemberState.objects.filter(management=self.mgmt, lag_bundle=self.lag):
+        for member in NSOLACPMemberState.objects.filter(management=self.mgmt, interface__lag=self.lag):
             content_bulk_update(member, status="changed")
 
         url = reverse(
@@ -7615,18 +7663,20 @@ class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         self.client.force_login(self.user)
 
         self.lag = Interface.objects.create(device=self.device, name="Port-channel20", type="lag")
-        member = Interface.objects.create(device=self.device, name="GigabitEthernet0/20", type="1000base-t")
+        member = Interface.objects.create(
+            device=self.device, name="GigabitEthernet0/20", type="1000base-t", lag=self.lag
+        )
         with transaction.atomic():
             self.bundle = NSOLACPBundleState.objects.create(
                 management=self.mgmt,
                 interface=self.lag,
                 lag_id=20,
                 status="imported",
+                observed_members=[member.name],
             )
             self.member = NSOLACPMemberState.objects.create(
                 management=self.mgmt,
                 interface=member,
-                lag_bundle=self.lag,
                 mode="active",
                 port_priority=100,
                 status="imported",
@@ -7680,7 +7730,7 @@ class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         self.assertEqual(self.member.port_priority, 102)
         self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
 
-    def test_accept_reports_a_refresh_conflict_after_two_interface_retargets(self):
+    def test_accept_refuses_a_member_retargeted_to_another_device(self):
         import copy
 
         from django.contrib.messages import get_messages
@@ -7721,17 +7771,16 @@ class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
             response = self.client.post(url)
 
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(build.call_count, 2)
-        self.assertEqual(
-            [str(message) for message in get_messages(response.wsgi_request)],
-            ["The LACP bundle changed. Refresh the page and try again."],
-        )
+        self.assertEqual(build.call_count, 1)
+        text = " ".join(str(message) for message in get_messages(response.wsgi_request))
+        self.assertIn(self.member.interface.name, text)
+        self.assertIn("missing from NetBox", text)
         self.bundle.refresh_from_db()
         self.member.refresh_from_db()
-        self.assertEqual(self.member.interface.device_id, target_devices[-1].pk)
+        self.assertEqual(self.member.interface.device_id, target_devices[0].pk)
         self.assertEqual((self.bundle.status, self.member.status), ("imported", "imported"))
 
-    def test_accept_reports_a_refresh_conflict_when_selected_members_are_deleted_before_build(self):
+    def test_accept_refuses_a_member_overlay_deleted_before_build(self):
         from django.contrib.messages import get_messages
 
         from netbox_nso_plugin.models import NSOLACPMemberState
@@ -7744,19 +7793,18 @@ class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         from netbox_nso_plugin.signals import suppress_intent_push
 
         second_interface = Interface.objects.create(
-            device=self.device,
-            name="GigabitEthernet0/21",
-            type="1000base-t",
+            device=self.device, name="GigabitEthernet0/21", type="1000base-t", lag=self.lag
         )
         with transaction.atomic():
             second_member = NSOLACPMemberState.objects.create(
                 management=self.mgmt,
                 interface=second_interface,
-                lag_bundle=self.lag,
                 mode="active",
                 port_priority=100,
                 status="imported",
             )
+        self.bundle.observed_members = [self.member.interface.name, second_interface.name]
+        self.bundle.save(update_fields=("observed_members",))
         selected_members = iter((self.member, second_member))
         original_build = RendererMutationPlan.build
 
@@ -7778,14 +7826,14 @@ class TestLACPBundleAcceptConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
             response = self.client.post(url)
 
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(build.call_count, 2)
-        self.assertEqual(
-            [str(message) for message in get_messages(response.wsgi_request)],
-            ["The LACP bundle changed. Refresh the page and try again."],
-        )
+        self.assertEqual(build.call_count, 1)
+        text = " ".join(str(message) for message in get_messages(response.wsgi_request))
+        self.assertIn(self.member.interface.name, text)
+        self.assertIn("no LACP member observation", text)
         self.bundle.refresh_from_db()
         self.assertEqual(self.bundle.status, "imported")
-        self.assertFalse(NSOLACPMemberState.objects.filter(pk__in=(self.member.pk, second_member.pk)).exists())
+        self.assertFalse(NSOLACPMemberState.objects.filter(pk=self.member.pk).exists())
+        self.assertTrue(NSOLACPMemberState.objects.filter(pk=second_member.pk, status="imported").exists())
 
 
 class TestRoutePolicyGrid(ViewTestBase):

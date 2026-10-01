@@ -55,7 +55,6 @@ _REVIEWED_MUTATION_SITES = frozenset(
         ("drain.py", "_stamp_last_acked", "NSOStaticRouteState.objects.bulk_update"),
         ("drain.py", "clear_acknowledged_lineage", "NSOStaticRouteState.objects.exclude().update"),
         ("onboarding.py", "_submit_claimed_provision", "NSOPlatformNedMapping.objects.get_or_create"),
-        ("template_content.py", "_reconcile_lag_topology", "stale.save"),
     }
 )
 

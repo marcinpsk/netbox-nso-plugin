@@ -82,6 +82,7 @@ class RendererDelete:
     """A proposed instance delete, before Collector expands its effects."""
 
     instance: Any
+    expected_before: Any = None
 
 
 @dataclass(frozen=True)
@@ -143,9 +144,9 @@ def planned_save(
     )
 
 
-def planned_delete(instance) -> RendererDelete:
+def planned_delete(instance, *, expected_before=None) -> RendererDelete:
     """Describe one delete for :meth:`RendererMutationPlan.build`."""
-    return RendererDelete(instance=instance)
+    return RendererDelete(instance=instance, expected_before=expected_before)
 
 
 def planned_set_update(queryset, **values) -> RendererSetUpdate:
@@ -668,10 +669,18 @@ def _plan_delete(proposed: RendererDelete):
     instance = proposed.instance
     label = instance._meta.label_lower
     spec = renderer_input_specs().get(label)
-    before = _stored_instance(instance)
+    before = proposed.expected_before if proposed.expected_before is not None else _stored_instance(instance)
+    if before is not None and (before.pk != instance.pk or before._meta.label_lower != label or before._state.adding):
+        raise IntentMutationProtocolError("a planned delete pre-image must identify its persisted target")
     if before is None:
         raise IntentMutationProtocolError(f"cannot plan deletion of missing {label} row {instance.pk!r}")
     writes, collector_footprint, changed_keys = _collector_writes(before)
+    writes = tuple(
+        replace(write, before_values=_field_values(before, None))
+        if write.model_label == label and write.pk == before.pk and not write.cascade
+        else write
+        for write in writes
+    )
     if spec is None:
         source_rows = []
         overlay_rows = []
@@ -949,6 +958,7 @@ class RendererWriter:
         self._consumed: set[int] = set()
         self._active_operation: int | None = None
         self._active_instance = None
+        self._acquisitions = set()
 
     def _acquired(self, index, pk=None):
         from .status_machine import OWNED_STATES
@@ -1105,6 +1115,8 @@ class RendererWriter:
         write = self.plan.write_set[index]
         if not self._creation_matches(write, instance):
             raise IntentPlanStaleError(f"{write.model_label} creation {write.natural_key!r} changed after planning")
+        if self._acquired(index):
+            _maintain_manifest(instance, grant=self.grant, acquisition=True)
         self._consumed.add(index)
         return True
 
@@ -1121,6 +1133,8 @@ class RendererWriter:
                 continue
             current = type(instance)._default_manager.filter(pk=write.pk).first()
             if current is not None and self._save_target_matches(write, current):
+                if self._acquired(index):
+                    _maintain_manifest(current, grant=self.grant, acquisition=True)
                 self._consumed.add(index)
                 return True
         return False
@@ -1429,6 +1443,10 @@ class RendererWriter:
         expected = before_pks - after_pks if action == "pre_remove" else after_pks - before_pks
         return action in {"pre_remove", "pre_add"} and self._selected_matches(tuple(expected), changed)
 
+    def record_acquisition(self, instance):
+        """Keep each acquired overlay for final transaction qualification."""
+        self._acquisitions.add((instance._meta.label_lower, instance.pk))
+
     def assert_complete(self):
         remaining = [
             write
@@ -1437,6 +1455,9 @@ class RendererWriter:
         ]
         if remaining:
             raise IntentMutationProtocolError(f"renderer write plan left operations unused: {remaining!r}")
+        from .ownership_planner import validate_plan_acquisitions
+
+        validate_plan_acquisitions(self._acquisitions)
 
 
 _ACTIVE_WRITER: contextvars.ContextVar[RendererWriter | None] = contextvars.ContextVar(

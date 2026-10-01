@@ -304,7 +304,13 @@ def promote_current_intent(
                         "interface_id", flat=True
                     )
                 )
-                candidates = candidates.filter(lag_bundle_id__in=eligible_bundle_ids)
+                from .lacp_topology import member_interfaces
+
+                candidates = candidates.filter(
+                    interface_id__in=member_interfaces(management.device_id)
+                    .filter(lag_id__in=eligible_bundle_ids)
+                    .values("pk")
+                )
             locked_statuses = list(candidates.order_by("pk"))
             if model is NSORoutePolicyState:
                 locked_statuses = _promotable_route_policy_rows(locked_statuses)

@@ -802,14 +802,11 @@ class TestReconcileRedistribution(TestCase):
             nso_instance=management.nso_instance,
             nso_device_name=other_device.name,
         )
-        acquire_overlay(
-            NSORedistributionState,
-            management=other_management,
-            dest_protocol="isis",
-            source_protocol="static",
-            redistribution=redistribution,
-            status="accepted",
-        )
+        state = NSORedistributionState.objects.get(management=management, redistribution=redistribution)
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=("status",))
+        NSORedistributionState.objects.filter(pk=state.pk).update(management=other_management)
+        state.refresh_from_db()
 
         plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
 
@@ -851,14 +848,11 @@ class TestReconcileRedistribution(TestCase):
             nso_instance=management.nso_instance,
             nso_device_name=other_device.name,
         )
-        acquire_overlay(
-            NSORedistributionState,
-            management=other_management,
-            dest_protocol="isis",
-            source_protocol="static",
-            redistribution=redistribution,
-            status="accepted",
-        )
+        state = NSORedistributionState.objects.get(management=management, redistribution=redistribution)
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=("status",))
+        NSORedistributionState.objects.filter(pk=state.pk).update(management=other_management)
+        state.refresh_from_db()
         plan = redistribution_reconcile_plan(self.device, {"entries": [self._entry(metric=20)]})
 
         with transaction.atomic(), offline_mutation():

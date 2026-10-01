@@ -374,7 +374,7 @@ class TestRealReconcilerGateFootprints(TestCase):
         bundle = NSOLACPBundleState.objects.get(management=self.mgmt, interface=lag)
         self.assertEqual(bundle.lag_id, 1)
         member = NSOLACPMemberState.objects.get(management=self.mgmt, interface=member_iface)
-        self.assertEqual(member.lag_bundle_id, lag.pk)  # the LAG Interface, not the bundle overlay
+        self.assertEqual(member.interface.lag_id, lag.pk)  # the LAG Interface, not the bundle overlay
         self.assertEqual(member.mode, "active")
 
     def test_bgp_gate_covers_the_materialized_graph_and_overlay(self):
