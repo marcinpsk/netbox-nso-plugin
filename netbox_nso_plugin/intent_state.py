@@ -1919,9 +1919,12 @@ def deletion_footprint_for_instance(instance) -> MutationFootprint:
     """Add Django's exact registered cascade closure to a row's footprint."""
     from django.db.models.deletion import Collector
 
+    from .management_lifecycle import collect_management_overlays
+
     base = footprint_for_instance(instance)
     collector = Collector(using=instance._state.db or "default", origin=instance)
     collector.collect([instance])
+    collect_management_overlays(collector, instance)
     source_rows = []
     overlay_rows = []
     cascade_scopes = set()
@@ -2655,6 +2658,10 @@ def _validate_explicit_delete(sender, instance, origin=None, **kwargs):
     if active_renderer_writer() is not None:
         require_planned_signal_write(instance, deleting=True)
     _lock_management_delete(instance, origin)
+    if sender._meta.label_lower == "netbox_nso_plugin.nsodevicemanagement":
+        from .management_lifecycle import delete_management_overlays
+
+        delete_management_overlays(instance, origin=origin, using=kwargs["using"])
     if sender._meta.label_lower in OVERLAY_MODEL_RANKS:
         from .ownership_planner import discard_acquisition
 

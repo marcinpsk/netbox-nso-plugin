@@ -86,6 +86,32 @@ def delete_management(instance):
         return writer.delete(instance)
 
 
+def collect_management_overlays(collector, instance):
+    """Add interface-owned overlays to a management row's deletion closure."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsodevicemanagement":
+        return
+    from .models import NSOInterfaceIPState, NSOInterfaceState
+
+    for model in (NSOInterfaceState, NSOInterfaceIPState):
+        collector.collect(model.objects.using(collector.using).filter(interface__device_id=instance.device_id))
+
+
+def delete_management_overlays(instance, *, origin, using):
+    """Remove offboarded interface overlays under the management deletion locks."""
+    from django.db.models.deletion import Collector
+
+    from .drain import reset_offboard_state
+    from .intent_state import _delete_origin_label
+
+    # Device deletion already collects these rows through their native interfaces.
+    if _delete_origin_label(origin) == "dcim.device":
+        return
+    reset_offboard_state(instance.device_id, using=using)
+    collector = Collector(using=using, origin=origin)
+    collect_management_overlays(collector, instance)
+    collector.delete()
+
+
 def _control_footprint(device_id):
     """Freeze the management row and current address owners for one control POST.
 
