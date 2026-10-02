@@ -13,6 +13,8 @@ from django.test import RequestFactory, TransactionTestCase
 from django.urls import reverse
 from requests.exceptions import ConnectionError
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._adapter_http import make_response
 from ._outbox_case import (
     ReceiptAdapter,
@@ -24,6 +26,7 @@ from ._outbox_case import (
     wait_until_postgres_blocks,
     without_commit_drain,
 )
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_STREAMS = {
@@ -260,7 +263,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         for attempt in range(2):
             candidate = copy.copy(current)
             candidate.name = name
-            plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=("name",)),))
+            plan = RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("name",)),)
+            )
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             try:
                 with mutation as writer:
@@ -526,7 +531,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         with without_commit_drain(), transaction.atomic():
-            logging_state = NSOLoggingLevelState.objects.create(
+            logging_state = acquire_overlay(
+                NSOLoggingLevelState,
                 management=self.mgmt,
                 console_severity="warning",
                 status="accepted",
@@ -554,7 +560,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         with without_commit_drain(), transaction.atomic():
-            logging_state = NSOLoggingLevelState.objects.create(
+            logging_state = acquire_overlay(
+                NSOLoggingLevelState,
                 management=self.mgmt,
                 console_severity="warning",
                 status="accepted",
@@ -582,7 +589,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         with without_commit_drain(), transaction.atomic():
             interface = self._create_interface(device=self.device, name="Ethernet1", type="1000base-t")
-            NSOISISInterfaceState.objects.create(
+            acquire_overlay(
+                NSOISISInterfaceState,
                 management=self.mgmt,
                 interface=interface,
                 af="ipv4",
@@ -725,7 +733,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         content_update(self.vlan_state, status="imported")
         other_device, other_management = make_managed("shared-vlan-accept", 2556)
         with without_commit_drain(), transaction.atomic():
-            other_state = NSOVLANState.objects.create(
+            other_state = acquire_overlay(
+                NSOVLANState,
                 management=other_management,
                 vlan=self.vlan_state.vlan,
                 status="accepted",
@@ -798,7 +807,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         interface = self._create_interface(device=self.device, name="Ethernet9", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
+            state = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
@@ -821,13 +831,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         first_interface = self._create_interface(device=self.device, name="Ethernet9.01", type="1000base-t")
         second_interface = self._create_interface(device=self.device, name="Ethernet9.02", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            first = NSOInterfaceMtuState.objects.create(
+            first = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=first_interface,
                 l2_mtu=1500,
                 status="accepted",
             )
-            second = NSOInterfaceMtuState.objects.create(
+            second = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=second_interface,
                 l2_mtu=1500,
@@ -869,7 +881,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         interface = self._create_interface(device=self.device, name="Ethernet9.1", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
+            state = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
@@ -898,7 +911,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with transaction.atomic():
             interface = self._create_interface(device=self.device, name="Ethernet9.11", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
+            state = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
@@ -931,7 +945,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         interface = self._create_interface(device=self.device, name="Ethernet9.2", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
+            state = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
@@ -1011,7 +1026,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from django.contrib.messages.storage.fallback import FallbackStorage
         from django.db import connections
 
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction, mirror_transaction
+        from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
         from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.signals import suppress_intent_push
         from netbox_nso_plugin.views import NSOBFDInterfaceStateAcceptView
@@ -1039,10 +1054,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             try:
                 with transaction.atomic():
                     current = NSOBFDInterfaceState.objects.get(pk=state.pk)
-                    with intent_transaction(footprint_for_instance(current)):
-                        current.status = "deploying"
-                        current.apply_attempt_id = uuid4()
-                        current.save(update_fields=["status", "apply_attempt_id"])
+                    current.status = "deploying"
+                    current.apply_attempt_id = uuid4()
+                    save_overlay_fixture(current, update_fields=["status", "apply_attempt_id"])
                     row_updated.set()
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
@@ -1094,7 +1108,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         interface = self._create_interface(device=self.device, name="Ethernet9.39", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            state = NSOInterfaceMtuState.objects.create(
+            state = acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
@@ -1446,7 +1461,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             )
         svi_interface = self._create_interface(device=self.device, name="Vlan3559", type="virtual")
         with without_commit_drain(), transaction.atomic():
-            svi_state = NSOSVIState.objects.create(
+            svi_state = acquire_overlay(
+                NSOSVIState,
                 management=self.mgmt,
                 interface=svi_interface,
                 vlan=self.vlan_state.vlan,
@@ -1481,7 +1497,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             try:
                 if not discovery_complete.wait(10):
                     raise AssertionError("switchport dependency discovery did not complete")
-                rescope_vlan(type(self.vlan_state).objects.get(pk=self.vlan_state.pk), target_group)
+                rescope_vlan(
+                    type(self.vlan_state).objects.get(pk=self.vlan_state.pk),
+                    target_group,
+                    grant=OwnershipGrant("operator_edit"),
+                )
                 rescope_done.set()
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
@@ -1581,7 +1601,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 if not accept_prepared.wait(10):
                     raise AssertionError("the accept did not reach its save fence")
                 with suppress_intent_push(), transaction.atomic():
-                    rescope_vlan(NSOVLANState.objects.get(pk=self.vlan_state.pk), target_group)
+                    rescope_vlan(
+                        NSOVLANState.objects.get(pk=self.vlan_state.pk),
+                        target_group,
+                        grant=OwnershipGrant("operator_edit"),
+                    )
                 rescope_done.set()
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
@@ -1724,7 +1748,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 status="changed",
             )
         plan, candidate_interface, candidate_state, tagged = _switchport_accept_plan(state)
-        delete_plan = RendererMutationPlan.build(deletes=(planned_delete(interface),))
+        delete_plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(interface),))
         delete_mutation = renderer_writes if delete_plan.changes_content else renderer_mirror_writes
         with without_commit_drain(), delete_mutation(delete_plan) as writer:
             writer.delete(interface)
@@ -1785,7 +1809,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def merge_vlan():
             try:
                 with suppress_intent_push(), transaction.atomic():
-                    rescope_vlan(NSOVLANState.objects.get(pk=self.vlan_state.pk), target_group)
+                    rescope_vlan(
+                        NSOVLANState.objects.get(pk=self.vlan_state.pk),
+                        target_group,
+                        grant=OwnershipGrant("operator_edit"),
+                    )
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -1904,7 +1932,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         def merge_vlan():
             try:
                 with suppress_intent_push(), transaction.atomic():
-                    rescope_vlan(NSOVLANState.objects.get(pk=self.vlan_state.pk), target_group)
+                    rescope_vlan(
+                        NSOVLANState.objects.get(pk=self.vlan_state.pk),
+                        target_group,
+                        grant=OwnershipGrant("operator_edit"),
+                    )
             except Exception as exc:  # noqa: BLE001 (the main test re-raises worker failures)
                 errors.append(exc)
             finally:
@@ -1982,7 +2014,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         with without_commit_drain(), transaction.atomic():
             states = [
-                NSOSwitchportState.objects.create(
+                acquire_overlay(
+                    NSOSwitchportState,
                     management=self.mgmt,
                     interface=Interface.objects.create(
                         device=self.device,
@@ -2061,13 +2094,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             untagged_vlan=self.vlan_state.vlan,
         )
         with without_commit_drain(), transaction.atomic():
-            svi_state = NSOSVIState.objects.create(
+            svi_state = acquire_overlay(
+                NSOSVIState,
                 management=self.mgmt,
                 interface=interface,
                 vlan=self.vlan_state.vlan,
                 status="accepted",
             )
-            switchport_state = NSOSwitchportState.objects.create(
+            switchport_state = acquire_overlay(
+                NSOSwitchportState,
                 management=self.mgmt,
                 interface=switchport_interface,
                 mode="access",
@@ -2075,6 +2110,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 status="in_sync",
             )
 
+        mirror_update(switchport_state, status="accepted")
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
@@ -2191,7 +2227,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 area=ospf_area,
                 interface=shared,
             )
-            bgp_state = NSOBGPPeerState.objects.create(
+            bgp_state = acquire_overlay(
+                NSOBGPPeerState,
                 management=self.mgmt,
                 bgp_peer=peer,
                 asn_str=str(local_as.asn),
@@ -2200,20 +2237,23 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             )
         with without_commit_drain(), transaction.atomic():
             states = [
-                NSOSVIState.objects.create(
+                acquire_overlay(
+                    NSOSVIState,
                     management=self.mgmt,
                     interface=svi,
                     vlan=self.vlan_state.vlan,
                     status="accepted",
                 ),
-                NSOSubinterfaceState.objects.create(
+                acquire_overlay(
+                    NSOSubinterfaceState,
                     management=self.mgmt,
                     interface=child,
                     parent_interface=shared,
                     dot1q_vlan=100,
                     status="accepted",
                 ),
-                NSOBFDInterfaceState.objects.create(
+                acquire_overlay(
+                    NSOBFDInterfaceState,
                     management=self.mgmt,
                     interface=shared,
                     min_tx=300,
@@ -2221,23 +2261,27 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     multiplier=3,
                     status="accepted",
                 ),
-                NSOInterfaceMtuState.objects.create(
+                acquire_overlay(
+                    NSOInterfaceMtuState,
                     management=self.mgmt,
                     interface=shared,
                     l2_mtu=1600,
                     status="accepted",
                 ),
-                NSOInterfaceState.objects.create(
+                acquire_overlay(
+                    NSOInterfaceState,
                     interface=shared,
                     attribute="description",
                     status="in_sync",
                 ),
-                NSOInterfaceIPState.objects.create(
+                acquire_overlay(
+                    NSOInterfaceIPState,
                     interface=shared,
                     address="198.18.40.1/31",
                     status="in_sync",
                 ),
-                NSOISISInterfaceState.objects.create(
+                acquire_overlay(
+                    NSOISISInterfaceState,
                     management=self.mgmt,
                     interface=shared,
                     af="ipv4",
@@ -2245,19 +2289,22 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                     isis_interface=isis_interface,
                     status="in_sync",
                 ),
-                NSOOSPFInterfaceState.objects.create(
+                acquire_overlay(
+                    NSOOSPFInterfaceState,
                     management=self.mgmt,
                     interface=shared,
                     process_id="1",
                     status="in_sync",
                 ),
-                NSOLACPBundleState.objects.create(
+                acquire_overlay(
+                    NSOLACPBundleState,
                     management=self.mgmt,
                     interface=shared,
                     lag_id=40,
                     status="in_sync",
                 ),
-                NSOSwitchportState.objects.create(
+                acquire_overlay(
+                    NSOSwitchportState,
                     management=self.mgmt,
                     interface=shared,
                     status="in_sync",
@@ -2265,6 +2312,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 bgp_state,
             ]
 
+        for state in states[8:10]:
+            mirror_update(state, status="accepted")
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
         config, session = adapter.patches()
         with config, session:
@@ -2349,7 +2398,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         other_device, _other_mgmt = make_managed("apply-selector-interface-move", 2559)
         interface = self._create_interface(device=self.device, name="Ethernet9.416", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            NSOInterfaceMtuState.objects.create(
+            acquire_overlay(
+                NSOInterfaceMtuState,
                 management=self.mgmt,
                 interface=interface,
                 l2_mtu=1500,
@@ -2374,13 +2424,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertFalse(self.mgmt.auto_apply)
         with without_commit_drain(), transaction.atomic():
             interface = self._create_interface(device=self.device, name="Ethernet9.42", type="lag")
-            lacp = NSOLACPBundleState.objects.create(
+            lacp = acquire_overlay(
+                NSOLACPBundleState,
                 management=self.mgmt,
                 interface=interface,
                 lag_id=42,
                 status="in_sync",
             )
-            switchport = NSOSwitchportState.objects.create(
+            switchport = acquire_overlay(
+                NSOSwitchportState,
                 management=self.mgmt,
                 interface=interface,
                 status="in_sync",
@@ -2505,11 +2557,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         first_interface = self._create_interface(device=self.device, name="Ethernet10", type="1000base-t")
         second_interface = self._create_interface(device=self.device, name="Ethernet11", type="1000base-t")
         with without_commit_drain(), transaction.atomic():
-            first = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt, interface=first_interface, l2_mtu=1500, status="accepted"
+            first = acquire_overlay(
+                NSOInterfaceMtuState, management=self.mgmt, interface=first_interface, l2_mtu=1500, status="accepted"
             )
-            second = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt, interface=second_interface, l2_mtu=1500, status="accepted"
+            second = acquire_overlay(
+                NSOInterfaceMtuState, management=self.mgmt, interface=second_interface, l2_mtu=1500, status="accepted"
             )
         attempt_id = uuid4()
         mirror_update(first, status="deploying", apply_attempt_id=attempt_id)
@@ -2683,7 +2735,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         state_pk = self.vlan_state.pk
         self.assertEqual(self.vlan_state.status, "accepted")
         registry, pushed = self._promotion_snapshot()
-        plan = RendererMutationPlan.build(deletes=(planned_delete(self.vlan_state),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(self.vlan_state),))
 
         with without_commit_drain(), renderer_writes(plan) as writer:
             writer.delete(self.vlan_state)
@@ -2716,7 +2768,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         registry, pushed = self._promotion_snapshot()
         state = NSOVLANState(management=self.mgmt, vlan=vlan, status="accepted")
         plan = RendererMutationPlan.build(
-            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")),),
         )
 
         with without_commit_drain(), renderer_writes(plan) as writer:
@@ -2973,7 +3026,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         with without_commit_drain(), transaction.atomic():
-            logging_state = NSOLoggingLevelState.objects.create(
+            logging_state = acquire_overlay(
+                NSOLoggingLevelState,
                 management=self.mgmt,
                 console_severity="warning",
                 status="accepted",
@@ -3030,7 +3084,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
         with without_commit_drain(), transaction.atomic():
-            logging_state = NSOLoggingLevelState.objects.create(
+            logging_state = acquire_overlay(
+                NSOLoggingLevelState,
                 management=self.mgmt,
                 console_severity="warning",
                 status="accepted",

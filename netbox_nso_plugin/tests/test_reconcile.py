@@ -18,6 +18,7 @@ from netbox_nso_plugin import drain
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
 from ._outbox_case import without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
 
 
@@ -621,7 +622,8 @@ class TestStaticRouteApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         # Assign through the suppressed writer footprint. The route is a qualifying native
         # anchor, but the greenfield signal does not create the overlay under test.
         _assign_without_push(route, device)
-        row = NSOStaticRouteState.objects.create(
+        row = acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=route,
             nso_prefix="198.18.99.0/24",
@@ -676,7 +678,8 @@ class TestL2SapApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Transaction
         mgmt = NSODeviceManagement.objects.create(
             device=device, nso_instance=inst, nso_device_name="sap-settle", adapter_device_id=90
         )
-        row = NSOL2SapState.objects.create(
+        row = acquire_overlay(
+            NSOL2SapState,
             management=mgmt,
             service_name="vpls-701",
             service_type="vpls",
@@ -714,8 +717,8 @@ class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         mgmt = NSODeviceManagement.objects.create(
             device=device, nso_instance=inst, nso_device_name="rp-settle", adapter_device_id=88
         )
-        row = NSORoutePolicyState.objects.create(
-            management=mgmt, family="community_list", object_name="CL-X", status=status_
+        row = acquire_overlay(
+            NSORoutePolicyState, management=mgmt, family="community_list", object_name="CL-X", status=status_
         )
         return mgmt, row
 
@@ -797,7 +800,8 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             mgmt = NSODeviceManagement.objects.create(
                 device=device, nso_instance=inst, nso_device_name="snmp-apply", adapter_device_id=91
             )
-            NSOSnmpHostState.objects.create(
+            acquire_overlay(
+                NSOSnmpHostState,
                 management=mgmt,
                 address="198.18.0.40",
                 version="v2c",
@@ -834,8 +838,8 @@ class TestApplyRollbackOnAdapterError(_CascadeFlushMixin, IntentPushResetMixin, 
         mgmt = NSODeviceManagement.objects.create(
             device=device, nso_instance=inst, nso_device_name="apply-rb", adapter_device_id=99
         )
-        row = NSORoutePolicyState.objects.create(
-            management=mgmt, family="community_list", object_name="CL-RB", status="accepted"
+        row = acquire_overlay(
+            NSORoutePolicyState, management=mgmt, family="community_list", object_name="CL-RB", status="accepted"
         )
         return mgmt, row
 
@@ -908,7 +912,7 @@ class TestApplyPreviewInterfaceScope(APITestCase):
         iface = Interface.objects.create(device=device, name="ae2.0", type="virtual", description="UPLINK")
         # Owned status (accepted) and the device description is empty → value differs →
         # genuinely pending, must show + apply. accepted_at=None proves it's status-driven.
-        NSOInterfaceState.objects.create(interface=iface, attribute="description", status="accepted", nso_value="")
+        acquire_overlay(NSOInterfaceState, interface=iface, attribute="description", status="accepted", nso_value="")
         changes = _apply_preview_interface_changes(device.pk)
         self.assertEqual([(c["interface"], c["attribute"]) for c in changes], [("ae2.0", "description")])
         self.assertEqual(changes[0]["netbox"], "UPLINK")
@@ -942,7 +946,9 @@ class TestApplyPreviewInterfaceScope(APITestCase):
         device = _make_device("ifprev3")
         iface = Interface.objects.create(device=device, name="ae3.0", type="virtual", description="MATCH")
         # Owned (in_sync) and the device already matches NetBox → not pending → not previewed.
-        NSOInterfaceState.objects.create(interface=iface, attribute="description", status="in_sync", nso_value="MATCH")
+        acquire_overlay(
+            NSOInterfaceState, interface=iface, attribute="description", status="in_sync", nso_value="MATCH"
+        )
         self.assertEqual(_apply_preview_interface_changes(device.pk), [])
 
 
@@ -963,7 +969,7 @@ class TestSafeReconcile(APITestCase):
         vlan = VLAN.objects.create(group=_device_vlan_group(device), vid=10, name="V10")
         imported = NSOVLANState.objects.create(management=mgmt, vlan=vlan, device_name="V10", status="imported")
         vlan2 = VLAN.objects.create(group=_device_vlan_group(device), vid=20, name="V20")
-        owned = NSOVLANState.objects.create(management=mgmt, vlan=vlan2, device_name="V20", status="accepted")
+        owned = acquire_overlay(NSOVLANState, management=mgmt, vlan=vlan2, device_name="V20", status="accepted")
         return mgmt, imported, owned
 
     def test_failure_marks_unowned_error_preserves_owned(self):

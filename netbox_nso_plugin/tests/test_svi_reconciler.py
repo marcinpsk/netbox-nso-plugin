@@ -8,7 +8,9 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOSVIState
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -255,6 +257,7 @@ class TestSviReconciler(TestCase):
             last_sync_at=plan.planned_at,
         )
         winner = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(interface, force_insert=True, natural_key=("device", "name")),
                 planned_save(
@@ -262,7 +265,7 @@ class TestSviReconciler(TestCase):
                     force_insert=True,
                     natural_key=("management", "interface"),
                 ),
-            )
+            ),
         )
         with renderer_mirror_writes(winner) as writer:
             writer.save(interface, force_insert=True)
@@ -379,7 +382,8 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         iface = Interface.objects.create(device=self.device, name=name, type="virtual")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=vid, name=f"V{vid}")
         NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
-        state = NSOSVIState.objects.create(
+        state = acquire_overlay(
+            NSOSVIState,
             management=self.management,
             interface=iface,
             vlan=vlan,
@@ -566,7 +570,8 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         vlan = VLAN.objects.create(group=group, vid=100, name="Duplicate VID")
         NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
         interface = Interface.objects.create(device=self.device, name="irb.200", type="virtual")
-        NSOSVIState.objects.create(
+        acquire_overlay(
+            NSOSVIState,
             management=self.management,
             interface=interface,
             vlan=vlan,
@@ -603,7 +608,8 @@ class TestSviWritePath(IntentPushResetMixin, TestCase):
         vlan = VLAN.objects.create(group=group, vid=100, name="Duplicate VID")
         NSOVLANState.objects.create(management=self.management, vlan=vlan, status="imported")
         interface = Interface.objects.create(device=self.device, name="irb.200", type="virtual")
-        NSOSVIState.objects.create(
+        acquire_overlay(
+            NSOSVIState,
             management=self.management,
             interface=interface,
             vlan=vlan,

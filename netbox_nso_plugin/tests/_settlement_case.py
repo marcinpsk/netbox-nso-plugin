@@ -19,6 +19,7 @@ from django.db import transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
+from ._ownership_case import acquire_overlay
 from ._settlement_adapter import FakeAdapter, LoopbackOnlySession, _Handler
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -83,8 +84,11 @@ def _own(sr, mgmt, *, generation, expected=True, status="deploying", orphan=Fals
             },
         )
 
-    with patch(PUT), transaction.atomic():
-        return NSOStaticRouteState.objects.create(
+    from netbox_nso_plugin.signals import suppress_intent_push
+
+    with patch(PUT), transaction.atomic(), suppress_intent_push():
+        return acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=sr,
             status=status,

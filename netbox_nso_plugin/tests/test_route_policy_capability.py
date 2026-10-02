@@ -19,6 +19,7 @@ from django.urls import reverse
 
 from netbox_nso_plugin.adapter_client import AdapterError
 
+from ._ownership_case import save_overlay_fixture
 from .mixins import IntentPushResetMixin
 
 TEST_PASSWORD = "capTestPwd!42"
@@ -377,10 +378,9 @@ class TestAttachBlockOverride(_CapBase):
             status="in_sync",
             is_materialized=True,
         )
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
-        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+        with suppress_intent_push():
+            save_overlay_fixture(state)
 
         verdict = {"known": True, "fully_supported": True, "unsupported": []}
         with patch("netbox_nso_plugin.adapter_client._request", side_effect=_request_returning(verdict)):
@@ -418,10 +418,9 @@ class TestPanelCapabilityBadge(_CapBase):
             object_id=obj.pk,
             status="accepted",
         )
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
-        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+        with suppress_intent_push():
+            save_overlay_fixture(state)
         return state
 
     def _annotated_states(self, obj):
@@ -548,10 +547,9 @@ class TestPanelCapabilityBadge(_CapBase):
             object_id=pl.pk,
             status="imported",
         )
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
 
-        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+        with suppress_intent_push():
+            save_overlay_fixture(state)
 
         ext = object.__new__(RoutePolicyNSODevices)
         ext.context = {"object": pl}

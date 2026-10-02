@@ -44,6 +44,7 @@ from netbox_nso_plugin.renderer_audit import audit_renderer_fleet
 
 from ._adapter_http import make_response
 from ._outbox_case import make_managed, reset_renderer_audit_rotation, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_apply_selector import _ApplyContractAdapter, _no_op
 
@@ -460,8 +461,8 @@ class TestNativeOnlyAcquisition(_CascadeFlushMixin, IntentPushResetMixin, Transa
                         interface = native_interface(device)
                         if initial is not None:
                             for attribute in ("description", "enabled"):
-                                NSOInterfaceState.objects.create(
-                                    interface=interface, attribute=attribute, status=initial
+                                acquire_overlay(
+                                    NSOInterfaceState, interface=interface, attribute=attribute, status=initial
                                 )
                     self.adapter.documents["interfaces-doc"] = {
                         "interfaces": [

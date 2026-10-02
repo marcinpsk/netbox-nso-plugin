@@ -27,6 +27,7 @@ from netbox_nso_plugin.models import (
     NSOInstance,
     NSOInterfaceState,
 )
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_response, make_session
 from ._outbox_case import (
@@ -38,6 +39,7 @@ from ._outbox_case import (
     open_provision_attempt,
     without_commit_drain,
 )
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
@@ -2283,8 +2285,8 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         self._make_managed()
         self.interface.enabled = True
         self.interface.save(update_fields=["enabled"])
-        en_state = NSOInterfaceState.objects.create(
-            interface=self.interface, attribute="enabled", status="in_sync", nso_value="True"
+        en_state = acquire_overlay(
+            NSOInterfaceState, interface=self.interface, attribute="enabled", status="in_sync", nso_value="True"
         )
         url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_edit_field", args=[en_state.pk])
 
@@ -2446,7 +2448,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
-        NSOISISInterfaceState.objects.create(
+        acquire_overlay(
+            NSOISISInterfaceState,
             management=self.mgmt,
             interface=self.interface,
             af="ipv4",
@@ -2469,7 +2472,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
-        NSOISISInterfaceState.objects.create(
+        acquire_overlay(
+            NSOISISInterfaceState,
             management=self.mgmt,
             interface=self.interface,
             af="ipv4",
@@ -2493,7 +2497,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
-        NSOISISInterfaceState.objects.create(
+        acquire_overlay(
+            NSOISISInterfaceState,
             management=self.mgmt,
             interface=self.interface,
             af="ipv4",
@@ -2515,7 +2520,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
 
         # in_sync + matching value (empty == empty) → no interface change in the preview.
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
-        NSOOSPFInterfaceState.objects.create(
+        acquire_overlay(
+            NSOOSPFInterfaceState,
             management=self.mgmt,
             interface=self.interface,
             process_id="1",
@@ -2545,7 +2551,7 @@ class TestNSOApplyPreviewView(ViewTestBase):
         # in_sync + matching value (empty == empty) → no interface change; only the VLAN is pending.
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2213, name="FW_uplink_cpms-01")
-        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
+        acquire_overlay(NSOVLANState, management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
 
         url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
         data = json.loads(self.client.get(url).content)
@@ -2591,7 +2597,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2299, name="stuck")
-        NSOVLANState.objects.create(
+        acquire_overlay(
+            NSOVLANState,
             management=self.mgmt,
             vlan=vlan,
             device_name="OLD",
@@ -2617,7 +2624,8 @@ class TestNSOApplyPreviewView(ViewTestBase):
         from netbox_nso_plugin.models import NSORedistributionState
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="bgp",
             source_protocol="connected",
@@ -2662,7 +2670,7 @@ class TestNSOApplyPreviewView(ViewTestBase):
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
         vlan = VLAN.objects.create(group=_device_vlan_group(self.device), vid=2300, name="pending")
-        NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
+        acquire_overlay(NSOVLANState, management=self.mgmt, vlan=vlan, device_name="OLD", status="accepted")
 
         url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
         data = json.loads(self.client.get(url).content)
@@ -2722,7 +2730,7 @@ class TestSwitchportStateAcceptView(ViewTestBase):
         from netbox_nso_plugin.models import NSOSwitchportState
 
         interface = Interface.objects.create(device=self.device, name=name, type="1000base-t")
-        return NSOSwitchportState.objects.create(management=self.mgmt, interface=interface, mode="access", **values)
+        return acquire_overlay(NSOSwitchportState, management=self.mgmt, interface=interface, mode="access", **values)
 
     def _preview_switchport_rows(self):
         url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
@@ -3068,8 +3076,13 @@ class TestDeviceNSOTabView(ViewTestBase):
         mgmt.adapter_device_id = 15
         mgmt.save(update_fields=["adapter_device_id"])
         for i in (1, 2):
-            NSOInterfaceIPState.objects.create(
-                interface=self.interface, address=f"10.9.9.{i}/32", vrf="", family="ipv4", status="in_sync"
+            acquire_overlay(
+                NSOInterfaceIPState,
+                interface=self.interface,
+                address=f"10.9.9.{i}/32",
+                vrf="",
+                family="ipv4",
+                status="in_sync",
             )
 
         stack, _mocks = self._patch_all_getters()
@@ -3234,7 +3247,8 @@ class TestDeviceNSOTabView(ViewTestBase):
                 type="other",
                 description="nb-0" if n == 0 else f"v-{n}",
             )
-            NSOInterfaceState.objects.create(
+            acquire_overlay(
+                NSOInterfaceState,
                 interface=iface,
                 attribute="description",
                 status="changed" if n == 0 else "imported",
@@ -3295,7 +3309,7 @@ class TestDeviceNSOTabView(ViewTestBase):
             management=self.mgmt, interface=iface, l2_mtu=9216, ip_mtu=9000, status="imported"
         )
         NSOInterfaceIPState.objects.create(interface=iface, address="10.0.0.1/31", family="ipv4", status="imported")
-        NSOSwitchportState.objects.create(management=self.mgmt, interface=iface, mode="access", status="imported")
+        acquire_overlay(NSOSwitchportState, management=self.mgmt, interface=iface, mode="access", status="imported")
 
         url = reverse(
             "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interface"}
@@ -3346,7 +3360,7 @@ class TestDeviceNSOTabView(ViewTestBase):
             family="ipv4",
             status="changed",
         )
-        NSOSwitchportState.objects.create(management=self.mgmt, interface=iface, mode="access", status="imported")
+        acquire_overlay(NSOSwitchportState, management=self.mgmt, interface=iface, mode="access", status="imported")
 
         url = reverse(
             "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "interface"}
@@ -3484,8 +3498,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         iface = Interface.objects.create(device=self.device, name="Gi0/9", type="other", description="nb")
         # cell 1 → apply_failed. Only the value-aware attribute cells can produce that kind
         # (interface_row_state); display_state folds apply_failed into "pending".
-        NSOInterfaceState.objects.create(
-            interface=iface, attribute="description", status="apply_failed", nso_value="device-side"
+        acquire_overlay(
+            NSOInterfaceState, interface=iface, attribute="description", status="apply_failed", nso_value="device-side"
         )
         # cell 2 → drift (unowned differ). apply_failed outranks drift in _KIND_SEVERITY,
         # so the ROW collapses to apply_failed while the raw kind set still holds "drift".
@@ -3594,8 +3608,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         from .test_read_gate import _rs
 
         mirror_update(self.mgmt, adapter_device_id=10)
-        NSOSwitchportState.objects.create(
-            management=self.mgmt, interface=self.interface, mode="access", status="imported"
+        acquire_overlay(
+            NSOSwitchportState, management=self.mgmt, interface=self.interface, mode="access", status="imported"
         )
         states = NSOSwitchportState.objects.filter(management=self.mgmt).order_by("pk")
         revisions = NSOIntentRevision.objects.filter(device=self.device).order_by("pk")
@@ -3774,8 +3788,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         owned_pending = Interface.objects.create(
             device=self.device, name="ae2.0", type="virtual", description="Core Link"
         )
-        NSOInterfaceState.objects.create(
-            interface=owned_pending, attribute="description", status="accepted", nso_value=""
+        acquire_overlay(
+            NSOInterfaceState, interface=owned_pending, attribute="description", status="accepted", nso_value=""
         )
         # Status says "changed" (DIFFER) but the values actually match → in sync.
         matched = Interface.objects.create(device=self.device, name="ae3.0", type="virtual", description="same")
@@ -3816,7 +3830,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         from netbox_nso_plugin.models import NSOInterfaceState
 
         iface = Interface.objects.create(device=self.device, name="ae9.0", type="virtual", description="Wants This")
-        NSOInterfaceState.objects.create(
+        acquire_overlay(
+            NSOInterfaceState,
             interface=iface,
             attribute="description",
             status="apply_failed",
@@ -3897,7 +3912,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.mgmt.save(update_fields=["manage_interfaces", "manage_description"])
         # A pending (owned) interface attr → counts.interfaces.pending == 1.
         iface = Interface.objects.create(device=self.device, name="et-9/9/9", type="other", description="nb")
-        NSOInterfaceState.objects.create(
+        acquire_overlay(
+            NSOInterfaceState,
             interface=iface,
             attribute="description",
             status="accepted",
@@ -4107,7 +4123,8 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         from netbox_nso_plugin.delivery import deliver
 
         # Create an 'enabled' interface state in accepted status
-        enabled_state = NSOInterfaceState.objects.create(
+        enabled_state = acquire_overlay(
+            NSOInterfaceState,
             interface=self.interface,
             attribute="enabled",
             status="accepted",
@@ -4154,7 +4171,8 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         content_bulk_update(self.iface_state, status="accepted")
         self.addCleanup(content_bulk_update, self.iface_state, status="changed")
         # Create a state with an unknown attribute — should be skipped
-        unknown_state = NSOInterfaceState.objects.create(
+        unknown_state = acquire_overlay(
+            NSOInterfaceState,
             interface=self.interface,
             attribute="mtu",
             status="accepted",
@@ -4224,6 +4242,7 @@ class TestInterfaceIntentDelivery(ViewTestBase):
 
                 self.iface_state.status = "accepted"
                 plan = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"),
                     saves=(planned_save(self.iface_state, update_fields=("status",)),),
                 )
                 with renderer_writes(plan) as writer:
@@ -4470,7 +4489,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_full_snmp_community_edit_repends_an_in_sync_row(self):
         from netbox_nso_plugin.models import NSOSnmpCommunityState
 
-        row = NSOSnmpCommunityState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpCommunityState,
             management=self.mgmt,
             community_hash="1111222233334444",
             access="RO",
@@ -4491,7 +4511,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_full_snmp_v3_user_edit_repends_an_in_sync_row(self):
         from netbox_nso_plugin.models import NSOSnmpV3UserState
 
-        row = NSOSnmpV3UserState.objects.create(
+        row = acquire_overlay(
+            NSOSnmpV3UserState,
             management=self.mgmt,
             username="monitor",
             group_name="readers",
@@ -4519,7 +4540,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_full_logging_level_edit_repends_a_deploying_row(self):
         from netbox_nso_plugin.models import NSOLoggingLevelState
 
-        row = NSOLoggingLevelState.objects.create(
+        row = acquire_overlay(
+            NSOLoggingLevelState,
             management=self.mgmt,
             console_severity="WARNING",
             status="deploying",
@@ -4679,8 +4701,8 @@ class TestOverlayFieldEditView(ViewTestBase):
     def test_edit_mtu_keeps_owned_status(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
-        row = NSOInterfaceMtuState.objects.create(
-            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="accepted"
+        row = acquire_overlay(
+            NSOInterfaceMtuState, management=self.mgmt, interface=self.interface, l2_mtu=9214, status="accepted"
         )
         r = self.client.post(self._url("interface_mtu", row.pk), {"l2_mtu": "9100"})
         self.assertEqual(r.status_code, 200)
@@ -5481,14 +5503,16 @@ class TestOverlayFieldEditView(ViewTestBase):
         lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
         edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/11", type="1000base-t")
         sibling = Interface.objects.create(device=self.device, name="GigabitEthernet0/12", type="1000base-t")
-        bundle = NSOLACPBundleState.objects.create(
+        bundle = acquire_overlay(
+            NSOLACPBundleState,
             management=self.mgmt,
             interface=lag,
             lag_id=11,
             min_links=1,
             status="deploying",
         )
-        edited_state = NSOLACPMemberState.objects.create(
+        edited_state = acquire_overlay(
+            NSOLACPMemberState,
             management=self.mgmt,
             interface=edited,
             lag_bundle=lag,
@@ -5496,7 +5520,8 @@ class TestOverlayFieldEditView(ViewTestBase):
             port_priority=100,
             status="deploying",
         )
-        sibling_state = NSOLACPMemberState.objects.create(
+        sibling_state = acquire_overlay(
+            NSOLACPMemberState,
             management=self.mgmt,
             interface=sibling,
             lag_bundle=lag,
@@ -5525,7 +5550,8 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         group = VLANGroup.objects.create(name="Shared Inline VLANs", slug="shared-inline-vlans")
         vlan = VLAN.objects.create(group=group, vid=120, name="OLD-NAME")
-        first = NSOVLANState.objects.create(
+        first = acquire_overlay(
+            NSOVLANState,
             management=self.mgmt,
             vlan=vlan,
             device_name="OLD-NAME",
@@ -5544,7 +5570,8 @@ class TestOverlayFieldEditView(ViewTestBase):
             nso_instance=self.nso_instance,
             nso_device_name=other_device.name,
         )
-        second = NSOVLANState.objects.create(
+        second = acquire_overlay(
+            NSOVLANState,
             management=other_mgmt,
             vlan=vlan,
             device_name="OLD-NAME",
@@ -5638,7 +5665,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         vlan = VLAN.objects.create(group=group, vid=220, name="CUSTOMER-A")
         NSOVLANState.objects.create(management=self.mgmt, vlan=vlan, status="imported")
         interface = Interface.objects.create(device=self.device, name="Vlan220", type="virtual")
-        state = NSOSVIState.objects.create(
+        state = acquire_overlay(
+            NSOSVIState,
             management=self.mgmt,
             interface=interface,
             vlan=vlan,
@@ -5907,12 +5935,14 @@ class TestOverlayFieldEditView(ViewTestBase):
             source_protocol="connected",
             route_map=route_map,
         )
-        NSOOSPFInstanceState.objects.create(
+        acquire_overlay(
+            NSOOSPFInstanceState,
             management=self.mgmt,
             process_id="7",
             status="accepted",
         )
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="ospf",
             dest_ref="7",
@@ -6028,7 +6058,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         from netbox_nso_plugin.views import _save_route_map_name_edit
 
         route_map = RouteMap.objects.create(name="RM-RACE-OLD")
-        state = NSORoutePolicyState.objects.create(
+        state = acquire_overlay(
+            NSORoutePolicyState,
             management=self.mgmt,
             family="route_map",
             object_name=route_map.name,
@@ -6036,7 +6067,8 @@ class TestOverlayFieldEditView(ViewTestBase):
             object_id=route_map.pk,
             status="accepted",
         )
-        fallback = NSORedistributionState.objects.create(
+        fallback = acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="ospf",
             source_protocol="connected",
@@ -7176,7 +7208,8 @@ class TestBfdGrid(ViewTestBase):
             min_rx=300,
             multiplier=3,
         )
-        NSOBFDInterfaceState.objects.create(
+        acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.mgmt,
             interface=self.ifaces["Gi0/2"],
             status="accepted",
@@ -7185,7 +7218,8 @@ class TestBfdGrid(ViewTestBase):
             multiplier=3,
             micro_bfd=True,
         )
-        NSOBFDInterfaceState.objects.create(
+        acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.mgmt,
             interface=self.ifaces["Gi0/3"],
             status="in_sync",
@@ -7459,7 +7493,7 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         NSOSnmpCommunityState.objects.create(
             management=cls.mgmt, community_hash="abcd1234abcd1234", access="RO", status="imported"
         )
-        NSOSwitchportState.objects.create(management=cls.mgmt, interface=cls.gi, mode="access", status="imported")
+        acquire_overlay(NSOSwitchportState, management=cls.mgmt, interface=cls.gi, mode="access", status="imported")
 
     def _get(self, key):
         url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": key})
@@ -7777,7 +7811,8 @@ class TestRoutePolicyGrid(ViewTestBase):
             object_id=route_map.id,
             status="imported",
         )
-        cls.rp_unmatched = NSORoutePolicyState.objects.create(
+        cls.rp_unmatched = acquire_overlay(
+            NSORoutePolicyState,
             management=cls.mgmt,
             family="prefix_list",
             object_name="PL-LOOPBACKS",
@@ -7903,13 +7938,14 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
             vault_ref="secret/snmp/community#community",
         )
         create_plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(
                 planned_save(
                     community,
                     force_insert=True,
                     natural_key=("management", "community_hash"),
                 ),
-            )
+            ),
         )
         with renderer_mirror_writes(create_plan) as writer:
             writer.save(community, force_insert=True)
@@ -7919,6 +7955,7 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         acquired.accepted_at = timezone.now()
         fields = ("status", "accepted_at")
         accept_plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(planned_save(acquired, update_fields=fields),),
             planned_at=acquired.accepted_at,
         )
@@ -7930,7 +7967,7 @@ class TestApplyRefusesAStaleSnmpStore(_CascadeFlushMixin, IntentPushResetMixin, 
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         community = self._own_a_community()
-        plan = RendererMutationPlan.build(deletes=(planned_delete(community),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(community),))
         with without_commit_drain(), renderer_writes(plan) as writer:
             writer.delete(community)
 
@@ -8161,14 +8198,16 @@ class TestReviewRegressionPins(ViewTestBase):
         from netbox_nso_plugin.models import NSORedistributionState
         from netbox_nso_plugin.views import NSORedistributionBulkAcceptView
 
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="bgp",
             dest_ref="65001",
             source_protocol="static",
             status="accepted",
         )
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="bgp",
             dest_ref="65001",
@@ -8182,7 +8221,8 @@ class TestReviewRegressionPins(ViewTestBase):
             source_protocol="static",
             status="imported",
         )
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="unknown",
             source_protocol="static",
@@ -8190,7 +8230,8 @@ class TestReviewRegressionPins(ViewTestBase):
         )
         # A delivery key that is NOT a redistribution destination: adapter payload data
         # populates this column, and the signal path refuses what this path must too.
-        NSORedistributionState.objects.create(
+        acquire_overlay(
+            NSORedistributionState,
             management=self.mgmt,
             dest_protocol="vlan",
             source_protocol="static",
@@ -8345,8 +8386,8 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         with without_commit_drain(), transaction.atomic():
             # The native MTU is the ownership anchor the Accept adopted; the owned overlay mirrors it.
             interface = Interface.objects.create(device=self.device, name="Port-channel7791", type="lag", mtu=9000)
-            self.mtu_state = NSOInterfaceMtuState.objects.create(
-                management=self.mgmt, interface=interface, l2_mtu=9000, status="accepted"
+            self.mtu_state = acquire_overlay(
+                NSOInterfaceMtuState, management=self.mgmt, interface=interface, l2_mtu=9000, status="accepted"
             )
 
     def _apply(self, adapter):

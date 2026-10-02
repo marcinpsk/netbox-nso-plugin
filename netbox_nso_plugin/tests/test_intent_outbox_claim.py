@@ -32,6 +32,7 @@ from ._outbox_case import (
     state_of,
     without_commit_drain,
 )
+from ._ownership_case import save_overlay_fixture
 from ._static_route_case import _unassign_and_retire
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -201,7 +202,6 @@ class TestCoalescedRoutePolicyClaimPreservesSuccessHook(_ClaimCase):
         from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
         from netbox_nso_plugin import drain
-        from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.signals import suppress_intent_push
 
@@ -222,8 +222,8 @@ class TestCoalescedRoutePolicyClaimPreservesSuccessHook(_ClaimCase):
             object_id=community_list.pk,
             status="accepted",
         )
-        with suppress_intent_push(), intent_transaction(footprint_for_instance(state)):
-            state.save()
+        with suppress_intent_push():
+            save_overlay_fixture(state)
 
         enqueue(self.device, "route_policy")
         enqueue(self.device, "route_policy")

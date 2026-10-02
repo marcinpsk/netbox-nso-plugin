@@ -14,6 +14,8 @@ from django.contrib.auth import get_user_model
 from django.test import TransactionTestCase
 from django.urls import reverse
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import ReceiptAdapter, make_managed, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -37,7 +39,8 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 status="accepted",
             )
             plan = RendererMutationPlan.build(
-                saves=(planned_save(state, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(state, force_insert=True, natural_key=("management", "interface")),),
             )
             with renderer_writes(plan) as writer:
                 writer.save(state, force_insert=True)
@@ -53,7 +56,8 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 management=self.management, interface=interface, mode="tagged-all", status="accepted"
             )
             plan = RendererMutationPlan.build(
-                saves=(planned_save(state, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(state, force_insert=True, natural_key=("management", "interface")),),
             )
             with renderer_writes(plan) as writer:
                 writer.save(state, force_insert=True)
@@ -81,7 +85,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         row = create(name)
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(row.interface),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row.interface),))
+        ) as writer:
             writer.delete(row.interface)
         return row
 
@@ -341,13 +347,14 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                                     )
                                     with renderer_writes(
                                         RendererMutationPlan.build(
+                                            grant=OwnershipGrant("create"),
                                             saves=(
                                                 planned_save(
                                                     member_state,
                                                     force_insert=True,
                                                     natural_key=("management", "interface"),
                                                 ),
-                                            )
+                                            ),
                                         )
                                     ) as writer:
                                         writer.save(member_state, force_insert=True)
@@ -364,7 +371,10 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                                 changed = copy.copy(retained.interface)
                                 changed.name = f"{prefix}{index + 200}"
                                 with renderer_writes(
-                                    RendererMutationPlan.build(saves=(planned_save(changed, update_fields=("name",)),))
+                                    RendererMutationPlan.build(
+                                        grant=OwnershipGrant("create"),
+                                        saves=(planned_save(changed, update_fields=("name",)),),
+                                    )
                                 ) as writer:
                                     writer.save(changed, update_fields=("name",))
                             elif trigger == "tick":
@@ -398,7 +408,8 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             without_commit_drain(),
             renderer_writes(
                 RendererMutationPlan.build(
-                    saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),)
+                    grant=OwnershipGrant("create"),
+                    saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),),
                 )
             ) as writer,
         ):
@@ -480,7 +491,8 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         )
         with renderer_writes(
             RendererMutationPlan.build(
-                saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),),
             )
         ) as writer:
             writer.save(member, force_insert=True)
@@ -564,14 +576,17 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         )
         with renderer_writes(
             RendererMutationPlan.build(
-                saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),),
             )
         ) as writer:
             writer.save(member, force_insert=True)
         unowned = copy.copy(excluded_bundle)
         unowned.status = "changed"
         with renderer_writes(
-            RendererMutationPlan.build(saves=(planned_save(unowned, update_fields=("status",)),))
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), saves=(planned_save(unowned, update_fields=("status",)),)
+            )
         ) as writer:
             writer.save(unowned, update_fields=("status",))
 
@@ -626,7 +641,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             detached = copy.copy(unowned)
             detached.status = "changed"
             with renderer_writes(
-                RendererMutationPlan.build(saves=(planned_save(detached, update_fields=("status",)),))
+                RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(detached, update_fields=("status",)),)
+                )
             ) as writer:
                 writer.save(detached, update_fields=("status",))
             edited = copy.copy(owned)
@@ -638,7 +655,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 fields = ("mode",)
             with renderer_writes(
                 RendererMutationPlan.build(
-                    deletes=(planned_delete(unowned),), saves=(planned_save(edited, update_fields=fields),)
+                    grant=OwnershipGrant("create"),
+                    deletes=(planned_delete(unowned),),
+                    saves=(planned_save(edited, update_fields=fields),),
                 )
             ) as writer:
                 writer.delete(unowned)
@@ -665,10 +684,14 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             detached = copy.copy(row)
             detached.status = "changed"
             with renderer_writes(
-                RendererMutationPlan.build(saves=(planned_save(detached, update_fields=("status",)),))
+                RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(detached, update_fields=("status",)),)
+                )
             ) as writer:
                 writer.save(detached, update_fields=("status",))
-            with renderer_mirror_writes(RendererMutationPlan.build(deletes=(planned_delete(row.interface),))) as writer:
+            with renderer_mirror_writes(
+                RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(row.interface),))
+            ) as writer:
                 writer.delete(row.interface)
             assert not NSOSwitchingRootDeletion.objects.filter(
                 management=self.management, scope=scope, root_name=name
@@ -690,14 +713,18 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         ):
             deleted = create(old_name)
             replacement = create(new_name)
-            with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted.interface),))) as writer:
+            with renderer_writes(
+                RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted.interface),))
+            ) as writer:
                 writer.delete(deleted.interface)
             for name in (old_name, f"{new_name}-final"):
                 current = Interface.objects.get(pk=replacement.interface_id)
                 changed = copy.copy(current)
                 changed.name = name
                 with renderer_writes(
-                    RendererMutationPlan.build(saves=(planned_save(changed, update_fields=("name",)),))
+                    RendererMutationPlan.build(
+                        grant=OwnershipGrant("create"), saves=(planned_save(changed, update_fields=("name",)),)
+                    )
                 ) as writer:
                     writer.save(changed, update_fields=("name",))
             config, session = self.adapter.patches()
@@ -720,7 +747,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         )
 
         deleted = self._switchport("Ethernet61")
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         assert NSOSwitchingRootDeletion.objects.filter(management=self.management, root_name="Ethernet61").exists()
         unowned = NSOSwitchportState(
@@ -728,14 +757,17 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         )
         with renderer_mirror_writes(
             RendererMutationPlan.build(
-                saves=(planned_save(unowned, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(unowned, force_insert=True, natural_key=("management", "interface")),),
             )
         ) as writer:
             writer.save(unowned, force_insert=True)
         restored = copy.copy(unowned)
         restored.status = "accepted"
         with renderer_writes(
-            RendererMutationPlan.build(saves=(planned_save(restored, update_fields=("status",)),))
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"), saves=(planned_save(restored, update_fields=("status",)),)
+            )
         ) as writer:
             writer.save(restored, update_fields=("status",))
         config, session = self.adapter.patches()
@@ -768,11 +800,14 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         )
         with renderer_writes(
             RendererMutationPlan.build(
-                saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(member, force_insert=True, natural_key=("management", "interface")),),
             )
         ) as writer:
             writer.save(member, force_insert=True)
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(member),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(member),))
+        ) as writer:
             writer.delete(member)
         config, session = self.adapter.patches()
         with config, session:
@@ -846,6 +881,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         unowned = copy.copy(detached)
         unowned.status = "changed"
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             deletes=(planned_delete(deleted),),
             saves=(planned_save(unowned, update_fields=("status",)),),
         )
@@ -876,7 +912,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
         deleted = self._bundle("Port-channel3")
         before = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         deleted_revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp").revision
         assert deleted_revision > before
@@ -889,7 +927,8 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             status="accepted",
         )
         plan = RendererMutationPlan.build(
-            saves=(planned_save(restored, force_insert=True, natural_key=("management", "interface")),)
+            grant=OwnershipGrant("create"),
+            saves=(planned_save(restored, force_insert=True, natural_key=("management", "interface")),),
         )
         with renderer_writes(plan) as writer:
             writer.save(restored, force_insert=True)
@@ -916,6 +955,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         unowned = copy.copy(detached)
         unowned.status = "changed"
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             deletes=(planned_delete(deleted),),
             saves=(planned_save(unowned, update_fields=("status",)),),
         )
@@ -934,7 +974,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
         bundle = self._bundle("Port-channel12")
         native = bundle.interface
-        plan = RendererMutationPlan.build(deletes=(planned_delete(native),))
+        plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(native),))
         with renderer_writes(plan) as writer:
             writer.delete(native)
 
@@ -948,7 +988,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
         state = self._switchport("Ethernet12")
         native = state.interface
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(native),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(native),))
+        ) as writer:
             writer.delete(native)
         assert NSOSwitchingRootDeletion.objects.filter(
             management=self.management, scope="switchport", root_name="Ethernet12"
@@ -971,6 +1013,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         unowned = copy.copy(detached)
         unowned.status = "changed"
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             deletes=(planned_delete(deleted),),
             saves=(planned_save(unowned, update_fields=("status",)),),
         )
@@ -982,7 +1025,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
         changed = copy.copy(retained)
         changed.min_links = 2
-        plan = RendererMutationPlan.build(saves=(planned_save(changed, update_fields=("min_links",)),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(changed, update_fields=("min_links",)),)
+        )
         config, session = self.adapter.patches()
         with config, session, renderer_writes(plan) as writer:
             writer.save(changed, update_fields=("min_links",))
@@ -1009,7 +1054,13 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         self.management.auto_apply = True
         self.management.save(update_fields=["auto_apply"])
         config, session = self.adapter.patches()
-        with config, session, renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with (
+            config,
+            session,
+            renderer_writes(
+                RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+            ) as writer,
+        ):
             writer.delete(deleted)
         assert self.adapter.requests[-1]["body"]["deleted_roots"] == ["Ethernet65"]
         changed = copy.copy(retained)
@@ -1019,7 +1070,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             config,
             session,
             renderer_writes(
-                RendererMutationPlan.build(saves=(planned_save(changed, update_fields=("mode",)),))
+                RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(changed, update_fields=("mode",)),)
+                )
             ) as writer,
         ):
             writer.save(changed, update_fields=("mode",))
@@ -1031,7 +1084,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             config,
             session,
             renderer_writes(
-                RendererMutationPlan.build(saves=(planned_save(unowned, update_fields=("status",)),))
+                RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(unowned, update_fields=("status",)),)
+                )
             ) as writer,
         ):
             writer.save(unowned, update_fields=("status",))
@@ -1074,6 +1129,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         unowned = copy.copy(detached)
         unowned.status = "changed"
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             deletes=(planned_delete(deleted),),
             saves=(planned_save(unowned, update_fields=("status",)),),
         )
@@ -1098,7 +1154,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             config,
             session,
             renderer_writes(
-                RendererMutationPlan.build(saves=(planned_save(edited, update_fields=("mode",)),))
+                RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(edited, update_fields=("mode",)),)
+                )
             ) as writer,
         ):
             writer.save(edited, update_fields=("mode",))
@@ -1113,7 +1171,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         deleted = self._bundle("Port-channel7")
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         self.adapter._respond = lambda body: {
             "status": "prepared",
@@ -1136,7 +1196,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
         deleted = self._bundle("Port-channel13")
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         config, session = self.adapter.patches()
         with config, session:
@@ -1152,7 +1214,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from ._outbox_case import enqueue, entries
 
         deleted = self._bundle("Port-channel8")
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         enqueue(self.device, "lacp")
         self.adapter._respond = lambda body: (
@@ -1173,7 +1237,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from ._outbox_case import enqueue, entries
 
         deleted = self._bundle("Port-channel9")
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         enqueue(self.device, "lacp")
         self.adapter._respond = lambda body: (
@@ -1200,7 +1266,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         )
 
         deleted = self._bundle("Port-channel10")
-        with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(deleted),))) as writer:
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
             writer.delete(deleted)
         first_version = NSOSwitchingRootDeletion.objects.get(
             management=self.management, root_name="Port-channel10"
@@ -1214,11 +1282,14 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 status="accepted",
             )
             plan = RendererMutationPlan.build(
-                saves=(planned_save(restored, force_insert=True, natural_key=("management", "interface")),)
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(restored, force_insert=True, natural_key=("management", "interface")),),
             )
             with renderer_writes(plan) as writer:
                 writer.save(restored, force_insert=True)
-            with renderer_writes(RendererMutationPlan.build(deletes=(planned_delete(restored),))) as writer:
+            with renderer_writes(
+                RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(restored),))
+            ) as writer:
                 writer.delete(restored)
             return {
                 "status": "prepared",

@@ -15,6 +15,10 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
 from django.utils import timezone
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
+from ._ownership_case import acquire_overlay
+
 PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 
 
@@ -178,6 +182,7 @@ def _acquire_static_route(route, device) -> None:
     candidate.nso_next_hop = str(route.next_hop or "")
     candidate.last_sync_at = timezone.now()
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"),
         saves=(
             planned_save(
                 candidate,
@@ -207,7 +212,9 @@ def _assign_and_accept(route, *devices):
     )
     from netbox_nso_plugin.signals import suppress_intent_push
 
-    assignment = RendererMutationPlan.build(m2m_writes=(planned_m2m_add(route, "devices", devices),))
+    assignment = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_add(route, "devices", devices),)
+    )
     mutation = renderer_writes(assignment) if assignment.changes_content else renderer_mirror_writes(assignment)
     with mutation as writer, suppress_intent_push():
         writer.m2m_add(route, "devices", devices)
@@ -235,7 +242,9 @@ def _edit_owned_route(route, **values):
         for field_name, value in values.items():
             setattr(candidate, field_name, value)
         fields = tuple(values)
-        plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
+        )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
             writer.save(candidate, update_fields=fields)
@@ -265,7 +274,7 @@ def _delete_owned_route(route):
     )
 
     current = type(route).objects.get(pk=route.pk)
-    plan = RendererMutationPlan.build(deletes=(planned_delete(current),))
+    plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(current),))
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         writer.delete(current)
@@ -286,6 +295,7 @@ def _accept_with_permit(route, device):
         try:
             if not route.devices.filter(pk=device.pk).exists():
                 assignment = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"),
                     m2m_writes=(planned_m2m_add(route, "devices", (device,)),),
                 )
                 mutation = (
@@ -315,6 +325,7 @@ def _unassign_and_retire(route, device):
     state = NSOStaticRouteState.objects.filter(management__device=device, static_route=current).first()
     deletes = () if state is None else (planned_delete(state),)
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"),
         deletes=deletes,
         m2m_writes=(planned_m2m_set(current, "devices", remaining),),
     )
@@ -337,7 +348,8 @@ def _own(sr, mgmt, *, status="in_sync", mirror_vrf=None):
 
     with transaction.atomic():
         attempt_id = NSOApplyAttempt.objects.create(management=mgmt).pk if status == "deploying" else None
-        return NSOStaticRouteState.objects.create(
+        return acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=sr,
             status=status,

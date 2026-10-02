@@ -7,7 +7,10 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Platform, Site
 from django.test import TestCase, TransactionTestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import trust_scope
+from ._ownership_case import acquire_overlay, update_or_acquire_overlay
 from ._static_route_case import _assign_without_push
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -63,7 +66,8 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         # Brownfield setup mirrors reconcile (under suppress) so the greenfield
         # assign-signal doesn't auto-own the route before we set the desired status.
         _assign_without_push(sr, self.device)
-        return NSOStaticRouteState.objects.create(
+        return acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=sr,
             status=status,
@@ -170,7 +174,8 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
             defaults={"metric": 1, "interface_next_hop": "GigabitEthernet0/0"},
         )
         sr.devices.add(self.device)
-        NSOStaticRouteState.objects.create(
+        acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=sr,
             status="accepted",
@@ -306,7 +311,8 @@ class TestOnStaticRouteStateSave(IntentPushDeliveryMixin, TestCase):
             with self.captureOnCommitCallbacks(execute=True):
                 with renderer_writes(
                     RendererMutationPlan.build(
-                        saves=[planned_save(state, force_insert=True, natural_key=("management", "static_route"))]
+                        grant=OwnershipGrant("create"),
+                        saves=[planned_save(state, force_insert=True, natural_key=("management", "static_route"))],
                     )
                 ) as writer:
                     writer.save(state, force_insert=True)
@@ -357,7 +363,7 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.10.0/24", next_hop="10.0.0.10", metric=1)
         sr.devices.add(self.device)
-        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+        state = acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
 
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
@@ -373,7 +379,7 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.12.0/24", next_hop="10.0.0.12", metric=1)
         sr.devices.add(self.device)
-        state = NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
+        state = acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
 
         with patch(PUT) as mock_push:
             with self.captureOnCommitCallbacks(execute=True):
@@ -391,8 +397,10 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.13.0/24", next_hop="10.0.0.13", metric=1)
         _assign_without_push(sr, self.device)
-        NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(sr, "devices", ()),))
+        acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(sr, "devices", ()),)
+        )
 
         with patch(PUT):
             with self.assertRaisesRegex(IntentMutationProtocolError, "bypassed the active renderer writer"):
@@ -412,11 +420,13 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
         mgmt = self._mgmt()
         sr = StaticRoute.objects.create(prefix="10.9.14.0/24", next_hop="10.0.0.14", metric=1)
         _assign_without_push(sr, self.device)
-        NSOStaticRouteState.objects.create(management=mgmt, static_route=sr, status="accepted")
-        plan = RendererMutationPlan.build(m2m_writes=(planned_m2m_set(sr, "devices", ()),))
+        acquire_overlay(NSOStaticRouteState, management=mgmt, static_route=sr, status="accepted")
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"), m2m_writes=(planned_m2m_set(sr, "devices", ()),)
+        )
 
         self.assertIn((self.device.pk, "static_route"), plan.content_keys)
-        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="static_route").exists())
+        baseline_entries = set(NSOIntentOutboxEntry.objects.values_list("pk", flat=True))
 
         with patch(PUT):
             with self.captureOnCommitCallbacks(execute=True):
@@ -426,7 +436,11 @@ class TestForeignStaticRouteEvents(IntentPushDeliveryMixin, TestCase):
         self.assertFalse(
             StaticRoute.devices.through.objects.filter(staticroute_id=sr.pk, device_id=self.device.pk).exists()
         )
-        self.assertTrue(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="static_route").exists())
+        self.assertTrue(
+            NSOIntentOutboxEntry.objects.filter(device=self.device, scope="static_route")
+            .exclude(pk__in=baseline_entries)
+            .exists()
+        )
 
     def test_delete_route_only_applies_the_database_cascade(self):
         from netbox_routing.models import StaticRoute
@@ -479,7 +493,8 @@ class _StaticRouteWireCase:
             interface_next_hop="GigabitEthernet0/0" if next_hop_is_none else "",
         )
         _assign_without_push(sr, self.device)
-        state = NSOStaticRouteState.objects.create(
+        state = acquire_overlay(
+            NSOStaticRouteState,
             management=mgmt,
             static_route=sr,
             status="accepted",
@@ -614,7 +629,8 @@ class TestStaticRouteIntentGenerationOnTheWire(_StaticRouteWireCase, IntentPushR
             device=other, nso_instance=inst, nso_device_name="nso-sr-gen-2", adapter_device_id=4243
         )
         _assign_without_push(state.static_route, other)
-        other_state, _ = NSOStaticRouteState.objects.update_or_create(
+        other_state, _ = update_or_acquire_overlay(
+            NSOStaticRouteState,
             management=other_mgmt,
             static_route=state.static_route,
             defaults={"status": "accepted", "intent_generation": generation},

@@ -12,6 +12,21 @@ from django.urls import reverse
 from netbox.models import NetBoxModel
 
 from .outbox import CONTRIBUTION_KIND_CHOICES, CONTRIBUTION_KIND_ORDINARY
+from .ownership_grants import GRANTS
+from .ownership_querysets import OwnershipQuerySet
+
+
+class _OwnedOverlayModel(NetBoxModel):
+    objects = OwnershipQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+        base_manager_name = "objects"
+
+    def save(self, *args, **kwargs):
+        """Hold the ownership check, write, and release cleanup in one transaction."""
+        with transaction.atomic(using=kwargs.get("using") or self._state.db or "default"):
+            return super().save(*args, **kwargs)
 
 
 class AdapterConnection(NetBoxModel):
@@ -825,7 +840,7 @@ class NSOFamilyReadState(NetBoxModel):
         return f"{self.management} / {self.family} [{self.observed_outcome or 'unknown'}]"
 
 
-class NSOInterfaceState(NetBoxModel):
+class NSOInterfaceState(_OwnedOverlayModel):
     """Per-interface, per-attribute intent status overlay (Phase 2).
 
     Intent value lives on ``dcim.Interface`` (description/enabled fields).
@@ -877,6 +892,7 @@ class NSOInterfaceState(NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["interface", "attribute"]
         unique_together = [("interface", "attribute")]
         verbose_name = "NSO Interface State"
@@ -890,7 +906,7 @@ class NSOInterfaceState(NetBoxModel):
         return reverse("plugins:netbox_nso_plugin:nsointerfacestate", args=[self.pk])
 
 
-class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOInterfaceIPState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-interface, per-address IP address status overlay (Phase 3).
 
     Tracks the synchronisation state for each IP address reported by NSO for a
@@ -992,6 +1008,7 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["interface", "address", "vrf"]
         unique_together = [("interface", "address", "vrf")]
         verbose_name = "NSO Interface IP State"
@@ -1033,7 +1050,7 @@ _SNMP_PRIV_PROTOCOL_CHOICES = [
 ]
 
 
-class NSOSnmpCommunityState(NetBoxModel):
+class NSOSnmpCommunityState(_OwnedOverlayModel):
     """Per-device SNMP community status overlay (read path).
 
     The community string itself is never stored — only its opaque SHA-256 hash
@@ -1094,6 +1111,7 @@ class NSOSnmpCommunityState(NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "community_hash"]
         unique_together = [("management", "community_hash")]
         verbose_name = "NSO SNMP Community State"
@@ -1109,7 +1127,7 @@ class NSOSnmpCommunityState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOSnmpV3UserState(NetBoxModel):
+class NSOSnmpV3UserState(_OwnedOverlayModel):
     """Per-device SNMP v3 user status overlay (read path).
 
     Passwords are never stored — ``has_auth_secret`` / ``has_priv_secret``
@@ -1169,6 +1187,7 @@ class NSOSnmpV3UserState(NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "username"]
         unique_together = [("management", "username")]
         verbose_name = "NSO SNMP V3 User State"
@@ -1184,7 +1203,7 @@ class NSOSnmpV3UserState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOSnmpHostState(NetBoxModel):
+class NSOSnmpHostState(_OwnedOverlayModel):
     """Per-device SNMP trap/inform host status overlay (read path)."""
 
     management = models.ForeignKey(
@@ -1223,6 +1242,7 @@ class NSOSnmpHostState(NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "address"]
         unique_together = [("management", "address")]
         verbose_name = "NSO SNMP Host State"
@@ -1238,7 +1258,7 @@ class NSOSnmpHostState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOSnmpSystemInfoState(NetBoxModel):
+class NSOSnmpSystemInfoState(_OwnedOverlayModel):
     """Per-device SNMP system location/contact status overlay (read path).
 
     At most one row per device management object (enforced by OneToOneField).
@@ -1258,6 +1278,7 @@ class NSOSnmpSystemInfoState(NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         verbose_name = "NSO SNMP System Info State"
         verbose_name_plural = "NSO SNMP System Info States"
 
@@ -1271,7 +1292,7 @@ class NSOSnmpSystemInfoState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOLoggingHostState(NetBoxModel):
+class NSOLoggingHostState(_OwnedOverlayModel):
     """Per-device remote syslog server (logging host) status overlay (read path)."""
 
     management = models.ForeignKey(
@@ -1293,6 +1314,7 @@ class NSOLoggingHostState(NetBoxModel):
     )
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "address"]
         unique_together = [("management", "address")]
         verbose_name = "NSO Logging Host State"
@@ -1322,7 +1344,7 @@ _OC_SEVERITY_CHOICES = [
 ]
 
 
-class NSOLoggingLevelState(NetBoxModel):
+class NSOLoggingLevelState(_OwnedOverlayModel):
     """Per-device local logging severity levels overlay (console/monitor/module).
 
     At most one row per device management object (OneToOneField) — the
@@ -1353,6 +1375,7 @@ class NSOLoggingLevelState(NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         indexes = [
             models.Index(
                 fields=["management", "status", "apply_attempt_id"],
@@ -1395,7 +1418,7 @@ _STATIC_ROUTE_STATUS_CHOICES = [
 ]
 
 
-class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOStaticRouteState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, static_route) compliance overlay for static routing.
 
     One row exists per (NSODeviceManagement, StaticRoute) pair.  The StaticRoute
@@ -1450,6 +1473,7 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, NetBoxModel):
     last_acked_triple = models.JSONField(null=True, blank=True, default=None)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "static_route"]
         unique_together = [("management", "static_route")]
         indexes = [
@@ -1484,7 +1508,7 @@ _L2_SAP_STATUS_CHOICES = [
 ]
 
 
-class NSOL2SapState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOL2SapState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-SAP compliance overlay for Nokia L2 services.
 
     One row per (device, service, SAP). The service is reconciled into a native
@@ -1528,6 +1552,7 @@ class NSOL2SapState(_NSODeviceTabURLMixin, NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "service_name", "sap_id"]
         unique_together = [("management", "service_name", "sap_id")]
         indexes = [
@@ -1562,7 +1587,7 @@ _ISIS_STATUS_CHOICES = [
 ]
 
 
-class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOISISInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, interface, af) IS-IS enablement compliance overlay.
 
     Tracks the status of IS-IS interface enablement for each (NSODeviceManagement,
@@ -1617,6 +1642,7 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface", "af"]
         unique_together = [("management", "interface", "af")]
         verbose_name = "NSO IS-IS Interface State"
@@ -1626,7 +1652,7 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / {self.interface} ({self.af}) [{self.status}]"
 
 
-class NSOISISInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOISISInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, isis_process_tag) IS-IS process compliance overlay.
 
     Tracks the status of IS-IS process-level config (net, is-type, metric-style,
@@ -1676,6 +1702,7 @@ class NSOISISInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "process_tag"]
         unique_together = [("management", "process_tag")]
         verbose_name = "NSO IS-IS Instance State"
@@ -1685,7 +1712,7 @@ class NSOISISInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / isis {self.process_tag} [{self.status}]"
 
 
-class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, process_tag, algo_id) IS-IS Flex-Algorithm compliance overlay.
 
     Tracks the status of one Flex-Algo definition the operator manages via NSO.
@@ -1722,6 +1749,7 @@ class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "process_tag", "algo_id"]
         unique_together = [("management", "process_tag", "algo_id")]
         verbose_name = "NSO IS-IS Flex-Algo State"
@@ -1746,7 +1774,7 @@ _BGP_STATUS_CHOICES = [
 _BGP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
 
 
-class NSOBGPPeerState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, asn, vrf, peer_address) BGP peer compliance overlay.
 
     Tracks the reconcile status of each BGP peer discovered from NSO.
@@ -1791,6 +1819,7 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "asn_str", "vrf_name", "peer_address_str"]
         unique_together = [("management", "asn_str", "vrf_name", "peer_address_str")]
         verbose_name = "NSO BGP Peer State"
@@ -1801,7 +1830,7 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / ASN:{self.asn_str}{vrf_part} peer:{self.peer_address_str} [{self.status}]"
 
 
-class NSOBGPPeerTemplateState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOBGPPeerTemplateState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, peer-group name) BGP peer-group TEMPLATE compliance overlay.
 
     Tracks the reconcile status of each BGP peer-group template (netbox-routing's
@@ -1842,6 +1871,7 @@ class NSOBGPPeerTemplateState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "template_name"]
         unique_together = [("management", "template_name")]
         verbose_name = "NSO BGP Peer Template State"
@@ -1900,7 +1930,7 @@ class SharedObjectStateMixin(models.Model):
         abstract = True
 
 
-class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxModel):
+class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, policy-object) compliance overlay for route policy.
 
     A single generic model covers all four object families (prefix-list,
@@ -1949,6 +1979,7 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, NetBoxM
     unsupported_members = models.JSONField(default=list, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "family", "object_name"]
         unique_together = [("management", "family", "object_name")]
         indexes = [
@@ -2049,7 +2080,7 @@ _OSPF_STATUS_CHOICES = [
 _OSPF_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
 
 
-class NSOOSPFInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOOSPFInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, process_id) OSPF process compliance overlay.
 
     Tracks the status of OSPF process-level config (router-id, vrf, areas)
@@ -2087,6 +2118,7 @@ class NSOOSPFInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "process_id"]
         unique_together = [("management", "process_id")]
         verbose_name = "NSO OSPF Instance State"
@@ -2096,7 +2128,7 @@ class NSOOSPFInstanceState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / ospf {self.process_id} [{self.status}]"
 
 
-class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, interface) OSPF interface compliance overlay.
 
     Tracks the status of OSPF interface config (area, passive, cost, network-type, auth)
@@ -2129,6 +2161,7 @@ class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         verbose_name = "NSO OSPF Interface State"
@@ -2153,7 +2186,7 @@ _REDISTRIBUTION_STATUS_CHOICES = [
 _REDISTRIBUTION_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
 
 
-class NSORedistributionState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSORedistributionState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, destination, source) redistribution statement compliance overlay.
 
     Tracks the observed + intended state of each `redistribute <source>` statement
@@ -2201,6 +2234,7 @@ class NSORedistributionState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "dest_protocol", "dest_ref", "source_protocol"]
         unique_together = [("management", "dest_protocol", "dest_ref", "source_protocol", "source_ref")]
         verbose_name = "NSO Redistribution State"
@@ -2226,7 +2260,7 @@ _LACP_STATUS_CHOICES = [
 ]
 
 
-class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOLACPBundleState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, LAG interface) LACP bundle compliance overlay.
 
     Carries the LACP parameters NetBox has no native column for — min-links,
@@ -2265,6 +2299,7 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         verbose_name = "NSO LACP Bundle State"
@@ -2274,7 +2309,7 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / {self.interface} [{self.status}]"
 
 
-class NSOLACPMemberState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOLACPMemberState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, member interface) LACP member compliance overlay.
 
     Carries the per-member LACP mode + port-priority and links to the parent LAG
@@ -2309,6 +2344,7 @@ class NSOLACPMemberState(_NSODeviceTabURLMixin, NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         verbose_name = "NSO LACP Member State"
@@ -2331,7 +2367,7 @@ _VLAN_STATUS_CHOICES = [
 ]
 
 
-class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOVLANState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, ipam.VLAN) VLAN-database compliance overlay.
 
     The VLAN itself is reconciled into a per-device ``ipam.VLANGroup`` (slug
@@ -2359,6 +2395,7 @@ class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "vlan"]
         unique_together = [("management", "vlan")]
         indexes = [
@@ -2380,7 +2417,7 @@ class NSOVLANState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / VLAN {self.vlan} [{self.status}]"
 
 
-class NSOSwitchportState(_NSODeviceTabURLMixin, NetBoxModel):
+class NSOSwitchportState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, interface) L2 switchport compliance overlay.
 
     Reconciles into the native ``Interface.mode``/``untagged_vlan``/``tagged_vlans``;
@@ -2422,6 +2459,7 @@ class NSOSwitchportState(_NSODeviceTabURLMixin, NetBoxModel):
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         verbose_name = "NSO Switchport State"
@@ -2431,7 +2469,7 @@ class NSOSwitchportState(_NSODeviceTabURLMixin, NetBoxModel):
         return f"{self.management} / {self.interface} [{self.status}]"
 
 
-class NSOSVIState(NetBoxModel):
+class NSOSVIState(_OwnedOverlayModel):
     """Per-SVI/IRB compliance overlay.
 
     Tracks an L3 VLAN interface (IOS interface VlanN / Junos irb.N) materialised
@@ -2456,6 +2494,7 @@ class NSOSVIState(NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         indexes = [
@@ -2483,7 +2522,7 @@ class NSOSVIState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOSubinterfaceState(NetBoxModel):
+class NSOSubinterfaceState(_OwnedOverlayModel):
     """Per-subinterface compliance overlay (dot1q L3 subinterfaces).
 
     Tracks a dot1q subinterface (IOS Gi0/1.100 / Junos ge-0/0/0.100) materialised
@@ -2520,6 +2559,7 @@ class NSOSubinterfaceState(NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         indexes = [
@@ -2547,7 +2587,7 @@ class NSOSubinterfaceState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOInterfaceMtuState(NetBoxModel):
+class NSOInterfaceMtuState(_OwnedOverlayModel):
     """Per-interface MTU compliance overlay (Phase 2b — read path).
 
     Mirrors the device's MTU surface for one ``dcim.Interface``: ``l2_mtu`` (the
@@ -2584,6 +2624,7 @@ class NSOInterfaceMtuState(NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         indexes = [
@@ -2611,7 +2652,7 @@ class NSOInterfaceMtuState(NetBoxModel):
         return reverse("dcim:device_nso", kwargs={"pk": self.management.device_id})
 
 
-class NSOBFDInterfaceState(NetBoxModel):
+class NSOBFDInterfaceState(_OwnedOverlayModel):
     """Per-interface BFD compliance overlay (write path).
 
     BFD timers themselves are modelled in netbox_routing (BFDInterface/BFDProfile);
@@ -2636,6 +2677,7 @@ class NSOBFDInterfaceState(NetBoxModel):
     apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
+        base_manager_name = "objects"
         ordering = ["management", "interface"]
         unique_together = [("management", "interface")]
         indexes = [
@@ -2934,6 +2976,19 @@ class NSOLinkRoleAssignment(NetBoxModel):
 # fields would multiply the write cost of a bulk edit for records no operator browses.
 
 
+class NSOOwnershipAcquisition(models.Model):
+    """Keep the acquiring operation until an overlay has a native manifest binding."""
+
+    state_model_label = models.CharField(max_length=200)
+    state_id = models.PositiveBigIntegerField()
+    grant_kind = models.CharField(max_length=32, choices=tuple((kind, kind) for kind in sorted(GRANTS)))
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("state_model_label", "state_id"), name="nso_owner_acquisition_identity")
+        ]
+
+
 class NSOOwnershipManifest(models.Model):
     """Durable ownership evidence for one native object in one delivery scope."""
 
@@ -2945,6 +3000,7 @@ class NSOOwnershipManifest(models.Model):
     state_model_label = models.CharField(max_length=200)
     state_key = models.JSONField(default=dict, blank=True)
     ownership_state = models.CharField(max_length=32, default="owned")
+    grant_kind = models.CharField(max_length=32, choices=tuple((kind, kind) for kind in sorted(GRANTS)))
     deletion_authority = models.BooleanField(default=False)
     acknowledged_lineage = models.JSONField(default=list, blank=True)
 

@@ -21,6 +21,7 @@ from django.db import connections
 from django.test import TestCase, TransactionTestCase
 from ipam.models import IPAddress, IPRange, Prefix, Role
 
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -222,7 +223,8 @@ class TestAutoAssignIP(IntentPushDeliveryMixin, TestCase):
                 state = None
                 if referenced:
                     iface = Interface.objects.create(device=self.device, name=f"Loopback20{index}", type="virtual")
-                    state = NSOInterfaceIPState.objects.create(
+                    state = acquire_overlay(
+                        NSOInterfaceIPState,
                         interface=iface,
                         address=f"10.20{index}.0.1/24",
                         family="ipv4",
@@ -249,7 +251,8 @@ class TestAutoAssignIP(IntentPushDeliveryMixin, TestCase):
         self._make_mgmt()
         pool = Prefix.objects.create(prefix="10.204.0.0/24", role=self.lb_role)
         iface = Interface.objects.create(device=self.device, name="Loopback204", type="virtual")
-        state = NSOInterfaceIPState.objects.create(
+        state = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.204.0.1/24",
             family="ipv4",
@@ -327,7 +330,8 @@ class TestAutoAssignIP(IntentPushDeliveryMixin, TestCase):
         pool = Prefix.objects.get(pk=self.pool_lo4.pk)
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback153", type="virtual")
-        existing = NSOInterfaceIPState.objects.create(
+        existing = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.100.0.99/24",
             family="ipv4",
@@ -416,7 +420,8 @@ class TestAutoAssignIP(IntentPushDeliveryMixin, TestCase):
         mgmt = self._make_mgmt()
         iface = Interface.objects.create(device=self.device, name="Loopback101", type="virtual")
         # Pre-existing accepted state → fill-empty guard should fire.
-        NSOInterfaceIPState.objects.create(
+        acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.100.0.99/24",
             family="ipv4",
@@ -885,7 +890,8 @@ class TestRollbackAutoAssigned(IntentPushDeliveryMixin, TestCase):
         ip = IPAddress.objects.create(address="10.200.0.1/32", status="reserved")
         ip.assigned_object = iface
         ip.save()
-        state = NSOInterfaceIPState.objects.create(
+        state = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.200.0.1/32",
             family="ipv4",
@@ -909,7 +915,8 @@ class TestRollbackAutoAssigned(IntentPushDeliveryMixin, TestCase):
         ip = IPAddress.objects.create(address="198.18.200.1/32", status="reserved")
         ip.assigned_object = iface
         ip.save()
-        state = NSOInterfaceIPState.objects.create(
+        state = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="198.18.200.1/32",
             family="ipv4",
@@ -938,7 +945,8 @@ class TestRollbackAutoAssigned(IntentPushDeliveryMixin, TestCase):
         ip = IPAddress.objects.create(address="10.200.0.2/32", status="active")
         ip.assigned_object = iface
         ip.save()
-        state = NSOInterfaceIPState.objects.create(
+        state = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.200.0.2/32",
             family="ipv4",
@@ -982,7 +990,8 @@ class TestReconcileAutoAssignedActivation(TestCase):
         ip.assigned_object = iface
         ip.save()
         # Create NSOInterfaceIPState as accepted + auto_assigned
-        NSOInterfaceIPState.objects.create(
+        acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.50.0.1/32",
             vrf="",
@@ -1021,7 +1030,8 @@ class TestReconcileAutoAssignedActivation(TestCase):
         ip = IPAddress.objects.create(address="10.50.0.2/32", status="active")
         ip.assigned_object = iface
         ip.save()
-        NSOInterfaceIPState.objects.create(
+        acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.50.0.2/32",
             vrf="",
@@ -1371,7 +1381,8 @@ class TestAutoAssignIPP2P(TestCase):
         iface_a.tags.add(tag)
 
         # Pre-create a managed state on device A
-        NSOInterfaceIPState.objects.create(
+        acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_a,
             address="10.99.0.100/31",
             family="ipv4",
@@ -1483,7 +1494,8 @@ class TestRollbackP2PCascade(TestCase):
         ip_b.assigned_object = iface_b
         ip_b.save()
 
-        state_a = NSOInterfaceIPState.objects.create(
+        state_a = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_a,
             address="10.88.0.0/31",
             family="ipv4",
@@ -1492,7 +1504,8 @@ class TestRollbackP2PCascade(TestCase):
             allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_P2P,
             source_pool=child,
         )
-        state_b = NSOInterfaceIPState.objects.create(
+        state_b = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_b,
             address="10.88.0.1/31",
             family="ipv4",
@@ -1524,7 +1537,8 @@ class TestRollbackP2PCascade(TestCase):
         ip_a = IPAddress.objects.create(address="198.18.202.0/31", status="reserved")
         ip_a.assigned_object = iface_a
         ip_a.save()
-        state_a = NSOInterfaceIPState.objects.create(
+        state_a = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_a,
             address="198.18.202.0/31",
             family="ipv4",
@@ -1533,7 +1547,8 @@ class TestRollbackP2PCascade(TestCase):
             allocation_kind=NSOInterfaceIPState.ALLOCATION_KIND_P2P,
             source_pool=child,
         )
-        state_b = NSOInterfaceIPState.objects.create(
+        state_b = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_b,
             address="198.18.202.1/31",
             family="ipv4",
@@ -1588,14 +1603,16 @@ class TestReconcileP2PBothInSync(TestCase):
         ip_b.assigned_object = iface_b
         ip_b.save()
 
-        state_a = NSOInterfaceIPState.objects.create(
+        state_a = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_a,
             address=addr_a,
             family="ipv4",
             status="accepted",
             auto_assigned=True,
         )
-        state_b = NSOInterfaceIPState.objects.create(
+        state_b = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface_b,
             address=addr_b,
             family="ipv4",
@@ -1690,7 +1707,8 @@ class TestRollbackContentTypeScoping(TestCase):
         decoy.assigned_object_id = iface.pk
         decoy.save()
 
-        state = NSOInterfaceIPState.objects.create(
+        state = acquire_overlay(
+            NSOInterfaceIPState,
             interface=iface,
             address="10.210.0.1/32",
             family="ipv4",

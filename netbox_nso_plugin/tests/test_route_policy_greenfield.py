@@ -12,15 +12,22 @@ from unittest.mock import patch
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from .mixins import IntentPushDeliveryMixin
 
 
 def _save_without_push(instance):
-    from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
+    from netbox_nso_plugin.intent_state import OVERLAY_MODEL_RANKS, footprint_for_instance, intent_transaction
     from netbox_nso_plugin.signals import suppress_intent_push
 
-    with suppress_intent_push(), intent_transaction(footprint_for_instance(instance)):
-        instance.save()
+    from ._ownership_case import save_overlay_fixture
+
+    with suppress_intent_push():
+        if instance._meta.label_lower in OVERLAY_MODEL_RANKS:
+            return save_overlay_fixture(instance)
+        with intent_transaction(footprint_for_instance(instance)):
+            instance.save()
     return instance
 
 
@@ -29,7 +36,9 @@ def _execute_route_map_acquisition(mgmt, route_map):
     from netbox_nso_plugin.renderer_writer import renderer_mirror_writes, renderer_writes
     from netbox_nso_plugin.signals import _route_policy_acquisition_plan
 
-    plan, operations, result = _route_policy_acquisition_plan(mgmt, route_maps=(route_map,))
+    plan, operations, result = _route_policy_acquisition_plan(
+        mgmt, grant=OwnershipGrant("accept"), route_maps=(route_map,)
+    )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer:
         for candidate, fields, created in operations:

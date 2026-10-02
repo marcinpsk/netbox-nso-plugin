@@ -6,6 +6,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.test import TestCase
 
 from ._outbox_case import content_update
+from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin
 
 
@@ -188,7 +189,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
                     "min_rx": 300,
                     "multiplier": 1 if field_name == "multiplier" else 3,
                 }
-                state = NSOBFDInterfaceState.objects.create(
+                state = acquire_overlay(
+                    NSOBFDInterfaceState,
                     management=self.management,
                     interface=interface,
                     status="in_sync",
@@ -238,7 +240,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
 
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
-        state = NSOBFDInterfaceState.objects.create(
+        state = acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.management,
             interface=self.iface,
             min_tx=300,
@@ -257,8 +260,14 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.bfd_reconciler import reconcile_bfd
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
-        NSOBFDInterfaceState.objects.create(
-            management=self.management, interface=self.iface, min_tx=300, min_rx=300, multiplier=3, status="accepted"
+        acquire_overlay(
+            NSOBFDInterfaceState,
+            management=self.management,
+            interface=self.iface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="accepted",
         )
         reconcile_bfd(
             self.device,
@@ -283,7 +292,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         reconcile_bfd(self.device, [full])
         state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
         state.status = "in_sync"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
 
         empty_name = [{**full, "interface_name": ""}]
         self.assertTrue(bfd_reconcile_plan(self.device, empty_name).changes_content)
@@ -319,7 +328,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         profile_id = BFDInterface.objects.get(interface=self.iface).bfd_profile_id
 
         reconcile_bfd(
@@ -354,7 +363,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         reconcile_bfd(self.device, [full])
         state = NSOBFDInterfaceState.objects.get(management=self.management, interface=self.iface)
         state.status = "accepted"
-        state.save(update_fields=["status"])
+        save_overlay_fixture(state, update_fields=["status"])
         profile_id = BFDInterface.objects.get(interface=self.iface).bfd_profile_id
         corrected = dict(full)
         corrected.pop("multiplier")
@@ -446,7 +455,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
             micro_bfd=False,
             enabled=True,
         )
-        NSOBFDInterfaceState.objects.create(
+        acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.management,
             interface=self.iface,
             min_tx=333,
@@ -487,10 +497,17 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
         ge = Interface.objects.create(device=self.device, name="Gi7/7", type="1000base-t")
-        confirmed = NSOBFDInterfaceState.objects.create(
-            management=self.management, interface=ge, min_tx=300, min_rx=300, multiplier=3, status="in_sync"
+        confirmed = acquire_overlay(
+            NSOBFDInterfaceState,
+            management=self.management,
+            interface=ge,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            status="in_sync",
         )
-        deploying = NSOBFDInterfaceState.objects.create(
+        deploying = acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.management,
             interface=self.iface,
             min_tx=300,
@@ -557,7 +574,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
 
         attempt = uuid4()
-        deploying = NSOBFDInterfaceState.objects.create(
+        deploying = acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.management,
             interface=self.iface,
             min_tx=300,
@@ -593,7 +611,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.signals import reset_intent_push_state
 
-        NSOBFDInterfaceState.objects.create(
+        acquire_overlay(
+            NSOBFDInterfaceState,
             management=self.management,
             interface=self.iface,
             min_tx=300,

@@ -9,6 +9,7 @@ from ipam.models import VLAN
 
 from . import adapter_client
 from .models import NSOSVIState, NSOVLANState
+from .ownership_grants import OwnershipGrant
 from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 from .signals import _schedule_intent_push, suppress_intent_push
 from .svi_identity import attached_svi_vlans, svi_errors
@@ -85,6 +86,7 @@ def create_svi(management, vlan, unit, vrf, *, svi_type):
             raise ValidationError({"vlan": "This SVI overlay already exists."})
 
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("create"),
         saves=(
             planned_save(interface, force_insert=True, natural_key=("device", "name")),
             planned_save(

@@ -13,7 +13,9 @@ from django.test import TestCase
 from django.utils import timezone
 
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceMtuState
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -351,7 +353,9 @@ class TestInterfaceMtuReconciler(TestCase):
                 candidate.l2_mtu = 9000
                 candidate.last_sync_at = waiting.planned_at
                 fields = ("l2_mtu", "last_sync_at")
-                competing = RendererMutationPlan.build(saves=[planned_save(candidate, update_fields=fields)])
+                competing = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=[planned_save(candidate, update_fields=fields)]
+                )
                 with renderer_mirror_writes(competing) as writer:
                     writer.save(candidate, update_fields=fields)
                 self.assertFalse(NSOInterfaceMtuState.objects.filter(interface=self.lag99).exists())
@@ -588,7 +592,8 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
     def _state(self, l2_mtu=9216, status="accepted"):
         from uuid import uuid4
 
-        return NSOInterfaceMtuState.objects.create(
+        return acquire_overlay(
+            NSOInterfaceMtuState,
             management=self.management,
             interface=self.po1,
             l2_mtu=l2_mtu,
@@ -611,10 +616,13 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
 
         state = self._state(l2_mtu=9216, status="accepted")
 
+        entries = NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface_mtu")
+        before = list(entries.values())
+
         state.l2_mtu = 9000
         state.save(update_fields=("l2_mtu",))
 
-        self.assertFalse(NSOIntentOutboxEntry.objects.filter(device=self.device, scope="interface_mtu").exists())
+        self.assertEqual(list(entries.values()), before)
 
     def test_exact_content_writer_schedules_mtu_behavior(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry
@@ -623,6 +631,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         state = self._state(l2_mtu=9216, status="accepted")
         state.l2_mtu = 9000
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(planned_save(state, update_fields=("l2_mtu",)),),
         )
 
@@ -647,7 +656,8 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
 
         state = self._state(l2_mtu=9000)
         other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
-        confirmed = NSOInterfaceMtuState.objects.create(
+        confirmed = acquire_overlay(
+            NSOInterfaceMtuState,
             management=self.management,
             interface=other,
             l2_mtu=1500,

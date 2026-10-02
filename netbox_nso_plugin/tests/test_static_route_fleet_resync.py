@@ -29,7 +29,10 @@ from django.core.management import CommandError, call_command
 from django.db import connection, transaction
 from django.test import TransactionTestCase
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 COMMAND = "nso_resync_static_route_intent"
@@ -89,13 +92,14 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 accepted_at=timezone.now(),
             )
             plan = RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
                 saves=(
                     planned_save(
                         state,
                         force_insert=True,
                         natural_key=("management", "static_route"),
                     ),
-                )
+                ),
             )
             with renderer_writes(plan) as writer:
                 writer.save(state, force_insert=True)
@@ -413,16 +417,14 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert second_pass[rejected.device_id]["armed"] == 1, "the rejected device was never retried"
 
     def test_a_route_the_push_cannot_carry_is_never_armed(self):
-        """Codex S6 P2 — the arm set must equal the set the pusher serializes.
-
-        An interface-only next hop has no place in the static-route snapshot, so the push
-        drops that row. Arming it anyway mints a generation the adapter never receives:
-        nothing can correlate it, no later run finds a sentinel row to retry it with, and
-        an Apply is then free to promote a row only the backstop can end.
-        """
+        """Arm only carried routes and restore them when retraction blocks a store-only push."""
         from netbox_routing.models import StaticRoute
 
-        from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
+        from netbox_nso_plugin.intent_drift import (
+            _backfill_static_route_generations,
+            _restore_static_route_generations,
+            resync_static_route_intent_fleet,
+        )
         from netbox_nso_plugin.intent_generation import UNALLOCATED
         from netbox_nso_plugin.models import NSOStaticRouteState
 
@@ -435,31 +437,38 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
             )
             _assign_without_push(iface_route, mgmt.device)
-            skipped = NSOStaticRouteState.objects.create(
+            skipped = acquire_overlay(
+                NSOStaticRouteState,
                 management=mgmt,
                 static_route=iface_route,
                 status="accepted",
                 nso_prefix="10.78.0.0/16",
             )
-        sent = {}
+        with transaction.atomic():
+            armed = _backfill_static_route_generations(mgmt)
+            self.assertEqual([row["pk"] for row in armed], [carried.pk])
+            carried.refresh_from_db()
+            skipped.refresh_from_db()
+            self.assertGreater(carried.intent_generation, UNALLOCATED)
+            self.assertEqual(skipped.intent_generation, UNALLOCATED)
+            self.assertEqual(_restore_static_route_generations(armed), 1)
 
-        def _ack(adapter_device_id, routes):
-            sent["routes"] = routes
-            return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
-
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_ack):
+        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
             results = resync_static_route_intent_fleet()
+        put.assert_not_called()
 
         carried.refresh_from_db()
         skipped.refresh_from_db()
-        assert [r["route_id"] for r in sent["routes"]] == [carried.static_route_id]
-        assert carried.intent_generation > UNALLOCATED
+        assert carried.intent_generation == UNALLOCATED
+        assert carried.generation_started_at is None
         assert skipped.intent_generation == UNALLOCATED, (
             "a row the push never carries was armed: the adapter has never seen that generation, "
             "so no result can name it and no later pass would re-arm it"
         )
         assert skipped.generation_started_at is None
-        assert results[0]["armed"] == 1
+        assert results[0]["ok"] is False
+        assert results[0]["armed"] == 0
+        assert results[0]["armed_rolled_back"] == 1
 
     def test_a_route_that_becomes_unpushable_before_arming_stays_unallocated(self):
         """Retry eligibility when an exact arming plan becomes stale."""
@@ -490,7 +499,9 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 candidate.next_hop = None
                 candidate.interface_next_hop = "Ethernet1/1"
                 fields = ("next_hop", "interface_next_hop")
-                route_plan = RendererMutationPlan.build(saves=(planned_save(candidate, update_fields=fields),))
+                route_plan = RendererMutationPlan.build(
+                    grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=fields),)
+                )
                 with without_commit_drain(), real_renderer_writes(route_plan) as writer:
                     writer.save(candidate, update_fields=fields)
                 revision.refresh_from_db()

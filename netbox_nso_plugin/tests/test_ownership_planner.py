@@ -226,8 +226,9 @@ class TestManifestRetirement(TestCase):
             "native_key": {"group_id": 16, "vid": 27},
             "state_model_label": "netbox_nso_plugin.nsovlanstate",
         }
-        owned = NSOOwnershipManifest.objects.create(**identity)
+        owned = NSOOwnershipManifest.objects.create(grant_kind="create", **identity)
         detached = NSOOwnershipManifest.objects.create(
+            grant_kind="create",
             **{**identity, "device_id": 1628},
             ownership_state="detached",
         )

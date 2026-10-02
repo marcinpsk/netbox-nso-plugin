@@ -13,6 +13,8 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
+from netbox_nso_plugin.ownership_grants import OwnershipGrant
+
 from ._outbox_case import in_thread
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
@@ -216,6 +218,7 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
             NSOVLANState(management=m4, vlan=vlan, status="in_sync"),
         )
         plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("create"),
             saves=(planned_save(state, force_insert=True, natural_key=("management", "vlan")) for state in states),
         )
         with suppress_intent_push(), renderer_writes(plan) as writer:
@@ -229,7 +232,7 @@ class TestVlanDeletePropagation(_VlanGreenfieldBase):
         ):
             with self.captureOnCommitCallbacks(execute=True):
                 candidate = VLAN.objects.get(pk=vlan.pk)
-                plan = RendererMutationPlan.build(deletes=(planned_delete(candidate),))
+                plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(candidate),))
                 with renderer_writes(plan) as writer:
                     writer.delete(candidate)
 

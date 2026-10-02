@@ -11,9 +11,10 @@ from enum import Enum
 from types import MappingProxyType
 
 from django.apps import apps
+from django.db import transaction
 from django.utils import timezone
 
-from .intent_state import NETBOX_BASE_METADATA_FIELDS
+from .intent_state import NETBOX_BASE_METADATA_FIELDS, OVERLAY_MODEL_RANKS
 
 ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
     {
@@ -480,6 +481,7 @@ def detach_device_manifests(device_id: int) -> None:
     """Detach each owned manifest identity for a direct management teardown."""
     from .models import NSOOwnershipManifest
 
+    _discard_device_acquisitions(device_id)
     NSOOwnershipManifest.objects.filter(
         device_id=device_id,
         ownership_state="owned",
@@ -490,6 +492,7 @@ def retire_device_manifests(device_id: int) -> None:
     """Retire all owned manifest identities for a device teardown."""
     from .models import NSOOwnershipManifest
 
+    _discard_device_acquisitions(device_id)
     NSOOwnershipManifest.objects.filter(
         device_id=device_id,
         ownership_state="owned",
@@ -614,10 +617,164 @@ def _manifest_state_key(instance, native_field):
     return state_key
 
 
-def maintain_manifest(instance) -> None:
+def discard_acquisition(instance, *, using=None, acquisition_pk=None):
+    """Remove pending evidence when one overlay's ownership episode ends."""
+    if instance._meta.label_lower not in OVERLAY_MODEL_RANKS:
+        return
+
+    from .models import NSOOwnershipAcquisition
+
+    evidence = NSOOwnershipAcquisition.objects.using(using or instance._state.db or "default").filter(
+        state_model_label=instance._meta.label_lower,
+        state_id=instance.pk,
+    )
+    if acquisition_pk is not None:
+        evidence = evidence.filter(pk=acquisition_pk)
+    evidence.delete()
+
+
+def _discard_device_acquisitions(device_id):
+    from django.db.models import Q
+
+    from .intent_state import OVERLAY_MODEL_RANKS
+    from .models import NSOOwnershipAcquisition
+
+    acquisitions = Q()
+    for label in OVERLAY_MODEL_RANKS:
+        model = apps.get_model(label)
+        fields = {field.name for field in model._meta.concrete_fields}
+        filters = [Q(**{f"{name}__device_id": device_id}) for name in ("management", "interface") if name in fields]
+        if not filters:
+            continue
+        device_filter = filters[0]
+        for alternative in filters[1:]:
+            device_filter |= alternative
+        acquisitions |= Q(
+            state_model_label=label,
+            state_id__in=model.objects.filter(device_filter).values("pk"),
+        )
+    if acquisitions:
+        NSOOwnershipAcquisition.objects.filter(acquisitions).delete()
+
+
+def _manifest_grant_defaults(instance, *, grant=None):
+    if instance._meta.label_lower not in OVERLAY_MODEL_RANKS:
+        return {}
+
+    from .intent_state import IntentMutationProtocolError
+    from .models import NSOOwnershipAcquisition
+    from .ownership_grants import GRANTS, OwnershipGrant
+
+    evidence = NSOOwnershipAcquisition.objects.filter(
+        state_model_label=instance._meta.label_lower,
+        state_id=instance.pk,
+        grant_kind__in=GRANTS,
+    ).first()
+    if evidence is None:
+        if isinstance(grant, OwnershipGrant) and grant.kind != "manifest_reown":
+            _record_acquisition(instance, grant)
+            return {"grant_kind": grant.kind}
+        raise IntentMutationProtocolError(f"{instance._meta.label_lower} row {instance.pk!r} has no acquisition grant")
+    return {"grant_kind": evidence.grant_kind}
+
+
+def _record_acquisition(instance, grant):
+    if instance._meta.label_lower not in OVERLAY_MODEL_RANKS:
+        return
+
+    from .intent_state import IntentMutationProtocolError
+    from .models import NSOOwnershipAcquisition
+    from .ownership_grants import OwnershipGrant
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
+    if not isinstance(grant, OwnershipGrant) or writer is None or writer.grant != grant:
+        raise IntentMutationProtocolError("acquisition provenance requires the acquiring writer")
+    NSOOwnershipAcquisition.objects.update_or_create(
+        state_model_label=instance._meta.label_lower,
+        state_id=instance.pk,
+        defaults={"grant_kind": grant.kind},
+    )
+
+
+def _manifest_lineage_defaults(rule, instance):
+    if rule.acknowledged_lineage_field is None:
+        return {}
+    lineage = getattr(instance, rule.acknowledged_lineage_field, None)
+    return {"acknowledged_lineage": [] if lineage is None else [copy.deepcopy(lineage)]}
+
+
+def _prepare_acquisition(instance, grant, acquisition):
+    if instance._meta.label_lower not in OVERLAY_MODEL_RANKS:
+        return False
+
+    from .models import NSOOwnershipAcquisition
+    from .ownership_grants import GRANTS
+    from .status_machine import is_owned
+
+    if not is_owned(instance.status):
+        discard_acquisition(instance)
+        return False
+    if acquisition:
+        _record_acquisition(instance, grant)
+        return True
+    return NSOOwnershipAcquisition.objects.filter(
+        state_model_label=instance._meta.label_lower, state_id=instance.pk, grant_kind__in=GRANTS
+    ).exists()
+
+
+def _manifest_incarnation(binding):
+    _rule, scope, device_id, native_label, native_id, _native_key, state_label, state_key = binding
+    return {
+        "device_id": device_id,
+        "scope": scope,
+        "native_model_label": native_label,
+        "native_id": native_id,
+        "state_model_label": state_label,
+        "state_key": state_key,
+    }
+
+
+def _owned_manifest_for_binding(binding):
+    from .models import NSOOwnershipManifest
+    from .ownership_grants import GRANTS
+
+    return (
+        NSOOwnershipManifest.objects.filter(
+            **_manifest_incarnation(binding), ownership_state="owned", grant_kind__in=GRANTS
+        )
+        .order_by("-pk")
+        .first()
+    )
+
+
+def _continuing_manifest(binding, previous_binding):
+    current = _owned_manifest_for_binding(binding)
+    if current is None and previous_binding is not None:
+        current = _owned_manifest_for_binding(previous_binding)
+    return current
+
+
+def _retire_superseded_manifests(binding, previous_binding, retained_pk):
+    from django.db.models import Q
+
+    from .models import NSOOwnershipManifest
+
+    incarnations = Q(**_manifest_incarnation(binding))
+    if previous_binding is not None:
+        incarnations |= Q(**_manifest_incarnation(previous_binding))
+    NSOOwnershipManifest.objects.filter(incarnations, ownership_state="owned").exclude(pk=retained_pk).update(
+        ownership_state="retired"
+    )
+
+
+@transaction.atomic
+def maintain_manifest(instance, *, grant=None, acquisition=False, previous_binding=None) -> None:
     """Make one overlay's manifest agree with its persisted ownership state."""
     from . import status_machine as sm
     from .models import NSOOwnershipManifest
+
+    acquisition = _prepare_acquisition(instance, grant, acquisition)
 
     binding = manifest_binding(instance)
     if binding is None:
@@ -636,20 +793,16 @@ def maintain_manifest(instance) -> None:
             signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
             if signature is None:
                 return
-        from django.db import IntegrityError, transaction
+        from django.db import IntegrityError
 
-        lineage = (
-            getattr(instance, rule.acknowledged_lineage_field, None)
-            if rule.acknowledged_lineage_field is not None
-            else None
-        )
         defaults = {
             "native_id": native_id,
             "ownership_state": "owned",
             "deletion_authority": rule.deletion_authority,
         }
-        if rule.acknowledged_lineage_field is not None:
-            defaults["acknowledged_lineage"] = [] if lineage is None else [copy.deepcopy(lineage)]
+        if acquisition:
+            defaults.update(_manifest_grant_defaults(instance))
+        defaults.update(_manifest_lineage_defaults(rule, instance))
 
         def adopt_manifest(pk, **changes):
             """Update one reusable row without letting a peer insert abort this transaction."""
@@ -660,42 +813,51 @@ def maintain_manifest(instance) -> None:
                 return False
             return True
 
-        incarnation = {
-            "device_id": device_id,
-            "scope": scope,
-            "native_model_label": native_model_label,
-            "native_id": native_id,
-            "state_model_label": state_model_label,
-            "state_key": state_key,
-        }
-        NSOOwnershipManifest.objects.filter(
-            **incarnation,
-            ownership_state="owned",
-        ).exclude(native_key=native_key).update(ownership_state="retired")
         exact = NSOOwnershipManifest.objects.filter(**identity).first()
         if exact is not None:
-            NSOOwnershipManifest.objects.filter(pk=exact.pk).exclude(ownership_state="retired").update(**defaults)
+            if exact.ownership_state != "owned" and not acquisition:
+                predecessor = _continuing_manifest(binding, previous_binding)
+                if predecessor is None:
+                    discard_acquisition(instance)
+                    return
+                defaults["grant_kind"] = predecessor.grant_kind
+            NSOOwnershipManifest.objects.filter(pk=exact.pk).update(**defaults)
+            _retire_superseded_manifests(binding, previous_binding, exact.pk)
+            discard_acquisition(instance)
             return
-        if state_model_label == "netbox_nso_plugin.nsobgppeerstate" and _reuse_bgp_manifest(
-            identity, native_id, signature, adopt_manifest
+        if (
+            state_model_label == "netbox_nso_plugin.nsobgppeerstate"
+            and _reuse_bgp_manifest(
+                instance,
+                binding,
+                signature,
+                adopt_manifest,
+                acquisition=acquisition,
+                previous_binding=previous_binding,
+            )
+            is not None
         ):
             return
-        previous = (
-            NSOOwnershipManifest.objects.filter(
-                **incarnation,
-                ownership_state="retired",
-            )
-            .order_by("-pk")
-            .first()
-        )
+        previous = _owned_manifest_for_binding(binding)
         if previous is not None and adopt_manifest(previous.pk, native_key=native_key):
+            _retire_superseded_manifests(binding, previous_binding, previous.pk)
+            discard_acquisition(instance)
             return
-        # The identity read above and this write are two statements, so a peer audit can land
-        # the same row in between. get_or_create absorbs that conflict in its own savepoint
-        # instead of aborting the enclosing mirror transaction.
+        predecessor = None if previous_binding is None else _owned_manifest_for_binding(previous_binding)
+        defaults.update(
+            {"grant_kind": predecessor.grant_kind}
+            if predecessor is not None and not acquisition
+            else _manifest_grant_defaults(instance, grant=grant)
+        )
+        # A savepoint isolates a concurrent insert of the same manifest identity.
         recorded, created = NSOOwnershipManifest.objects.get_or_create(**identity, defaults=defaults)
         if not created:
-            NSOOwnershipManifest.objects.filter(pk=recorded.pk).exclude(ownership_state="retired").update(**defaults)
+            rows = NSOOwnershipManifest.objects.filter(pk=recorded.pk)
+            if not acquisition:
+                rows = rows.exclude(ownership_state="retired")
+            rows.update(**defaults)
+        _retire_superseded_manifests(binding, previous_binding, recorded.pk)
+        discard_acquisition(instance)
     else:
         NSOOwnershipManifest.objects.filter(**identity, ownership_state="owned").update(ownership_state="detached")
 
@@ -704,6 +866,7 @@ def retire_overlay_manifest(instance) -> None:
     """Retire the durable identity after an exact writer-owned overlay delete."""
     from .models import NSOOwnershipManifest
 
+    discard_acquisition(instance)
     binding = manifest_binding(instance)
     if binding is None:
         return
@@ -761,16 +924,17 @@ def _valid_overlay_signature(scope, native_model_label, native_id, state_model_l
         return None
 
 
-def _reuse_bgp_manifest(identity, native_id, signature, adopt_manifest):
-    """Reuse one matching BGP manifest when its persisted identity is valid."""
+def _reuse_bgp_manifest(instance, binding, signature, adopt_manifest, *, acquisition, previous_binding):
+    """Adopt an authorized BGP alias or refuse its passive resurrection."""
     from .models import NSOOwnershipManifest
 
+    _rule, scope, device_id, native_model_label, native_id, native_key, state_model_label, state_key = binding
     candidates = NSOOwnershipManifest.objects.filter(
-        device_id=identity["device_id"],
-        scope=identity["scope"],
-        native_model_label=identity["native_model_label"],
+        device_id=device_id,
+        scope=scope,
+        native_model_label=native_model_label,
         native_id=native_id,
-        state_model_label=identity["state_model_label"],
+        state_model_label=state_model_label,
     ).order_by("pk")
     for candidate in candidates:
         candidate_signature = _valid_overlay_signature(
@@ -782,12 +946,14 @@ def _reuse_bgp_manifest(identity, native_id, signature, adopt_manifest):
         )
         if candidate_signature != signature:
             continue
-        if candidate.ownership_state == "retired":
-            return True
-        if adopt_manifest(candidate.pk, native_key=identity["native_key"], state_key=identity["state_key"]):
-            return True
+        if candidate.ownership_state != "owned" and not acquisition:
+            return OwnershipAction.NONE
+        if adopt_manifest(candidate.pk, native_key=native_key, state_key=state_key):
+            _retire_superseded_manifests(binding, previous_binding, candidate.pk)
+            discard_acquisition(instance)
+            return OwnershipAction.RECORD_MANIFEST
         break
-    return False
+    return None
 
 
 def _manifest_states(device_id, requested):
@@ -978,7 +1144,7 @@ def _demotion_plan(overlay):
 def _demote_overlay(instance, device_id, scope, *, entry, requested) -> bool:
     """Demote one owned overlay that carries no deletion authority to demote it with."""
     from .intent_state import MutationFootprint, intent_transaction, reconcile_family_footprint
-    from .renderer_writer import consume_renderer_plan
+    from .renderer_writer import consume_renderer_plan, finalize_renderer_fingerprints
 
     # Planned twice on purpose: this pre-pass only derives the lock footprint. The consumed
     # plan is rebuilt below after the transaction re-pends the deploying rows.
@@ -994,6 +1160,7 @@ def _demote_overlay(instance, device_id, scope, *, entry, requested) -> bool:
         candidate, update_fields, plan = _demotion_plan(current)
         with consume_renderer_plan(plan, permit, content=True) as writer:
             writer.save(candidate, update_fields=update_fields)
+        finalize_renderer_fingerprints(permit.bumped, unchanged_only=True)
     return True
 
 
@@ -1238,6 +1405,7 @@ _STATE_SEEDERS = {
 
 def _reown_manifest(manifest, rule, native):
     from .models import NSODeviceManagement
+    from .ownership_grants import OwnershipGrant
     from .renderer_writer import (
         RendererMutationPlan,
         planned_m2m_set,
@@ -1260,6 +1428,7 @@ def _reown_manifest(manifest, rule, native):
     if candidate._meta.label_lower == "netbox_nso_plugin.nsoswitchportstate":
         m2m_writes = (planned_m2m_set(candidate, "tagged_vlans", tuple(native.tagged_vlans.all())),)
     plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("manifest_reown", manifest_pk=manifest.pk),
         saves=(planned_save(candidate, force_insert=True, natural_key=natural_key),),
         m2m_writes=m2m_writes,
         planned_at=getattr(candidate, "accepted_at", None),
@@ -1643,7 +1812,7 @@ def _retract_manifest(manifest, overlay=None, *, expected_action, requested) -> 
         reconcile_family_footprint,
     )
     from .models import NSODeviceManagement, NSOOwnershipManifest
-    from .renderer_writer import consume_renderer_plan
+    from .renderer_writer import consume_renderer_plan, finalize_renderer_fingerprints
     from .signals import _is_intent_push_suppressed, _is_render_request
     from .status_machine import is_owned
 
@@ -1709,6 +1878,7 @@ def _retract_manifest(manifest, overlay=None, *, expected_action, requested) -> 
             transitions=transitions,
             delete_origin=delete_origin,
         )
+        finalize_renderer_fingerprints(permit.bumped, unchanged_only=True)
     return True
 
 
@@ -1723,12 +1893,13 @@ def _transition_manifest_ownership(manifest, *, expected_action, requested, owne
         if rechecked is None:
             return False
         current_manifest = rechecked[0]
-        return bool(
-            NSOOwnershipManifest.objects.filter(
-                pk=current_manifest.pk,
-                ownership_state="owned",
-            ).update(ownership_state=ownership_state)
-        )
+        updated = NSOOwnershipManifest.objects.filter(
+            pk=current_manifest.pk,
+            ownership_state="owned",
+        ).update(ownership_state=ownership_state)
+        if updated and rechecked[3] is not None:
+            discard_acquisition(rechecked[3])
+        return bool(updated)
 
 
 def _detach_manifest(manifest, *, expected_action, requested) -> bool:

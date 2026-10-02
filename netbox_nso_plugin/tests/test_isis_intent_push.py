@@ -11,6 +11,7 @@ from __future__ import annotations
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.test import TestCase
 
+from ._ownership_case import update_or_acquire_overlay
 from .mixins import IntentPushResetMixin
 
 
@@ -43,7 +44,8 @@ class TestIsisIntentPush(IntentPushResetMixin, TestCase):
             ),
             suppress_intent_push(),
         ):
-            NSOISISInstanceState.objects.update_or_create(
+            update_or_acquire_overlay(
+                NSOISISInstanceState,
                 management=mgmt,
                 process_tag="",
                 defaults={"net": "49.0001.00", "is_type": "level-2-only", "status": "in_sync", **state_kwargs},

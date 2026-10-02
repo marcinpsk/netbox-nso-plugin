@@ -21,6 +21,8 @@ from __future__ import annotations
 import copy
 import logging
 
+from .ownership_grants import OwnershipGrant
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -508,6 +510,7 @@ def _assign_one_p2p_family(
             state_a_link = copy.copy(state_a)
             state_a_link.peer_state = state_b
             plan = RendererMutationPlan.build(
+                grant=OwnershipGrant("autoassign"),
                 saves=(
                     planned_save(ip_a, force_insert=True, natural_key=("address", "vrf")),
                     planned_save(ip_b, force_insert=True, natural_key=("address", "vrf")),
@@ -704,6 +707,7 @@ def _reserve_single(interface, mgmt, family: str, pool, result, push=True) -> No
                     else ("family", "status", "auto_assigned", "allocation_kind", "source_pool", "accepted_at")
                 )
                 plan = RendererMutationPlan.build(
+                    grant=OwnershipGrant("autoassign"),
                     saves=(
                         planned_save(ip_obj, force_insert=True, natural_key=("address", "vrf")),
                         planned_save(

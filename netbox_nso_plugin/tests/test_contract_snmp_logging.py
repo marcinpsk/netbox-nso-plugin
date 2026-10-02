@@ -27,6 +27,8 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.template_content import _reconcile_logging_config, _reconcile_snmp_config
 
+from ._ownership_case import acquire_overlay
+
 SNMP_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "communities", "v3_users", "hosts", "system_info"}
 SNMP_COMMUNITY_KEYS = {"community_hash", "access", "acl"}
 SNMP_V3USER_KEYS = {"username", "has_auth_secret", "has_priv_secret"}
@@ -142,8 +144,12 @@ class TestOwnedRowsSurviveReconcile(TestCase):
         )
 
     def test_owned_system_info_values_survive_reconcile(self):
-        row = NSOSnmpSystemInfoState.objects.create(
-            management=self.mgmt, location="operator-loc", contact="op@example.net", status="accepted"
+        row = acquire_overlay(
+            NSOSnmpSystemInfoState,
+            management=self.mgmt,
+            location="operator-loc",
+            contact="op@example.net",
+            status="accepted",
         )
         _reconcile_snmp_config(self.device, SNMP_PAYLOAD)  # device says DC1 / noc@x
         row.refresh_from_db()
@@ -152,16 +158,21 @@ class TestOwnedRowsSurviveReconcile(TestCase):
         self.assertEqual(row.status, "accepted")  # still differs from device → pending apply
 
     def test_owned_system_info_settles_in_sync_when_device_matches(self):
-        row = NSOSnmpSystemInfoState.objects.create(
-            management=self.mgmt, location="DC1", contact="noc@x", status="accepted"
+        row = acquire_overlay(
+            NSOSnmpSystemInfoState, management=self.mgmt, location="DC1", contact="noc@x", status="accepted"
         )
         _reconcile_snmp_config(self.device, SNMP_PAYLOAD)
         row.refresh_from_db()
         self.assertEqual(row.status, "in_sync")  # device confirms the intent
 
     def test_owned_community_attrs_survive_reconcile(self):
-        row = NSOSnmpCommunityState.objects.create(
-            management=self.mgmt, community_hash="abc", access="RW", acl="OP-ACL", status="accepted"
+        row = acquire_overlay(
+            NSOSnmpCommunityState,
+            management=self.mgmt,
+            community_hash="abc",
+            access="RW",
+            acl="OP-ACL",
+            status="accepted",
         )
         _reconcile_snmp_config(self.device, SNMP_PAYLOAD)  # device says RO / ACL-1
         row.refresh_from_db()
@@ -169,8 +180,8 @@ class TestOwnedRowsSurviveReconcile(TestCase):
         self.assertEqual(row.acl, "OP-ACL")
 
     def test_owned_snmp_host_attrs_survive_reconcile(self):
-        row = NSOSnmpHostState.objects.create(
-            management=self.mgmt, address="10.0.0.9", port=11162, version="3", status="accepted"
+        row = acquire_overlay(
+            NSOSnmpHostState, management=self.mgmt, address="10.0.0.9", port=11162, version="3", status="accepted"
         )
         _reconcile_snmp_config(self.device, SNMP_PAYLOAD)  # device says port 162 / 2c
         row.refresh_from_db()
@@ -178,11 +189,11 @@ class TestOwnedRowsSurviveReconcile(TestCase):
         self.assertEqual(row.version, "3")
 
     def test_owned_logging_host_values_survive_and_absent_owned_not_deleted(self):
-        absent = NSOLoggingHostState.objects.create(
-            management=self.mgmt, address="10.9.9.9", severity="critical", status="accepted"
+        absent = acquire_overlay(
+            NSOLoggingHostState, management=self.mgmt, address="10.9.9.9", severity="critical", status="accepted"
         )
-        edited = NSOLoggingHostState.objects.create(
-            management=self.mgmt, address="10.0.0.5", severity="emergency", status="accepted"
+        edited = acquire_overlay(
+            NSOLoggingHostState, management=self.mgmt, address="10.0.0.5", severity="emergency", status="accepted"
         )
         _reconcile_logging_config(self.device, LOGGING_PAYLOAD)  # 10.0.0.5 → informational; 10.9.9.9 absent
         self.assertTrue(
