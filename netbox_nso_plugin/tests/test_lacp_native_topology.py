@@ -7,7 +7,7 @@ from copy import deepcopy
 from dcim.models import Interface
 from django.contrib.auth import get_user_model
 from django.contrib.messages import SUCCESS, get_messages
-from django.db import transaction
+from django.db import connection, transaction
 from django.test import TransactionTestCase
 from django.urls import reverse
 
@@ -675,6 +675,32 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertIn("no longer a member", response.json()["message"])
         member.refresh_from_db()
         self.assertIsNone(member.port_priority)
+        self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="lacp").exists())
+
+    def test_inline_member_edit_refuses_bundle_deleted_after_validation(self):
+        self.assert_reconcile_ran()
+        bundle = self.bundle_state()
+        member = NSOLACPMemberState.objects.get(management=self.management, interface=self.member_interfaces[0])
+        deleted = []
+
+        def delete_before_lookup(execute, sql, params, many, context):
+            # Delete the real row when the save resolves its previously validated bundle.
+            if not deleted and 'FROM "netbox_nso_plugin_nsolacpbundlestate"' in sql and "LIMIT 21" in sql:
+                deleted.append(bundle.pk)
+                NSOLACPBundleState.objects.filter(pk=bundle.pk).delete()
+            return execute(sql, params, many, context)
+
+        with without_commit_drain(), connection.execute_wrapper(delete_before_lookup):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:overlay_field_edit", args=("lacp_member", member.pk)),
+                {"port_priority": "200"},
+            )
+        self.assertEqual(deleted, [bundle.pk])
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("tracked LACP bundle", response.json()["message"])
+        member.refresh_from_db()
+        self.assertIsNone(member.port_priority)
+        self.assertEqual(member.status, "imported")
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="lacp").exists())
 
     def test_member_rename_between_selection_and_lock_refuses_accept(self):

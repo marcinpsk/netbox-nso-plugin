@@ -5290,21 +5290,30 @@ def _save_route_map_name_edit(state, old_name):
     return None
 
 
+def _lacp_member_bundle(obj):
+    """Refuse an inline edit if its tracked native bundle disappeared."""
+    from .lacp_topology import bundle_of
+    from .models import NSOLACPBundleState
+
+    try:
+        return NSOLACPBundleState.objects.get(management=obj.management, interface=bundle_of(obj.interface))
+    except NSOLACPBundleState.DoesNotExist:
+        raise OwnershipNotQualified(
+            f"{obj.interface.name} is no longer linked to a tracked LACP bundle. Refresh and retry.",
+            device_id=obj.interface.device_id,
+        ) from None
+
+
 def _save_lacp_edit(obj, key, old_values):
     """Own a complete LACP bundle while preserving which member actually changed."""
     import copy
 
     from . import status_machine as sm
     from .intent_state import reconcile_family_footprint
-    from .lacp_topology import acquisition_validator, bundle_of, member_states
-    from .models import NSOLACPBundleState
+    from .lacp_topology import acquisition_validator, member_states
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-    bundle = (
-        obj
-        if key == "lacp_bundle"
-        else NSOLACPBundleState.objects.get(management=obj.management, interface=bundle_of(obj.interface))
-    )
+    bundle = obj if key == "lacp_bundle" else _lacp_member_bundle(obj)
     validate = acquisition_validator(bundle)
     members = list(member_states(bundle))
     if key == "lacp_member" and obj.pk not in {member.pk for member in members}:
