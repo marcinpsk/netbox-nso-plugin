@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v1.7.0 (2026-10-02)
+
+### Bug Fixes
+
+- **ownership**: Lock only overlay rows during status updates
+  ([`aa23892`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aa238923218a50d8b6979d37b6ef2971a943372f))
+
+### Features
+
+- **ownership**: Start ownership only through a classified explicit grant
+  ([`7a15b09`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7a15b091fe8363afc13f83a8e9b71100371e761f))
+
+### Testing
+
+- **opengrep**: Serialize path labels for parallel workers
+  ([`7342a8e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7342a8e465d0f44360d3bd890b5d83a160f4e72f))
+
+
 ## v1.6.2 (2026-10-01)
 
 ### Bug Fixes
