@@ -159,7 +159,7 @@ class TestReviewPatternCheckerPaths(SimpleTestCase):
 
             for checker, _rule_id, _violation in _CHECKER_CASES:
                 for invalid_path in (missing_path, non_python_path):
-                    with self.subTest(checker=checker.name, path=invalid_path):
+                    with self.subTest(checker=checker.name, path=str(invalid_path)):
                         result = _run_checker(checker, "scan", invalid_path)
 
                         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
