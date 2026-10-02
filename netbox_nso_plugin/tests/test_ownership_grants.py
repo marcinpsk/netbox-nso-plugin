@@ -40,6 +40,24 @@ class TestOwnershipGrants(IntentPushResetMixin, TestCase):
     def state(self, status="imported"):
         return NSOInterfaceState.objects.create(interface=self.interface, attribute="description", status=status)
 
+    def test_status_update_accepts_a_nullable_related_filter(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        state = NSORedistributionState.objects.create(
+            management=self.management,
+            dest_protocol="isis",
+            source_protocol="static",
+            status="unknown",
+        )
+
+        changed = NSORedistributionState.objects.filter(pk=state.pk, redistribution__metric__isnull=True).update(
+            status="imported"
+        )
+
+        self.assertEqual(changed, 1)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+
     def test_writer_saves_non_overlays_without_acquisition_evidence(self):
         from django.db import connection
 
@@ -806,3 +824,49 @@ class TestOwnershipReleaseConcurrency(_CascadeFlushMixin, IntentPushResetMixin, 
         self.assertEqual(manifest.grant_kind, "link_role")
         self.assertFalse(evidence_rows.exists())
         self.assertEqual(observed_statuses, ["accepted"])
+
+
+class TestOwnershipStatusUpdateLocks(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def test_status_update_locks_the_overlay_without_locking_joined_native_rows(self):
+        from dcim.models import Device
+        from django.db import DatabaseError
+
+        device, _management = make_managed("status-update-locks", 17584)
+        interface = Interface.objects.create(device=device, name="Loopback1", type="virtual")
+        state = NSOInterfaceState.objects.create(interface=interface, attribute="description", status="unknown")
+        outcomes = []
+        errors = []
+
+        def probe_locks():
+            try:
+                for label, model, pk in (
+                    ("interface", Interface, interface.pk),
+                    ("device", Device, device.pk),
+                    ("overlay", NSOInterfaceState, state.pk),
+                ):
+                    try:
+                        with transaction.atomic():
+                            model.objects.select_for_update(of=("self",), nowait=True).get(pk=pk)
+                    except DatabaseError as exc:
+                        outcomes.append((label, getattr(exc.__cause__, "sqlstate", None)))
+                    else:
+                        outcomes.append((label, None))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        peer = threading.Thread(target=probe_locks)
+        with transaction.atomic():
+            changed = NSOInterfaceState.objects.filter(pk=state.pk, interface__device__name=device.name).update(
+                status="imported"
+            )
+            peer.start()
+            peer.join(timeout=30)
+            self.assertFalse(peer.is_alive(), "lock probe did not finish")
+            self.assertEqual(errors, [])
+            self.assertEqual(outcomes, [("interface", None), ("device", None), ("overlay", "55P03")])
+
+        self.assertEqual(changed, 1)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")

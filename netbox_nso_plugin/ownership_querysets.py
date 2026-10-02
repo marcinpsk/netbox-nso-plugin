@@ -19,7 +19,7 @@ class OwnershipQuerySet(RestrictedQuerySet):
         if not isinstance(kwargs["status"], str):
             raise IntentMutationProtocolError(f"{self.model._meta.label_lower} status requires an exact literal value")
         with transaction.atomic(using=self.db):
-            rows = tuple(self.select_for_update().order_by("pk"))
+            rows = tuple(self.select_for_update(of=("self",)).order_by("pk"))
             if not rows:
                 return 0
             writer = active_renderer_writer()
