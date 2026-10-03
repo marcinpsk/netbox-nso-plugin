@@ -284,6 +284,7 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
 
         assert {scope for scope, rule in rules.items() if rule.foreign_overlay_delete == "retire"} == {
             "bfd",
+            "lacp",
             "ospf",
             "route_policy",
             "subinterface",

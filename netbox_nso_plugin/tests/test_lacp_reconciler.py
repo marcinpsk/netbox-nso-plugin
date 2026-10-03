@@ -86,7 +86,7 @@ class TestReconcileLagConfig(TestCase):
         m1 = NSOLACPMemberState.objects.get(interface=self.m1)
         assert m1.mode == "active"
         assert m1.port_priority == 128
-        assert m1.lag_bundle == self.lag
+        assert m1.interface.lag == self.lag
         m2 = NSOLACPMemberState.objects.get(interface=self.m2)
         assert m2.port_priority is None
 
@@ -107,8 +107,8 @@ class TestReconcileLagConfig(TestCase):
         self.assertEqual(NSOLACPBundleState.objects.filter(management=self.mgmt, interface=self.lag).count(), 1)
         self.assertEqual(NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag).min_links, 1)
 
-    def test_owned_member_move_bumps_the_lacp_document(self):
-        """A lag_bundle change affects the nested LACP document, not only the member row."""
+    def test_passive_member_move_preserves_owned_native_topology(self):
+        """A device observation cannot move an owned native member."""
         from netbox_nso_plugin.models import NSOIntentRevision
 
         second_lag = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
@@ -137,8 +137,8 @@ class TestReconcileLagConfig(TestCase):
 
         member.refresh_from_db()
         revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
-        assert member.lag_bundle_id == second_lag.pk
-        assert revision.revision == before + 1
+        assert member.interface.lag_id == self.lag.pk
+        assert revision.revision == before
 
     def test_idempotent_second_reconcile(self):
         data = _payload([self._bundle(min_links=3)])
@@ -166,8 +166,10 @@ class TestReconcileLagConfig(TestCase):
         )
 
         def is_lag_probe(sql):
-            return 'FROM "dcim_interface"' in sql and any(
-                predicate in sql for predicate in ('"lag_id" =', '"lag_id" IN (')
+            return (
+                'FROM "dcim_interface"' in sql
+                and " WHERE " in sql
+                and any(predicate in sql.split(" WHERE ", 1)[1] for predicate in ('"lag_id" =', '"lag_id" IN ('))
             )
 
         with CaptureQueriesContext(connection) as equality_queries:
@@ -202,8 +204,10 @@ class TestReconcileLagConfig(TestCase):
         )
 
         def is_lag_probe(sql):
-            return 'FROM "dcim_interface"' in sql and any(
-                predicate in sql for predicate in ('"lag_id" =', '"lag_id" IN (')
+            return (
+                'FROM "dcim_interface"' in sql
+                and " WHERE " in sql
+                and any(predicate in sql.split(" WHERE ", 1)[1] for predicate in ('"lag_id" =', '"lag_id" IN ('))
             )
 
         with CaptureQueriesContext(connection) as equality_queries:
@@ -321,8 +325,8 @@ class TestReconcileLagConfig(TestCase):
         state = NSOLACPBundleState.objects.get(management=self.mgmt, interface=self.lag)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
         self.assertEqual(plan_calls, 2)
-        self.assertEqual(state.status, "changed")
-        self.assertEqual(revision.revision, revision_after_flip + 1)
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(revision.revision, revision_after_flip)
 
     def test_stale_accepted_bundle_replans_after_status_flip(self):
         from unittest.mock import patch
@@ -355,8 +359,8 @@ class TestReconcileLagConfig(TestCase):
         state.refresh_from_db()
         revision = NSOIntentRevision.objects.get(device=self.device, scope="lacp")
         self.assertEqual(plan_calls, 2)
-        self.assertEqual(state.status, "changed")
-        self.assertEqual(revision.revision, revision_after_flip + 1)
+        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(revision.revision, revision_after_flip)
 
     def test_bundle_preimage_change_reacquires_fresh_plan(self):
         from datetime import UTC, datetime
@@ -435,7 +439,7 @@ class TestReconcileLagConfig(TestCase):
             tuple(getattr(state, field) for field in compared_fields),
             tuple(getattr(control_state, field) for field in compared_fields),
         )
-        self.assertEqual(revision.revision, revision_after_edit + 1)
+        self.assertEqual(revision.revision, revision_after_edit)  # Owned observations preserve native intent.
 
     def test_stale_owned_bundle_husk_preserved(self):
         # An owned (accepted) row is never pruned, even as a husk.
@@ -525,7 +529,7 @@ class TestReconcileLagConfig(TestCase):
         reconcile_lag_config(self.device, _payload([self._bundle(members=[])]))
         assert not NSOLACPMemberState.objects.filter(interface=self.m1).exists()
 
-    def test_stale_member_still_bundled_marked_changed(self):
+    def test_stale_unowned_member_is_unlinked_and_pruned(self):
         reconcile_lag_config(
             self.device,
             _payload([self._bundle(members=[{"interface_name": "GigabitEthernet0/1", "mode": "active"}])]),
@@ -533,8 +537,9 @@ class TestReconcileLagConfig(TestCase):
         self.m1.lag = self.lag
         self.m1.save(update_fields=["lag"])
         reconcile_lag_config(self.device, _payload([self._bundle(members=[])]))
-        state = NSOLACPMemberState.objects.get(interface=self.m1)
-        assert state.status == "changed"
+        self.m1.refresh_from_db()
+        self.assertIsNone(self.m1.lag_id)
+        self.assertFalse(NSOLACPMemberState.objects.filter(interface=self.m1).exists())
 
     def test_no_management_returns_empty(self):
         other_device = Device.objects.create(

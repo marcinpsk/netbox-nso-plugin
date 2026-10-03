@@ -2279,6 +2279,8 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         on_delete=models.CASCADE,
         related_name="nso_lacp_bundle_states",
     )
+    observed_members = models.JSONField(default=list, blank=True)
+    device_present = models.BooleanField(default=True)
     lag_id = models.PositiveIntegerField(null=True, blank=True)
     min_links = models.PositiveSmallIntegerField(null=True, blank=True)
     system_priority = models.PositiveIntegerField(null=True, blank=True)
@@ -2312,8 +2314,8 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
 class NSOLACPMemberState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, member interface) LACP member compliance overlay.
 
-    Carries the per-member LACP mode + port-priority and links to the parent LAG
-    interface. One row per (management, member interface). Status lifecycle
+    Carries the per-member LACP mode and port priority. Native topology identifies
+    the parent LAG. One row per (management, member interface). Status lifecycle
     mirrors NSOLACPBundleState.
     """
 
@@ -2326,13 +2328,6 @@ class NSOLACPMemberState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         to="dcim.Interface",
         on_delete=models.CASCADE,
         related_name="nso_lacp_member_states",
-    )
-    lag_bundle = models.ForeignKey(
-        to="dcim.Interface",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="nso_lacp_member_bundles",
     )
     mode = models.CharField(max_length=8, blank=True, default="")
     port_priority = models.PositiveIntegerField(null=True, blank=True)

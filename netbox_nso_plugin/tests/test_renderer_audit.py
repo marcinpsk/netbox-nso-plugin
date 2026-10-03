@@ -378,7 +378,8 @@ class TestRendererAuditRepair(_CascadeFlushMixin, IntentPushResetMixin, Transact
         from netbox_nso_plugin.models import NSOIntentRevision, NSOStaticRouteState
         from netbox_nso_plugin.renderer_audit import _repair_with_retries
 
-        route = own_route(self.management, "198.18.164.0/24", None, device=self.device)
+        route = own_route(self.management, "198.18.164.0/24", "198.18.0.164", device=self.device)
+        type(route).objects.filter(pk=route.pk).update(next_hop=None)
         state = NSOStaticRouteState.objects.get(management=self.management, static_route=route)
         mirror_update(state, status="deploying", apply_attempt_id=uuid4())
         NSOIntentRevision.objects.filter(device=self.device, scope="static_route").update(verified_revision=None)

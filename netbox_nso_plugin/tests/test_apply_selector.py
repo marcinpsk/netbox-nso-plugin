@@ -805,7 +805,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = self._create_interface(device=self.device, name="Ethernet9", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             state = acquire_overlay(
                 NSOInterfaceMtuState,
@@ -828,8 +828,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
-        first_interface = self._create_interface(device=self.device, name="Ethernet9.01", type="1000base-t")
-        second_interface = self._create_interface(device=self.device, name="Ethernet9.02", type="1000base-t")
+        first_interface = self._create_interface(device=self.device, name="Ethernet9.01", type="1000base-t", mtu=1500)
+        second_interface = self._create_interface(device=self.device, name="Ethernet9.02", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             first = acquire_overlay(
                 NSOInterfaceMtuState,
@@ -879,7 +879,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = self._create_interface(device=self.device, name="Ethernet9.1", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.1", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             state = acquire_overlay(
                 NSOInterfaceMtuState,
@@ -909,7 +909,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
         with transaction.atomic():
-            interface = self._create_interface(device=self.device, name="Ethernet9.11", type="1000base-t")
+            interface = self._create_interface(device=self.device, name="Ethernet9.11", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             state = acquire_overlay(
                 NSOInterfaceMtuState,
@@ -943,7 +943,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = self._create_interface(device=self.device, name="Ethernet9.2", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.2", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             state = acquire_overlay(
                 NSOInterfaceMtuState,
@@ -1106,7 +1106,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        interface = self._create_interface(device=self.device, name="Ethernet9.39", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.39", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             state = acquire_overlay(
                 NSOInterfaceMtuState,
@@ -2021,6 +2021,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                         device=self.device,
                         name=f"Ethernet9.{index}",
                         type="1000base-t",
+                        mode="access",
                     ),
                     mode="access",
                     untagged_vlan=self.vlan_state.vlan,
@@ -2396,7 +2397,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
         other_device, _other_mgmt = make_managed("apply-selector-interface-move", 2559)
-        interface = self._create_interface(device=self.device, name="Ethernet9.416", type="1000base-t")
+        interface = self._create_interface(device=self.device, name="Ethernet9.416", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             acquire_overlay(
                 NSOInterfaceMtuState,
@@ -2423,7 +2424,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         self.assertFalse(self.mgmt.auto_apply)
         with without_commit_drain(), transaction.atomic():
-            interface = self._create_interface(device=self.device, name="Ethernet9.42", type="lag")
+            interface = self._create_interface(device=self.device, name="Ethernet9.42", type="lag", mode="access")
             lacp = acquire_overlay(
                 NSOLACPBundleState,
                 management=self.mgmt,
@@ -2554,8 +2555,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.models import NSOInterfaceMtuState
         from netbox_nso_plugin.views import _save_owned_overlay_edit
 
-        first_interface = self._create_interface(device=self.device, name="Ethernet10", type="1000base-t")
-        second_interface = self._create_interface(device=self.device, name="Ethernet11", type="1000base-t")
+        first_interface = self._create_interface(device=self.device, name="Ethernet10", type="1000base-t", mtu=1500)
+        second_interface = self._create_interface(device=self.device, name="Ethernet11", type="1000base-t", mtu=1500)
         with without_commit_drain(), transaction.atomic():
             first = acquire_overlay(
                 NSOInterfaceMtuState, management=self.mgmt, interface=first_interface, l2_mtu=1500, status="accepted"

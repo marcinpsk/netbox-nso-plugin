@@ -1296,7 +1296,7 @@ class TestPushIntentOnAccept(_SignalDBBase):
     def test_pushes_enabled_attribute(self):
         from dcim.models import Interface
 
-        self._make_mgmt(adapter_device_id=3)
+        self._make_mgmt(adapter_device_id=3, manage_enabled=True)
         iface = Interface.objects.create(device=self.device, name="Loopback0", type="virtual", enabled=False)
         state = self._accepted_state(iface, "enabled", nso_value="true")
 
@@ -1366,7 +1366,9 @@ class TestPushIntentOnAccept(_SignalDBBase):
         from netbox_nso_plugin.signals import interface_intent_item
 
         self._make_mgmt(adapter_device_id=7)
-        state = self._accepted_state(self.iface, "mtu", nso_value="1500")
+        state = self._accepted_state(self.iface, "description", nso_value="1500")
+        type(state).objects.filter(pk=state.pk).update(attribute="mtu")  # Model foreign identity drift.
+        state.refresh_from_db()
 
         self.assertIsNone(interface_intent_item(state))
         with patch(f"{_MOD}.put_intent") as mock_put:
@@ -1859,7 +1861,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         from netbox_nso_plugin.models import NSODeviceManagement
 
         return NSODeviceManagement.objects.create(
-            device=self.device, nso_instance=self.nso_instance, nso_device_name="core-rtr-01", adapter_device_id=42
+            device=self.device,
+            nso_instance=self.nso_instance,
+            nso_device_name="core-rtr-01",
+            adapter_device_id=42,
+            manage_description=True,
         )
 
     def test_svi_delete_pushes_reduced_snapshot(self):
@@ -1886,7 +1892,9 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         from netbox_nso_plugin.models import NSOSubinterfaceState
 
         mgmt = self._mgmt()
-        child = Interface.objects.create(device=self.device, name="GigabitEthernet0/0.99", type="virtual")
+        child = Interface.objects.create(
+            device=self.device, name="GigabitEthernet0/0.99", type="virtual", parent=self.iface
+        )
         with (
             patch("netbox_nso_plugin.adapter_client.put_subinterface_intent"),
             self.captureOnCommitCallbacks(execute=True),
@@ -1916,6 +1924,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
     def test_interface_mtu_delete_pushes_reduced_snapshot(self):
         from netbox_nso_plugin.models import NSOInterfaceMtuState
 
+        self.iface.mtu = 9000
+        self.iface.save(update_fields=("mtu",))
         mgmt = self._mgmt()
         with (
             patch("netbox_nso_plugin.adapter_client.put_interface_mtu_intent"),
@@ -2006,8 +2016,11 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
         from netbox_nso_plugin.models import NSOStaticRouteState
 
         mgmt = self._mgmt()
-        # No devices M2M — the greenfield-accept signal must not interfere here.
+        # Assign the route without the greenfield Accept signal.
         route = StaticRoute.objects.create(prefix="198.18.99.0/24", next_hop="198.18.0.1", name="del-sr", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, self.device)
         with (
             patch("netbox_nso_plugin.adapter_client.put_static_route_intent"),
             self.captureOnCommitCallbacks(execute=True),
@@ -2025,6 +2038,9 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
 
         mgmt = self._mgmt()
         route = StaticRoute.objects.create(prefix="198.18.98.0/24", next_hop="198.18.0.1", metric=1)
+        from ._static_route_case import _assign_without_push
+
+        _assign_without_push(route, self.device)
         row = acquire_overlay(
             NSOStaticRouteState,
             management=mgmt,
@@ -2284,7 +2300,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             auto_apply=True,
         )
         lag = Interface.objects.create(device=self.device, name="Port-channel11", type="lag")
-        member_iface = Interface.objects.create(device=self.device, name="Gi9/1", type="1000base-t")
+        member_iface = Interface.objects.create(device=self.device, name="Gi9/1", type="1000base-t", lag=lag)
         acquire_overlay(
             NSOLACPBundleState,
             management=mgmt,
@@ -2294,12 +2310,12 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             system_priority=100,
             timer="fast",
             status="accepted",
+            observed_members=[member_iface.name],
         )
         member = acquire_overlay(
             NSOLACPMemberState,
             management=mgmt,
             interface=member_iface,
-            lag_bundle=lag,
             mode="active",
             port_priority=128,
             status="accepted",
@@ -2317,6 +2333,8 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             adapter_device_id=42,
             auto_apply=True,
         )
+        self.iface.mode = "tagged"
+        self.iface.save(update_fields=("mode",))
         row = acquire_overlay(
             NSOSwitchportState, management=mgmt, interface=self.iface, mode="trunk", status="accepted"
         )

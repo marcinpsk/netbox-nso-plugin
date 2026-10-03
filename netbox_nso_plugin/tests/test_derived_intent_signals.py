@@ -340,6 +340,7 @@ class TestInterfaceSaveHandler(TestCase):
             nso_instance=nso,
             nso_device_name=self.dev1.name,
             adapter_device_id=16234,
+            manage_enabled=True,
         )
         acquire_overlay(
             NSOInterfaceState,
