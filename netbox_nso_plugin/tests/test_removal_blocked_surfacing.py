@@ -55,7 +55,6 @@ def _blocked_job(job_id=50, scope="isis", status="failed", updated="2026-07-10T0
             "detail": {
                 "scope": scope,
                 "orphans": {"interface-config": [["lo0", "ipv4"], ["lag31", "ipv4"]], "process-config": [["legacy"]]},
-                "preview": "<edit-config>… would delete lo0 …</edit-config>",
                 "hint": "Re-accept them into intent to keep them, or force-removal to flush.",
             },
         },
@@ -218,7 +217,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             entry["orphans"],
             {"interface-config": [["lo0", "ipv4"], ["lag31", "ipv4"]], "process-config": [["legacy"]]},
         )
-        self.assertIn("would delete lo0", entry["preview"])
+        self.assertNotIn("preview", entry)
         self.assertEqual(entry["blocked_at"], "2026-07-10T06:00:00Z")
 
     def test_blocked_apply_head_is_included_in_the_poll_payload(self):
@@ -842,7 +841,7 @@ class TestFreeFormErrorDetail(TestCase):
 
         self.assertEqual([e["scope"] for e in entries], ["isis"])
         self.assertEqual(entries[0]["orphans"], {})
-        self.assertEqual(entries[0]["preview"], "")
+        self.assertNotIn("preview", entries[0])
 
 
 class TestFreeFormResidue(TestCase):

@@ -476,7 +476,7 @@ def _attribute_static_route_error(device_id, detail):
 _PUSH_ERROR_ATTRIBUTION = {"static_route": _attribute_static_route_error}
 
 
-def _record_push_outcome(device_id, scope, attempt, exc):
+def _record_push_outcome(device_id, scope, attempt, exc, *, expected_management_id=None):
     """Persist (or clear) this scope's rejection record, discarding a superseded response.
 
     Per ``(device, scope)`` under ``select_for_update``: the record is a JSONField shared
@@ -491,7 +491,10 @@ def _record_push_outcome(device_id, scope, attempt, exc):
         return
     try:
         with transaction.atomic():
-            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            managements = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id)
+            if expected_management_id is not None:
+                managements = managements.filter(pk=expected_management_id)
+            mgmt = managements.first()
             if mgmt is None:
                 return
             high_water = int((mgmt.intent_push_attempts or {}).get(scope) or 0)
@@ -2404,9 +2407,10 @@ def lacp_bundle_intent_item(row, members):
 
 def lacp_renderable_bundle_filter():
     """Select the LACP bundles that the device snapshot can contain."""
+    from .lacp_topology import bundle_state_filter
     from .status_machine import OWNED_STATES
 
-    return Q(status__in=OWNED_STATES, vpc_sensitive=False)
+    return Q(status__in=OWNED_STATES, vpc_sensitive=False) & bundle_state_filter()
 
 
 def _push_lacp_intent_for_device(device_id, adapter_device_id):
@@ -2417,7 +2421,8 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
     owned snapshot out as part of the one Apply.
     """
     from . import switching_preparation
-    from .models import NSOLACPBundleState, NSOLACPMemberState
+    from .lacp_topology import member_states
+    from .models import NSOLACPBundleState
     from .status_machine import OWNED_STATES
 
     bundles = []
@@ -2427,14 +2432,7 @@ def _push_lacp_intent_for_device(device_id, adapter_device_id):
     for b in NSOLACPBundleState.objects.filter(
         lacp_renderable_bundle_filter(), management__device_id=device_id
     ).select_related("interface"):
-        members = (
-            lacp_member_intent_item(member)
-            for member in NSOLACPMemberState.objects.filter(
-                management__device_id=device_id,
-                lag_bundle=b.interface,
-                status__in=OWNED_STATES,
-            ).select_related("interface")
-        )
+        members = (lacp_member_intent_item(member) for member in member_states(b).filter(status__in=OWNED_STATES))
         bundles.append(lacp_bundle_intent_item(b, members))
 
     _push_changed(

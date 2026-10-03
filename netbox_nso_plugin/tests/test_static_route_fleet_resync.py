@@ -434,7 +434,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         carried = self._own_route(mgmt, "10.77.0.0/16", "10.0.0.78")
         with _quiet_fixture(), transaction.atomic():
             iface_route = StaticRoute.objects.create(
-                prefix="10.78.0.0/16", next_hop=None, interface_next_hop="Ethernet1/1", metric=1
+                prefix="10.78.0.0/16", next_hop="198.18.0.78", interface_next_hop="Ethernet1/1", metric=1
             )
             _assign_without_push(iface_route, mgmt.device)
             skipped = acquire_overlay(
@@ -444,6 +444,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 status="accepted",
                 nso_prefix="10.78.0.0/16",
             )
+        StaticRoute.objects.filter(pk=iface_route.pk).update(next_hop=None)
         with transaction.atomic():
             armed = _backfill_static_route_generations(mgmt)
             self.assertEqual([row["pk"] for row in armed], [carried.pk])

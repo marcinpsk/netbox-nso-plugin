@@ -271,7 +271,11 @@ class TestReconcileStaticRoutes(TestCase):
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-membership")
         route = StaticRoute.objects.create(prefix="198.18.44.0/24", next_hop="198.18.0.44", metric=1)
+        from ._static_route_case import _assign_without_push, _unassign_without_push
+
+        _assign_without_push(route, self.device)
         acquire_overlay(NSOStaticRouteState, management=management, static_route=route, status="in_sync")
+        _unassign_without_push(route, self.device)
         payload = self._route_payload(self._route_entry(str(route.prefix), str(route.next_hop)))
 
         with self._auto_create_ctx(True):
@@ -730,8 +734,11 @@ class TestReconcileStaticRoutes(TestCase):
 
         route = StaticRoute.objects.get(prefix="198.18.76.0/24")
         state = NSOStaticRouteState.objects.get(management__device=self.device, static_route=route)
+        StaticRoute.objects.filter(pk=route.pk).update(next_hop="198.18.0.76")
+        state.static_route.refresh_from_db()
         state.status = "in_sync"
         save_overlay_fixture(state, update_fields=["status"])
+        StaticRoute.objects.filter(pk=route.pk).update(next_hop=None)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="static_route")
         before = revision.revision
 

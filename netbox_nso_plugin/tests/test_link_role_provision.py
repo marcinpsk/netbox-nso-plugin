@@ -77,7 +77,11 @@ class _Base(IntentPushResetMixin, TestCase):
 
     def _manage(self, device):
         return NSODeviceManagement.objects.create(
-            device=device, nso_instance=self.inst, nso_device_name=device.name, adapter_device_id=device.pk
+            device=device,
+            nso_instance=self.inst,
+            nso_device_name=device.name,
+            adapter_device_id=device.pk,
+            manage_description=True,
         )
 
     def _provision(self, iface):
@@ -345,6 +349,7 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 nso_instance=self.inst,
                 nso_device_name=self.dev_a.name,
                 adapter_device_id=self.dev_a.pk,
+                manage_description=True,
             )
             self.iface = Interface.objects.create(
                 device=self.dev_a, name="Gi1/1", type="1000base-t", description="to-peer"

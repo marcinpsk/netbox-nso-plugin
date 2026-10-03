@@ -169,7 +169,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
         mgmt = self._make_mgmt()
         sr, _ = StaticRoute.objects.get_or_create(
             prefix="192.168.50.0/24",
-            next_hop=None,
+            next_hop="198.18.0.1",
             vrf=None,
             defaults={"metric": 1, "interface_next_hop": "GigabitEthernet0/0"},
         )
@@ -182,6 +182,7 @@ class TestPushStaticRouteIntentForDevice(IntentPushResetMixin, TestCase):
             nso_prefix="192.168.50.0/24",
         )
 
+        StaticRoute.objects.filter(pk=sr.pk).update(next_hop=None)  # Model native drift after acquisition.
         with patch(PUT) as mock_push:
             deliver("static_route", self.device.pk, mgmt.adapter_device_id)
 
@@ -488,7 +489,7 @@ class _StaticRouteWireCase:
 
         sr = StaticRoute.objects.create(
             prefix=prefix,
-            next_hop=None if next_hop_is_none else next_hop,
+            next_hop="198.18.0.42" if next_hop_is_none else next_hop,
             metric=1,
             interface_next_hop="GigabitEthernet0/0" if next_hop_is_none else "",
         )
@@ -502,6 +503,8 @@ class _StaticRouteWireCase:
             nso_next_hop="" if next_hop_is_none else next_hop,
             intent_generation=generation,
         )
+        if next_hop_is_none:
+            StaticRoute.objects.filter(pk=sr.pk).update(next_hop=None)
         trust_scope(self.device, mgmt, "static_route")
         return state
 

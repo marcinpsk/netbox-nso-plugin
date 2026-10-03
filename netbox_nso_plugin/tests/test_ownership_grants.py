@@ -103,6 +103,14 @@ class TestOwnershipGrants(IntentPushResetMixin, TestCase):
         )
         self.assertEqual(manifest.ownership_state, "owned")
         self.assertEqual(manifest.grant_kind, kind)
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        with without_commit_drain():
+            self.assertEqual(reconcile_scope_ownership(device_id, (scope,)), (), self._testMethodName)
+        row.refresh_from_db()
+        manifest.refresh_from_db()
+        self.assertIn(row.status, sm.OWNED_STATES)
+        self.assertEqual(manifest.ownership_state, "owned")
 
     def test_unclassified_owned_insert_is_refused(self):
         for status in sm.OWNED_STATES:
@@ -457,10 +465,11 @@ class TestOwnershipGrants(IntentPushResetMixin, TestCase):
         self.assertFalse(type(state).objects.filter(pk=state.pk).exists())
         self.assertFalse(self.acquisition_evidence(state).exists())
 
-    def test_management_teardown_discards_evidence_for_surviving_interface_overlays(self):
+    def test_management_teardown_removes_interface_overlays_and_acquisition_evidence(self):
         state = self.pending_ip_acquisition()
         type(self.management).objects.filter(pk=self.management.pk).delete()
-        self.assertTrue(type(state).objects.filter(pk=state.pk).exists())
+        self.assertFalse(type(state).objects.filter(pk=state.pk).exists())
+        self.assertTrue(Interface.objects.filter(pk=self.interface.pk).exists())
         self.assertFalse(self.acquisition_evidence(state).exists())
 
     def test_device_manifest_termination_discards_unbound_evidence(self):

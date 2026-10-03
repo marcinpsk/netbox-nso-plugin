@@ -160,10 +160,11 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
         with _fixtures():
             pushed = _route("10.66.0.0/16", "10.0.0.1", devices=[self.device])
             unowned = _route("10.66.0.0/16", "10.0.0.1", devices=[self.device])
-            interface_only = _route("10.66.0.0/16", None, devices=[self.device])
+            interface_only = _route("10.66.0.0/16", "198.18.0.66", devices=[self.device])
             _own(pushed, self.mgmt)
             _own(unowned, self.mgmt, status="imported")
             _own(interface_only, self.mgmt)
+            type(interface_only).objects.filter(pk=interface_only.pk).update(next_hop=None)
 
         with patch(PUT, side_effect=_duplicate_triple(("", "10.66.0.0/16", "10.0.0.1"))) as put:
             _push(self.device.pk, self.mgmt.adapter_device_id)

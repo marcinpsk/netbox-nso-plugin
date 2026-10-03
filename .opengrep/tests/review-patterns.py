@@ -2796,3 +2796,12 @@ def raw_overlay_dml(cursor, model, value):
     RawSQL('SELECT status FROM netbox_nso_plugin_nsointerfacestate', [])
     # ok: nso-overlay-raw-sql-dml
     cursor.execute('UPDATE ipam_vlan SET name = %s', ['placeholder'])
+
+
+def lacp_observation_is_not_intent(bundle, interface):
+    # ruleid: nso-lacp-observation-is-not-intent
+    names = bundle.observed_members
+    # ruleid: nso-lacp-observation-is-not-intent
+    names = getattr(bundle, "observed_members", [])
+    # ok: nso-lacp-observation-is-not-intent
+    members = interface.member_interfaces.all()

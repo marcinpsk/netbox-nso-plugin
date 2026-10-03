@@ -481,10 +481,10 @@ class TestOwnershipManifestMaintenance(TestCase):
 
         # The overlay stays on this device's management while its interface belongs to another device.
         other_device = make_device("manifest-maintenance", 2)
-        interface = Interface.objects.create(device=other_device, name="Ethernet4/0", type="1000base-t")
+        interface = Interface.objects.create(device=self.device, name="Ethernet4/0", type="1000base-t")
         OSPFInterface.objects.create(
             instance=OSPFInstance.objects.create(
-                device=other_device,
+                device=self.device,
                 process_id="1628",
                 name="1628",
                 router_id="198.18.4.1",
@@ -501,6 +501,8 @@ class TestOwnershipManifestMaintenance(TestCase):
             status="accepted",
         )
 
+        Interface.objects.filter(pk=interface.pk).update(device=other_device)
+        state.interface.refresh_from_db()
         NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="ospf").delete()
         natives = _native_prefetch(_native_bindings(self.management, frozenset({"ospf"})))
 

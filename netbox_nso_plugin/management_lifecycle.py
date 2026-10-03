@@ -12,6 +12,7 @@ from .renderer_writer import (
     planned_save,
     renderer_mirror_writes,
     renderer_writes,
+    renderer_writes_replanning_once,
 )
 
 ONBOARD_EVIDENCE_FIELDS = ("onboard_status", "onboard_steps", "onboard_error")
@@ -79,11 +80,39 @@ def _prepare_source_fence(instance, update_fields):
 
 
 def delete_management(instance):
-    """Delete one management row and its exact Collector closure through the writer."""
-    plan = RendererMutationPlan.build(deletes=(planned_delete(instance),))
-    context = renderer_writes if plan.changes_content else renderer_mirror_writes
-    with context(plan) as writer:
+    """Delete the exact Collector closure and retry one stale plan acquisition."""
+
+    def plan_delete():
+        return RendererMutationPlan.build(deletes=(planned_delete(instance),))
+
+    with renderer_writes_replanning_once(plan_delete) as (writer, _plan):
         return writer.delete(instance)
+
+
+def collect_management_overlays(collector, instance):
+    """Add interface-owned overlays to a management row's deletion closure."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsodevicemanagement":
+        return
+    from .models import NSOInterfaceIPState, NSOInterfaceState
+
+    for model in (NSOInterfaceState, NSOInterfaceIPState):
+        collector.collect(model.objects.using(collector.using).filter(interface__device_id=instance.device_id))
+
+
+def delete_management_overlays(instance, *, origin, using):
+    """Remove offboarded interface overlays under the management deletion locks."""
+    from django.db.models.deletion import Collector
+
+    from .drain import reset_offboard_state
+    from .intent_state import _delete_origin_label
+
+    # Device deletion already collects these rows through their native interfaces.
+    if _delete_origin_label(origin) == "dcim.device":
+        return
+    reset_offboard_state(instance.device_id, using=using)
+    collector = Collector(using=using, origin=origin)
+    collect_management_overlays(collector, instance)
+    collector.delete()
 
 
 def _control_footprint(device_id):

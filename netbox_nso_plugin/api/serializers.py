@@ -419,7 +419,7 @@ class NSOLACPBundleStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOLACPBundleState
         fields = "__all__"
-        read_only_fields = ["status"]
+        read_only_fields = ["status", "observed_members", "device_present"]
 
 
 class NSOLACPMemberStateSerializer(ModelSerializer):  # noqa: D101
