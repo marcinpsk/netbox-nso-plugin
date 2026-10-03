@@ -11,6 +11,7 @@ on:
       - main
       - develop
       - 'stack/1627-**'
+      - 'fix/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
