@@ -6,8 +6,10 @@ import copy
 import dataclasses
 
 from dcim.models import Interface
+from django.db import connection
 from django.db.models.signals import post_delete
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from extras.models import Tag
 from ipam.models import IPAddress
@@ -17,6 +19,7 @@ from netbox_nso_plugin.models import NSOInterfaceIPState, NSOOwnershipAcquisitio
 from netbox_nso_plugin.renderer_writer import (
     RendererMutationPlan,
     consume_renderer_plan,
+    planned_delete,
     planned_save,
     renderer_mirror_writes,
     renderer_writes,
@@ -60,6 +63,29 @@ class TestRendererDeleteBatch(TestCase):
         self.assertIsNone(self.retained.peer_state_id)
         self.assertEqual(self.retained.status, "imported")
         self.assertTrue(Tag.objects.filter(pk=self.tag.pk).exists())
+
+    def test_batch_execution_does_not_reload_root_footprints(self):
+        through = self.first.tags.through
+        plan = self._plan()
+        with renderer_mirror_writes(plan) as writer, CaptureQueriesContext(connection) as queries:
+            writer.delete_many(self.roots)
+        interface_reads = [query["sql"] for query in queries if 'FROM "dcim_interface"' in query["sql"]]
+        self.assertEqual(interface_reads, [])
+        self.assertFalse(NSOInterfaceIPState.objects.filter(pk__in=self.root_ids).exists())
+        self.assertFalse(through.objects.filter(object_id__in=self.root_ids).exists())
+        self.retained.refresh_from_db()
+        self.assertIsNone(self.retained.peer_state_id)
+
+    def test_single_delete_execution_keeps_interface_reads_bounded(self):
+        plan = RendererMutationPlan.build(deletes=(planned_delete(self.first),))
+        with renderer_mirror_writes(plan) as writer, CaptureQueriesContext(connection) as queries:
+            writer.delete(self.first)
+        interface_reads = [query["sql"] for query in queries if 'FROM "dcim_interface"' in query["sql"]]
+        self.assertLessEqual(len(interface_reads), 1, interface_reads)
+        self.assertFalse(NSOInterfaceIPState.objects.filter(pk=self.root_ids[0]).exists())
+        self.assertTrue(NSOInterfaceIPState.objects.filter(pk=self.root_ids[1]).exists())
+        self.retained.refresh_from_db()
+        self.assertIsNone(self.retained.peer_state_id)
 
     def test_changed_root_rejects_the_entire_batch(self):
         plan = self._plan()

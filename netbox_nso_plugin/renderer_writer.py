@@ -667,7 +667,7 @@ def _append_deleted_overlay(deleted_overlays, row):
         deleted_overlays.append(row)
 
 
-def _collector_closure(instance):
+def _collector_closure(instance, *, effects_only=False):
     from django.db.models.deletion import Collector
 
     from .management_lifecycle import collect_management_overlays
@@ -675,10 +675,10 @@ def _collector_closure(instance):
     collector = Collector(using=instance._state.db or "default", origin=instance)
     collector.collect([instance])
     collect_management_overlays(collector, instance)
-    return _describe_collector(collector, {(instance._meta.label_lower, instance.pk)})[:4]
+    return _describe_collector(collector, {(instance._meta.label_lower, instance.pk)}, effects_only=effects_only)[:4]
 
 
-def _describe_collector(collector, root_identities, *, batch=False):  # noqa: C901
+def _describe_collector(collector, root_identities, *, batch=False, effects_only=False):  # noqa: C901
     """Flatten the collected effects without replacing its dependency graph."""
     writes = []
     deleted_overlays = []
@@ -691,6 +691,8 @@ def _describe_collector(collector, root_identities, *, batch=False):  # noqa: C9
     specs = renderer_input_specs()
 
     def record_change(before, after, *, future=False):
+        if effects_only:
+            return
         spec = specs.get(before._meta.label_lower)
         if batch:
             label = before._meta.label_lower
@@ -761,14 +763,15 @@ def _describe_collector(collector, root_identities, *, batch=False):  # noqa: C9
                         cascade=True,
                     )
                 )
-                after = copy.copy(row)
-                setattr(after, field.attname, thaw_field_value(field, frozen_value))
-                if field.is_relation and field.is_cached(after):
-                    field.delete_cached_value(after)
-                record_change(row, after, future=True)
-                if batch:
-                    peer_reads.append(RendererRead(model._meta.label_lower, row.pk, _field_values(row, None)))
-    if batch:
+                if not effects_only:
+                    after = copy.copy(row)
+                    setattr(after, field.attname, thaw_field_value(field, frozen_value))
+                    if field.is_relation and field.is_cached(after):
+                        field.delete_cached_value(after)
+                    record_change(row, after, future=True)
+                    if batch:
+                        peer_reads.append(RendererRead(model._meta.label_lower, row.pk, _field_values(row, None)))
+    if batch and not effects_only:
         deleted_identities = {(write.model_label, write.pk) for write in writes if write.operation == "delete"}
         peer_reads = [read for read in peer_reads if (read.model_label, read.pk) not in deleted_identities]
         footprints.append(
@@ -1506,7 +1509,7 @@ class RendererWriter:
         current = type(instance)._default_manager.filter(pk=instance.pk).first()
         if current is None or not self._fields_match(root_write.before_values, current):
             raise IntentPlanStaleError(f"{root_write.model_label} row {root_write.pk!r} changed after planning")
-        closure, deleted_overlays, _footprint, _changed_keys = _collector_closure(current)
+        closure, deleted_overlays, _footprint, _changed_keys = _collector_closure(current, effects_only=True)
         matched = []
         available = [candidate for candidate in range(len(self.plan.write_set)) if candidate not in self._consumed]
         for expected in closure:
@@ -1558,7 +1561,7 @@ class RendererWriter:
             raise IntentMutationProtocolError("the deletion group is outside the unconsumed frozen write set")
         _roots, collector = _collect_delete_batch(label, using, pks)
         closure, overlays, _footprint, _keys, _reads = _describe_collector(
-            collector, {(label, pk) for pk in pks}, batch=True
+            collector, {(label, pk) for pk in pks}, batch=True, effects_only=True
         )
         available = defaultdict(list)
         for index in batch.write_indexes:
