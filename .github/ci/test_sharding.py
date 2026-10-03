@@ -77,12 +77,15 @@ def create_shard_artifacts(temporary):
 
 class ShardingContractTests(unittest.TestCase):
     def test_stacked_pull_requests_run_the_test_workflow(self):
-        workflow = Path(__file__).parents[1] / "workflows" / "test.yaml"
-        trigger = workflow.read_text(encoding="utf-8").split("  pull_request:\n", 1)[1].split("\nconcurrency:", 1)[0]
-        branches = [line.strip()[2:].strip("'\"") for line in trigger.splitlines() if line.strip().startswith("- ")]
-        for base in ("main", "develop", "stack/1627-example", "fix/1762-lacp-native-topology"):
-            with self.subTest(base=base):
-                self.assertTrue(any(fnmatch.fnmatchcase(base, pattern) for pattern in branches), base)
+        for name in ("test.yaml", "js-test.yaml"):
+            workflow = Path(__file__).parents[1] / "workflows" / name
+            trigger = (
+                workflow.read_text(encoding="utf-8").split("  pull_request:\n", 1)[1].split("\nconcurrency:", 1)[0]
+            )
+            branches = [line.strip()[2:].strip("'\"") for line in trigger.splitlines() if line.strip().startswith("- ")]
+            for base in ("main", "develop", "stack/1627-example", "fix/1762-lacp-native-topology"):
+                with self.subTest(workflow=name, base=base):
+                    self.assertTrue(any(fnmatch.fnmatchcase(base, pattern) for pattern in branches), base)
 
     def test_complete_shards_pass_and_incomplete_or_duplicate_runs_fail(self):
         helper = Path(__file__).with_name("sharding.py")
