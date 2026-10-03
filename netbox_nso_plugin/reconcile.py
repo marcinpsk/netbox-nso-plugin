@@ -72,7 +72,12 @@ def _mark_scope_error(mgmt, model_names: tuple[str, ...]) -> None:
 
     for name in model_names:
         model = getattr(models, name)
-        for row in model.objects.filter(management=mgmt):
+        lookup = (
+            {"interface__device_id": mgmt.device_id}
+            if name in {"NSOInterfaceState", "NSOInterfaceIPState"}
+            else {"management": mgmt}
+        )
+        for row in model.objects.filter(**lookup):
             new_status = sm.on_reconcile_error(row.status)
             if new_status != row.status:
                 row.status = new_status

@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import copy
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -86,6 +87,23 @@ class RendererDelete:
 
 
 @dataclass(frozen=True)
+class RendererDeleteBatch:
+    """Proposed interface-IP roots for one exact Collector operation."""
+
+    instances: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class RendererFrozenDeleteBatch:
+    """Frozen roots and effect indexes for one homogeneous deletion group."""
+
+    model_label: str
+    using: str
+    selected_pks: tuple[Any, ...]
+    write_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RendererRead:
     """One persisted row whose exact state a frozen plan depends on."""
 
@@ -149,6 +167,11 @@ def planned_delete(instance, *, expected_before=None) -> RendererDelete:
     return RendererDelete(instance=instance, expected_before=expected_before)
 
 
+def planned_delete_many(instances) -> RendererDeleteBatch:
+    """Describe one explicit interface-IP deletion group."""
+    return RendererDeleteBatch(instances=tuple(instances))
+
+
 def planned_set_update(queryset, **values) -> RendererSetUpdate:
     """Freeze one queryset and its exact set-based update values."""
     model = queryset.model
@@ -195,6 +218,7 @@ class RendererMutationPlan:
     validate_after_acquire: Callable[[], None] | None = dataclass_field(default=None, compare=False, repr=False)
     settles_deploying: bool = True
     execution: Any = dataclass_field(default=None, compare=False, repr=False)
+    delete_batches: tuple[RendererFrozenDeleteBatch, ...] = ()
 
     @property
     def changes_content(self) -> bool:
@@ -206,6 +230,7 @@ class RendererMutationPlan:
         *,
         saves=(),
         deletes=(),
+        delete_batches=(),
         set_updates=(),
         m2m_writes=(),
         read_dependencies=(),
@@ -233,6 +258,8 @@ class RendererMutationPlan:
         footprints: list[MutationFootprint] = []
         content_keys: set[tuple[int, str]] = set()
         effective_saves = []
+        frozen_batches = []
+        batch_reads = []
 
         for proposed, before, after in effective_save_states:
             validate_acquisition(before, after, grant)
@@ -252,6 +279,13 @@ class RendererMutationPlan:
             writes.extend(delete_writes)
             footprints.append(footprint)
             content_keys.update(changed_keys)
+        for proposed in delete_batches:
+            batch, delete_writes, footprint, changed_keys, peer_reads = _plan_delete_many(proposed, len(writes))
+            frozen_batches.append(batch)
+            writes.extend(delete_writes)
+            footprints.append(footprint)
+            content_keys.update(changed_keys)
+            batch_reads.extend(peer_reads)
         for proposed in set_updates:
             write, footprint, changed_keys = _plan_set_update(proposed, grant=grant)
             writes.append(write)
@@ -268,6 +302,11 @@ class RendererMutationPlan:
             footprints.append(footprint)
             content_keys.update(changed_keys)
         read_identities = set()
+        for read in batch_reads:
+            identity = (read.model_label, read.pk)
+            if identity not in read_identities:
+                reads.append(read)
+                read_identities.add(identity)
         for instance in read_dependencies:
             read, footprint = _plan_read(instance)
             identity = (read.model_label, read.pk)
@@ -278,6 +317,7 @@ class RendererMutationPlan:
             read_identities.add(identity)
 
         content_keys.update(_prospective_visibility_keys(effective_saves))
+        _validate_delete_batch_overlaps(writes, frozen_batches)
 
         footprints.extend(additional_footprints)
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
@@ -291,6 +331,7 @@ class RendererMutationPlan:
             validate_after_acquire=validate_after_acquire,
             settles_deploying=settles_deploying,
             execution=execution,
+            delete_batches=tuple(frozen_batches),
         )
 
 
@@ -560,8 +601,24 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs, before, afte
             **{row_kind: (SourceRow(label, None if before is None else before.pk),)},
         )
         return write, footprint, set()
+    stored_before = before if label == "ipam.ipaddress" else None
+    candidates: tuple[Any, ...] = (before, after)
+    if (
+        stored_before is not None
+        and proposed.update_fields is not None
+        and {instance._meta.get_field(name).attname for name in proposed.update_fields}
+        == {"assigned_object_type_id", "assigned_object_id"}
+        and after.assigned_object_type_id is None
+        and after.assigned_object_id is None
+    ):
+        # Clearing only the assignment adds no target to the stored footprint.
+        candidates = (before,)
     base = MutationFootprint.merge(
-        *(footprint_for_instance(candidate, spec) for candidate in (before, after) if candidate is not None)
+        *(
+            footprint_for_instance(candidate, spec, stored_before=stored_before)
+            for candidate in candidates
+            if candidate is not None
+        )
     )
     dependency_footprint, dependency_changed = _dependencies(before, after, spec)
     footprint = MutationFootprint.merge(base, dependency_footprint)
@@ -594,19 +651,41 @@ def _collector_closure(instance):
     collector = Collector(using=instance._state.db or "default", origin=instance)
     collector.collect([instance])
     collect_management_overlays(collector, instance)
-    root_identity = (instance._meta.label_lower, instance.pk)
+    return _describe_collector(collector, {(instance._meta.label_lower, instance.pk)})[:4]
+
+
+def _describe_collector(collector, root_identities, *, batch=False):  # noqa: C901
+    """Flatten the collected effects without replacing its dependency graph."""
     writes = []
     deleted_overlays = []
     footprints = []
     changed_keys = set()
+    peer_reads = []
+    cascade_scopes = set()
+    resolved_keys = set()
+    root_device_ids = set()
     specs = renderer_input_specs()
 
-    def record_change(before, after):
+    def record_change(before, after, *, future=False):
         spec = specs.get(before._meta.label_lower)
+        if batch:
+            label = before._meta.label_lower
+            if label in OVERLAY_MODEL_RANKS or label in SOURCE_MODEL_RANKS:
+                row_kind = "overlay_rows" if label in OVERLAY_MODEL_RANKS else "source_rows"
+                rows = (SourceRow(label, before.pk),)
+                if future:
+                    rows = (*rows, SourceRow(label, None))
+                footprints.append(MutationFootprint.for_keys((), **{row_kind: rows}))
         if spec is None:
             return
+        before_footprint = footprint_for_instance(before, spec)
+        if batch:
+            resolved_keys.update(before_footprint.revision_keys)
+            cascade_scopes.update(spec.scopes)
+            if (before._meta.label_lower, before.pk) in root_identities:
+                root_device_ids.update(before_footprint.device_ids)
         dependency_footprint, dependency_changed = _dependencies(before, after, spec)
-        footprints.append(footprint_for_instance(before, spec))
+        footprints.append(before_footprint)
         if after is not None:
             footprints.append(footprint_for_instance(after, spec))
         footprints.append(dependency_footprint)
@@ -621,7 +700,7 @@ def _collector_closure(instance):
                     model_label=model._meta.label_lower,
                     pk=row.pk,
                     before_values=_field_values(row, None),
-                    cascade=(model._meta.label_lower, row.pk) != root_identity,
+                    cascade=(model._meta.label_lower, row.pk) not in root_identities,
                 )
             )
             record_change(row, None)
@@ -634,10 +713,10 @@ def _collector_closure(instance):
                     model_label=queryset.model._meta.label_lower,
                     pk=row.pk,
                     before_values=_field_values(row, None),
-                    cascade=True,
+                    cascade=(queryset.model._meta.label_lower, row.pk) not in root_identities,
                 )
             )
-            record_change(row, None)
+            record_change(row, None, future=True)
     for (field, value), querysets in collector.field_updates.items():
         for rows in querysets:
             model, materialized = _materialize_field_update_rows(rows)
@@ -651,6 +730,7 @@ def _collector_closure(instance):
                         pk=row.pk,
                         update_fields=(field.name,),
                         values=((field.attname, _normal(value)),),
+                        before_values=((field.attname, _normal(getattr(row, field.attname))),) if batch else (),
                         cascade=True,
                     )
                 )
@@ -658,9 +738,85 @@ def _collector_closure(instance):
                 setattr(after, field.attname, _normal(value))
                 if field.is_relation and field.is_cached(after):
                     field.delete_cached_value(after)
-                record_change(row, after)
+                record_change(row, after, future=True)
+                if batch:
+                    peer_reads.append(RendererRead(model._meta.label_lower, row.pk, _field_values(row, None)))
+    if batch:
+        deleted_identities = {(write.model_label, write.pk) for write in writes if write.operation == "delete"}
+        peer_reads = [read for read in peer_reads if (read.model_label, read.pk) not in deleted_identities]
+        footprints.append(
+            MutationFootprint.for_keys(
+                {*resolved_keys, *((device_id, scope) for device_id in root_device_ids for scope in cascade_scopes)}
+            )
+        )
     footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
-    return tuple(writes), tuple(deleted_overlays), footprint, changed_keys
+    return tuple(writes), tuple(deleted_overlays), footprint, changed_keys, tuple(peer_reads)
+
+
+def _delete_batch_identity(instances):
+    if not instances:
+        raise IntentMutationProtocolError("a deletion batch requires persisted interface-IP roots")
+    label = "netbox_nso_plugin.nsointerfaceipstate"
+    using = instances[0]._state.db or "default"
+    if using != "default":
+        raise IntentMutationProtocolError("renderer deletion batches require the default lock transaction database")
+    pks = []
+    for instance in instances:
+        if (
+            instance._meta.label_lower != label
+            or (instance._state.db or "default") != using
+            or instance.pk is None
+            or instance._state.adding
+        ):
+            raise IntentMutationProtocolError("deletion batches require homogeneous persisted interface-IP roots")
+        pks.append(instance.pk)
+    if len(set(pks)) != len(pks):
+        raise IntentMutationProtocolError("a deletion batch contains duplicate roots")
+    return label, using, tuple(sorted(pks))
+
+
+def _collect_delete_batch(label, using, pks):
+    from netbox.models.deletion import CustomCollector
+
+    model = apps.get_model(label)
+    origin = model._default_manager.using(using).filter(pk__in=pks).order_by("pk")
+    roots = tuple(origin.select_related("interface"))
+    if tuple(row.pk for row in roots) != pks:
+        raise IntentPlanStaleError("a deletion batch lost a selected root")
+    collector = CustomCollector(using=using, origin=origin)
+    collector.collect(roots)
+    return roots, collector
+
+
+def _plan_delete_many(proposed, offset):
+    label, using, pks = _delete_batch_identity(proposed.instances)
+    _roots, collector = _collect_delete_batch(label, using, pks)
+    writes, _overlays, footprint, keys, reads = _describe_collector(collector, {(label, pk) for pk in pks}, batch=True)
+    batch = RendererFrozenDeleteBatch(label, using, pks, tuple(range(offset, offset + len(writes))))
+    return batch, writes, footprint, keys, reads
+
+
+def _validate_delete_batch_overlaps(writes, batches):
+    """Reject overlapping effects and writes that replace a frozen peer target."""
+    indexes_by_row = defaultdict(list)
+    for index, write in enumerate(writes):
+        indexes_by_row[(write.model_label, write.pk)].append(index)
+        for pk in write.selected_pks:
+            if write.operation == "set_update":
+                indexes_by_row[(write.model_label, pk)].append(index)
+    for batch in batches:
+        group = set(batch.write_indexes)
+        for index in batch.write_indexes:
+            effect = writes[index]
+            for other_index in indexes_by_row[(effect.model_label, effect.pk)]:
+                if other_index in group:
+                    continue
+                other = writes[other_index]
+                if effect.operation == "delete" or other.operation == "delete":
+                    raise IntentMutationProtocolError("a deletion batch overlaps another planned operation")
+                for name, before_value in effect.before_values:
+                    if name in dict(other.values) and dict(other.values)[name] != before_value:
+                        raise IntentMutationProtocolError("a planned write changes a deletion batch field pre-image")
 
 
 def _collector_writes(instance):
@@ -962,6 +1118,40 @@ class RendererWriter:
         self._active_operation: int | None = None
         self._active_instance = None
         self._acquisitions = set()
+        self._active_delete_indexes: frozenset[int] = frozenset()
+        self._write_indexes = defaultdict(list)
+        self._creation_indexes = defaultdict(list)
+        self._creation_fields = defaultdict(set)
+        self._reference_creation_indexes = defaultdict(list)
+        self._batch_indexes: set[int] = set()
+        for index, write in enumerate(plan.write_set):
+            self._write_indexes[(write.operation, write.model_label, write.pk)].append(index)
+            if write.operation == "save" and write.pk is None:
+                if any(isinstance(value, RendererCreationRef) for _name, value in write.natural_key):
+                    self._reference_creation_indexes[write.model_label].append(index)
+                else:
+                    self._creation_indexes[(write.model_label, write.natural_key)].append(index)
+                    self._creation_fields[write.model_label].add(tuple(name for name, _value in write.natural_key))
+        for batch in plan.delete_batches:
+            if (
+                not batch.write_indexes
+                or len(set(batch.write_indexes)) != len(batch.write_indexes)
+                or any(index < 0 or index >= len(plan.write_set) for index in batch.write_indexes)
+                or self._batch_indexes.intersection(batch.write_indexes)
+            ):
+                raise IntentMutationProtocolError("the frozen deletion group has invalid effect membership")
+            roots = tuple(
+                sorted(
+                    write.pk
+                    for index in batch.write_indexes
+                    if (write := plan.write_set[index]).operation == "delete"
+                    and not write.cascade
+                    and write.model_label == batch.model_label
+                )
+            )
+            if roots != batch.selected_pks:
+                raise IntentMutationProtocolError("the frozen deletion group has invalid root membership")
+            self._batch_indexes.update(batch.write_indexes)
 
     def _acquired(self, index, pk=None):
         from .status_machine import OWNED_STATES
@@ -1016,6 +1206,17 @@ class RendererWriter:
 
     def validate_dependencies(self):
         """Reject frozen inputs that changed before their locks were acquired."""
+        selected = defaultdict(set)
+        for write in self.plan.write_set:
+            if write.pk is not None and write.before_values:
+                selected[write.model_label].add(write.pk)
+        for read in self.plan.read_set:
+            selected[read.model_label].add(read.pk)
+        stored = {
+            (label, row.pk): row
+            for label, pks in selected.items()
+            for row in apps.get_model(label)._default_manager.filter(pk__in=pks)
+        }
         for write in self.plan.write_set:
             if write.operation == "m2m_add" and not isinstance(write.pk, RendererCreationRef):
                 current = apps.get_model(write.model_label)._default_manager.filter(pk=write.pk).first()
@@ -1025,7 +1226,7 @@ class RendererWriter:
                     raise IntentPlanStaleError("the planned M2M additions changed after planning")
             if write.pk is None or not write.before_values:
                 continue
-            current = apps.get_model(write.model_label)._default_manager.filter(pk=write.pk).first()
+            current = stored.get((write.model_label, write.pk))
             if current is None:
                 raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
             if self._fields_match(write.before_values, current):
@@ -1034,7 +1235,7 @@ class RendererWriter:
                 continue
             raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
         for read in self.plan.read_set:
-            current = apps.get_model(read.model_label)._default_manager.filter(pk=read.pk).first()
+            current = stored.get((read.model_label, read.pk))
             if current is None or not self._fields_match(read.values, current):
                 raise IntentPlanStaleError(f"{read.model_label} row {read.pk!r} changed after planning")
 
@@ -1043,9 +1244,19 @@ class RendererWriter:
             return instance.pk == write.pk
         return self._fields_match(write.natural_key, instance)
 
+    def _save_indexes(self, instance):
+        label = instance._meta.label_lower
+        indexes = list(self._write_indexes[("save", label, instance.pk)]) if instance.pk is not None else []
+        for names in self._creation_fields[label]:
+            key = tuple((name, _normal(getattr(instance, name))) for name in names)
+            indexes.extend(self._creation_indexes[(label, key)])
+        indexes.extend(self._reference_creation_indexes[label])
+        return sorted(indexes)
+
     def _find_save(self, instance, update_fields, force_insert=False):
         normalized_fields = None if update_fields is None else tuple(sorted(set(update_fields)))
-        for index, write in enumerate(self.plan.write_set):
+        for index in self._save_indexes(instance):
+            write = self.plan.write_set[index]
             if index in self._consumed:
                 continue
             if (
@@ -1104,9 +1315,9 @@ class RendererWriter:
         index = next(
             (
                 candidate
-                for candidate, write in enumerate(self.plan.write_set)
+                for candidate in self._save_indexes(instance)
                 if candidate not in self._consumed
-                and write.operation == "save"
+                and (write := self.plan.write_set[candidate]).operation == "save"
                 and write.force_insert
                 and write.model_label == instance._meta.label_lower
                 and self._identity_matches(write, instance)
@@ -1125,7 +1336,8 @@ class RendererWriter:
 
     def consume_applied_save(self, instance) -> bool:
         """Consume a frozen update that another writer applied exactly."""
-        for index, write in enumerate(self.plan.write_set):
+        for index in self._save_indexes(instance):
+            write = self.plan.write_set[index]
             if (
                 index in self._consumed
                 or write.operation != "save"
@@ -1170,16 +1382,19 @@ class RendererWriter:
         return False
 
     @contextlib.contextmanager
-    def _operation(self, index, instance=None):
+    def _operation(self, index, instance=None, *, delete_indexes=()):
         previous = self._active_operation
         previous_instance = self._active_instance
+        previous_deletes = self._active_delete_indexes
         self._active_operation = index
         self._active_instance = instance
+        self._active_delete_indexes = frozenset(delete_indexes)
         try:
             yield
         finally:
             self._active_operation = previous
             self._active_instance = previous_instance
+            self._active_delete_indexes = previous_deletes
 
     def save_via(self, instance, save, *, update_fields=None, force_insert=False):
         """Execute one exact planned save through a model-aware callback."""
@@ -1234,6 +1449,7 @@ class RendererWriter:
                 candidate
                 for candidate, write in enumerate(self.plan.write_set)
                 if candidate not in self._consumed
+                and candidate not in self._batch_indexes
                 and write.operation == "delete"
                 and not write.cascade
                 and write.model_label == instance._meta.label_lower
@@ -1278,10 +1494,56 @@ class RendererWriter:
             _retire_overlay_manifest(overlay)
         if current._meta.label_lower not in OVERLAY_MODEL_RANKS:
             _retire_overlay_manifest(current)
-        with self._operation(index):
+        with self._operation(index, delete_indexes=matched):
             result = current.delete()
         instance.pk = None
         self._consumed.update(matched)
+        return result
+
+    def delete_many(self, instances):
+        """Execute the exact unconsumed group with its validated CustomCollector."""
+        instances = tuple(instances)
+        label, using, pks = _delete_batch_identity(instances)
+        batch = next(
+            (
+                group
+                for group in self.plan.delete_batches
+                if (group.model_label, group.using, group.selected_pks) == (label, using, pks)
+                and not self._consumed.intersection(group.write_indexes)
+            ),
+            None,
+        )
+        if batch is None:
+            raise IntentMutationProtocolError("the deletion group is outside the unconsumed frozen write set")
+        _roots, collector = _collect_delete_batch(label, using, pks)
+        closure, overlays, _footprint, _keys, _reads = _describe_collector(
+            collector, {(label, pk) for pk in pks}, batch=True
+        )
+        available = defaultdict(list)
+        for index in batch.write_indexes:
+            write = self.plan.write_set[index]
+            available[(write.operation, write.model_label, write.pk)].append(index)
+        matched = []
+        for effect in closure:
+            candidates = available[(effect.operation, effect.model_label, effect.pk)]
+            index = next((candidate for candidate in candidates if self.plan.write_set[candidate] == effect), None)
+            if index is None:
+                raise IntentPlanStaleError("the frozen deletion group changed before execution")
+            candidates.remove(index)
+            matched.append(index)
+        if len(matched) != len(batch.write_indexes):
+            raise IntentPlanStaleError("the frozen deletion group lost a planned effect")
+        retired = set()
+        for overlay in overlays:
+            identity = (overlay._meta.label_lower, overlay.pk)
+            if identity not in retired:
+                _retire_overlay_manifest(overlay)
+                retired.add(identity)
+        with self._operation(matched[0], delete_indexes=matched):
+            result = collector.delete()
+        self._consumed.update(matched)
+        for instance in instances:
+            instance.pk = None
         return result
 
     def _owner_matches(self, expected, instance):
@@ -1409,10 +1671,8 @@ class RendererWriter:
             return False
         if deleting:
             return any(
-                write.operation == "delete"
-                and write.model_label == instance._meta.label_lower
-                and write.pk == instance.pk
-                for write in self.plan.write_set
+                index not in self._consumed and index in self._active_delete_indexes
+                for index in self._write_indexes[("delete", instance._meta.label_lower, instance.pk)]
             )
         write = self.plan.write_set[self._active_operation]
         normalized_fields = None if update_fields is None else tuple(sorted(set(update_fields)))
@@ -1488,6 +1748,8 @@ def consume_renderer_plan(plan: RendererMutationPlan, permit, *, content: bool):
     if plan.validate_after_acquire is not None:
         plan.validate_after_acquire()
     writer = RendererWriter(plan, content=content, permit=permit)
+    if plan.delete_batches:
+        writer.validate_dependencies()
     token = _ACTIVE_WRITER.set(writer)
     try:
         yield writer

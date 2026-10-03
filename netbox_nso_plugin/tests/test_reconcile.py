@@ -991,6 +991,76 @@ class TestSafeReconcile(APITestCase):
         self.assertEqual(imported.status, "imported")  # marking happens only after the gate rolls back
         self.assertEqual(owned.status, "accepted")  # owned ownership preserved
 
+    def _assert_interface_fault_isolated(self, model, values, owned_values, fault_target, family, context_key):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.reconcile import reconcile_device
+
+        from .test_gated_reconcile import _rs
+
+        mgmt, _imported, _owned = self._setup()
+        mgmt.manage_interfaces = True
+        iface = Interface.objects.create(device=mgmt.device, name="Ethernet1", type="1000base-t")
+        imported = model.objects.create(interface=iface, status="imported", **values)
+        owned = acquire_overlay(model, interface=iface, status="accepted", **owned_values)
+        other = _make_device("scope-other")
+        other_iface = Interface.objects.create(device=other, name="Ethernet1", type="1000base-t")
+        unrelated = model.objects.create(interface=other_iface, status="imported", **values)
+        empty = {"interfaces": [], "read_state": _rs()}
+
+        def fail_reconcile(*_args):
+            raise RuntimeError("interface read failed")
+
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_interfaces_doc", return_value=empty),
+            patch("netbox_nso_plugin.adapter_client.get_state", return_value={}),
+            patch("netbox_nso_plugin.adapter_client.get_svi", return_value={"svis": [], "read_state": _rs()}),
+            patch("netbox_nso_plugin.adapter_client.get_subinterface", return_value=empty),
+            patch("netbox_nso_plugin.adapter_client.get_interface_mtu", return_value=empty),
+            patch("netbox_nso_plugin.adapter_client.get_interface_ips", return_value=empty),
+            patch("netbox_nso_plugin.adapter_client.get_lag_config", return_value={"bundles": [], "read_state": _rs()}),
+            patch(
+                "netbox_nso_plugin.adapter_client.get_vlan_database", return_value={"vlans": [], "read_state": _rs()}
+            ),
+            patch("netbox_nso_plugin.adapter_client.get_switchport", return_value=empty),
+            patch(f"netbox_nso_plugin.template_content.{fault_target}", new=fail_reconcile),
+        ):
+            ctx = reconcile_device(mgmt.device, mgmt)
+
+        imported.refresh_from_db()
+        owned.refresh_from_db()
+        unrelated.refresh_from_db()
+        self.assertEqual(imported.status, "error")
+        self.assertEqual(owned.status, "accepted")
+        self.assertEqual(unrelated.status, "imported")
+        self.assertFalse(ctx[context_key])
+        self.assertEqual(ctx["_gate"][family], "skipped_unavailable")
+        self.assertEqual(ctx["_gate"]["lag_config"], "ran")
+
+    def test_interface_ip_fault_marks_only_device_unowned_rows_and_continues(self):
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        self._assert_interface_fault_isolated(
+            NSOInterfaceIPState,
+            {"address": "198.18.0.1/24"},
+            {"address": "198.18.0.2/24"},
+            "_reconcile_interface_ips",
+            "interface_ip",
+            "interface_ips",
+        )
+
+    def test_interface_attribute_fault_marks_only_device_unowned_rows_and_continues(self):
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        self._assert_interface_fault_isolated(
+            NSOInterfaceState,
+            {"attribute": "description", "nso_value": "observed"},
+            {"attribute": "enabled", "nso_value": "true"},
+            "_upsert_interface_states",
+            "interface_attributes",
+            "interface_states",
+        )
+
     def test_adapter_error_propagates(self):
         from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.reconcile import _safe_reconcile
