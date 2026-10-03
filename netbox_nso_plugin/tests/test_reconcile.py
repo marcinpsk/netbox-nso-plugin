@@ -1000,6 +1000,9 @@ class TestSafeReconcile(APITestCase):
 
         mgmt, _imported, _owned = self._setup()
         mgmt.manage_interfaces = True
+        mgmt.manage_description = True
+        mgmt.manage_enabled = True
+        mgmt.save(update_fields=("manage_interfaces", "manage_description", "manage_enabled"))
         iface = Interface.objects.create(device=mgmt.device, name="Ethernet1", type="1000base-t")
         imported = model.objects.create(interface=iface, status="imported", **values)
         owned = acquire_overlay(model, interface=iface, status="accepted", **owned_values)
