@@ -147,6 +147,10 @@ class AuthorityPending(Exception):
 
     code = "nso_store_only_authority_pending"
 
+    def __init__(self, message, *, management_id):
+        super().__init__(message)
+        self.management_id = management_id
+
 
 @dataclasses.dataclass(frozen=True)
 class ClaimFlags:
@@ -606,7 +610,9 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     device_id, scope = state.device_id, state.scope
     marking_mode = delivery.delivery_keys()[scope].marking_mode
     if deletions or untracked_mark:
-        raise AuthorityPending(f"{device_id}/{scope} holds deletion authority a store-only request cannot carry")
+        raise AuthorityPending(
+            f"{device_id}/{scope} holds deletion authority a store-only request cannot carry", management_id=mgmt.pk
+        )
     revision = _intent_revision(device_id, scope)
     rendered = delivery.render(scope, device_id, mgmt.adapter_device_id)
     push_seq = allocate_push_seq()
@@ -996,7 +1002,7 @@ def _report_protocol_violation(claim: Claim, reason: str) -> None:
     )
 
 
-def _report_refusal(device_id, scope, exc) -> None:
+def _report_refusal(device_id, scope, exc, *, expected_management_id=None) -> None:
     """Surface a push this key may not conclude, where an operator reads its other refusals.
 
     Two callers, one rule: the store-only claim that may not carry authority (§4.3(d)) and
@@ -1007,7 +1013,13 @@ def _report_refusal(device_id, scope, exc) -> None:
     from . import signals
 
     logger.warning("the %s/%s push was refused: %s", device_id, scope, exc)
-    signals._record_push_outcome(device_id, scope, (signals.read_push_attempt(device_id, scope) or 0), exc)
+    signals._record_push_outcome(
+        device_id,
+        scope,
+        (signals.read_push_attempt(device_id, scope) or 0),
+        exc,
+        expected_management_id=expected_management_id,
+    )
 
 
 def _degradations(state, claim: Claim, response, now) -> list[dict]:
@@ -1258,7 +1270,7 @@ def _abandon_locked(state) -> None:
     """Rehome one locked claim without opening another transaction."""
     from .models import NSOIntentOutboxEntry
 
-    NSOIntentOutboxEntry.objects.filter(
+    NSOIntentOutboxEntry.objects.using(state._state.db).filter(
         device_id=state.device_id, scope=state.scope, consumed_by_push_seq=state.push_seq
     ).update(consumed_by_push_seq=None)
     queued = {int(record["route_id"]): record for record in state.queued_deletions}
@@ -1270,6 +1282,49 @@ def _abandon_locked(state) -> None:
     state.queued_deletions = list(queued.values())
     _clear_claim(state)
     state.save()
+
+
+def reset_offboard_state(device_id, *, using):
+    """Reset delivery evidence while keeping pending deletion authority."""
+    from django.db import connections
+    from utilities.exceptions import AbortRequest
+
+    from .models import NSOIntentOutboxState
+
+    database = connections[using]
+    if not database.in_atomic_block:
+        raise RuntimeError("offboard reset requires the management deletion transaction")
+    with database.cursor() as cursor:
+        cursor.execute("SHOW transaction_isolation")
+        isolation = cursor.fetchone()[0]
+    if isolation != "read committed":
+        raise AbortRequest("Offboarding requires a read committed transaction.")
+    try:
+        with transaction.atomic(using=using):
+            states = list(
+                NSOIntentOutboxState.objects.using(using)
+                .select_for_update(nowait=True, of=("self",))
+                .filter(device_id=device_id)
+                .order_by("scope", "pk")
+            )
+    except OperationalError as exc:
+        if getattr(exc.__cause__, "sqlstate", None) != "55P03":
+            raise
+        raise AbortRequest("Intent delivery is busy. Retry offboarding after it finishes.") from None
+
+    for state in states:
+        if state.push_seq is not None:
+            _abandon_locked(state)
+        else:
+            _clear_claim(state)
+        state.last_error_code = ""
+        state.last_error_at = None
+        state.degraded_deletions = []
+        state.attempts = 0
+        state.last_drain_attempted_at = None
+        state.last_success_identity = ""
+        state.last_success_at = None
+        state.save()
 
 
 # ── Switching preparations stay outside the receipt protocol ────────────────
@@ -1421,8 +1476,9 @@ def _drain_once(
     try:
         claimed, timed_out = _claim_or_compact(device_id, scope, mode=send_mode, force=force)
     except AuthorityPending as refusal:
-        _record_claim_refusal(device_id, scope, refusal)
-        _report_refusal(device_id, scope, refusal)
+        if not _record_claim_refusal(device_id, scope, refusal):
+            return SUPERSEDED, None
+        _report_refusal(device_id, scope, refusal, expected_management_id=refusal.management_id)
         return REFUSED, None
     if timed_out:
         return FAILED, None
@@ -1601,16 +1657,27 @@ def _dissolve(claim: Claim, exc) -> str:
     return REJECTED
 
 
-def _record_claim_refusal(device_id, scope, exc) -> None:
-    """Record a refusal whose claim transaction rolled back."""
+def _record_claim_refusal(device_id, scope, exc: AuthorityPending) -> bool:
+    """Record a rolled-back refusal only while its management row remains eligible."""
+    from .models import NSODeviceManagement
+
     with transaction.atomic():
         state = _lock_state(device_id, scope)
+        management = (
+            NSODeviceManagement.objects.order_by()
+            .select_for_update(of=("self",))
+            .filter(pk=exc.management_id, device_id=device_id, adapter_device_id__isnull=False)
+            .first()
+        )
+        if management is None:
+            return False
         now = _db_now()
         state.attempts += 1
         state.last_drain_attempted_at = now
         state.last_error_code = str(getattr(exc, "code", "") or type(exc).__name__)[:64]
         state.last_error_at = now
         state.save()
+    return True
 
 
 def _withhold(claim: Claim, exc) -> str:
@@ -1620,9 +1687,11 @@ def _withhold(claim: Claim, exc) -> str:
     deletion survives and the ids can still be cross-checked against what a later pass
     reports removing. Only the backfill-only claim's acknowledged success lifts this.
     """
-    abandon(claim)
     with transaction.atomic():
         state = _lock_state(claim.device_id, claim.scope)
+        if state.push_seq != claim.push_seq:
+            return SUPERSEDED
+        _abandon_locked(state)
         now = _db_now()
         if state.fence_withheld_since is None:
             state.fence_withheld_since = now

@@ -476,7 +476,7 @@ def _attribute_static_route_error(device_id, detail):
 _PUSH_ERROR_ATTRIBUTION = {"static_route": _attribute_static_route_error}
 
 
-def _record_push_outcome(device_id, scope, attempt, exc):
+def _record_push_outcome(device_id, scope, attempt, exc, *, expected_management_id=None):
     """Persist (or clear) this scope's rejection record, discarding a superseded response.
 
     Per ``(device, scope)`` under ``select_for_update``: the record is a JSONField shared
@@ -491,7 +491,10 @@ def _record_push_outcome(device_id, scope, attempt, exc):
         return
     try:
         with transaction.atomic():
-            mgmt = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id).first()
+            managements = NSODeviceManagement.objects.select_for_update().filter(device_id=device_id)
+            if expected_management_id is not None:
+                managements = managements.filter(pk=expected_management_id)
+            mgmt = managements.first()
             if mgmt is None:
                 return
             high_water = int((mgmt.intent_push_attempts or {}).get(scope) or 0)

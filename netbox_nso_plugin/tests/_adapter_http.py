@@ -65,6 +65,32 @@ def make_session(status_code=200, json_data=None, content=None, response=None):
     return session
 
 
+def make_transport_session(response, *, error=None):
+    """Keep the real Session request preparation and substitute only its send."""
+    session = _REAL_SESSION()
+
+    def send(request, **kwargs):
+        if error is not None:
+            raise error
+        response.request = request
+        response.url = request.url
+        return response
+
+    session.send = MagicMock(spec=session.send, side_effect=send)
+    return session
+
+
+def make_apply_preview(device_id=10, *, diffs=None, generation_id=81, document_digest="a" * 64, outformat="native"):
+    """Return the current adapter ApplyDiffOut shape."""
+    return {
+        "device_id": device_id,
+        "outformat": outformat,
+        "diffs": {} if diffs is None else diffs,
+        "generation_id": generation_id,
+        "document_digest": document_digest,
+    }
+
+
 def patch_matching_control_state(test_case):
     """Patch the adapter boundary with an empty control state that matches default management."""
     patchers = (

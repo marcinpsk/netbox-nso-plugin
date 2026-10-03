@@ -2317,6 +2317,38 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
 class TestNSOApplyPreviewView(ViewTestBase):
     """Tests for NSOApplyPreviewView (what Apply would push)."""
 
+    def _get_diff_preview(self, diffs, *, outformat="native", error=None):
+        """Use the current generation contract at the external HTTP boundary."""
+        from ._adapter_http import make_apply_preview
+
+        response_payload = make_apply_preview(
+            self.mgmt.adapter_device_id, diffs=diffs, outformat="cli" if outformat == "cli" else "native"
+        )
+        session = make_session(json_data=response_payload)
+        if error is not None:
+            session.request.side_effect = error
+        with (
+            patch(
+                "netbox_nso_plugin.adapter_client._resolve_config",
+                return_value={
+                    "url": "http://adapter.invalid",
+                    "token": "test-token",
+                    "verify_tls": True,
+                    "ca_cert_path": None,
+                    "timeout": 30,
+                },
+            ),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
+            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+            data = self.client.get(url, {"outformat": outformat}).json()
+        session.request.assert_called_once()
+        self.assertEqual(
+            session.request.call_args.kwargs["params"],
+            {"outformat": "cli" if outformat == "cli" else "native"},
+        )
+        return data
+
     def test_preview_lists_pending_changes(self):
         import json
 
@@ -2382,31 +2414,16 @@ class TestNSOApplyPreviewView(ViewTestBase):
     def test_preview_forwards_outformat_to_adapter_and_echoes_it(self):
         """?outformat=cli threads to the adapter apply-diff (NSO's NED-uniform +/- tree
         diff for the preview's diff-u panel) and is echoed so the JS picks the renderer."""
-        import json
-        from unittest.mock import patch
-
         self.mgmt.adapter_device_id = 77
         self.mgmt.save()
-        with patch(
-            "netbox_nso_plugin.adapter_client.get_apply_diff",
-            return_value={"outformat": "cli", "diffs": {"isis": "+ isis bfd"}},
-        ) as gad:
-            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
-            data = json.loads(self.client.get(url + "?outformat=cli").content)
-        gad.assert_called_once_with(77, outformat="cli")
+        data = self._get_diff_preview({"device_intent": "+ isis bfd"}, outformat="cli")
         self.assertEqual(data["outformat"], "cli")
-        self.assertEqual(data["device_diff"], {"isis": "+ isis bfd"})
+        self.assertEqual(data["device_diff"], {"device_intent": "+ isis bfd"})
 
     def test_preview_invalid_outformat_falls_back_to_native(self):
-        import json
-        from unittest.mock import patch
-
         self.mgmt.adapter_device_id = 78
         self.mgmt.save()
-        with patch("netbox_nso_plugin.adapter_client.get_apply_diff", return_value={"diffs": {}}) as gad:
-            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
-            data = json.loads(self.client.get(url + "?outformat=bogus").content)
-        gad.assert_called_once_with(78, outformat="native")
+        data = self._get_diff_preview({}, outformat="bogus")
         self.assertEqual(data["outformat"], "native")
 
     def test_preview_reports_whether_the_dry_run_actually_ran(self):
@@ -2416,26 +2433,14 @@ class TestNSOApplyPreviewView(ViewTestBase):
         confirm modal. When the dry-run THREW, both read the failure as reassurance. So the
         preview must say which case it is.
         """
-        import json
-        from unittest.mock import patch
-
-        from netbox_nso_plugin.adapter_client import AdapterError
-
         self.mgmt.adapter_device_id = 79
         self.mgmt.save()
-        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
-
-        with patch(
-            "netbox_nso_plugin.adapter_client.get_apply_diff",
-            side_effect=AdapterError("Adapter unreachable: nope", code="nso_unreachable"),
-        ):
-            failed = json.loads(self.client.get(url).content)
+        failed = self._get_diff_preview({}, error=requests.ConnectionError("external boundary unavailable"))
         self.assertEqual(failed["device_diff"], {})
         self.assertFalse(failed["diff_available"], "a dry-run that threw must not read as an empty diff")
         self.assertFalse(failed["nothing_pending"], "and it must never let Apply skip the confirm modal")
 
-        with patch("netbox_nso_plugin.adapter_client.get_apply_diff", return_value={"diffs": {}}):
-            clean = json.loads(self.client.get(url).content)
+        clean = self._get_diff_preview({})
         self.assertEqual(clean["device_diff"], {})
         self.assertTrue(clean["diff_available"], "a dry-run that ran and found nothing is a real answer")
 
@@ -2618,9 +2623,6 @@ class TestNSOApplyPreviewView(ViewTestBase):
         which the NSO dry-run shows. The preview must say nothing_pending=False so the
         confirm modal opens instead of auto-proceeding (the #11 redistribution case:
         routing_changes=[] total=0 while device_diff.bgp held the real adoption)."""
-        import json
-        from unittest.mock import patch
-
         from netbox_nso_plugin.models import NSORedistributionState
 
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
@@ -2634,27 +2636,17 @@ class TestNSOApplyPreviewView(ViewTestBase):
         )
         self.mgmt.adapter_device_id = 79
         self.mgmt.save()
-        with patch(
-            "netbox_nso_plugin.adapter_client.get_apply_diff",
-            return_value={"outformat": "cli", "diffs": {"bgp": "+ redistribute connected route-map RM-CONN"}},
-        ):
-            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
-            data = json.loads(self.client.get(url + "?outformat=cli").content)
+        data = self._get_diff_preview({"device_intent": "+ redistribute connected route-map RM-CONN"}, outformat="cli")
         self.assertEqual(data["total"], 0)  # nothing itemised — the row reads as settled
         self.assertFalse(data["nothing_pending"])  # but the transaction is real → confirm
 
     def test_preview_nothing_pending_in_steady_state(self):
         """No pending rows AND an empty dry-run diff → genuinely nothing to commit, the
         Apply button may proceed without the confirm modal (unchanged fast path)."""
-        import json
-        from unittest.mock import patch
-
         content_bulk_update(self.iface_state, status="in_sync", nso_value="")
         self.mgmt.adapter_device_id = 80
         self.mgmt.save()
-        with patch("netbox_nso_plugin.adapter_client.get_apply_diff", return_value={"diffs": {}}):
-            url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
-            data = json.loads(self.client.get(url).content)
+        data = self._get_diff_preview({})
         self.assertEqual(data["total"], 0)
         self.assertTrue(data["nothing_pending"])
 

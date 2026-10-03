@@ -589,8 +589,11 @@ def _append_deleted_overlay(deleted_overlays, row):
 def _collector_closure(instance):
     from django.db.models.deletion import Collector
 
+    from .management_lifecycle import collect_management_overlays
+
     collector = Collector(using=instance._state.db or "default", origin=instance)
     collector.collect([instance])
+    collect_management_overlays(collector, instance)
     root_identity = (instance._meta.label_lower, instance.pk)
     writes = []
     deleted_overlays = []
