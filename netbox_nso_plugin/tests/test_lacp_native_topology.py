@@ -107,7 +107,8 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             patcher.start()
             self.addCleanup(patcher.stop)
         reset_renderer_audit_rotation(self)
-        user = get_user_model().objects.create_superuser(username="lacp-topology-admin", password="test-password")
+        user = get_user_model().objects.create_superuser(username="lacp-topology-admin")
+        self.assertFalse(user.has_usable_password())
         self.client.force_login(user)
         with without_commit_drain(), transaction.atomic():
             self.device, self.management = make_managed("lacp-native-topology", self.adapter.device_id)

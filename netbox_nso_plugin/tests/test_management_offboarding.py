@@ -125,6 +125,10 @@ class TestManagementOffboarding(IntentPushResetMixin, TestCase):
         self.other_management.refresh_from_db()
         self.other_description.refresh_from_db()
         self.other_ip_state.refresh_from_db()
+        self.assertEqual(self.other_description.status, "accepted")
+        self.assertEqual(self.other_ip_state.status, "in_sync")
+        self.interface.refresh_from_db()
+        self.assertEqual(self.interface.description, "Keep this native value")
 
     def test_queryset_delete_removes_interface_overlays(self):
         content_update(self.other_ip_state, peer_state=self.ip_state)
