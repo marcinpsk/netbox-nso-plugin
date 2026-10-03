@@ -3474,7 +3474,7 @@ def _blocked_removals(jobs):
     orphans were re-accepted) masks a stale block, while other scopes' jobs and
     non-removal jobs never do. A blocked removal means the intent retraction is NOT
     enforced on the device, so the entry carries everything the operator needs to
-    resolve it: the orphan keys and the dry-run preview the adapter refused to commit.
+    resolve it: the scope, orphan keys and blocked job identity.
     """
     blocked = []
     seen_scopes = set()
@@ -3508,7 +3508,6 @@ def _blocked_removals(jobs):
                     "scope": scope,
                     "job_id": job.get("id"),
                     "orphans": orphans,
-                    "preview": detail.get("preview") or "",
                     "blocked_at": job.get("updated_at"),
                 }
             )
@@ -5852,11 +5851,10 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
 
         # (Model, category label, item fn, detail fn) — all read defensively.
-        # 5th element = the adapter apply-diff SCOPE the row's push rides (None =
-        # pushed out-of-band, no dry-run scope). The modal badges rows whose scope
-        # produced no delta as "no device change" — a row staged long ago can be
-        # already-satisfied on the device (the example-comm case). Redistribution rides
-        # its destination protocol's scope.
+        # The fifth element names the intent scope that receives the row's push.
+        # None marks a push outside the mirrored scopes. Redistribution uses its
+        # destination protocol's scope. The dry-run preview covers the whole device,
+        # so its delta cannot identify a separate change for each row or scope.
         preview_specs = [
             (NSOVLANState, "VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else "", "vlan"),
             (NSOSwitchportState, "Switchport", _iface, lambda r: r.mode or "", None),
@@ -5981,16 +5979,35 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         # Every consumer that reads meaning INTO emptiness (the per-row "no device change"
         # badge, the skip-the-confirm-modal gate) must therefore know which one it got.
         diff_available = False
+        generation_id = None
+        document_digest = None
+        diff_error = "preview_unavailable"
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
 
             try:
-                device_diff = (client.get_apply_diff(mgmt.adapter_device_id, outformat=outformat) or {}).get(
-                    "diffs", {}
+                preview = client.get_apply_diff(mgmt.adapter_device_id, outformat=outformat)
+                generation_id = preview["generation_id"]
+                document_digest = preview["document_digest"]
+                unavailable = (
+                    preview["diffs"]
+                    .get(client.APPLY_PREVIEW_KEY, "")
+                    .startswith(client.APPLY_PREVIEW_UNAVAILABLE_PREFIX)
                 )
-                diff_available = True
+                if not unavailable:
+                    device_diff = preview["diffs"]
+                    diff_available = True
+                    diff_error = None
+            except client.AdapterError as exc:
+                diff_error = (
+                    exc.code
+                    if exc.code in ("invalid_response", "nso_unreachable", "nso_timeout", "configuration_error")
+                    else "preview_unavailable"
+                )
+                logger.debug("apply-diff unavailable for device %s", device_pk)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("apply-diff unavailable for device %s: %s", device_pk, exc)
+                diff_error = "preview_unavailable"
+                logger.debug("apply-diff unavailable for device %s (%s)", device_pk, type(exc).__name__)
 
         # #107: the Apply button auto-proceeds (no confirm modal) only when NOTHING would
         # be committed. The itemised total alone cannot prove that: accepting an imported
@@ -6001,7 +6018,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         # confirmation — an unavailable adapter (device_diff={}) proves nothing, which is
         # why the gate demands diff_available and not merely an empty dict.
         total = len(changes) + len(routing_changes)
-        return JsonResponse(
+        response = JsonResponse(
             {
                 "auto_apply": auto_apply,
                 "changes": changes,
@@ -6012,8 +6029,13 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 "outformat": outformat,
                 "device_diff": device_diff,
                 "diff_available": diff_available,
+                "generation_id": generation_id,
+                "document_digest": document_digest,
+                "diff_error": diff_error,
             }
         )
+        response["Cache-Control"] = "no-store"
+        return response
 
 
 # ── IP auto-assignment operator actions ──────────────────────────────────
