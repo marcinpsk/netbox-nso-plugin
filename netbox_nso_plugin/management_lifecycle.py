@@ -12,6 +12,7 @@ from .renderer_writer import (
     planned_save,
     renderer_mirror_writes,
     renderer_writes,
+    renderer_writes_replanning_once,
 )
 
 ONBOARD_EVIDENCE_FIELDS = ("onboard_status", "onboard_steps", "onboard_error")
@@ -79,10 +80,12 @@ def _prepare_source_fence(instance, update_fields):
 
 
 def delete_management(instance):
-    """Delete one management row and its exact Collector closure through the writer."""
-    plan = RendererMutationPlan.build(deletes=(planned_delete(instance),))
-    context = renderer_writes if plan.changes_content else renderer_mirror_writes
-    with context(plan) as writer:
+    """Delete the exact Collector closure and retry one stale plan acquisition."""
+
+    def plan_delete():
+        return RendererMutationPlan.build(deletes=(planned_delete(instance),))
+
+    with renderer_writes_replanning_once(plan_delete) as (writer, _plan):
         return writer.delete(instance)
 
 
