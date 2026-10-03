@@ -2,8 +2,10 @@
 # Copyright (C) 2026 Marcin Zieba
 """Interface-IP reconciliation on large devices."""
 
+import os
 from ipaddress import IPv4Address
 from time import perf_counter
+from unittest import skipUnless
 
 from dcim.models import Interface
 from django.contrib.contenttypes.models import ContentType
@@ -41,11 +43,12 @@ class TestInterfaceIpScale(TestCase):
         started = perf_counter()
         with CaptureQueriesContext(connection) as queries:
             result = _reconcile_interface_ips(device, payload)
-        print("elapsed", perf_counter() - started, "queries", len(queries))
-        self.assertLess(len(queries), 4096)
+        elapsed = perf_counter() - started
+        self.assertLess(len(queries), 4096, f"128 overlay replacements: {elapsed:.2f}s, {len(queries)} queries")
         self.assertEqual(len(result), 128)
         self.assertEqual({row.vrf for row in result}, {"NEW"})
 
+    @skipUnless(os.environ.get("NSO_RUN_SCALE_TESTS") == "1", "Run with NSO_RUN_SCALE_TESTS=1 in the scale lane")
     def test_large_device_replacements_finish_inside_the_job_budget(self):
         self._assert_native_replacements(7400, 8800)
 
@@ -104,11 +107,11 @@ class TestInterfaceIpScale(TestCase):
                 pre_body=lambda: interface_ip_reconcile_plan(device, payload),
             )
         elapsed = perf_counter() - started
-        print(f"{address_count} native interface-IP replacements: {elapsed:.2f}s, {query_count} queries")
+        diagnostic = f"{address_count} native interface-IP replacements: {elapsed:.2f}s, {query_count} queries"
         self.assertEqual(outcome.disposition, "ran")
-        self.assertLess(elapsed, 600)
+        self.assertLess(elapsed, 600, diagnostic)
         if address_count == 128:
-            self.assertLess(query_count, 6500)
+            self.assertLess(query_count, 6500, diagnostic)
         self.assertEqual(len(context["interface_ips"]), address_count)
         self.assertEqual({row.vrf for row in context["interface_ips"]}, {"NEW"})
         self.assertEqual({row.status for row in context["interface_ips"]}, {"imported"})

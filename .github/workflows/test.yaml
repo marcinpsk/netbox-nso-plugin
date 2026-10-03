@@ -178,6 +178,21 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+      - name: Run the large interface-IP scale gate
+        if: matrix.shard == 1
+        timeout-minutes: 20
+        working-directory: netbox-nso-plugin
+        env:
+          NETBOX_CONFIGURATION: netbox.configuration
+          NETBOX_NSO_USE_REAL_NETBOX: "1"
+          NSO_RUN_SCALE_TESTS: "1"
+          PYTHONPATH: ${{ github.workspace }}/netbox/netbox
+          TEST_DB_NAME: test_netbox_nso_plugin_ci
+        run: |
+          python -u -m pytest -n 4 --no-cov --disable-warnings -o pythonpath=../netbox/netbox \
+            netbox_nso_plugin/tests/test_interface_ip_scale.py::TestInterfaceIpScale::test_large_device_replacements_finish_inside_the_job_budget \
+            --durations=1
+
   test-netbox-coverage:
     name: test-netbox (${{ matrix.environment.python-version }}, ${{ matrix.environment.netbox-version }})
     needs: test-netbox
