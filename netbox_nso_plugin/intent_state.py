@@ -1705,12 +1705,21 @@ def _interface_ip_source_rows(interface_ids) -> tuple[SourceRow, ...]:
     )
 
 
-def footprint_for_instance(instance, spec: RendererInputSpec | None = None) -> MutationFootprint:
+def footprint_for_instance(instance, spec: RendererInputSpec | None = None, *, stored_before=None) -> MutationFootprint:
     """Resolve one instance to its immutable pre-write footprint."""
+    if stored_before is not None and (
+        instance._meta.label_lower != "ipam.ipaddress"
+        or stored_before._meta.label_lower != instance._meta.label_lower
+        or stored_before.pk is None
+        or stored_before._state.adding
+        or stored_before.pk != instance.pk
+        or stored_before._state.db != instance._state.db
+    ):
+        raise IntentMutationProtocolError("a stored footprint pre-image must identify the persisted native IP")
     spec = spec or _REGISTRY[instance._meta.label_lower]
     if spec.shared_kind == "route_policy":
         return _route_policy_instance_footprint(instance, spec)
-    return _regular_instance_footprint(instance, spec)
+    return _regular_instance_footprint(instance, spec, stored_before=stored_before)
 
 
 def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
@@ -1743,10 +1752,15 @@ def _route_policy_instance_footprint(instance, spec) -> MutationFootprint:
     )
 
 
-def _regular_instance_footprint(instance, spec) -> MutationFootprint:
+def _regular_instance_footprint(instance, spec, *, stored_before=None) -> MutationFootprint:
     """Resolve non-policy rows and unattached route-policy leaf rows."""
     keys = spec.resolver(instance, spec)
-    prior_ip_keys, prior_ip_overlays = _previous_ip_address_targets(instance, spec)
+    prior_ip_keys, prior_ip_overlays = _previous_ip_address_targets(
+        instance,
+        spec,
+        stored_before=stored_before,
+        resolved_current_keys=keys if stored_before is instance else None,
+    )
     keys.update(prior_ip_keys)
     keys.update(_previous_device_targets(instance, spec))
     shared_keys = ()
@@ -1766,7 +1780,7 @@ def _regular_instance_footprint(instance, spec) -> MutationFootprint:
     row = (SourceRow(instance._meta.label_lower, instance.pk),)
     if instance._meta.label_lower == "ipam.ipaddress":
         assigned = getattr(instance, "assigned_object", None)
-        current = type(instance).objects.filter(pk=instance.pk).first() if instance.pk is not None else None
+        current = _ip_address_preimage(instance, stored_before)
         current_assigned = getattr(current, "assigned_object", None)
         row = (
             *row,
@@ -1886,14 +1900,25 @@ def _previous_device_targets(instance, spec) -> set[tuple[int, str]]:
     return spec.resolver(current, spec)
 
 
-def _previous_ip_address_targets(instance, spec):
+def _ip_address_preimage(instance, stored_before):
+    """Use the frozen native row when the exact planner already loaded it."""
+    if stored_before is not None:
+        return stored_before
+    return type(instance).objects.filter(pk=instance.pk).first() if instance.pk is not None else None
+
+
+def _previous_ip_address_targets(instance, spec, *, stored_before=None, resolved_current_keys=None):
     """Resolve the old device and overlay before a GenericForeignKey reassignment."""
     if instance._meta.label_lower != "ipam.ipaddress" or instance.pk is None:
         return set(), ()
-    current = type(instance).objects.filter(pk=instance.pk).first()
+    current = _ip_address_preimage(instance, stored_before)
     if current is None:
         return set(), ()
-    keys = spec.resolver(current, spec)
+    keys = (
+        set(resolved_current_keys)
+        if current is instance and resolved_current_keys is not None
+        else spec.resolver(current, spec)
+    )
     assigned = current.assigned_object
     if getattr(getattr(assigned, "_meta", None), "label_lower", None) != "dcim.interface":
         return keys, ()
