@@ -1455,9 +1455,19 @@ class TestGetApplyDiffOutformat(TestCase):
 
         from netbox_nso_plugin import adapter_client
 
-        with patch("netbox_nso_plugin.adapter_client._request", return_value={"diffs": {}}) as req:
+        from ._adapter_http import make_apply_preview
+
+        session = make_session(json_data=make_apply_preview(5, outformat="cli"))
+        with (
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=session),
+        ):
             adapter_client.get_apply_diff(5, outformat="cli")
-        req.assert_called_once_with("GET", "/api/v1/devices/5/actions/apply-diff", params={"outformat": "cli"})
+        session.request.assert_called_once()
+        self.assertEqual(
+            session.request.call_args.args, ("GET", "http://adapter.local/api/v1/devices/5/actions/apply-diff")
+        )
+        self.assertEqual(session.request.call_args.kwargs["params"], {"outformat": "cli"})
 
 
 class TestCaptureWireBody(unittest.TestCase):

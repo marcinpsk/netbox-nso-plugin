@@ -128,6 +128,8 @@ STORE_INCARNATION_HEADER = "X-Store-Incarnation"
 _GENERATION_PAGE_LIMIT = 500
 # One UI poll can hold at most 10,000 generation rows.
 _GENERATION_PAGE_MAX = 20
+APPLY_PREVIEW_KEY = "device_intent"
+APPLY_PREVIEW_UNAVAILABLE_PREFIX = "!! preview unavailable:"
 
 # Process-wide pooled session, reused across calls so connections to the (internal)
 # adapter are kept alive instead of a fresh TCP+TLS handshake per request. Keyed by the
@@ -885,13 +887,44 @@ def get_intent_summary(adapter_device_id: int) -> dict:
 
 
 def get_apply_diff(adapter_device_id: int, outformat: str = "native") -> dict:
-    """GET /api/v1/devices/{id}/actions/apply-diff → per-scope diff (NSO dry-run, no commit).
+    """Return the validated current whole-device generation preview.
 
     ``outformat="native"``: device-native rendering (CLI for cli NEDs, edit-config XML
     for netconf NEDs). ``outformat="cli"``: NSO's NED-uniform ``+``/``-`` tree diff —
     what the apply-preview renders through the vendored diff2html.
     """
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff", params={"outformat": outformat})
+    preview = _document(
+        _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff", params={"outformat": outformat}),
+        "Apply preview",
+    )
+    expected_fields = {"device_id", "outformat", "diffs", "generation_id", "document_digest"}
+    if (
+        set(preview) != expected_fields
+        or type(preview["device_id"]) is not int
+        or preview["device_id"] != adapter_device_id
+        or preview["outformat"] != outformat
+    ):
+        raise AdapterError("Adapter returned a malformed Apply preview envelope.", code="invalid_response")
+    diffs = preview["diffs"]
+    if (
+        not isinstance(diffs, dict)
+        or set(diffs) not in (set(), {APPLY_PREVIEW_KEY})
+        or any(not isinstance(delta, str) for delta in diffs.values())
+    ):
+        raise AdapterError("Adapter returned a malformed whole-device Apply preview.", code="invalid_response")
+    generation_id = preview["generation_id"]
+    digest = preview["document_digest"]
+    valid_identity = (
+        type(generation_id) is int
+        and generation_id > 0
+        and isinstance(digest, str)
+        and len(digest) == 64
+        and all(char in "0123456789abcdef" for char in digest)
+    )
+    unavailable = diffs.get(APPLY_PREVIEW_KEY, "").startswith(APPLY_PREVIEW_UNAVAILABLE_PREFIX)
+    if not valid_identity and not (unavailable and generation_id is None and digest is None):
+        raise AdapterError("Adapter returned a malformed Apply preview identity.", code="invalid_response")
+    return preview
 
 
 # READSEM S4 D4/R2-4: per-adapter capability memo for /interfaces-doc. A route-level 404
