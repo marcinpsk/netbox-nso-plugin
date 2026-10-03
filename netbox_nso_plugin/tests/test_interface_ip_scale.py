@@ -8,6 +8,7 @@ from time import perf_counter
 from unittest import skipUnless
 
 from dcim.models import Interface
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection
 from django.test import TestCase
@@ -107,7 +108,10 @@ class TestInterfaceIpScale(TestCase):
                 pre_body=lambda: interface_ip_reconcile_plan(device, payload),
             )
         elapsed = perf_counter() - started
-        diagnostic = f"{address_count} native interface-IP replacements: {elapsed:.2f}s, {query_count} queries"
+        diagnostic = (
+            f"NetBox {settings.VERSION}: {address_count} native interface-IP replacements: "
+            f"{elapsed:.2f}s, {query_count} queries"
+        )
         self.assertEqual(outcome.disposition, "ran")
         self.assertLess(elapsed, 600, diagnostic)
         if address_count == 128:

@@ -32,11 +32,11 @@ jobs:
       matrix:
         environment: &netbox-environments
           - python-version: "3.12"
-            netbox-version: "v4.6.10"
-            netbox-ref: "560da79ea1213a0b8bbc9ecf4ac03714fa2071d7"
+            netbox-version: &netbox-version "v4.7.0"
+            netbox-ref: &netbox-ref "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
           - python-version: "3.13"
-            netbox-version: "v4.7.0"
-            netbox-ref: "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
+            netbox-version: *netbox-version
+            netbox-ref: *netbox-ref
         shard: [1, 2]
 
     services:
