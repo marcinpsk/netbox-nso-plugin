@@ -1950,3 +1950,30 @@ class TestOwnershipActionRecheck(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 mark_and=True,
             ).exists()
         )
+
+    def test_offboarding_after_lacp_retire_plan_skips_the_stale_action(self):
+        from dcim.models import Interface
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOLACPBundleState, NSOLACPMemberState
+        from netbox_nso_plugin.ownership_planner import OwnershipAction
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        bundle = Interface.objects.create(device=self.device, name="Port-channel19", type="lag")
+        member = Interface.objects.create(device=self.device, name="Ethernet11", type="1000base-t", lag=bundle)
+        NSOLACPBundleState.objects.create(
+            management=self.management, interface=bundle, lag_id=19, status="imported", observed_members=[member.name]
+        )
+        original = acquire_overlay(NSOLACPMemberState, management=self.management, interface=member, status="accepted")
+        with suppress_intent_push():
+            NSOLACPMemberState.objects.filter(pk=original.pk).delete()
+
+        self._run_after_plan(
+            planner_name="_manifest_lifecycle_actions",
+            scope="lacp",
+            matches_action=lambda entry: entry[-1] is OwnershipAction.RETIRE,
+            accept=self.management.delete,
+        )
+
+        self.assertFalse(NSODeviceManagement.objects.filter(device=self.device).exists())
+        member.refresh_from_db()
+        self.assertEqual(member.lag_id, bundle.pk)

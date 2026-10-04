@@ -51,6 +51,51 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("LACP grid", () => {
+  it.each([undefined, null, "Ethernet1", { name: "Ethernet1" }, 1])(
+    "renders members when observed membership is %j",
+    (observedMembers) => {
+      const row = {
+        bundle: { name: "ae0", url: "/dcim/interfaces/20/" },
+        members: [],
+        observed_members: observedMembers,
+      };
+      const table = mount(row);
+      const members = table.config.columns.find((column) => column.field === "_members").formatter(cell(row));
+
+      expect(members.textContent).toContain("Device members: ");
+    },
+  );
+
+  it("renders reported member names and device absence", () => {
+    const row = {
+      bundle: { name: "ae0", url: "/dcim/interfaces/20/" },
+      members: [],
+      observed_members: ["Ethernet1", "Ethernet2"],
+    };
+    const table = mount(row);
+    const formatter = table.config.columns.find((column) => column.field === "_members").formatter;
+
+    expect(formatter(cell(row)).textContent).toContain("Device members: Ethernet1, Ethernet2");
+    row.device_present = false;
+    expect(formatter(cell(row)).textContent).toContain("Not reported by the device");
+  });
+
+  it.each([null, "Ethernet1", { name: "Ethernet1" }, 1])(
+    "formats a refreshed row when observed membership is %j",
+    (observedMembers) => {
+      const row = {
+        bundle: { name: "ae0", url: "/dcim/interfaces/20/" },
+        members: [],
+        observed_members: [],
+      };
+      const table = mount(row);
+      row.observed_members = observedMembers;
+      const members = table.config.columns.find((column) => column.field === "_members").formatter(cell(row));
+
+      expect(members.textContent).toContain("Device members: ");
+    },
+  );
+
   it("compacts bundle parameters and keeps system identity read-only", () => {
     const row = {
       bundle: { name: "Port-channel10", url: "/dcim/interfaces/10/" },

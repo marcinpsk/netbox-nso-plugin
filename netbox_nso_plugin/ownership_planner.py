@@ -2000,7 +2000,9 @@ def _retire_manifest(manifest, *, expected_action, requested) -> bool:
         from .renderer_writer import RendererMutationPlan, renderer_writes_replanning_once
         from .signals import suppress_intent_push
 
-        management = NSODeviceManagement.objects.get(device_id=manifest.device_id)
+        management = NSODeviceManagement.objects.filter(device_id=manifest.device_id).first()
+        if management is None:
+            return False
 
         def plan_fn():
             expected = topology_snapshot(management)

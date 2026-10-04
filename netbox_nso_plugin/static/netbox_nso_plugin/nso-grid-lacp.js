@@ -126,7 +126,7 @@
     observed.className = "small text-muted";
     observed.textContent = row.device_present === false
       ? "Not reported by the device"
-      : "Device members: " + (row.observed_members || []).join(", ");
+      : "Device members: " + (Array.isArray(row.observed_members) ? row.observed_members : []).join(", ");
     wrap.appendChild(observed);
     return wrap;
   }
@@ -146,7 +146,7 @@
           row._parameters = [row.min_links, row.system_priority, row.system_id, row.timer, row.admin_key].join(" ");
           row._members = (row.members || []).map(function (member) {
             return [member.interface.name, member.mode, member.port_priority].join(" ");
-          }).join(" ") + " " + (row.observed_members || []).join(" ");
+          }).join(" ") + " " + (Array.isArray(row.observed_members) ? row.observed_members : []).join(" ");
           return row;
         });
       },
