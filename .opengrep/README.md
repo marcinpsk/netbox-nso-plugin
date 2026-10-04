@@ -54,7 +54,7 @@ References checked on 2026-09-12:
 
 | Issue class | Mechanical check | Limit |
 | --- | --- | --- |
-| Empty fallback used as array validation before joining observed LACP members | `nso-observed-members-join-without-array-check` | JavaScript calls on `(row.observed_members || [])` and `(row.observed_members ?? [])`. The rule accepts `Array.isArray` normalization and joins of other fields. Aliases and direct joins without a fallback are outside this call-shape check. |
+| Empty fallback used as array validation before joining observed LACP members | `nso-observed-members-join-without-array-check` | JavaScript calls on `(row.observed_members \|\| [])` and `(row.observed_members ?? [])`. The rule accepts `Array.isArray` normalization and joins of other fields. Aliases and direct joins without a fallback are outside this call-shape check. |
 | Push scheduled while suppression is active | `nso-push-inside-suppression` | Direct or module-qualified calls (`signals.suppress_intent_push()`) in a suppression context. It does not follow helper calls. |
 | Assertion compares a value with itself | `nso-tautological-assertion` | Literal assertion shapes, not proof that every assertion reaches the intended path. |
 | Test `setUp` skips the intent-push reset | `nso-intent-push-reset-setup-chain` | A `setUp` in a class that lists `IntentPushResetMixin` as a direct base must call `super().setUp()`. Inherited mixins and module-qualified base names are not followed. |

@@ -11,10 +11,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import yaml
 from django.test import SimpleTestCase
+from markdown_it import MarkdownIt
 
 _RULES_PATH = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
 _ROOT = _RULES_PATH.parents[1]
@@ -178,6 +180,19 @@ class TestReviewPatternCheckerPaths(SimpleTestCase):
 
 
 class TestOpenGrepRuleStructure(SimpleTestCase):
+    def test_observed_members_coverage_table_preserves_the_complete_limits(self):
+        lines = (_RULES_PATH.parent / "README.md").read_text(encoding="utf-8").splitlines()
+        row = next(line for line in lines if "`nso-observed-members-join-without-array-check`" in line)
+        source = "| Issue class | Mechanical check | Limit |\n| --- | --- | --- |\n" + row
+        table = ET.fromstring(MarkdownIt("commonmark").enable("table").render(source))
+        cells = table.findall("./tbody/tr/td")
+
+        self.assertEqual(len(cells), 3)
+        limits = "".join(cells[2].itertext())
+        self.assertIn("(row.observed_members || [])", limits)
+        self.assertIn("(row.observed_members ?? [])", limits)
+        self.assertIn("outside this call-shape check.", limits)
+
     def test_rule_roots_resolve_or_have_module_qualified_variants(self):
         violations = _rule_violations(_RULES_PATH)
 
