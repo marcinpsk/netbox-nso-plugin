@@ -1284,7 +1284,9 @@ class RendererWriter:
         label = instance._meta.label_lower
         indexes = list(self._write_indexes[("save", label, instance.pk)]) if instance.pk is not None else []
         for names in self._creation_fields[label]:
-            key = tuple((name, _normal(getattr(instance, name))) for name in names)
+            key = tuple(
+                (name, freeze_field_value(instance._meta.get_field(name), getattr(instance, name))) for name in names
+            )
             indexes.extend(self._creation_indexes[(label, key)])
         indexes.extend(self._reference_creation_indexes[label])
         return sorted(indexes)
