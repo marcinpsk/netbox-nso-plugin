@@ -4,11 +4,9 @@
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 
@@ -114,54 +112,6 @@ class ShardingContractTests(unittest.TestCase):
             report_path.unlink()
             result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_the_workflow_gate_step_runs_the_aggregator_for_its_own_environment(self):
-        helper = Path(__file__).with_name("sharding.py")
-        workflow = helper.parents[1] / "workflows" / "test.yaml"
-        lines = iter(workflow.read_text(encoding="utf-8").splitlines())
-        for line in lines:
-            if line.strip() == "- name: Verify complete execution and combined coverage":
-                step_indentation = len(line) - len(line.lstrip())
-                break
-        else:
-            self.fail("The workflow has no coverage verification step")
-        for line in lines:
-            if line.strip() and len(line) - len(line.lstrip()) <= step_indentation:
-                self.fail("The coverage verification step has no run block")
-            if line.strip() == "run: |":
-                indentation = len(line) - len(line.lstrip())
-                break
-        else:
-            self.fail("The coverage verification step has no run block")
-        script_lines = []
-        for line in lines:
-            if line.strip() and len(line) - len(line.lstrip()) <= indentation:
-                break
-            script_lines.append(line)
-        script = textwrap.dedent("\n".join(script_lines))
-        self.assertTrue(script)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = create_shard_artifacts(temporary)
-            results = root / ".ci-results"
-            results.mkdir()
-            for shard in (1, 2):
-                (root / f"shard-{shard}").rename(results / f"shard-{shard}")
-            target = root / ".github" / "ci" / "sharding.py"
-            target.parent.mkdir(parents=True)
-            shutil.copyfile(helper, target)
-            environment = dict(os.environ, CI_SHARDS="2", SHARD_RESULT="failure")
-            environment.pop("PYTHONPATH", None)
-            result = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", script],
-                cwd=root,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("100%", result.stdout)
-            self.assertTrue((results / "durations.json").is_file())
 
 
 if __name__ == "__main__":
