@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import copy
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -38,6 +39,29 @@ from .ownership_grants import OwnershipGrant, validate_acquisition
 
 class IntentPlanStaleError(IntentMutationProtocolError):
     """A renderer input row changed after its exact plan was frozen."""
+
+
+@dataclass(frozen=True)
+class FrozenJSON:
+    """Retain the exact JSON shape without mutable references."""
+
+    serialized: str
+
+
+def freeze_field_value(field, value):
+    """Freeze stored field values with their declared JSON codec."""
+    if field.get_internal_type() == "JSONField":
+        return FrozenJSON(json.dumps(value, cls=field.encoder, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return _normal(value)
+
+
+def thaw_field_value(field, value):
+    """Restore a frozen field without guessing its shape from a default."""
+    if field.get_internal_type() == "JSONField":
+        if not isinstance(value, FrozenJSON):
+            raise IntentMutationProtocolError("JSON fields require a lossless frozen value")
+        return json.loads(value.serialized, cls=field.decoder)
+    return value
 
 
 @dataclass(frozen=True)
@@ -159,7 +183,7 @@ def planned_set_update(queryset, **values) -> RendererSetUpdate:
         sorted(
             (
                 model._meta.get_field(name).attname,
-                _normal(value),
+                freeze_field_value(model._meta.get_field(name), value),
             )
             for name, value in values.items()
         )
@@ -353,7 +377,7 @@ def _planned_field_value(instance, field, creation_refs, reference_fields=()):
         reference = creation_refs.get(id(related))
         if reference is not None:
             return reference
-    return _normal(getattr(instance, field.attname))
+    return freeze_field_value(field, getattr(instance, field.attname))
 
 
 def _field_values(instance, update_fields, creation_refs=None, reference_fields=()):
@@ -643,6 +667,7 @@ def _collector_closure(instance):
             model, materialized = _materialize_field_update_rows(rows)
             if model is None:
                 continue
+            frozen_value = freeze_field_value(field, value)
             for row in materialized:
                 writes.append(
                     RendererWrite(
@@ -650,12 +675,12 @@ def _collector_closure(instance):
                         model_label=model._meta.label_lower,
                         pk=row.pk,
                         update_fields=(field.name,),
-                        values=((field.attname, _normal(value)),),
+                        values=((field.attname, frozen_value),),
                         cascade=True,
                     )
                 )
                 after = copy.copy(row)
-                setattr(after, field.attname, _normal(value))
+                setattr(after, field.attname, thaw_field_value(field, frozen_value))
                 if field.is_relation and field.is_cached(after):
                     field.delete_cached_value(after)
                 record_change(row, after)
@@ -712,7 +737,7 @@ def _plan_delete(proposed: RendererDelete):
             elif write.operation == "set_update":
                 after = copy.copy(descendant)
                 for attname, value in write.values:
-                    setattr(after, attname, value)
+                    setattr(after, attname, thaw_field_value(descendant._meta.get_field(attname), value))
                 footprints.extend(
                     (
                         footprint_for_instance(descendant, descendant_spec),
@@ -758,7 +783,7 @@ def _plan_set_update(proposed: RendererSetUpdate, *, grant=None):
     for before in selected_rows:
         after = copy.copy(before)
         for attname, value in values.items():
-            setattr(after, attname, value)
+            setattr(after, attname, thaw_field_value(model._meta.get_field(attname), value))
         validate_acquisition(before, after, grant)
         dependency_footprint, dependency_changed = _dependencies(before, after, spec)
         footprints.extend((footprint_for_instance(before, spec), footprint_for_instance(after, spec)))
@@ -981,7 +1006,13 @@ class RendererWriter:
             return False
         operation = self.plan.write_set[self._active_operation]
         normalized = tuple(
-            sorted((queryset.model._meta.get_field(name).attname, _normal(value)) for name, value in values.items())
+            sorted(
+                (
+                    queryset.model._meta.get_field(name).attname,
+                    freeze_field_value(queryset.model._meta.get_field(name), value),
+                )
+                for name, value in values.items()
+            )
         )
         return (
             operation.operation == "set_update"
@@ -1004,7 +1035,7 @@ class RendererWriter:
                     return self._reference_matches(expected, related)
             related = self._resolve_reference(expected)
             return related is not None and getattr(instance, attname) == related.pk
-        return _normal(getattr(instance, attname)) == expected
+        return freeze_field_value(instance._meta.get_field(attname), getattr(instance, attname)) == expected
 
     def _fields_match(self, expected_values, instance):
         return all(self._value_matches(instance, attname, expected) for attname, expected in expected_values)
@@ -1074,7 +1105,7 @@ class RendererWriter:
                 if related is None:
                     return None
                 expected = related.pk
-            filters[attname] = expected
+            filters[attname] = thaw_field_value(model._meta.get_field(attname), expected)
         return model._default_manager.filter(**filters).first()
 
     def _resolve_creation(self, write):
@@ -1186,7 +1217,15 @@ class RendererWriter:
         index = self._find_save(instance, update_fields, force_insert)
         write = self.plan.write_set[index]
         previous_binding = (
-            _owned_binding(type(instance)(pk=write.pk, **dict(write.before_values)))
+            _owned_binding(
+                type(instance)(
+                    pk=write.pk,
+                    **{
+                        name: thaw_field_value(instance._meta.get_field(name), value)
+                        for name, value in write.before_values
+                    },
+                )
+            )
             if write.before_values and write.model_label in OVERLAY_MODEL_RANKS
             else None
         )
@@ -1373,7 +1412,10 @@ class RendererWriter:
             None,
         )
         normalized = tuple(
-            sorted((model._meta.get_field(name).attname, _normal(value)) for name, value in values.items())
+            sorted(
+                (model._meta.get_field(name).attname, freeze_field_value(model._meta.get_field(name), value))
+                for name, value in values.items()
+            )
         )
         if (
             index is None

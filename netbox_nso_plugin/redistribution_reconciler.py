@@ -396,7 +396,7 @@ def _frozen_redistribution_operations(plan):
     from netbox_routing.models import Redistribution
 
     from .models import NSORedistributionState
-    from .renderer_writer import RendererCreationRef
+    from .renderer_writer import RendererCreationRef, thaw_field_value
 
     models = {model._meta.label_lower: model for model in (Redistribution, NSORedistributionState)}
     creations = {}
@@ -405,21 +405,23 @@ def _frozen_redistribution_operations(plan):
             continue
         model = models[write.model_label]
         values = {
-            name: creations[value].pk if isinstance(value, RendererCreationRef) else value
+            name: creations[value].pk
+            if isinstance(value, RendererCreationRef)
+            else thaw_field_value(model._meta.get_field(name), value)
             for name, value in write.values
         }
         current = model.objects.filter(pk=write.pk).first() if write.pk is not None else None
         if write.force_insert:
             natural_key = {
-                name: creations[value].pk if isinstance(value, RendererCreationRef) else value
+                name: creations[value].pk
+                if isinstance(value, RendererCreationRef)
+                else thaw_field_value(model._meta.get_field(name), value)
                 for name, value in write.natural_key
             }
             current = model.objects.filter(**natural_key).first()
         instance = copy.copy(current) if current is not None else model(pk=write.pk)
         if not write.force_insert or current is None:
             for field_name, value in values.items():
-                if model._meta.get_field(field_name).get_internal_type() == "JSONField":
-                    value = dict(value)
                 setattr(instance, field_name, value)
         if write.force_insert:
             reference = RendererCreationRef(model_label=write.model_label, natural_key=write.natural_key)

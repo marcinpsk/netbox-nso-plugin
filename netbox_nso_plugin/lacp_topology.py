@@ -237,6 +237,8 @@ def execute_frozen_operations(writer, model_labels):
     """Execute only the native and overlay operations frozen by the active plan."""
     from django.apps import apps
 
+    from .renderer_writer import thaw_field_value
+
     for write in writer.plan.write_set:
         if write.model_label not in model_labels or write.cascade:
             continue
@@ -247,9 +249,6 @@ def execute_frozen_operations(writer, model_labels):
             continue
         candidate = copy.copy(current) if current is not None else model(pk=write.pk)
         for name, value in write.values:
-            field = model._meta.get_field(name)
-            if field.get_internal_type() == "JSONField":
-                value = list(value) if isinstance(field.default(), list) else dict(value)
-            setattr(candidate, name, value)
+            setattr(candidate, name, thaw_field_value(model._meta.get_field(name), value))
         if not (writer.consume_existing_creation(candidate) or writer.consume_applied_save(candidate)):
             writer.save(candidate, update_fields=write.update_fields, force_insert=write.force_insert)

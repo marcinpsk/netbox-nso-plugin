@@ -251,6 +251,7 @@ def _repair_candidates(device_id, candidates, management):
         for scope in repaired:
             outbox.bump_intent_revision(device_id, scope)
 
+        from .renderer_writer import thaw_field_value
         from .signals import suppress_intent_push
 
         plans = {scope: _repair_plan(device_id, scope) for scope in repaired}
@@ -262,7 +263,7 @@ def _repair_candidates(device_id, candidates, management):
                         model = apps.get_model(write.model_label)
                         candidate = model.objects.get(pk=write.pk)
                         for attname, value in write.values:
-                            setattr(candidate, attname, value)
+                            setattr(candidate, attname, thaw_field_value(model._meta.get_field(attname), value))
                         writer.save(candidate, update_fields=write.update_fields)
 
         verified_at = timezone.now()
