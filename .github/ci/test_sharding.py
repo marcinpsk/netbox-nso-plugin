@@ -75,6 +75,16 @@ def create_shard_artifacts(temporary):
 
 
 class ShardingContractTests(unittest.TestCase):
+    def test_pull_request_workflows_target_main_and_develop(self):
+        for name in ("test.yaml", "js-test.yaml"):
+            workflow = Path(__file__).parents[1] / "workflows" / name
+            trigger = (
+                workflow.read_text(encoding="utf-8").split("  pull_request:\n", 1)[1].split("\nconcurrency:", 1)[0]
+            )
+            branches = [line.strip()[2:].strip("'\"") for line in trigger.splitlines() if line.strip().startswith("- ")]
+            with self.subTest(workflow=name):
+                self.assertEqual(branches, ["main", "develop"])
+
     def test_complete_shards_pass_and_incomplete_or_duplicate_runs_fail(self):
         helper = Path(__file__).with_name("sharding.py")
         with tempfile.TemporaryDirectory() as temporary:
