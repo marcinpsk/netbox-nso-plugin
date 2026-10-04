@@ -118,3 +118,21 @@ class FrozenJSONWriteTests(IntentPushResetMixin, TestCase):
                 writer.set_update(Interface, plan.write_set[0], custom_field_data={"metadata": []})
         self.interface.refresh_from_db()
         self.assertEqual(self.interface.custom_field_data, {})
+
+    def test_creation_lookup_preserves_json_natural_key_values(self):
+        candidate = Interface(
+            device=self.device,
+            name="Ethernet2",
+            type="1000base-t",
+            custom_field_data=self._nested_value(),
+        )
+        candidate._site = self.device.site
+        candidate._location = self.device.location
+        candidate._rack = self.device.rack
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(candidate, force_insert=True, natural_key=("device", "name", "custom_field_data")),)
+        )
+        with without_commit_drain(), renderer_mirror_writes(plan) as writer:
+            writer.save(candidate, force_insert=True)
+        stored = Interface.objects.get(device=self.device, name="Ethernet2")
+        self.assertEqual(stored.custom_field_data, self._nested_value())

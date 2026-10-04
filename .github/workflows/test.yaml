@@ -32,11 +32,11 @@ jobs:
       matrix:
         environment: &netbox-environments
           - python-version: "3.12"
-            netbox-version: "v4.6.10"
-            netbox-ref: "560da79ea1213a0b8bbc9ecf4ac03714fa2071d7"
+            netbox-version: &netbox-version "v4.7.0"
+            netbox-ref: &netbox-ref "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
           - python-version: "3.13"
-            netbox-version: "v4.7.0"
-            netbox-ref: "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
+            netbox-version: *netbox-version
+            netbox-ref: *netbox-ref
         shard: [1, 2]
 
     services:
@@ -106,11 +106,6 @@ jobs:
           # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models.
           # Pinned to a commit SHA (not the mutable feature/integration branch) so CI is
           # reproducible and a fork push cannot silently change what this repo tests against.
-          # This SHA is feature/integration's tip and provides the netbox_routing.helpers.isis
-          # module (NET_RE, auth_pair_errors) that views.py imports, migration
-          # 0039_bgprouter_router_id (BGPRouter.router_id, BGPPeer.source/local_as/ttl,
-          # IS-IS FRR + SRv6 prefix-SID), and the static-route form/serializer refusals
-          # test_static_route_refusals.py exercises.
           uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@dca9ed1a4a972e9dfeba95dbed10247d46eba405"
           uv pip install --system -e .
 
@@ -176,6 +171,21 @@ jobs:
           path: netbox-nso-plugin/.ci-results/
           include-hidden-files: true
           if-no-files-found: error
+
+      - name: Run the large interface-IP scale gate
+        if: matrix.shard == 1
+        timeout-minutes: 20
+        working-directory: netbox-nso-plugin
+        env:
+          NETBOX_CONFIGURATION: netbox.configuration
+          NETBOX_NSO_USE_REAL_NETBOX: "1"
+          NSO_RUN_SCALE_TESTS: "1"
+          PYTHONPATH: ${{ github.workspace }}/netbox/netbox
+          TEST_DB_NAME: test_netbox_nso_plugin_ci
+        run: |
+          python -u -m pytest -n 4 --no-cov --disable-warnings -o pythonpath=../netbox/netbox \
+            netbox_nso_plugin/tests/test_interface_ip_scale.py::TestInterfaceIpScale::test_large_device_replacements_finish_inside_the_job_budget \
+            --durations=1
 
   test-netbox-coverage:
     name: test-netbox (${{ matrix.environment.python-version }}, ${{ matrix.environment.netbox-version }})
