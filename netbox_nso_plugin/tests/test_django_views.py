@@ -5412,7 +5412,7 @@ class TestOverlayFieldEditView(ViewTestBase):
         response = self.client.post(self._url("static_route", row.pk), {"metric": "25"})
 
         self.assertEqual(response.status_code, 400, response.content)
-        self.assertIn("does not qualify", response.json()["message"])
+        self.assertEqual(response.json()["message"], "The static_route binding does not qualify for ownership.")
         native.refresh_from_db()
         row.refresh_from_db()
         self.assertEqual(native.metric, 10)

@@ -179,6 +179,31 @@ class TestEnableIgpForRole(IntentPushResetMixin, TestCase):
             maintain_manifest(candidate)
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.dev_a.pk, scope="ospf").exists())
 
+    def test_foreign_ospf_binding_returns_public_refusal_without_saving(self):
+        from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
+
+        role = NSOLinkRole.objects.create(
+            name="ospf-refusal", slug="ospf-refusal", igp="ospf", ospf_process_id="1", ospf_area="0"
+        )
+        foreign_management = NSODeviceManagement.objects.create(
+            device=self.dev_b, nso_instance=self.inst, nso_device_name="lg-b", adapter_device_id=self.dev_b.pk
+        )
+        native = OSPFInterface.objects.create(
+            interface=self.if_a,
+            instance=OSPFInstance.objects.create(device=self.dev_a, name="1", process_id="1", router_id="198.18.0.1"),
+            area=OSPFArea.objects.create(area_id="0", area_type="standard"),
+        )
+
+        result = enable_igp_for_role(self.if_a, role, push=False, mgmt=foreign_management)
+
+        self.assertEqual(result["error"], "The ospf binding does not qualify for ownership.")
+        self.assertFalse(result["enabled"])
+        self.assertFalse(
+            NSOOSPFInterfaceState.objects.filter(management=foreign_management, interface=self.if_a).exists()
+        )
+        native.refresh_from_db()
+        self.assertEqual(native.instance.device_id, self.dev_a.pk)
+
     def test_igp_none_is_noop(self):
         role = NSOLinkRole.objects.create(
             name="g-noigp",

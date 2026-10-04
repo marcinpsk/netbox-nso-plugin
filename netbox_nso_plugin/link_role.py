@@ -265,7 +265,7 @@ def enable_igp_for_role(interface, role, push=True, *, mgmt=None) -> dict:
     try:
         require_qualifying_ownership(state)
     except OwnershipNotQualified as exc:
-        result["error"] = str(exc)
+        result["error"] = exc.public_message
         return result
     fields = None if current is None else tuple(values)
     plan = RendererMutationPlan.build(

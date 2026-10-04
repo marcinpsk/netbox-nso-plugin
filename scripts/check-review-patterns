@@ -15,16 +15,22 @@ case "$mode" in
       shopt -s globstar nullglob
       set -- netbox_nso_plugin netbox_nso_plugin/tests/**/*.py .github/ci/**/*.py conftest.py isolated_test_settings.py contract_tests/**/*.py netbox_stubs/**/*.py .devcontainer/**/*.py
     fi
-    "$scan_bin" scan --no-git-ignore --include '*.py' --max-target-bytes 0 --config .opengrep/nso-rules.yaml --error -- "$@"
-    python3 .opengrep/check-adapter-error-continue.py scan ${explicit_paths[@]+"${explicit_paths[@]}"}
-    python3 .opengrep/check-resume-failure-guidance.py scan ${explicit_paths[@]+"${explicit_paths[@]}"}
-    python3 .opengrep/check-vlan-identity-flow.py scan ${explicit_paths[@]+"${explicit_paths[@]}"}
+    "$scan_bin" scan --no-git-ignore --include '*.py' --include '*.js' --max-target-bytes 0 --config .opengrep/nso-rules.yaml --error -- "$@"
+    python_paths=()
+    for path in "${explicit_paths[@]}"; do
+      if [[ -d "$path" || "$path" != *.js ]]; then python_paths+=("$path"); fi
+    done
+    if (( ${#explicit_paths[@]} && ! ${#python_paths[@]} )); then exit 0; fi
+    python3 .opengrep/check-adapter-error-continue.py scan ${python_paths[@]+"${python_paths[@]}"}
+    python3 .opengrep/check-resume-failure-guidance.py scan ${python_paths[@]+"${python_paths[@]}"}
+    python3 .opengrep/check-vlan-identity-flow.py scan ${python_paths[@]+"${python_paths[@]}"}
     ;;
   test)
     if (( $# )); then echo "test does not accept arguments" >&2; exit 2; fi
     staging_dir="$(mktemp -d)"
     trap 'rm -rf "$staging_dir"' EXIT
     cp .opengrep/nso-rules.yaml "$staging_dir/review-patterns.yaml"
+    cp .opengrep/tests/review-patterns.js "$staging_dir/review-patterns.js"
     sed -e 's/# ruleid: nso-vlan-identity-flow/# ast-finding: nso-vlan-identity-flow/' \
       -e 's/# ok: nso-vlan-identity-flow/# ast-clean: nso-vlan-identity-flow/' \
       -e 's/, nso-vlan-identity-flow//g' \

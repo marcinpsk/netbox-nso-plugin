@@ -2,6 +2,7 @@
 /* SPDX-FileCopyrightText: 2026 Marcin Zieba <marcinpsk@gmail.com> */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createServer } from "node:http";
 import "../../static/netbox_nso_plugin/nso-grid.js";
 import "../../static/netbox_nso_plugin/nso-grid-lacp.js";
 
@@ -20,13 +21,16 @@ class FakeTabulator {
   toggleColumn() {}
   setFilter() {}
   clearFilter() {}
+  replaceData(rows) {
+    this.config.data = rows;
+  }
 }
 FakeTabulator.instances = [];
 
-function mount(row) {
+function mount(row, jsonUrl = "/lacp.json") {
   const root = document.createElement("div");
   root.className = "nso-grid nso-lacp";
-  root.dataset.jsonUrl = "/lacp.json";
+  root.dataset.jsonUrl = jsonUrl;
   root.innerHTML = '<div class="nso-grid-msg"></div><div class="nso-grid-table"></div>';
   const payload = document.createElement("script");
   payload.id = "nso-lacp-data";
@@ -62,7 +66,8 @@ describe("LACP grid", () => {
       const table = mount(row);
       const members = table.config.columns.find((column) => column.field === "_members").formatter(cell(row));
 
-      expect(members.textContent).toContain("Device members: ");
+      expect(members.textContent).toBe("\u2014Device members: ");
+      expect(table.config.data[0]._members).toBe(" ");
     },
   );
 
@@ -76,23 +81,38 @@ describe("LACP grid", () => {
     const formatter = table.config.columns.find((column) => column.field === "_members").formatter;
 
     expect(formatter(cell(row)).textContent).toContain("Device members: Ethernet1, Ethernet2");
+    expect(table.config.data[0]._members).toBe(" Ethernet1 Ethernet2");
     row.device_present = false;
     expect(formatter(cell(row)).textContent).toContain("Not reported by the device");
   });
 
   it.each([null, "Ethernet1", { name: "Ethernet1" }, 1])(
     "formats a refreshed row when observed membership is %j",
-    (observedMembers) => {
+    async (observedMembers) => {
       const row = {
         bundle: { name: "ae0", url: "/dcim/interfaces/20/" },
         members: [],
         observed_members: [],
       };
-      const table = mount(row);
-      row.observed_members = observedMembers;
-      const members = table.config.columns.find((column) => column.field === "_members").formatter(cell(row));
+      const server = createServer((_request, response) => {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ rows: [{ ...row, observed_members: observedMembers }] }));
+      });
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const table = mount(row, `http://127.0.0.1:${server.address().port}/lacp.json`);
+        const formatter = table.config.columns.find((column) => column.field === "_members").formatter;
+        table.el.parentElement.dispatchEvent(new CustomEvent("nso:popedit-saved"));
 
-      expect(members.textContent).toContain("Device members: ");
+        await vi.waitFor(() => {
+          const fresh = table.config.data[0];
+          expect(fresh.observed_members).toEqual(observedMembers);
+          expect(formatter(cell(fresh)).textContent).toBe("\u2014Device members: ");
+          expect(fresh._members).toBe(" ");
+        });
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
     },
   );
 

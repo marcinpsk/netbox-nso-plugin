@@ -194,8 +194,8 @@ class NSOActionPermissionMixin(LoginRequiredMixin):
         except OwnershipNotQualified as exc:
             is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
             if is_ajax or "key" in kwargs or exc.device_id is None:
-                return JsonResponse({"status": "error", "message": str(exc)}, status=400)
-            messages.error(request, str(exc))
+                return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
+            messages.error(request, exc.public_message)
             return redirect(_device_nso_tab_url(exc.device_id))
 
 

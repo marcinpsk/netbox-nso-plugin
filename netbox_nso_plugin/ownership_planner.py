@@ -29,8 +29,9 @@ ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
 class OwnershipNotQualified(IntentMutationProtocolError):
     """An explicit acquisition resolved a binding that does not qualify."""
 
-    def __init__(self, message, *, device_id=None):
-        super().__init__(message)
+    def __init__(self, public_message, *, device_id=None):
+        super().__init__("Ownership acquisition is not qualified.")
+        self.public_message = public_message
         self.device_id = device_id
 
 
