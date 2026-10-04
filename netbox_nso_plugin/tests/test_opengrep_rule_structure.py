@@ -27,7 +27,7 @@ _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
 _ROOT_NAME = re.compile(r"(?<![\w.$])(?<!\bdef )([A-Za-z_]\w*)(?=\s*[.(])")
 # These literal rule roots are not imported modules.
-_ALLOWED_ROOT_NAMES = frozenset({"self", "getattr", "int", "open", "super"})
+_ALLOWED_ROOT_NAMES = frozenset({"self", "getattr", "int", "open", "repr", "str", "super"})
 
 _COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
 assert _COVERAGE_SPEC is not None
@@ -185,6 +185,20 @@ class TestOpenGrepRuleStructure(SimpleTestCase):
 
     def test_getattr_needs_no_import_or_qualified_variant(self):
         document = {"rules": [{"id": "observation-read", "pattern": 'getattr($OBJECT, "observed_members", ...)'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            rules_path = Path(directory) / "nso-rules.yaml"
+            rules_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+            self.assertEqual(_rule_violations(rules_path), [])
+
+    def test_exception_rendering_builtins_need_no_import_or_qualified_variant(self):
+        document = {
+            "rules": [
+                {
+                    "id": "exception-rendering",
+                    "pattern-either": [{"pattern": "str($ERROR)"}, {"pattern": "repr($ERROR)"}],
+                }
+            ]
+        }
         with tempfile.TemporaryDirectory() as directory:
             rules_path = Path(directory) / "nso-rules.yaml"
             rules_path.write_text(yaml.safe_dump(document), encoding="utf-8")
