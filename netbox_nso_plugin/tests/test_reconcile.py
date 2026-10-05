@@ -994,7 +994,7 @@ class TestSafeReconcile(APITestCase):
     def _assert_interface_fault_isolated(self, model, values, owned_values, fault_target, family, context_key):
         from dcim.models import Interface
 
-        from netbox_nso_plugin.reconcile import reconcile_device
+        from netbox_nso_plugin.reconcile import _LeaseOutcome, reconcile_device
 
         from .test_gated_reconcile import _rs
 
@@ -1015,6 +1015,8 @@ class TestSafeReconcile(APITestCase):
             raise RuntimeError("interface read failed")
 
         with (
+            # The shared Redis lease can defer or fail before the injected fault runs.
+            patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
             patch("netbox_nso_plugin.adapter_client.get_interfaces_doc", return_value=empty),
             patch("netbox_nso_plugin.adapter_client.get_state", return_value={}),
             patch("netbox_nso_plugin.adapter_client.get_svi", return_value={"svis": [], "read_state": _rs()}),

@@ -607,7 +607,7 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
 class TestOffboardingAbandonsTheClaim(_ClaimCase):
     """Offboarding retires the cached body and returns its pending deletion authority."""
 
-    tag = "park"
+    tag = "off"
     adapter_device_id = 7507
 
     def _claim_with_authority(self):
