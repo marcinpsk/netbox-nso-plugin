@@ -88,6 +88,29 @@ describe('blocked removal current deployment preview', () => {
     expect(button().disabled).toBe(false);
   });
 
+  it('clears a loaded or pending preview when the orphan set of the same job changes', async () => {
+    await mount();
+    button().click();
+    await vi.waitFor(() => expect(result().textContent).toContain('<edit-config>literal</edit-config>'));
+    blocks = [{ ...block(), orphans: { route: [['198.18.1.0/24']] } }];
+    poll();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('198.18.1.0/24'));
+    expect(result().textContent).toBe('');
+    expect(result().classList.contains('d-none')).toBe(true);
+    expect(document.body.textContent).not.toContain('73');
+
+    let finish;
+    fetch.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    button().click();
+    blocks = [block()];
+    poll();
+    await vi.waitFor(() => expect(document.body.textContent).toContain('198.18.0.0/24'));
+    expect(button().disabled).toBe(false);
+    finish({ ok: true, json: async () => preview('stale orphan delta') });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(document.body.textContent).not.toContain('stale orphan delta');
+  });
+
   it('discards a late response when the block disappears', async () => {
     await mount();
     let finish;

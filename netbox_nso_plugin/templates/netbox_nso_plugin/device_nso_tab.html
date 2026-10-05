@@ -520,6 +520,8 @@
       var pre = node.querySelector('[data-slot="preview"]');
       var identity = node.querySelector('[data-slot="generation"]');
       if (button.disabled) return;
+      var seq = node.previewSeq = (node.previewSeq || 0) + 1;
+      function current() { return node.parentNode === blockedBox && node.previewSeq === seq; }
       button.disabled = true;
       pre.classList.remove('d-none');
       pre.textContent = 'Loading current deployment preview…';
@@ -529,7 +531,7 @@
       })
         .then(function (r) { if (!r.ok) throw new Error('preview unavailable'); return r.json(); })
         .then(function (d) {
-          if (node.parentNode !== blockedBox) return;
+          if (!current()) return;
           var validIdentity = Number.isInteger(d.generation_id) && d.generation_id > 0
             && typeof d.document_digest === 'string' && /^[a-f0-9]{64}$/.test(d.document_digest);
           var diffs = d.device_diff;
@@ -545,9 +547,9 @@
           pre.textContent = diffs.device_intent || 'No device change for this generation.';
         })
         .catch(function () {
-          if (node.parentNode === blockedBox) pre.textContent = 'Preview unavailable. Try again.';
+          if (current()) pre.textContent = 'Preview unavailable. Try again.';
         })
-        .finally(function () { if (node.parentNode === blockedBox) button.disabled = false; });
+        .finally(function () { if (current()) button.disabled = false; });
     }
     function renderBlocked(list) {
       if (!blockedBox || !blockedTpl) return;
@@ -565,6 +567,16 @@
           node.querySelector('[data-action="preview"]').addEventListener('click', function () { loadBlockedPreview(node); });
         }
         node.querySelector('[data-slot="scope"]').textContent = b.scope;
+        var orphanKey = JSON.stringify(b.orphans || {});
+        if (node.dataset.orphanKey !== orphanKey) {
+          // A changed orphan set drops the loaded preview and any request still in flight.
+          node.previewSeq = (node.previewSeq || 0) + 1;
+          node.dataset.orphanKey = orphanKey;
+          node.querySelector('[data-slot="preview"]').classList.add('d-none');
+          node.querySelector('[data-slot="preview"]').textContent = '';
+          node.querySelector('[data-slot="generation"]').textContent = '';
+          node.querySelector('[data-action="preview"]').disabled = false;
+        }
         var ul = node.querySelector('[data-slot="orphans"]');
         ul.replaceChildren();
         Object.keys(b.orphans || {}).forEach(function (list) {
