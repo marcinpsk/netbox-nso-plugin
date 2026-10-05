@@ -721,6 +721,29 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertIn("no longer linked to a tracked LACP bundle", refused.exception.public_message)
         self.assertFalse([query for query in queries.captured_queries if "nsolacpbundlestate" in query["sql"]])
 
+    def test_reconcile_fails_closed_for_a_member_moved_to_another_device(self):
+        from netbox_nso_plugin.intent_state import RendererTargetsChanged
+        from netbox_nso_plugin.lacp_reconciler import reconcile_lag_config
+
+        self.assert_reconcile_ran()
+        moved = self.member_interfaces[0]
+        other = make_managed("lacp-moved-member-target", self.adapter.device_id + 1)[0]
+        # NetBox clean() forbids moving a component, so only a raw ORM write reaches this state.
+        Interface.objects.filter(pk=moved.pk).update(device=other)
+        with without_commit_drain():
+            namesake = Interface.objects.create(
+                device=self.device, name=moved.name, type="100gbase-x-qsfp28", lag=self.bundle_interface
+            )
+        payload = deepcopy(self.adapter.documents["lag-config"])
+        payload["bundles"][0]["members"] = payload["bundles"][0]["members"][1:]
+
+        with without_commit_drain(), self.assertRaises(RendererTargetsChanged):
+            reconcile_lag_config(self.device, payload)
+
+        namesake.refresh_from_db()
+        self.assertEqual(namesake.lag_id, self.bundle_interface.pk)
+        self.assertTrue(NSOLACPMemberState.objects.filter(management=self.management, interface=moved).exists())
+
     def test_member_rename_between_selection_and_lock_refuses_accept(self):
         self.assert_reconcile_ran()
 
