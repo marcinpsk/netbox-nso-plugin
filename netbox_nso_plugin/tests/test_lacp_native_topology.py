@@ -266,6 +266,45 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assert_native_topology()
         self.assert_lacp_intent(requests)
 
+    def edit(self, key, row, data):
+        return self.client.post(reverse("plugins:netbox_nso_plugin:overlay_field_edit", args=(key, row.pk)), data)
+
+    def test_owned_bundle_stays_editable_while_the_device_omits_it(self):
+        self.reconcile_and_accept_bundle()
+        self.adapter.documents["lag-config"] = {"bundles": []}
+        self.assert_reconcile_ran()
+        bundle, member = self.bundle_state(), self.lacp_states[1]
+        self.assertEqual(bundle.observed_members, [])
+
+        response = self.edit("lacp_bundle", bundle, {"timer": "fast"})
+        self.assertEqual(response.status_code, 200, response.content)
+        response = self.edit("lacp_member", member, {"port_priority": "200"})
+        self.assertEqual(response.status_code, 200, response.content)
+
+        bundle.refresh_from_db()
+        member.refresh_from_db()
+        self.assertEqual((bundle.timer, member.port_priority), ("fast", 200))
+        self.assert_owned()
+
+    def test_owned_bundle_edit_that_acquires_an_unreported_member_is_refused(self):
+        self.reconcile_and_accept_bundle()
+        with without_commit_drain():
+            added = Interface.objects.create(
+                device=self.device, name="et-0/0/3", type="100gbase-x-qsfp28", lag=self.bundle_interface
+            )
+            NSOLACPMemberState.objects.create(
+                management=self.management, interface=added, mode="active", status="imported"
+            )
+        bundle = self.bundle_state()
+
+        response = self.edit("lacp_bundle", bundle, {"timer": "fast"})
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("et-0/0/3 is not reported", str(response.json()))
+        bundle.refresh_from_db()
+        self.assertEqual(bundle.timer, "")
+        self.assertEqual(NSOLACPMemberState.objects.get(interface=added).status, "imported")
+
     def test_missing_reported_member_refuses_bundle_accept(self):
         self.adapter.documents["lag-config"]["bundles"][0]["members"].append(
             {"interface_name": "et-0/0/3", "mode": "active"}

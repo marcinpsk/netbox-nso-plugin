@@ -93,6 +93,7 @@ def native_validation_message(interface, **changes):
 def bundle_acquisition_blockers(bundle_state):
     """Require the complete reported membership before any bundle acquisition."""
     from .models import NSOLACPMemberState
+    from .status_machine import is_owned
 
     bundle = bundle_state.interface
     blockers = []
@@ -101,6 +102,9 @@ def bundle_acquisition_blockers(bundle_state):
     if not is_bundle(bundle, bundle_state.management.device_id):
         reason = native_validation_message(bundle, type="lag")
         blockers.append(f"NetBox does not model {bundle.name} as a LAG" + (f": {reason}" if reason else "."))
+    # Device observations gate only an operation that acquires a row; owned intent stays editable.
+    if is_owned(bundle_state.status) and all(is_owned(row.status) for row in member_states(bundle_state)):
+        return tuple(blockers)
     reported = set(bundle_state.observed_members)
     interfaces = {row.name: row for row in Interface.objects.filter(device_id=bundle.device_id).select_related("lag")}
     overlays = {
