@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netbox-nso-plugin"
-version = "1.6.2"
+version = "1.7.0"
 description = "NetBox plugin integrating NetBox with Cisco NSO via the nso-adapter REST API"
 readme = "README.md"
 requires-python = ">=3.12.0"
@@ -83,7 +83,7 @@ dev = [
     "build",
     "packaging",
     "reuse",
-    "ruff==0.16.8",
+    "ruff==0.16.9",
     "pre-commit",
     "pytest",
     "pytest-django",
