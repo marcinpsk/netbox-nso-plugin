@@ -5294,13 +5294,16 @@ def _lacp_member_bundle(obj):
     from .lacp_topology import bundle_of
     from .models import NSOLACPBundleState
 
-    try:
-        return NSOLACPBundleState.objects.get(management=obj.management, interface=bundle_of(obj.interface))
-    except NSOLACPBundleState.DoesNotExist:
-        raise OwnershipNotQualified(
-            f"{obj.interface.name} is no longer linked to a tracked LACP bundle. Refresh and retry.",
-            device_id=obj.interface.device_id,
-        ) from None
+    bundle = bundle_of(obj.interface)
+    if bundle is not None:
+        try:
+            return NSOLACPBundleState.objects.get(management=obj.management, interface=bundle)
+        except NSOLACPBundleState.DoesNotExist:
+            pass
+    raise OwnershipNotQualified(
+        f"{obj.interface.name} is no longer linked to a tracked LACP bundle. Refresh and retry.",
+        device_id=obj.interface.device_id,
+    )
 
 
 def _save_lacp_edit(obj, key, old_values):

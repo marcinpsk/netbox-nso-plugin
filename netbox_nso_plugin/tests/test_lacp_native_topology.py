@@ -704,6 +704,23 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual(member.status, "imported")
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="lacp").exists())
 
+    def test_inline_member_edit_refuses_a_member_without_native_lag_before_lookup(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.ownership_planner import OwnershipNotQualified
+        from netbox_nso_plugin.views import _lacp_member_bundle
+
+        self.assert_reconcile_ran()
+        member = NSOLACPMemberState.objects.select_related("interface").get(
+            management=self.management, interface=self.member_interfaces[0]
+        )
+        Interface.objects.filter(pk=member.interface_id).update(lag=None)
+        member.interface.refresh_from_db()
+        with CaptureQueriesContext(connection) as queries, self.assertRaises(OwnershipNotQualified) as refused:
+            _lacp_member_bundle(member)
+        self.assertIn("no longer linked to a tracked LACP bundle", refused.exception.public_message)
+        self.assertFalse([query for query in queries.captured_queries if "nsolacpbundlestate" in query["sql"]])
+
     def test_member_rename_between_selection_and_lock_refuses_accept(self):
         self.assert_reconcile_ran()
 
