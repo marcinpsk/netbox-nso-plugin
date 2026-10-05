@@ -342,6 +342,7 @@ def _document(data, what: str) -> dict:
 
 
 _PUBLIC_ERROR_MESSAGES = {
+    "bgp_source_as_required": "The device's NED requires a source AS for this BGP redistribution.",
     "configuration_error": "The NSO adapter is not configured. See the server log.",
     "invalid_response": "The NSO adapter returned an invalid response. See the server log.",
 }
