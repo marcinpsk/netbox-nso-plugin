@@ -2836,3 +2836,33 @@ def ownership_refusal_diagnostics():
         # ok: nso-ownership-refusal-exception-diagnostic
         response = str(error)
     return response
+
+
+def exact_route_policy_names(name, rows):
+    # ruleid: nso-route-policy-name-folding
+    rows.filter(object_name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    Q(family="prefix_list", object_name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    rows.annotate(name_key=Lower("object_name"))
+    # ruleid: nso-route-policy-name-folding
+    rows.annotate(name_key=functions.Upper("object_name"))
+    # ruleid: nso-route-policy-name-folding
+    RouteMap.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    PrefixList.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    models.ASPath.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    CommunityList.objects.filter(name__iexact=name)
+    # ok: nso-route-policy-name-folding
+    RouteMap.objects.filter(name=name)
+    # ok: nso-route-policy-name-folding
+    rows.filter(object_name=name)
+    # ok: nso-route-policy-name-folding
+    Device.objects.filter(name__iexact=name)
+    # ok: nso-route-policy-name-folding
+    rows.annotate(action_key=Lower("action"))
+    # ok: nso-route-policy-name-folding
+    local_key = name.casefold()
+    return local_key

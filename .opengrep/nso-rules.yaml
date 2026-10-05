@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-route-policy-name-folding
+    languages: [python]
+    severity: ERROR
+    message: Use exact policy names. This checks direct ORM lookups and Lower/Upper calls, not local-variable casefold(), aliased models, or dynamic managers. Reconcile integration tests cover those paths.
+    pattern-either:
+      - pattern: $CALL(..., object_name__iexact=$NAME, ...)
+      - patterns:
+          - pattern: $FUNCTION("object_name")
+          - metavariable-regex:
+              metavariable: $FUNCTION
+              regex: '^(?:.*\.)?(?:Lower|Upper)$'
+      - patterns:
+          - pattern: $MODEL.objects.filter(..., name__iexact=$NAME, ...)
+          - metavariable-regex:
+              metavariable: $MODEL
+              regex: '^(?:.*\.)?(?:RouteMap|PrefixList|ASPath|CommunityList)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
   - id: nso-ownership-refusal-exception-diagnostic
     languages: [python]
     severity: ERROR
