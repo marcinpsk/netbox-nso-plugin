@@ -183,7 +183,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--rules", type=Path, default=_RULES_PATH)
     parser.add_argument("--fixture", type=Path, nargs="+", default=_FIXTURE_PATHS)
     parser.add_argument("--opengrep-bin", default=os.environ.get("OPENGREP_BIN", "opengrep"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.fixture:
+        parser.error("no fixture file found")
+    # Annotations and the scanned copies are both keyed by the fixture basename.
+    if len({path.name for path in args.fixture}) != len(args.fixture):
+        parser.error("fixture basenames must be unique")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

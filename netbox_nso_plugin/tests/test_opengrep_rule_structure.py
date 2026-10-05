@@ -299,6 +299,25 @@ class TestOpenGrepRuleStructure(SimpleTestCase):
 
 
 class TestOpenGrepAlternativeCoverage(SimpleTestCase):
+    def test_fixture_set_must_be_found_and_have_unique_basenames(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            copies = [Path(directory, name, _FIXTURE_PATH.name) for name in ("a", "b")]
+            cases = (
+                ("no fixture file found", [], patch.object(_COVERAGE, "_FIXTURE_PATHS", [])),
+                ("fixture basenames must be unique", ["--fixture", *map(str, copies)], contextlib.nullcontext()),
+            )
+            for message, argv, context in cases:
+                stderr = io.StringIO()
+                with self.subTest(message), context, contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as refused:
+                        _COVERAGE._parse_args(argv)
+                    self.assertEqual(refused.exception.code, 2)
+                    self.assertIn(message, stderr.getvalue())
+
     def test_generated_sub_rules_drop_path_filters(self):
         document = {
             "rules": [

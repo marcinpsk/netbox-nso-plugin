@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 def create_shard_artifacts(temporary):
     """Produce reports and coverage from two real pytest shards."""
@@ -75,13 +77,10 @@ def create_shard_artifacts(temporary):
 class ShardingContractTests(unittest.TestCase):
     def test_pull_request_workflows_target_main_and_develop(self):
         for name in ("test.yaml", "js-test.yaml"):
-            workflow = Path(__file__).parents[1] / "workflows" / name
-            trigger = (
-                workflow.read_text(encoding="utf-8").split("  pull_request:\n", 1)[1].split("\nconcurrency:", 1)[0]
-            )
-            branches = [line.strip()[2:].strip("'\"") for line in trigger.splitlines() if line.strip().startswith("- ")]
+            workflow = yaml.safe_load((Path(__file__).parents[1] / "workflows" / name).read_text(encoding="utf-8"))
+            # PyYAML reads the bare `on` key as the YAML 1.1 boolean True.
             with self.subTest(workflow=name):
-                self.assertEqual(branches, ["main", "develop"])
+                self.assertEqual(workflow[True]["pull_request"]["branches"], ["main", "develop"])
 
     def test_complete_shards_pass_and_incomplete_or_duplicate_runs_fail(self):
         helper = Path(__file__).with_name("sharding.py")
