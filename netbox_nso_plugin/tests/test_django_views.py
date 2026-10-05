@@ -6322,7 +6322,13 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         self.device = fixtures["device"]
         self.mgmt = fixtures["mgmt"]
 
-    def test_concurrent_case_variant_route_map_insert_returns_a_field_error(self):
+    def test_concurrent_case_variant_route_map_insert_succeeds(self):
+        self._concurrent_route_map_insert("rm-race-target", succeeds=True)
+
+    def test_concurrent_exact_route_map_insert_returns_a_field_error(self):
+        self._concurrent_route_map_insert("RM-RACE-TARGET", succeeds=False)
+
+    def _concurrent_route_map_insert(self, collision_name, succeeds):
         import contextlib
         from threading import Barrier, Thread
 
@@ -6388,7 +6394,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
             try:
                 validation_finished.wait(timeout=20)
                 with without_commit_drain(), transaction.atomic():
-                    RouteMap.objects.create(name="rm-race-target")
+                    RouteMap.objects.create(name=collision_name)
             except Exception as exc:  # noqa: BLE001
                 results["collision_error"] = exc
             finally:
@@ -6399,7 +6405,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
 
         request_thread = Thread(target=request_edit)
         collision_thread = Thread(target=create_collision)
-        with patch("netbox_nso_plugin.views._save_route_map_name_edit", side_effect=save_after_collision):
+        with patch("netbox_nso_plugin.views._save_route_map_name_edit", new=save_after_collision):
             request_thread.start()
             collision_thread.start()
             request_thread.join(timeout=30)
@@ -6412,6 +6418,15 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         self.assertNotIn("collision_error", results, results.get("collision_error"))
         response = results.get("response")
         self.assertIsNotNone(response, results.get("request_error"))
+        if succeeds:
+            self.assertEqual(response.status_code, 200, response.content)
+            route_map.refresh_from_db()
+            policy_class.refresh_from_db()
+            state.refresh_from_db()
+            self.assertEqual(route_map.name, "RM-RACE-TARGET")
+            self.assertEqual(policy_class.object_name, "RM-RACE-TARGET")
+            self.assertEqual((state.object_name, state.status), ("RM-RACE-TARGET", "accepted"))
+            return
         self.assertEqual(response.status_code, 400, response.content)
         self.assertIn("object_name", response.json()["errors"])
         route_map.refresh_from_db()
@@ -6561,7 +6576,13 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
             results["collision_revisions"],
         )
 
-    def test_concurrent_case_variant_classification_insert_returns_a_field_error(self):
+    def test_concurrent_case_variant_classification_insert_succeeds(self):
+        self._concurrent_classification_insert("rm-class-race-target", succeeds=True)
+
+    def test_concurrent_exact_classification_insert_returns_a_field_error(self):
+        self._concurrent_classification_insert("RM-CLASS-RACE-TARGET", succeeds=False)
+
+    def _concurrent_classification_insert(self, collision_name, succeeds):
         import contextlib
         from threading import Barrier, Thread
 
@@ -6629,7 +6650,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
                 with without_commit_drain(), transaction.atomic():
                     NSORoutePolicyObjectClass.objects.create(
                         family="route_map",
-                        object_name="rm-class-race-target",
+                        object_name=collision_name,
                         mode="local",
                     )
             except Exception as exc:  # noqa: BLE001
@@ -6642,7 +6663,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
 
         request_thread = Thread(target=request_edit)
         collision_thread = Thread(target=create_collision)
-        with patch("netbox_nso_plugin.views._save_route_map_name_edit", side_effect=save_after_collision):
+        with patch("netbox_nso_plugin.views._save_route_map_name_edit", new=save_after_collision):
             request_thread.start()
             collision_thread.start()
             request_thread.join(timeout=30)
@@ -6655,6 +6676,15 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         self.assertNotIn("collision_error", results, results.get("collision_error"))
         response = results.get("response")
         self.assertIsNotNone(response, results.get("request_error"))
+        if succeeds:
+            self.assertEqual(response.status_code, 200, response.content)
+            route_map.refresh_from_db()
+            policy_class.refresh_from_db()
+            state.refresh_from_db()
+            self.assertEqual(route_map.name, "RM-CLASS-RACE-TARGET")
+            self.assertEqual(policy_class.object_name, "RM-CLASS-RACE-TARGET")
+            self.assertEqual((state.object_name, state.status), ("RM-CLASS-RACE-TARGET", "accepted"))
+            return
         self.assertEqual(response.status_code, 400, response.content)
         self.assertIn("object_name", response.json()["errors"])
         route_map.refresh_from_db()
@@ -6664,7 +6694,7 @@ class TestOverlayFieldEditViewRenameRace(_CascadeFlushMixin, IntentPushResetMixi
         self.assertEqual(
             NSORoutePolicyObjectClass.objects.filter(
                 family="route_map",
-                object_name__iexact="RM-CLASS-RACE-TARGET",
+                object_name=collision_name,
             ).count(),
             1,
         )

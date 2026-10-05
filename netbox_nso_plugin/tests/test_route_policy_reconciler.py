@@ -136,38 +136,26 @@ class TestReconcileRoutePolicy(TestCase):
                 }
                 self.assertTrue(route_policy_reconcile_plan(self.device, payload).changes_content)
 
-    def test_case_insensitive_name_adopts_existing_object(self):
-        """A device object whose name differs only in CASE from an existing netbox_routing
-        object must ADOPT it, not crash on the Lower(name) unique constraint.
-
-        Regression: get_or_create(name='ACCEPT-ALL') with an existing 'accept-all' did
-        get-miss → create → IntegrityError, which aborted the whole route-policy reconcile
-        and left EVERY row marked 'error' (self-perpetuating once the status machine also
-        couldn't move error→conflict).
-        """
+    def test_case_variant_name_creates_a_separate_object(self):
         from netbox_routing.models import RouteMap
 
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
-        existing = RouteMap.objects.create(name="accept-all")  # e.g. imported from another device
+        existing = RouteMap.objects.create(name="accept-all")
         self._make_mgmt(self.device)
+        reconcile_route_policy(
+            self.device,
+            {"route_maps": [{"name": "ACCEPT-ALL", "entries": [{"seq": 10, "action": "permit"}]}]},
+        )
 
-        payload = {
-            "prefix_lists": [],
-            "community_lists": [],
-            "as_paths": [],
-            "route_maps": [{"name": "ACCEPT-ALL", "entries": [{"seq": 10, "action": "permit"}]}],
-        }
-        reconcile_route_policy(self.device, payload)  # must not raise
-
-        # No duplicate object created; the device's row adopts the existing (other-case) one.
-        self.assertEqual(RouteMap.objects.filter(name__iexact="accept-all").count(), 1)
-        st = NSORoutePolicyState.objects.get(
+        self.assertEqual(set(RouteMap.objects.values_list("name", flat=True)), {"accept-all", "ACCEPT-ALL"})
+        state = NSORoutePolicyState.objects.get(
             management__device=self.device, family="route_map", object_name="ACCEPT-ALL"
         )
-        self.assertNotEqual(st.status, "error")
-        self.assertEqual(st.object_id, existing.pk)
+        self.assertEqual(state.status, "imported")
+        self.assertNotEqual(state.object_id, existing.pk)
+        self.assertEqual(state.assigned_object.name, "ACCEPT-ALL")
 
     def test_deploying_row_waits_for_correlated_apply_evidence(self):
         """An ordinary device read cannot identify the Apply attempt that it reflects."""
@@ -450,8 +438,7 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(row.status, "accepted")
         self.assertIsNone(row.apply_attempt_id)
 
-    def test_classification_mode_agrees_with_apply_on_a_mixed_case_name(self):
-        """The NSO tab badge and Apply must read one classification, case-insensitively."""
+    def test_classification_mode_is_exact_on_a_mixed_case_name(self):
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
 
@@ -460,11 +447,12 @@ class TestReconcileRoutePolicy(TestCase):
         reconcile_route_policy(self.device, {"community_lists": [{"name": "cl-local", "entries": []}]})
         state = NSORoutePolicyState.objects.get(management=management, object_name="cl-local")
 
-        self.assertEqual(_group_mode(state.family, state.object_name), "local")
-        self.assertEqual(state.classification_mode, "local")
+        self.assertEqual(_group_mode(state.family, state.object_name), "master")
+        self.assertEqual(state.classification_mode, "master")
+        self.assertEqual(state.assigned_object.name, "cl-local")
 
-    def test_promotion_excludes_a_local_row_that_only_postgres_case_folds_onto_its_class(self):
-        """UPPER() folds the greek final sigma onto sigma; python str.lower()/upper() does not."""
+    def test_promotion_keeps_a_distinct_unicode_policy_name(self):
+        """Distinct Unicode names do not inherit another list's LOCAL classification."""
         from types import SimpleNamespace
         from uuid import uuid4
 
@@ -476,10 +464,9 @@ class TestReconcileRoutePolicy(TestCase):
         NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-\u03c3", mode="local")
         reconcile_route_policy(self.device, {"community_lists": [{"name": "CL-\u03c2", "entries": []}]})
         row = NSORoutePolicyState.objects.get(management=management, object_name="CL-\u03c2")
-        self.assertNotEqual("CL-\u03c2".lower(), "CL-\u03c3".lower())
-        self.assertEqual(_group_mode(row.family, row.object_name), "local")
-        self.assertEqual(row.classification_mode, "local")
-        self.assertIsNone(row.object_id)
+        self.assertEqual(_group_mode(row.family, row.object_name), "master")
+        self.assertEqual(row.classification_mode, "master")
+        self.assertEqual(row.assigned_object.name, "CL-\u03c2")
         row.status = "accepted"
         save_overlay_fixture(row, update_fields=["status"])
         prepared = SimpleNamespace(management=management, rows=[row])
@@ -495,8 +482,8 @@ class TestReconcileRoutePolicy(TestCase):
         )
 
         row.refresh_from_db()
-        self.assertEqual(row.status, "accepted")
-        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual(row.status, "deploying")
+        self.assertIsNotNone(row.apply_attempt_id)
 
     def test_reconciles_all_families(self):
         """One object per family → created in netbox_routing + a state row each."""
@@ -752,37 +739,37 @@ class TestReconcileRoutePolicy(TestCase):
         )
         self.assertEqual(s2.status, "conflict")
 
-    def test_master_grouping_is_case_insensitive_across_devices(self):
+    def test_master_grouping_is_exact_across_devices(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         self._make_mgmt(self.device)
         self._make_mgmt(self.device2)
-        reconcile_route_policy(self.device, self._pl_payload("SHARED-CASE", "10.0.0.0/8"))
-        reconcile_route_policy(self.device2, self._pl_payload("shared-case", "10.1.0.0/16"))
+        reconcile_route_policy(self.device, self._pl_payload("SHARED-CASE", "198.18.0.0/24"))
+        reconcile_route_policy(self.device2, self._pl_payload("shared-case", "198.18.1.0/24"))
 
-        rows = NSORoutePolicyState.objects.filter(family="prefix_list", object_name__iexact="shared-case")
+        rows = NSORoutePolicyState.objects.filter(family="prefix_list")
         second = rows.get(management__device=self.device2)
-        self.assertEqual(second.status, "conflict")
-        self.assertEqual(rows.filter(is_materialized=True).count(), 1)
+        self.assertEqual(second.status, "imported")
+        self.assertEqual(rows.filter(is_materialized=True).count(), 2)
+        self.assertEqual(second.assigned_object.name, "shared-case")
+        self.assertNotEqual(second.object_id, rows.get(management__device=self.device).object_id)
 
-    def test_casing_only_rename_is_not_treated_as_stale_on_same_device(self):
+    def test_casing_only_rename_replaces_the_unowned_identity(self):
         from netbox_nso_plugin.models import NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         self._make_mgmt(self.device)
-        reconcile_route_policy(self.device, self._pl_payload("PRESENT-CASE", "10.0.0.0/8"))
-        reconcile_route_policy(self.device, self._pl_payload("present-case", "10.0.0.0/8"))
+        reconcile_route_policy(self.device, self._pl_payload("PRESENT-CASE", "198.18.0.0/24"))
+        old = NSORoutePolicyState.objects.get(management__device=self.device, object_name="PRESENT-CASE")
+        reconcile_route_policy(self.device, self._pl_payload("present-case", "198.18.0.0/24"))
 
-        rows = NSORoutePolicyState.objects.filter(
-            management__device=self.device,
-            family="prefix_list",
-            object_name__iexact="present-case",
-        )
-        self.assertEqual(rows.count(), 1)
-        state = rows.get()
+        self.assertFalse(NSORoutePolicyState.objects.filter(pk=old.pk).exists())
+        state = NSORoutePolicyState.objects.get(management__device=self.device, object_name="present-case")
+        self.assertNotEqual(state.pk, old.pk)
         self.assertTrue(state.device_present)
-        self.assertNotIn(state.status, ("changed", "conflict"))
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.assigned_object.name, "present-case")
 
     def _rm_payload(self, name, entries):
         return {
@@ -955,16 +942,13 @@ class TestReconcileRoutePolicy(TestCase):
         )
         self.assertEqual(s2.status, "conflict")
 
-    def test_group_mode_is_case_insensitive(self):
-        """_group_mode must match the object dedup (name__iexact): a peer device reporting a
-        different case (ACCEPT-ALL vs accept-all — the same shared object) must still see the
-        operator's LOCAL classification, not silently revert to implicit MASTER."""
+    def test_group_mode_uses_the_exact_name(self):
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass
         from netbox_nso_plugin.route_policy_reconciler import _group_mode
 
         NSORoutePolicyObjectClass.objects.create(family="prefix_list", object_name="ACCEPT-ALL", mode="local")
-        self.assertEqual(_group_mode("prefix_list", "accept-all"), "local")  # different case still LOCAL
-        self.assertEqual(_group_mode("prefix_list", "ACCEPT-ALL"), "local")  # exact case unchanged
+        self.assertEqual(_group_mode("prefix_list", "accept-all"), "master")
+        self.assertEqual(_group_mode("prefix_list", "ACCEPT-ALL"), "local")
 
     def test_local_classification_suppresses_cross_device_conflict(self):
         """A LOCAL group legitimately differs per device → captured-only, no materialization,
@@ -2455,8 +2439,8 @@ class TestSharedObjectOwnership(TestCase):
         self.assertEqual((d1_prefix.status, d1_prefix.is_materialized), ("accepted", True))
         self.assertEqual((d2_route_map.status, d2_route_map.is_materialized), ("imported", True))
         warm_cache = route_policy_reconciler._PL_UNIT_CACHE.get() or {}
-        self.assertIn(prefix_name.lower(), warm_cache)
-        stale_units = warm_cache[prefix_name.lower()]
+        self.assertIn(prefix_name, warm_cache)
+        stale_units = warm_cache[prefix_name]
         stale_hash = route_policy_reconciler._hash(canonical_route_map(route_map_capture, lambda _name: stale_units))
         self.assertEqual(d2_route_map.content_hash, stale_hash)
 
