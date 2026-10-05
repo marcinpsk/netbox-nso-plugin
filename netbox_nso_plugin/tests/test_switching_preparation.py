@@ -342,7 +342,6 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                                     member_state = NSOLACPMemberState(
                                         management=self.management,
                                         interface=member,
-                                        lag_bundle=retained.interface,
                                         status="accepted",
                                     )
                                     with renderer_writes(
@@ -400,7 +399,6 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         member = NSOLACPMemberState(
             management=self.management,
             interface=member_interface,
-            lag_bundle=bundle.interface,
             status="accepted",
             mode="",
         )
@@ -486,9 +484,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             interface = Interface.objects.create(
                 device=self.device, name="Ethernet35", type="1000base-t", lag=bundle.interface
             )
-        member = NSOLACPMemberState(
-            management=self.management, interface=interface, lag_bundle=bundle.interface, status="accepted"
-        )
+        member = NSOLACPMemberState(management=self.management, interface=interface, status="accepted")
         with renderer_writes(
             RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -571,9 +567,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             interface = Interface.objects.create(
                 device=self.device, name="Ethernet37", type="1000base-t", lag=excluded_bundle.interface
             )
-        member = NSOLACPMemberState(
-            management=self.management, interface=interface, lag_bundle=excluded_bundle.interface, status="accepted"
-        )
+        member = NSOLACPMemberState(management=self.management, interface=interface, status="accepted")
         with renderer_writes(
             RendererMutationPlan.build(
                 grant=OwnershipGrant("create"),
@@ -794,7 +788,6 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         member = NSOLACPMemberState(
             management=self.management,
             interface=interface,
-            lag_bundle=bundle.interface,
             mode="active",
             status="accepted",
         )

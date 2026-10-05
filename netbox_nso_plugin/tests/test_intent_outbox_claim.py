@@ -604,10 +604,10 @@ class TestAForcedCallFormsItsOwnClaim(_ClaimCase):
         assert continued is None
 
 
-class TestUnmanagedClaimIsParked(_ClaimCase):
-    """O1.13 (R11-m1): unmanaging is not a third abandon cause; the claim simply waits."""
+class TestOffboardingAbandonsTheClaim(_ClaimCase):
+    """Offboarding retires the cached body and returns its pending deletion authority."""
 
-    tag = "park"
+    tag = "off"
     adapter_device_id = 7507
 
     def _claim_with_authority(self):
@@ -620,7 +620,7 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
         assert claimed.deletions
         return claimed
 
-    def test_unmanaging_after_the_claim_parks_it_rather_than_sending(self):
+    def test_offboarding_after_the_claim_returns_authority_without_sending(self):
         from netbox_nso_plugin import drain
 
         claimed = self._claim_with_authority()
@@ -633,14 +633,14 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
 
         assert self.adapter.requests == []
         row = state_of(self.device, "static_route")
-        assert row.push_seq == claimed.push_seq
-        assert [d["route_id"] for d in row.claim_deletions] == [d["route_id"] for d in claimed.deletions]
-        assert row.queued_deletions == []
-        parked = entries(self.device, "static_route")
-        assert parked, "the parked claim kept the rows it consumed"
-        assert [e.consumed_by_push_seq for e in parked] == [claimed.push_seq] * len(parked)
+        assert row.push_seq is None
+        assert row.claim_deletions == []
+        assert row.queued_deletions == claimed.deletions
+        pending = entries(self.device, "static_route")
+        assert pending, "offboarding kept the pending deletion entries"
+        assert all(entry.consumed_by_push_seq is None for entry in pending)
 
-    def test_unmanaging_between_send_and_outcome_still_records_the_outcome(self):
+    def test_offboarding_between_send_and_outcome_supersedes_the_outcome(self):
         from netbox_nso_plugin import drain
 
         claimed = self._claim_with_authority()
@@ -650,11 +650,11 @@ class TestUnmanagedClaimIsParked(_ClaimCase):
         with patch("netbox_nso_plugin.adapter_client.delete_device"):
             self.mgmt.delete()
 
-        assert drain.settle(claimed, response) == drain.SUCCEEDED
+        assert drain.settle(claimed, response) == drain.SUPERSEDED
 
         row = state_of(self.device, "static_route")
-        assert (row.push_seq, row.claim_deletions, row.queued_deletions) == (None, [], [])
-        assert entries(self.device, "static_route") == []
+        assert (row.push_seq, row.claim_deletions, row.queued_deletions) == (None, [], claimed.deletions)
+        assert entries(self.device, "static_route", unconsumed=True)
 
 
 class TestControlOutcomesCannotCollideWithAdapterAnswers(_ClaimCase):

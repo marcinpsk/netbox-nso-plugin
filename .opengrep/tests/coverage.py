@@ -20,8 +20,8 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _RULES_PATH = _REPO_ROOT / ".opengrep" / "nso-rules.yaml"
-_FIXTURE_PATH = _REPO_ROOT / ".opengrep" / "tests" / "review-patterns.py"
-_RULE_ID_ANNOTATION = re.compile(r"#\s*ruleid:\s*(.+?)\s*$")
+_FIXTURE_PATHS = sorted((_REPO_ROOT / ".opengrep" / "tests").glob("review-patterns.*"))
+_RULE_ID_ANNOTATION = re.compile(r"(?:#|//)\s*ruleid:\s*(.+?)\s*$")
 _RULE_METADATA_KEYS = {
     "fix",
     "fix-regex",
@@ -181,22 +181,28 @@ def _result_rule_id(check_id: str, sub_rules: dict[str, tuple[str, int]]) -> str
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rules", type=Path, default=_RULES_PATH)
-    parser.add_argument("--fixture", type=Path, default=_FIXTURE_PATH)
+    parser.add_argument("--fixture", type=Path, nargs="+", default=_FIXTURE_PATHS)
     parser.add_argument("--opengrep-bin", default=os.environ.get("OPENGREP_BIN", "opengrep"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.fixture:
+        parser.error("no fixture file found")
+    # Annotations and the scanned copies are both keyed by the fixture basename.
+    if len({path.name for path in args.fixture}) != len(args.fixture):
+        parser.error("fixture basenames must be unique")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     """Check rule and alternative coverage against the annotated fixture."""
     args = _parse_args(argv)
     document = yaml.safe_load(args.rules.read_text(encoding="utf-8"))
-    fixture = args.fixture.read_text(encoding="utf-8")
-    annotations = _annotated_lines(fixture)
+    annotations = {path.name: _annotated_lines(path.read_text(encoding="utf-8")) for path in args.fixture}
+    annotated_rule_ids = {rule_id for fixture in annotations.values() for rule_id in fixture}
     alternatives = split_rule_alternatives(document)
     original_rule_ids = [rule["id"] for rule in document["rules"]]
     sub_rules = {rule["id"]: (rule_id, index) for rule_id, index, rule in alternatives}
 
-    failures = [f"{rule_id}: no # ruleid fixture annotation" for rule_id in original_rule_ids if rule_id not in annotations]
+    failures = [f"{rule_id}: no ruleid fixture annotation" for rule_id in original_rule_ids if rule_id not in annotated_rule_ids]
     covered = set()
     generated_document = deepcopy(document)
     generated_document["rules"] = [rule for _, _, rule in alternatives]
@@ -204,12 +210,13 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="opengrep-fixture-coverage-") as temporary_directory:
         temporary_path = Path(temporary_directory)
         generated_config = temporary_path / "review-pattern-alternatives.yaml"
-        generated_fixture = temporary_path / "review-patterns.py"
+        generated_fixtures = [temporary_path / path.name for path in args.fixture]
         generated_config.write_text(yaml.safe_dump(generated_document, sort_keys=False), encoding="utf-8")
-        shutil.copyfile(args.fixture, generated_fixture)
+        for fixture, generated_fixture in zip(args.fixture, generated_fixtures, strict=True):
+            shutil.copyfile(fixture, generated_fixture)
         try:
             completed = subprocess.run(
-                [args.opengrep_bin, "scan", "--config", str(generated_config), "--json", str(generated_fixture)],
+                [args.opengrep_bin, "scan", "--config", str(generated_config), "--json", *(str(path) for path in generated_fixtures)],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -238,7 +245,8 @@ def main(argv: list[str] | None = None) -> int:
             if sub_rule_id is None:
                 continue
             rule_id, alternative_index = sub_rules[sub_rule_id]
-            if result["start"]["line"] in annotations.get(rule_id, set()):
+            fixture_annotations = annotations[Path(result["path"]).name]
+            if result["start"]["line"] in fixture_annotations.get(rule_id, set()):
                 covered.add((rule_id, alternative_index))
 
         delivery_fixture = temporary_path / "netbox_nso_plugin" / "delivery.py"

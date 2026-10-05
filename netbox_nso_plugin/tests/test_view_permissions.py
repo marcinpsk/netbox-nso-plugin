@@ -40,7 +40,7 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         cls.device = Device.objects.create(name="perm-router-01", device_type=device_type, role=role, site=site)
         cls.nso_instance = NSOInstance.objects.create(name="perm-nso", adapter_instance_id="perm-nso-id")
         cls.mgmt = NSODeviceManagement.objects.create(
-            device=cls.device, nso_instance=cls.nso_instance, nso_device_name="perm-router-01"
+            device=cls.device, nso_instance=cls.nso_instance, nso_device_name="perm-router-01", manage_description=True
         )
         cls.interface = Interface.objects.create(device=cls.device, name="Loopback0", type="virtual")
         cls.iface_state = NSOInterfaceState.objects.create(

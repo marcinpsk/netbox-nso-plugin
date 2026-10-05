@@ -11,10 +11,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import yaml
 from django.test import SimpleTestCase
+from markdown_it import MarkdownIt
 
 _RULES_PATH = Path(__file__).resolve().parents[2] / ".opengrep" / "nso-rules.yaml"
 _ROOT = _RULES_PATH.parents[1]
@@ -27,7 +29,7 @@ _PATTERN_KEYS = {"pattern", "pattern-inside", "pattern-not", "pattern-not-inside
 _PATTERN_LIST_KEYS = {"patterns", "pattern-either"}
 _ROOT_NAME = re.compile(r"(?<![\w.$])(?<!\bdef )([A-Za-z_]\w*)(?=\s*[.(])")
 # These literal rule roots are not imported modules.
-_ALLOWED_ROOT_NAMES = frozenset({"self", "int", "open", "super"})
+_ALLOWED_ROOT_NAMES = frozenset({"self", "getattr", "int", "open", "repr", "str", "super"})
 
 _COVERAGE_SPEC = importlib.util.spec_from_file_location("_opengrep_coverage", _COVERAGE_PATH)
 assert _COVERAGE_SPEC is not None
@@ -178,10 +180,44 @@ class TestReviewPatternCheckerPaths(SimpleTestCase):
 
 
 class TestOpenGrepRuleStructure(SimpleTestCase):
+    def test_observed_members_coverage_table_preserves_the_complete_limits(self):
+        lines = (_RULES_PATH.parent / "README.md").read_text(encoding="utf-8").splitlines()
+        row = next(line for line in lines if "`nso-observed-members-join-without-array-check`" in line)
+        source = "| Issue class | Mechanical check | Limit |\n| --- | --- | --- |\n" + row
+        table = ET.fromstring(MarkdownIt("commonmark").enable("table").render(source))
+        cells = table.findall("./tbody/tr/td")
+
+        self.assertEqual(len(cells), 3)
+        limits = "".join(cells[2].itertext())
+        self.assertIn("(row.observed_members || [])", limits)
+        self.assertIn("(row.observed_members ?? [])", limits)
+        self.assertIn("outside this call-shape check.", limits)
+
     def test_rule_roots_resolve_or_have_module_qualified_variants(self):
         violations = _rule_violations(_RULES_PATH)
 
         self.assertEqual(violations, [], "\n".join(violations))
+
+    def test_getattr_needs_no_import_or_qualified_variant(self):
+        document = {"rules": [{"id": "observation-read", "pattern": 'getattr($OBJECT, "observed_members", ...)'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            rules_path = Path(directory) / "nso-rules.yaml"
+            rules_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+            self.assertEqual(_rule_violations(rules_path), [])
+
+    def test_exception_rendering_builtins_need_no_import_or_qualified_variant(self):
+        document = {
+            "rules": [
+                {
+                    "id": "exception-rendering",
+                    "pattern-either": [{"pattern": "str($ERROR)"}, {"pattern": "repr($ERROR)"}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            rules_path = Path(directory) / "nso-rules.yaml"
+            rules_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+            self.assertEqual(_rule_violations(rules_path), [])
 
     def test_rule_scan_finds_distinct_root_names(self):
         _, scanned_names = _scan_rules(_RULES_PATH)
@@ -263,6 +299,25 @@ class TestOpenGrepRuleStructure(SimpleTestCase):
 
 
 class TestOpenGrepAlternativeCoverage(SimpleTestCase):
+    def test_fixture_set_must_be_found_and_have_unique_basenames(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            copies = [Path(directory, name, _FIXTURE_PATH.name) for name in ("a", "b")]
+            cases = (
+                ("no fixture file found", [], patch.object(_COVERAGE, "_FIXTURE_PATHS", [])),
+                ("fixture basenames must be unique", ["--fixture", *map(str, copies)], contextlib.nullcontext()),
+            )
+            for message, argv, context in cases:
+                stderr = io.StringIO()
+                with self.subTest(message), context, contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as refused:
+                        _COVERAGE._parse_args(argv)
+                    self.assertEqual(refused.exception.code, 2)
+                    self.assertIn(message, stderr.getvalue())
+
     def test_generated_sub_rules_drop_path_filters(self):
         document = {
             "rules": [

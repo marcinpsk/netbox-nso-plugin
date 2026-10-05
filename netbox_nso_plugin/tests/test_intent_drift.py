@@ -126,6 +126,7 @@ class TestIntentDrift(IntentPushResetMixin, TestCase):
         # as owned even with a stale accepted_at set — so the adapter's 1 intent row reads
         # as orphaned and the scope is flagged.
         mock_sum.return_value = {"scopes": {"interface_intent": {"count": 1, "applied": 0, "failed": 0}}}
+        type(self.mgmt).objects.filter(pk=self.mgmt.pk).update(manage_description=True)
         state = acquire_overlay(
             NSOInterfaceState, interface=self.iface, attribute="description", status="accepted", accepted_at=None
         )

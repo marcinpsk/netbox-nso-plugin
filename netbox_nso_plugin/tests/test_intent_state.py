@@ -229,11 +229,51 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                         for scope in ("vlan", "svi", "switchport")
                     },
                 )
-        expected_count = 5 if family == "switchport" else 4
+        expected_count = 5 if family == "switchport" else 6  # Native topology locks add two bulk overlay reads.
         self.assertEqual(counts, [expected_count, expected_count], f"{family}: dependency query counts {counts}")
 
     def test_interface_tagged_vlan_dependency_queries_are_constant(self):
         self._assert_tagged_vlan_dependency_query_budget("interface")
+
+    def test_native_bundle_dependency_queries_are_constant_with_member_count(self):
+        import copy
+
+        from dcim.models import Interface
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        counts = []
+        with without_commit_drain(), transaction.atomic():
+            for count in (1, 12):
+                bundle = Interface.objects.create(device=self.device, name=f"test-bundle-{count}", type="lag")
+                bundle_state = NSOLACPBundleState.objects.create(
+                    management=self.management, interface=bundle, lag_id=count, status="imported"
+                )
+                members = []
+                for index in range(count):
+                    interface = Interface.objects.create(
+                        device=self.device, name=f"test-member-{count}-{index}", type="1000base-t", lag=bundle
+                    )
+                    members.append(
+                        NSOLACPMemberState.objects.create(
+                            management=self.management, interface=interface, status="imported"
+                        )
+                    )
+                spec = intent_state._REGISTRY["dcim.interface"]
+                after = copy.copy(bundle)
+                after.name = f"test-renamed-bundle-{count}"
+                with CaptureQueriesContext(connection) as queries:
+                    footprint, placement_changed = spec.dependency_resolver(bundle, after, spec)
+                counts.append(len(queries))
+                self.assertEqual(set(footprint.revision_keys), {(self.device.pk, "lacp")})
+                self.assertEqual(
+                    set(footprint.overlay_rows),
+                    {SourceRow(row._meta.label_lower, row.pk) for row in (bundle_state, *members)},
+                )
+                self.assertFalse(placement_changed)
+        self.assertEqual(counts[0], counts[1], f"native bundle dependency query counts {counts}")
 
     def test_switchport_tagged_vlan_dependency_queries_are_constant(self):
         self._assert_tagged_vlan_dependency_query_budget("switchport")
@@ -360,7 +400,9 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         from netbox_nso_plugin.intent_state import audit_scope_footprint
         from netbox_nso_plugin.models import NSOSwitchportState
 
-        interface = Interface.objects.create(device=self.device, name="Ethernet1623/2", type="1000base-t")
+        interface = Interface.objects.create(
+            device=self.device, name="Ethernet1623/2", type="1000base-t", mode="tagged"
+        )
         state = acquire_overlay(
             NSOSwitchportState,
             management=self.management,
@@ -903,6 +945,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 "ipam.rir",
                 "ipam.vlangroup",
                 "netbox_nso_plugin.nsoinstance",
+                "netbox_nso_plugin.nsoownershipmanifest",  # Episode locks do not contribute renderer fields.
                 "netbox_nso_plugin.nsoroutepolicyobjectclass",
                 "netbox_routing.bfdinterface",
                 "netbox_routing.bfdprofile",
@@ -1030,19 +1073,21 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             NSOPlatformNedMapping.objects.create(platform=platform, ned_id="test-ned")
 
             lag = Interface.objects.create(device=self.device, name="Bundle-Ether1", type="lag")
-            member = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+            member = Interface.objects.create(
+                device=self.device, name="Ethernet1", type="1000base-t", lag=lag, mode="tagged"
+            )
             acquire_overlay(
                 NSOLACPBundleState,
                 management=self.management,
                 interface=lag,
                 lag_id=1,
                 status="accepted",
+                observed_members=[member.name],
             )
             acquire_overlay(
                 NSOLACPMemberState,
                 management=self.management,
                 interface=member,
-                lag_bundle=lag,
                 mode="active",
                 status="accepted",
             )

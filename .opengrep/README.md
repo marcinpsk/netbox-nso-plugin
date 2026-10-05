@@ -14,20 +14,21 @@ Install OpenGrep from its official release, or set `OPENGREP_BIN` to an installe
 executable. The rules and fixtures are tested with OpenGrep 1.30.0. Install the
 repository hooks with `pre-commit install --install-hooks`.
 
-The pre-commit hooks scan the package and its test files when Python code, rules,
-or the runner changes. The directory scan uses the root `.semgrepignore` instead
+The pre-commit hooks scan the package and its test files when Python or JavaScript
+code, rules, or the runner changes. The directory scan uses the root `.semgrepignore` instead
 of OpenGrep defaults and disables Git ignore handling. It checks every Python
-file under `netbox_nso_plugin` except files in `/netbox_nso_plugin/migrations/`.
+and JavaScript file under `netbox_nso_plugin` except files in
+`/netbox_nso_plugin/migrations/`.
 The leading slash anchors this path at the repository root. The scan applies no
 file-size limit. Rule changes also run the annotated fixtures. Missing OpenGrep,
 invalid rules, and findings fail the hook. An explicit target is also supported:
-`scripts/check-review-patterns scan path/to/file.py`. Arguments after `scan` are
+`scripts/check-review-patterns scan path/to/file.js`. Arguments after `scan` are
 paths, not scanner options. Fixtures contain deliberate defects, so Ruff excludes
 only `.opengrep/tests`.
 
 Every rule ID and every positive pattern alternative must match at least one
-`# ruleid:` fixture line. The fixture hook fails when a rule or alternative has
-no matching defect. The fixture hook also checks that a push builder definition
+`# ruleid:` Python or `// ruleid:` JavaScript fixture line. The fixture hook fails
+when a rule or alternative has no matching defect. It also checks that a push builder definition
 in `delivery.py` is reported. The tree scan checks the remaining path filters.
 
 ## Preserve CodeRabbit's default scan
@@ -53,6 +54,7 @@ References checked on 2026-09-12:
 
 | Issue class | Mechanical check | Limit |
 | --- | --- | --- |
+| Empty fallback used as array validation before joining observed LACP members | `nso-observed-members-join-without-array-check` | JavaScript calls on `(row.observed_members \|\| [])` and `(row.observed_members ?? [])`. The rule accepts `Array.isArray` normalization and joins of other fields. Aliases and direct joins without a fallback are outside this call-shape check. |
 | Push scheduled while suppression is active | `nso-push-inside-suppression` | Direct or module-qualified calls (`signals.suppress_intent_push()`) in a suppression context. It does not follow helper calls. |
 | Assertion compares a value with itself | `nso-tautological-assertion` | Literal assertion shapes, not proof that every assertion reaches the intended path. |
 | Test `setUp` skips the intent-push reset | `nso-intent-push-reset-setup-chain` | A `setUp` in a class that lists `IntentPushResetMixin` as a direct base must call `super().setUp()`. Inherited mixins and module-qualified base names are not followed. |
@@ -91,3 +93,8 @@ shape. First confirm that the defect is missed, then implement the rule and run
 both commands above. Do not add a broad suppression to make the tree pass.
 
 The `nso-overlay-raw-sql-dml` rule blocks INSERT, UPDATE, and DELETE against overlay tables in production cursor, raw queryset, and RawSQL calls. Tests and migrations are exempt. Overlay writes must use the guarded ORM seam.
+
+The ownership refusal check rejects `str`, `repr`, and `.args` reads inside
+bare and module-qualified `OwnershipNotQualified` handlers. Use the authored
+`public_message` field. This check covers direct reads, not aliases or helper
+functions. CodeQL still checks exception diagnostics in HTTP responses.

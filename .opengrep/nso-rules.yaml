@@ -1,6 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-ownership-refusal-exception-diagnostic
+    languages: [python]
+    severity: ERROR
+    message: Use public_message for an ownership refusal. Do not render exception diagnostics.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              try:
+                  ...
+              except OwnershipNotQualified as $EXC:
+                  ...
+          - pattern-inside: |
+              try:
+                  ...
+              except $MODULE.OwnershipNotQualified as $EXC:
+                  ...
+      - pattern-either:
+          - pattern: str($EXC)
+          - pattern: repr($EXC)
+          - pattern: $EXC.args
+  - id: nso-observed-members-join-without-array-check
+    languages: [javascript]
+    severity: ERROR
+    message: Validate observed_members with Array.isArray before joining it. An empty fallback does not validate non-array values.
+    pattern-either:
+      - pattern: ($ROW.observed_members || []).join(...)
+      - pattern: ($ROW.observed_members ?? []).join(...)
   - id: nso-vlan-identity-from-interface-name
     languages: [python]
     severity: ERROR
@@ -621,3 +648,18 @@ rules:
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**", "**/migrations/**"]
+  - id: nso-lacp-observation-is-not-intent
+    languages: [python]
+    severity: ERROR
+    message: Read reported LACP members only in the LACP reconciler, topology, or view code.
+    pattern-either:
+      - pattern: $OBJECT.observed_members
+      - pattern: getattr($OBJECT, "observed_members", ...)
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude:
+        - "**/tests/**"
+        - "**/migrations/**"
+        - "**/lacp_reconciler.py"
+        - "**/lacp_topology.py"
+        - "**/views.py"

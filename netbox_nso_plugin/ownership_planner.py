@@ -14,7 +14,7 @@ from django.apps import apps
 from django.db import transaction
 from django.utils import timezone
 
-from .intent_state import NETBOX_BASE_METADATA_FIELDS, OVERLAY_MODEL_RANKS
+from .intent_state import NETBOX_BASE_METADATA_FIELDS, OVERLAY_MODEL_RANKS, IntentMutationProtocolError
 
 ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
     {
@@ -24,6 +24,15 @@ ROUTE_POLICY_NATIVE_MODEL_LABELS = MappingProxyType(
         "route_map": "netbox_routing.routemap",
     }
 )
+
+
+class OwnershipNotQualified(IntentMutationProtocolError):
+    """An explicit acquisition resolved a binding that does not qualify."""
+
+    def __init__(self, public_message, *, device_id=None):
+        super().__init__("Ownership acquisition is not qualified.")
+        self.public_message = public_message
+        self.device_id = device_id
 
 
 class OwnershipAction(str, Enum):
@@ -89,7 +98,7 @@ _CONVERTED_SCOPE_RULES = {
             ("netbox_nso_plugin.nsolacpbundlestate", "interface"),
             ("netbox_nso_plugin.nsolacpmemberstate", "interface"),
         ),
-        foreign_overlay_delete="reown",
+        foreign_overlay_delete="retire",
         deletion_authority=True,
         intentional_semantic_delta=(
             "Native bundle and member topology qualifies existing ownership. Acquisition requires an explicit operation."
@@ -768,6 +777,81 @@ def _retire_superseded_manifests(binding, previous_binding, retained_pk):
     )
 
 
+def _require_qualifying_acquisition(instance, binding, acquisition, *, signatures=None):
+    """Refuse a resolved explicit binding that the ownership audit would retract."""
+    from .status_machine import is_owned
+
+    if not acquisition or not is_owned(instance.status):
+        return
+    rule, scope, device_id, native_model_label, native_id, _native_key, state_model_label, state_key = binding
+    signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
+    management = _manifest_management(instance)
+    native = _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label])
+    qualifies = (
+        native is not None and not _native_anchor_lost(scope, native, device_id)
+        if rule.qualification == "overlay_anchor"
+        else signature
+        in (
+            signatures
+            if signatures is not None
+            else _qualifying_overlay_signatures(device_id, frozenset({scope}), management=management)
+        )
+    )
+    if not qualifies:
+        if scope == "lacp":
+            from .lacp_topology import native_validation_message
+
+            interface = instance.interface
+            if state_model_label.endswith("bundlestate"):
+                reason = f"NetBox does not model {interface.name} as a LAG"
+                detail = native_validation_message(interface, type="lag")
+            else:
+                bundle = interface.lag
+                reason = f"NetBox does not model {interface.name} as a member of {bundle.name if bundle else 'a LAG'}"
+                detail = native_validation_message(interface, lag=bundle) if bundle else ""
+            raise OwnershipNotQualified(reason + (f": {detail}" if detail else "."), device_id=device_id)
+        raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
+
+
+def require_qualifying_ownership(instance):
+    """Check a producer's resolved binding before it builds an acquisition plan."""
+    binding = manifest_binding(instance)
+    if binding is not None:
+        _require_qualifying_acquisition(instance, binding, True)
+
+
+def validate_plan_acquisitions(identities):
+    """Qualify each surviving acquisition against the final transaction state."""
+    signatures = {}
+    for label, pk in sorted(identities):
+        instance = apps.get_model(label)._default_manager.filter(pk=pk).first()
+        if instance is None:
+            continue
+        binding = manifest_binding(instance)
+        if binding is None:
+            continue
+        rule, scope, device_id, *_identity = binding
+        qualifying = None
+        if rule.qualification == "native_binding":
+            management = _manifest_management(instance)
+            key = (device_id, scope)
+            if key not in signatures:
+                signatures[key] = _qualifying_overlay_signatures(device_id, frozenset({scope}), management=management)
+            qualifying = signatures[key]
+        _require_qualifying_acquisition(instance, binding, True, signatures=qualifying)
+        maintain_manifest(instance)
+
+
+def _qualify_or_defer_acquisition(instance, binding, acquisition):
+    from .renderer_writer import active_renderer_writer
+
+    writer = active_renderer_writer()
+    if acquisition and writer is not None:
+        writer.record_acquisition(instance)
+    if binding is not None and writer is None:
+        _require_qualifying_acquisition(instance, binding, acquisition)
+
+
 @transaction.atomic
 def maintain_manifest(instance, *, grant=None, acquisition=False, previous_binding=None) -> None:
     """Make one overlay's manifest agree with its persisted ownership state."""
@@ -777,6 +861,7 @@ def maintain_manifest(instance, *, grant=None, acquisition=False, previous_bindi
     acquisition = _prepare_acquisition(instance, grant, acquisition)
 
     binding = manifest_binding(instance)
+    _qualify_or_defer_acquisition(instance, binding, acquisition)
     if binding is None:
         return
     rule, scope, device_id, native_model_label, native_id, native_key, state_model_label, state_key = binding
@@ -1322,16 +1407,6 @@ def _seed_interface_mtu(candidate, native, _manifest):
     candidate.l2_mtu = native.mtu
 
 
-def _seed_lacp_member(candidate, native, _manifest):
-    candidate.lag_bundle = native.lag
-    candidate.mode = ""
-
-
-def _seed_lacp_bundle(candidate, native, _manifest):
-    suffix = "".join(character for character in native.name if character.isdigit())
-    candidate.lag_id = int(suffix) if suffix else None
-
-
 def _seed_flex_algo(candidate, native, _manifest):
     candidate.process_tag = native.instance.process_tag
 
@@ -1392,8 +1467,6 @@ _STATE_SEEDERS = {
     "netbox_nso_plugin.nsoisisflexalgostate": _seed_flex_algo,
     "netbox_nso_plugin.nsoisisinstancestate": _seed_isis_instance,
     "netbox_nso_plugin.nsoisisinterfacestate": _seed_isis_interface,
-    "netbox_nso_plugin.nsolacpbundlestate": _seed_lacp_bundle,
-    "netbox_nso_plugin.nsolacpmemberstate": _seed_lacp_member,
     "netbox_nso_plugin.nsoospfinstancestate": _seed_ospf_instance,
     "netbox_nso_plugin.nsoospfinterfacestate": _seed_ospf_interface,
     "netbox_nso_plugin.nsoredistributionstate": _seed_redistribution,
@@ -1473,17 +1546,18 @@ def _interface_attribute_bindings(management):
 
 
 def _lacp_bindings(management):
-    from dcim.models import Interface
+    from .lacp_topology import bundle_interfaces, member_interfaces
 
-    bundles = (
-        _native_binding("lacp", row, "netbox_nso_plugin.nsolacpbundlestate")
-        for row in Interface.objects.filter(device_id=management.device_id, type="lag").order_by("pk")
+    return (
+        *(
+            _native_binding("lacp", row, "netbox_nso_plugin.nsolacpbundlestate")
+            for row in bundle_interfaces(management.device_id)
+        ),
+        *(
+            _native_binding("lacp", row, "netbox_nso_plugin.nsolacpmemberstate")
+            for row in member_interfaces(management.device_id)
+        ),
     )
-    members = (
-        _native_binding("lacp", row, "netbox_nso_plugin.nsolacpmemberstate")
-        for row in Interface.objects.filter(device_id=management.device_id, lag_id__isnull=False).order_by("pk")
-    )
-    return (*bundles, *members)
 
 
 def _vlan_bindings(management):
@@ -1914,6 +1988,47 @@ def _detach_manifest(manifest, *, expected_action, requested) -> bool:
 
 def _retire_manifest(manifest, *, expected_action, requested) -> bool:
     """Close a durable identity whose only content vanished with its overlay."""
+    if manifest.scope == "lacp":
+        from .intent_state import reconcile_family_footprint
+        from .lacp_topology import (
+            bundle_episode_retirement,
+            bundle_of,
+            execute_frozen_operations,
+            topology_snapshot,
+            topology_validator,
+        )
+        from .models import NSODeviceManagement
+        from .renderer_writer import RendererMutationPlan, renderer_writes_replanning_once
+        from .signals import suppress_intent_push
+
+        management = NSODeviceManagement.objects.filter(device_id=manifest.device_id).first()
+        if management is None:
+            return False
+
+        def plan_fn():
+            expected = topology_snapshot(management)
+            rechecked = _rechecked_manifest_action(manifest, requested, expected_action)
+            if rechecked is None:
+                return RendererMutationPlan.build()
+            native = rechecked[2]
+            bundle = native if manifest.state_model_label.endswith("bundlestate") else bundle_of(native)
+            return RendererMutationPlan.build(
+                saves=bundle_episode_retirement(management, bundle),
+                validate_after_acquire=topology_validator(management, expected),
+                additional_footprints=(reconcile_family_footprint(management.device_id, ("lacp",)),),
+                settles_deploying=False,
+            )
+
+        with renderer_writes_replanning_once(plan_fn) as (writer, plan), suppress_intent_push():
+            execute_frozen_operations(
+                writer,
+                {
+                    "netbox_nso_plugin.nsoownershipmanifest",
+                    "netbox_nso_plugin.nsolacpbundlestate",
+                    "netbox_nso_plugin.nsolacpmemberstate",
+                },
+            )
+            return bool(plan.write_set)
     return _transition_manifest_ownership(
         manifest,
         expected_action=expected_action,

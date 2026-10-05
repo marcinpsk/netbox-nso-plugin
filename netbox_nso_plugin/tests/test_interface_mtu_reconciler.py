@@ -187,6 +187,8 @@ class TestInterfaceMtuReconciler(TestCase):
 
         from ._outbox_case import content_update
 
+        self.po1.mtu = 9000
+        self.po1.save(update_fields=("mtu",))
         payload = {"interfaces": [_mtu_entry(self.po1.name, mtu=9000)]}
         interface_mtu_reconciler.reconcile_interface_mtu(self.device, payload)
         real_plan = interface_mtu_reconciler.interface_mtu_reconcile_plan
@@ -655,7 +657,7 @@ class TestInterfaceMtuWritePath(IntentPushResetMixin, TestCase):
         from ._outbox_case import mirror_update
 
         state = self._state(l2_mtu=9000)
-        other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag")
+        other = Interface.objects.create(device=self.device, name="Port-channel2", type="lag", mtu=1500)
         confirmed = acquire_overlay(
             NSOInterfaceMtuState,
             management=self.management,

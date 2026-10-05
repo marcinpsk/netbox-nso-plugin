@@ -407,7 +407,8 @@
     </div>
   </template>
 
-  <div id="nso-blocked-removals" class="mb-3 d-none"></div>
+  <div id="nso-blocked-removals" class="mb-3 d-none"
+       data-preview-url="{% url 'plugins:netbox_nso_plugin:device_apply_preview' object.pk %}"></div>
   <template id="nso-blocked-removal-tpl">
     <div class="alert alert-danger d-flex align-items-start mb-2" role="alert">
       <span class="mdi mdi-shield-alert-outline me-2 mt-1"></span>
@@ -419,12 +420,15 @@
         resolved. Re-accept the rows below in NetBox to keep them on the device, or force
         the removal to retract them deliberately.
         <ul class="mb-1 mt-1" data-slot="orphans"></ul>
-        <details class="mb-2">
-          <summary class="small">Dry-run preview of the refused device change</summary>
-          <pre class="small border rounded p-2 mt-1 mb-0"
+        <div class="mb-2">
+          <button type="button" class="btn btn-sm btn-outline-primary" data-action="preview">Preview current deployment</button>
+          <div class="small mt-1">Shows the current device-wide deployment. Force removal can differ
+            from this preview, especially for static routes.</div>
+          <div class="small text-muted" data-slot="generation"></div>
+          <pre class="small border rounded p-2 mt-1 mb-0 d-none"
                style="max-height: 20rem; overflow: auto; white-space: pre-wrap;"
-               data-slot="preview"></pre>
-        </details>
+               aria-live="polite" data-slot="preview"></pre>
+        </div>
         <form method="post" class="d-inline"
               action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_force_removal' mgmt.pk %}"
               onsubmit="return confirm('Force removal will RETRACT the listed orphaned rows from the live device. Continue?');">
@@ -511,15 +515,70 @@
     }
     var blockedBox = document.getElementById('nso-blocked-removals');
     var blockedTpl = document.getElementById('nso-blocked-removal-tpl');
+    function loadBlockedPreview(node) {
+      var button = node.querySelector('[data-action="preview"]');
+      var pre = node.querySelector('[data-slot="preview"]');
+      var identity = node.querySelector('[data-slot="generation"]');
+      if (button.disabled) return;
+      var seq = node.previewSeq = (node.previewSeq || 0) + 1;
+      function current() { return node.parentNode === blockedBox && node.previewSeq === seq; }
+      button.disabled = true;
+      pre.classList.remove('d-none');
+      pre.textContent = 'Loading current deployment preview…';
+      identity.textContent = '';
+      fetch(blockedBox.dataset.previewUrl, {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }, cache: 'no-store'
+      })
+        .then(function (r) { if (!r.ok) throw new Error('preview unavailable'); return r.json(); })
+        .then(function (d) {
+          if (!current()) return;
+          var validIdentity = Number.isInteger(d.generation_id) && d.generation_id > 0
+            && typeof d.document_digest === 'string' && /^[a-f0-9]{64}$/.test(d.document_digest);
+          var diffs = d.device_diff;
+          var validDiff = diffs && typeof diffs === 'object' && !Array.isArray(diffs)
+            && (Object.keys(diffs).length === 0 || (Object.keys(diffs).length === 1
+              && typeof diffs.device_intent === 'string'));
+          if (d.diff_available !== true || !validIdentity || !validDiff) {
+            pre.textContent = d.diff_error === 'invalid_response'
+              ? 'Preview unavailable: invalid adapter response.' : 'Preview unavailable. Try again.';
+            return;
+          }
+          identity.textContent = 'Current deployment generation ' + d.generation_id;
+          pre.textContent = diffs.device_intent || 'No device change for this generation.';
+        })
+        .catch(function () {
+          if (current()) pre.textContent = 'Preview unavailable. Try again.';
+        })
+        .finally(function () { if (current()) button.disabled = false; });
+    }
     function renderBlocked(list) {
       if (!blockedBox || !blockedTpl) return;
-      blockedBox.innerHTML = '';
-      if (!list || !list.length) { blockedBox.classList.add('d-none'); return; }
+      if (!list || !list.length) { blockedBox.replaceChildren(); blockedBox.classList.add('d-none'); return; }
       blockedBox.classList.remove('d-none');
+      var existing = new Map();
+      Array.from(blockedBox.children).forEach(function (node) { existing.set(node.dataset.blockKey, node); });
+      var keep = [];
       list.forEach(function (b) {
-        var node = blockedTpl.content.cloneNode(true);
+        var key = JSON.stringify([b.scope, b.job_id]);
+        var node = existing.get(key);
+        if (!node) {
+          node = blockedTpl.content.firstElementChild.cloneNode(true);
+          node.dataset.blockKey = key;
+          node.querySelector('[data-action="preview"]').addEventListener('click', function () { loadBlockedPreview(node); });
+        }
         node.querySelector('[data-slot="scope"]').textContent = b.scope;
+        var orphanKey = JSON.stringify(b.orphans || {});
+        if (node.dataset.orphanKey !== orphanKey) {
+          // A changed orphan set drops the loaded preview and any request still in flight.
+          node.previewSeq = (node.previewSeq || 0) + 1;
+          node.dataset.orphanKey = orphanKey;
+          node.querySelector('[data-slot="preview"]').classList.add('d-none');
+          node.querySelector('[data-slot="preview"]').textContent = '';
+          node.querySelector('[data-slot="generation"]').textContent = '';
+          node.querySelector('[data-action="preview"]').disabled = false;
+        }
         var ul = node.querySelector('[data-slot="orphans"]');
+        ul.replaceChildren();
         Object.keys(b.orphans || {}).forEach(function (list) {
           (b.orphans[list] || []).forEach(function (k) {
             var li = document.createElement('li');
@@ -528,14 +587,12 @@
             ul.appendChild(li);
           });
         });
-        var pre = node.querySelector('[data-slot="preview"]');
-        if (b.preview) { pre.textContent = b.preview; }
-        else { pre.closest('details').classList.add('d-none'); }
         node.querySelector('input[name="scope"]').value = b.scope;
         node.querySelector('[data-slot="job"]').textContent = b.job_id;
         node.querySelector('[data-slot="when"]').textContent = rel(b.blocked_at) || '';
-        blockedBox.appendChild(node);
+        keep.push(node);
       });
+      blockedBox.replaceChildren.apply(blockedBox, keep);
     }
     var residueBox = document.getElementById('nso-residue-removals');
     var residueTpl = document.getElementById('nso-residue-removal-tpl');
@@ -844,26 +901,8 @@
         h += '</tbody></table></div>';
       }
       if (d.routing_changes && d.routing_changes.length) {
-        var diffScopes = Object.keys(d.device_diff || {});
         h += '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Category</th><th>Item</th><th>Properties pushed</th><th>State</th></tr></thead><tbody>';
         d.routing_changes.forEach(function (c) {
-          // A staged row whose scope produced NO dry-run delta is already satisfied on
-          // the device (or unrepresentable on the NED) — say so instead of implying a push.
-          // But ONLY when a dry-run actually ran: if it threw (adapter down, NSO busy) the
-          // server also sends device_diff={}, and reading that as "no device change" told
-          // the operator every staged row already matched the device — the one moment the
-          // panel knows least is the one it sounded most certain.
-          var satisfied = d.diff_available && c.scope && diffScopes.indexOf(c.scope) === -1;
-          if (!satisfied && c.scope === 'route_policy' && c.item && c.item.length >= 3) {
-            // Shared-object scope: several policies ride ONE diff — flag the individual
-            // object when its name is absent (boundary-guarded so example-comm does not
-            // match inside example-comm-2). Best-effort heuristic; a miss shows no badge.
-            var rx = new RegExp(c.item.replace(/[.*+?^\x24{}()|[\]\\]/g, '\\$&') + '(?=[\\s{;]|$)');
-            satisfied = !rx.test(String(d.device_diff[c.scope] || ''));
-          }
-          var noChange = satisfied
-            ? ' <span class="badge text-bg-info" title="The NSO dry-run shows no device change for this intent — the device already matches it (or the NED cannot express it).">no device change</span>'
-            : '';
           // Staged-and-forgotten: accepted ≥7 days ago and still not settled — say it
           // loudly, whether no apply ever ran or an old apply never converged.
           var stale = '';
@@ -874,7 +913,7 @@
               : 'Accepted ' + c.staged_days + ' days ago and still not in sync — the last apply never converged or the change was re-staged.';
             stale = ' <span class="badge text-bg-warning text-dark" title="' + staleTitle + '">' + staleLabel + '</span>';
           }
-          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong>' + noChange + '</td><td><span class="text-muted small">' + esc(c.status) + '</span>' + stale + '</td></tr>';
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span>' + stale + '</td></tr>';
         });
         h += '</tbody></table></div>';
       }
@@ -929,7 +968,7 @@
         if (!d.diff_available) {
           return '<p class="text-warning mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
         }
-        return '<p class="text-muted mb-0">No device change — the intent already matches the device.</p>';
+        return '<p class="text-muted mb-0">No device change for this generation.</p>';
       }
       if (d.outformat === 'cli' && window.Diff2Html) {
         var unified = keys.map(function (k) {
@@ -985,7 +1024,7 @@
       // Keyed on THIS payload (not the cli-based skip decision): a non-empty dry-run
       // must render the two-panel layout even with zero itemised rows (#107).
       var hasDiff = d.device_diff && Object.keys(d.device_diff).length;
-      if (!d.total && !hasDiff) { return '<p class="text-muted mb-0">Nothing pending — NetBox and the device are in sync.</p>'; }
+      if (!d.total && !hasDiff && d.diff_available) { return '<p class="text-muted mb-0">No itemised pending changes. No device change for this generation.</p>'; }
       return ''
         + '<div class="row g-3">'
         + '  <div class="col-lg-4"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'

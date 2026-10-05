@@ -201,59 +201,6 @@ def _upsert_interface_states(device, interfaces: list) -> dict:
     return result
 
 
-def _reconcile_lag_topology(device, lag_data: dict) -> dict:
-    """Reconcile adapter LAG topology against NetBox interfaces.
-
-    Besides building the device-tab display structure, this writes NetBox's
-    native LAG model: each existing bundle interface is set to ``type='lag'``
-    and each existing member's ``lag`` FK is pointed at it; members no longer
-    reported in a bundle are unlinked (drift). Interfaces missing from NetBox
-    are not created here — they come from device sync — and are reported as
-    ``netbox_interface=None``.
-    """
-    from dcim.models import Interface
-
-    iface_map = {interface.name: interface for interface in Interface.objects.filter(device=device)}
-    reconciled_lags = []
-
-    for lag in lag_data.get("lags") or []:
-        bundle = iface_map.get(lag.get("name"))
-        if bundle is not None and bundle.type != "lag":
-            bundle.type = "lag"
-            bundle.save(update_fields=["type"])
-
-        reconciled_members = []
-        member_names: set[str] = set()
-        for member in lag.get("members") or []:
-            member_name = member.get("interface")
-            member_names.add(member_name)
-            member_iface = iface_map.get(member_name)
-            if bundle is not None and member_iface is not None and member_iface.lag_id != bundle.id:
-                member_iface.lag = bundle
-                member_iface.save(update_fields=["lag"])
-            reconciled_members.append({**member, "netbox_interface": member_iface})
-
-        # Drift: unlink NetBox members that NSO no longer reports in this bundle.
-        if bundle is not None:
-            for stale in Interface.objects.filter(device=device, lag=bundle).exclude(name__in=member_names):
-                stale.lag = None
-                stale.save(update_fields=["lag"])
-
-        reconciled_lags.append(
-            {
-                **lag,
-                "netbox_interface": bundle,
-                "members": reconciled_members,
-            }
-        )
-
-    return {
-        "refresh_source": lag_data.get("refresh_source"),
-        "last_refreshed_at": lag_data.get("last_refreshed_at"),
-        "lags": reconciled_lags,
-    }
-
-
 def _build_payload_index(payload: dict) -> tuple[set, dict, dict]:
     """Parse the adapter payload into a lookup set, attribute map, and bound-port map.
 
@@ -302,6 +249,23 @@ def _interface_ip_native(state, vrf_obj, IPAddress, interface_type):
     ).first()
 
 
+def _interface_ip_native_candidates(IPAddress, interface_type, iface_map, addresses):
+    """Index ordered native rows without changing either first-row lookup."""
+    address_field = IPAddress._meta.get_field("address")
+    prepared = {address_field.get_prep_value(address) for address in addresses}
+    interfaces = {interface.pk: interface for interface in iface_map.values()}
+    assigned_field = IPAddress._meta.get_field("assigned_object")
+    by_address = {}
+    by_assignment = {}
+    for native in IPAddress.objects.filter(address__in=prepared).select_related("vrf"):
+        if native.assigned_object_type_id == interface_type.pk and native.assigned_object_id in interfaces:
+            assigned_field.set_cached_value(native, interfaces[native.assigned_object_id])
+        key = (address_field.get_prep_value(native.address), native.vrf_id)
+        by_address.setdefault(key, native)
+        by_assignment.setdefault((*key, native.assigned_object_type_id, native.assigned_object_id), native)
+    return by_address, by_assignment
+
+
 def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0915
     """Build the exact native and overlay writes for one interface-IP read."""
     from dcim.models import Interface
@@ -310,7 +274,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
     from ipam.models import VRF, IPAddress
 
     from .models import NSOInterfaceIPState
-    from .renderer_writer import planned_delete, planned_save
+    from .renderer_writer import planned_save
 
     auto_create = _adapter_setting("interface_ip_auto_create")
     interface_type = ContentType.objects.get_for_model(Interface)
@@ -322,35 +286,57 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
         .order_by("pk")
     }
     payload_set, attr_map, bound_port_map = _build_payload_index(payload)
-    resolved_keys = set()
+    resolved_items = []
+    for iface_name, address, vrf_name in sorted(payload_set):
+        iface = iface_map.get(iface_name)
+        if iface is None and iface_name in bound_port_map:
+            iface = iface_map.get(bound_port_map[iface_name])
+        if iface is not None:
+            resolved_items.append((iface_name, address, vrf_name, iface))
+    resolved_keys = {(iface.pk, address, vrf_name) for _name, address, vrf_name, iface in resolved_items}
+    addresses = {address for _name, address, _vrf, _iface in resolved_items}
+    addresses.update(row.address for key, row in states.items() if key not in resolved_keys)
+    native_by_address, native_by_assignment = _interface_ip_native_candidates(
+        IPAddress, interface_type, iface_map, addresses
+    )
+    address_field = IPAddress._meta.get_field("address")
+    vrfs = {}
     saves = []
     deletes = []
     operations = []
     prefixes = []
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def vrf(name):
+        if name not in vrfs:
+            vrfs[name] = _interface_ip_vrf(VRF, name)
+        return vrfs[name]
+
+    def native_for_state(state, vrf_obj):
+        key = (
+            address_field.get_prep_value(state.address),
+            None if vrf_obj is None else vrf_obj.pk,
+            interface_type.pk,
+            state.interface_id,
+        )
+        return native_by_assignment.get(key)
+
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), expected_before=None):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                expected_before=expected_before,
             )
         )
         operations.append(("save", instance, update_fields, force_insert))
 
     def delete(instance):
-        deletes.append(planned_delete(instance))
-        operations.append(("delete", instance, None, False))
+        deletes.append(instance)
 
-    for iface_name, address, vrf_name in sorted(payload_set):
-        iface = iface_map.get(iface_name)
-        if iface is None and iface_name in bound_port_map:
-            iface = iface_map.get(bound_port_map[iface_name])
-        if iface is None:
-            continue
+    for iface_name, address, vrf_name, iface in resolved_items:
         key = (iface.pk, address, vrf_name)
-        resolved_keys.add(key)
         current = states.get(key)
         attrs = attr_map.get((iface_name, address, vrf_name), {})
         state = (
@@ -368,8 +354,10 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
         state.secondary = attrs.get("secondary", False)
         state.last_sync_at = planned_at
 
-        vrf_obj = _interface_ip_vrf(VRF, vrf_name)
-        existing_ip = IPAddress.objects.filter(address=address, vrf=vrf_obj).first()
+        vrf_obj = vrf(vrf_name)
+        existing_ip = native_by_address.get(
+            (address_field.get_prep_value(address), None if vrf_obj is None else vrf_obj.pk)
+        )
         previous_status = state.status
         if existing_ip is not None and existing_ip.assigned_object == iface:
             state.status = sm.on_reconcile(state.status, matches=True)
@@ -382,19 +370,23 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
             ):
                 native = copy.copy(existing_ip)
                 native.status = "active"
-                save(native, update_fields=("status",))
+                save(native, update_fields=("status",), expected_before=existing_ip)
                 if state.peer_state is not None:
-                    peer_vrf = _interface_ip_vrf(VRF, state.peer_state.vrf)
+                    peer_vrf = vrf(state.peer_state.vrf)
                     peer_ip = _interface_ip_native(state.peer_state, peer_vrf, IPAddress, interface_type)
                     if peer_ip is not None and peer_ip.status == "reserved":
                         peer_candidate = copy.copy(peer_ip)
                         peer_candidate.status = "active"
-                        save(peer_candidate, update_fields=("status",))
+                        save(peer_candidate, update_fields=("status",), expected_before=peer_ip)
         elif existing_ip is not None and existing_ip.assigned_object is None:
             if auto_create:
                 native = copy.copy(existing_ip)
                 native.assigned_object = iface
-                save(native, update_fields=("assigned_object_type", "assigned_object_id"))
+                save(
+                    native,
+                    update_fields=("assigned_object_type", "assigned_object_id"),
+                    expected_before=existing_ip,
+                )
                 state.status = sm.on_reconcile(state.status, matches=True)
             elif not sm.is_owned(state.status):
                 state.status = sm.on_reconcile(state.status, matches=True)
@@ -420,6 +412,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
             state,
             force_insert=current is None,
             natural_key=("interface", "address", "vrf"),
+            expected_before=current,
         )
 
     reported_addresses = {(interface_id, address) for interface_id, address, _vrf in resolved_keys}
@@ -427,13 +420,17 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
         key = (stale.interface_id, stale.address, stale.vrf)
         if key in resolved_keys:
             continue
-        stale_vrf = _interface_ip_vrf(VRF, stale.vrf)
-        native = _interface_ip_native(stale, stale_vrf, IPAddress, interface_type)
+        stale_vrf = vrf(stale.vrf)
+        native = native_for_state(stale, stale_vrf)
         if (stale.interface_id, stale.address) in reported_addresses:
             if native is not None:
                 native_candidate = copy.copy(native)
                 native_candidate.assigned_object = None
-                save(native_candidate, update_fields=("assigned_object_type", "assigned_object_id"))
+                save(
+                    native_candidate,
+                    update_fields=("assigned_object_type", "assigned_object_id"),
+                    expected_before=native,
+                )
             delete(stale)
             continue
         next_status = sm.on_reconcile(stale.status, present=False)
@@ -442,12 +439,18 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
         if native is not None:
             native_candidate = copy.copy(native)
             native_candidate.assigned_object = None
-            save(native_candidate, update_fields=("assigned_object_type", "assigned_object_id"))
+            save(
+                native_candidate,
+                update_fields=("assigned_object_type", "assigned_object_id"),
+                expected_before=native,
+            )
         candidate = copy.copy(stale)
         candidate.status = next_status
         candidate.last_sync_at = planned_at
-        save(candidate, update_fields=("status", "last_sync_at"))
+        save(candidate, update_fields=("status", "last_sync_at"), expected_before=stale)
 
+    if deletes:
+        operations.append(("delete_many", tuple(deletes), None, False))
     return saves, deletes, operations, prefixes
 
 
@@ -460,11 +463,12 @@ def _interface_ip_prefix_table(address, vrf_obj):
 
 def _interface_ip_plan_and_operations(device, payload, planned_at=None):
     """Freeze one interface-IP reconciliation before lock acquisition."""
-    from .renderer_writer import RendererMutationPlan
+    from .renderer_writer import RendererMutationPlan, planned_delete_many
 
     planned_at = planned_at or timezone.now()
     saves, deletes, operations, prefixes = _interface_ip_reconcile_operations(device, payload, planned_at)
-    plan = RendererMutationPlan.build(saves=saves, deletes=deletes, planned_at=planned_at)
+    batches = (planned_delete_many(deletes),) if deletes else ()
+    plan = RendererMutationPlan.build(saves=saves, delete_batches=batches, planned_at=planned_at)
     prefix_footprint = MutationFootprint.for_keys(
         (),
         shared_keys=(_interface_ip_prefix_table(address, vrf_obj)[1] for address, vrf_obj in prefixes),
@@ -537,8 +541,8 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     with mutation as writer, suppress_intent_push():
         for operation, instance, update_fields, force_insert in operations:
-            if operation == "delete":
-                writer.delete(instance)
+            if operation == "delete_many":
+                writer.delete_many(instance)
             else:
                 writer.save(instance, update_fields=update_fields, force_insert=force_insert)
         _ensure_interface_ip_prefixes(writer, prefixes)

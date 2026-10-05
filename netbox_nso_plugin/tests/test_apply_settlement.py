@@ -185,7 +185,7 @@ class TestAttemptSettlement(TestCase):
 
         attempt_id = uuid4()
         last_apply_at = timezone.now()
-        interface = Interface.objects.create(device=self.device, name="Port-channel1626", type="lag")
+        interface = Interface.objects.create(device=self.device, name="Port-channel1626", type="lag", mtu=9000)
         row = acquire_overlay(
             NSOInterfaceMtuState,
             management=self.management,
@@ -646,7 +646,7 @@ class TestAttemptSettlement(TestCase):
 
         attempt_id = uuid4()
         selected = {"interface_mtu": 505}
-        interface = Interface.objects.create(device=self.device, name="Port-channel1642", type="lag")
+        interface = Interface.objects.create(device=self.device, name="Port-channel1642", type="lag", mtu=9000)
         row = acquire_overlay(
             NSOInterfaceMtuState,
             management=self.management,
