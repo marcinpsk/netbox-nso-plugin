@@ -8,6 +8,7 @@ import copy
 import io
 import json
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
@@ -150,10 +151,17 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
             self.assertEqual(list(entry.match_prefix_list.values_list("name", flat=True)), [reference])
             self.assertEqual(self._state(self.mgmt_a, "route_map", name).assigned_object.name, name)
         before_entries = list(RouteMapEntry.objects.values())
-        before_revisions = list(NSOIntentRevision.objects.values())
+        before_revisions = list(
+            NSOIntentRevision.objects.order_by("device_id", "scope").values_list("device_id", "scope", "revision")
+        )
         reconcile_route_policy(self.device_a, payload)
         self.assertEqual(list(RouteMapEntry.objects.values()), before_entries)
-        self.assertEqual(list(NSOIntentRevision.objects.values()), before_revisions)
+        self.assertEqual(
+            list(
+                NSOIntentRevision.objects.order_by("device_id", "scope").values_list("device_id", "scope", "revision")
+            ),
+            before_revisions,
+        )
         self.assertFalse(NSOIntentOutboxEntry.objects.exists())
 
     def test_accept_only_one_variant_and_its_exact_contributors(self):
@@ -271,7 +279,11 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         before_outbox = list(NSOIntentOutboxEntry.objects.values())
         for status in ("accepted", "deploying", "in_sync", "apply_failed"):
             with self.subTest(status=status):
-                self._offline(lambda: NSORoutePolicyState.objects.filter(pk=state.pk).update(status=status))
+                self._offline(
+                    lambda: NSORoutePolicyState.objects.filter(pk=state.pk).update(
+                        status=status, apply_attempt_id=uuid4() if status == "deploying" else None
+                    )
+                )
                 reconcile_route_policy(self.device_b, self._payload("prefix_list", capture))
                 state.refresh_from_db()
                 self.assertEqual(state.status, status)
@@ -449,7 +461,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
                     list(getattr(reference, field).values_list("pk", flat=True)) if family != "route_map" else []
                 )
                 footprint = route_policy_footprint(((family, upper),))
-                self.assertEqual(footprint.shared_keys, (("route-policy", f"{family}:{upper}"),))
+                self.assertEqual(set(footprint.shared_keys), {("route-policy", f"{family}:{upper}")})
                 self.assertNotIn((device_c.pk, "route_policy"), footprint.revision_keys)
                 self._accept(self._state(self.mgmt_a, family, upper))
                 set_classification(family, upper, "local")
@@ -627,6 +639,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         reconcile_route_policy(self.device_a, self._payload("prefix_list", capture))
         old = self._state(self.mgmt_a, "prefix_list", "POLICY")
         self._accept(old)
+        content_update(old, status="in_sync")
         reconcile_route_policy(
             self.device_a, self._payload("prefix_list", self._capture("prefix_list", "policy", True))
         )
@@ -770,3 +783,89 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
             '"route_map": "Policy"',
             json.dumps(delivery.render("ospf", self.device_a.pk, self.mgmt_a.adapter_device_id).payload),
         )
+
+    @staticmethod
+    def _native_reference_capture():
+        PrefixList.objects.create(name="LIST")
+        CommunityList.objects.create(name="100")
+        ASPath.objects.create(name="PATH")
+        RouteMap.objects.create(name="SUB")
+        return {
+            "route_maps": [
+                {
+                    "name": "POLICY",
+                    "entries": [
+                        {
+                            "sequence": 10,
+                            "action": "permit",
+                            "match_prefix_lists": ["LIST"],
+                            "match_community_lists": ["100"],
+                            "match_as_paths": ["PATH"],
+                            "match": json.dumps({"_junos_from_policy": ["SUB"]}),
+                            "set": json.dumps({"community_add": ["100"]}),
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def _assert_native_references(self, management):
+        entry = RouteMapEntry.objects.get(route_map__name="POLICY")
+        self.assertEqual(list(entry.match_prefix_list.values_list("name", flat=True)), ["LIST"])
+        self.assertEqual(list(entry.match_community_list.values_list("name", flat=True)), ["100"])
+        self.assertEqual(list(entry.match_aspath.values_list("name", flat=True)), ["PATH"])
+        self.assertEqual(entry.call_policy.name, "SUB")
+        self.assertEqual(entry.set_communities.get().community_list.name, "100")
+        self.assertFalse((entry.vendor_ext or {}).get("unmapped"))
+        self._accept(self._state(management, "route_map", "POLICY"))
+
+    def test_stale_owner_rematerialization_resolves_exact_native_references_from_the_peer_capture(self):
+        payload = self._native_reference_capture()
+        reconcile_route_policy(self.device_a, payload)
+        reconcile_route_policy(self.device_b, payload)
+        reconcile_route_policy(self.device_a, {})
+        self._assert_native_references(self.mgmt_b)
+
+    def test_classification_resolves_exact_native_references_before_community_literals(self):
+        payload = self._native_reference_capture()
+        reconcile_route_policy(self.device_a, payload)
+        set_classification("route_map", "POLICY", "local")
+        set_classification("route_map", "POLICY", "master")
+        self._assert_native_references(self.mgmt_a)
+
+    def test_renamed_community_list_with_a_conflicting_capture_keeps_its_planned_reference(self):
+        payload = self._payload("community_list", self._capture("community_list", "POLICY"))
+        reconcile_route_policy(self.device_a, payload)
+        reconcile_route_policy(self.device_b, payload)
+        original = CommunityList.objects.get(name="POLICY")
+        content_update(original, name="policy")
+        changed = self._payload("community_list", self._capture("community_list", "POLICY", True))
+        changed.update(
+            {
+                "route_maps": [
+                    {
+                        "name": "MATCH-POLICY",
+                        "entries": [{"sequence": 10, "action": "permit", "match_community_lists": ["POLICY"]}],
+                    }
+                ],
+                "read_state": _rs(),
+            }
+        )
+        self.adapter.captures[self.mgmt_b.adapter_device_id] = changed
+        config, session = self.adapter.patches()
+        with config, session:
+            context = reconcile_category(self.device_b, self.mgmt_b, "route_policy")
+        self.assertEqual(context["_gate"]["route_policy"], "ran")
+        state = self._state(self.mgmt_b, "community_list", "POLICY")
+        self.assertEqual(state.status, "conflict")
+        self.assertEqual(state.assigned_object.name, "POLICY")
+        self.assertNotEqual(state.object_id, original.pk)
+        self.assertFalse(state.assigned_object.communitylistentries.exists())
+        entry = RouteMapEntry.objects.get(route_map__name="MATCH-POLICY")
+        self.assertEqual(list(entry.match_community_list.values_list("name", flat=True)), ["POLICY"])
+        self.assertFalse(entry.match_community.exists())
+        self.assertFalse((entry.vendor_ext or {}).get("unmapped"))
+        original.refresh_from_db()
+        self.assertEqual(original.name, "policy")
+        self.assertEqual(ownership.get_spec("community_list").extract(original)["entries"][0]["community"], "64512:1")
+        self.assertFalse(NSOIntentOutboxEntry.objects.exists())

@@ -5068,7 +5068,7 @@ def _route_map_name_errors(state, old_name):
     old_class_ids = tuple(
         NSORoutePolicyObjectClass.objects.filter(
             family="route_map",
-            object_name__iexact=old_name,
+            object_name=old_name,
         ).values_list("pk", flat=True)
     )
     for field_name, messages_list in _route_map_name_collision_errors(
@@ -5088,7 +5088,7 @@ def _route_map_name_errors(state, old_name):
         NSORoutePolicyState.objects.filter(
             management_id__in=attached_mgmt_ids,
             family="route_map",
-            object_name__iexact=state.object_name,
+            object_name=state.object_name,
         )
         .exclude(content_type_id=state.content_type_id, object_id=state.object_id)
         .exists()
@@ -5116,7 +5116,7 @@ def _route_map_rename_dependents(route_map, old_name):
     )
     redistribution_states = list(
         NSORedistributionState.objects.filter(
-            Q(redistribution__route_map=route_map) | Q(redistribution__isnull=True, route_map__iexact=old_name),
+            Q(redistribution__route_map=route_map) | Q(redistribution__isnull=True, route_map=old_name),
             status__in=owned,
         ).select_related("management")
     )
@@ -5130,15 +5130,15 @@ def _route_map_rename_dependents(route_map, old_name):
 
 
 def _route_map_name_collision_errors(route_map_model, route_map_pk, new_name, class_ids):
-    """Return case-insensitive native and classification rename conflicts."""
+    """Return exact native and classification rename conflicts."""
     from .models import NSORoutePolicyObjectClass
 
-    if route_map_model.objects.filter(name__iexact=new_name).exclude(pk=route_map_pk).exists():
+    if route_map_model.objects.filter(name=new_name).exclude(pk=route_map_pk).exists():
         return {"object_name": ["A route map with this name already exists."]}
     if class_ids and (
         NSORoutePolicyObjectClass.objects.filter(
             family="route_map",
-            object_name__iexact=new_name,
+            object_name=new_name,
         )
         .exclude(pk__in=class_ids)
         .exists()
@@ -5166,16 +5166,12 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
             object_id=state.object_id,
         ).order_by("pk")
     )
-    classes = list(
-        NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name__iexact=old_name).order_by("pk")
-    )
+    classes = list(NSORoutePolicyObjectClass.objects.filter(family="route_map", object_name=old_name).order_by("pk"))
     class_ids = tuple(policy_class.pk for policy_class in classes)
     attached_ids = tuple(attached_state.pk for attached_state in attached)
     attached_management_ids = tuple(attached_state.management_id for attached_state in attached)
     fallback_redistribution = [
-        row
-        for row in redistribution_states
-        if row.redistribution_id is None and row.route_map.casefold() == old_name.casefold()
+        row for row in redistribution_states if row.redistribution_id is None and row.route_map == old_name
     ]
     operations = []
     for attached_state in attached:
@@ -5207,7 +5203,7 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
             NSORoutePolicyState.objects.filter(
                 management_id__in=attached_management_ids,
                 family="route_map",
-                object_name__iexact=new_name,
+                object_name=new_name,
             )
             .exclude(pk__in=attached_ids)
             .exists()
@@ -5227,7 +5223,7 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
         dependent_route_policy_targets.update(
             NSORoutePolicyState.objects.filter(
                 family=family,
-                object_name__iexact=name,
+                object_name=name,
                 status__in=signals._OWNED_PUSH_STATUSES,
                 management__adapter_device_id__isnull=False,
             ).values_list("management__device_id", flat=True)
@@ -7792,7 +7788,7 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
         current = NSORoutePolicyState.objects.filter(
             management=mgmt,
             family=family,
-            object_name__iexact=obj.name,
+            object_name=obj.name,
         ).first()
         created = current is None
         if current is None:

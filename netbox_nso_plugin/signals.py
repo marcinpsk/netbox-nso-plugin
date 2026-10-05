@@ -16,6 +16,7 @@ from django.db.models.signals import m2m_changed, post_delete, post_save, pre_de
 from django.dispatch import receiver
 from django.utils import timezone
 
+from .renderer_audit import RendererAuditRepairFailed
 from .snmp_versions import canonical_snmp_version
 from .status_machine import OWNED_STATES as _OWNED_PUSH_STATUSES
 
@@ -2994,19 +2995,28 @@ def _on_redistribution_state_save(sender, instance, **kwargs):
         _schedule_redistribution_push(mgmt.device_id, instance.dest_protocol)
 
 
+class RoutePolicyBindingInvalid(RendererAuditRepairFailed):
+    """A policy overlay is bound to a native object with a different exact name."""
+
+
 def route_policy_intent_item(row):
     """Return one owned route-policy object in the adapter's exact wire shape."""
     obj = row.assigned_object
     if obj is None:
         return None
     from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
-    from .renderer_audit import RendererAuditRepairFailed
 
     target_label = obj._meta.label_lower
     if ROUTE_POLICY_NATIVE_MODEL_LABELS.get(row.family) != target_label:
         raise RendererAuditRepairFailed(
             f"route-policy family {row.family!r} cannot render target model {target_label!r}"
         )
+    if obj.name != row.object_name:
+        raise RoutePolicyBindingInvalid(
+            f"route-policy {row.family} {row.object_name!r} is bound to native name {obj.name!r}"
+        )
+    if row.family == "route_map":
+        _refuse_unmapped_route_policy_references(row, obj)
     return {
         "family": row.family,
         "name": row.object_name,
@@ -3014,6 +3024,19 @@ def route_policy_intent_item(row):
         "accepted": True,
         **({"invert_match": bool(getattr(obj, "invert_match", False))} if row.family == "community_list" else {}),
     }
+
+
+def _refuse_unmapped_route_policy_references(row, obj):
+    for entry in obj.route_map_entries.all().order_by("sequence"):
+        unmapped = (entry.vendor_ext or {}).get("unmapped", {})
+        references = {
+            key: value for key, value in unmapped.items() if key.startswith("match_") or key == "set_community"
+        }
+        if references:
+            raise RendererAuditRepairFailed(
+                f"route-policy {row.object_name!r} entry {entry.sequence} has unresolved references: "
+                f"{json.dumps(references, sort_keys=True)}"
+            )
 
 
 def _push_route_policy_intent_for_device(device_id, adapter_device_id):
@@ -3453,7 +3476,7 @@ def _route_policy_acquisition_plan(mgmt, *, grant, primary_operations=(), route_
     planned_at = timezone.now()
     saves = []
     operations = list(primary_operations)
-    staged = {(candidate.family, candidate.object_name.casefold()) for candidate, _fields, _created in operations}
+    staged = {(candidate.family, candidate.object_name) for candidate, _fields, _created in operations}
     for candidate, fields, created in operations:
         saves.append(
             planned_save(
@@ -3466,14 +3489,14 @@ def _route_policy_acquisition_plan(mgmt, *, grant, primary_operations=(), route_
     drifted: list = []
     cross_device: list = []
     for family, obj in _route_map_contributors(route_maps):
-        key = (family, obj.name.casefold())
+        key = (family, obj.name)
         if key in staged:
             continue
         ct = ContentType.objects.get_for_model(obj)
         state = NSORoutePolicyState.objects.filter(
             management=mgmt,
             family=family,
-            object_name__iexact=obj.name,
+            object_name=obj.name,
         ).first()
         created = state is None
         if state is None:
