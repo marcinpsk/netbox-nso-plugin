@@ -1450,6 +1450,16 @@ def _effective_after(instance, before, update_fields):
                 field.set_cached_value(effective, field.get_cached_value(instance))
             elif field.is_cached(effective):
                 field.delete_cached_value(effective)
+    for relation in instance._meta.private_fields:
+        # A generic relation saved through both columns keeps the caller's planned target.
+        if getattr(relation, "fk_field", None) is None or not {relation.ct_field, relation.fk_field} <= set(
+            update_fields
+        ):
+            continue
+        if relation.is_cached(instance):
+            relation.set_cached_value(effective, relation.get_cached_value(instance))
+        elif relation.is_cached(effective):
+            relation.delete_cached_value(effective)
     return effective
 
 

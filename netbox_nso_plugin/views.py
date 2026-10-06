@@ -5173,11 +5173,15 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
     fallback_redistribution = [
         row for row in redistribution_states if row.redistribution_id is None and row.route_map == old_name
     ]
+    route_map_candidate = copy.copy(route_map)
+    route_map_candidate.name = new_name
     operations = []
     for attached_state in attached:
         candidate = copy.copy(attached_state)
         candidate.object_name = new_name
-        update_fields = {"object_name"}
+        # Render the prospective row against the prospective native name.
+        candidate.assigned_object = route_map_candidate
+        update_fields = {"object_name", "content_type", "object_id"}
         if candidate.pk == state.pk:
             if not sm.is_owned(candidate.status):
                 candidate.accepted_at = planned_at
@@ -5189,8 +5193,6 @@ def _route_map_name_edit_operations(state, old_name, planned_at):
         candidate = copy.copy(policy_class)
         candidate.object_name = new_name
         operations.append((candidate, ("object_name",)))
-    route_map_candidate = copy.copy(route_map)
-    route_map_candidate.name = new_name
     operations.append((route_map_candidate, ("name",)))
     for redistribution_state in fallback_redistribution:
         candidate = copy.copy(redistribution_state)
