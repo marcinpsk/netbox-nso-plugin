@@ -2572,6 +2572,28 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(state.is_materialized)
         self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
 
+    def test_omitted_referenced_prefix_list_reconciles_while_another_device_has_policy_state(self):
+        """A read of a reference edge locks the devices the edge renders for."""
+        from netbox_routing.models import PrefixList, RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        management = self._mgmt(self.d1)
+        self._mgmt(self.d2)
+        reconcile_route_policy(self.d1, self._pl("PL-REFERENCED-READ", ["198.18.96.0/24"]))
+        reconcile_route_policy(self.d2, self._pl("PL-OTHER-DEVICE", ["198.18.97.0/24"]))
+        prefix_list = PrefixList.objects.get(name="PL-REFERENCED-READ")
+        caller = RouteMap.objects.create(name="RM-REFERENCES-PL")
+        entry = RouteMapEntry.objects.create(route_map=caller, sequence=10, action="permit")
+        entry.match_prefix_list.add(prefix_list)
+
+        reconcile_route_policy(self.d1, {})
+
+        state = NSORoutePolicyState.objects.get(management=management, object_name="PL-REFERENCED-READ")
+        self.assertFalse(state.device_present)
+        self.assertEqual(list(entry.match_prefix_list.values_list("pk", flat=True)), [prefix_list.pk])
+
     def test_diverged_unowned_replacement_keeps_intent_and_revision(self):
         from netbox_routing.models import PrefixListEntry
 

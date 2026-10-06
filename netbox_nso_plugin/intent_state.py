@@ -454,12 +454,18 @@ class MutationFootprint:
     @classmethod
     def merge(cls, *footprints: MutationFootprint) -> MutationFootprint:
         """Combine footprints during discovery, before any lock is acquired."""
-        return cls.for_keys(
+        merged = cls.for_keys(
             (key for footprint in footprints for key in footprint.revision_keys),
             shared_keys=(key for footprint in footprints for key in footprint.shared_keys),
             source_rows=(row for footprint in footprints for row in footprint.source_rows),
             overlay_rows=(row for footprint in footprints for row in footprint.overlay_rows),
         )
+        # Keep device locks that carry no revision key.
+        device_ids = {
+            *merged.device_ids,
+            *(device_id for footprint in footprints for device_id in footprint.device_ids),
+        }
+        return replace(merged, device_ids=tuple(sorted(device_ids)))
 
 
 @dataclass(frozen=True)

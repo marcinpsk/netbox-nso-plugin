@@ -455,10 +455,12 @@ def _plan_read(instance):
     else:
         raise IntentMutationProtocolError(f"{label} is not a ranked renderer dependency")
     read = RendererRead(model_label=label, pk=stored.pk, values=_field_values(stored, None))
-    footprint = MutationFootprint.for_keys(
-        (),
-        **{row_kind: (SourceRow(label, stored.pk),)},
-    )
+    spec = renderer_input_specs().get(label)
+    footprint = MutationFootprint.for_keys((), **{row_kind: (SourceRow(label, stored.pk),)})
+    if spec is not None:
+        # Lock the plan-time target devices, not their revisions: a read bumps nothing.
+        targets = {device_id for device_id, _scope in spec.resolver(stored, spec)}
+        footprint = replace(footprint, device_ids=tuple(sorted(targets)))
     return read, footprint
 
 
