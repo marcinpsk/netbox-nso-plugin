@@ -3028,7 +3028,7 @@ def route_policy_intent_item(row):
 
 def route_map_entry_unmapped(entry, route_map_name):
     """Return the entry's ``vendor_ext["unmapped"]`` markers; refuse any other shape."""
-    vendor_ext = entry.vendor_ext or {}
+    vendor_ext = {} if entry.vendor_ext is None else entry.vendor_ext
     unmapped = vendor_ext.get("unmapped", {}) if isinstance(vendor_ext, dict) else None
     if not isinstance(unmapped, dict):
         raise RendererAuditRepairFailed(

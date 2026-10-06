@@ -275,7 +275,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         entry = RouteMapEntry.objects.create(route_map=native, sequence=1, action="permit")
         capture = {"name": "MALFORMED", "entries": [{"sequence": 10, "action": "permit"}]}
         state = self._own(self.mgmt_a, "route_map", native, captured=capture)
-        for vendor_ext in ({"unmapped": None}, {"unmapped": ["X"]}, ["unmapped"]):
+        for vendor_ext in ({"unmapped": None}, {"unmapped": ["X"]}, ["unmapped"], [], ""):
             with self.subTest(vendor_ext=vendor_ext):
                 self._offline(
                     lambda value=vendor_ext: RouteMapEntry.objects.filter(pk=entry.pk).update(vendor_ext=value)
