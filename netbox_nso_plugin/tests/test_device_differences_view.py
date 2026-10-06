@@ -124,3 +124,40 @@ class TestDeviceDifferencesView(TestCase):
         self.assertNotContains(response, "not supported yet")
         self.assertContains(response, "Ethernet2 198.18.0.1/24 (VRF example-vrf)")
         self.assertNotContains(response, "&#x27;Ethernet2&#x27;")
+
+    def _candidate_page(self):
+        from ipam.models import IPAddress
+
+        from ._observation_case import ip_observation
+
+        candidate = IPAddress.objects.create(address="198.18.0.1/32")
+        state = NSOFamilyReadState.objects.create(management=self.management, family="interface_ip")
+        snapshot = observation("interface_ip", interfaces=[ip_observation("Ethernet2")])
+        NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("interface_ip", 1, 1, snapshot))
+        return candidate
+
+    def _ip_rows(self, response):
+        return [row for row in response.context["page_obj"] if row["scope"] == "ip" and row["kind"] == "device_only"]
+
+    def test_association_candidate_the_user_cannot_view_is_not_rendered(self):
+        candidate = self._candidate_page()
+        response = self.client.get(self.url, {"scope": "ip"})
+        self.assertEqual(response.status_code, 200)
+        (row,) = self._ip_rows(response)
+        self.assertIsNone(row["association_candidate"])
+        self.assertNotContains(response, "Proposed association")
+        self.assertNotContains(response, candidate.get_absolute_url())
+
+    def test_association_candidate_the_user_can_view_is_rendered(self):
+        from ipam.models import IPAddress
+
+        candidate = self._candidate_page()
+        permission = ObjectPermission.objects.create(
+            name="View the candidate", actions=["view"], constraints={"pk": candidate.pk}
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+        permission.users.add(self.user)
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._ip_rows(response)
+        self.assertEqual(row["association_candidate"], candidate)
+        self.assertContains(response, f"(IP #{candidate.pk})")
