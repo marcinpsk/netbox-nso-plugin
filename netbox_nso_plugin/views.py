@@ -496,10 +496,14 @@ _PENDING_KINDS = {"pending", "apply_failed"}
 # into the single row-level state the grid sorts and quick-filters on.
 _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
 
-# Grid category → the intent-push scope whose rejection record belongs on its banner.
-# Only the scopes whose push failures are persisted appear here (see
-# signals._record_push_outcome); a category with no entry simply renders no banner.
-_CATEGORY_PUSH_SCOPES = {"static": "static_route", "subinterface": "subinterface", "svi": "svi"}
+# Each category maps to the independent push scopes shown on its banner.
+_CATEGORY_PUSH_SCOPES = {
+    "static": ("static_route",),
+    "subinterface": ("subinterface",),
+    "svi": ("svi",),
+    "redistribution": ("ospf", "isis", "bgp"),
+}
+_PUSH_SCOPE_LABELS = {"ospf": "OSPF", "isis": "IS-IS", "bgp": "BGP"}
 _PUBLIC_PUSH_REASONS = frozenset(
     {
         "backfill_carries_deletions",
@@ -542,20 +546,32 @@ def _push_error_kind(code, reason):
 
 
 def _category_push_error(key, mgmt):
-    """Return this category's persisted intent-push failure, classified for the banner.
+    """Return all outstanding scope failures as one safe banner object."""
+    scopes = _CATEGORY_PUSH_SCOPES.get(key)
+    if scopes is None or mgmt is None:
+        return None
+    errors = [
+        (scope, _scope_push_error(entry))
+        for scope in scopes
+        if isinstance(entry := (mgmt.intent_push_errors or {}).get(scope), dict)
+    ]
+    if not errors:
+        return None
+    if len(scopes) == 1:
+        return errors[0][1]
+    result = {
+        field: "; ".join(f"{_PUSH_SCOPE_LABELS[scope]}: {error.get(field, '')}" for scope, error in errors)
+        for field in ("code", "headline", "message", "attempt", "at")
+    }
+    result["detail"] = {}
+    result["kind"] = next(
+        kind for kind in ("unknown", "unsent", "rejected") if any(error["kind"] == kind for _scope, error in errors)
+    )
+    return result
 
-    A failed push is not an adapter READ error: the operator's edit was saved and the
-    device was never told. Without this the only trace is a log line — the grid would show
-    a green, freshly-accepted row over intent that never landed. The classification is
-    derived here rather than stored, so a record written before this existed still renders
-    honestly.
-    """
-    scope = _CATEGORY_PUSH_SCOPES.get(key)
-    if scope is None or mgmt is None:
-        return None
-    entry = (mgmt.intent_push_errors or {}).get(scope)
-    if not isinstance(entry, dict):
-        return None
+
+def _scope_push_error(entry):
+    """Classify one persisted failure and expose only fixed public text."""
     code = entry.get("code") if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", str(entry.get("code") or "")) else ""
     detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
     reason = detail.get("reason")
