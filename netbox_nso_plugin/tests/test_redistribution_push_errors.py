@@ -53,7 +53,9 @@ class TestRedistributionPushErrors(_CascadeFlushMixin, IntentPushResetMixin, Tra
         acquire_overlay(
             NSOISISInstanceState, management=self.mgmt, isis_instance=isis, process_tag="CORE", status="in_sync"
         )
-        acquire_overlay(NSOOSPFInstanceState, management=self.mgmt, ospf_instance=ospf, process_id=1, status="in_sync")
+        acquire_overlay(
+            NSOOSPFInstanceState, management=self.mgmt, ospf_instance=ospf, process_id="1", status="in_sync"
+        )
         self.rejections = {"isis": "bgp_source_as_required"}
         self.adapter = ReceiptAdapter(respond=self._adapter_response)
         for patcher in self.adapter.patches():
