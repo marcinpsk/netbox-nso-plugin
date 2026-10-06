@@ -1529,9 +1529,14 @@ def _native_binding(scope, native, state_model_label, state_key=None):
     return scope, native, state_model_label, state_key or {}
 
 
-def _interface_attribute_bindings(management):
+def device_interfaces(management):
+    """Return every native interface used by the interface binding projection."""
     from dcim.models import Interface
 
+    return Interface.objects.filter(device_id=management.device_id).order_by("pk")
+
+
+def _interface_attribute_bindings(management):
     attributes = tuple(management.managed_attributes)
     return tuple(
         _native_binding(
@@ -1540,7 +1545,7 @@ def _interface_attribute_bindings(management):
             "netbox_nso_plugin.nsointerfacestate",
             {"attribute": attribute},
         )
-        for interface in Interface.objects.filter(device_id=management.device_id).order_by("pk")
+        for interface in device_interfaces(management)
         for attribute in attributes
     )
 
@@ -1602,10 +1607,14 @@ def _ip_bindings(management):
     from ipam.models import IPAddress
 
     interface_type = ContentType.objects.get_for_model(Interface)
-    rows = IPAddress.objects.filter(
-        assigned_object_type=interface_type,
-        assigned_object_id__in=Interface.objects.filter(device_id=management.device_id).values("pk"),
-    ).order_by("pk")
+    rows = (
+        IPAddress.objects.filter(
+            assigned_object_type=interface_type,
+            assigned_object_id__in=Interface.objects.filter(device_id=management.device_id).values("pk"),
+        )
+        .select_related("vrf")
+        .order_by("pk")
+    )
     return tuple(_native_binding("ip", row, "netbox_nso_plugin.nsointerfaceipstate") for row in rows)
 
 

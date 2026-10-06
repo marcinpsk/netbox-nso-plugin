@@ -729,8 +729,9 @@ def _invalidate_source_admissions(instance) -> int:
     from django.db.models import F
 
     from .models import NSOFamilyReadState
-    from .read_gate import _RESET_FIELDS
+    from .read_gate import _RESET_FIELDS, delete_observations
 
+    delete_observations(instance)
     return NSOFamilyReadState.objects.filter(management=instance).update(
         **_RESET_FIELDS,
         publication_sequence=F("publication_sequence") + 1,
@@ -847,6 +848,7 @@ def _onboard_into_adapter(instance, client) -> bool:
             nso_device_name=current.nso_device_name,
             netbox_device_id=current.device_id,
         )
+        _invalidate_source_admissions(current)
         current.adapter_device_id = result["id"]
         current.adapter_source_epoch = result.get("source_epoch")
         current.source_epoch_aware = result.get("source_epoch") is not None

@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import contextlib
 import copy
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -794,6 +795,78 @@ def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
             and not (kinds_by_iface[i.id] & _PENDING_KINDS)
         ]
     return ordered  # "all" (or unknown) → no filter
+
+
+class NSODeviceDifferencesView(LoginRequiredMixin, View):
+    """Render snapshot differences without an adapter read or a reconcile."""
+
+    def get(self, request, pk):
+        from django.core.paginator import Paginator
+
+        from .device_differences import (
+            KINDS,
+            MISSING,
+            NOT_SUPPORTED,
+            differences,
+            identity_label,
+            observation_snapshots,
+        )
+        from .ownership_planner import converted_scope_rules
+
+        permissions = ("dcim.view_device", "netbox_nso_plugin.view_nsodevicemanagement")
+        if not all(request.user.has_perm(permission) for permission in permissions):
+            raise PermissionDenied
+        device = get_object_or_404(Device.objects.restrict(request.user, "view"), pk=pk)
+        management = get_object_or_404(NSODeviceManagement.objects.restrict(request.user, "view"), device=device)
+        scope = request.GET.get("scope", "")
+        kind = request.GET.get("kind", "")
+        snapshots = observation_snapshots(management)
+        rows = differences(management, snapshots=snapshots)
+        not_compared = [row.scope for row in rows if row.kind == "unavailable" and row.reason == NOT_SUPPORTED]
+        rows = [row for row in rows if row.scope not in not_compared]
+        scoped = [row for row in rows if not scope or row.scope == scope]
+        counts = {value: sum(row.kind == value for row in scoped) for value in KINDS}
+        filtered = [row for row in scoped if not kind or row.kind == kind]
+        css = {
+            "netbox_only": "text-bg-info",
+            "device_only": "text-bg-primary",
+            "mismatch": "text-bg-warning text-dark",
+            "ambiguous": "text-bg-danger",
+            "unavailable": "text-bg-dark",
+        }
+
+        def display(value):
+            return str(value) if value is MISSING else json.dumps(value, sort_keys=True, default=str)
+
+        page = Paginator(filtered, 50).get_page(request.GET.get("page"))
+        page.object_list = [
+            {
+                "scope": row.scope,
+                "kind": row.kind,
+                "css": css[row.kind],
+                "identity": identity_label(row),
+                "attribute": row.attribute,
+                "netbox_value": display(row.netbox_value),
+                "device_value": display(row.device_value),
+                "reason": row.reason,
+                "association_candidate": row.association_candidate,
+            }
+            for row in page.object_list
+        ]
+        return render(
+            request,
+            "netbox_nso_plugin/categories/differences.html",
+            {
+                "device": device,
+                "page_obj": page,
+                "scope": scope,
+                "kind": kind,
+                "scopes": sorted(set(converted_scope_rules()) - set(not_compared)),
+                "not_compared": not_compared,
+                "counts": counts,
+                "snapshots": [snapshots[family] for family in sorted(snapshots)],
+            },
+        )
 
 
 class NSOCategoryView(LoginRequiredMixin, View):

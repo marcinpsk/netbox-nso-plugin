@@ -534,6 +534,14 @@ _RESET_FIELDS = {
     "applied_publication_sequence": 0,
 }
 
+
+def delete_observations(management):
+    """Remove snapshots when the management source identity changes."""
+    from .models import NSOFamilyObservation
+
+    NSOFamilyObservation.objects.filter(read_state__management=management).delete()
+
+
 _MARKER_FIELDS = [
     "adapter_incarnation",
     "adapter_incarnation_born",
@@ -615,6 +623,7 @@ def _adopt_incarnation(m, inc: str, born) -> None:
 
     from .models import NSOFamilyReadState
 
+    delete_observations(m)
     blanked = NSOFamilyReadState.objects.filter(management=m).update(
         **_RESET_FIELDS,
         publication_sequence=F("publication_sequence") + 1,
@@ -693,6 +702,7 @@ def _adopt_source_epoch(m, row, source_epoch) -> str | None:
 
         from .models import NSOFamilyReadState
 
+        delete_observations(m)
         blanked = NSOFamilyReadState.objects.filter(management=m).update(
             **_RESET_FIELDS,
             publication_sequence=F("publication_sequence") + 1,
@@ -904,6 +914,18 @@ def mark_publication_error_if_current(mgmt, family: str, decision: _Decision, ep
     return True
 
 
+def _publication_observation(family, decision, observation):
+    from .adapter_client import AdapterError
+    from .observations import OBSERVATION_ATTRIBUTES, ObservationProtocolError, observation_defaults
+
+    if decision.disposition != RAN or decision.payload_revision is None or family not in OBSERVATION_ATTRIBUTES:
+        return None
+    try:
+        return observation_defaults(family, decision.payload_revision, decision.source_epoch, observation)
+    except ObservationProtocolError as exc:
+        raise AdapterError(str(exc), code="invalid_response") from exc
+
+
 def gated_family_run(
     mgmt,
     family: str,
@@ -912,15 +934,12 @@ def gated_family_run(
     *,
     epoch,
     pre_body: Callable[[], Any] | None = None,
+    observation: dict | None = None,
 ) -> GateResult:
     """ONE family document → ONE gate decision → at most ONE body run (R3-6).
 
-    The admission transaction commits BEFORE the body runs, so a body failure after
-    admission keeps ``applied_*`` advanced (deliberate — the read was real; the
-    materialization failure surfaces via the caller's existing scope-error path).
-    An admitted body is fenced right before it runs (B5-F2): if a successor already
-    applied a newer attempt, the stale body is refused. LEGACY has no attempt
-    ordering — it runs unfenced.
+    Admission commits before publication. Body writes, applied identity, and the
+    observation commit together under the publication fence.
     """
     decision = _gate_and_record(mgmt, family, read_state, epoch=epoch)
     if not decision.run_body:
@@ -966,7 +985,16 @@ def gated_family_run(
             row = NSOFamilyReadState.objects.select_for_update().get(management=current_management, family=family)
             if not _locked_publication_matches(current_management, row, decision, epoch):
                 raise _SupersededPublication
+            snapshot = _publication_observation(family, decision, observation)
             value = body()
+            if snapshot is not None:
+                from .models import NSOFamilyObservation
+
+                current_management.refresh_from_db()
+                row.refresh_from_db()
+                if not _locked_publication_matches(current_management, row, decision, epoch):
+                    raise _SupersededPublication
+                NSOFamilyObservation.objects.update_or_create(read_state=row, defaults=snapshot)
             row.applied_attempt_id = decision.attempt_id
             row.applied_incarnation = decision.incarnation
             row.applied_source_epoch = decision.source_epoch
@@ -1060,6 +1088,7 @@ def observe_aggregate(mgmt, read_states: dict[str, dict | None], *, epoch) -> bo
 
                 from .models import NSOFamilyReadState
 
+                delete_observations(m)
                 NSOFamilyReadState.objects.filter(management=m).update(
                     publication_sequence=F("publication_sequence") + 1
                 )
