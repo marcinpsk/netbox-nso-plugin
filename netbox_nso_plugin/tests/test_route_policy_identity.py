@@ -43,6 +43,7 @@ from netbox_nso_plugin.signals import route_policy_intent_item, suppress_intent_
 
 from ._adapter_http import make_response
 from ._outbox_case import ReceiptAdapter, content_update, make_managed, own_route, without_commit_drain
+from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_read_gate import _rs
 
@@ -78,13 +79,16 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         return NSORoutePolicyState.objects.get(management=management, family=family, object_name=name)
 
     def _accept(self, state):
+        state.refresh_from_db()
+        # Accepting a row that already matches the device owns it as in_sync.
+        expected = "in_sync" if state.status in ("imported", "in_sync") else "accepted"
         with without_commit_drain():
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:routing_accept_route_policy", args=[state.pk])
             )
         self.assertEqual(response.status_code, 302, response.content)
         state.refresh_from_db()
-        self.assertEqual(state.status, "accepted")
+        self.assertEqual(state.status, expected)
 
     def _send(self, device):
         config, session = self.adapter.patches()
@@ -119,6 +123,25 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
     def _offline(self, function):
         with transaction.atomic(), offline_mutation(), suppress_intent_push():
             return function()
+
+    @staticmethod
+    def _own(management, family, native, **values):
+        """Acquire an overlay bound to ``native`` under its current exact name."""
+        return acquire_overlay(
+            NSORoutePolicyState,
+            management=management,
+            family=family,
+            object_name=native.name,
+            content_type=ContentType.objects.get_for_model(native),
+            object_id=native.pk,
+            status="accepted",
+            **values,
+        )
+
+    def _rename_native(self, native, name):
+        """Rename a native object out of band, as an old stored binding left it."""
+        self._offline(lambda: type(native).objects.filter(pk=native.pk).update(name=name))
+        native.refresh_from_db()
 
     def test_case_pairs_complete_the_route_policy_scope_and_repeat_without_content_changes(self):
         payload = {
@@ -237,17 +260,10 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
     def test_cross_variant_binding_refuses_render_and_publication(self):
         from netbox_nso_plugin.signals import RoutePolicyBindingInvalid
 
-        native = RouteMap.objects.create(name="accept-all")
-        state = self._offline(
-            lambda: NSORoutePolicyState.objects.create(
-                management=self.mgmt_a,
-                family="route_map",
-                object_name="ACCEPT-ALL",
-                content_type=ContentType.objects.get_for_model(RouteMap),
-                object_id=native.pk,
-                status="accepted",
-            )
-        )
+        native = RouteMap.objects.create(name="ACCEPT-ALL")
+        state = self._own(self.mgmt_a, "route_map", native)
+        self._rename_native(native, "accept-all")
+        state = NSORoutePolicyState.objects.get(pk=state.pk)
         with self.assertRaisesRegex(RoutePolicyBindingInvalid, "ACCEPT-ALL.*accept-all"):
             route_policy_intent_item(state)
         with self.assertRaises(RoutePolicyBindingInvalid):
@@ -514,18 +530,17 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
     def test_reset_runbook_checks_the_claim_then_prepares_deletes_resumes_reconciles_accepts_and_verifies(self):
         lower = RouteMap.objects.create(name="policy")
         RouteMapEntry.objects.create(route_map=lower, sequence=1, action="permit")
+        upper = RouteMap.objects.create(name="POLICY")
         for management in (self.mgmt_a, self.mgmt_b):
-            for name in ("POLICY", "policy"):
-                self._offline(
-                    lambda: NSORoutePolicyState.objects.create(
-                        management=management,
-                        family="route_map",
-                        object_name=name,
-                        content_type=ContentType.objects.get_for_model(RouteMap),
-                        object_id=lower.pk,
-                        status="accepted",
-                    )
-                )
+            for native in (upper, lower):
+                self._own(management, "route_map", native)
+        config, session = self.adapter.patches()
+        with config, session:
+            for device in (self.device_a, self.device_b):
+                self.assertEqual(drain.drain_key(device.pk, "route_policy"), drain.SUCCEEDED)
+        # The old case-folded reconcile bound both variants to one native root.
+        self._offline(lambda: NSORoutePolicyState.objects.filter(object_name="POLICY").update(object_id=lower.pk))
+        self._offline(upper.delete)
         for name in ("POLICY", "policy"):
             NSORoutePolicyObjectClass.objects.create(family="route_map", object_name=name, mode="master")
         own_route(self.mgmt_a, "198.18.10.0/24", "198.18.0.1")
@@ -598,17 +613,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         capture = {"name": "OLD-GRAPH", "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": ["X"]}]}
         root = RouteMap.objects.create(name=capture["name"])
         RouteMapEntry.objects.create(route_map=root, sequence=1, action="permit")
-        self._offline(
-            lambda: NSORoutePolicyState.objects.create(
-                management=self.mgmt_a,
-                family="route_map",
-                object_name=root.name,
-                content_type=ContentType.objects.get_for_model(RouteMap),
-                object_id=root.pk,
-                status="accepted",
-                captured=capture,
-            )
-        )
+        self._own(self.mgmt_a, "route_map", root, captured=capture)
         before_entries = list(RouteMapEntry.objects.values())
         before_revisions = list(NSOIntentRevision.objects.values())
         stdout = io.StringIO()
@@ -663,8 +668,6 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         )
 
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOOSPFInstanceState, NSORedistributionState
-
-        from ._ownership_case import acquire_overlay
 
         rir = RIR.objects.create(name="Policy private", slug="policy-private", is_private=True)
         local = ASN.objects.create(asn=64512, rir=rir)

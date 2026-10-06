@@ -229,13 +229,13 @@ class TestReconcileRoutePolicy(TestCase):
         payload = {
             "community_lists": [
                 {"name": "CL-MASTER", "entries": []},
-                {"name": "cl-local", "entries": []},
+                {"name": "CL-LOCAL", "entries": []},
                 {"name": "CL-ATTACHED", "entries": []},
             ]
         }
         reconcile_route_policy(self.device, payload)
         master = NSORoutePolicyState.objects.get(management=management, object_name="CL-MASTER")
-        local = NSORoutePolicyState.objects.get(management=management, object_name="cl-local")
+        local = NSORoutePolicyState.objects.get(management=management, object_name="CL-LOCAL")
         attached_local = NSORoutePolicyState.objects.get(management=management, object_name="CL-ATTACHED")
         NSORoutePolicyObjectClass.objects.create(
             family="community_list",
@@ -2542,7 +2542,7 @@ class TestSharedObjectOwnership(TestCase):
         self.assertTrue(state.is_materialized)
         self.assertFalse(CommunityListEntry.objects.filter(community_list=root).exists())
 
-    def test_owned_prefix_list_capture_replaces_content_when_the_group_has_no_owner(self):
+    def test_owned_prefix_list_capture_never_replaces_content_when_the_group_has_no_owner(self):
         from netbox_routing.models import PrefixListEntry
 
         from netbox_nso_plugin.models import NSORoutePolicyState
@@ -2556,9 +2556,11 @@ class TestSharedObjectOwnership(TestCase):
         reconcile_route_policy(self.d1, initial)
         state = NSORoutePolicyState.objects.get(management=management, object_name="PL-OWNED-FIRST-CAPTURE")
         content_update(state, status="accepted", is_materialized=False)
+        before = list(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).order_by("pk").values())
+        self.assertTrue(before)
         payload = self._pl(state.object_name, [])
 
-        self.assertTrue(route_policy_reconcile_plan(self.d1, payload).changes_content)
+        self.assertFalse(route_policy_reconcile_plan(self.d1, payload).changes_content)
 
         with (
             patch("netbox_nso_plugin.reconcile._acquire_reconcile_lease", return_value=_LeaseOutcome()),
@@ -2569,8 +2571,10 @@ class TestSharedObjectOwnership(TestCase):
         state.refresh_from_db()
         self.assertEqual(result["_gate"]["route_policy"], "legacy")
         self.assertEqual(state.status, "accepted")
-        self.assertTrue(state.is_materialized)
-        self.assertFalse(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).exists())
+        self.assertFalse(state.is_materialized)
+        self.assertEqual(
+            list(PrefixListEntry.objects.filter(prefix_list_id=state.object_id).order_by("pk").values()), before
+        )
 
     def test_omitted_referenced_prefix_list_reconciles_while_another_device_has_policy_state(self):
         """A read of a reference edge locks the devices the edge renders for."""

@@ -403,7 +403,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
             scope_revisions={"route_policy": revision},
         )
         community_list = CommunityList.objects.get(name="CLJ")
-        content_update(community_list, name="CLJ-NEW")
+        content_update(community_list, invert_match=not community_list.invert_match)
         carrier = _job(8528, in_sync=1)
         carrier["apply_attempt_id"] = str(attempt_id)
 

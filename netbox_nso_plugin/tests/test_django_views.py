@@ -6143,7 +6143,7 @@ class TestOverlayFieldEditView(ViewTestBase):
             status="imported",
         )
 
-        response = self.client.post(self._url("route_map_name", row.pk), {"object_name": "rm-taken"})
+        response = self.client.post(self._url("route_map_name", row.pk), {"object_name": "RM-TAKEN"})
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("object_name", response.json()["errors"])
