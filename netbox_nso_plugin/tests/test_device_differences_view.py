@@ -22,15 +22,8 @@ from .test_gated_reconcile import _make
 
 class TestDeviceDifferencesView(TestCase):
     def setUp(self):
-        from dcim.models import Device
-
         self.device, self.management = _make(f"panel{uuid4().hex[:8]}", manage_description=True)
-        self.user = get_user_model().objects.create_user(username=f"panel{uuid4().hex[:8]}")
-        permission = ObjectPermission.objects.create(name="View device differences", actions=["view"])
-        permission.object_types.add(
-            ObjectType.objects.get_for_model(Device), ObjectType.objects.get_for_model(NSODeviceManagement)
-        )
-        permission.users.add(self.user)
+        self.user = self._viewer()
         self.client.force_login(self.user)
         state = NSOFamilyReadState.objects.create(management=self.management, family="interface_attributes")
         snapshot = observation("interface_attributes", interfaces=[interface_observation("Ethernet2")])
@@ -38,6 +31,17 @@ class TestDeviceDifferencesView(TestCase):
             read_state=state, **observation_defaults("interface_attributes", 1, 1, snapshot)
         )
         self.url = reverse("plugins:netbox_nso_plugin:device_nso_differences", kwargs={"pk": self.device.pk})
+
+    @staticmethod
+    def _viewer(*, interfaces=True):
+        from dcim.models import Device, Interface
+
+        user = get_user_model().objects.create_user(username=f"panel{uuid4().hex[:8]}")
+        permission = ObjectPermission.objects.create(name=f"View differences {user.username}", actions=["view"])
+        models = [Device, NSODeviceManagement] + ([Interface] if interfaces else [])
+        permission.object_types.add(*(ObjectType.objects.get_for_model(model) for model in models))
+        permission.users.add(user)
+        return user
 
     def test_permitted_get_renders_rows_and_snapshot_without_writes(self):
         transport = ObservationTransport(
@@ -161,3 +165,74 @@ class TestDeviceDifferencesView(TestCase):
         (row,) = self._ip_rows(response)
         self.assertEqual(row["association_candidate"], candidate)
         self.assertContains(response, f"(IP #{candidate.pk})")
+
+    def _scope_rows(self, response, scope):
+        return [row for row in response.context["page_obj"] if row["scope"] == scope]
+
+    def _ip_snapshot(self, *interfaces):
+        state = NSOFamilyReadState.objects.create(management=self.management, family="interface_ip")
+        snapshot = observation("interface_ip", interfaces=list(interfaces))
+        NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("interface_ip", 1, 1, snapshot))
+
+    def _assigned_ip(self, address):
+        from dcim.models import Interface
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import IPAddress
+
+        interface = Interface.objects.get(device=self.device, name="lag-60")
+        return IPAddress.objects.create(
+            address=address,
+            assigned_object_type=ContentType.objects.get_for_model(Interface),
+            assigned_object_id=interface.pk,
+        )
+
+    def test_interface_the_user_cannot_view_is_not_listed(self):
+        self.client.force_login(self._viewer(interfaces=False))
+        response = self.client.get(self.url, {"scope": "interface"})
+        self.assertEqual([row["identity"] for row in self._scope_rows(response, "interface")], ["Ethernet2"])
+        self.assertNotContains(response, "lag-60")
+
+    def test_interface_the_user_cannot_view_but_the_device_reports_is_ambiguous(self):
+        state = NSOFamilyReadState.objects.get(management=self.management, family="interface_attributes")
+        snapshot = observation("interface_attributes", interfaces=[interface_observation("lag-60")])
+        NSOFamilyObservation.objects.filter(read_state=state).update(
+            **observation_defaults("interface_attributes", 1, 1, snapshot)
+        )
+        self.client.force_login(self._viewer(interfaces=False))
+        response = self.client.get(self.url, {"scope": "interface"})
+        (row,) = self._scope_rows(response, "interface")
+        self.assertEqual((row["kind"], row["identity"]), ("ambiguous", "lag-60"))
+        self.assertEqual(row["reason"], "NetBox object is not visible to you")
+        self.assertEqual(row["netbox_value"], "missing")
+
+    def test_ip_the_user_cannot_view_is_not_listed(self):
+        self._assigned_ip("198.18.0.9/24")
+        self._ip_snapshot()
+        response = self.client.get(self.url, {"scope": "ip"})
+        self.assertEqual(self._scope_rows(response, "ip"), [])
+        self.assertNotContains(response, "198.18.0.9")
+
+    def test_ip_the_user_cannot_view_but_the_device_reports_is_ambiguous_without_its_prefix(self):
+        from ._observation_case import ip_observation
+
+        self._assigned_ip("198.18.0.9/24")
+        self._ip_snapshot(ip_observation("lag-60", "198.18.0.9/32", prefix_length=32))
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["identity"]), ("ambiguous", "lag-60 198.18.0.9/32"))
+        self.assertEqual(row["reason"], "NetBox object is not visible to you")
+        self.assertEqual(row["netbox_value"], "missing")
+
+    def test_ip_the_user_can_view_is_compared(self):
+        from ipam.models import IPAddress
+
+        native = self._assigned_ip("198.18.0.9/24")
+        permission = ObjectPermission.objects.create(
+            name="View the IP", actions=["view"], constraints={"pk": native.pk}
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+        permission.users.add(self.user)
+        self._ip_snapshot()
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["identity"]), ("netbox_only", "lag-60 198.18.0.9/24"))

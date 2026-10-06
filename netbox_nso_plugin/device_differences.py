@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Derive read-only NetBox differences from the last published device observations."""
 
+import contextlib
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from .template_content import interface_ip_vrf_candidates_by_name, resolve_inter
 
 KINDS = ("netbox_only", "device_only", "mismatch", "ambiguous", "unavailable")
 NOT_SUPPORTED = "not supported yet"
+NOT_VISIBLE = "NetBox object is not visible to you"
 
 
 class _MissingValue:
@@ -62,7 +64,15 @@ def _interface_blockers(native, device):
     return "multiple interfaces have the same name" if len(native) > 1 or len(device) > 1 else ""
 
 
-def _interface_rows(spec, management, snapshot):
+def _visible_pks(model, user, objects):
+    return set(
+        model.objects.restrict(user, "view").filter(pk__in=[obj.pk for obj in objects]).values_list("pk", flat=True)
+    )
+
+
+def _interface_rows(spec, management, snapshot, user):
+    from dcim.models import Interface
+
     attributes = [
         projection
         for projection in spec.attributes
@@ -70,9 +80,14 @@ def _interface_rows(spec, management, snapshot):
     ]
     native = defaultdict(list)
     device = defaultdict(list)
+    hidden = set()
     rows = []
-    for interface in device_interfaces(management):
-        if not interface.name:
+    interfaces = list(device_interfaces(management))
+    visible = _visible_pks(Interface, user, interfaces)
+    for interface in interfaces:
+        if interface.pk not in visible:
+            hidden.add(interface.name)
+        elif not interface.name:
             rows.append(
                 Difference(spec.scope, "ambiguous", f"interface {interface.pk}", reason="missing interface name")
             )
@@ -82,7 +97,7 @@ def _interface_rows(spec, management, snapshot):
         device[spec.identity(item)].append(item)
     for name in sorted(native.keys() | device.keys()):
         native_items, device_items = native[name], device[name]
-        reason = spec.blockers(native_items, device_items)
+        reason = NOT_VISIBLE if name in hidden else spec.blockers(native_items, device_items)
         if reason:
             rows.append(Difference(spec.scope, "ambiguous", name, reason=reason))
         elif not native_items:
@@ -205,13 +220,23 @@ def _ip_group_rows(spec, native, device, candidates, device_count):
     return rows
 
 
-def _ip_rows(spec, management, snapshot):
+def _ip_rows(spec, management, snapshot, user):
+    from ipam.models import IPAddress
+
     interfaces = {interface.pk: interface for interface in device_interfaces(management)}
     device, rows, blocked = _ip_device_index(
         spec, snapshot, {interface.name: interface for interface in interfaces.values()}
     )
     native = defaultdict(list)
-    for _scope, ip, _model, _key in _ip_bindings(management):
+    hidden = set()
+    bindings = [ip for _scope, ip, _model, _key in _ip_bindings(management)]
+    visible = _visible_pks(IPAddress, user, bindings)
+    for ip in bindings:
+        if ip.pk not in visible:
+            with contextlib.suppress(KeyError, ValueError):
+                item = _native_ip_projection(ip, interfaces)
+                hidden.add((item["interface"], item["host"], ip.vrf_id))
+            continue
         interface = interfaces.get(ip.assigned_object_id)
         if interface is None or not interface.name:
             rows.append(Difference(spec.scope, "ambiguous", str(ip.address), reason="native interface is unavailable"))
@@ -227,7 +252,11 @@ def _ip_rows(spec, management, snapshot):
     for key, items in device.items():
         device_counts[(key[1], key[2])] += len(items)
     for key in sorted(native.keys() | device.keys(), key=repr):
-        if key not in blocked:
+        if key in hidden:
+            rows.append(
+                Difference(spec.scope, "ambiguous", spec.identity((device[key] or native[key])[0]), reason=NOT_VISIBLE)
+            )
+        elif key not in blocked:
             host_vrf = (key[1], key[2])
             rows.extend(_ip_group_rows(spec, native[key], device[key], candidates[host_vrf], device_counts[host_vrf]))
     return rows
@@ -289,8 +318,8 @@ def observation_snapshots(management):
     }
 
 
-def differences(management, *, snapshots=None):
-    """Return ordered differences using only snapshots and current NetBox rows."""
+def differences(management, *, user, snapshots=None):
+    """Return ordered differences using only snapshots and the NetBox rows *user* can view."""
     if snapshots is None:
         snapshots = observation_snapshots(management)
     rows = []
@@ -303,7 +332,7 @@ def differences(management, *, snapshots=None):
         if snapshot is None:
             rows.append(Difference(scope, "unavailable", reason="no successful read yet"))
             continue
-        rows.extend(spec.rows(spec, management, snapshot))
+        rows.extend(spec.rows(spec, management, snapshot, user))
         rows.extend(
             Difference(scope, "ambiguous", f"device entry {item['index']}", reason=item["reason"])
             for item in snapshot.document["unprojectable"]

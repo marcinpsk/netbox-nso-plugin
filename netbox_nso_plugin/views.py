@@ -822,7 +822,7 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
         scope = request.GET.get("scope", "")
         kind = request.GET.get("kind", "")
         snapshots = observation_snapshots(management)
-        rows = differences(management, snapshots=snapshots)
+        rows = differences(management, user=request.user, snapshots=snapshots)
         not_compared = [row.scope for row in rows if row.kind == "unavailable" and row.reason == NOT_SUPPORTED]
         rows = [row for row in rows if row.scope not in not_compared]
         scoped = [row for row in rows if not scope or row.scope == scope]

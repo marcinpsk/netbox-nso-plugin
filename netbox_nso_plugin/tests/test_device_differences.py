@@ -5,6 +5,7 @@
 from uuid import uuid4
 
 from dcim.models import Interface
+from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection
 from django.test import TestCase
@@ -26,6 +27,7 @@ class TestDeviceDifferences(TestCase):
         self.device, self.management = _make(
             f"diff{uuid4().hex[:8]}", manage_interfaces=True, manage_description=True, manage_enabled=True
         )
+        self.user = get_user_model().objects.create_superuser(username=f"diff{uuid4().hex[:8]}")
         self.interface = Interface.objects.get(device=self.device)
         self.interface.name = "Ethernet1"
         self.interface.description = "NetBox description"
@@ -40,7 +42,7 @@ class TestDeviceDifferences(TestCase):
         )
 
     def _rows(self, scope):
-        return [row for row in differences(self.management) if row.scope == scope]
+        return [row for row in differences(self.management, user=self.user) if row.scope == scope]
 
     def _ip(self, address="198.18.0.1/24", *, interface=None, vrf=None, assigned=True):
         return IPAddress.objects.create(
@@ -193,7 +195,7 @@ class TestDeviceDifferences(TestCase):
                 ],
             )
             with CaptureQueriesContext(connection) as captured:
-                differences(self.management)
+                differences(self.management, user=self.user)
             return len(captured)
 
         self.assertEqual(queries(2), queries(6))
@@ -240,7 +242,7 @@ class TestDeviceDifferences(TestCase):
         self.assertEqual([row.kind for row in self._rows("ip")], ["ambiguous"])
 
     def test_other_scopes_are_explicitly_unavailable(self):
-        rows = [row for row in differences(self.management) if row.scope not in ("interface", "ip")]
+        rows = [row for row in differences(self.management, user=self.user) if row.scope not in ("interface", "ip")]
         self.assertEqual({row.scope for row in rows}, set(converted_scope_rules()) - {"interface", "ip"})
         self.assertTrue(all((row.kind, row.reason) == ("unavailable", "not supported yet") for row in rows))
 
@@ -253,7 +255,7 @@ class TestDeviceDifferences(TestCase):
             self.management.adapter_device_id, observation("interface_attributes"), observation("interface_ip")
         )
         with bound_session(transport.session()), CaptureQueriesContext(connection) as queries:
-            differences(self.management)
+            differences(self.management, user=self.user)
         self.assertEqual(transport.requests, [])
         self.assertFalse(any(query["sql"].lstrip().split()[0] in {"INSERT", "UPDATE", "DELETE"} for query in queries))
         self.assertEqual(
