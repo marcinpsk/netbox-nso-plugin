@@ -4,9 +4,11 @@
 
 import json
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin.models import NSORoutePolicyState
+from netbox_nso_plugin.renderer_audit import RendererAuditRepairFailed
+from netbox_nso_plugin.signals import route_map_entry_unmapped
 
 _MATCH_REFERENCES = (
     ("match_prefix_lists", "match_prefix_list"),
@@ -34,7 +36,10 @@ class Command(BaseCommand):
                 if position >= len(entries):
                     continue
                 entry = entries[position]
-                markers = (entry.vendor_ext or {}).get("unmapped", {})
+                try:
+                    markers = route_map_entry_unmapped(entry, native.name)
+                except RendererAuditRepairFailed as exc:
+                    raise CommandError(str(exc)) from None
                 missing = {}
                 for capture_key, field in _MATCH_REFERENCES:
                     resolved = {obj.name for obj in getattr(entry, field).all()}

@@ -270,6 +270,47 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
             delivery.render("route_policy", self.device_a.pk, self.mgmt_a.adapter_device_id)
         self.assertEqual(self.adapter.requests, [])
 
+    def test_malformed_unmapped_markers_refuse_render_and_the_reference_report(self):
+        native = RouteMap.objects.create(name="MALFORMED")
+        entry = RouteMapEntry.objects.create(route_map=native, sequence=1, action="permit")
+        capture = {"name": "MALFORMED", "entries": [{"sequence": 10, "action": "permit"}]}
+        state = self._own(self.mgmt_a, "route_map", native, captured=capture)
+        for vendor_ext in ({"unmapped": None}, {"unmapped": ["X"]}, ["unmapped"]):
+            with self.subTest(vendor_ext=vendor_ext):
+                self._offline(
+                    lambda value=vendor_ext: RouteMapEntry.objects.filter(pk=entry.pk).update(vendor_ext=value)
+                )
+                with self.assertRaisesRegex(RendererAuditRepairFailed, "'MALFORMED' entry 1 has malformed"):
+                    route_policy_intent_item(NSORoutePolicyState.objects.get(pk=state.pk))
+                with self.assertRaises(RendererAuditRepairFailed):
+                    delivery.render("route_policy", self.device_a.pk, self.mgmt_a.adapter_device_id)
+                with self.assertRaisesRegex(CommandError, "'MALFORMED' entry 1 has malformed"):
+                    call_command("nso_route_policy_reference_report", stdout=io.StringIO())
+        self.assertEqual(self.adapter.requests, [])
+
+    def test_refused_route_map_leaves_unrelated_publication_and_never_sends_a_partial_snapshot(self):
+        payload = self._payload("prefix_list", self._capture("prefix_list", "GOOD"))
+        payload["route_maps"] = [
+            {"name": "BLOCKED", "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": ["MISSING"]}]}
+        ]
+        reconcile_route_policy(self.device_a, payload)
+        blocked = self._state(self.mgmt_a, "route_map", "BLOCKED")
+        with self.assertRaisesRegex(RendererAuditRepairFailed, "MISSING"):
+            self._accept(blocked)
+        blocked.refresh_from_db()
+        self.assertEqual(blocked.status, "imported")
+        self._accept(self._state(self.mgmt_a, "prefix_list", "GOOD"))
+        self.assertEqual({(obj["family"], obj["name"]) for obj in self._send(self.device_a)}, {("prefix_list", "GOOD")})
+        sent = len(self.adapter.requests)
+        native = RouteMap.objects.create(name="EDITED")
+        entry = RouteMapEntry.objects.create(route_map=native, sequence=1, action="permit")
+        self._own(self.mgmt_a, "route_map", native)
+        marker = {"unmapped": {"match_prefix_list": ["MISSING"]}}
+        self._offline(lambda: RouteMapEntry.objects.filter(pk=entry.pk).update(vendor_ext=marker))
+        with self.assertRaisesRegex(RendererAuditRepairFailed, "'EDITED' entry 1 has unresolved references"):
+            delivery.render("route_policy", self.device_a.pk, self.mgmt_a.adapter_device_id)
+        self.assertEqual(len(self.adapter.requests), sent)
+
     def test_owned_native_contents_survive_an_old_cross_variant_materialized_owner(self):
         capture = self._capture("prefix_list", "policy")
         reconcile_route_policy(self.device_b, self._payload("prefix_list", capture))

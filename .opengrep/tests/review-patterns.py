@@ -2866,3 +2866,24 @@ def exact_route_policy_names(name, rows):
     # ok: nso-route-policy-name-folding
     local_key = name.casefold()
     return local_key
+
+
+def route_map_entry_unmapped(entry):
+    vendor_ext = entry.vendor_ext or {}
+    # ok: nso-route-map-unmapped-direct-read
+    return vendor_ext.get("unmapped", {})
+
+
+def unmapped_marker_reads(entry, vendor_ext, key):
+    # ruleid: nso-route-map-unmapped-direct-read
+    markers = (entry.vendor_ext or {}).get("unmapped", {})
+    # ruleid: nso-route-map-unmapped-direct-read
+    markers = vendor_ext.get("unmapped")
+    # ruleid: nso-route-map-unmapped-direct-read
+    markers = vendor_ext["unmapped"]
+    # ok: nso-route-map-unmapped-direct-read
+    vendor_ext["unmapped"] = {}
+    # ok: nso-route-map-unmapped-direct-read
+    vendor_ext.setdefault("unmapped", {})["set_community"] = markers
+    # ok: nso-route-map-unmapped-direct-read
+    return vendor_ext.get(key)

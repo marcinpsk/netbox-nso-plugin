@@ -3026,9 +3026,21 @@ def route_policy_intent_item(row):
     }
 
 
+def route_map_entry_unmapped(entry, route_map_name):
+    """Return the entry's ``vendor_ext["unmapped"]`` markers; refuse any other shape."""
+    vendor_ext = entry.vendor_ext or {}
+    unmapped = vendor_ext.get("unmapped", {}) if isinstance(vendor_ext, dict) else None
+    if not isinstance(unmapped, dict):
+        raise RendererAuditRepairFailed(
+            f"route-policy {route_map_name!r} entry {entry.sequence} has malformed vendor_ext: "
+            f"{json.dumps(entry.vendor_ext, sort_keys=True)}"
+        )
+    return unmapped
+
+
 def _refuse_unmapped_route_policy_references(row, obj):
     for entry in obj.route_map_entries.all().order_by("sequence"):
-        unmapped = (entry.vendor_ext or {}).get("unmapped", {})
+        unmapped = route_map_entry_unmapped(entry, row.object_name)
         references = {
             key: value for key, value in unmapped.items() if key.startswith("match_") or key == "set_community"
         }

@@ -55,6 +55,7 @@ References checked on 2026-09-12:
 | Issue class | Mechanical check | Limit |
 | --- | --- | --- |
 | Policy names folded into another identity | `nso-route-policy-name-folding` | Direct `object_name__iexact`, `Lower` or `Upper` of `object_name`, and canonical or module-qualified policy-model `name__iexact` filters. Local-variable `casefold()`, aliased models, and dynamic managers need reconcile integration tests. Tests are excluded. |
+| Route-map `vendor_ext["unmapped"]` read without shape validation | `nso-route-map-unmapped-direct-read` | `get()` and subscript reads of the literal `"unmapped"` key outside `signals.route_map_entry_unmapped`. Writes (`setdefault`, subscript assignment) are allowed. A key held in a variable is not checked. Tests are excluded. |
 | Empty fallback used as array validation before joining observed LACP members | `nso-observed-members-join-without-array-check` | JavaScript calls on `(row.observed_members \|\| [])` and `(row.observed_members ?? [])`. The rule accepts `Array.isArray` normalization and joins of other fields. Aliases and direct joins without a fallback are outside this call-shape check. |
 | Push scheduled while suppression is active | `nso-push-inside-suppression` | Direct or module-qualified calls (`signals.suppress_intent_push()`) in a suppression context. It does not follow helper calls. |
 | Assertion compares a value with itself | `nso-tautological-assertion` | Literal assertion shapes, not proof that every assertion reaches the intended path. |
