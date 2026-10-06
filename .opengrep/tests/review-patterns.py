@@ -2855,6 +2855,14 @@ def exact_route_policy_names(name, rows):
     models.ASPath.objects.filter(name__iexact=name)
     # ruleid: nso-route-policy-name-folding
     CommunityList.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    RouteMap.objects.get(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    PrefixList.objects.exclude(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    models.ASPath.objects.get_or_create(name__iexact=name)
+    # ok: nso-route-policy-name-folding
+    RouteMap.objects.get(name=name)
     # ok: nso-route-policy-name-folding
     RouteMap.objects.filter(name=name)
     # ok: nso-route-policy-name-folding

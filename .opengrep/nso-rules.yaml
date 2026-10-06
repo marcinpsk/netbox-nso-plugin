@@ -13,7 +13,7 @@ rules:
               metavariable: $FUNCTION
               regex: '^(?:.*\.)?(?:Lower|Upper)$'
       - patterns:
-          - pattern: $MODEL.objects.filter(..., name__iexact=$NAME, ...)
+          - pattern: $MODEL.objects.$METHOD(..., name__iexact=$NAME, ...)
           - metavariable-regex:
               metavariable: $MODEL
               regex: '^(?:.*\.)?(?:RouteMap|PrefixList|ASPath|CommunityList)$'
