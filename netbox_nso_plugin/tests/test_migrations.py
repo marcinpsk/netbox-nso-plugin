@@ -22,6 +22,8 @@ from ._ownership_case import acquire_overlay
 from .mixins import _CascadeFlushMixin
 
 APP = "netbox_nso_plugin"
+# Hand-written cross-app pins above the 0001 floor; the schema needs them, and CI installs them.
+DELIBERATE_PINS = {("netbox_routing", "0040_case_sensitive_policy_names")}
 OUTBOX = "0018_intent_outbox"
 PRE_OUTBOX = "0017_settlement_cursor_epoch"
 DEPLOYMENT_CONTROL = "0019_intent_deployment_control"
@@ -63,12 +65,18 @@ class TestMigrationGraph(SimpleTestCase):
             (name, dep_app, dep_name)
             for name, mig in ours.items()
             for dep_app, dep_name in mig.dependencies
-            if dep_app != APP and floor.get(dep_app) != dep_name
+            if dep_app != APP and floor.get(dep_app) != dep_name and (dep_app, dep_name) not in DELIBERATE_PINS
         )
         assert not stray, (
             f"cross-app pins off the 0001 floor {floor} — repin to the floor, "
             f"or move the floor deliberately in 0001's successor and here: {stray}"
         )
+
+    def test_the_plugin_schema_requires_case_sensitive_policy_names(self):
+        # Exact policy identity cannot store case-distinct names under the pre-0040 Lower(name) constraint.
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        (leaf,) = (node for node in loader.graph.leaf_nodes() if node[0] == APP)
+        assert ("netbox_routing", "0040_case_sensitive_policy_names") in loader.graph.forwards_plan(leaf)
 
     def test_the_migration_graph_has_a_single_leaf(self):
         # Built from disk with no connection: two leaves make Django refuse to migrate at
