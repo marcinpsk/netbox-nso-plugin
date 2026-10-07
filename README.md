@@ -45,14 +45,18 @@ migration 0022 because no deployed data uses that schema.
 
 ## Installation
 
+The plugin has hard foreign keys to the netbox-routing fork. Install the fork commit that CI tests
+(migration `0040_case_sensitive_policy_names` or later; plugin migrations refuse an older fork):
+
 ```bash
+pip install "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@f8c0626b45a38f7f13daf9f224a810fb7364d800"
 pip install netbox-nso-plugin
 ```
 
-Add to `PLUGINS` in `configuration.py`:
+Add both to `PLUGINS` in `configuration.py`:
 
 ```python
-PLUGINS = ["netbox_nso_plugin"]
+PLUGINS = ["netbox_routing", "netbox_nso_plugin"]
 PLUGINS_CONFIG = {
     "netbox_nso_plugin": {
         "adapter_url": "https://nso-adapter.example.net",
