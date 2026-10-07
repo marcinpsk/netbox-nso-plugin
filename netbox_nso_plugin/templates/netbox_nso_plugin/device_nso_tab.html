@@ -303,12 +303,12 @@
           <span class="mdi mdi-sync"></span> Sync Now
         </button>
       </form>
-      <form method="post" class="nso-action-form" data-label="Sync from NSO"
-            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'sync-from-nso' %}">
+      <form method="post" class="nso-action-form" data-label="Refresh NSO state"
+            action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_action' mgmt.pk 'refresh-nso-state' %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-outline-primary nso-action-btn"
-                title="Re-read NSO's CURRENT config into the mirror — no device contact. Heals stale/never-read family chips without the cost of a device round-trip. (Sync Now asks NSO to re-read the live device first; Refresh overlays only redisplays the mirror.)">
-          <span class="mdi mdi-database-sync"></span> Sync from NSO
+                title="Re-read NSO's CURRENT config into the adapter mirror, with no device contact. Heals stale or never-read family chips without a device round-trip. NetBox does not change. (Sync Now asks NSO to re-read the live device first; Refresh overlays only redisplays the mirror; Sync from NSO in Differences corrects NetBox.)">
+          <span class="mdi mdi-database-sync"></span> Refresh NSO state
         </button>
       </form>
       <form method="post" class="nso-action-form" data-label="Detect Drift"
@@ -338,7 +338,7 @@
             action="{% url 'plugins:netbox_nso_plugin:nsodevicemanagement_reconcile' mgmt.pk %}">
         {% csrf_token %}
         <button type="submit" class="btn btn-outline-secondary"
-                title="Redisplay from the adapter's mirror — no NSO contact at all. (Sync from NSO re-reads NSO's config; Sync Now re-reads the live device via NSO.)">
+                title="Redisplay from the adapter's mirror — no NSO contact at all. (Refresh NSO state re-reads NSO's config; Sync Now re-reads the live device via NSO.)">
           <span class="mdi mdi-cloud-refresh"></span> Refresh overlays
         </button>
       </form>

@@ -28,12 +28,31 @@
   {% if not_compared %}
     <div class="small text-muted mb-2">Not compared yet: {{ not_compared|join:", " }}.</div>
   {% endif %}
+  <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_nso_sync_preview' pk=device.pk %}" data-sync-form>
+  {% csrf_token %}
+  {% if can_sync and sync_scopes %}
+    <div class="d-flex flex-wrap gap-3 align-items-center border rounded px-2 py-2 mb-2">
+      <span class="small fw-semibold">Sync from NSO</span>
+      {% for value in sync_scopes %}
+        <div class="form-check form-check-inline mb-0">
+          <input class="form-check-input" type="checkbox" name="scope" value="{{ value }}" id="nso-sync-scope-{{ value }}">
+          <label class="form-check-label small" for="nso-sync-scope-{{ value }}">All {{ value }} rows</label>
+        </div>
+      {% endfor %}
+      <span class="small text-muted">or select rows below. The device wins; only NetBox changes.</span>
+      <button type="submit" class="btn btn-sm btn-primary ms-auto"
+              title="Read the selected scopes again and preview the NetBox changes. Nothing is written until you confirm.">
+        <span class="mdi mdi-database-arrow-left"></span> Sync from NSO
+      </button>
+    </div>
+  {% endif %}
   <div class="table-responsive">
     <table class="table table-sm table-hover">
-      <thead><tr><th>Scope</th><th>Kind</th><th>Identity</th><th>Attribute</th><th>NetBox</th><th>Device</th><th>Reason / association</th></tr></thead>
+      <thead><tr>{% if can_sync %}<th class="text-nowrap"><span class="visually-hidden">Select</span></th>{% endif %}<th>Scope</th><th>Kind</th><th>Identity</th><th>Attribute</th><th>NetBox</th><th>Device</th><th>Reason / association</th></tr></thead>
       <tbody>
         {% for row in page_obj %}
           <tr>
+            {% if can_sync %}<td>{% if row.syncable %}<input class="form-check-input" type="checkbox" name="row" value="{{ row.token }}" aria-label="Select {{ row.scope }} {{ row.identity }}">{% elif row.sync_note %}<span class="small text-muted text-nowrap">{{ row.sync_note }}</span>{% endif %}</td>{% endif %}
             <td>{{ row.scope }}</td><td><span class="badge {{ row.css }}">{{ row.kind }}</span></td>
             <td>{{ row.identity }}</td><td>{{ row.attribute }}</td>
             <td><code>{{ row.netbox_value }}</code></td><td><code>{{ row.device_value }}</code></td>
@@ -42,10 +61,11 @@
               (IP #{{ row.association_candidate.pk }})
             {% endif %}</td>
           </tr>
-        {% empty %}<tr><td colspan="7">No differences for these filters.</td></tr>{% endfor %}
+        {% empty %}<tr><td colspan="{% if can_sync %}8{% else %}7{% endif %}">No differences for these filters.</td></tr>{% endfor %}
       </tbody>
     </table>
   </div>
+  </form>
   <div class="d-flex justify-content-between align-items-center small">
     <span>{{ page_obj.paginator.count }} rows. Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}.</span>
     <nav aria-label="Differences pages">

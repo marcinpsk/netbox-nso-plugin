@@ -244,9 +244,11 @@ def _ip_group_rows(spec, native, device, candidates, device_count):
 
 
 def _ip_rows(spec, management, snapshot, user):
+    from dcim.models import Interface
     from ipam.models import VRF, IPAddress
 
     interfaces = {interface.pk: interface for interface in device_interfaces(management)}
+    visible_interfaces = _visible_pks(Interface, user, interfaces.values())
     device, rows, blocked, hidden_vrfs = _ip_device_index(
         spec, snapshot, {interface.name: interface for interface in interfaces.values()}, user
     )
@@ -257,7 +259,7 @@ def _ip_rows(spec, management, snapshot, user):
     native_vrfs = [ip.vrf for ip in bindings if ip.vrf_id is not None]
     hidden_vrfs |= {vrf.pk for vrf in native_vrfs} - _visible_pks(VRF, user, native_vrfs)
     for ip in bindings:
-        if ip.pk not in visible or ip.vrf_id in hidden_vrfs:
+        if ip.pk not in visible or ip.vrf_id in hidden_vrfs or ip.assigned_object_id not in visible_interfaces:
             with contextlib.suppress(KeyError, ValueError):
                 item = _native_ip_projection(ip, interfaces)
                 hidden.add((item["interface"], item["host"], ip.vrf_id))

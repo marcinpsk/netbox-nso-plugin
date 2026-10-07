@@ -18,6 +18,12 @@ app_name = "netbox_nso_plugin"
 
 urlpatterns = [
     path("devices/<int:pk>/nso-differences/", views.NSODeviceDifferencesView.as_view(), name="device_nso_differences"),
+    path(
+        "devices/<int:pk>/nso-sync/preview/", views.NSODeviceSyncPreviewView.as_view(), name="device_nso_sync_preview"
+    ),
+    path(
+        "devices/<int:pk>/nso-sync/confirm/", views.NSODeviceSyncConfirmView.as_view(), name="device_nso_sync_confirm"
+    ),
     # Adapter Connection (singleton)
     path("adapter-connection/", views.AdapterConnectionEditView.as_view(), name="adapterconnection"),
     # Failover Settings (singleton)
@@ -181,7 +187,7 @@ urlpatterns = [
         name="device_nso_category_counts",
     ),
     # Device NSO tab — background "Refresh overlays" (plugin-cache reconcile only; the
-    # adapter-side CDB re-read is the sync-from-nso ACTION, S5a)
+    # adapter-side CDB re-read is the refresh-nso-state ACTION, S5a)
     path(
         "device-management/<int:pk>/reconcile/",
         views.NSODeviceReconcileView.as_view(),

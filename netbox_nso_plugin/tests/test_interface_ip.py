@@ -731,13 +731,13 @@ class TestInterfaceIPReassignment(IntentPushDeliveryMixin, TestCase):
         mock_put.assert_not_called()
 
 
-class TestAcceptInterfaceIPConflict(TestCase):
-    """The accept view resolves an interface-IP conflict by adopting the device reality.
+class TestInterfaceIPIntentAccept(TestCase):
+    """IP Accept takes ownership of the device-reported address and never changes NetBox IPAM.
 
     Mirrors the live sw01 case: the OOB mgmt IP is reported by NSO on ``vme.0`` but
-    NetBox has it on the ``me0`` onboarding stand-in → conflict. Accepting must
-    reassign the IPAddress onto ``vme.0`` (no device push — the device already has it)
-    and settle the state to in_sync/owned.
+    NetBox has it on the ``me0`` onboarding stand-in. The removed device-value Accept moved
+    the IPAddress and returned HTTP 500 on a duplicate host; Sync from NSO is now the verb
+    that corrects NetBox.
     """
 
     @classmethod
@@ -746,14 +746,13 @@ class TestAcceptInterfaceIPConflict(TestCase):
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import IPAddress
 
-        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceIPState
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
         mfg = Manufacturer.objects.create(name="Acc Mfg", slug="accmfg")
         dt = DeviceType.objects.create(manufacturer=mfg, model="AccDev", slug="accdev")
         role = DeviceRole.objects.create(name="AccRole", slug="accrole")
         site = Site.objects.create(name="AccSite", slug="accsite")
         cls.device = Device.objects.create(name="acc-sw01", device_type=dt, role=role, site=site)
-        # me0 = onboarding mgmt stand-in (holds the IP); vme.0 = what the NED reports.
         cls.me0 = Interface.objects.create(device=cls.device, name="me0", type="virtual", mgmt_only=True)
         cls.vme0 = Interface.objects.create(device=cls.device, name="vme.0", type="virtual")
         cls.ip = IPAddress.objects.create(
@@ -763,9 +762,6 @@ class TestAcceptInterfaceIPConflict(TestCase):
         )
         nso = NSOInstance.objects.create(name="acc-nso", adapter_instance_id="acc-nso-id")
         NSODeviceManagement.objects.create(device=cls.device, nso_instance=nso, nso_device_name="acc-sw01")
-        cls.state = NSOInterfaceIPState.objects.create(
-            interface=cls.vme0, address="172.30.150.90/24", vrf="", family="ipv4", status="conflict"
-        )
         cls._OT = ObjectType
 
     def setUp(self):
@@ -783,23 +779,11 @@ class TestAcceptInterfaceIPConflict(TestCase):
         perm.users.add(self.user)
         self.client.force_login(self.user)
 
-    def _grant_ip_permission(self, action):
-        from ipam.models import IPAddress
-        from users.models import ObjectPermission
-
-        permission = ObjectPermission.objects.create(name=f"acc-ip-{action}", actions=[action])
-        permission.object_types.add(self._OT.objects.get_for_model(IPAddress))
-        permission.users.add(self.user)
-
-    def _create_unmaterialized_state(self, address):
+    def _state(self, interface, address, status):
         from netbox_nso_plugin.models import NSOInterfaceIPState
 
         return NSOInterfaceIPState.objects.create(
-            interface=self.vme0,
-            address=address,
-            vrf="",
-            family="ipv4",
-            status="conflict",
+            interface=interface, address=address, vrf="", family="ipv4", status=status
         )
 
     def _post_accept(self, state):
@@ -808,98 +792,91 @@ class TestAcceptInterfaceIPConflict(TestCase):
         url = reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_accept", kwargs={"pk": state.pk})
         return self.client.post(url)
 
-    def test_accept_without_add_permission_refuses_creation(self):
+    def _assert_native_unchanged(self):
         from ipam.models import IPAddress
 
-        state = self._create_unmaterialized_state("198.18.30.1/24")
-
-        response = self._post_accept(state)
-
-        self.assertEqual(response.status_code, 403)
-        self.assertFalse(IPAddress.objects.filter(address=state.address).exists())
-        state.refresh_from_db()
-        self.assertEqual(state.status, "conflict")
-        self.assertIsNone(state.accepted_at)
-
-    def test_accept_without_change_permission_refuses_reassignment(self):
-        response = self._post_accept(self.state)
-
-        self.assertEqual(response.status_code, 403)
+        before = (str(self.ip.address), self.ip.assigned_object_id, self.ip.last_updated)
         self.ip.refresh_from_db()
-        self.assertEqual(self.ip.assigned_object, self.me0)
-        self.state.refresh_from_db()
-        self.assertEqual(self.state.status, "conflict")
-        self.assertIsNone(self.state.accepted_at)
+        self.assertEqual((str(self.ip.address), self.ip.assigned_object_id, self.ip.last_updated), before)
+        self.assertEqual(IPAddress.objects.filter(address__net_host="172.30.150.90").count(), 1)
 
-    def test_add_permission_allows_creation(self):
-        from ipam.models import IPAddress
-
-        from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision
-
-        self._grant_ip_permission("add")
-        state = self._create_unmaterialized_state("198.18.31.1/24")
+    def test_imported_address_becomes_accepted_without_ip_permission(self):
+        state = self._state(self.me0, "172.30.150.90/24", "imported")
 
         response = self._post_accept(state)
 
         self.assertEqual(response.status_code, 302)
-        native = IPAddress.objects.get(address=state.address)
-        self.assertEqual(native.assigned_object, self.vme0)
         state.refresh_from_db()
-        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.status, "accepted")
         self.assertIsNotNone(state.accepted_at)
-        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
-        self.assertEqual(revision.verified_revision, revision.revision)
-        self.assertEqual(
-            revision.verified_fingerprint,
-            delivery.canonical_fingerprint(delivery.render("ip", self.device.pk, None).payload),
-        )
+        self._assert_native_unchanged()
 
-    def test_add_permission_does_not_allow_reassignment(self):
-        self._grant_ip_permission("add")
-
-        response = self._post_accept(self.state)
-
-        self.assertEqual(response.status_code, 403)
-        self.ip.refresh_from_db()
-        self.assertEqual(self.ip.assigned_object, self.me0)
-        self.state.refresh_from_db()
-        self.assertEqual(self.state.status, "conflict")
-        self.assertIsNone(self.state.accepted_at)
-
-    def test_change_permission_does_not_allow_creation(self):
-        from ipam.models import IPAddress
-
-        self._grant_ip_permission("change")
-        state = self._create_unmaterialized_state("198.18.32.1/24")
+    def test_duplicate_host_conflict_no_longer_writes_ipam_or_fails(self):
+        state = self._state(self.vme0, "172.30.150.90/32", "conflict")
 
         response = self._post_accept(state)
 
-        self.assertEqual(response.status_code, 403)
-        self.assertFalse(IPAddress.objects.filter(address=state.address).exists())
+        self.assertEqual(response.status_code, 302)
         state.refresh_from_db()
-        self.assertEqual(state.status, "conflict")
-        self.assertIsNone(state.accepted_at)
+        self.assertEqual(state.status, "accepted")
+        self._assert_native_unchanged()
+        self.assertEqual(self.ip.assigned_object_id, self.me0.pk)
 
-    def test_accept_moves_ip_to_ned_interface_and_settles_in_sync(self):
-        from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision
+    def test_status_without_an_accept_transition_is_refused(self):
+        from django.contrib.messages import get_messages
 
-        self._grant_ip_permission("change")
-        resp = self._post_accept(self.state)
-        self.assertEqual(resp.status_code, 302)
+        from netbox_nso_plugin.models import NSOInterfaceIPState
 
-        self.ip.refresh_from_db()
-        self.assertEqual(self.ip.assigned_object, self.vme0)  # moved me0 -> vme.0
-        self.state.refresh_from_db()
-        self.assertEqual(self.state.status, "in_sync")
-        self.assertIsNotNone(self.state.accepted_at)
-        revision = NSOIntentRevision.objects.get(device=self.device, scope="ip")
-        self.assertEqual(revision.verified_revision, revision.revision)
-        self.assertEqual(
-            revision.verified_fingerprint,
-            delivery.canonical_fingerprint(delivery.render("ip", self.device.pk, None).payload),
+        states = [
+            self._state(self.vme0, "172.30.151.1/32", "unknown"),
+            self._state(self.vme0, "172.30.151.2/32", "error"),
+            acquire_overlay(
+                NSOInterfaceIPState, interface=self.vme0, address="172.30.151.3/32", family="ipv4", status="in_sync"
+            ),
+        ]
+        for state in states:
+            status = state.status
+            with self.subTest(status=status):
+                response = self._post_accept(state)
+                self.assertEqual(response.status_code, 302)
+                state.refresh_from_db()
+                self.assertEqual(state.status, status)
+                self.assertIn(
+                    f"Cannot accept {state.address} on vme.0 from status {status}.",
+                    [str(message) for message in get_messages(response.wsgi_request)],
+                )
+
+    def test_overlay_of_a_device_outside_the_users_management_permission_is_not_found(self):
+        from users.models import ObjectPermission
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        other = Device.objects.create(
+            name="acc-sw02", device_type=self.device.device_type, role=self.device.role, site=self.device.site
         )
+        other_interface = Interface.objects.create(device=other, name="vme.0", type="virtual")
+        NSODeviceManagement.objects.create(
+            device=other, nso_instance=NSOInstance.objects.get(name="acc-nso"), nso_device_name="acc-sw02"
+        )
+        own = NSODeviceManagement.objects.get(device=self.device)
+        ObjectPermission.objects.filter(users=self.user).update(constraints={"pk": own.pk})
+        state = self._state(other_interface, "172.30.152.1/32", "imported")
+
+        response = self._post_accept(state)
+
+        self.assertEqual(response.status_code, 404)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+
+    def test_user_without_management_change_permission_is_refused(self):
+        from django.contrib.auth import get_user_model
+
+        self.client.force_login(get_user_model().objects.create_user(username="acc-viewer"))
+        state = self._state(self.me0, "172.30.150.90/24", "imported")
+
+        self.assertEqual(self._post_accept(state).status_code, 403)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
 
 
 class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
