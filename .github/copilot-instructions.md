@@ -129,14 +129,14 @@ Other useful helpers include `netbox-run-bg`, `netbox-stop`, `netbox-restart`, `
 What `netbox-test` actually does (`.devcontainer/scripts/load-aliases.sh`):
 
 ```bash
-workers="${NETBOX_TEST_WORKERS:-8}"
+workers="${NETBOX_TEST_WORKERS:-auto}"
 target="netbox_nso_plugin/tests"
 parallel_args=()
 if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
   target="$1"          # a leading non-flag argument selects the module/class/test
   shift
 fi
-if [ "$workers" -gt 1 ]; then
+if [ "$workers" != 0 ] && [ "$workers" != 1 ]; then
   parallel_args=(-n "$workers" --maxschedchunk=1)
 else
   parallel_args=(-n 0)     # the pyproject addopts request `-n auto`; -n 0 turns a run serial
@@ -151,8 +151,8 @@ Why this is the only path you should take:
 
 - It activates the NetBox venv, where `pytest`, `pytest-django`, `pytest-cov`, `pytest-xdist`, `ruff`, Django, and all plugin runtime deps are already present (`.devcontainer/scripts/setup.sh` does this on container build).
 - It runs pytest from the plugin checkout so `pyproject.toml` and both conftest files are loaded. The session guard blocks every unmocked adapter request; Django's runner does not load that guard and can otherwise call the live adapter during tests.
-- It reuses the isolated PostgreSQL databases and gives every xdist worker its own suffixed database. Eight workers are the default; set `NETBOX_TEST_WORKERS=1` for a serial run.
-- A raw `pytest` also runs in parallel: the `addopts` carry `-n auto`, capped at `MAX_PARALLEL_WORKERS` (8) by the `pytest_xdist_auto_num_workers` hook in the repo-root `conftest.py`, because every worker takes a private test database.
+- It reuses the isolated PostgreSQL databases and gives every xdist worker its own suffixed database. The default is `-n auto`, capped at `MAX_PARALLEL_WORKERS`; set `NETBOX_TEST_WORKERS=1` for a serial run.
+- A raw `pytest` also runs in parallel: the `addopts` carry `-n auto`, capped at `MAX_PARALLEL_WORKERS` (16) by the `pytest_xdist_auto_num_workers` hook in the repo-root `conftest.py`, because every worker takes a private test database.
 
 Common variants:
 
