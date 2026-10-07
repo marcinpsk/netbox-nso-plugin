@@ -166,6 +166,22 @@ class TestDeviceDifferencesView(TestCase):
         self.assertEqual(row["association_candidate"], candidate)
         self.assertContains(response, f"(IP #{candidate.pk})")
 
+    def test_hidden_duplicate_candidate_does_not_make_the_row_ambiguous(self):
+        from ipam.models import IPAddress
+
+        candidate = self._candidate_page()
+        IPAddress.objects.create(address="198.18.0.1/31")
+        permission = ObjectPermission.objects.create(
+            name="View the candidate only", actions=["view"], constraints={"pk": candidate.pk}
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+        permission.users.add(self.user)
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["reason"]), ("device_only", ""))
+        self.assertEqual(row["association_candidate"], candidate)
+        self.assertNotContains(response, "multiple addresses have the same host and VRF")
+
     def _scope_rows(self, response, scope):
         return [row for row in response.context["page_obj"] if row["scope"] == scope]
 

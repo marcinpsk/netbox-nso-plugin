@@ -802,7 +802,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
 
     def get(self, request, pk):
         from django.core.paginator import Paginator
-        from ipam.models import IPAddress
 
         from .device_differences import (
             KINDS,
@@ -840,10 +839,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
             return str(value) if value is MISSING else json.dumps(value, sort_keys=True, default=str)
 
         page = Paginator(filtered, 50).get_page(request.GET.get("page"))
-        candidate_pks = {row.association_candidate.pk for row in page.object_list if row.association_candidate}
-        visible_candidates = set(
-            IPAddress.objects.restrict(request.user, "view").filter(pk__in=candidate_pks).values_list("pk", flat=True)
-        )
         page.object_list = [
             {
                 "scope": row.scope,
@@ -854,9 +849,7 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
                 "netbox_value": display(row.netbox_value),
                 "device_value": display(row.device_value),
                 "reason": row.reason,
-                "association_candidate": row.association_candidate
-                if row.association_candidate and row.association_candidate.pk in visible_candidates
-                else None,
+                "association_candidate": row.association_candidate,
             }
             for row in page.object_list
         ]

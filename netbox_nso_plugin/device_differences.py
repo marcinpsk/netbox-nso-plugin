@@ -186,7 +186,7 @@ def _ip_device_index(spec, snapshot, interfaces):
     return device, rows, blocked
 
 
-def _ip_candidates(hosts):
+def _ip_candidates(hosts, user):
     from django.db.models import Q
     from ipam.models import IPAddress
 
@@ -194,7 +194,7 @@ def _ip_candidates(hosts):
     for host in hosts:
         query |= Q(address__net_host=host)
     candidates = defaultdict(list)
-    for native in IPAddress.objects.filter(query).select_related("vrf").order_by("pk"):
+    for native in IPAddress.objects.restrict(user, "view").filter(query).select_related("vrf").order_by("pk"):
         candidates[(str(ip_interface(str(native.address)).ip), native.vrf_id)].append(native)
     return candidates
 
@@ -247,7 +247,7 @@ def _ip_rows(spec, management, snapshot, user):
             rows.append(Difference(spec.scope, "ambiguous", str(ip.address), reason="invalid native address"))
             continue
         native[(item["interface"], item["host"], ip.vrf_id)].append(item)
-    candidates = _ip_candidates({key[1] for key in device})
+    candidates = _ip_candidates({key[1] for key in device}, user)
     device_counts = Counter()
     for key, items in device.items():
         device_counts[(key[1], key[2])] += len(items)
