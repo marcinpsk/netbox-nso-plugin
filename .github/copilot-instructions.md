@@ -157,7 +157,7 @@ Why this is the only path you should take:
 Common variants:
 
 ```bash
-netbox-test                                                        # full suite, eight workers
+netbox-test                                                        # full suite, automatic workers capped at 16
 netbox-test netbox_nso_plugin/tests/test_models.py                 # one module
 netbox-test netbox_nso_plugin/tests/test_models.py::TestX          # one class
 netbox-test netbox_nso_plugin/tests/test_models.py::TestX::test_y  # one test
