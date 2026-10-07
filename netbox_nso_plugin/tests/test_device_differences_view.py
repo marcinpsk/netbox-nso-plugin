@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Authorize and render the read-only Differences panel through real Django views."""
 
+import json
 from uuid import uuid4
 
 from core.models import ObjectType
@@ -278,6 +279,9 @@ class TestDeviceDifferencesView(TestCase):
         (row,) = self._scope_rows(response, "ip")
         self.assertEqual((row["kind"], row["reason"]), ("ambiguous", "NetBox object is not visible to you"))
         self.assertNotContains(response, "non-unique VRF name")
+        self.assertEqual(row["identity"], "lag-60 198.18.0.9/24")
+        self.assertEqual(json.loads(row["device_value"])["vrf"], None)
+        self.assertEqual(json.loads(row["device_value"])["address"], "198.18.0.9/24")
 
     def test_visible_ip_in_a_hidden_vrf_is_not_visible_and_never_names_the_vrf(self):
         from ipam.models import VRF
@@ -300,6 +304,8 @@ class TestDeviceDifferencesView(TestCase):
         (row,) = self._scope_rows(response, "ip")
         self.assertEqual((row["kind"], row["reason"]), ("ambiguous", "NetBox object is not visible to you"))
         self.assertEqual(row["netbox_value"], "missing")
+        self.assertEqual(row["identity"], "lag-60 198.18.0.9/24")
+        self.assertNotContains(response, "hidden-vrf")
 
     def test_visible_ip_in_a_visible_vrf_is_compared(self):
         from ipam.models import VRF

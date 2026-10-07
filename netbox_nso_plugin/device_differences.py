@@ -152,6 +152,11 @@ def _device_ip_projection(entry, address, interfaces):
     }
 
 
+def _without_vrf(observed):
+    """Return the observed address without the name of a VRF the user cannot view."""
+    return {**observed, "vrf": None}
+
+
 def _ip_device_index(spec, snapshot, interfaces, user):
     from ipam.models import VRF
 
@@ -177,10 +182,26 @@ def _ip_device_index(spec, snapshot, interfaces, user):
                 continue
             name = address["vrf"]
             if len(vrfs[name]) > 1:
-                reason = NOT_VISIBLE if any(vrf.pk in hidden_vrfs for vrf in vrfs[name]) else "non-unique VRF name"
-                rows.append(
-                    Difference(spec.scope, "ambiguous", spec.identity(item), device_value=address, reason=reason)
-                )
+                if any(vrf.pk in hidden_vrfs for vrf in vrfs[name]):
+                    rows.append(
+                        Difference(
+                            spec.scope,
+                            "ambiguous",
+                            spec.identity(_without_vrf(item)),
+                            device_value=_without_vrf(address),
+                            reason=NOT_VISIBLE,
+                        )
+                    )
+                else:
+                    rows.append(
+                        Difference(
+                            spec.scope,
+                            "ambiguous",
+                            spec.identity(item),
+                            device_value=address,
+                            reason="non-unique VRF name",
+                        )
+                    )
                 blocked.update((item["interface"], item["host"], vrf.pk) for vrf in vrfs[name])
                 continue
             vrf_id = vrfs[name][0].pk if vrfs[name] else (name if name else None)
@@ -257,9 +278,9 @@ def _ip_rows(spec, management, snapshot, user):
         device_counts[(key[1], key[2])] += len(items)
     for key in sorted(native.keys() | device.keys(), key=repr):
         if (key in hidden or key[2] in hidden_vrfs) and not native[key]:
-            rows.append(
-                Difference(spec.scope, "ambiguous", spec.identity((device[key] or native[key])[0]), reason=NOT_VISIBLE)
-            )
+            item = (device[key] or native[key])[0]
+            item = _without_vrf(item) if key[2] in hidden_vrfs else item
+            rows.append(Difference(spec.scope, "ambiguous", spec.identity(item), reason=NOT_VISIBLE))
         elif key not in blocked:
             host_vrf = (key[1], key[2])
             rows.extend(_ip_group_rows(spec, native[key], device[key], candidates[host_vrf], device_counts[host_vrf]))
