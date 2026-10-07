@@ -1,0 +1,56 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com> #}
+<div data-differences-panel>
+  <div class="small mb-3">
+    {% for snapshot in snapshots %}
+      <div><strong>{{ snapshot.read_state.family }}</strong>: Revision {{ snapshot.revision }}.
+        Observed {{ snapshot.observed_at|date:"c" }}.</div>
+    {% empty %}
+      <div>No successful read yet.</div>
+    {% endfor %}
+  </div>
+  <form method="get" action="{% url 'plugins:netbox_nso_plugin:device_nso_differences' pk=device.pk %}"
+        class="d-flex flex-wrap gap-2 align-items-center mb-3" data-differences-filter>
+    <label for="nso-difference-scope">Scope</label>
+    <select id="nso-difference-scope" name="scope" class="form-select form-select-sm w-auto">
+      <option value="">All scopes</option>
+      {% for value in scopes %}<option value="{{ value }}"{% if scope == value %} selected{% endif %}>{{ value }}</option>{% endfor %}
+    </select>
+    <label for="nso-difference-kind">Kind</label>
+    <select id="nso-difference-kind" name="kind" class="form-select form-select-sm w-auto">
+      <option value="">All kinds</option>
+      {% for value, count in counts.items %}<option value="{{ value }}"{% if kind == value %} selected{% endif %}>{{ value }} ({{ count }})</option>{% endfor %}
+    </select>
+  </form>
+  <div class="small mb-2">
+    {% for value, count in counts.items %}<span class="me-3">{{ value }}: {{ count }}</span>{% endfor %}
+  </div>
+  {% if not_compared %}
+    <div class="small text-muted mb-2">Not compared yet: {{ not_compared|join:", " }}.</div>
+  {% endif %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover">
+      <thead><tr><th>Scope</th><th>Kind</th><th>Identity</th><th>Attribute</th><th>NetBox</th><th>Device</th><th>Reason / association</th></tr></thead>
+      <tbody>
+        {% for row in page_obj %}
+          <tr>
+            <td>{{ row.scope }}</td><td><span class="badge {{ row.css }}">{{ row.kind }}</span></td>
+            <td>{{ row.identity }}</td><td>{{ row.attribute }}</td>
+            <td><code>{{ row.netbox_value }}</code></td><td><code>{{ row.device_value }}</code></td>
+            <td>{{ row.reason }}{% if row.association_candidate %}
+              Proposed association: <a href="{{ row.association_candidate.get_absolute_url }}">{{ row.association_candidate }}</a>
+              (IP #{{ row.association_candidate.pk }})
+            {% endif %}</td>
+          </tr>
+        {% empty %}<tr><td colspan="7">No differences for these filters.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="d-flex justify-content-between align-items-center small">
+    <span>{{ page_obj.paginator.count }} rows. Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}.</span>
+    <nav aria-label="Differences pages">
+      {% if page_obj.has_previous %}<a data-differences-page href="?scope={{ scope|urlencode }}&amp;kind={{ kind|urlencode }}&amp;page={{ page_obj.previous_page_number }}">Previous</a>{% endif %}
+      {% if page_obj.has_next %}<a class="ms-2" data-differences-page href="?scope={{ scope|urlencode }}&amp;kind={{ kind|urlencode }}&amp;page={{ page_obj.next_page_number }}">Next</a>{% endif %}
+    </nav>
+  </div>
+</div>

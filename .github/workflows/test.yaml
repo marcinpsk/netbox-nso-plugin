@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_SHARDS: "2"
+  CI_SHARDS: "3"
 
 jobs:
   test-netbox:
@@ -37,7 +37,7 @@ jobs:
           - python-version: "3.13"
             netbox-version: *netbox-version
             netbox-ref: *netbox-ref
-        shard: [1, 2]
+        shard: [1, 2, 3]
 
     services:
       redis:
@@ -106,7 +106,7 @@ jobs:
           # netbox_routing fork: the plugin has hard FKs to its ISIS/OSPF/BGP/StaticRoute models.
           # Pinned to a commit SHA (not the mutable feature/integration branch) so CI is
           # reproducible and a fork push cannot silently change what this repo tests against.
-          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@dca9ed1a4a972e9dfeba95dbed10247d46eba405"
+          uv pip install --system "netbox-routing @ git+https://github.com/marcinpsk/netbox-routing.git@f8c0626b45a38f7f13daf9f224a810fb7364d800"
           uv pip install --system -e .
 
       - name: Set up NetBox configuration

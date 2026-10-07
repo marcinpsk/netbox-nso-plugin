@@ -17,6 +17,7 @@ from .models import (
 app_name = "netbox_nso_plugin"
 
 urlpatterns = [
+    path("devices/<int:pk>/nso-differences/", views.NSODeviceDifferencesView.as_view(), name="device_nso_differences"),
     # Adapter Connection (singleton)
     path("adapter-connection/", views.AdapterConnectionEditView.as_view(), name="adapterconnection"),
     # Failover Settings (singleton)

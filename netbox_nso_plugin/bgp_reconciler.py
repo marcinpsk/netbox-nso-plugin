@@ -402,8 +402,8 @@ def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, sour
 def _af_device_content(
     af_list: list,
     *,
-    route_maps_by_name=None,
-    prefix_lists_by_name=None,
+    route_maps_by_name,
+    prefix_lists_by_name,
 ) -> list:
     """Canonical per-AF policy content from the device payload.
 
@@ -412,12 +412,8 @@ def _af_device_content(
     """
     afs = []
 
-    def resolve(name, objects_by_name, resolver):
-        if not name:
-            return None
-        if objects_by_name is not None:
-            return objects_by_name.get(name)
-        return resolver(name)
+    def resolve(name, objects_by_name):
+        return objects_by_name.get(name) if name else None
 
     for paf in af_list:
         af_str = paf["af"]
@@ -425,16 +421,10 @@ def _af_device_content(
             {
                 "af": af_str,
                 "enabled": bool(paf.get("enabled", True)),
-                "routemap_in": _bgp_fk_identity(resolve(paf.get("routemap_in"), route_maps_by_name, _resolve_routemap)),
-                "routemap_out": _bgp_fk_identity(
-                    resolve(paf.get("routemap_out"), route_maps_by_name, _resolve_routemap)
-                ),
-                "prefixlist_in": _bgp_fk_identity(
-                    resolve(paf.get("prefixlist_in"), prefix_lists_by_name, _resolve_prefixlist)
-                ),
-                "prefixlist_out": _bgp_fk_identity(
-                    resolve(paf.get("prefixlist_out"), prefix_lists_by_name, _resolve_prefixlist)
-                ),
+                "routemap_in": _bgp_fk_identity(resolve(paf.get("routemap_in"), route_maps_by_name)),
+                "routemap_out": _bgp_fk_identity(resolve(paf.get("routemap_out"), route_maps_by_name)),
+                "prefixlist_in": _bgp_fk_identity(resolve(paf.get("prefixlist_in"), prefix_lists_by_name)),
+                "prefixlist_out": _bgp_fk_identity(resolve(paf.get("prefixlist_out"), prefix_lists_by_name)),
             }
         )
     return sorted(afs, key=lambda a: a["af"])
@@ -492,8 +482,8 @@ def _peer_device_content(
     desired: dict,
     af_list: list,
     *,
-    route_maps_by_name=None,
-    prefix_lists_by_name=None,
+    route_maps_by_name,
+    prefix_lists_by_name,
 ) -> dict:
     """Build canonical device content with stable natural FK identities."""
     content = {f: (_bgp_fk_identity(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
@@ -521,8 +511,8 @@ def _template_device_content(
     remote_asn_obj,
     af_list: list,
     *,
-    route_maps_by_name=None,
-    prefix_lists_by_name=None,
+    route_maps_by_name,
+    prefix_lists_by_name,
 ) -> dict:
     """Canonical device-desired content for a peer-group template (remote-AS + AF policies)."""
     return {
@@ -539,30 +529,6 @@ def _template_object_content(template_obj, address_families=None) -> dict:
     """Canonical content read back from a netbox-routing BGPPeerTemplate object + its AFs."""
     afs = _af_object_content(template_obj) if address_families is None else _af_rows_content(address_families)
     return {"remote_as": _bgp_fk_identity(template_obj.remote_as), "afs": afs}
-
-
-def _resolve_routemap(name):
-    """Resolve a netbox_routing.RouteMap by name (created by the route-policy reconciler)."""
-    if not name:
-        return None
-    try:
-        from netbox_routing.models import RouteMap
-
-        return RouteMap.objects.filter(name=name).first()
-    except Exception:
-        return None
-
-
-def _resolve_prefixlist(name):
-    """Resolve a netbox_routing.PrefixList by name."""
-    if not name:
-        return None
-    try:
-        from netbox_routing.models import PrefixList
-
-        return PrefixList.objects.filter(name=name).first()
-    except Exception:
-        return None
 
 
 class _BGPGraphPlanner:  # noqa: PLR0904

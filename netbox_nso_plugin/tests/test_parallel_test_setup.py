@@ -33,7 +33,7 @@ def test_real_netbox_ci_disables_root_stubs(monkeypatch):
     assert root_conftest._should_inject_netbox_stubs() is False
 
 
-@pytest.mark.parametrize(("detected_workers", "expected"), [("4", 4), ("32", 8)])
+@pytest.mark.parametrize(("detected_workers", "expected"), [("4", 4), ("32", 16)])
 def test_auto_worker_count_never_exceeds_the_cap(monkeypatch, detected_workers, expected):
     # PYTEST_XDIST_AUTO_NUM_WORKERS short-circuits xdist's own CPU detection, so this
     # exercises the real hook chain without depending on the cores of the host.
@@ -41,13 +41,13 @@ def test_auto_worker_count_never_exceeds_the_cap(monkeypatch, detected_workers, 
 
     monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", detected_workers)
 
-    assert root_conftest.MAX_PARALLEL_WORKERS == 8
+    assert root_conftest.MAX_PARALLEL_WORKERS == 16
     assert root_conftest.pytest_xdist_auto_num_workers(None) == expected
 
 
 @pytest.mark.parametrize(
     ("workers", "expected_args"),
-    [(None, "-n 8 --maxschedchunk=1"), ("1", "-n 0")],
+    [(None, "-n auto --maxschedchunk=1"), ("0", "-n 0"), ("1", "-n 0"), ("4", "-n 4 --maxschedchunk=1")],
 )
 def test_netbox_test_aliases_request_the_configured_worker_count(workers, expected_args):
     # `-n 0` is what a serial run needs now that the addopts request `-n auto`.

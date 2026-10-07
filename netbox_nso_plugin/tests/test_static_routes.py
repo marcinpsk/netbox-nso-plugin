@@ -237,14 +237,19 @@ class TestReconcileStaticRoutes(TestCase):
             static_route_reconcile_plan(self.device, payload)
 
     def test_plan_matches_only_the_duplicate_route_selected_by_the_body(self):
+        from ipam.models import VRF
         from netbox_routing.models import StaticRoute
 
         from netbox_nso_plugin.models import NSOStaticRouteState
         from netbox_nso_plugin.template_content import _reconcile_static_routes, static_route_reconcile_plan
 
         management = self._make_mgmt(self.device, nso_device_name="sr-plan-duplicate")
+        # The device trigger keys on vrf_id; two same-named VRFs still share the wire triple.
         routes = [
-            StaticRoute.objects.create(prefix="198.18.43.0/24", next_hop="198.18.0.43", metric=1) for _index in range(2)
+            StaticRoute.objects.create(
+                prefix="198.18.43.0/24", next_hop="198.18.0.43", vrf=VRF.objects.create(name="DUP"), metric=1
+            )
+            for _index in range(2)
         ]
         from ._static_route_case import _assign_without_push
 
@@ -256,7 +261,7 @@ class TestReconcileStaticRoutes(TestCase):
                 static_route=route,
                 status="in_sync",
             )
-        payload = self._route_payload(self._route_entry("198.18.43.0/24", "198.18.0.43"))
+        payload = self._route_payload(self._route_entry("198.18.43.0/24", "198.18.0.43", vrf="DUP"))
 
         self.assertTrue(static_route_reconcile_plan(self.device, payload).changes_content)
         _reconcile_static_routes(self.device, payload)

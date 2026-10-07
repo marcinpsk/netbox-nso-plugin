@@ -2836,3 +2836,73 @@ def ownership_refusal_diagnostics():
         # ok: nso-ownership-refusal-exception-diagnostic
         response = str(error)
     return response
+
+
+def exact_route_policy_names(name, rows):
+    # ruleid: nso-route-policy-name-folding
+    rows.filter(object_name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    Q(family="prefix_list", object_name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    rows.annotate(name_key=Lower("object_name"))
+    # ruleid: nso-route-policy-name-folding
+    rows.annotate(name_key=functions.Upper("object_name"))
+    # ruleid: nso-route-policy-name-folding
+    RouteMap.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    PrefixList.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    models.ASPath.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    CommunityList.objects.filter(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    RouteMap.objects.get(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    PrefixList.objects.exclude(name__iexact=name)
+    # ruleid: nso-route-policy-name-folding
+    models.ASPath.objects.get_or_create(name__iexact=name)
+    # ok: nso-route-policy-name-folding
+    RouteMap.objects.get(name=name)
+    # ok: nso-route-policy-name-folding
+    RouteMap.objects.filter(name=name)
+    # ok: nso-route-policy-name-folding
+    rows.filter(object_name=name)
+    # ok: nso-route-policy-name-folding
+    Site.objects.filter(name__iexact=name)
+    # ok: nso-route-policy-name-folding
+    rows.annotate(action_key=Lower("action"))
+    # ok: nso-route-policy-name-folding
+    local_key = name.casefold()
+    return local_key
+
+
+def route_map_entry_unmapped(entry):
+    vendor_ext = entry.vendor_ext or {}
+    # ok: nso-route-map-unmapped-direct-read
+    return vendor_ext.get("unmapped", {})
+
+
+def unmapped_marker_reads(entry, vendor_ext, key):
+    # ruleid: nso-route-map-unmapped-direct-read
+    markers = (entry.vendor_ext or {}).get("unmapped", {})
+    # ruleid: nso-route-map-unmapped-direct-read
+    markers = vendor_ext.get("unmapped")
+    # ruleid: nso-route-map-unmapped-direct-read
+    markers = vendor_ext["unmapped"]
+    # ok: nso-route-map-unmapped-direct-read
+    vendor_ext["unmapped"] = {}
+    # ok: nso-route-map-unmapped-direct-read
+    vendor_ext.setdefault("unmapped", {})["set_community"] = markers
+    # ok: nso-route-map-unmapped-direct-read
+    return vendor_ext.get(key)
+
+
+def differences_unrestricted_netbox_query(user, query):
+    # ruleid: nso-differences-unrestricted-netbox-query
+    rows = IPAddress.objects.filter(query)
+    # ruleid: nso-differences-unrestricted-netbox-query
+    rows = VRF.objects.all()
+    # ok: nso-differences-unrestricted-netbox-query
+    rows = IPAddress.objects.restrict(user, "view").filter(query)
+    # ok: nso-differences-unrestricted-netbox-query
+    rows = NSOFamilyObservation.objects.filter(query)
