@@ -50,6 +50,13 @@ def _duplicate_route_id(route_id):
     )
 
 
+def _same_named_vrfs():
+    """Two VRFs with one name: the device trigger keys on vrf_id, the payload on the VRF name."""
+    from ipam.models import VRF
+
+    return VRF.objects.create(name="DUP"), VRF.objects.create(name="DUP")
+
+
 def _raises(exc):
     def do_push(body):
         raise exc
@@ -131,9 +138,10 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
     def test_duplicate_route_id_names_one_route_and_duplicate_triple_names_all_of_them(self):
         """P6.3 — `duplicate_triple` fires on two PAYLOAD entries sharing a triple, so it does
         not resolve to one overlay; attributing it to one would point at an arbitrary route."""
+        vrf_a, vrf_b = _same_named_vrfs()
         with _fixtures():
-            first = _route("10.61.0.0/16", "10.0.0.1", devices=[self.device])
-            second = _route("10.61.0.0/16", "10.0.0.1", devices=[self.device])
+            first = _route("10.61.0.0/16", "10.0.0.1", vrf=vrf_a, devices=[self.device])
+            second = _route("10.61.0.0/16", "10.0.0.1", vrf=vrf_b, devices=[self.device])
             _own(first, self.mgmt)
             _own(second, self.mgmt)
 
@@ -141,7 +149,7 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
             _push(self.device.pk, self.mgmt.adapter_device_id)
         self.assertEqual(_record(self.mgmt)["route_ids"], [first.pk])
 
-        with patch(PUT, side_effect=_duplicate_triple(("", "10.61.0.0/16", "10.0.0.1"))):
+        with patch(PUT, side_effect=_duplicate_triple(("DUP", "10.61.0.0/16", "10.0.0.1"))):
             _push(self.device.pk, self.mgmt.adapter_device_id)
         self.assertEqual(_record(self.mgmt)["route_ids"], sorted([first.pk, second.pk]))
 
@@ -157,16 +165,17 @@ class TestIntentPushRejectionRecord(IntentPushResetMixin, TestCase):
 
     def test_attribution_names_only_routes_the_push_serialized(self):
         """A rejection names PAYLOAD entries, so both predicates must select the same rows."""
+        vrf_a, vrf_b = _same_named_vrfs()
         with _fixtures():
-            pushed = _route("10.66.0.0/16", "10.0.0.1", devices=[self.device])
-            unowned = _route("10.66.0.0/16", "10.0.0.1", devices=[self.device])
-            interface_only = _route("10.66.0.0/16", "198.18.0.66", devices=[self.device])
+            pushed = _route("10.66.0.0/16", "10.0.0.1", vrf=vrf_a, devices=[self.device])
+            unowned = _route("10.66.0.0/16", "10.0.0.1", vrf=vrf_b, devices=[self.device])
+            interface_only = _route("10.66.0.0/16", "198.18.0.66", vrf=vrf_a, devices=[self.device])
             _own(pushed, self.mgmt)
             _own(unowned, self.mgmt, status="imported")
             _own(interface_only, self.mgmt)
             type(interface_only).objects.filter(pk=interface_only.pk).update(next_hop=None)
 
-        with patch(PUT, side_effect=_duplicate_triple(("", "10.66.0.0/16", "10.0.0.1"))) as put:
+        with patch(PUT, side_effect=_duplicate_triple(("DUP", "10.66.0.0/16", "10.0.0.1"))) as put:
             _push(self.device.pk, self.mgmt.adapter_device_id)
 
         serialized = {route["route_id"] for route in put.call_args.args[1]}

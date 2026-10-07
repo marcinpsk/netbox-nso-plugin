@@ -339,6 +339,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
         try:
             from .intent_state import footprint_for_instance, intent_transaction
             from .management_lifecycle import save_management
+            from .signals import _invalidate_source_admissions
 
             with intent_transaction(footprint_for_instance(mgmt)):
                 current = type(mgmt).objects.get(pk=mgmt.pk)
@@ -361,6 +362,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
                     )
                     if not _mirror_management(current, adapter_device_id=adapter_device["id"]):
                         continue
+                    _invalidate_source_admissions(current)
                     invalidate_delivery_baselines(current.device_id)
                 elif state is _IDENTITY_CHANGED:
                     if adapter_device is None:
@@ -390,6 +392,7 @@ def reconcile_device_links(rows, snapshot=None) -> tuple[int, int]:  # noqa: C90
                         )
                         if not _mirror_management(current, adapter_device_id=None):
                             continue
+                        _invalidate_source_admissions(current)
                     invalidate_delivery_baselines(current.device_id)
                 elif state is _UNMAPPED:
                     # The pointer is already null and this branch does not change it. The repair

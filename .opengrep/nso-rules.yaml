@@ -1,6 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-route-policy-name-folding
+    languages: [python]
+    severity: ERROR
+    message: Use exact policy names. This checks direct ORM lookups and Lower/Upper calls, not local-variable casefold(), aliased models, or dynamic managers. Reconcile integration tests cover those paths.
+    pattern-either:
+      - pattern: $CALL(..., object_name__iexact=$NAME, ...)
+      - patterns:
+          - pattern: $FUNCTION("object_name")
+          - metavariable-regex:
+              metavariable: $FUNCTION
+              regex: '^(?:.*\.)?(?:Lower|Upper)$'
+      - patterns:
+          - pattern: $MODEL.objects.$METHOD(..., name__iexact=$NAME, ...)
+          - metavariable-regex:
+              metavariable: $MODEL
+              regex: '^(?:.*\.)?(?:RouteMap|PrefixList|ASPath|CommunityList)$'
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
+  - id: nso-route-map-unmapped-direct-read
+    languages: [python]
+    severity: ERROR
+    message: Read vendor_ext["unmapped"] through signals.route_map_entry_unmapped, which refuses a malformed shape. This checks get() and subscript reads of the literal "unmapped" key, not a key held in a variable.
+    patterns:
+      - pattern-either:
+          - pattern: $EXT.get("unmapped", ...)
+          - pattern: $EXT["unmapped"]
+      - pattern-not-inside: $EXT["unmapped"] = $VALUE
+      - pattern-not-inside: |
+          def route_map_entry_unmapped(...):
+              ...
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
   - id: nso-ownership-refusal-exception-diagnostic
     languages: [python]
     severity: ERROR
@@ -663,3 +697,17 @@ rules:
         - "**/lacp_reconciler.py"
         - "**/lacp_topology.py"
         - "**/views.py"
+  - id: nso-differences-unrestricted-netbox-query
+    languages: [python]
+    severity: ERROR
+    message: The Differences panel uses only rows the user can view. Query this model through .restrict(user, "view").
+    patterns:
+      - pattern: $MODEL.objects.$METHOD(...)
+      - metavariable-regex:
+          metavariable: $MODEL
+          regex: ^(Device|Interface|IPAddress|Prefix|VLAN|VRF)$
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(?!restrict$)
+    paths:
+      include: ["netbox_nso_plugin/device_differences.py"]

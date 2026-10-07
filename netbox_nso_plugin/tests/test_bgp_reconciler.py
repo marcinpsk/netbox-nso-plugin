@@ -2300,8 +2300,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         one_peer = self._payload(self._router_payload(peers=peers[:1]))
         plan = bgp_reconcile_plan(self.device, one_peer)
-        self.assertIn(("route-policy", "route_map:rm-batch"), plan.lock_footprint.shared_keys)
-        self.assertIn(("route-policy", "prefix_list:pl-batch"), plan.lock_footprint.shared_keys)
+        self.assertIn(("route-policy", "route_map:RM-BATCH"), plan.lock_footprint.shared_keys)
+        self.assertIn(("route-policy", "prefix_list:PL-BATCH"), plan.lock_footprint.shared_keys)
         self.assertIn(SourceRow("netbox_routing.routemap", None), plan.lock_footprint.source_rows)
         self.assertIn(SourceRow("netbox_routing.prefixlist", None), plan.lock_footprint.source_rows)
         with CaptureQueriesContext(connection) as one_queries:

@@ -8,7 +8,7 @@ import types
 
 # Each worker takes a private PostgreSQL test database on the shared dev instance, so the
 # worker count must not follow the core count of the host.
-MAX_PARALLEL_WORKERS = 8
+MAX_PARALLEL_WORKERS = 16
 
 
 def pytest_xdist_auto_num_workers(config):

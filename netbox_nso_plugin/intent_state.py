@@ -454,12 +454,18 @@ class MutationFootprint:
     @classmethod
     def merge(cls, *footprints: MutationFootprint) -> MutationFootprint:
         """Combine footprints during discovery, before any lock is acquired."""
-        return cls.for_keys(
+        merged = cls.for_keys(
             (key for footprint in footprints for key in footprint.revision_keys),
             shared_keys=(key for footprint in footprints for key in footprint.shared_keys),
             source_rows=(row for footprint in footprints for row in footprint.source_rows),
             overlay_rows=(row for footprint in footprints for row in footprint.overlay_rows),
         )
+        # Keep device locks that carry no revision key.
+        device_ids = {
+            *merged.device_ids,
+            *(device_id for footprint in footprints for device_id in footprint.device_ids),
+        }
+        return replace(merged, device_ids=tuple(sorted(device_ids)))
 
 
 @dataclass(frozen=True)
@@ -1115,7 +1121,7 @@ def _route_policy_groups(instance) -> tuple[tuple[str, str], ...]:
                 "route_map__name", flat=True
             )
         )
-    return tuple(sorted(groups, key=lambda group: (group[0], group[1].casefold())))
+    return tuple(sorted(groups, key=lambda group: (group[0], group[1])))
 
 
 def _route_policy_prospective_visibility(effective_saves):
@@ -1124,7 +1130,7 @@ def _route_policy_prospective_visibility(effective_saves):
 
     state_label = "netbox_nso_plugin.nsoroutepolicystate"
     acquired_groups = {
-        (after.family, after.object_name.casefold())
+        (after.family, after.object_name)
         for before, after in effective_saves
         if after._meta.label_lower == state_label
         and (before is None or not sm.is_owned(before.status))
@@ -1139,7 +1145,7 @@ def _route_policy_prospective_visibility(effective_saves):
         if spec is None or spec.shared_kind != "route_policy" or after._meta.label_lower == state_label:
             continue
         groups = {
-            (family, name.casefold())
+            (family, name)
             for candidate in (before, after)
             if candidate is not None
             for family, name in _route_policy_groups(candidate)
@@ -1165,7 +1171,7 @@ def _route_map_consumer_rows(instance):
         status__in=OWNED_STATES,
     ).select_related("management")
     redistribution_states = NSORedistributionState.objects.filter(
-        Q(redistribution__route_map_id=instance.pk) | Q(redistribution__isnull=True, route_map__iexact=instance.name),
+        Q(redistribution__route_map_id=instance.pk) | Q(redistribution__isnull=True, route_map=instance.name),
         status__in=OWNED_STATES,
     ).select_related("management")
     return (*bgp_states, *redistribution_states)
@@ -1400,7 +1406,7 @@ def _native_source_is_rendered(instance) -> bool:
     if groups := _route_policy_groups(instance):
         predicate = functools.reduce(
             operator.or_,
-            (Q(family=family, object_name__iexact=name) for family, name in groups),
+            (Q(family=family, object_name=name) for family, name in groups),
         )
         return NSORoutePolicyState.objects.filter(predicate, status__in=OWNED_STATES).exists()
     if label.startswith("netbox_routing."):
@@ -1450,6 +1456,16 @@ def _effective_after(instance, before, update_fields):
                 field.set_cached_value(effective, field.get_cached_value(instance))
             elif field.is_cached(effective):
                 field.delete_cached_value(effective)
+    for relation in instance._meta.private_fields:
+        # A generic relation saved through both columns keeps the caller's planned target.
+        if getattr(relation, "fk_field", None) is None or not {relation.ct_field, relation.fk_field} <= set(
+            update_fields
+        ):
+            continue
+        if relation.is_cached(instance):
+            relation.set_cached_value(effective, relation.get_cached_value(instance))
+        elif relation.is_cached(effective):
+            relation.delete_cached_value(effective)
     return effective
 
 
@@ -1621,7 +1637,7 @@ def _generic_keys(instance, spec: RendererInputSpec) -> set[tuple[int, str]]:
         )
         rows = NSORoutePolicyState.objects.all()
         if family and name:
-            rows = rows.filter(family=family, object_name__iexact=name)
+            rows = rows.filter(family=family, object_name=name)
         device_ids = set(rows.values_list("management__device_id", flat=True))
         return _management_keys(device_ids, spec.scopes) | _route_map_consumer_keys(instance)
     if instance._meta.label_lower in {
@@ -1776,7 +1792,7 @@ def _regular_instance_footprint(instance, spec, *, stored_before=None) -> Mutati
         family = getattr(instance, "family", instance._meta.label_lower)
         name = getattr(instance, "object_name", getattr(instance, "name", ""))
         if name:
-            shared_keys = (("route-policy", f"{family}:{str(name).casefold()}"),)
+            shared_keys = (("route-policy", f"{family}:{str(name)}"),)
     row = (SourceRow(instance._meta.label_lower, instance.pk),)
     if instance._meta.label_lower == "ipam.ipaddress":
         assigned = getattr(instance, "assigned_object", None)
@@ -2017,14 +2033,14 @@ def route_policy_footprint(groups, *, device_ids=()) -> MutationFootprint:
 
     from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
 
-    normalized = tuple(sorted({(str(family), str(name).casefold()) for family, name in groups if name}))
+    normalized = tuple(sorted({(str(family), str(name)) for family, name in groups if name}))
     if not normalized:
         return MutationFootprint.for_keys(
             {(int(device_id), scope) for device_id in device_ids for scope in ("route_policy", "bgp", "isis", "ospf")}
         )
     predicate = functools.reduce(
         operator.or_,
-        (Q(family=family, object_name__iexact=name) for family, name in normalized),
+        (Q(family=family, object_name=name) for family, name in normalized),
     )
     states = list(NSORoutePolicyState.objects.filter(predicate).select_related("management", "content_type"))
     affected_devices = {int(device_id) for device_id in device_ids}

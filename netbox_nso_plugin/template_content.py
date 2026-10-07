@@ -236,7 +236,26 @@ def _interface_ip_vrf(VRF, name):
     """Return the named VRF, or the global table when it is absent or unknown."""
     if not name:
         return None
-    return VRF.objects.filter(name=name).first()
+    return interface_ip_vrf_candidates(VRF, name).first()
+
+
+def interface_ip_vrf_candidates(VRF, name):
+    """Return all named VRFs so readers can detect an ambiguous name."""
+    return VRF.objects.filter(name=name).order_by("pk")
+
+
+def interface_ip_vrf_candidates_by_name(VRF, names):
+    """Return {name: [VRF, ...]} for many names in one query, so readers can detect an ambiguous name."""
+    by_name = {name: [] for name in names}
+    for vrf in VRF.objects.filter(name__in=by_name).order_by("pk"):
+        by_name[vrf.name].append(vrf)
+    return by_name
+
+
+def resolve_interface_ip_interface(iface_map, iface_name, bound_port):
+    """Resolve a router interface by name, then by its Nokia port binding."""
+    interface = iface_map.get(iface_name)
+    return interface if interface is not None else iface_map.get(bound_port)
 
 
 def _interface_ip_native(state, vrf_obj, IPAddress, interface_type):
@@ -288,9 +307,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
     payload_set, attr_map, bound_port_map = _build_payload_index(payload)
     resolved_items = []
     for iface_name, address, vrf_name in sorted(payload_set):
-        iface = iface_map.get(iface_name)
-        if iface is None and iface_name in bound_port_map:
-            iface = iface_map.get(bound_port_map[iface_name])
+        iface = resolve_interface_ip_interface(iface_map, iface_name, bound_port_map.get(iface_name))
         if iface is not None:
             resolved_items.append((iface_name, address, vrf_name, iface))
     resolved_keys = {(iface.pk, address, vrf_name) for _name, address, vrf_name, iface in resolved_items}

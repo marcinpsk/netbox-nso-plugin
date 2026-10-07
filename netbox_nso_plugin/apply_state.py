@@ -188,34 +188,21 @@ def lock_intent_revisions(device_id: int, scopes) -> dict[str, int]:
 
 
 def _promotable_route_policy_rows(rows: list) -> list:
-    """Drop the unmaterialized LOCAL route-policy rows, classifying the whole batch in two queries."""
+    """Drop the unmaterialized LOCAL route-policy rows, classifying the whole batch in one query."""
     from django.contrib.contenttypes.models import ContentType
-    from django.db.models.functions import Upper
 
-    from .models import NSORoutePolicyObjectClass, NSORoutePolicyState
+    from .models import NSORoutePolicyObjectClass
 
     if not rows:
         return rows
-    # Postgres folds BOTH sides, exactly as the object_name__iexact _group_mode uses: python
-    # str.upper()/lower() disagrees with UPPER() on names like the greek final sigma.
-    row_keys = {
-        pk: (family, name_key)
-        for pk, family, name_key in NSORoutePolicyState.objects.filter(pk__in=[row.pk for row in rows])
-        .annotate(name_key=Upper("object_name"))
-        .values_list("pk", "family", "name_key")
-    }
-    modes: dict[tuple[str, str], str] = {}
-    classified = (
-        NSORoutePolicyObjectClass.objects.annotate(name_key=Upper("object_name"))
-        .filter(
-            family__in={family for family, _name in row_keys.values()},
-            name_key__in={name for _family, name in row_keys.values()},
-        )
-        .order_by("family", "object_name")
-        .values_list("family", "name_key", "mode")
+    row_keys = {row.pk: (row.family, row.object_name) for row in rows}
+    modes = dict(
+        ((family, name), mode)
+        for family, name, mode in NSORoutePolicyObjectClass.objects.filter(
+            family__in={row.family for row in rows},
+            object_name__in={row.object_name for row in rows},
+        ).values_list("family", "object_name", "mode")
     )
-    for family, name_key, mode in classified:
-        modes.setdefault((family, name_key), mode)
     local_rows = [row for row in rows if modes.get(row_keys[row.pk], "master") == "local"]
     if not local_rows:
         return rows

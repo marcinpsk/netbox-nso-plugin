@@ -117,14 +117,15 @@ netbox-shell() {
 }
 
 netbox-test() {
-  local workers="${NETBOX_TEST_WORKERS:-8}"
+  local workers="${NETBOX_TEST_WORKERS:-auto}"
   local target="netbox_nso_plugin/tests"
   local parallel_args=()
   if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
     target="$1"
     shift
   fi
-  if [ "$workers" -gt 1 ]; then
+  if [ "$workers" != 0 ] && [ "$workers" != 1 ]; then
+    # `auto` is capped by MAX_PARALLEL_WORKERS in the repo-root conftest.py.
     parallel_args=(-n "$workers" --maxschedchunk=1)
   else
     # The pyproject addopts request `-n auto`; -n 0 makes it serial.
@@ -136,14 +137,14 @@ netbox-test() {
 }
 
 netbox-test-coverage() {
-  local workers="${NETBOX_TEST_WORKERS:-8}"
+  local workers="${NETBOX_TEST_WORKERS:-auto}"
   local target="netbox_nso_plugin/tests"
   local parallel_args=()
   if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
     target="$1"
     shift
   fi
-  if [ "$workers" -gt 1 ]; then
+  if [ "$workers" != 0 ] && [ "$workers" != 1 ]; then
     parallel_args=(-n "$workers" --maxschedchunk=1)
   else
     # The pyproject addopts request `-n auto`; -n 0 is what turns a run serial again.
@@ -233,7 +234,7 @@ dev-help() {
   echo ""
   echo "🛠️  Development Tools:"
   echo "  netbox-shell        : Open NetBox Django shell"
-  echo "  netbox-test         : Run plugin tests (8 workers, warm DB reuse)"
+  echo "  netbox-test         : Run plugin tests (-n auto, capped in conftest.py; warm DB reuse)"
   echo "  netbox-test-coverage: Run plugin tests with coverage"
   echo "  netbox-test-django  : Diagnose Django-runner-specific behavior"
   echo "  netbox-manage       : Run Django management commands"

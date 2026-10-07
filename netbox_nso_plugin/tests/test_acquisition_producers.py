@@ -186,6 +186,7 @@ UNRESOLVED_DISPOSITIONS = {
     ("provision_lifecycle.py", "validate_provision_evidence"): (1, "Validate external job status."),
     ("provision_lifecycle.py", "mark_provision_terminal"): (1, "Write provision lifecycle status, not overlay status."),
     ("signals.py", "_invalidate_source_admissions"): (1, "Family read admission status is not overlay status."),
+    ("read_gate.py", "gated_family_run"): (1, "Observation JSON does not acquire an overlay."),
     ("filters.py", "NSOInterfaceStateFilterSet"): (1, "Declare a status filter; no row write."),
     ("tables.py", "NSOInterfaceStateTable"): (1, "Declare a status column; no row write."),
 }

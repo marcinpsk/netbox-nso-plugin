@@ -1099,7 +1099,7 @@
   </script>
 
   {# ── NSO configuration: counts-first, rows loaded lazily on expand ──────── #}
-  {% if nso_categories %}
+  {% if nso_categories or mgmt %}
     <h4 class="mt-4 mb-2"><span class="mdi mdi-format-list-bulleted"></span> NSO Configuration</h4>
     {# READSEM S4 (R11/R12): device-wide reset banner — always in the DOM so the #}
     {# counts poll can toggle it; honored by every render path incl. adapter-down. #}
@@ -1120,6 +1120,15 @@
        data-cat-counts-url="{% url 'plugins:netbox_nso_plugin:device_nso_category_counts' device_pk=object.pk %}">
       Counts reflect the last sync. Click a category to load its rows.
     </p>
+    <div class="card mb-2 nso-category" data-cat-key="differences"
+         data-cat-url="{% url 'plugins:netbox_nso_plugin:device_nso_differences' pk=object.pk %}">
+      <div class="card-header d-flex justify-content-between align-items-center nso-cat-toggle"
+           role="button" tabindex="0" aria-expanded="false" style="cursor: pointer;">
+        <span><span class="mdi mdi-vector-difference me-1"></span><strong>Differences</strong></span>
+        <span class="mdi mdi-chevron-down nso-cat-chevron"></span>
+      </div>
+      <div class="card-body nso-cat-body d-none"><div class="text-muted small">Loading…</div></div>
+    </div>
     {% for cat in nso_categories %}
       <div class="card mb-2 nso-category"
            data-cat-key="{{ cat.key }}"
@@ -1297,6 +1306,39 @@
             loaded = true; fetchRows(true);  // force a live reconcile, then render
           });
         }
+      });
+    })();
+
+    (function () {
+      "use strict";
+      function loadDifferences(panel, parameters) {
+        var form = panel.querySelector('[data-differences-filter]');
+        fetch(form.action + '?' + parameters.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+          .then(function (response) { if (!response.ok) throw new Error('HTTP ' + response.status); return response.text(); })
+          .then(function (html) {
+            var container = document.createElement('div'); container.innerHTML = html;
+            var next = container.querySelector('[data-differences-panel]');
+            if (!next) throw new Error('response has no differences panel');  // e.g. the login page after a session expiry
+            panel.replaceWith(next);
+          })
+          .catch(function () {
+            var message = document.createElement('div'); message.className = 'text-danger small';
+            message.textContent = 'Failed to load differences.'; panel.prepend(message);
+          });
+      }
+      document.addEventListener('change', function (event) {
+        var form = event.target.closest('[data-differences-filter]'); if (!form) return;
+        loadDifferences(form.closest('[data-differences-panel]'), new URLSearchParams(new FormData(form)));
+      });
+      document.addEventListener('submit', function (event) {
+        var form = event.target.closest('[data-differences-filter]'); if (!form) return;
+        event.preventDefault();
+        loadDifferences(form.closest('[data-differences-panel]'), new URLSearchParams(new FormData(form)));
+      });
+      document.addEventListener('click', function (event) {
+        var link = event.target.closest('[data-differences-page]'); if (!link) return;
+        event.preventDefault();
+        loadDifferences(link.closest('[data-differences-panel]'), new URLSearchParams(link.search));
       });
     })();
 
