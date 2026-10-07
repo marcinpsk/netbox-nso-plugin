@@ -258,6 +258,64 @@ class TestDeviceDifferencesView(TestCase):
         self.assertEqual((row["netbox_value"], row["device_value"]), ("24", "25"))
         self.assertNotContains(response, "NetBox object is not visible to you")
 
+    def _grant_view(self, *objects):
+        for obj in objects:
+            permission = ObjectPermission.objects.create(
+                name=f"View {obj._meta.model_name} {obj.pk}", actions=["view"], constraints={"pk": obj.pk}
+            )
+            permission.object_types.add(ObjectType.objects.get_for_model(type(obj)))
+            permission.users.add(self.user)
+
+    def test_vrf_name_shared_with_a_hidden_vrf_is_not_visible_rather_than_non_unique(self):
+        from ipam.models import VRF
+
+        from ._observation_case import ip_observation
+
+        self._grant_view(VRF.objects.create(name="shared-vrf"))
+        VRF.objects.create(name="shared-vrf")
+        self._ip_snapshot(ip_observation("lag-60", "198.18.0.9/24", vrf="shared-vrf"))
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["reason"]), ("ambiguous", "NetBox object is not visible to you"))
+        self.assertNotContains(response, "non-unique VRF name")
+
+    def test_visible_ip_in_a_hidden_vrf_is_not_visible_and_never_names_the_vrf(self):
+        from ipam.models import VRF
+
+        from ._observation_case import ip_observation
+
+        native = self._assigned_ip("198.18.0.9/24")
+        native.vrf = VRF.objects.create(name="hidden-vrf")
+        native.save()
+        self._grant_view(native)
+        self._ip_snapshot()
+        response = self.client.get(self.url, {"scope": "ip"})
+        self.assertEqual(self._scope_rows(response, "ip"), [])
+        self.assertNotContains(response, "hidden-vrf")
+        snapshot = observation("interface_ip", interfaces=[ip_observation("lag-60", "198.18.0.9/24", vrf="hidden-vrf")])
+        NSOFamilyObservation.objects.filter(read_state__management=self.management).filter(
+            read_state__family="interface_ip"
+        ).update(**observation_defaults("interface_ip", 1, 1, snapshot))
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["reason"]), ("ambiguous", "NetBox object is not visible to you"))
+        self.assertEqual(row["netbox_value"], "missing")
+
+    def test_visible_ip_in_a_visible_vrf_is_compared(self):
+        from ipam.models import VRF
+
+        from ._observation_case import ip_observation
+
+        vrf = VRF.objects.create(name="open-vrf")
+        native = self._assigned_ip("198.18.0.9/24")
+        native.vrf = vrf
+        native.save()
+        self._grant_view(native, vrf)
+        self._ip_snapshot(ip_observation("lag-60", "198.18.0.9/25", vrf="open-vrf", prefix_length=25))
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["attribute"]), ("mismatch", "prefix_length"))
+
     def test_ip_the_user_can_view_is_compared(self):
         from ipam.models import IPAddress
 

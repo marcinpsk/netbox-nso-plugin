@@ -152,12 +152,15 @@ def _device_ip_projection(entry, address, interfaces):
     }
 
 
-def _ip_device_index(spec, snapshot, interfaces):
+def _ip_device_index(spec, snapshot, interfaces, user):
     from ipam.models import VRF
 
     device = defaultdict(list)
     names = {address["vrf"] for entry in snapshot.document["interfaces"] for address in entry["addresses"]}
+    # Match names over every VRF so keys stay true; rows that depend on a hidden VRF are redacted.
     vrfs = interface_ip_vrf_candidates_by_name(VRF, sorted(name for name in names if name))
+    every_vrf = [vrf for candidates in vrfs.values() for vrf in candidates]
+    hidden_vrfs = {vrf.pk for vrf in every_vrf} - _visible_pks(VRF, user, every_vrf)
     vrfs[None] = vrfs[""] = []
     rows = []
     blocked = set()
@@ -174,16 +177,15 @@ def _ip_device_index(spec, snapshot, interfaces):
                 continue
             name = address["vrf"]
             if len(vrfs[name]) > 1:
+                reason = NOT_VISIBLE if any(vrf.pk in hidden_vrfs for vrf in vrfs[name]) else "non-unique VRF name"
                 rows.append(
-                    Difference(
-                        spec.scope, "ambiguous", spec.identity(item), device_value=address, reason="non-unique VRF name"
-                    )
+                    Difference(spec.scope, "ambiguous", spec.identity(item), device_value=address, reason=reason)
                 )
                 blocked.update((item["interface"], item["host"], vrf.pk) for vrf in vrfs[name])
                 continue
             vrf_id = vrfs[name][0].pk if vrfs[name] else (name if name else None)
             device[(item["interface"], item["host"], vrf_id)].append(item)
-    return device, rows, blocked
+    return device, rows, blocked, hidden_vrfs
 
 
 def _ip_candidates(hosts, user):
@@ -221,18 +223,20 @@ def _ip_group_rows(spec, native, device, candidates, device_count):
 
 
 def _ip_rows(spec, management, snapshot, user):
-    from ipam.models import IPAddress
+    from ipam.models import VRF, IPAddress
 
     interfaces = {interface.pk: interface for interface in device_interfaces(management)}
-    device, rows, blocked = _ip_device_index(
-        spec, snapshot, {interface.name: interface for interface in interfaces.values()}
+    device, rows, blocked, hidden_vrfs = _ip_device_index(
+        spec, snapshot, {interface.name: interface for interface in interfaces.values()}, user
     )
     native = defaultdict(list)
     hidden = set()
     bindings = [ip for _scope, ip, _model, _key in _ip_bindings(management)]
     visible = _visible_pks(IPAddress, user, bindings)
+    native_vrfs = [ip.vrf for ip in bindings if ip.vrf_id is not None]
+    hidden_vrfs |= {vrf.pk for vrf in native_vrfs} - _visible_pks(VRF, user, native_vrfs)
     for ip in bindings:
-        if ip.pk not in visible:
+        if ip.pk not in visible or ip.vrf_id in hidden_vrfs:
             with contextlib.suppress(KeyError, ValueError):
                 item = _native_ip_projection(ip, interfaces)
                 hidden.add((item["interface"], item["host"], ip.vrf_id))
@@ -252,7 +256,7 @@ def _ip_rows(spec, management, snapshot, user):
     for key, items in device.items():
         device_counts[(key[1], key[2])] += len(items)
     for key in sorted(native.keys() | device.keys(), key=repr):
-        if key in hidden and not native[key]:
+        if (key in hidden or key[2] in hidden_vrfs) and not native[key]:
             rows.append(
                 Difference(spec.scope, "ambiguous", spec.identity((device[key] or native[key])[0]), reason=NOT_VISIBLE)
             )
