@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_SHARDS: "2"
+  CI_SHARDS: "3"
 
 jobs:
   test-netbox:
@@ -37,7 +37,7 @@ jobs:
           - python-version: "3.13"
             netbox-version: *netbox-version
             netbox-ref: *netbox-ref
-        shard: [1, 2]
+        shard: [1, 2, 3]
 
     services:
       redis:
