@@ -252,7 +252,7 @@ def _ip_rows(spec, management, snapshot, user):
     for key, items in device.items():
         device_counts[(key[1], key[2])] += len(items)
     for key in sorted(native.keys() | device.keys(), key=repr):
-        if key in hidden:
+        if key in hidden and not native[key]:
             rows.append(
                 Difference(spec.scope, "ambiguous", spec.identity((device[key] or native[key])[0]), reason=NOT_VISIBLE)
             )

@@ -239,6 +239,25 @@ class TestDeviceDifferencesView(TestCase):
         self.assertEqual(row["reason"], "NetBox object is not visible to you")
         self.assertEqual(row["netbox_value"], "missing")
 
+    def test_hidden_ip_at_the_same_key_does_not_replace_the_visible_comparison(self):
+        from ipam.models import IPAddress
+
+        from ._observation_case import ip_observation
+
+        native = self._assigned_ip("198.18.0.9/24")
+        self._assigned_ip("198.18.0.9/32")
+        permission = ObjectPermission.objects.create(
+            name="View the visible IP", actions=["view"], constraints={"pk": native.pk}
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+        permission.users.add(self.user)
+        self._ip_snapshot(ip_observation("lag-60", "198.18.0.9/25", prefix_length=25))
+        response = self.client.get(self.url, {"scope": "ip"})
+        (row,) = self._scope_rows(response, "ip")
+        self.assertEqual((row["kind"], row["attribute"]), ("mismatch", "prefix_length"))
+        self.assertEqual((row["netbox_value"], row["device_value"]), ("24", "25"))
+        self.assertNotContains(response, "NetBox object is not visible to you")
+
     def test_ip_the_user_can_view_is_compared(self):
         from ipam.models import IPAddress
 
