@@ -1317,7 +1317,9 @@
           .then(function (response) { if (!response.ok) throw new Error('HTTP ' + response.status); return response.text(); })
           .then(function (html) {
             var container = document.createElement('div'); container.innerHTML = html;
-            panel.replaceWith(container.querySelector('[data-differences-panel]'));
+            var next = container.querySelector('[data-differences-panel]');
+            if (!next) throw new Error('response has no differences panel');  // e.g. the login page after a session expiry
+            panel.replaceWith(next);
           })
           .catch(function () {
             var message = document.createElement('div'); message.className = 'text-danger small';
