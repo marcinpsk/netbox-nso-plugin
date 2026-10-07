@@ -22,32 +22,24 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         records = []
-        states = NSORoutePolicyState.objects.filter(family="route_map").select_related("management", "content_type")
+        # Only the materialized capture built the native entries (sequence = position + 1).
+        states = NSORoutePolicyState.objects.filter(family="route_map", is_materialized=True).select_related(
+            "management", "content_type"
+        )
         for state in states.order_by("management_id", "object_name", "pk"):
             native = state.assigned_object
             if native is None or native._meta.label_lower != "netbox_routing.routemap":
                 continue
-            entries = tuple(
-                native.route_map_entries.order_by("sequence").prefetch_related(
+            entries = {
+                entry.sequence: entry
+                for entry in native.route_map_entries.prefetch_related(
                     "match_prefix_list", "match_community_list", "match_aspath"
                 )
-            )
-            for position, captured in enumerate((state.captured or {}).get("entries") or []):
-                if position >= len(entries):
-                    continue
-                entry = entries[position]
-                try:
-                    markers = route_map_entry_unmapped(entry, native.name)
-                except RendererAuditRepairFailed as exc:
-                    raise CommandError(str(exc)) from None
-                missing = {}
-                for capture_key, field in _MATCH_REFERENCES:
-                    resolved = {obj.name for obj in getattr(entry, field).all()}
-                    marked = set(markers.get(field) or [])
-                    names = [name for name in captured.get(capture_key) or [] if name not in resolved | marked]
-                    if names:
-                        missing[field] = names
-                if missing:
+            }
+            for sequence, captured in enumerate((state.captured or {}).get("entries") or [], start=1):
+                entry = entries.get(sequence)
+                missing = self._missing(entry, native.name, captured)
+                if missing or entry is None:
                     records.append(
                         {
                             "device_id": state.management.device_id,
@@ -56,9 +48,26 @@ class Command(BaseCommand):
                             "native_name": native.name,
                             "status": state.status,
                             "is_materialized": state.is_materialized,
-                            "entry_id": entry.pk,
-                            "sequence": entry.sequence,
+                            "entry_id": entry.pk if entry else None,
+                            "sequence": sequence,
+                            "unmatched": entry is None,
                             "missing": missing,
                         }
                     )
         self.stdout.write(json.dumps(records, sort_keys=True, indent=2))
+
+    @staticmethod
+    def _missing(entry, native_name, captured):
+        """Return captured references with no native edge or unmapped marker (all of them without an entry)."""
+        try:
+            markers = route_map_entry_unmapped(entry, native_name) if entry else {}
+        except RendererAuditRepairFailed as exc:
+            raise CommandError(str(exc)) from None
+        missing = {}
+        for capture_key, field in _MATCH_REFERENCES:
+            resolved = {obj.name for obj in getattr(entry, field).all()} if entry else set()
+            marked = set(markers.get(field) or [])
+            names = [name for name in captured.get(capture_key) or [] if name not in resolved | marked]
+            if names:
+                missing[field] = names
+        return missing

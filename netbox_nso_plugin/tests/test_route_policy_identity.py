@@ -274,7 +274,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         native = RouteMap.objects.create(name="MALFORMED")
         entry = RouteMapEntry.objects.create(route_map=native, sequence=1, action="permit")
         capture = {"name": "MALFORMED", "entries": [{"sequence": 10, "action": "permit"}]}
-        state = self._own(self.mgmt_a, "route_map", native, captured=capture)
+        state = self._own(self.mgmt_a, "route_map", native, captured=capture, is_materialized=True)
         for vendor_ext in ({"unmapped": None}, {"unmapped": ["X"]}, ["unmapped"], [], ""):
             with self.subTest(vendor_ext=vendor_ext):
                 self._offline(
@@ -654,7 +654,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         capture = {"name": "OLD-GRAPH", "entries": [{"sequence": 10, "action": "permit", "match_prefix_lists": ["X"]}]}
         root = RouteMap.objects.create(name=capture["name"])
         RouteMapEntry.objects.create(route_map=root, sequence=1, action="permit")
-        self._own(self.mgmt_a, "route_map", root, captured=capture)
+        self._own(self.mgmt_a, "route_map", root, captured=capture, is_materialized=True)
         before_entries = list(RouteMapEntry.objects.values())
         before_revisions = list(NSOIntentRevision.objects.values())
         stdout = io.StringIO()
@@ -665,6 +665,30 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         self.assertEqual(records[0]["missing"], {"match_prefix_list": ["X"]})
         self.assertEqual(list(RouteMapEntry.objects.values()), before_entries)
         self.assertEqual(list(NSOIntentRevision.objects.values()), before_revisions)
+
+    def test_reference_report_pairs_only_the_materialized_capture_and_reports_unmatched_entries(self):
+        root = RouteMap.objects.create(name="SHARED")
+        entry = RouteMapEntry.objects.create(route_map=root, sequence=1, action="permit")
+        owner = {
+            "name": "SHARED",
+            "entries": [
+                {"sequence": 10, "action": "permit", "match_prefix_lists": ["X"]},
+                {"sequence": 20, "action": "permit", "match_as_paths": ["Y"]},
+            ],
+        }
+        peer = {"name": "SHARED", "entries": [{"sequence": 10, "action": "deny", "match_prefix_lists": ["Z"]}]}
+        state = self._own(self.mgmt_a, "route_map", root, captured=owner, is_materialized=True)
+        self._own(self.mgmt_b, "route_map", root, captured=peer)
+        stdout = io.StringIO()
+        call_command("nso_route_policy_reference_report", stdout=stdout)
+        records = json.loads(stdout.getvalue())
+        self.assertEqual(
+            [(r["state_id"], r["entry_id"], r["sequence"], r["unmatched"], r["missing"]) for r in records],
+            [
+                (state.pk, entry.pk, 1, False, {"match_prefix_list": ["X"]}),
+                (state.pk, None, 2, True, {"match_aspath": ["Y"]}),
+            ],
+        )
 
     def test_stale_owner_creates_an_exact_root_before_a_peer_reconciles_the_native_rename(self):
         capture = self._capture("prefix_list", "POLICY")
