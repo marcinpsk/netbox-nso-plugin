@@ -797,6 +797,24 @@ def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
     return ordered  # "all" (or unknown) → no filter
 
 
+def _difference_value(scope, value):
+    """Render one side of a difference row as readable text, never as a raw document."""
+    from .device_differences import MISSING
+
+    if value is MISSING:
+        return str(value)
+    if not isinstance(value, dict):
+        return json.dumps(value, default=str)
+    if scope == "ip":
+        address = value.get("address") or (
+            value["host"] if value.get("prefix_length") is None else f"{value['host']}/{value['prefix_length']}"
+        )
+        place = f" on {value['interface']}" if value.get("interface") else ""
+        return f"{address}{place}" + (f" (VRF {value['vrf']})" if value.get("vrf") else "")
+    names = ("description", "enabled") if scope == "interface" else sorted(value)
+    return "; ".join(f"{name}: {json.dumps(value[name], default=str)}" for name in names if value.get(name) is not None)
+
+
 class NSODeviceDifferencesView(LoginRequiredMixin, View):
     """Render snapshot differences without an adapter read or a reconcile."""
 
@@ -805,7 +823,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
 
         from .device_differences import (
             KINDS,
-            MISSING,
             NOT_SUPPORTED,
             differences,
             identity_label,
@@ -837,9 +854,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
             "unavailable": "text-bg-dark",
         }
 
-        def display(value):
-            return str(value) if value is MISSING else json.dumps(value, sort_keys=True, default=str)
-
         page = Paginator(filtered, 50).get_page(request.GET.get("page"))
         page.object_list = [
             {
@@ -848,8 +862,8 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
                 "css": css[row.kind],
                 "identity": identity_label(row),
                 "attribute": row.attribute,
-                "netbox_value": display(row.netbox_value),
-                "device_value": display(row.device_value),
+                "netbox_value": _difference_value(row.scope, row.netbox_value),
+                "device_value": _difference_value(row.scope, row.device_value),
                 "reason": row.reason,
                 "association_candidate": row.association_candidate,
                 "token": row_token(row),
