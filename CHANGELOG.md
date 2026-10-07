@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v1.7.1 (2026-10-05)
+
+### Bug Fixes
+
+- **lacp**: Keep owned bundle intent editable while the device omits it
+  ([`5b5a3c2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5b5a3c20c0c634e4de404fe9d07dd8e3d94984f3))
+
+- **ui**: Clear a blocked-removal preview when its orphan set changes
+  ([`dab0985`](https://github.com/marcinpsk/netbox-nso-plugin/commit/dab09850c0c5d2839346fd60db41a2ee074e9320))
+
+### Chores
+
+- **deps**: Bump ruff
+  ([`2842137`](https://github.com/marcinpsk/netbox-nso-plugin/commit/284213759cc1c4707787be44cd5534be4551978c))
+
+- **deps**: Bump urllib3 from 2.7.0 to 2.8.0
+  ([`d4f0cbb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d4f0cbb2b1b516301c1f27a8b6c6b89b6ad75d40))
+
+- **deps**: Bump virtualenv from 21.3.3 to 21.7.13
+  ([`a4729d8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a4729d86bbb12fd7076e2e42576f911b50005e40))
+
+- **deps**: Bump vitest from 5.0.1 to 5.0.3 in the js-minor-patch group
+  ([`377325a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/377325a943d35508ec0f778e08c7887be431fecb))
+
+### Testing
+
+- Stub the reconcile lease in the fault isolation tests
+  ([`f05285a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f05285aa486e52cdb9f642c09ed5dcf7908f7abf))
+
+- **ci**: Parse workflow triggers as YAML and validate coverage fixtures
+  ([`bea5378`](https://github.com/marcinpsk/netbox-nso-plugin/commit/bea5378b0ba9afbc84b512509599943f0c542767))
+
+
 ## v1.7.0 (2026-10-02)
 
 ### Bug Fixes
