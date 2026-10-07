@@ -632,6 +632,38 @@ class TestReconcileRoutePolicy(TestCase):
             self.assertEqual(len(prefetches), 1)
             self.assertIn(" WHERE ", prefetches[0])
 
+    def test_route_map_planner_looks_up_each_missing_reference_name_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from netbox_routing.models import CommunityList, PrefixList
+
+        from netbox_nso_plugin.route_policy_reconciler import route_policy_reconcile_plan
+
+        self._make_mgmt(self.device)
+        entry = {
+            "action": "permit",
+            "match_prefix_lists": ["MISSING-PL"],
+            "set": json.dumps({"community": "64512:1", "community_additive": True}),
+        }
+        payload = {
+            "route_maps": [
+                {"name": name, "entries": [{**entry, "sequence": 10}, {**entry, "sequence": 20}]}
+                for name in ("MISS-RM-A", "MISS-RM-B")
+            ]
+        }
+
+        with CaptureQueriesContext(connection) as captured:
+            route_policy_reconcile_plan(self.device, payload)
+
+        for model, name in ((PrefixList, "MISSING-PL"), (CommunityList, "64512:1")):
+            lookups = [
+                query["sql"]
+                for query in captured.captured_queries
+                if f'FROM "{model._meta.db_table}"' in query["sql"] and name in query["sql"]
+            ]
+            # One payload prefetch plus one fallback miss, not one fallback per entry.
+            self.assertEqual(len(lookups), 2, lookups)
+
     def test_display_projection_rejects_a_registered_through_model(self):
         from netbox_routing.models import CommunityList, RouteMapEntry
 

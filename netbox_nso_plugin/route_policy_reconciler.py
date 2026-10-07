@@ -300,6 +300,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         self.prefixes = {str(row.prefix): row for row in CustomPrefix.objects.filter(prefix__in=prefix_values)}
         self.communities = {str(row.community): row for row in Community.objects.filter(community__in=community_values)}
         self.name_maps = {family: {} for family in self.models}
+        # Every root this planner creates lands in self.roots first, so a recorded miss stays valid.
+        self.missing_root_keys = set()
         self.community_members = {}
         self.seen = set()
         self.modified_state_pks = set()
@@ -738,8 +740,10 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             references.extend(("community_list", action.name) for action in structured.set_communities)
             for family, name in references:
                 root = self.roots[family].get(name)
-                if root is None:
+                if root is None and (family, name) not in self.missing_root_keys:
                     root = self.models[family].objects.filter(name=name).first()
+                    if root is None:
+                        self.missing_root_keys.add((family, name))
                 if root is not None:
                     self.roots[family][name] = root
                     self.name_maps[family][name] = root
