@@ -840,6 +840,19 @@ class NSOFamilyReadState(NetBoxModel):
         return f"{self.management} / {self.family} [{self.observed_outcome or 'unknown'}]"
 
 
+class NSOFamilyObservation(models.Model):
+    """Last successful device observation, committed with its family publication."""
+
+    read_state = models.OneToOneField(NSOFamilyReadState, on_delete=models.CASCADE, related_name="observation")
+    revision = models.BigIntegerField()
+    source_epoch = models.BigIntegerField()
+    digest = models.CharField(max_length=64)
+    coverage = models.JSONField()
+    document = models.JSONField()
+    observed_at = models.DateTimeField()
+    recorded_at = models.DateTimeField(auto_now=True)
+
+
 class NSOInterfaceState(_OwnedOverlayModel):
     """Per-interface, per-attribute intent status overlay (Phase 2).
 

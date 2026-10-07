@@ -189,7 +189,15 @@ def _gated(
         validator(payload)
     context_before = dict(ctx)
     try:
-        result = gated_family_run(mgmt, family, read_state, body, epoch=epoch, pre_body=pre_body)
+        result = gated_family_run(
+            mgmt,
+            family,
+            read_state,
+            body,
+            epoch=epoch,
+            pre_body=pre_body,
+            observation=payload.get("observation") if isinstance(payload, dict) else None,
+        )
     except ReconcileScopeError as exc:
         from .read_gate import (
             SKIPPED_STALE_ATTEMPT,

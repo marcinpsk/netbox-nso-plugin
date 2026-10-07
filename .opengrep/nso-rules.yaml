@@ -697,3 +697,17 @@ rules:
         - "**/lacp_reconciler.py"
         - "**/lacp_topology.py"
         - "**/views.py"
+  - id: nso-differences-unrestricted-netbox-query
+    languages: [python]
+    severity: ERROR
+    message: The Differences panel uses only rows the user can view. Query this model through .restrict(user, "view").
+    patterns:
+      - pattern: $MODEL.objects.$METHOD(...)
+      - metavariable-regex:
+          metavariable: $MODEL
+          regex: ^(Device|Interface|IPAddress|Prefix|VLAN|VRF)$
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(?!restrict$)
+    paths:
+      include: ["netbox_nso_plugin/device_differences.py"]

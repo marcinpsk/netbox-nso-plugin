@@ -2868,7 +2868,7 @@ def exact_route_policy_names(name, rows):
     # ok: nso-route-policy-name-folding
     rows.filter(object_name=name)
     # ok: nso-route-policy-name-folding
-    Device.objects.filter(name__iexact=name)
+    Site.objects.filter(name__iexact=name)
     # ok: nso-route-policy-name-folding
     rows.annotate(action_key=Lower("action"))
     # ok: nso-route-policy-name-folding
@@ -2895,3 +2895,14 @@ def unmapped_marker_reads(entry, vendor_ext, key):
     vendor_ext.setdefault("unmapped", {})["set_community"] = markers
     # ok: nso-route-map-unmapped-direct-read
     return vendor_ext.get(key)
+
+
+def differences_unrestricted_netbox_query(user, query):
+    # ruleid: nso-differences-unrestricted-netbox-query
+    rows = IPAddress.objects.filter(query)
+    # ruleid: nso-differences-unrestricted-netbox-query
+    rows = VRF.objects.all()
+    # ok: nso-differences-unrestricted-netbox-query
+    rows = IPAddress.objects.restrict(user, "view").filter(query)
+    # ok: nso-differences-unrestricted-netbox-query
+    rows = NSOFamilyObservation.objects.filter(query)
