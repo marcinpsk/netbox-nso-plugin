@@ -4,7 +4,7 @@
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {% if interface_ips %}
-  <p class="text-muted small mb-2">IP addresses reported by the device, correlated to their NetBox interface. Until accepted (or interface-IP auto-create is enabled) these are <strong>imported</strong> — recorded here but not yet written to NetBox IPAM.</p>
+  <p class="text-muted small mb-2">IP addresses reported by the device, correlated to their NetBox interface. Accept makes an address NetBox intent and does not change NetBox IPAM. To correct NetBox IPAM to the device, use <strong>Sync from NSO</strong> in Differences.</p>
   <div id="flt-interface-ips">
   {% include "netbox_nso_plugin/categories/_table_filter.html" with fid="flt-interface-ips" placeholder="Filter by interface / address / VRF…" show_status=True %}
   <div class="table-responsive mb-3">
@@ -22,12 +22,7 @@
           <td>{% if ip.secondary %}<span class="badge text-bg-light">secondary</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=ip.status residue=ip.residue_survivor residue_job=ip.residue_job_id %}</td>
           <td class="text-end">
-            {% if ip.status == "conflict" %}
-            <form method="post" action="{% url 'plugins:netbox_nso_plugin:nsointerfaceipstate_accept' pk=ip.pk %}" class="d-inline">
-              {% csrf_token %}
-              <button type="submit" class="btn btn-sm btn-warning" title="Adopt this address onto {{ ip.interface.name }} (move it from its current NetBox interface). No device change — the device already has it.">Accept onto {{ ip.interface.name }}</button>
-            </form>
-            {% endif %}
+            {% url 'plugins:netbox_nso_plugin:nsointerfaceipstate_accept' pk=ip.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=ip.status form_class="d-inline" title="Make NetBox the source of truth for this address (written to the device on Apply). NetBox IPAM does not change; use Sync from NSO in Differences to correct NetBox." %}
           </td>
         </tr>
         {% endfor %}

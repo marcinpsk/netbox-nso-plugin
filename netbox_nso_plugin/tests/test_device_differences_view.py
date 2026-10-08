@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Authorize and render the read-only Differences panel through real Django views."""
 
-import json
 from uuid import uuid4
 
 from core.models import ObjectType
@@ -280,8 +279,7 @@ class TestDeviceDifferencesView(TestCase):
         self.assertEqual((row["kind"], row["reason"]), ("ambiguous", "NetBox object is not visible to you"))
         self.assertNotContains(response, "non-unique VRF name")
         self.assertEqual(row["identity"], "lag-60 198.18.0.9/24")
-        self.assertEqual(json.loads(row["device_value"])["vrf"], None)
-        self.assertEqual(json.loads(row["device_value"])["address"], "198.18.0.9/24")
+        self.assertEqual(row["device_value"], "198.18.0.9/24")
 
     def test_visible_ip_in_a_hidden_vrf_is_not_visible_and_never_names_the_vrf(self):
         from ipam.models import VRF
@@ -335,3 +333,30 @@ class TestDeviceDifferencesView(TestCase):
         response = self.client.get(self.url, {"scope": "ip"})
         (row,) = self._scope_rows(response, "ip")
         self.assertEqual((row["kind"], row["identity"]), ("netbox_only", "lag-60 198.18.0.9/24"))
+
+    def test_present_values_render_readably_without_raw_json(self):
+        from ._observation_case import ip_observation
+
+        native = self._assigned_ip("198.18.0.9/24")
+        self._grant_view(native)
+        self._ip_snapshot(ip_observation("lag-60", "198.18.0.20/32", prefix_length=32, vrf="example-vrf"))
+        response = self.client.get(self.url)
+        rows = {(row["scope"], row["kind"], row["identity"]): row for row in response.context["page_obj"]}
+
+        self.assertEqual(
+            rows[("interface", "device_only", "Ethernet2")]["device_value"],
+            'description: "device description"; enabled: true',
+        )
+        self.assertEqual(rows[("interface", "netbox_only", "lag-60")]["netbox_value"], 'description: ""')
+        self.assertEqual(rows[("ip", "netbox_only", "lag-60 198.18.0.9/24")]["netbox_value"], "198.18.0.9/24 on lag-60")
+        self.assertEqual(
+            rows[("ip", "device_only", "lag-60 198.18.0.20/32 (VRF example-vrf)")]["device_value"],
+            "198.18.0.20/32 on lag-60 (VRF example-vrf)",
+        )
+        self.assertEqual(
+            rows[("ip", "device_only", "lag-60 198.18.0.20/32 (VRF example-vrf)")]["netbox_value"], "missing"
+        )
+        values = [row[side] for row in response.context["page_obj"] for side in ("netbox_value", "device_value")]
+        self.assertFalse([value for value in values if "{" in value or "}" in value])
+        self.assertNotContains(response, "encap_tag")
+        self.assertNotContains(response, "prefix_length")

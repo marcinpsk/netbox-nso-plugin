@@ -127,11 +127,11 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         response = self.client.post(url)
         self.assertEqual(response.status_code, 403)
 
-    def test_sync_from_nso_action_denied_without_permission(self):
-        """S5a C: the new comprehensive-read action rides the same authz mixin."""
+    def test_refresh_nso_state_action_denied_without_permission(self):
+        """S5a C: Refresh NSO state rides the same authz mixin."""
         url = reverse(
             "plugins:netbox_nso_plugin:nsodevicemanagement_action",
-            kwargs={"pk": self.mgmt.pk, "action": "sync-from-nso"},
+            kwargs={"pk": self.mgmt.pk, "action": "refresh-nso-state"},
         )
         response = self.client.post(url)
         self.assertEqual(response.status_code, 403)

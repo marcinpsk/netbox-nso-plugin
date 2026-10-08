@@ -1,0 +1,115 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{# Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com> #}
+{% extends 'base/layout.html' %}
+
+{% block title %}Sync from NSO: {{ device }}{% endblock %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-xl-10 offset-xl-1">
+    <div class="card mb-3" data-sync-preview>
+      <h5 class="card-header">Sync from NSO preview</h5>
+      <div class="card-body">
+        <p class="text-muted mb-3">
+          The device wins. Sync changes only NetBox, only rows that NetBox does not own, and schedules no device
+          delivery. Nothing changes until you confirm.
+        </p>
+        {% if error %}
+          <div class="alert alert-danger" role="alert" data-sync-error>{{ error }}</div>
+        {% endif %}
+        {% if snapshots %}
+          <div class="small text-muted mb-3">
+            {% for snapshot in snapshots %}
+              <span class="d-inline-block me-3"><strong>{{ snapshot.read_state.family }}</strong> revision
+                {{ snapshot.revision }}, observed {{ snapshot.observed_at|date:"c" }}</span>
+            {% endfor %}
+          </div>
+        {% endif %}
+
+        {% if plan %}
+          <h6>NetBox changes <span class="badge text-bg-secondary">{{ changes|length }}</span></h6>
+          <div class="table-responsive mb-3">
+            <table class="table table-sm table-hover mb-0" data-sync-steps>
+              <thead><tr><th>Scope</th><th>Action</th><th>Object</th><th>Change</th></tr></thead>
+              <tbody>
+                {% for step in changes %}
+                  <tr>
+                    <td>{{ step.scope }}</td>
+                    <td><span class="badge text-bg-primary">{{ step.action }}</span></td>
+                    <td>{{ step.target }}</td>
+                    <td><code>{{ step.detail }}</code></td>
+                  </tr>
+                {% empty %}
+                  <tr><td colspan="4" class="text-muted">No NetBox change.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          {% if statuses %}
+            <h6>Overlay status <span class="badge text-bg-secondary">{{ statuses|length }}</span></h6>
+            <ul class="small mb-3" data-sync-statuses>
+              {% for step in statuses %}<li>{{ step.scope }} {{ step.target }}: {{ step.detail }}</li>{% endfor %}
+            </ul>
+          {% endif %}
+
+          <h6>Blockers <span class="badge {% if plan.blockers %}text-bg-danger{% else %}text-bg-secondary{% endif %}">{{ plan.blockers|length }}</span></h6>
+          <div class="table-responsive mb-3">
+            <table class="table table-sm mb-0" data-sync-blockers>
+              <thead><tr><th>Scope</th><th>Row</th><th>Reason</th></tr></thead>
+              <tbody>
+                {% for blocker in plan.blockers %}
+                  <tr><td>{{ blocker.scope }}</td><td>{{ blocker.target }}</td><td>{{ blocker.reason }}</td></tr>
+                {% empty %}
+                  <tr><td colspan="3" class="text-muted">No blocker.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <p class="small text-muted">Sync skips a blocked row. The other rows in the plan still run.</p>
+
+          {% if plan.notes %}
+            <ul class="small text-muted mb-3" data-sync-notes>
+              {% for note in plan.notes %}<li>{{ note.scope }} {{ note.target }}: {{ note.reason }}</li>{% endfor %}
+            </ul>
+          {% endif %}
+        {% endif %}
+
+        <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_nso_sync_confirm' pk=device.pk %}">
+          {% csrf_token %}
+          {% for name, value in selection_fields %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+          {% if plan %}<input type="hidden" name="digest" value="{{ plan.digest }}">{% endif %}
+          {% for choice in primary_choices %}
+            <div class="row g-2 align-items-center mb-2" data-sync-primary>
+              <label class="col-12 col-md-auto col-form-label col-form-label-sm" for="{{ choice.name }}">
+                {{ choice.label }} is the device {{ choice.fields }}
+              </label>
+              <div class="col-12 col-md-auto">
+                <select class="form-select form-select-sm no-ts w-auto mw-100" id="{{ choice.name }}" name="{{ choice.name }}">
+                  <option value="">Keep the address (blocked)</option>
+                  <option value="clear"{% if choice.choice == "clear" %} selected{% endif %}>Clear the device {{ choice.fields }}</option>
+                  {% for ip in choice.replacements %}
+                    <option value="{{ ip.pk }}"{% if choice.choice == ip.pk|stringformat:"s" %} selected{% endif %}>Replace with {{ ip.address }} (IP #{{ ip.pk }})</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <div class="col-12 col-md-auto small text-muted">Preview again after you change this.</div>
+            </div>
+          {% endfor %}
+          <div class="d-flex flex-wrap gap-2 align-items-center mt-3">
+            <button type="submit" class="btn btn-primary"{% if not plan or not plan.operations %} disabled{% endif %}>
+              <span class="mdi mdi-database-arrow-left"></span> Confirm Sync from NSO
+            </button>
+            <button type="submit" class="btn btn-outline-secondary"
+                    formaction="{% url 'plugins:netbox_nso_plugin:device_nso_sync_preview' pk=device.pk %}">
+              Preview again
+            </button>
+            <a href="{% url 'dcim:device_nso' pk=device.pk %}" class="btn btn-outline-secondary">Cancel</a>
+            {% if plan %}<span class="small text-muted ms-auto">Plan digest <code data-sync-digest>{{ plan.digest|slice:":16" }}</code></span>{% endif %}
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

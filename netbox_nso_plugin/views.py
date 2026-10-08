@@ -797,6 +797,28 @@ def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
     return ordered  # "all" (or unknown) → no filter
 
 
+def _difference_value(scope, value):
+    """Render one side of a difference row as readable text, never as a raw document."""
+    from .device_differences import MISSING
+
+    if value is MISSING:
+        return str(value)
+    if not isinstance(value, dict):
+        return json.dumps(value, default=str)
+    if scope == "ip":
+        address = value.get("address")
+        if not address:
+            host = value.get("host")
+            if not host:
+                address = "invalid address"
+            else:
+                address = host if value.get("prefix_length") is None else f"{host}/{value['prefix_length']}"
+        place = f" on {value['interface']}" if value.get("interface") else ""
+        return f"{address}{place}" + (f" (VRF {value['vrf']})" if value.get("vrf") else "")
+    names = ("description", "enabled") if scope == "interface" else sorted(value)
+    return "; ".join(f"{name}: {json.dumps(value[name], default=str)}" for name in names if value.get(name) is not None)
+
+
 class NSODeviceDifferencesView(LoginRequiredMixin, View):
     """Render snapshot differences without an adapter read or a reconcile."""
 
@@ -805,12 +827,13 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
 
         from .device_differences import (
             KINDS,
-            MISSING,
             NOT_SUPPORTED,
             differences,
             identity_label,
             observation_snapshots,
         )
+        from .device_sync import NOT_SUPPORTED as SYNC_NOT_SUPPORTED
+        from .device_sync import SYNC_SCOPES, SYNCABLE_KINDS, row_token
         from .ownership_planner import converted_scope_rules
 
         permissions = ("dcim.view_device", "netbox_nso_plugin.view_nsodevicemanagement")
@@ -835,9 +858,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
             "unavailable": "text-bg-dark",
         }
 
-        def display(value):
-            return str(value) if value is MISSING else json.dumps(value, sort_keys=True, default=str)
-
         page = Paginator(filtered, 50).get_page(request.GET.get("page"))
         page.object_list = [
             {
@@ -846,13 +866,21 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
                 "css": css[row.kind],
                 "identity": identity_label(row),
                 "attribute": row.attribute,
-                "netbox_value": display(row.netbox_value),
-                "device_value": display(row.device_value),
+                "netbox_value": _difference_value(row.scope, row.netbox_value),
+                "device_value": _difference_value(row.scope, row.device_value),
                 "reason": row.reason,
                 "association_candidate": row.association_candidate,
+                "token": row_token(row),
+                "syncable": row.scope in SYNC_SCOPES and row.kind in SYNCABLE_KINDS,
+                "sync_note": "" if row.scope in SYNC_SCOPES else SYNC_NOT_SUPPORTED,
             }
             for row in page.object_list
         ]
+        compared = sorted(set(converted_scope_rules()) - set(not_compared))
+        can_sync = (
+            request.user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
+            and NSODeviceManagement.objects.restrict(request.user, "change").filter(pk=management.pk).exists()
+        )
         return render(
             request,
             "netbox_nso_plugin/categories/differences.html",
@@ -861,12 +889,112 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
                 "page_obj": page,
                 "scope": scope,
                 "kind": kind,
-                "scopes": sorted(set(converted_scope_rules()) - set(not_compared)),
+                "scopes": compared,
                 "not_compared": not_compared,
                 "counts": counts,
                 "snapshots": [snapshots[family] for family in sorted(snapshots)],
+                "can_sync": can_sync,
+                "sync_scopes": [value for value in compared if value in SYNC_SCOPES],
             },
         )
+
+
+def _sync_management(request, pk):
+    """Return the device and management row that the user may sync."""
+    device = get_object_or_404(Device.objects.restrict(request.user, "view"), pk=pk)
+    management = get_object_or_404(NSODeviceManagement.objects.restrict(request.user, "change"), device=device)
+    return device, management
+
+
+_SYNC_PERMISSIONS = ("dcim.view_device", "netbox_nso_plugin.change_nsodevicemanagement")
+_MALFORMED_SYNC_SELECTION = "The Sync from NSO selection is malformed."
+
+
+class NSODeviceSyncPreviewView(NSOActionPermissionMixin, View):
+    """Read the selected scopes again and show the Sync from NSO plan. NetBox does not change."""
+
+    required_permission = _SYNC_PERMISSIONS
+
+    def post(self, request, pk):  # noqa: D102
+        from .device_differences import observation_snapshots
+        from .device_sync import SyncReadFailed, SyncSelection, SyncSelectionError, preview_sync
+
+        device, management = _sync_management(request, pk)
+        try:
+            selection = SyncSelection.from_post(request.POST)
+        except SyncSelectionError:
+            return HttpResponseBadRequest(_MALFORMED_SYNC_SELECTION)
+        plan = None
+        error = ""
+        if not (selection.rows or selection.scopes):
+            error = "Select at least one row or scope."
+        else:
+            try:
+                plan = preview_sync(management, request.user, selection)
+            except SyncReadFailed as exc:
+                error = str(exc)
+        chosen = {token for token, *_rest in plan.primary_choices} if plan is not None else set()
+        snapshots = observation_snapshots(management)
+        return render(
+            request,
+            "netbox_nso_plugin/device_sync_preview.html",
+            {
+                "object": device,
+                "device": device,
+                "plan": plan,
+                "error": error,
+                "selection_fields": [
+                    (name, value)
+                    for name, value in selection.fields()
+                    if not (name.startswith("primary-") and name.removeprefix("primary-") in chosen)
+                ],
+                "primary_choices": [
+                    {
+                        "name": f"primary-{token}",
+                        "label": label,
+                        "fields": fields,
+                        "choice": dict(selection.primary).get(token, ""),
+                        "replacements": replacements,
+                    }
+                    for token, label, fields, replacements in (plan.primary_choices if plan is not None else ())
+                ],
+                "snapshots": [snapshots[family] for family in sorted(snapshots)],
+                "changes": [step for step in plan.steps if step.action != "status"] if plan is not None else [],
+                "statuses": [step for step in plan.steps if step.action == "status"] if plan is not None else [],
+            },
+        )
+
+
+class NSODeviceSyncConfirmView(NSOActionPermissionMixin, View):
+    """Execute exactly the previewed Sync from NSO plan, or write nothing."""
+
+    required_permission = _SYNC_PERMISSIONS
+
+    def post(self, request, pk):  # noqa: D102
+        from .device_sync import SyncRowFailed, SyncSelection, SyncSelectionError, SyncStale, confirm_sync
+
+        device, management = _sync_management(request, pk)
+        try:
+            selection = SyncSelection.from_post(request.POST)
+        except SyncSelectionError:
+            return HttpResponseBadRequest(_MALFORMED_SYNC_SELECTION)
+        try:
+            plan = confirm_sync(management, request.user, selection, request.POST.get("digest", ""))
+        except SyncStale:
+            messages.error(
+                request, "STALE: the plan changed after the preview. Sync from NSO wrote nothing. Preview again."
+            )
+        except SyncRowFailed as exc:
+            messages.error(request, f"Sync from NSO wrote nothing. {exc.label}: {exc.reason}")
+        else:
+            written = sum(step.action != "status" for step in plan.steps)
+            messages.success(
+                request,
+                f"Sync from NSO wrote {written} NetBox change(s) and scheduled no device delivery."
+                if plan.operations
+                else "Sync from NSO had nothing to write.",
+            )
+        return redirect(_device_nso_tab_url(device.pk))
 
 
 class NSOCategoryView(LoginRequiredMixin, View):
@@ -2620,7 +2748,7 @@ class NSODeviceManagementDeleteView(NSODevicesReturnMixin, generic.ObjectDeleteV
 
 _ACTION_LABELS = {
     "sync": "Sync",
-    "sync-from-nso": "Sync from NSO",
+    "refresh-nso-state": "Refresh NSO state",
     "detect-drift": "Detect Drift",
     "connect": "Test Connection",
     "apply": "Apply Intent",
@@ -3304,7 +3432,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
 
         action_fn = {
             "sync": client.trigger_sync,
-            "sync-from-nso": client.trigger_sync_from_nso,
+            "refresh-nso-state": client.trigger_sync_from_nso,
             "detect-drift": client.trigger_detect_drift,
             "connect": client.trigger_connect,
             "apply": client.trigger_apply,
@@ -6716,62 +6844,42 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
 
 
 class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
-    """Resolve an interface-IP *conflict* by adopting the device's reality into NetBox.
+    """Accept one interface IP as NetBox intent. NetBox IPAM does not change.
 
-    The IP reconciler flags an address that NSO reports on one interface but which
-    NetBox has assigned to a *different* interface as ``conflict`` (it refuses to
-    silently move an IP). Accepting is the operator override: reassign the existing
-    IPAddress to the NED-reported interface — e.g. move the device's OOB mgmt IP off
-    the onboarding ``me0`` stand-in onto the real ``vme.0``. The device already
-    carries the address (NSO read it there), so NetBox now *matches* the device →
-    status ``in_sync``, and NO device push happens: the reassignment fires the
-    IPAddress signal while the row is still ``conflict``, which skips the push.
+    The status machine's accept event takes ownership; Apply delivers the address.
+    Sync from NSO is the verb that corrects NetBox to the device.
     """
 
     def post(self, request, pk):  # noqa: D102
-        from ipam.models import IPAddress
-
-        try:
-            from ipam.models import VRF
-        except ImportError:
-            VRF = None
-
+        from . import status_machine as sm
         from .models import NSOInterfaceIPState
-        from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
-        from .signals import suppress_intent_push
+        from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        state = get_object_or_404(NSOInterfaceIPState, pk=pk)
-        iface = state.interface
-        vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf and VRF is not None else None
-
-        current_native = IPAddress.objects.filter(address=state.address, vrf=vrf_obj).first()
-        permission = "ipam.change_ipaddress" if current_native is not None else "ipam.add_ipaddress"
-        if not request.user.has_perm(permission):
-            raise PermissionDenied
-        native = copy.copy(current_native) if current_native is not None else IPAddress(status="active")
-        native.address = state.address
-        native.vrf = vrf_obj
-        native.assigned_object = iface
-        native.full_clean()
+        permitted = NSODeviceManagement.objects.restrict(request.user, "change").values("device_id")
+        state = get_object_or_404(
+            NSOInterfaceIPState.objects.select_related("interface").filter(interface__device_id__in=permitted), pk=pk
+        )
+        device_id = state.interface.device_id
+        if not sm.can(sm.ACCEPT, state.status):
+            messages.error(
+                request, f"Cannot accept {state.address} on {state.interface.name} from status {state.status}."
+            )
+            return redirect(_device_nso_tab_url(device_id))
         candidate = copy.copy(state)
-        candidate.status = "in_sync"
-        candidate.accepted_at = timezone.now()
-        state_fields = ("status", "accepted_at")
-        created = current_native is None
+        candidate.status = sm.advance(state.status, sm.ACCEPT)
+        if candidate.accepted_at is None:
+            candidate.accepted_at = timezone.now()
+        fields = ("status", "accepted_at")
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("accept"),
-            saves=(
-                planned_save(native, force_insert=created, natural_key=("address", "vrf")),
-                planned_save(candidate, update_fields=state_fields),
-            ),
+            saves=(planned_save(candidate, update_fields=fields),),
             planned_at=candidate.accepted_at,
         )
-        with renderer_writes(plan) as writer, suppress_intent_push():
-            writer.save(native, force_insert=created)
-            writer.save(candidate, update_fields=state_fields)
-
-        messages.success(request, f"Adopted {candidate.address} onto {iface.name}.")
-        return redirect(_device_nso_tab_url(iface.device_id))
+        mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
+        with mutation as writer:
+            writer.save(candidate, update_fields=fields)
+        messages.success(request, f"Accepted {candidate.address} on {state.interface.name} as NetBox intent.")
+        return redirect(_device_nso_tab_url(device_id))
 
 
 class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):

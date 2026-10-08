@@ -1388,8 +1388,8 @@ class TestNSODeviceActionView(ViewTestBase):
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_post_sync_from_nso_ajax_success(self, mock_session_cls, mock_cfg):
-        """S5a C: the fifth action — comprehensive CDB-only read — rides the generic
+    def test_post_refresh_nso_state_ajax_success(self, mock_session_cls, mock_cfg):
+        """S5a C: Refresh NSO state (the CDB-only adapter read) rides the generic
         dispatch: AJAX POST hits /actions/sync-from-nso and returns the job id."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
@@ -1405,7 +1405,7 @@ class TestNSODeviceActionView(ViewTestBase):
         session = make_session(response=make_response(202, json_data={"job_id": 77}))
         mock_session_cls.return_value = session
 
-        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "sync-from-nso"])
+        url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[mgmt.pk, "refresh-nso-state"])
         response = self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.content)
@@ -3167,9 +3167,11 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertNotIn("Refresh from NSO", html)
         self.assertIn("Last device sync", html)
         self.assertIn("Sync Now", html)  # the genuine device-reread action is unchanged
-        # S5a C: the middle tier of the three-button ladder — comprehensive CDB-only read.
-        self.assertIn("Sync from NSO", html)
-        self.assertIn("sync-from-nso", html)
+        # S5a C: the middle tier of the three-button ladder is Refresh NSO state (M-9).
+        self.assertIn("</span> Refresh NSO state", html)
+        self.assertIn("/refresh-nso-state/", html)
+        self.assertNotIn("sync-from-nso", html)
+        self.assertNotIn("</span> Sync from NSO", html)
 
     def test_tab_render_is_counts_only_no_scoped_fetches(self):
         """The tab RENDER fetches no per-scope adapter data — only get_device for the

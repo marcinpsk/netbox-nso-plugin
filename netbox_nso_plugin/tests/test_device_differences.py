@@ -241,6 +241,15 @@ class TestDeviceDifferences(TestCase):
         self._snapshot("ip", [ip_observation(address="invalid")])
         self.assertEqual([row.kind for row in self._rows("ip")], ["ambiguous"])
 
+    def test_differences_view_renders_an_empty_device_address(self):
+        from django.urls import reverse
+
+        self._snapshot("ip", [ip_observation(address="")])
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:device_nso_differences", args=[self.device.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "invalid address")
+
     def test_other_scopes_are_explicitly_unavailable(self):
         rows = [row for row in differences(self.management, user=self.user) if row.scope not in ("interface", "ip")]
         self.assertEqual({row.scope for row in rows}, set(converted_scope_rules()) - {"interface", "ip"})
