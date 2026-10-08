@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba
 """Project scope bindings with their reconciler normalizers."""
 
+from . import routing_policy_projection, routing_protocol_projection
 from .comparison_values import (
     MISSING,
     ProjectedEntry,
@@ -12,10 +13,10 @@ from .comparison_values import (
 )
 from .ownership_planner import _NATIVE_BINDING_BUILDERS, _native_binding, converted_scope_rules, device_interfaces
 
+ROUTING_SCOPES = frozenset(routing_protocol_projection.ATTRIBUTES) | frozenset(routing_policy_projection.ATTRIBUTES)
+
 
 def routing_projection(scope):
-    from . import routing_policy_projection, routing_protocol_projection
-
     return routing_policy_projection if scope in routing_policy_projection.ATTRIBUTES else routing_protocol_projection
 
 
@@ -334,7 +335,7 @@ _NATIVE_PROJECTORS = {
 
 
 def native_entries(scope, management, *, ned_id=""):
-    if scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+    if scope in ROUTING_SCOPES:
         return routing_projection(scope).native_entries(scope, management, ned_id=ned_id)
     from .adapter_client import AdapterError
 
@@ -620,7 +621,7 @@ def _route_device(item, management):
 
 
 def device_entries(scope, management, snapshot, *, ned_id="", native_items=()):
-    if scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+    if scope in ROUTING_SCOPES:
         entries = routing_projection(scope).device_entries(
             scope, management, snapshot, ned_id=ned_id, native_items=native_items
         )

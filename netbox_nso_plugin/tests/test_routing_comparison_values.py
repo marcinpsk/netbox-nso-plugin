@@ -15,12 +15,17 @@ from netbox_nso_plugin.device_differences import (
     _routing_coverage_rows,
     differences,
 )
-from netbox_nso_plugin.difference_projection import ProjectedEntry
+from netbox_nso_plugin.difference_projection import ROUTING_SCOPES, ProjectedEntry, routing_projection
 
 from ._routing_observation_case import DOCUMENTS, routing_observation
 
 
-@pytest.mark.parametrize("scope", ["bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"])
+def test_routing_scopes_come_from_the_routing_projections():
+    assert sorted(ROUTING_SCOPES) == ["bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"]
+    assert all(scope in routing_projection(scope).ATTRIBUTES for scope in ROUTING_SCOPES)
+
+
+@pytest.mark.parametrize("scope", sorted(ROUTING_SCOPES))
 def test_unobserved_routing_inventory_is_unavailable(scope):
     spec = SCOPE_SPECS[scope]
     observed = routing_observation(spec.family)

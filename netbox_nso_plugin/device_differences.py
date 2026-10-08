@@ -10,6 +10,7 @@ from ipaddress import ip_interface
 from typing import Any
 
 from .comparison_values import MISSING
+from .difference_projection import ROUTING_SCOPES, routing_projection
 from .ownership_planner import _ip_bindings, converted_scope_rules, device_interfaces
 from .summary import _netbox_value_for, matches_device_value
 
@@ -306,9 +307,7 @@ def _entry_visibility(entries, user):
 
 
 def _entry_component(spec, item):
-    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
-        from .difference_projection import routing_projection
-
+    if spec.scope in ROUTING_SCOPES:
         return routing_projection(spec.scope).component(spec.scope, item)
     if len(spec.components) == 1:
         return spec.components[0]
@@ -396,9 +395,7 @@ def _projected_group_rows(spec, native, device, snapshot, ned_id):
 
 
 def _nested_component_gaps(spec, snapshot):
-    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
-        from .difference_projection import routing_projection
-
+    if spec.scope in ROUTING_SCOPES:
         return routing_projection(spec.scope).nested_gaps(spec.scope, snapshot)
     if spec.scope == "l2_sap":
         return {
@@ -416,7 +413,7 @@ def _nested_component_gaps(spec, snapshot):
 
 
 def _nested_coverage_rows(spec, gaps, entries, visible):
-    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+    if spec.scope in ROUTING_SCOPES:
         return _routing_coverage_rows(spec, gaps, entries, visible)
     hidden = set()
     for item in entries:
@@ -451,7 +448,7 @@ def _routing_coverage_rows(spec, gaps, entries, visible):
 
 
 def _nested_entry_blocked(spec, item, gaps):
-    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+    if spec.scope in ROUTING_SCOPES:
         return any(
             isinstance(item.identity, tuple) and item.identity[: len(prefix)] == prefix for prefix, _attribute in gaps
         )
@@ -703,8 +700,6 @@ SCOPE_SPECS.update(
 
 
 def _routing_scope_specs():
-    from .difference_projection import routing_projection
-
     return {
         scope: ScopeSpec(
             scope,
