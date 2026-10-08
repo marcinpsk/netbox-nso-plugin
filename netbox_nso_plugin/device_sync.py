@@ -27,6 +27,8 @@ NOT_SUPPORTED = "sync not supported yet (#1790)"
 OWNED = "owned: Release first"
 UNPROVEN_ABSENCE = "the device observation has entries that Sync cannot compare, so absence is not proven"
 PROTECTED = "NetBox protects it with dependent objects"
+HIDDEN_TARGET = "(hidden)"
+HIDDEN_SOURCE = "the address is on an interface that is not visible to you"
 SYNCABLE_KINDS = ("mismatch", "device_only", "netbox_only")
 _TOKEN = re.compile(r"^([a-z_]+):[0-9a-f]{16}$")
 _PRIMARY_FIELDS = (("primary_ip4", "primary IPv4"), ("primary_ip6", "primary IPv6"), ("oob_ip", "OOB IP"))
@@ -219,7 +221,8 @@ class _Planner:
         self.status_saves = []
 
     def block(self, scope, target, reason):
-        self.plan.blockers.append(SyncNote(scope, target, reason))
+        # Sync needs only change permission, so a hidden row never shows its name.
+        self.plan.blockers.append(SyncNote(scope, HIDDEN_TARGET if reason == NOT_VISIBLE else target, reason))
 
     def note(self, scope, target, reason):
         self.plan.notes.append(SyncNote(scope, target, reason))
@@ -396,7 +399,7 @@ def _plan_ip_device_only(planner, context, row, label, moved_from):
         planner.block("ip", label, "the address belongs to another object; Sync never changes it for one device")
         return
     if assigned is not None and assigned.pk not in context.visible_interfaces:
-        planner.block("ip", label, NOT_VISIBLE)
+        planner.block("ip", label, HIDDEN_SOURCE)
         return
     after = _candidate(candidate)
     after.address = address

@@ -419,11 +419,11 @@ class TestSyncPermissions(SyncCase):
         self.assertEqual(
             sorted((blocker.target, blocker.reason) for blocker in plan.blockers),
             [
+                ("(hidden)", "NetBox object is not visible to you"),
                 ("lag-60 198.18.6.5/25", "permission denied: you cannot change this IP address"),
-                ("lag-60 198.18.6.9/32", "NetBox object is not visible to you"),
             ],
         )
-        self.assertNotContains(response, "198.18.6.9/24")
+        self.assertNotContains(response, "198.18.6.9")
         self.assertNotContains(response, f"IP #{hidden.pk}")
         self.assertNotContains(response, "198.18.6.200")
         visible.refresh_from_db()
@@ -442,13 +442,36 @@ class TestSyncPermissions(SyncCase):
         self.assertEqual(self.changes(plan), [])
         self.assertEqual(
             [(blocker.target, blocker.reason) for blocker in plan.blockers],
-            [("lo0.0 198.18.14.1/32", "NetBox object is not visible to you")],
+            [("lo0.0 198.18.14.1/32", "the address is on an interface that is not visible to you")],
         )
         self.assertNotContains(response, "me0")
         differences = self.client.get(
             reverse("plugins:netbox_nso_plugin:device_nso_differences", kwargs={"pk": self.device.pk})
         )
         self.assertNotContains(differences, "me0")
+
+    def test_change_only_user_never_sees_a_hidden_interface_name(self):
+        hidden = self.interface("xe-7/7/7")
+        ObjectPermission.objects.filter(
+            users=self.user, object_types__model__in=["interface", "nsodevicemanagement"]
+        ).delete()
+        self.grant(Interface, ["view"], {"pk": self.lag.pk})
+        self.grant(NSODeviceManagement, ["change"])
+        Interface.objects.filter(pk__in=[self.lag.pk, hidden.pk]).update(description="netbox text")
+        transport = self.transport(
+            interfaces=[
+                interface_observation("lag-60", description="netbox text"),
+                interface_observation("xe-7/7/7", description="device text"),
+            ]
+        )
+        response, plan = self.preview(transport, {"scope": "interface"})
+
+        self.assertEqual(self.changes(plan), [])
+        self.assertEqual(
+            [(blocker.scope, blocker.target, blocker.reason) for blocker in plan.blockers],
+            [("interface", "(hidden)", "NetBox object is not visible to you")],
+        )
+        self.assertNotContains(response, "xe-7/7/7")
 
     def test_validation_failure_never_shows_a_hidden_range(self):
         from ipam.models import IPRange
