@@ -10,8 +10,8 @@ silent drop); the live rehearsal is the true cross-repo check.
 
 ``CATEGORY_FAMILIES`` maps each device-tab category to the families it actually DISPLAYS
 (codex R2-6: reconciliation dependencies are NOT display dependencies — LACP renders
-lag_config rows only; the ``lag`` topology outcome has no production consumer and is an
-explicit non-goal). ``AGGREGATION_ORDER`` ranks per-family states worst-first for merged
+lag_config rows only; native NetBox topology is the source of truth).
+``AGGREGATION_ORDER`` ranks per-family states worst-first for merged
 category chips (D8; healthy = fresh-present OR authoritative-empty, D10).
 """
 
@@ -47,7 +47,7 @@ ALL_FAMILY_KEYS: tuple[str, ...] = (
 # (keys match summary._CATEGORIES; verified against the categories' actual row sources).
 CATEGORY_FAMILIES: dict[str, tuple[str, ...]] = {
     "interface": ("interface_attributes", "interface_ip", "interface_mtu", "switchport"),
-    "lacp": ("lag_config",),  # lag topology outcome NOT displayed (no production consumer)
+    "lacp": ("lag_config",),  # The LACP category displays configuration overlays.
     "vlan": ("vlan",),
     "svi": ("svi",),
     "subinterface": ("subinterface",),

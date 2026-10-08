@@ -23,7 +23,7 @@ from .device_differences import (
 from .ownership_planner import _ip_bindings, converted_scope_rules, device_interfaces
 
 SYNC_SCOPES = ("ip", "interface")
-NOT_SUPPORTED = "sync not supported yet (#1790)"
+NOT_SUPPORTED = "sync not supported yet"
 OWNED = "owned: Release first"
 UNPROVEN_ABSENCE = "the device observation has entries that Sync cannot compare, so absence is not proven"
 PROTECTED = "NetBox protects it with dependent objects"

@@ -13,7 +13,7 @@ from django.test.utils import CaptureQueriesContext
 from ipam.models import VRF, IPAddress
 
 from netbox_nso_plugin.adapter_client import bound_session
-from netbox_nso_plugin.device_differences import differences
+from netbox_nso_plugin.device_differences import SCOPE_SPECS, differences
 from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
 from netbox_nso_plugin.observations import observation_defaults
 from netbox_nso_plugin.ownership_planner import converted_scope_rules
@@ -251,8 +251,8 @@ class TestDeviceDifferences(TestCase):
         self.assertContains(response, "invalid address")
 
     def test_other_scopes_are_explicitly_unavailable(self):
-        rows = [row for row in differences(self.management, user=self.user) if row.scope not in ("interface", "ip")]
-        self.assertEqual({row.scope for row in rows}, set(converted_scope_rules()) - {"interface", "ip"})
+        rows = [row for row in differences(self.management, user=self.user) if row.scope not in SCOPE_SPECS]
+        self.assertEqual({row.scope for row in rows}, set(converted_scope_rules()) - SCOPE_SPECS.keys())
         self.assertTrue(all((row.kind, row.reason) == ("unavailable", "not supported yet") for row in rows))
 
     def test_differences_performs_no_writes_or_adapter_calls(self):

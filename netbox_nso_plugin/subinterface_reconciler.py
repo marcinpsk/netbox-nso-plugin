@@ -21,6 +21,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def subinterface_values(item):
+    """Return the parent name, tag, and VRF used by reconcile and comparison."""
+    return item.get("parent_interface") or "", item.get("dot1q_vlan"), item.get("vrf") or ""
+
+
 def subinterface_reconcile_plan(device, payload: dict):
     """Freeze every native interface and subinterface overlay write."""
     from django.utils import timezone
@@ -80,16 +85,13 @@ def _subinterface_reconcile_operations(device, payload, planned_at):
             if current is not None
             else NSOSubinterfaceState(management=management, interface=interface)
         )
-        parent = interfaces.get(item.get("parent_interface") or "")
-        device_dot1q = item.get("dot1q_vlan")
-        device_vrf = item.get("vrf") or ""
+        parent_name, device_dot1q, device_vrf = subinterface_values(item)
+        parent = interfaces.get(parent_name)
         owned = sm.is_owned(state.status)
         if owned:
             desired_parent_name = state.parent_interface.name if state.parent_interface else ""
             matches = (
-                desired_parent_name == (item.get("parent_interface") or "")
-                and state.dot1q_vlan == device_dot1q
-                and state.vrf == device_vrf
+                desired_parent_name == parent_name and state.dot1q_vlan == device_dot1q and state.vrf == device_vrf
             )
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:

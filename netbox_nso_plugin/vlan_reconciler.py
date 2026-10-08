@@ -50,6 +50,13 @@ def _rescope_plan_ready(plan):
 _NSO_TO_NETBOX_MODE = {"access": "access", "trunk": "tagged", "trunk-all": "tagged-all"}
 
 
+def switchport_values(item):
+    """Return the switchport values used by reconcile and comparison."""
+    mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
+    untagged = item.get("untagged_vlan")
+    return mode, None if untagged == 1 else untagged, sorted(item.get("tagged_vlans") or [])
+
+
 def _validated_vlan_id(value, field_name):
     if type(value) is not int:
         raise AdapterError(f"{field_name} must be an integer VLAN ID", code="invalid_response")
@@ -529,11 +536,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             continue  # not resolved before acquisition, or gone since; the next read picks it up
         if interface.device_id != device.pk or interface.name != item["interface_name"]:
             raise IntentPlanStaleError(f"dcim.interface row {interface.pk!r} changed identity after resolution")
-        nso_mode = _NSO_TO_NETBOX_MODE.get(item.get("mode") or "", "")
-        nso_untagged = item.get("untagged_vlan")
-        if nso_untagged == 1:
-            nso_untagged = None
-        nso_tagged = sorted(item.get("tagged_vlans") or [])
+        nso_mode, nso_untagged, nso_tagged = switchport_values(item)
         current = states.get(interface.pk)
         state = (
             copy.copy(current)

@@ -32,3 +32,8 @@ path = [
 ]
 SPDX-FileCopyrightText = "2025 Marcin Zieba <marcinpsk@gmail.com>"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["netbox_nso_plugin/schemas/*.json"]
+SPDX-FileCopyrightText = "2026 Marcin Zieba"
+SPDX-License-Identifier = "Apache-2.0"

@@ -616,7 +616,7 @@ class TestSyncReadAndScopes(SyncCase):
         transport = self.transport()
         _response, plan = self.preview(transport, {"scope": "bgp"})
         self.assertEqual(
-            [(blocker.scope, blocker.reason) for blocker in plan.blockers], [("bgp", "sync not supported yet (#1790)")]
+            [(blocker.scope, blocker.reason) for blocker in plan.blockers], [("bgp", "sync not supported yet")]
         )
         self.assertEqual(plan.operations, [])
 

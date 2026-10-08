@@ -567,6 +567,33 @@ def _reconcile_interface_ips(device, payload: dict) -> list:
     return list(NSOInterfaceIPState.objects.filter(interface__device=device).select_related("interface"))
 
 
+def snmp_host_values(entry):
+    """Return the host fields used by SNMP reconcile and comparison."""
+    return {
+        "version": entry.get("version") or "v2c",
+        "notify_type": entry.get("notify_type") or "trap",
+        "port": entry.get("port"),
+        "community_hash": entry.get("community_hash") or "",
+        "username": entry.get("username") or "",
+    }
+
+
+def snmp_host_field_matches(ned_id, field, native, observed, *, omitted=False):
+    """Compare a host field with the observed NED default-port exception."""
+    if (
+        field == "port"
+        and ned_id.startswith(("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli"))
+        and (observed is None or omitted)
+        and native in (None, 162)
+    ):
+        return True
+    if omitted:
+        return False
+    if field == "version":
+        return canonical_snmp_version(native) == canonical_snmp_version(observed)
+    return native == observed
+
+
 def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
     """Build the deterministic SNMP write sequence for preflight and apply."""
     from .models import (
@@ -702,20 +729,14 @@ def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
     for entry in payload.get("hosts") or []:
         if isinstance(entry, dict) and (address := entry.get("address") or ""):
             incoming_hosts[address] = entry
-    suppress_default_port = _device_ned_id(device).startswith(("timos", "arcos-", "cisco-ios-cli", "cisco-iosxe-cli"))
+    ned_id = _device_ned_id(device)
     host_fields = ("version", "notify_type", "port", "community_hash", "username")
     for address, entry in incoming_hosts.items():
         current = hosts.get(address)
         candidate = (
             copy.copy(current) if current is not None else NSOSnmpHostState(management=management, address=address)
         )
-        device_values = {
-            "version": entry.get("version") or "v2c",
-            "notify_type": entry.get("notify_type") or "trap",
-            "port": entry.get("port"),
-            "community_hash": entry.get("community_hash") or "",
-            "username": entry.get("username") or "",
-        }
+        device_values = snmp_host_values(entry)
         owned = current is not None and sm.is_owned(current.status)
         if owned:
             if not NSOSnmpHostState.objects.filter(
@@ -726,17 +747,7 @@ def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
             ).exists():
                 continue
             matches = all(
-                (
-                    suppress_default_port
-                    and field == "port"
-                    and value is None
-                    and getattr(candidate, field) in (None, 162)
-                )
-                or (
-                    field == "version"
-                    and canonical_snmp_version(getattr(candidate, field)) == canonical_snmp_version(value)
-                )
-                or getattr(candidate, field) == value
+                snmp_host_field_matches(ned_id, field, getattr(candidate, field), value)
                 for field, value in device_values.items()
             )
             candidate.status = sm.on_reconcile(
@@ -957,6 +968,28 @@ def _canonical_logging_intent_field(ned_id: str, field: str, value):
     return _canonical_logging_field(ned_id, field, value)
 
 
+def logging_host_values(item):
+    """Return the host fields used by logging reconcile and comparison."""
+    return {
+        "port": item.get("port"),
+        **{name: item.get(name) or "" for name in ("severity", "facility", "transport", "vrf", "source")},
+    }
+
+
+def logging_host_field_matches(ned_id, field, native, observed, *, omitted=False):
+    """Compare a host field with the observed NED default-port exception."""
+    if (
+        field == "port"
+        and ned_id.startswith(("timos", "arcos-"))
+        and (observed is None or omitted)
+        and native in (None, 514)
+    ):
+        return True
+    if omitted:
+        return False
+    return _canonical_logging_field(ned_id, field, native) == observed
+
+
 def _logging_reconcile_operations(device, payload, planned_at):  # noqa: C901
     """Build the deterministic logging write sequence for preflight and apply."""
     from .models import NSODeviceManagement, NSOLoggingHostState, NSOLoggingLevelState
@@ -1006,21 +1039,13 @@ def _logging_reconcile_operations(device, payload, planned_at):  # noqa: C901
         save(candidate, update_fields=("status", "last_sync_at"))
 
     ned_id = _device_ned_id(device)
-    suppress_default_port = ned_id.startswith(("timos", "arcos-"))
     host_fields = ("port", "severity", "facility", "transport", "vrf", "source")
     for address, item in payload_hosts.items():
         current = current_hosts.get(address)
         candidate = (
             copy.copy(current) if current is not None else NSOLoggingHostState(management=management, address=address)
         )
-        device_values = {
-            "port": item.get("port"),
-            "severity": item.get("severity") or "",
-            "facility": item.get("facility") or "",
-            "transport": item.get("transport") or "",
-            "vrf": item.get("vrf") or "",
-            "source": item.get("source") or "",
-        }
+        device_values = logging_host_values(item)
         owned = current is not None and sm.is_owned(current.status)
         if owned:
             if not NSOLoggingHostState.objects.filter(
@@ -1031,13 +1056,7 @@ def _logging_reconcile_operations(device, payload, planned_at):  # noqa: C901
             ).exists():
                 continue
             matches = all(
-                (
-                    suppress_default_port
-                    and field == "port"
-                    and value is None
-                    and getattr(candidate, field) in (None, 514)
-                )
-                or _canonical_logging_field(ned_id, field, getattr(candidate, field)) == value
+                logging_host_field_matches(ned_id, field, getattr(candidate, field), value)
                 for field, value in device_values.items()
             )
             candidate.status = sm.on_reconcile(
@@ -1166,6 +1185,16 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
     }
 
 
+def static_route_identity(vrf_name, prefix, next_hop, interface_next_hop):
+    """Return the route identity used by reconcile and comparison."""
+    return vrf_name or "", prefix, next_hop or None, (interface_next_hop or None) if not next_hop else None
+
+
+def static_route_permanent(value):
+    """Return the route permanence used by reconcile and comparison."""
+    return bool(value)
+
+
 def _static_route_metric(entry: dict, device=None) -> int:
     """Clamp the NSO metric to StaticRoute's 0..255 PositiveSmallInt constraint.
 
@@ -1264,9 +1293,6 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
         )
         operations.append(("save", instance, update_fields, force_insert, None))
 
-    def route_identity(vrf_name, prefix, next_hop, interface_next_hop):
-        return vrf_name, prefix, next_hop, interface_next_hop if next_hop is None else None
-
     routes = payload.get("routes", []) if isinstance(payload, dict) else []
     routes = routes if isinstance(routes, list) else []
     for entry in routes:
@@ -1290,7 +1316,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
                 save(vrf, force_insert=True, natural_key=("name",))
                 vrfs[vrf_name] = vrf
 
-        identity = route_identity(vrf_name, prefix, next_hop, interface_next_hop)
+        identity = static_route_identity(vrf_name, prefix, next_hop, interface_next_hop)
         route = planned_routes.get(identity)
         if route is None:
             lookup = {"vrf": vrf, "prefix": prefix, "next_hop": next_hop}
@@ -1308,7 +1334,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
                 next_hop=next_hop,
                 interface_next_hop=interface_next_hop,
                 metric=_static_route_metric(entry, device),
-                permanent=bool(entry.get("permanent", False)),
+                permanent=static_route_permanent(entry.get("permanent", False)),
                 tag=entry.get("tag"),
                 name=entry.get("name") or "",
             )
@@ -1347,7 +1373,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
 
         reported_matches = (
             route.metric == _static_route_metric(entry, device)
-            and bool(route.permanent) == bool(entry.get("permanent", False))
+            and static_route_permanent(route.permanent) == static_route_permanent(entry.get("permanent", False))
             and route.tag == entry.get("tag")
         )
         if resolve_status:
