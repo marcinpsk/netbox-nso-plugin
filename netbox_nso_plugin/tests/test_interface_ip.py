@@ -811,6 +811,20 @@ class TestInterfaceIPIntentAccept(TestCase):
         self.assertIsNotNone(state.accepted_at)
         self._assert_native_unchanged()
 
+    def test_address_absent_from_ipam_is_accepted_without_creating_it(self):
+        from ipam.models import IPAddress
+
+        state = self._state(self.me0, "198.18.0.77/24", "imported")
+        ip_count = IPAddress.objects.count()
+
+        response = self._post_accept(state)
+
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(IPAddress.objects.count(), ip_count)
+        self.assertFalse(IPAddress.objects.filter(address__net_host="198.18.0.77").exists())
+
     def test_duplicate_host_conflict_no_longer_writes_ipam_or_fails(self):
         state = self._state(self.vme0, "172.30.150.90/32", "conflict")
 
