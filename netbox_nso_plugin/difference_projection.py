@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
-"""Project switching and service bindings with their reconciler normalizers."""
+"""Project scope bindings with their reconciler normalizers."""
 
-from dataclasses import dataclass, field
-
-from .device_differences import MISSING
+from .comparison_values import (
+    MISSING,
+    ProjectedEntry,
+    _normalized,
+    _values,
+    inherit_parent_dependencies,
+    observed_value,
+)
 from .ownership_planner import _NATIVE_BINDING_BUILDERS, _native_binding, converted_scope_rules, device_interfaces
+
+
+def routing_projection(scope):
+    from . import routing_policy_projection, routing_protocol_projection
+
+    return routing_policy_projection if scope in routing_policy_projection.ATTRIBUTES else routing_protocol_projection
 
 
 def _interface_comparison_bindings(management, scope):
@@ -83,29 +94,6 @@ def _comparison_bindings(management, scope):
             rows = rows.select_related(*relations)
         bindings.extend(_native_binding(scope, row, label) for row in rows.order_by("pk"))
     return tuple(bindings)
-
-
-@dataclass
-class ProjectedEntry:
-    identity: object
-    values: dict
-    objects: tuple = ()
-    unavailable: dict = field(default_factory=dict)
-    reason: str = ""
-
-
-def observed_value(item, name):
-    if "present" in item and name not in item["present"]:
-        return MISSING
-    return item.get(name, MISSING)
-
-
-def _values(item, names):
-    return {name: observed_value(item, name) for name in names}
-
-
-def _normalized(item, values):
-    return {name: value if observed_value(item, name) is not MISSING else MISSING for name, value in values.items()}
 
 
 def _overlay_values(overlay, names):
@@ -346,6 +334,8 @@ _NATIVE_PROJECTORS = {
 
 
 def native_entries(scope, management, *, ned_id=""):
+    if scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+        return routing_projection(scope).native_entries(scope, management, ned_id=ned_id)
     from .adapter_client import AdapterError
 
     bindings = _comparison_bindings(management, scope)
@@ -370,6 +360,19 @@ def native_entries(scope, management, *, ned_id=""):
 
         options["compare_supported"] = _snmp_value_compare_supported(management.device)
     entries = []
+    if scope == "l2_sap":
+        from vpn.models import L2VPN
+
+        prefix = f"nso-{management.device_id}-"
+        entries.extend(
+            ProjectedEntry((row.slug[len(prefix) :],), {}, (row,), coverage_only=True)
+            for row in L2VPN.objects.filter(slug__startswith=prefix).order_by("pk")
+        )
+        entries.extend(
+            ProjectedEntry((row.service_name,), {}, (row.l2vpn,), coverage_only=True)
+            for _scope, row, _model, _key in bindings
+            if row.l2vpn is not None
+        )
     for _scope, row, _model, _key in bindings:
         try:
             entries.append(_NATIVE_PROJECTORS[scope](management, row, **options))
@@ -486,6 +489,7 @@ def _l2_device(document, interfaces):
         if service.get("saps") is None or "saps" not in service.get("present", []):
             entries.append(ProjectedEntry((service["service_name"],), {}, reason="service SAP coverage is unavailable"))
             continue
+        entries.append(ProjectedEntry((service["service_name"],), {}, coverage_only=True))
         for sap in service["saps"]:
             try:
                 _validated_l2_services({"services": [{**service, "saps": [sap]}]})
@@ -615,7 +619,12 @@ def _route_device(item, management):
     return ProjectedEntry(_route_identity(identity_values), values, tuple(vrfs), reason=reason)
 
 
-def device_entries(scope, management, snapshot, *, ned_id=""):
+def device_entries(scope, management, snapshot, *, ned_id="", native_items=()):
+    if scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+        entries = routing_projection(scope).device_entries(
+            scope, management, snapshot, ned_id=ned_id, native_items=native_items
+        )
+        return inherit_parent_dependencies(scope, native_items, entries)
     from django.core.exceptions import ValidationError
 
     from .adapter_client import AdapterError
@@ -624,9 +633,9 @@ def device_entries(scope, management, snapshot, *, ned_id=""):
     document = snapshot.document
     interfaces = {row.name: row for row in device_interfaces(management)}
     if scope == "lacp":
-        return _lag_device(document, interfaces)
+        return inherit_parent_dependencies(scope, native_items, _lag_device(document, interfaces))
     if scope == "l2_sap":
-        return _l2_device(document, interfaces)
+        return inherit_parent_dependencies(scope, native_items, _l2_device(document, interfaces))
     if scope == "snmp":
         return _snmp_device(document)
     if scope == "logging":

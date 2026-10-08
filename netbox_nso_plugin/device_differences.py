@@ -9,20 +9,12 @@ from dataclasses import dataclass
 from ipaddress import ip_interface
 from typing import Any
 
+from .comparison_values import MISSING
 from .ownership_planner import _ip_bindings, converted_scope_rules, device_interfaces
 from .summary import _netbox_value_for, matches_device_value
 
 KINDS = ("netbox_only", "device_only", "mismatch", "ambiguous", "unavailable")
-NOT_SUPPORTED = "not supported yet"
 NOT_VISIBLE = "NetBox object is not visible to you"
-
-
-class _MissingValue:
-    def __str__(self):
-        return "missing"
-
-
-MISSING = _MissingValue()
 
 
 @dataclass(frozen=True)
@@ -314,6 +306,10 @@ def _entry_visibility(entries, user):
 
 
 def _entry_component(spec, item):
+    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+        from .difference_projection import routing_projection
+
+        return routing_projection(spec.scope).component(spec.scope, item)
     if len(spec.components) == 1:
         return spec.components[0]
     return {
@@ -326,6 +322,10 @@ def _entry_component(spec, item):
 
 
 def _scope_component_gaps(spec, snapshot):
+    if spec.scope == "redistribution":
+        from .routing_protocol_projection import component_gaps
+
+        return component_gaps(snapshot)
     gaps = {}
     for name in spec.components:
         if name != "system" and name not in snapshot.document["present"]:
@@ -346,6 +346,11 @@ def _coverage_reason(scope, attribute, coverage):
 
 
 def _projected_matches(spec, projection, native, device, ned_id):
+    if spec.scope == "isis":
+        from .template_content import _ISIS_PROCESS_FLAG_DEFAULTS, _isis_process_flag_matches
+
+        if projection.name in _ISIS_PROCESS_FLAG_DEFAULTS:
+            return _isis_process_flag_matches(device, native)
     if projection.name == "port" and spec.scope in {"logging", "snmp"}:
         from .template_content import logging_host_field_matches, snmp_host_field_matches
 
@@ -391,6 +396,10 @@ def _projected_group_rows(spec, native, device, snapshot, ned_id):
 
 
 def _nested_component_gaps(spec, snapshot):
+    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+        from .difference_projection import routing_projection
+
+        return routing_projection(spec.scope).nested_gaps(spec.scope, snapshot)
     if spec.scope == "l2_sap":
         return {
             (item["service_name"], "saps"): "service SAP coverage is unavailable"
@@ -407,6 +416,8 @@ def _nested_component_gaps(spec, snapshot):
 
 
 def _nested_coverage_rows(spec, gaps, entries, visible):
+    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+        return _routing_coverage_rows(spec, gaps, entries, visible)
     hidden = set()
     for item in entries:
         if visible[id(item)]:
@@ -421,6 +432,34 @@ def _nested_coverage_rows(spec, gaps, entries, visible):
         else Difference(spec.scope, "unavailable", name, attribute, reason=reason)
         for (name, attribute), reason in sorted(gaps.items())
     ]
+
+
+def _routing_coverage_rows(spec, gaps, entries, visible):
+    rows = []
+    for (prefix, attribute), reason in sorted(gaps.items(), key=repr):
+        related = [
+            item
+            for item in entries
+            if isinstance(item.identity, tuple)
+            and (item.identity[: len(prefix)] == prefix or prefix[: len(item.identity)] == item.identity)
+        ]
+        if any(not visible[id(item)] for item in related):
+            rows.append(Difference(spec.scope, "ambiguous", reason=NOT_VISIBLE))
+        else:
+            rows.append(Difference(spec.scope, "unavailable", prefix, attribute or str(prefix[-1]), reason=reason))
+    return rows
+
+
+def _nested_entry_blocked(spec, item, gaps):
+    if spec.scope in {"bgp", "isis", "isis_flex_algo", "ospf", "redistribution", "route_policy"}:
+        return any(
+            isinstance(item.identity, tuple) and item.identity[: len(prefix)] == prefix for prefix, _attribute in gaps
+        )
+    if spec.scope == "l2_sap":
+        return (item.identity[0], "saps") in gaps
+    if spec.scope == "lacp" and item.identity[0] == "member":
+        return (item.values.get("bundle"), "member") in gaps
+    return False
 
 
 def _scope_rows(spec, management, snapshot, user):
@@ -439,23 +478,21 @@ def _scope_rows(spec, management, snapshot, user):
 
         ned_id = _device_ned_id(management.device)
     nested_gaps = _nested_component_gaps(spec, snapshot)
-    blocked_services = {name for name, attribute in nested_gaps if attribute == "saps"}
-    blocked_members = {name for name, attribute in nested_gaps if attribute == "member"}
     try:
         native_items = native_entries(spec.scope, management, ned_id=ned_id)
     except ModuleNotFoundError as exc:
         if exc.name not in {"netbox_routing", "netbox_routing.models"}:
             raise
         return [Difference(spec.scope, "unavailable", reason="NetBox routing models are unavailable")]
-    device_items = device_entries(spec.scope, management, snapshot, ned_id=ned_id)
+    device_items = device_entries(spec.scope, management, snapshot, ned_id=ned_id, native_items=native_items)
     visible = _entry_visibility((*native_items, *device_items), user)
     rows.extend(_nested_coverage_rows(spec, nested_gaps, (*native_items, *device_items), visible))
     hidden = set()
     for items, index in ((native_items, native), (device_items, device)):
         for item in items:
-            if _entry_component(spec, item) in gaps or (blocked_services and item.identity[0] in blocked_services):
+            if item.coverage_only:
                 continue
-            if blocked_members and item.identity[0] == "member" and item.values.get("bundle") in blocked_members:
+            if _entry_component(spec, item) in gaps or _nested_entry_blocked(spec, item, nested_gaps):
                 continue
             key = spec.identity(item)
             if not visible[id(item)]:
@@ -665,6 +702,33 @@ SCOPE_SPECS.update(
 )
 
 
+def _routing_scope_specs():
+    from .difference_projection import routing_projection
+
+    return {
+        scope: ScopeSpec(
+            scope,
+            family,
+            _projected_identity,
+            _projected_attributes(*routing_projection(scope).ATTRIBUTES[scope]),
+            _scope_blockers,
+            _scope_rows,
+            components,
+        )
+        for scope, family, components in (
+            ("bgp", "bgp", ("routers",)),
+            ("isis", "isis", ("processes", "interfaces")),
+            ("isis_flex_algo", "isis", ("processes",)),
+            ("ospf", "ospf", ("instances", "interfaces")),
+            ("redistribution", "redistribution", ("bgp", "isis", "ospf")),
+            ("route_policy", "route_policy", ("prefix_lists", "community_lists", "as_paths", "route_maps")),
+        )
+    }
+
+
+SCOPE_SPECS.update(_routing_scope_specs())
+
+
 def observation_snapshots(management):
     """Read each observation once so rows and displayed metadata use the same revision."""
     from .models import NSOFamilyObservation
@@ -683,10 +747,7 @@ def differences(management, *, user, snapshots=None):
         snapshots = observation_snapshots(management)
     rows = []
     for scope in converted_scope_rules():
-        spec = SCOPE_SPECS.get(scope)
-        if spec is None:
-            rows.append(Difference(scope, "unavailable", reason=NOT_SUPPORTED))
-            continue
+        spec = SCOPE_SPECS[scope]
         snapshot = snapshots.get(spec.family)
         if snapshot is None:
             rows.append(Difference(scope, "unavailable", reason="no successful read yet"))

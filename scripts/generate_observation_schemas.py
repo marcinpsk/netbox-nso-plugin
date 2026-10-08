@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
-"""Vendor the B1 observation components and their transitive schema references."""
+"""Vendor the observation components and their transitive schema references."""
 
 import argparse
 import copy
@@ -12,6 +12,12 @@ FAMILIES = frozenset(
         "interface_attributes",
         "interface_ip",
         "lag_config",
+        "lag",
+        "bgp",
+        "isis",
+        "ospf",
+        "redistribution",
+        "route_policy",
         "vlan",
         "switchport",
         "interface_mtu",

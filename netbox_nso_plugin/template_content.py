@@ -1755,10 +1755,10 @@ def _device_uses_timos_ned(device) -> bool:
 
 
 def _device_ned_id(device) -> str:
-    from .models import NSOPlatformNedMapping
-
     if not device.platform_id:
         return ""
+    from .models import NSOPlatformNedMapping
+
     mapping = NSOPlatformNedMapping.objects.filter(platform_id=device.platform_id).first()
     return str(mapping.ned_id) if mapping else ""
 
@@ -1787,6 +1787,13 @@ def _isis_srv6_locator_omitted_defaults(device) -> dict:
     return {}
 
 
+_ISIS_PROCESS_FLAG_DEFAULTS = {"overload_bit": False, "microloop_avoidance": False}
+
+
+def _isis_process_flag_matches(reported, intended) -> bool:
+    return intended is None or bool(reported) == intended
+
+
 def _isis_process_device_matches_intent(entry, state, device=None, inst=None) -> bool:
     """Return whether device-reported process scalars match an owned overlay."""
     for field in (
@@ -1804,9 +1811,9 @@ def _isis_process_device_matches_intent(entry, state, device=None, inst=None) ->
         intended = bool(getattr(state, f"{prefix}_auth_present") or getattr(state, f"{prefix}_auth_key"))
         if reported != intended:
             return False
-    for field in ("overload_bit", "microloop_avoidance"):
+    for field, default in _ISIS_PROCESS_FLAG_DEFAULTS.items():
         intended = getattr(state, field)
-        if intended is not None and bool(entry.get(field, False)) != intended:
+        if not _isis_process_flag_matches(entry.get(field, default), intended):
             return False
     if inst is not None:
         omitted_defaults = _isis_instance_omitted_defaults(device)

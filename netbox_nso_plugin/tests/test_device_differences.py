@@ -250,10 +250,11 @@ class TestDeviceDifferences(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "invalid address")
 
-    def test_other_scopes_are_explicitly_unavailable(self):
-        rows = [row for row in differences(self.management, user=self.user) if row.scope not in SCOPE_SPECS]
-        self.assertEqual({row.scope for row in rows}, set(converted_scope_rules()) - SCOPE_SPECS.keys())
-        self.assertTrue(all((row.kind, row.reason) == ("unavailable", "not supported yet") for row in rows))
+    def test_every_converted_scope_reports_missing_observation(self):
+        rows = differences(self.management, user=self.user)
+        self.assertEqual(set(SCOPE_SPECS), set(converted_scope_rules()))
+        self.assertEqual({row.scope for row in rows}, set(converted_scope_rules()))
+        self.assertTrue(all((row.kind, row.reason) == ("unavailable", "no successful read yet") for row in rows))
 
     def test_differences_performs_no_writes_or_adapter_calls(self):
         self._ip()

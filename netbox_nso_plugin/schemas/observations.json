@@ -175,6 +175,625 @@
         "title": "BfdObservationOut",
         "type": "object"
       },
+      "BgpAddressFamilyEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "afi": {
+            "title": "Afi",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "afi"
+        ],
+        "title": "BgpAddressFamilyEntry",
+        "type": "object"
+      },
+      "BgpAfDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "afi": {
+            "default": "",
+            "title": "Afi",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "redistribute": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RedistributionSourceEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redistribute"
+          }
+        },
+        "title": "BgpAfDestination",
+        "type": "object"
+      },
+      "BgpDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "asn": {
+            "title": "Asn",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpScopeDestination"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          }
+        },
+        "required": [
+          "asn"
+        ],
+        "title": "BgpDestination",
+        "type": "object"
+      },
+      "BgpDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "routers": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpRouterEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routers"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "routers",
+          "present",
+          "unprojectable"
+        ],
+        "title": "BgpDocument",
+        "type": "object"
+      },
+      "BgpObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/BgpDocument"
+          },
+          "family": {
+            "const": "bgp",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "BgpObservationOut",
+        "type": "object"
+      },
+      "BgpPeerEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "bfd_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bfd Enabled"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "local_as": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Local As"
+          },
+          "password_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password Present"
+          },
+          "peer_address": {
+            "title": "Peer Address",
+            "type": "string"
+          },
+          "peer_address_family": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpPolicyEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Address Family"
+          },
+          "peer_group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Group"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "remote_as": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remote As"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "ttl": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl"
+          }
+        },
+        "required": [
+          "peer_address"
+        ],
+        "title": "BgpPeerEntry",
+        "type": "object"
+      },
+      "BgpPeerGroupEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "peer_group_address_family": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpPolicyEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Group Address Family"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "remote_as": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remote As"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "BgpPeerGroupEntry",
+        "type": "object"
+      },
+      "BgpPolicyEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "afi": {
+            "title": "Afi",
+            "type": "string"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "prefixlist_in": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefixlist In"
+          },
+          "prefixlist_out": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefixlist Out"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "routemap_in": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routemap In"
+          },
+          "routemap_out": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routemap Out"
+          }
+        },
+        "required": [
+          "afi"
+        ],
+        "title": "BgpPolicyEntry",
+        "type": "object"
+      },
+      "BgpRedistributionComponent": {
+        "additionalProperties": false,
+        "properties": {
+          "inventory": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpDestination"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inventory"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "protocol": {
+            "const": "bgp",
+            "default": "bgp",
+            "title": "Protocol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inventory",
+          "present"
+        ],
+        "title": "BgpRedistributionComponent",
+        "type": "object"
+      },
+      "BgpRouterEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "asn": {
+            "title": "Asn",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "router_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Router Id"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpScopeEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          }
+        },
+        "required": [
+          "asn"
+        ],
+        "title": "BgpRouterEntry",
+        "type": "object"
+      },
+      "BgpScopeDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "address_family": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpAfDestination"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Address Family"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "vrf": {
+            "default": "",
+            "title": "Vrf",
+            "type": "string"
+          }
+        },
+        "title": "BgpScopeDestination",
+        "type": "object"
+      },
+      "BgpScopeEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "address_family": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpAddressFamilyEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Address Family"
+          },
+          "peer": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpPeerEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer"
+          },
+          "peer_group": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BgpPeerGroupEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Group"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "vrf": {
+            "default": "",
+            "title": "Vrf",
+            "type": "string"
+          }
+        },
+        "title": "BgpScopeEntry",
+        "type": "object"
+      },
       "InterfaceAttributesDocument": {
         "additionalProperties": false,
         "properties": {
@@ -645,6 +1264,1477 @@
         "title": "InterfaceMtuObservationOut",
         "type": "object"
       },
+      "IsisDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "process_tag": {
+            "default": "",
+            "title": "Process Tag",
+            "type": "string"
+          },
+          "redistribute": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RedistributionSourceEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redistribute"
+          }
+        },
+        "title": "IsisDestination",
+        "type": "object"
+      },
+      "IsisDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisInterfaceEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "processes": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisProcessEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Processes"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "processes",
+          "interfaces",
+          "present",
+          "unprojectable"
+        ],
+        "title": "IsisDocument",
+        "type": "object"
+      },
+      "IsisFlexAlgoEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "admin_group_exclude": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admin Group Exclude"
+          },
+          "admin_group_include_all": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admin Group Include All"
+          },
+          "admin_group_include_any": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admin Group Include Any"
+          },
+          "algo_id": {
+            "title": "Algo Id",
+            "type": "integer"
+          },
+          "metric_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Type"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          }
+        },
+        "required": [
+          "algo_id"
+        ],
+        "title": "IsisFlexAlgoEntry",
+        "type": "object"
+      },
+      "IsisInterfaceEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "af": {
+            "title": "Af",
+            "type": "string"
+          },
+          "bfd_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bfd Enabled"
+          },
+          "bound_port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bound Port"
+          },
+          "circuit_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Circuit Type"
+          },
+          "csnp_interval": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Csnp Interval"
+          },
+          "frr_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frr Enabled"
+          },
+          "frr_protection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frr Protection"
+          },
+          "hello_auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hello Auth Key Present"
+          },
+          "hello_auth_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hello Auth Present"
+          },
+          "hello_auth_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hello Auth Type"
+          },
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisLevelEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "lsp_interval": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lsp Interval"
+          },
+          "mesh_group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mesh Group"
+          },
+          "metric": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric"
+          },
+          "network_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Network Type"
+          },
+          "passive": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Passive"
+          },
+          "prefix_sid": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisPrefixSidEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Sid"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "process_tag": {
+            "default": "",
+            "title": "Process Tag",
+            "type": "string"
+          },
+          "retransmit_interval": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retransmit Interval"
+          },
+          "setting": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisSettingEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Setting"
+          }
+        },
+        "required": [
+          "interface_name",
+          "af"
+        ],
+        "title": "IsisInterfaceEntry",
+        "type": "object"
+      },
+      "IsisLevelEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Key Present"
+          },
+          "auth_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Present"
+          },
+          "auth_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Type"
+          },
+          "default_metric": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Metric"
+          },
+          "disabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disabled"
+          },
+          "hello_interval": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hello Interval"
+          },
+          "hello_multiplier": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hello Multiplier"
+          },
+          "labeled_preference": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Labeled Preference"
+          },
+          "level": {
+            "title": "Level",
+            "type": "integer"
+          },
+          "metric": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric"
+          },
+          "passive": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Passive"
+          },
+          "preference": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preference"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "wide_metrics_only": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wide Metrics Only"
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "title": "IsisLevelEntry",
+        "type": "object"
+      },
+      "IsisLocatorEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Algorithm"
+          },
+          "argument_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Argument Length"
+          },
+          "block_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Block Length"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "flavor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flavor"
+          },
+          "function_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Function Length"
+          },
+          "is_anycast": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Anycast"
+          },
+          "is_micro_segment": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Micro Segment"
+          },
+          "isis_level": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isis Level"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "node_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Length"
+          },
+          "prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "IsisLocatorEntry",
+        "type": "object"
+      },
+      "IsisObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/IsisDocument"
+          },
+          "family": {
+            "const": "isis",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "IsisObservationOut",
+        "type": "object"
+      },
+      "IsisPrefixSidEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "integer"
+          },
+          "explicit_null": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explicit Null"
+          },
+          "n_flag": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "N Flag"
+          },
+          "no_php": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "No Php"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "readvertise": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Readvertise"
+          },
+          "sid_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sid Index"
+          },
+          "sid_label": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sid Label"
+          }
+        },
+        "required": [
+          "algorithm"
+        ],
+        "title": "IsisPrefixSidEntry",
+        "type": "object"
+      },
+      "IsisProcessEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "area_auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Area Auth Key Present"
+          },
+          "area_auth_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Area Auth Present"
+          },
+          "area_auth_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Area Auth Type"
+          },
+          "distance": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Distance"
+          },
+          "domain_auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Auth Key Present"
+          },
+          "domain_auth_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Auth Present"
+          },
+          "domain_auth_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Auth Type"
+          },
+          "fast_reroute": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fast Reroute"
+          },
+          "flex_algo": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisFlexAlgoEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flex Algo"
+          },
+          "ignore_attached_bit": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ignore Attached Bit"
+          },
+          "is_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Type"
+          },
+          "level": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisLevelEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Level"
+          },
+          "lsp_initial_wait": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lsp Initial Wait"
+          },
+          "lsp_lifetime": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lsp Lifetime"
+          },
+          "lsp_max_wait": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lsp Max Wait"
+          },
+          "lsp_mtu": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lsp Mtu"
+          },
+          "lsp_refresh_interval": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lsp Refresh Interval"
+          },
+          "maximum_paths": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Paths"
+          },
+          "metric_style": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Style"
+          },
+          "microloop_avoidance": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Microloop Avoidance"
+          },
+          "net": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Net"
+          },
+          "overload_bit": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overload Bit"
+          },
+          "overload_on_startup": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overload On Startup"
+          },
+          "overload_timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overload Timeout"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "process_tag": {
+            "default": "",
+            "title": "Process Tag",
+            "type": "string"
+          },
+          "reference_bandwidth": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Bandwidth"
+          },
+          "segment_routing": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IsisSegmentRoutingEntry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "segment_routing_configured": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Routing Configured"
+          },
+          "segment_routing_reported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Segment Routing Reported"
+          },
+          "setting": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisSettingEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Setting"
+          },
+          "spf_initial_wait": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spf Initial Wait"
+          },
+          "spf_max_wait": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spf Max Wait"
+          },
+          "srv6_locator": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisLocatorEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Srv6 Locator"
+          },
+          "suppress_attached_bit": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suppress Attached Bit"
+          },
+          "te_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Te Enabled"
+          }
+        },
+        "title": "IsisProcessEntry",
+        "type": "object"
+      },
+      "IsisRedistributionComponent": {
+        "additionalProperties": false,
+        "properties": {
+          "inventory": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/IsisDestination"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inventory"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "protocol": {
+            "const": "isis",
+            "default": "isis",
+            "title": "Protocol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inventory",
+          "present"
+        ],
+        "title": "IsisRedistributionComponent",
+        "type": "object"
+      },
+      "IsisSegmentRoutingEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "maximum_sid_depth": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Sid Depth"
+          },
+          "node_sid_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Sid Index"
+          },
+          "node_sid_label": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Sid Label"
+          },
+          "node_sid_v6_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Sid V6 Index"
+          },
+          "node_sid_v6_label": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Sid V6 Label"
+          },
+          "prefix_sid_range": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Sid Range"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "srgb_range": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Srgb Range"
+          },
+          "srgb_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Srgb Start"
+          },
+          "srlb_range": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Srlb Range"
+          },
+          "srlb_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Srlb Start"
+          },
+          "srv6_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Srv6 Enabled"
+          },
+          "tunnel_table_pref": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tunnel Table Pref"
+          }
+        },
+        "title": "IsisSegmentRoutingEntry",
+        "type": "object"
+      },
+      "IsisSettingEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "IsisSettingEntry",
+        "type": "object"
+      },
       "L2SapEntry-Output": {
         "additionalProperties": false,
         "properties": {
@@ -1076,6 +3166,164 @@
         "title": "LagConfigObservationOut",
         "type": "object"
       },
+      "LagMemberEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "LagMemberEntry",
+        "type": "object"
+      },
+      "LagTopologyDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "bundles": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LagTopologyEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundles"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "present",
+          "bundles",
+          "unprojectable"
+        ],
+        "title": "LagTopologyDocument",
+        "type": "object"
+      },
+      "LagTopologyEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "lag_id": {
+            "title": "Lag Id",
+            "type": "integer"
+          },
+          "member": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/LagMemberEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "lag_id"
+        ],
+        "title": "LagTopologyEntry",
+        "type": "object"
+      },
+      "LagTopologyObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/LagTopologyDocument"
+          },
+          "family": {
+            "const": "lag",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "LagTopologyObservationOut",
+        "type": "object"
+      },
       "LoggingDocument": {
         "additionalProperties": false,
         "properties": {
@@ -1328,6 +3576,1224 @@
           "attributes"
         ],
         "title": "ObservationCoverage",
+        "type": "object"
+      },
+      "OspfAreaEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "area_id": {
+            "title": "Area Id",
+            "type": "string"
+          },
+          "area_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Area Type"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "area_id"
+        ],
+        "title": "OspfAreaEntry",
+        "type": "object"
+      },
+      "OspfDestination": {
+        "additionalProperties": false,
+        "properties": {
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "process_id": {
+            "title": "Process Id",
+            "type": "string"
+          },
+          "redistribute": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RedistributionSourceEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redistribute"
+          },
+          "vrf": {
+            "default": "",
+            "title": "Vrf",
+            "type": "string"
+          }
+        },
+        "required": [
+          "process_id"
+        ],
+        "title": "OspfDestination",
+        "type": "object"
+      },
+      "OspfDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "instances": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OspfInstanceEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instances"
+          },
+          "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OspfInterfaceEntry-Output"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "instances",
+          "interfaces",
+          "present",
+          "unprojectable"
+        ],
+        "title": "OspfDocument",
+        "type": "object"
+      },
+      "OspfInstanceEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "area": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OspfAreaEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Area"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "process_id": {
+            "title": "Process Id",
+            "type": "string"
+          },
+          "router_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Router Id"
+          },
+          "vrf": {
+            "default": "",
+            "title": "Vrf",
+            "type": "string"
+          }
+        },
+        "required": [
+          "process_id"
+        ],
+        "title": "OspfInstanceEntry",
+        "type": "object"
+      },
+      "OspfInterfaceEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "area_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Area Id"
+          },
+          "auth_key_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Key Present"
+          },
+          "auth_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Present"
+          },
+          "auth_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Type"
+          },
+          "bfd_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bfd Enabled"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost"
+          },
+          "interface_name": {
+            "title": "Interface Name",
+            "type": "string"
+          },
+          "network_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Network Type"
+          },
+          "passive": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Passive"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "process_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Process Id"
+          }
+        },
+        "required": [
+          "interface_name"
+        ],
+        "title": "OspfInterfaceEntry",
+        "type": "object"
+      },
+      "OspfObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/OspfDocument"
+          },
+          "family": {
+            "const": "ospf",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "OspfObservationOut",
+        "type": "object"
+      },
+      "OspfRedistributionComponent": {
+        "additionalProperties": false,
+        "properties": {
+          "inventory": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/OspfDestination"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inventory"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "protocol": {
+            "const": "ospf",
+            "default": "ospf",
+            "title": "Protocol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inventory",
+          "present"
+        ],
+        "title": "OspfRedistributionComponent",
+        "type": "object"
+      },
+      "PolicyAsPath": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyAsPathEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PolicyAsPath",
+        "type": "object"
+      },
+      "PolicyAsPathEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "pattern": {
+            "title": "Pattern",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "action",
+          "pattern"
+        ],
+        "title": "PolicyAsPathEntry",
+        "type": "object"
+      },
+      "PolicyCommunityEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "community": {
+            "title": "Community",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "action",
+          "community"
+        ],
+        "title": "PolicyCommunityEntry",
+        "type": "object"
+      },
+      "PolicyCommunityList": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyCommunityEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry"
+          },
+          "invert_match": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invert Match"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PolicyCommunityList",
+        "type": "object"
+      },
+      "PolicyPrefixEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "ge": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ge"
+          },
+          "le": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Le"
+          },
+          "prefix": {
+            "title": "Prefix",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "action",
+          "prefix"
+        ],
+        "title": "PolicyPrefixEntry",
+        "type": "object"
+      },
+      "PolicyPrefixList": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyPrefixEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PolicyPrefixList",
+        "type": "object"
+      },
+      "PolicyRouteMap": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyRouteMapEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entry"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PolicyRouteMap",
+        "type": "object"
+      },
+      "PolicyRouteMapEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "match_as_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Match As Paths"
+          },
+          "match_community_lists": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Match Community Lists"
+          },
+          "match_json": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Match Json"
+          },
+          "match_prefix_lists": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Match Prefix Lists"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "sequence": {
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "set_json": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Json"
+          }
+        },
+        "required": [
+          "sequence",
+          "action"
+        ],
+        "title": "PolicyRouteMapEntry",
+        "type": "object"
+      },
+      "RedistributionComponentCoverage": {
+        "additionalProperties": false,
+        "properties": {
+          "destinations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Destinations",
+            "type": "array"
+          },
+          "protocol": {
+            "enum": [
+              "bgp",
+              "isis",
+              "ospf"
+            ],
+            "title": "Protocol",
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/RedistributionSourceCoverage"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "protocol",
+          "destinations",
+          "sources"
+        ],
+        "title": "RedistributionComponentCoverage",
+        "type": "object"
+      },
+      "RedistributionCoverage": {
+        "additionalProperties": false,
+        "properties": {
+          "attributes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Attributes",
+            "type": "array"
+          },
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/RedistributionComponentCoverage"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "not_comparable": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Not Comparable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "attributes",
+          "components"
+        ],
+        "title": "RedistributionCoverage",
+        "type": "object"
+      },
+      "RedistributionDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "components": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/OspfRedistributionComponent"
+                },
+                {
+                  "$ref": "#/components/schemas/IsisRedistributionComponent"
+                },
+                {
+                  "$ref": "#/components/schemas/BgpRedistributionComponent"
+                }
+              ]
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/RedistributionEntry-Output"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries",
+          "components",
+          "unprojectable"
+        ],
+        "title": "RedistributionDocument",
+        "type": "object"
+      },
+      "RedistributionEntry-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "dest_protocol": {
+            "enum": [
+              "bgp",
+              "isis",
+              "ospf"
+            ],
+            "title": "Dest Protocol",
+            "type": "string"
+          },
+          "dest_ref": {
+            "title": "Dest Ref",
+            "type": "string"
+          },
+          "dest_vrf": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dest Vrf"
+          },
+          "metric": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric"
+          },
+          "metric_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Type"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "route_map": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Map"
+          },
+          "source_protocol": {
+            "title": "Source Protocol",
+            "type": "string"
+          },
+          "source_ref": {
+            "default": "",
+            "title": "Source Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_protocol",
+          "dest_protocol",
+          "dest_ref"
+        ],
+        "title": "RedistributionEntry",
+        "type": "object"
+      },
+      "RedistributionObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/RedistributionCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/RedistributionDocument"
+          },
+          "family": {
+            "const": "redistribution",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "RedistributionObservationOut",
+        "type": "object"
+      },
+      "RedistributionSourceCoverage": {
+        "additionalProperties": false,
+        "properties": {
+          "protocol": {
+            "title": "Protocol",
+            "type": "string"
+          },
+          "reference": {
+            "title": "Reference",
+            "type": "string"
+          }
+        },
+        "required": [
+          "protocol",
+          "reference"
+        ],
+        "title": "RedistributionSourceCoverage",
+        "type": "object"
+      },
+      "RedistributionSourceEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "metric": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric"
+          },
+          "metric_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metric Type"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "route_map": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Map"
+          },
+          "source_protocol": {
+            "title": "Source Protocol",
+            "type": "string"
+          },
+          "source_ref": {
+            "default": "",
+            "title": "Source Ref",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_protocol"
+        ],
+        "title": "RedistributionSourceEntry",
+        "type": "object"
+      },
+      "RoutePolicyDocument": {
+        "additionalProperties": false,
+        "properties": {
+          "as_paths": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyAsPath"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Paths"
+          },
+          "community_lists": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyCommunityList"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Community Lists"
+          },
+          "prefix_lists": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyPrefixList"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Lists"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
+          },
+          "route_maps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PolicyRouteMap"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Maps"
+          },
+          "unprojectable": {
+            "items": {
+              "$ref": "#/components/schemas/UnprojectableEntry"
+            },
+            "title": "Unprojectable",
+            "type": "array"
+          }
+        },
+        "required": [
+          "prefix_lists",
+          "community_lists",
+          "as_paths",
+          "route_maps",
+          "present",
+          "unprojectable"
+        ],
+        "title": "RoutePolicyDocument",
+        "type": "object"
+      },
+      "RoutePolicyObservationOut": {
+        "additionalProperties": false,
+        "properties": {
+          "coverage": {
+            "$ref": "#/components/schemas/ObservationCoverage"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/RoutePolicyDocument"
+          },
+          "family": {
+            "const": "route_policy",
+            "title": "Family",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_epoch": {
+            "title": "Source Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "source_epoch",
+          "digest",
+          "observed_at",
+          "coverage",
+          "family",
+          "document"
+        ],
+        "title": "RoutePolicyObservationOut",
         "type": "object"
       },
       "SnmpCommunityEntry-Output": {
@@ -2400,12 +5866,18 @@
   },
   "families": {
     "bfd": "BfdObservationOut",
+    "bgp": "BgpObservationOut",
     "interface_attributes": "InterfaceAttributesObservationOut",
     "interface_ip": "InterfaceIpObservationOut",
     "interface_mtu": "InterfaceMtuObservationOut",
+    "isis": "IsisObservationOut",
     "l2_service": "L2ServiceObservationOut",
+    "lag": "LagTopologyObservationOut",
     "lag_config": "LagConfigObservationOut",
     "logging": "LoggingObservationOut",
+    "ospf": "OspfObservationOut",
+    "redistribution": "RedistributionObservationOut",
+    "route_policy": "RoutePolicyObservationOut",
     "snmp": "SnmpObservationOut",
     "static_route": "StaticRouteObservationOut",
     "subinterface": "SubinterfaceObservationOut",
