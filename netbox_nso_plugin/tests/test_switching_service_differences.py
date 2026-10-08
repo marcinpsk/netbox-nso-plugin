@@ -68,6 +68,13 @@ class _ScopeDifferences:
     def rows(self):
         return [row for row in differences(self.management, user=self.user) if row.scope == self.scope]
 
+    def compared(self):
+        return [(row.kind, row.attribute) for row in self.rows() if row.kind != "unavailable"]
+
+    def omit(self, item, *names):
+        for name in names:
+            item["present"].remove(name)
+
     def test_match(self):
         self.publish()
         self.assertFalse([row for row in self.rows() if row.kind != "unavailable"])
@@ -320,6 +327,18 @@ class TestBfdDifferences(_ScopeDifferences, TestCase):
             interface=self.interface, bfd_profile=profile, micro_bfd=True, enabled=True
         )
 
+    def test_present_null_flags_use_reconciler_defaults(self):
+        self.native.micro_bfd = self.native.enabled = False
+        self.native.save()
+        self.changed_entry().update(micro_bfd=None, enabled=None)
+        self.publish()
+        self.assertEqual(self.compared(), [])
+
+    def test_omitted_flags_stay_missing(self):
+        self.omit(self.changed_entry(), "micro_bfd", "enabled")
+        self.publish()
+        self.assertEqual(self.compared(), [("mismatch", "enabled"), ("mismatch", "micro_bfd")])
+
 
 class TestLacpDifferences(_ScopeDifferences, TestCase):
     scope = "lacp"
@@ -420,6 +439,19 @@ class TestLoggingDifferences(_ScopeDifferences, TestCase):
             management=self.management, console_severity="CRITICAL", monitor_severity="NOTICE", module_severity="NOTICE"
         )
 
+    def test_present_null_local_levels_use_reconciler_defaults(self):
+        NSOLoggingLevelState.objects.filter(management=self.management).update(
+            console_severity="", monitor_severity="", module_severity=""
+        )
+        self.document["local_levels"].update(console_severity=None, monitor_severity=None, module_severity=None)
+        self.publish()
+        self.assertEqual(self.compared(), [])
+
+    def test_omitted_local_level_stays_missing(self):
+        self.omit(self.document["local_levels"], "console_severity")
+        self.publish()
+        self.assertEqual(self.compared(), [("mismatch", "console_severity")])
+
     def test_omitted_default_port_uses_timos_equivalence(self):
         self.use_ned("timos-test")
         host = self.document["hosts"][0]
@@ -455,6 +487,22 @@ class TestSnmpDifferences(_ScopeDifferences, TestCase):
             username="placeholder-user",
         )
         NSOSnmpSystemInfoState.objects.create(management=self.management, location="example-lab", contact="example")
+
+    def test_present_null_fields_use_reconciler_defaults(self):
+        NSOSnmpCommunityState.objects.filter(pk=self.native.pk).update(access="RO", acl="")
+        NSOSnmpSystemInfoState.objects.filter(management=self.management).update(location="", contact="")
+        self.changed_entry().update(access=None, acl=None)
+        self.document["system"].update(location=None, contact=None)
+        self.publish()
+        self.assertEqual(self.compared(), [])
+
+    def test_omitted_fields_stay_missing(self):
+        self.omit(self.changed_entry(), "access", "acl")
+        self.omit(self.document["system"], "location")
+        self.publish()
+        self.assertEqual(
+            sorted(self.compared()), [("mismatch", "access"), ("mismatch", "acl"), ("mismatch", "location")]
+        )
 
     def test_omitted_default_port_uses_timos_equivalence(self):
         self.use_ned("timos-test")
@@ -530,6 +578,22 @@ class TestStaticRouteDifferences(_ScopeDifferences, TestCase):
         self.changed_entry()["prefix"] = "invalid"
         self.publish()
         self.assertIn("ambiguous", [row.kind for row in self.rows()])
+
+    def test_empty_and_null_names_use_reconciler_defaults(self):
+        for native, device in ((None, ""), ("", None)):
+            with self.subTest(native=native, device=device):
+                self.native.name = native
+                self.native.interface_next_hop = device
+                self.native.permanent = None
+                self.native.save()
+                self.changed_entry().update(name=device, interface_next_hop=native)
+                self.publish()
+                self.assertEqual(self.compared(), [])
+
+    def test_omitted_name_stays_missing(self):
+        self.omit(self.changed_entry(), "name")
+        self.publish()
+        self.assertEqual(self.compared(), [("mismatch", "name")])
 
     def test_interface_next_hop_uses_the_broader_binding(self):
         self.native.next_hop = None

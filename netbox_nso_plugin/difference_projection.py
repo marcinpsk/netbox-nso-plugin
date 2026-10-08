@@ -312,15 +312,17 @@ def _snmp_native(management, row, *, compare_supported):
 
 
 def _route_native(management, row):
+    from .template_content import static_route_interface_next_hop, static_route_name, static_route_permanent
+
     values = {
         "vrf": row.vrf.name if row.vrf else "",
         "prefix": str(row.prefix),
         "next_hop": str(row.next_hop) if row.next_hop is not None else None,
-        "interface_next_hop": row.interface_next_hop,
+        "interface_next_hop": static_route_interface_next_hop(row.interface_next_hop),
         "metric": row.metric,
-        "permanent": row.permanent,
+        "permanent": static_route_permanent(row.permanent),
         "tag": row.tag,
-        "name": row.name,
+        "name": static_route_name(row.name),
         "next_hop_vrf": MISSING,
     }
     return ProjectedEntry(
@@ -385,7 +387,7 @@ def _route_identity(values):
 
 
 def _interface_device(scope, item, management, interfaces):
-    from .bfd_reconciler import _profile_values
+    from .bfd_reconciler import _profile_values, bfd_flag_values
     from .interface_mtu_reconciler import _validated_interface_items
     from .subinterface_reconciler import subinterface_values
     from .svi_reconciler import svi_values
@@ -443,7 +445,7 @@ def _interface_device(scope, item, management, interfaces):
         if interface is not None:
             name = interface.name
             related.append(interface)
-        values = _values(item, ("min_tx", "min_rx", "multiplier", "enabled", "micro_bfd"))
+        values = {**_values(item, ("min_tx", "min_rx", "multiplier")), **_normalized(item, bfd_flag_values(item))}
         if all(values[key] is not MISSING and values[key] is not None for key in ("min_tx", "min_rx", "multiplier")):
             reason = "invalid BFD profile" if _profile_values(values) is None else ""
     return ProjectedEntry(name, values, tuple(related), reason=reason)
@@ -508,7 +510,7 @@ def _l2_device(document, interfaces):
 
 def _snmp_device(document):
     from .snmp_versions import canonical_snmp_version
-    from .template_content import snmp_host_values
+    from .template_content import snmp_community_values, snmp_host_values, snmp_system_values
     from .vault_refs import is_secret_fingerprint
 
     entries = []
@@ -519,7 +521,7 @@ def _snmp_device(document):
         entries.append(
             ProjectedEntry(
                 ("community", item["name"]),
-                {**_values(item, ("access", "acl")), "secret": item["name"]},
+                {**_normalized(item, snmp_community_values(item)), "secret": item["name"]},
             )
         )
     for item in document["users"] or []:
@@ -542,12 +544,13 @@ def _snmp_device(document):
             values["version"] = canonical_snmp_version(values["version"])
         entries.append(ProjectedEntry(("host", item["address"]), values))
     if document["system"].get("present"):
-        entries.append(ProjectedEntry(("system",), _values(document["system"], ("location", "contact"))))
+        system = document["system"]
+        entries.append(ProjectedEntry(("system",), _normalized(system, snmp_system_values(system))))
     return entries
 
 
 def _logging_device(document, ned_id):
-    from .template_content import _canonical_logging_field, logging_host_values
+    from .template_content import _canonical_logging_field, logging_host_values, logging_level_values
 
     entries = []
     for item in document["hosts"] or []:
@@ -558,7 +561,7 @@ def _logging_device(document, ned_id):
         entries.append(ProjectedEntry(("host", item["address"]), values))
     if document["local_levels"] is not None:
         item = document["local_levels"]
-        values = _values(item, ("console_severity", "monitor_severity", "module_severity"))
+        values = _normalized(item, logging_level_values(item))
         for name, value in values.items():
             if value is not MISSING:
                 values[name] = _canonical_logging_field(ned_id, "severity", value)
@@ -570,11 +573,24 @@ def _route_device(item, management):
     from ipam.models import VRF
     from netbox_routing.models import StaticRoute
 
-    from .template_content import _static_route_metric, interface_ip_vrf_candidates_by_name, static_route_permanent
-
-    values = _values(
-        item, ("vrf", "prefix", "next_hop", "interface_next_hop", "next_hop_vrf", "metric", "permanent", "tag", "name")
+    from .template_content import (
+        _static_route_metric,
+        interface_ip_vrf_candidates_by_name,
+        static_route_interface_next_hop,
+        static_route_name,
+        static_route_permanent,
     )
+
+    values = {
+        **_values(item, ("vrf", "prefix", "next_hop", "next_hop_vrf", "metric", "permanent", "tag")),
+        **_normalized(
+            item,
+            {
+                "interface_next_hop": static_route_interface_next_hop(item.get("interface_next_hop")),
+                "name": static_route_name(item.get("name")),
+            },
+        ),
+    }
     if values["permanent"] is not MISSING:
         values["permanent"] = static_route_permanent(values["permanent"])
     for name in ("prefix", "next_hop"):

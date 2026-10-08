@@ -578,6 +578,16 @@ def snmp_host_values(entry):
     }
 
 
+def snmp_community_values(entry):
+    """Return the community fields used by SNMP reconcile and comparison."""
+    return {"access": entry.get("access") or "RO", "acl": entry.get("acl") or ""}
+
+
+def snmp_system_values(entry):
+    """Return the system fields used by SNMP reconcile and comparison."""
+    return {name: entry.get(name) or "" for name in ("location", "contact")}
+
+
 def snmp_host_field_matches(ned_id, field, native, observed, *, omitted=False):
     """Compare a host field with the observed NED default-port exception."""
     if (
@@ -657,8 +667,8 @@ def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
             if current is not None
             else NSOSnmpCommunityState(management=management, community_hash=community_hash)
         )
-        access = entry.get("access") or "RO"
-        acl = entry.get("acl") or ""
+        community = snmp_community_values(entry)
+        access, acl = community["access"], community["acl"]
         has_secret = bool(entry.get("has_secret", True))
         owned = current is not None and sm.is_owned(current.status)
         if owned:
@@ -784,8 +794,8 @@ def _snmp_reconcile_operations(device, payload, planned_at):  # noqa: C901
         system_result = (
             copy.copy(current_system) if current_system is not None else NSOSnmpSystemInfoState(management=management)
         )
-        location = system_data.get("location") or ""
-        contact = system_data.get("contact") or ""
+        system = snmp_system_values(system_data)
+        location, contact = system["location"], system["contact"]
         owned = current_system is not None and sm.is_owned(current_system.status)
         if owned:
             if NSOSnmpSystemInfoState.objects.filter(
@@ -976,6 +986,13 @@ def logging_host_values(item):
     }
 
 
+def logging_level_values(entry):
+    """Return the local severities used by logging reconcile and comparison."""
+    from .models import NSOLoggingLevelState
+
+    return {name: entry.get(name) or "" for name in NSOLoggingLevelState.SEVERITY_FIELDS}
+
+
 def logging_host_field_matches(ned_id, field, native, observed, *, omitted=False):
     """Compare a host field with the observed NED default-port exception."""
     if (
@@ -1092,7 +1109,7 @@ def _logging_reconcile_operations(device, payload, planned_at):  # noqa: C901
         level_result = (
             copy.copy(current_level) if current_level is not None else NSOLoggingLevelState(management=management)
         )
-        device_levels = {field: levels_data.get(field) or "" for field in NSOLoggingLevelState.SEVERITY_FIELDS}
+        device_levels = logging_level_values(levels_data)
         owned = current_level is not None and sm.is_owned(current_level.status)
         if owned:
             if NSOLoggingLevelState.objects.filter(
@@ -1187,7 +1204,22 @@ def _reconcile_logging_config(device, payload: dict) -> dict:
 
 def static_route_identity(vrf_name, prefix, next_hop, interface_next_hop):
     """Return the route identity used by reconcile and comparison."""
-    return vrf_name or "", prefix, next_hop or None, (interface_next_hop or None) if not next_hop else None
+    return (
+        vrf_name or "",
+        prefix,
+        next_hop or None,
+        None if next_hop else static_route_interface_next_hop(interface_next_hop),
+    )
+
+
+def static_route_name(value):
+    """Return the route name used by reconcile and comparison."""
+    return value or ""
+
+
+def static_route_interface_next_hop(value):
+    """Return the forwarding interface used by reconcile and comparison."""
+    return value or None
 
 
 def static_route_permanent(value):
@@ -1301,7 +1333,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
         vrf_name = entry.get("vrf") or ""
         prefix = entry.get("prefix") or ""
         next_hop = entry.get("next_hop") or None
-        interface_next_hop = entry.get("interface_next_hop") or None
+        interface_next_hop = static_route_interface_next_hop(entry.get("interface_next_hop"))
         if not prefix or (not next_hop and not interface_next_hop):
             continue
         vrf = None
@@ -1336,7 +1368,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
                 metric=_static_route_metric(entry, device),
                 permanent=static_route_permanent(entry.get("permanent", False)),
                 tag=entry.get("tag"),
-                name=entry.get("name") or "",
+                name=static_route_name(entry.get("name")),
             )
             try:
                 route.full_clean(exclude=("vrf",) if vrf is not None and vrf.pk is None else ())

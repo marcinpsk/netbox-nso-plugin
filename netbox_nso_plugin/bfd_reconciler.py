@@ -23,6 +23,11 @@ def _profile_values(entry):
     return f"bfd-{tx}-{rx}-x{mult}", tx, rx, mult
 
 
+def bfd_flag_values(entry):
+    """Return the BFD flags used by reconcile and comparison."""
+    return {"micro_bfd": bool(entry.get("micro_bfd", False)), "enabled": bool(entry.get("enabled", True))}
+
+
 def bfd_reconcile_plan(device, interfaces: list):
     """Freeze every native BFD and overlay write before reconciliation."""
     from django.utils import timezone
@@ -115,6 +120,7 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
 
     for interface_id, (interface, entry) in entries_by_interface.items():
         seen_interface_ids.add(interface_id)
+        flags = bfd_flag_values(entry)
         current_state = state_by_interface.get(interface_id)
         owned = current_state is not None and sm.is_owned(current_state.status)
         desired_entry = (
@@ -132,15 +138,14 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
             native = BFDInterface(
                 interface=interface,
                 bfd_profile=profile,
-                micro_bfd=current_state.micro_bfd if owned else bool(entry.get("micro_bfd", False)),
-                enabled=True if owned else bool(entry.get("enabled", True)),
+                micro_bfd=current_state.micro_bfd if owned else flags["micro_bfd"],
+                enabled=True if owned else flags["enabled"],
             )
             save(native, force_insert=True, natural_key=("interface",))
             native_by_interface[interface_id] = native
         elif not owned:
             profile = profile_for(desired_entry)
-            desired_micro = bool(entry.get("micro_bfd", False))
-            desired_enabled = bool(entry.get("enabled", True))
+            desired_micro, desired_enabled = flags["micro_bfd"], flags["enabled"]
             if (
                 (profile is not None and profile.pk is None)
                 or current_native.bfd_profile_id != (profile.pk if profile is not None else None)
@@ -169,14 +174,14 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
                 state.min_rx,
                 state.multiplier,
             )
-            matches = matches and state.micro_bfd == bool(entry.get("micro_bfd", False))
+            matches = matches and state.micro_bfd == flags["micro_bfd"]
             # A matching read is not apply evidence: only a correlated apply result settles deploying.
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:
             state.min_tx, state.min_rx, state.multiplier = (
                 reported_profile_values[1:] if reported_profile_values else (None, None, None)
             )
-            state.micro_bfd = bool(entry.get("micro_bfd", False))
+            state.micro_bfd = flags["micro_bfd"]
             state.status = sm.on_reconcile(state.status)
         state.last_sync_at = planned_at
         created = current_state is None
