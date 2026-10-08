@@ -10,7 +10,7 @@ from django.test import TestCase
 from netbox_routing.models import ISISFlexAlgo, ISISInstance, OSPFInstance, Redistribution
 
 from netbox_nso_plugin.comparison_values import MISSING
-from netbox_nso_plugin.device_differences import differences
+from netbox_nso_plugin.device_differences import NOT_VISIBLE, differences
 from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
 from netbox_nso_plugin.observations import observation_defaults
 
@@ -674,6 +674,60 @@ class TestRoutingProtocolDifferences(TestCase):
                 rows = self._rows("redistribution")
                 self.assertNotIn(hidden.name, repr(rows))
                 self.assertTrue(any(row.kind == "ambiguous" for row in rows))
+
+    def _redist_entry(self, protocol, reference, **values):
+        from ._scope_observation_case import entry
+
+        return entry(
+            dest_protocol=protocol,
+            dest_ref=reference,
+            source_protocol="static",
+            source_ref="",
+            metric=10,
+            metric_type=None,
+            route_map=None,
+            **values,
+        )
+
+    def test_redistribution_destination_vrf_follows_the_native_destination_key(self):
+        self._redistribution(self._ospf(), metric=10)
+        self._redistribution(self._process(), metric=10)
+        for protocol, reference, values in (
+            ("ospf", "10", {"dest_vrf": None}),
+            ("ospf", "10", {}),
+            ("isis", "CORE", {"dest_vrf": ""}),
+            ("isis", "CORE", {"dest_vrf": None}),
+        ):
+            with self.subTest(protocol=protocol, values=values):
+                document = self._redist_document([self._redist_entry(protocol, reference, **values)], protocol=protocol)
+                self._snapshot("redistribution", document, self._redist_coverage(protocol))
+                rows = [row for row in self._rows("redistribution") if row.kind != "unavailable"]
+                self.assertEqual([(row.kind, row.attribute) for row in rows], [])
+
+    def test_redistribution_vrf_on_a_non_ospf_destination_is_ambiguous(self):
+        self._redistribution(self._process(), metric=10)
+        document = self._redist_document([self._redist_entry("isis", "CORE", dest_vrf="TENANT_A")])
+        self._snapshot("redistribution", document, self._redist_coverage())
+        self.assertIn(
+            ("ambiguous", "invalid observed redistribution identity"),
+            [(row.kind, row.reason) for row in self._rows("redistribution")],
+        )
+
+    def test_redistribution_null_ospf_destination_vrf_keeps_a_hidden_destination_redacted(self):
+        from core.models import ObjectType
+        from users.models import ObjectPermission
+
+        self._redistribution(self._ospf(process="4747"), metric=10)
+        self.user = get_user_model().objects.create_user(username=f"ospfdest{uuid4().hex[:8]}")
+        permission = ObjectPermission.objects.create(name="Visible redistribution", actions=["view"])
+        permission.object_types.add(ObjectType.objects.get_for_model(Redistribution))
+        permission.users.add(self.user)
+        document = self._redist_document([self._redist_entry("ospf", "4747", dest_vrf=None)], protocol="ospf")
+        self._snapshot("redistribution", document, self._redist_coverage("ospf"))
+        rows = self._rows("redistribution")
+        compared = [(row.kind, row.reason) for row in rows if row.kind != "unavailable"]
+        self.assertEqual(compared, [("ambiguous", NOT_VISIBLE)])
+        self.assertNotIn("4747", repr(rows))
 
     def test_redistribution_bgp_source_asdot_matches_asplain(self):
         native = self._redistribution(self._process())

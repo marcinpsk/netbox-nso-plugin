@@ -499,10 +499,19 @@ def _redist_identity(item):
     return (
         protocol,
         _redist_reference(protocol, item["dest_ref"]),
-        item.get("dest_vrf"),
+        _redist_destination_vrf_key(protocol, item.get("dest_vrf")),
         source_protocol,
         source_ref,
     )
+
+
+def _redist_destination_vrf_key(protocol, vrf):
+    """Return the destination VRF as the native destination key stores it."""
+    if protocol == "ospf":
+        return vrf or ""
+    if vrf:
+        raise ValueError("only an OSPF destination carries a VRF")
+    return None
 
 
 def _redist_native(management):
