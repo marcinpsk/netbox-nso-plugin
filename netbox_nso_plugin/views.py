@@ -806,9 +806,13 @@ def _difference_value(scope, value):
     if not isinstance(value, dict):
         return json.dumps(value, default=str)
     if scope == "ip":
-        address = value.get("address") or (
-            value["host"] if value.get("prefix_length") is None else f"{value['host']}/{value['prefix_length']}"
-        )
+        address = value.get("address")
+        if not address:
+            host = value.get("host")
+            if not host:
+                address = "invalid address"
+            else:
+                address = host if value.get("prefix_length") is None else f"{host}/{value['prefix_length']}"
         place = f" on {value['interface']}" if value.get("interface") else ""
         return f"{address}{place}" + (f" (VRF {value['vrf']})" if value.get("vrf") else "")
     names = ("description", "enabled") if scope == "interface" else sorted(value)
