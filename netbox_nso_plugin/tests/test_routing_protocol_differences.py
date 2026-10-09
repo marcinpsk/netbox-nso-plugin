@@ -514,6 +514,27 @@ class TestRoutingProtocolDifferences(TestCase):
         self._snapshot("redistribution", document, self._redist_coverage())
         self.assertTrue(all(row.kind == "unavailable" for row in self._rows("redistribution")))
 
+    def test_redistribution_missing_destination_collection_names_the_collection(self):
+        inventories = {
+            "isis": [{"process_tag": "CORE", "present": ["process_tag"]}],
+            "ospf": [{"process_id": "10", "vrf": "", "present": ["process_id", "vrf"]}],
+            "bgp": [
+                {
+                    "asn": "64512",
+                    "scope": [{"vrf": "", "address_family": [{"afi": "ipv4", "present": ["afi"]}]}],
+                    "present": ["asn", "scope"],
+                }
+            ],
+        }
+        for protocol, inventory in inventories.items():
+            with self.subTest(protocol=protocol):
+                document = self._redist_document([], protocol=protocol, inventory=inventory)
+                self._snapshot("redistribution", document, self._redist_coverage(protocol))
+                self.assertIn(
+                    ("unavailable", "redistribute", "redistribute collection was not reported"),
+                    [(row.kind, row.attribute, row.reason) for row in self._rows("redistribution")],
+                )
+
     def test_redistribution_duplicate_is_ambiguous(self):
         entry = {
             "dest_protocol": "isis",

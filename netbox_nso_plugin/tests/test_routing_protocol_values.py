@@ -165,7 +165,7 @@ def test_redistribution_missing_sources_block_only_the_destination():
         },
         coverage={"components": [{"protocol": "ospf"}]},
     )
-    assert list(nested_gaps("redistribution", snapshot)) == [(("ospf", "10", ""), "")]
+    assert list(nested_gaps("redistribution", snapshot)) == [(("ospf", "10", ""), "redistribute")]
 
 
 def test_segment_routing_explicit_absence_is_authoritative():

@@ -972,7 +972,7 @@ def _redist_nested_gaps(document, covered):
                 vrf = destination.get("vrf", "") if protocol == "ospf" else None
                 reason = _collection_gap(destination, "redistribute")
                 if reason:
-                    gaps[((protocol, reference, vrf), "")] = reason
+                    gaps[((protocol, reference, vrf), "redistribute")] = reason
                 continue
             asn = _redist_reference("bgp", destination["asn"])
             reason = _collection_gap(destination, "scope")
@@ -986,7 +986,7 @@ def _redist_nested_gaps(document, covered):
                     reference = f"{asn}/{scope.get('vrf', '')}" + (f"/{family['afi']}" if family.get("afi") else "")
                     reason = _collection_gap(family, "redistribute")
                     if reason:
-                        gaps[(("bgp", reference, None), "")] = reason
+                        gaps[(("bgp", reference, None), "redistribute")] = reason
     return gaps
 
 
