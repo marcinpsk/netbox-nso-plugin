@@ -215,7 +215,7 @@ class TestMtuDifferences(_ScopeDifferences, TestCase):
 
     def test_zero_is_distinct_from_null_and_missing(self):
         for value in (0, None):
-            with self.subTest(value=value):
+            with self.subTest(value=str(value)):
                 self.changed_entry()["mtu"] = value
                 self.publish()
                 self.assertIn(("mismatch", "mtu"), [(row.kind, row.attribute) for row in self.rows()])
@@ -357,6 +357,36 @@ class TestLacpDifferences(_ScopeDifferences, TestCase):
             management=self.management, interface=self.interface, mode="active", port_priority=200
         )
 
+    def test_hidden_bundle_overlay_restricts_observed_only_member(self):
+        from core.models import ObjectType
+        from users.models import ObjectPermission
+
+        from netbox_nso_plugin.comparison_values import MISSING
+
+        member = Interface.objects.create(device=self.device, name="Ethernet2", type="1000base-t")
+        self.document["bundles"][0]["member"] = [entry(interface_name=member.name, mode="active", port_priority=123)]
+        self.user = get_user_model().objects.create_user(username=f"bundle{uuid4().hex[:8]}")
+        for model in (Interface, NSOLACPMemberState):
+            permission = ObjectPermission.objects.create(name=f"Visible {model._meta.model_name}", actions=["view"])
+            permission.object_types.add(ObjectType.objects.get_for_model(model))
+            permission.users.add(self.user)
+        self.publish()
+        rows = self.rows()
+        self.assertFalse(any(row.kind == "device_only" for row in rows))
+        self.assertTrue(any(row.kind == "ambiguous" and row.reason == NOT_VISIBLE for row in rows))
+        self.assertTrue(all(row.identity == "" for row in rows if row.kind == "ambiguous"))
+        self.assertTrue(all(row.device_value is MISSING for row in rows if row.kind == "ambiguous"))
+        self.assertNotIn(member.name, repr(rows))
+        self.assertNotIn(self.native.name, repr(rows))
+        self.assertNotIn("123", repr(rows))
+        permission = ObjectPermission.objects.create(name="Visible bundle overlay", actions=["view"])
+        permission.object_types.add(ObjectType.objects.get_for_model(NSOLACPBundleState))
+        permission.users.add(self.user)
+        self.user = get_user_model().objects.get(pk=self.user.pk)
+        rows = self.rows()
+        self.assertTrue(any(row.kind == "device_only" and row.identity == ("member", member.name) for row in rows))
+        self.assertIn("123", repr(rows))
+
     def test_membership_uses_native_topology(self):
         self.interface.lag = None
         self.interface.save()
@@ -407,6 +437,44 @@ class TestL2SapDifferences(_ScopeDifferences, TestCase):
 
     def changed_entry(self):
         return self.document["services"][0]["saps"][0]
+
+    def test_hidden_service_restricts_observed_only_sap(self):
+        from core.models import ObjectType
+        from users.models import ObjectPermission
+        from vpn.models import L2VPN
+
+        from netbox_nso_plugin.comparison_values import MISSING
+
+        service = L2VPN.objects.create(
+            name="example-service", slug=f"nso-{self.device.pk}-example-service", type="vpws"
+        )
+        self.native.l2vpn = service
+        self.native.save()
+        self.document["services"][0]["saps"] = [
+            entry(sap_id="Ethernet1:200", port=self.interface.name, outer_tag=200, inner_tag=None)
+        ]
+        self.user = get_user_model().objects.create_user(username=f"service{uuid4().hex[:8]}")
+        for model in (Interface, NSOL2SapState):
+            permission = ObjectPermission.objects.create(name=f"Visible {model._meta.model_name}", actions=["view"])
+            permission.object_types.add(ObjectType.objects.get_for_model(model))
+            permission.users.add(self.user)
+        self.publish()
+        rows = self.rows()
+        self.assertFalse(any(row.kind == "device_only" for row in rows))
+        self.assertTrue(any(row.kind == "ambiguous" and row.reason == NOT_VISIBLE for row in rows))
+        self.assertTrue(all(row.identity == "" and row.device_value is MISSING for row in rows))
+        self.assertNotIn(service.name, repr(rows))
+        self.assertNotIn("Ethernet1:200", repr(rows))
+        self.assertNotIn("200", repr(rows))
+        permission = ObjectPermission.objects.create(name="Visible L2 service", actions=["view"])
+        permission.object_types.add(ObjectType.objects.get_for_model(L2VPN))
+        permission.users.add(self.user)
+        self.user = get_user_model().objects.get(pk=self.user.pk)
+        rows = self.rows()
+        self.assertTrue(
+            any(row.kind == "device_only" and row.identity == (service.name, "Ethernet1:200") for row in rows)
+        )
+        self.assertIn("200", repr(rows))
 
     def test_partial_sap_coverage_cannot_claim_absence(self):
         self.document["services"][0].pop("saps")
@@ -564,7 +632,7 @@ class TestStaticRouteDifferences(_ScopeDifferences, TestCase):
         self.native.save()
         self.changed_entry()["present"].remove("permanent")
         for value in (None, False, MISSING):
-            with self.subTest(value=value):
+            with self.subTest(value=str(value)):
                 if value is MISSING:
                     self.changed_entry().pop("permanent")
                 else:

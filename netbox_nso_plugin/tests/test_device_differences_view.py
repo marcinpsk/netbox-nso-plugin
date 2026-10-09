@@ -140,15 +140,18 @@ class TestDeviceDifferencesView(TestCase):
         self.assertContains(response, "sync not supported yet")
         self.assertNotContains(response, "#1790")
 
-    def test_unsupported_scopes_collapse_into_one_line_and_ip_identity_is_readable(self):
+    def test_all_scopes_are_compared_and_ip_identity_is_readable(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
         from ._observation_case import ip_observation
 
         state = NSOFamilyReadState.objects.create(management=self.management, family="interface_ip")
         snapshot = observation("interface_ip", interfaces=[ip_observation("Ethernet2", vrf="example-vrf")])
         NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("interface_ip", 1, 1, snapshot))
         response = self.client.get(self.url)
-        self.assertContains(response, "Not compared yet: ", count=1)
-        self.assertNotContains(response, "not supported yet")
+        self.assertNotContains(response, "Not compared yet:")
+        self.assertEqual(set(response.context["scopes"]), set(converted_scope_rules()))
+        self.assertContains(response, "no successful read yet")
         self.assertContains(response, "Ethernet2 198.18.0.1/24 (VRF example-vrf)")
         self.assertNotContains(response, "&#x27;Ethernet2&#x27;")
 

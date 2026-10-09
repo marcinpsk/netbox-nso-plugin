@@ -1017,6 +1017,8 @@ def get_isis_interfaces(adapter_device_id: int) -> dict:
     out = {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
+    if "observation" in data:
+        out["observation"] = data["observation"]
     return out
 
 

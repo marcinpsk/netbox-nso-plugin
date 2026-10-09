@@ -25,9 +25,6 @@
   <div class="small mb-2">
     {% for value, count in counts.items %}<span class="me-3">{{ value }}: {{ count }}</span>{% endfor %}
   </div>
-  {% if not_compared %}
-    <div class="small text-muted mb-2">Not compared yet: {{ not_compared|join:", " }}.</div>
-  {% endif %}
   <form method="post" action="{% url 'plugins:netbox_nso_plugin:device_nso_sync_preview' pk=device.pk %}" data-sync-form>
   {% csrf_token %}
   {% if can_sync and sync_scopes %}

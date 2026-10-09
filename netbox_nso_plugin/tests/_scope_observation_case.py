@@ -218,8 +218,15 @@ def publish_scope_observation(management, family, read_state, body, **kwargs):
     """Supply the typed observation when a gate test publishes a revisioned family."""
     from netbox_nso_plugin.read_gate import gated_family_run
 
-    if family in DOCUMENTS and isinstance(read_state, dict) and "observation" not in kwargs:
-        kwargs["observation"] = scope_observation(
+    from ._routing_observation_case import DOCUMENTS as routing_documents
+    from ._routing_observation_case import routing_observation
+
+    if family in DOCUMENTS or family in routing_documents:
+        make_observation = scope_observation if family in DOCUMENTS else routing_observation
+    else:
+        make_observation = None
+    if make_observation is not None and isinstance(read_state, dict) and "observation" not in kwargs:
+        kwargs["observation"] = make_observation(
             family, revision=read_state.get("payload_revision"), source_epoch=read_state.get("source_epoch")
         )
     return gated_family_run(management, family, read_state, body, **kwargs)

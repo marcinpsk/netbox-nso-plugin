@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
-"""Publish switching and service observations through every plugin reconcile seam."""
+"""Publish switching, service and routing observations through every plugin reconcile seam."""
 
 from uuid import uuid4
 
@@ -12,9 +12,20 @@ from netbox_nso_plugin.read_gate import gated_family_run
 from netbox_nso_plugin.reconcile import reconcile_category, reconcile_device
 
 from ._observation_case import ObservationTransport
+from ._routing_observation_case import DOCUMENTS as ROUTING_DOCUMENTS
+from ._routing_observation_case import routing_observation
 from ._scope_observation_case import DOCUMENTS, scope_observation
 from .test_gated_reconcile import _make
 from .test_read_gate import _rs
+
+DOCUMENTS = {**DOCUMENTS, **ROUTING_DOCUMENTS}
+
+
+def family_observation(family, **kwargs):
+    if family in ROUTING_DOCUMENTS:
+        return routing_observation(family, **kwargs)
+    return scope_observation(family, **kwargs)
+
 
 FAMILY_ENDPOINTS = {
     "interface_attributes": ("interfaces-doc", "interfaces", "interfaces"),
@@ -30,6 +41,11 @@ FAMILY_ENDPOINTS = {
     "logging": ("logging-config", "hosts", "logging"),
     "snmp": ("snmp-config", "communities", "snmp"),
     "static_route": ("static-routes", "routes", "static"),
+    "bgp": ("bgp-config", "routers", "bgp"),
+    "isis": ("isis-interfaces", "processes", "isis"),
+    "ospf": ("ospf", "instances", "ospf"),
+    "route_policy": ("route-policy", "prefix_lists", "route_policy"),
+    "redistribution": ("redistribution", "entries", "redistribution"),
 }
 
 
@@ -44,10 +60,10 @@ class TestScopeObservationPublication(TestCase):
             manage_routing=True,
             manage_static=True,
             manage_bgp=True,
-            manage_isis=False,
-            manage_ospf=False,
-            manage_route_policy=False,
-            manage_redistribution=False,
+            manage_isis=True,
+            manage_ospf=True,
+            manage_route_policy=True,
+            manage_redistribution=True,
         )
         self.transport = ObservationTransport(
             self.management.adapter_device_id,
@@ -57,13 +73,12 @@ class TestScopeObservationPublication(TestCase):
         for family, (endpoint, collection, _category) in FAMILY_ENDPOINTS.items():
             self.transport.documents[endpoint] = {
                 collection: [],
-                "observation": scope_observation(family),
+                "observation": family_observation(family),
                 "read_state": _rs(),
             }
-        self.transport.documents["bgp-config"] = {
-            "routers": [],
-            "read_state": _rs(outcome="unavailable", result="kept", succeeded=False),
-        }
+        self.transport.documents["isis-interfaces"]["interfaces"] = []
+        self.transport.documents["ospf"]["interfaces"] = []
+        self.transport.documents["route-policy"].update(community_lists=[], as_paths=[], route_maps=[])
 
     def assert_snapshots(self, families):
         for family in families:
@@ -93,7 +108,7 @@ class TestScopeObservationPublication(TestCase):
         def fail():
             raise RuntimeError("body failed")
 
-        for family in FAMILY_ENDPOINTS:
+        for family in DOCUMENTS:
             with self.subTest(family=family):
                 gated_family_run(
                     self.management,
@@ -101,7 +116,7 @@ class TestScopeObservationPublication(TestCase):
                     _rs(),
                     lambda: None,
                     epoch=self.management.adapter_device_id,
-                    observation=scope_observation(family),
+                    observation=family_observation(family),
                 )
                 with self.assertRaisesRegex(RuntimeError, "body failed"):
                     gated_family_run(
@@ -110,12 +125,12 @@ class TestScopeObservationPublication(TestCase):
                         _rs(attempt_id=2),
                         fail,
                         epoch=self.management.adapter_device_id,
-                        observation=scope_observation(family, revision=2),
+                        observation=family_observation(family, revision=2),
                     )
-        self.assert_snapshots(FAMILY_ENDPOINTS)
+        self.assert_snapshots(DOCUMENTS)
 
     def test_missing_observation_fails_closed_for_each_family(self):
-        for family in FAMILY_ENDPOINTS:
+        for family in DOCUMENTS:
             with self.subTest(family=family), self.assertRaises(AdapterError):
                 gated_family_run(
                     self.management,

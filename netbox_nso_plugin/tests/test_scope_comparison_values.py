@@ -23,13 +23,28 @@ B1_FAMILIES = {
     "static_route": "static_route",
 }
 
+B2_FAMILIES = {
+    "bgp": "bgp",
+    "isis": "isis",
+    "isis_flex_algo": "isis",
+    "ospf": "ospf",
+    "redistribution": "redistribution",
+    "route_policy": "route_policy",
+}
 
-@pytest.mark.parametrize("scope,family", B1_FAMILIES.items())
+
+@pytest.mark.parametrize("scope,family", (B1_FAMILIES | B2_FAMILIES).items())
 def test_supported_scope_without_snapshot_reports_no_successful_read(scope, family):
     rows = differences(SimpleNamespace(), user=None, snapshots={})
     row = next(row for row in rows if row.scope == scope)
     assert (row.kind, row.reason) == ("unavailable", "no successful read yet")
     assert SCOPE_SPECS[scope].family == family
+
+
+def test_every_converted_scope_has_a_comparison_spec():
+    from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
+    assert set(SCOPE_SPECS) == set(converted_scope_rules())
 
 
 @pytest.mark.parametrize("value", [None, "", False, 0, [], "example"])

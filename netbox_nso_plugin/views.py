@@ -827,7 +827,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
 
         from .device_differences import (
             KINDS,
-            NOT_SUPPORTED,
             differences,
             identity_label,
             observation_snapshots,
@@ -845,8 +844,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
         kind = request.GET.get("kind", "")
         snapshots = observation_snapshots(management)
         rows = differences(management, user=request.user, snapshots=snapshots)
-        not_compared = [row.scope for row in rows if row.kind == "unavailable" and row.reason == NOT_SUPPORTED]
-        rows = [row for row in rows if row.scope not in not_compared]
         scoped = [row for row in rows if not scope or row.scope == scope]
         counts = {value: sum(row.kind == value for row in scoped) for value in KINDS}
         filtered = [row for row in scoped if not kind or row.kind == kind]
@@ -876,7 +873,7 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
             }
             for row in page.object_list
         ]
-        compared = sorted(set(converted_scope_rules()) - set(not_compared))
+        compared = sorted(converted_scope_rules())
         can_sync = (
             request.user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
             and NSODeviceManagement.objects.restrict(request.user, "change").filter(pk=management.pk).exists()
@@ -890,7 +887,6 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
                 "scope": scope,
                 "kind": kind,
                 "scopes": compared,
-                "not_compared": not_compared,
                 "counts": counts,
                 "snapshots": [snapshots[family] for family in sorted(snapshots)],
                 "can_sync": can_sync,

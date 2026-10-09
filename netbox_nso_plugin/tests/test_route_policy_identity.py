@@ -44,6 +44,7 @@ from netbox_nso_plugin.signals import route_policy_intent_item, suppress_intent_
 from ._adapter_http import make_response
 from ._outbox_case import ReceiptAdapter, content_update, make_managed, own_route, without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._routing_observation_case import routing_observation
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_read_gate import _rs
 
@@ -56,7 +57,12 @@ class _PolicyAdapter(ReceiptAdapter):
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith("/route-policy"):
             device_id = int(url.split("/devices/")[1].split("/")[0])
-            return make_response(200, self.captures[device_id])
+            payload = copy.deepcopy(self.captures[device_id])
+            state = payload["read_state"]
+            payload["observation"] = routing_observation(
+                "route_policy", revision=state["payload_revision"], source_epoch=state["source_epoch"]
+            )
+            return make_response(200, payload)
         return super()._handle(method, url, **kwargs)
 
 

@@ -136,6 +136,17 @@ class TestReadStatePassthrough(unittest.TestCase):
         )
         self.assertEqual(out.get("read_state"), _READ_STATE)
 
+    def test_isis_rebuilder_keeps_observation(self):
+        from ._routing_observation_case import routing_observation
+
+        observed = routing_observation("isis")
+        out = self._fetch(
+            "get_isis_interfaces",
+            {"device_id": 9, "read_state": _READ_STATE, "processes": [], "interfaces": [], "observation": observed},
+            9,
+        )
+        self.assertEqual(out.get("observation"), observed)
+
     def test_isis_rebuilder_rejects_non_object_bodies(self):
         from netbox_nso_plugin import adapter_client
 

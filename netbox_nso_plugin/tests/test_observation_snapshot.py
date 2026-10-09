@@ -211,10 +211,10 @@ class TestObservationSnapshot(TestCase):
         self.assertEqual(context["_gate"]["interface_attributes"], "legacy")
         self.assertFalse(NSOFamilyObservation.objects.exists())
 
-    def test_null_revision_and_non_observer_keep_previous_snapshot(self):
+    def test_null_revision_keeps_previous_snapshot(self):
         self._publish()
         self._publish("interface_ip")
-        for family in ("interface_attributes", "interface_ip", "bgp"):
+        for family in ("interface_attributes", "interface_ip"):
             gated_family_run(
                 self.management,
                 family,
@@ -229,8 +229,8 @@ class TestObservationSnapshot(TestCase):
         self._publish("interface_ip")
         gated_family_run(
             self.management,
-            "bgp",
-            _rs(incarnation=_INC_B[0], incarnation_born=_INC_B[1]),
+            "interface_attributes",
+            _rs(incarnation=_INC_B[0], incarnation_born=_INC_B[1], payload_revision=None),
             lambda: None,
             epoch=self.management.adapter_device_id,
         )
@@ -240,7 +240,11 @@ class TestObservationSnapshot(TestCase):
         self._publish()
         self._publish("interface_ip")
         gated_family_run(
-            self.management, "bgp", _rs(source_epoch=2), lambda: None, epoch=self.management.adapter_device_id
+            self.management,
+            "interface_attributes",
+            _rs(source_epoch=2, payload_revision=None),
+            lambda: None,
+            epoch=self.management.adapter_device_id,
         )
         self.assertFalse(NSOFamilyObservation.objects.exists())
 
