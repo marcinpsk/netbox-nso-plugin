@@ -33,6 +33,7 @@ from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 from netbox_nso_plugin.tests.mixins import _CascadeFlushMixin
 
 from ._outbox_case import mirror_update
+from ._scope_observation_case import publish_scope_observation
 
 
 def _make_device(name):
@@ -181,10 +182,8 @@ class TestGateTransitions(TestCase):
         self.epoch = self.mgmt.adapter_device_id
 
     def _run(self, read_state, body=None, family="bfd"):
-        from netbox_nso_plugin.read_gate import gated_family_run
-
         body = body or _Recorder()
-        result = gated_family_run(self.mgmt, family, read_state, body, epoch=self.epoch)
+        result = publish_scope_observation(self.mgmt, family, read_state, body, epoch=self.epoch)
         return result, body
 
     def _row(self, family="bfd"):
@@ -335,12 +334,11 @@ class TestGateTransitions(TestCase):
         self.assertNotEqual(row.publication_sequence, row.applied_publication_sequence)
 
     def test_plan_failure_carries_the_publication_guard(self):
-        from netbox_nso_plugin.read_gate import gated_family_run
         from netbox_nso_plugin.reconcile import ReconcileScopeError
 
         boom = RuntimeError("plan failed")
         with self.assertRaises(ReconcileScopeError) as raised:
-            gated_family_run(
+            publish_scope_observation(
                 self.mgmt,
                 "bfd",
                 _rs(attempt_id=8),
@@ -355,7 +353,7 @@ class TestGateTransitions(TestCase):
 
     def test_changed_renderer_targets_skip_the_admitted_publication(self):
         from netbox_nso_plugin.intent_state import MutationFootprint, ReconcileMutationPlan, RendererTargetsChanged
-        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT
 
         def targets_changed():
             raise RendererTargetsChanged("renderer targets changed during acquisition")
@@ -365,7 +363,7 @@ class TestGateTransitions(TestCase):
             MutationFootprint.for_keys({(self.mgmt.device_id, "bfd")}),
             validate_after_acquire=targets_changed,
         )
-        result = gated_family_run(
+        result = publish_scope_observation(
             self.mgmt,
             "bfd",
             _rs(attempt_id=8),
@@ -402,10 +400,10 @@ class TestGateTransitions(TestCase):
 
     def test_epoch_mismatch_writes_nothing(self):
         from netbox_nso_plugin.models import NSOFamilyReadState
-        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT, gated_family_run
+        from netbox_nso_plugin.read_gate import SKIPPED_STALE_ATTEMPT
 
         body = _Recorder()
-        result = gated_family_run(self.mgmt, "bfd", _rs(attempt_id=7), body, epoch=self.epoch + 1)
+        result = publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=7), body, epoch=self.epoch + 1)
         self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
         self.assertEqual(body.calls, 0)
         self.assertFalse(NSOFamilyReadState.objects.filter(management=self.mgmt, family="bfd").exists())
@@ -436,12 +434,12 @@ class TestGateTransitions(TestCase):
             if not raced["done"]:
                 raced["done"] = True
                 # B runs to completion in A's stall window (after A's admission commit)
-                read_gate.gated_family_run(mgmt, family, _rs(attempt_id=6), _Recorder(), epoch=epoch)
+                publish_scope_observation(mgmt, family, _rs(attempt_id=6), _Recorder(), epoch=epoch)
             return decision
 
         body_a = _Recorder()
         with patch.object(read_gate, "_gate_and_record", side_effect=racing):
-            result = read_gate.gated_family_run(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
+            result = publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
         self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
         self.assertEqual(body_a.calls, 0)
         self.assertEqual(self._row().applied_attempt_id, 6)
@@ -461,7 +459,7 @@ class TestGateTransitions(TestCase):
             if not raced["done"]:
                 raced["done"] = True
                 # B adopts the NEWER incarnation and applies the SAME attempt number
-                read_gate.gated_family_run(
+                publish_scope_observation(
                     mgmt,
                     family,
                     _rs(attempt_id=5, incarnation=_INC_B[0], incarnation_born=_INC_B[1]),
@@ -472,7 +470,7 @@ class TestGateTransitions(TestCase):
 
         body_a = _Recorder()
         with patch.object(read_gate, "_gate_and_record", side_effect=racing):
-            result = read_gate.gated_family_run(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
+            result = publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
         self.assertEqual(result.disposition, SKIPPED_STALE_ATTEMPT)
         self.assertEqual(body_a.calls, 0)
         row = self._row()
@@ -500,7 +498,7 @@ class TestGateTransitions(TestCase):
 
         body = _Recorder()
         with patch.object(read_gate, "_gate_and_record", side_effect=racing):
-            result = read_gate.gated_family_run(
+            result = publish_scope_observation(
                 self.mgmt,
                 "bfd",
                 _rs(attempt_id=2, source_epoch=1),
@@ -568,10 +566,8 @@ class TestIncarnationAdoption(TestCase):
         self.epoch = self.mgmt.adapter_device_id
 
     def _run(self, read_state, family="bfd", body=None):
-        from netbox_nso_plugin.read_gate import gated_family_run
-
         body = body or _Recorder()
-        return gated_family_run(self.mgmt, family, read_state, body, epoch=self.epoch), body
+        return publish_scope_observation(self.mgmt, family, read_state, body, epoch=self.epoch), body
 
     def _observe(self, families):
         from netbox_nso_plugin.read_gate import observe_aggregate
@@ -872,9 +868,7 @@ class TestAggregateObservation(TestCase):
         self.epoch = self.mgmt.adapter_device_id
 
     def _adopt(self, attempt_id=1):
-        from netbox_nso_plugin.read_gate import gated_family_run
-
-        gated_family_run(self.mgmt, "bfd", _rs(attempt_id=attempt_id), _Recorder(), epoch=self.epoch)
+        publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=attempt_id), _Recorder(), epoch=self.epoch)
 
     def _observe(self, families, epoch=None):
         from netbox_nso_plugin.read_gate import observe_aggregate
@@ -1474,7 +1468,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         """Serialize reconciliation bodies with native intent edits before either writes."""
         from netbox_nso_plugin import read_gate
         from netbox_nso_plugin.apply_state import lock_device_intent_transaction
-        from netbox_nso_plugin.read_gate import RAN, gated_family_run
+        from netbox_nso_plugin.read_gate import RAN
 
         identity_checked = threading.Event()
         intent_locked = threading.Event()
@@ -1509,7 +1503,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         def publish():
             try:
                 with patch.object(read_gate, "_publication_identity_current", side_effect=pause_after_identity_check):
-                    outcome["result"] = gated_family_run(
+                    outcome["result"] = publish_scope_observation(
                         self.mgmt,
                         "bfd",
                         _rs(attempt_id=5),
@@ -1677,12 +1671,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         A resumes with its stale attempt 5 → the gate refuses, applied stays 6,
         and A's exit logs the loud lease loss."""
         from netbox_nso_plugin.models import NSOFamilyReadState
-        from netbox_nso_plugin.read_gate import (
-            RAN,
-            SKIPPED_STALE_ATTEMPT,
-            DeviceReadLease,
-            gated_family_run,
-        )
+        from netbox_nso_plugin.read_gate import RAN, SKIPPED_STALE_ATTEMPT, DeviceReadLease
 
         a = DeviceReadLease(self.conn, self.key, ttl_s=1)
         self.assertTrue(a.acquire())
@@ -1696,11 +1685,11 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
                 b = DeviceReadLease(self.conn, self.key, ttl_s=30)
                 self.assertTrue(b.acquire())
                 with b:
-                    rb = gated_family_run(self.mgmt, "bfd", _rs(attempt_id=6), _Recorder(), epoch=self.epoch)
+                    rb = publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=6), _Recorder(), epoch=self.epoch)
                 self.assertEqual(rb.disposition, RAN)
                 # A resumes, still believing it owns the device
                 body_a = _Recorder()
-                ra = gated_family_run(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
+                ra = publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=5), body_a, epoch=self.epoch)
                 outcome["ra"] = ra
                 outcome["body_a_calls"] = body_a.calls
         self.assertEqual(outcome["ra"].disposition, SKIPPED_STALE_ATTEMPT)
@@ -1712,7 +1701,6 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
 
     def test_concurrent_first_create_single_row(self):
         from netbox_nso_plugin.models import NSOFamilyReadState
-        from netbox_nso_plugin.read_gate import gated_family_run
 
         errs = []
         barrier = threading.Barrier(2)
@@ -1720,7 +1708,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         def run(attempt):
             try:
                 barrier.wait(timeout=10)
-                gated_family_run(self.mgmt, "bfd", _rs(attempt_id=attempt), _Recorder(), epoch=self.epoch)
+                publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=attempt), _Recorder(), epoch=self.epoch)
             except Exception as exc:  # noqa: BLE001 - the test asserts none happen
                 errs.append(exc)
             finally:
@@ -1739,7 +1727,6 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
     def test_adoption_serialized_across_families(self):
         """Two families racing with DIFFERENT incarnations must converge on the
         newest born with no out-of-order adoption (row locks serialize them)."""
-        from netbox_nso_plugin.read_gate import gated_family_run
 
         barrier = threading.Barrier(2)
         errs = []
@@ -1747,7 +1734,7 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         def run(family, inc):
             try:
                 barrier.wait(timeout=10)
-                gated_family_run(
+                publish_scope_observation(
                     self.mgmt,
                     family,
                     _rs(attempt_id=1, incarnation=inc[0], incarnation_born=inc[1]),
@@ -1773,16 +1760,16 @@ class TestOrchestratedOverwrites(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(self.mgmt.adapter_incarnation, _INC_B[0])
 
     def test_aggregate_vs_adoption_interleave_no_deadlock(self):
-        from netbox_nso_plugin.read_gate import gated_family_run, observe_aggregate
+        from netbox_nso_plugin.read_gate import observe_aggregate
 
-        gated_family_run(self.mgmt, "bfd", _rs(attempt_id=1), _Recorder(), epoch=self.epoch)
+        publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=1), _Recorder(), epoch=self.epoch)
         errs = []
         stop = threading.Event()
 
         def gate_loop():
             try:
                 for n in range(2, 12):
-                    gated_family_run(self.mgmt, "bfd", _rs(attempt_id=n), _Recorder(), epoch=self.epoch)
+                    publish_scope_observation(self.mgmt, "bfd", _rs(attempt_id=n), _Recorder(), epoch=self.epoch)
             except Exception as exc:  # noqa: BLE001
                 errs.append(exc)
             finally:

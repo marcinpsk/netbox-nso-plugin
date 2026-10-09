@@ -880,6 +880,7 @@ _INTENT_SCOPES_BY_READ_FAMILY = {
     "interface_attributes": ("interface",),
     "interface_ip": ("ip",),
     "lag_config": ("lacp",),
+    "lag": ("lacp",),
     "l2_service": ("l2_sap",),
     "redistribution": ("bgp", "isis", "ospf"),
 }
@@ -916,9 +917,9 @@ def mark_publication_error_if_current(mgmt, family: str, decision: _Decision, ep
 
 def _publication_observation(family, decision, observation):
     from .adapter_client import AdapterError
-    from .observations import OBSERVATION_ATTRIBUTES, ObservationProtocolError, observation_defaults
+    from .observations import OBSERVATION_SCHEMAS, ObservationProtocolError, observation_defaults
 
-    if decision.disposition != RAN or decision.payload_revision is None or family not in OBSERVATION_ATTRIBUTES:
+    if decision.disposition != RAN or decision.payload_revision is None or family not in OBSERVATION_SCHEMAS:
         return None
     try:
         return observation_defaults(family, decision.payload_revision, decision.source_epoch, observation)

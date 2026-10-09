@@ -23,6 +23,7 @@ keywords = [
     "networking",
 ]
 dependencies = [
+    "jsonschema==4.26.0",
     "requests>=2.34.2",
 ]
 classifiers = [
@@ -42,7 +43,7 @@ Issues = "https://github.com/marcinpsk/netbox-nso-plugin/issues"
 include = ["netbox_nso_plugin*"]
 
 [tool.setuptools.package-data]
-netbox_nso_plugin = ["templates/**/*", "static/**/*"]
+netbox_nso_plugin = ["templates/**/*", "static/**/*", "schemas/*.json"]
 
 [tool.semantic_release]
 allow_zero_version = true

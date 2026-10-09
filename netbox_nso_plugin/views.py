@@ -816,7 +816,7 @@ def _difference_value(scope, value):
         place = f" on {value['interface']}" if value.get("interface") else ""
         return f"{address}{place}" + (f" (VRF {value['vrf']})" if value.get("vrf") else "")
     names = ("description", "enabled") if scope == "interface" else sorted(value)
-    return "; ".join(f"{name}: {json.dumps(value[name], default=str)}" for name in names if value.get(name) is not None)
+    return "; ".join(f"{name}: {json.dumps(value[name], default=str)}" for name in names if name in value)
 
 
 class NSODeviceDifferencesView(LoginRequiredMixin, View):

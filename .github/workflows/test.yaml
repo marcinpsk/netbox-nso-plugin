@@ -354,7 +354,7 @@ jobs:
         run: >-
           uv run -- pytest
           -c /dev/null --rootdir=.
-          contract_tests/test_live_adapter_contract.py
+          contract_tests/
           --quiet
 
       - name: Show adapter logs on failure

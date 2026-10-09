@@ -28,6 +28,24 @@ from .renderer_writer import RendererMutationPlan, planned_delete, planned_save
 logger = logging.getLogger(__name__)
 
 
+def lacp_bundle_values(item):
+    """Return the bundle parameters used by reconcile and comparison."""
+    return {
+        "lag_id": item.get("lag_id"),
+        "min_links": item.get("min_links"),
+        "system_priority": item.get("system_priority"),
+        "system_id": item.get("system_id") or "",
+        "timer": item.get("timer") or "",
+        "admin_key": item.get("admin_key"),
+        "vpc_sensitive": bool(item.get("vpc_sensitive")),
+    }
+
+
+def lacp_member_values(item):
+    """Return the member parameters used by reconcile and comparison."""
+    return {"mode": item.get("mode") or "", "port_priority": item.get("port_priority")}
+
+
 class _LACPReconcilePlanner:
     """Project native topology before deciding any overlay save or prune."""
 
@@ -182,13 +200,7 @@ class _LACPReconcilePlanner:
                 self.bundle_states.get(bundle.pk),
                 bundle,
                 {
-                    "lag_id": item.get("lag_id"),
-                    "min_links": item.get("min_links"),
-                    "system_priority": item.get("system_priority"),
-                    "system_id": item.get("system_id") or "",
-                    "timer": item.get("timer") or "",
-                    "admin_key": item.get("admin_key"),
-                    "vpc_sensitive": bool(item.get("vpc_sensitive")),
+                    **lacp_bundle_values(item),
                     "device_present": True,
                     "observed_members": sorted(
                         {
@@ -211,10 +223,7 @@ class _LACPReconcilePlanner:
                     NSOLACPMemberState,
                     self.member_rows.get(interface.pk),
                     interface,
-                    {
-                        "mode": member.get("mode") or "",
-                        "port_priority": member.get("port_priority"),
-                    },
+                    lacp_member_values(member),
                 )
 
     def plan_stale_overlays(self):

@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 _L2VPN_TYPE = {"epipe": "vpws", "vpls": "vpls"}
 
 
+def l2_sap_values(service, sap):
+    """Return the service type, port, and tags used by reconcile and comparison."""
+    return service.get("service_type"), sap.get("port", ""), sap.get("outer_tag"), sap.get("inner_tag")
+
+
 def _validated_l2_services(payload) -> list:
     """Validate one adapter L2 document before planning any changes."""
     from django.db import connection
@@ -188,10 +193,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
                 if current_state is not None
                 else NSOL2SapState(management=management, service_name=service_name, sap_id=sap["sap_id"])
             )
-            observed_service_type = service_type
-            observed_port = sap.get("port", "")
-            observed_outer_tag = sap.get("outer_tag")
-            observed_inner_tag = sap.get("inner_tag")
+            observed_service_type, observed_port, observed_outer_tag, observed_inner_tag = l2_sap_values(service, sap)
             owned = sm.is_owned(state.status)
             if not owned:
                 state.service_type = observed_service_type

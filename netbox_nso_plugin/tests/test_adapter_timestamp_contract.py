@@ -25,6 +25,7 @@ from django.test import TestCase
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSOInterfaceState
 
 from ._outbox_case import mirror_update
+from ._scope_observation_case import publish_scope_observation
 
 #: The two shapes the adapter is allowed to emit, and the instant each denotes.
 _WHOLE = ("2026-06-01T10:00:00Z", datetime(2026, 6, 1, 10, 0, 0, tzinfo=UTC))
@@ -128,12 +129,12 @@ class TestReadGateTimestamp(_AwareUTCMixin, TestCase):
 
     def test_incarnation_born_adopts_non_null_for_both_shapes(self):
         from netbox_nso_plugin.models import NSOFamilyReadState
-        from netbox_nso_plugin.read_gate import RAN, gated_family_run
+        from netbox_nso_plugin.read_gate import RAN
 
         for wire, expected in _SHAPES:
             with self.subTest(wire=wire):
                 mgmt = _make_mgmt(_make_device(f"ts-gate-{expected.microsecond}"))
-                result = gated_family_run(
+                result = publish_scope_observation(
                     mgmt,
                     "bfd",
                     self._read_state(wire, wire),

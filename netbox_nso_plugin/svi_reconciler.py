@@ -11,6 +11,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def svi_values(item):
+    """Return the SVI type and VRF used by reconcile and comparison."""
+    return item.get("type") or "svi", item.get("vrf") or ""
+
+
 def _vlan_choices(management, group):
     """Prefer attached VLANs over device-group fallback candidates."""
     from ipam.models import VLAN
@@ -103,8 +108,7 @@ def _svi_reconcile_operations(device, payload, planned_at):
         matches_for_vid = vlans.get(vid, {}) if vid else {}
         ambiguous = len(matches_for_vid) > 1
         vlan = next(iter(matches_for_vid.values())) if len(matches_for_vid) == 1 else None
-        device_type = item.get("type") or "svi"
-        device_vrf = item.get("vrf") or ""
+        device_type, device_vrf = svi_values(item)
         if sm.is_owned(state.status):
             desired_vid = state.vlan.vid if state.vlan else None
             matches = desired_vid == vid and state.svi_type == device_type and state.vrf == device_vrf

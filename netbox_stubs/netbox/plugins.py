@@ -19,3 +19,7 @@ class PluginConfig:
 
     def ready(self):
         """No-op ready hook."""
+
+
+class PluginTemplateExtension:
+    """Base class for importing pure helpers from template extension modules."""

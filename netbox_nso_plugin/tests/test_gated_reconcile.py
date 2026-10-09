@@ -367,7 +367,9 @@ class TestRealReconcilerGateFootprints(TestCase):
             "read_state": _rs(),
         }
 
-        with patch("netbox_nso_plugin.adapter_client.get_lag_config", return_value=payload):
+        with (
+            patch("netbox_nso_plugin.adapter_client.get_lag_config", return_value=payload),
+        ):
             ctx = reconcile_category(self.device, self.mgmt, "lacp")
 
         self.assertEqual(ctx["_gate"]["lag_config"], "ran")

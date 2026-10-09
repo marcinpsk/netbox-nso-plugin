@@ -11,7 +11,6 @@ from typing import Any
 
 from .ownership_planner import _ip_bindings, converted_scope_rules, device_interfaces
 from .summary import _netbox_value_for, matches_device_value
-from .template_content import interface_ip_vrf_candidates_by_name, resolve_interface_ip_interface
 
 KINDS = ("netbox_only", "device_only", "mismatch", "ambiguous", "unavailable")
 NOT_SUPPORTED = "not supported yet"
@@ -54,6 +53,7 @@ class ScopeSpec:
     attributes: tuple[AttributeProjection, ...]
     blockers: Callable
     rows: Callable
+    components: tuple[str, ...] = ()
 
 
 def _interface_identity(item):
@@ -144,6 +144,8 @@ def _native_ip_projection(native, interfaces):
 
 
 def _device_ip_projection(entry, address, interfaces):
+    from .template_content import resolve_interface_ip_interface
+
     interface = resolve_interface_ip_interface(interfaces, entry["interface"], entry["bound_port"])
     return {
         **address,
@@ -159,6 +161,8 @@ def _without_vrf(observed):
 
 def _ip_device_index(spec, snapshot, interfaces, user):
     from ipam.models import VRF
+
+    from .template_content import interface_ip_vrf_candidates_by_name
 
     device = defaultdict(list)
     names = {address["vrf"] for entry in snapshot.document["interfaces"] for address in entry["addresses"]}
@@ -289,6 +293,202 @@ def _ip_rows(spec, management, snapshot, user):
     return rows
 
 
+def _projected_identity(item):
+    return item.identity
+
+
+def _scope_blockers(native, device):
+    if len(native) > 1 or len(device) > 1:
+        return "multiple entries have the same identity"
+    return next((item.reason for item in (*native, *device) if item.reason), "")
+
+
+def _entry_visibility(entries, user):
+    grouped = defaultdict(dict)
+    for item in entries:
+        for obj in item.objects:
+            if obj is not None:
+                grouped[type(obj)][obj.pk] = obj
+    visible = {model: _visible_pks(model, user, objects.values()) for model, objects in grouped.items()}
+    return {id(item): all(obj is None or obj.pk in visible[type(obj)] for obj in item.objects) for item in entries}
+
+
+def _entry_component(spec, item):
+    if len(spec.components) == 1:
+        return spec.components[0]
+    return {
+        "community": "communities",
+        "user": "users",
+        "host": "hosts",
+        "system": "system",
+        "local_levels": "local_levels",
+    }[item.identity[0]]
+
+
+def _scope_component_gaps(spec, snapshot):
+    gaps = {}
+    for name in spec.components:
+        if name != "system" and name not in snapshot.document["present"]:
+            gaps[name] = "device component was not observed"
+        elif snapshot.document[name] is None:
+            gaps[name] = "device component is null"
+    return gaps
+
+
+def _coverage_reason(scope, attribute, coverage):
+    aliases = {"secret": "name", "bundle": "member", "port_priority": "member.port_priority"}
+    covered = "member.mode" if scope == "lacp" and attribute == "mode" else aliases.get(attribute, attribute)
+    if attribute in coverage.get("not_comparable", []) or covered in coverage.get("not_comparable", []):
+        return "attribute is not comparable in device coverage"
+    if attribute not in coverage["attributes"] and covered not in coverage["attributes"]:
+        return "attribute is not covered by the device observation"
+    return ""
+
+
+def _projected_matches(spec, projection, native, device, ned_id):
+    if projection.name == "port" and spec.scope in {"logging", "snmp"}:
+        from .template_content import logging_host_field_matches, snmp_host_field_matches
+
+        matches = logging_host_field_matches if spec.scope == "logging" else snmp_host_field_matches
+        return matches(ned_id, "port", native, device, omitted=device is MISSING)
+    return projection.matches(native, device)
+
+
+def _projected_group_rows(spec, native, device, snapshot, ned_id):
+    identity = spec.identity((device or native)[0])
+    reason = spec.blockers(native, device)
+    if reason:
+        return [Difference(spec.scope, "ambiguous", identity, reason=reason)]
+    if not native or not device:
+        item = (device or native)[0]
+        row = (
+            Difference(spec.scope, "device_only", identity, device_value=item.values)
+            if device
+            else Difference(spec.scope, "netbox_only", identity, netbox_value=item.values)
+        )
+        return [
+            row,
+            *(
+                Difference(spec.scope, "unavailable", identity, name, reason=reason)
+                for name, reason in item.unavailable.items()
+            ),
+        ]
+    rows = []
+    for projection in spec.attributes:
+        name = projection.name
+        if not any(name in item.values or name in item.unavailable for item in (native[0], device[0])):
+            continue
+        reason = native[0].unavailable.get(name) or device[0].unavailable.get(name)
+        reason = reason or _coverage_reason(spec.scope, name, snapshot.coverage)
+        netbox_value, device_value = projection.netbox_value(native[0]), projection.device_value(device[0])
+        if not reason and netbox_value is MISSING:
+            reason = "NetBox has no value for this attribute"
+        if reason:
+            rows.append(Difference(spec.scope, "unavailable", identity, name, reason=reason))
+        elif not _projected_matches(spec, projection, netbox_value, device_value, ned_id):
+            rows.append(Difference(spec.scope, "mismatch", identity, name, netbox_value, device_value))
+    return rows
+
+
+def _nested_component_gaps(spec, snapshot):
+    if spec.scope == "l2_sap":
+        return {
+            (item["service_name"], "saps"): "service SAP coverage is unavailable"
+            for item in snapshot.document["services"] or []
+            if item.get("saps") is None or "saps" not in item.get("present", [])
+        }
+    if spec.scope == "lacp":
+        return {
+            (item["name"], "member"): "LAG member coverage is unavailable"
+            for item in snapshot.document["bundles"] or []
+            if item.get("member") is None or "member" not in item.get("present", [])
+        }
+    return {}
+
+
+def _nested_coverage_rows(spec, gaps, entries, visible):
+    hidden = set()
+    for item in entries:
+        if visible[id(item)]:
+            continue
+        if spec.scope == "l2_sap":
+            hidden.add(item.identity[0])
+        elif spec.scope == "lacp":
+            hidden.add(item.identity[1] if item.identity[0] == "bundle" else item.values.get("bundle"))
+    return [
+        Difference(spec.scope, "ambiguous", reason=NOT_VISIBLE)
+        if name in hidden
+        else Difference(spec.scope, "unavailable", name, attribute, reason=reason)
+        for (name, attribute), reason in sorted(gaps.items())
+    ]
+
+
+def _scope_rows(spec, management, snapshot, user):
+    from .difference_projection import device_entries, native_entries
+
+    native = defaultdict(list)
+    device = defaultdict(list)
+    rows = []
+    gaps = _scope_component_gaps(spec, snapshot)
+    rows.extend(Difference(spec.scope, "unavailable", attribute=name, reason=reason) for name, reason in gaps.items())
+    if len(gaps) == len(spec.components):
+        return rows
+    ned_id = ""
+    if spec.scope in {"logging", "snmp"}:
+        from .template_content import _device_ned_id
+
+        ned_id = _device_ned_id(management.device)
+    nested_gaps = _nested_component_gaps(spec, snapshot)
+    blocked_services = {name for name, attribute in nested_gaps if attribute == "saps"}
+    blocked_members = {name for name, attribute in nested_gaps if attribute == "member"}
+    try:
+        native_items = native_entries(spec.scope, management, ned_id=ned_id)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"netbox_routing", "netbox_routing.models"}:
+            raise
+        return [Difference(spec.scope, "unavailable", reason="NetBox routing models are unavailable")]
+    device_items = device_entries(spec.scope, management, snapshot, ned_id=ned_id)
+    visible = _entry_visibility((*native_items, *device_items), user)
+    rows.extend(_nested_coverage_rows(spec, nested_gaps, (*native_items, *device_items), visible))
+    hidden = set()
+    for items, index in ((native_items, native), (device_items, device)):
+        for item in items:
+            if _entry_component(spec, item) in gaps or (blocked_services and item.identity[0] in blocked_services):
+                continue
+            if blocked_members and item.identity[0] == "member" and item.values.get("bundle") in blocked_members:
+                continue
+            key = spec.identity(item)
+            if not visible[id(item)]:
+                hidden.add(key)
+            elif key in (None, ""):
+                rows.append(Difference(spec.scope, "ambiguous", reason="missing native identity"))
+            else:
+                index[key].append(item)
+    for key in sorted(native.keys() | device.keys() | hidden, key=repr):
+        if key in hidden:
+            if device[key] or native[key] or any(item.identity == key for item in device_items):
+                rows.append(Difference(spec.scope, "ambiguous", reason=NOT_VISIBLE))
+        else:
+            rows.extend(_projected_group_rows(spec, native[key], device[key], snapshot, ned_id))
+    return rows
+
+
+def _same_value(native, device):
+    return type(native) is type(device) and native == device
+
+
+def _projected_attributes(*names):
+    return tuple(
+        AttributeProjection(
+            name,
+            lambda item, name=name: item.values.get(name, MISSING),
+            lambda item, name=name: item.values.get(name, MISSING),
+            _same_value,
+        )
+        for name in names
+    )
+
+
 def _description_projection():
     return AttributeProjection(
         "description",
@@ -331,6 +531,138 @@ SCOPE_SPECS = {
         _ip_rows,
     ),
 }
+
+
+SCOPE_SPECS.update(
+    {
+        "lacp": ScopeSpec(
+            "lacp",
+            "lag_config",
+            _projected_identity,
+            _projected_attributes(
+                "lag_id",
+                "min_links",
+                "system_priority",
+                "system_id",
+                "timer",
+                "admin_key",
+                "vpc_sensitive",
+                "bundle",
+                "mode",
+                "port_priority",
+            ),
+            _scope_blockers,
+            _scope_rows,
+            ("bundles",),
+        ),
+        "vlan": ScopeSpec(
+            "vlan", "vlan", _projected_identity, _projected_attributes("name"), _scope_blockers, _scope_rows, ("vlans",)
+        ),
+        "switchport": ScopeSpec(
+            "switchport",
+            "switchport",
+            _projected_identity,
+            _projected_attributes("mode", "untagged_vlan", "tagged_vlans"),
+            _scope_blockers,
+            _scope_rows,
+            ("interfaces",),
+        ),
+        "interface_mtu": ScopeSpec(
+            "interface_mtu",
+            "interface_mtu",
+            _projected_identity,
+            _projected_attributes("mtu", "ip_mtu", "mpls_mtu", "bound_port"),
+            _scope_blockers,
+            _scope_rows,
+            ("interfaces",),
+        ),
+        "svi": ScopeSpec(
+            "svi",
+            "svi",
+            _projected_identity,
+            _projected_attributes("vlan_id", "type", "vrf"),
+            _scope_blockers,
+            _scope_rows,
+            ("interfaces",),
+        ),
+        "subinterface": ScopeSpec(
+            "subinterface",
+            "subinterface",
+            _projected_identity,
+            _projected_attributes("parent_interface", "dot1q_vlan", "type", "vrf"),
+            _scope_blockers,
+            _scope_rows,
+            ("interfaces",),
+        ),
+        "bfd": ScopeSpec(
+            "bfd",
+            "bfd",
+            _projected_identity,
+            _projected_attributes("min_tx", "min_rx", "multiplier", "enabled", "micro_bfd"),
+            _scope_blockers,
+            _scope_rows,
+            ("interfaces",),
+        ),
+        "l2_sap": ScopeSpec(
+            "l2_sap",
+            "l2_service",
+            _projected_identity,
+            _projected_attributes("service_type", "service_id", "port", "outer_tag", "inner_tag"),
+            _scope_blockers,
+            _scope_rows,
+            ("services",),
+        ),
+        "logging": ScopeSpec(
+            "logging",
+            "logging",
+            _projected_identity,
+            _projected_attributes(
+                "port",
+                "severity",
+                "facility",
+                "transport",
+                "vrf",
+                "source",
+                "console_severity",
+                "monitor_severity",
+                "module_severity",
+            ),
+            _scope_blockers,
+            _scope_rows,
+            ("hosts", "local_levels"),
+        ),
+        "snmp": ScopeSpec(
+            "snmp",
+            "snmp",
+            _projected_identity,
+            _projected_attributes(
+                "access",
+                "acl",
+                "secret",
+                "auth_secret",
+                "priv_secret",
+                "version",
+                "notify_type",
+                "port",
+                "user",
+                "location",
+                "contact",
+            ),
+            _scope_blockers,
+            _scope_rows,
+            ("communities", "users", "hosts", "system"),
+        ),
+        "static_route": ScopeSpec(
+            "static_route",
+            "static_route",
+            _projected_identity,
+            _projected_attributes("interface_next_hop", "next_hop_vrf", "metric", "permanent", "tag", "name"),
+            _scope_blockers,
+            _scope_rows,
+            ("routes",),
+        ),
+    }
+)
 
 
 def observation_snapshots(management):
