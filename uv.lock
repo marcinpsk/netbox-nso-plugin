@@ -573,7 +573,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "jsonschema", specifier = "==4.26.0" },
+    { name = "jsonschema", specifier = ">=4.26.0,<5" },
     { name = "requests", specifier = ">=2.34.2" },
 ]
 
