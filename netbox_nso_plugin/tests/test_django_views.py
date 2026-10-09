@@ -1390,7 +1390,8 @@ class TestNSODeviceActionView(ViewTestBase):
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
     def test_post_refresh_nso_state_ajax_success(self, mock_session_cls, mock_cfg):
         """S5a C: Refresh NSO state (the CDB-only adapter read) rides the generic
-        dispatch: AJAX POST hits /actions/sync-from-nso and returns the job id."""
+        dispatch: the `refresh-nso-state` action calls the adapter path
+        /actions/sync-from-nso and returns the job id."""
         mgmt = NSODeviceManagement.objects.get(pk=self.mgmt.pk)
         mgmt.adapter_device_id = 10
         mgmt.save(update_fields=["adapter_device_id"])
