@@ -1227,13 +1227,13 @@ def static_route_permanent(value):
     return bool(value)
 
 
-def _static_route_metric(entry: dict, device=None) -> int:
+def _static_route_metric(entry: dict, ned_id: str) -> int:
     """Clamp the NSO metric to StaticRoute's 0..255 PositiveSmallInt constraint.
 
     Junos route metric/preference can exceed 255; an out-of-range value would fail
     full_clean() and drop the route, so fall back to the model default (1).
     """
-    if "metric" not in entry and device is not None and _device_uses_timos_ned(device):
+    if "metric" not in entry and ned_id.startswith("timos"):
         return 5
     m = entry.get("metric")
     return m if isinstance(m, int) and 0 <= m <= 255 else 1
@@ -1299,6 +1299,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
     auto_create = _adapter_setting("static_route_auto_create")
     vrf_auto_create = _adapter_setting("vrf_auto_create")
     vrfs = {row.name: row for row in VRF.objects.order_by("pk")}
+    ned_id = _device_ned_id(device)
     planned_routes = {}
     states = {
         row.static_route_id: row
@@ -1365,7 +1366,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
                 prefix=prefix,
                 next_hop=next_hop,
                 interface_next_hop=interface_next_hop,
-                metric=_static_route_metric(entry, device),
+                metric=_static_route_metric(entry, ned_id),
                 permanent=static_route_permanent(entry.get("permanent", False)),
                 tag=entry.get("tag"),
                 name=static_route_name(entry.get("name")),
@@ -1404,7 +1405,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             operations.append(("m2m_add", route, None, False, (device,)))
 
         reported_matches = (
-            route.metric == _static_route_metric(entry, device)
+            route.metric == _static_route_metric(entry, ned_id)
             and static_route_permanent(route.permanent) == static_route_permanent(entry.get("permanent", False))
             and route.tag == entry.get("tag")
         )
@@ -1718,7 +1719,7 @@ def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
     return rf
 
 
-def _isis_device_matches_intent(entry, state, ri=None, device=None) -> bool:
+def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
     """Return True when the device (adapter *entry*) has caught up to the owned overlay intent.
 
     Used for owned IS-IS rows where the clobber guard keeps the overlay == netbox-routing
@@ -1730,7 +1731,7 @@ def _isis_device_matches_intent(entry, state, ri=None, device=None) -> bool:
     long_scalars_match = all(
         entry.get(field) == getattr(ri, field)
         if field in entry
-        else (getattr(ri, field) is None if device is not None and _device_uses_timos_ned(device) else True)
+        else (getattr(ri, field) is None if ned_id.startswith("timos") else True)
         for field in long_scalar_fields
         if ri is not None and hasattr(ri, field)
     )

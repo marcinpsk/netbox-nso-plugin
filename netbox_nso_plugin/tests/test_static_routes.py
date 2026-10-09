@@ -332,6 +332,33 @@ class TestReconcileStaticRoutes(TestCase):
 
         self.assertEqual(StaticRoute.objects.get(prefix="198.18.40.0/24").metric, 5)
 
+    def test_ned_lookup_runs_once_per_reconcile_not_per_route(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+        from netbox_nso_plugin.template_content import static_route_reconcile_plan
+
+        self._make_mgmt(self.device, nso_device_name="sr-nokia-queries")
+        platform = Platform.objects.create(name="Static Nokia queries", slug="static-nokia-queries")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        table = NSOPlatformNedMapping._meta.db_table
+
+        def ned_queries(count):
+            entries = []
+            for index in range(count):
+                entry = self._route_entry(f"198.18.{index + 50}.0/24", "198.18.0.1")
+                entry.pop("metric")
+                entries.append(entry)
+            with self._auto_create_ctx(True), CaptureQueriesContext(connection) as queries:
+                static_route_reconcile_plan(self.device, self._route_payload(*entries))
+            return sum(table in query["sql"] for query in queries)
+
+        single = ned_queries(1)
+        self.assertEqual(ned_queries(5), single)
+
     def test_nokia_omitted_preference_does_not_rewrite_shared_metric(self):
         from netbox_routing.models import StaticRoute
 

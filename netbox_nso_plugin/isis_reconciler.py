@@ -534,6 +534,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
     from .template_content import (
+        _device_ned_id,
         _isis_device_matches_intent,
         _isis_instance_object_hash,
         _isis_interface_children_match,
@@ -545,6 +546,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
     operations = _Operations()
     if management is None:
         return operations, []
+    ned_id = _device_ned_id(device)
 
     process_entries = {}
     if "processes" in payload:
@@ -814,7 +816,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                         entry,
                         state,
                         current_native,
-                        device,
+                        ned_id,
                     )
                     and _isis_interface_children_match(entry, current_native)
                 )

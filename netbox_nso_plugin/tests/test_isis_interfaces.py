@@ -2174,6 +2174,41 @@ class TestReconcileIsisInterfaceLevels(TestCase):
 
         self.assertEqual(state.status, "in_sync")
 
+    def test_owned_interface_ned_lookup_runs_once_per_reconcile(self):
+        self._make_mgmt()
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        platform = Platform.objects.create(
+            name="Nokia ISIS queries",
+            slug="nokia-isis-queries",
+            manufacturer=self.device.device_type.manufacturer,
+        )
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="timos-nc-23.10")
+        self.device.platform = platform
+        self.device.save(update_fields=["platform"])
+        table = NSOPlatformNedMapping._meta.db_table
+
+        def ned_queries(count):
+            reported = []
+            for index in range(count):
+                iface, _ = Interface.objects.get_or_create(
+                    device=self.device, name=f"to-queries-{index}", defaults={"type": "1000base-t"}
+                )
+                reported.append({"interface_name": iface.name, "af": "ipv4", "process_tag": "", "passive": False})
+            for state in reconcile_isis(self.device, {"interfaces": reported})["interfaces"]:
+                state.status = "accepted"
+                save_overlay_fixture(state, update_fields=["status"])
+            with CaptureQueriesContext(connection) as queries:
+                reconcile_isis(self.device, {"interfaces": reported})
+            return sum(table in query["sql"] for query in queries)
+
+        single = ned_queries(1)
+        self.assertEqual(ned_queries(5), single)
+
     def test_owned_interface_level_omission_does_not_settle_when_scalars_match(self):
         """A level-only provenance gap must survive the top-level intent comparison."""
         self._make_mgmt()

@@ -681,6 +681,32 @@ class TestStaticRouteDifferences(_ScopeDifferences, TestCase):
         self.publish()
         self.assertFalse([row for row in self.rows() if row.kind != "unavailable"])
 
+    def test_query_count_stays_flat_when_observed_routes_grow(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VRF
+
+        self.use_ned("timos-test")
+
+        def publish_routes(count):
+            routes = []
+            for index in range(count):
+                VRF.objects.get_or_create(name=f"example-vrf-{index}")
+                route = copy.deepcopy(DOCUMENTS[self.family]["routes"][0])
+                route.update(vrf=f"example-vrf-{index}", prefix=f"198.18.{index + 10}.0/24")
+                self.omit(route, "metric")
+                route.pop("metric")
+                routes.append(route)
+            self.publish({**self.document, "routes": routes})
+
+        publish_routes(1)
+        with CaptureQueriesContext(connection) as queries:
+            small = self.rows()
+        publish_routes(10)
+        with self.assertNumQueries(len(queries)):
+            large = self.rows()
+        self.assertGreater(len(large), len(small))
+
 
 class TestComparisonQueryCount(TestCase):
     def setUp(self):

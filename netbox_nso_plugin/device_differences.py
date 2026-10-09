@@ -470,7 +470,7 @@ def _scope_rows(spec, management, snapshot, user):
     if len(gaps) == len(spec.components):
         return rows
     ned_id = ""
-    if spec.scope in {"logging", "snmp"}:
+    if spec.scope in {"logging", "snmp", "static_route"}:
         from .template_content import _device_ned_id
 
         ned_id = _device_ned_id(management.device)

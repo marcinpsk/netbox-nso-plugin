@@ -574,13 +574,11 @@ def _logging_device(document, ned_id):
     return entries
 
 
-def _route_device(item, management):
-    from ipam.models import VRF
+def _route_device(item, *, ned_id, vrfs_by_name):
     from netbox_routing.models import StaticRoute
 
     from .template_content import (
         _static_route_metric,
-        interface_ip_vrf_candidates_by_name,
         static_route_interface_next_hop,
         static_route_name,
         static_route_permanent,
@@ -603,14 +601,14 @@ def _route_device(item, management):
         if value is not MISSING and value is not None:
             parsed = StaticRoute._meta.get_field(name).to_python(value)
             values[name] = str(parsed) if parsed is not None else None
-    metric = _static_route_metric(item, management.device)
+    metric = _static_route_metric(item, ned_id)
     reason = (
         "metric cannot be represented by NetBox" if item.get("metric") is not None and metric != item["metric"] else ""
     )
     if values["metric"] is not MISSING:
         values["metric"] = metric
     name = item.get("vrf") or ""
-    vrfs = interface_ip_vrf_candidates_by_name(VRF, [name]).get(name, []) if name else []
+    vrfs = vrfs_by_name.get(name, []) if name else []
     if len(vrfs) > 1:
         reason = "non-unique VRF name"
     identity_values = {key: None if value is MISSING else value for key, value in values.items()}
@@ -643,13 +641,20 @@ def device_entries(scope, management, snapshot, *, ned_id="", native_items=()):
         return _logging_device(document, ned_id)
     entries = []
     collection = "vlans" if scope == "vlan" else ("routes" if scope == "static_route" else "interfaces")
+    if scope == "static_route":
+        from ipam.models import VRF
+
+        from .template_content import interface_ip_vrf_candidates_by_name
+
+        names = sorted({item["vrf"] for item in document[collection] or [] if item.get("vrf")})
+        vrfs_by_name = interface_ip_vrf_candidates_by_name(VRF, names)
     for item in document[collection] or []:
         try:
             if scope == "vlan":
                 normalized = _validated_vlan_items({"vlans": [item]})[0]
                 entries.append(ProjectedEntry(item["vlan_id"], _normalized(item, {"name": normalized["name"]})))
             elif scope == "static_route":
-                entries.append(_route_device(item, management))
+                entries.append(_route_device(item, ned_id=ned_id, vrfs_by_name=vrfs_by_name))
             else:
                 entries.append(_interface_device(scope, item, management, interfaces))
         except (AdapterError, ValueError, ValidationError) as exc:
