@@ -278,6 +278,28 @@ class TestIPSync(SyncCase):
         self.assertTrue(Interface.objects.filter(pk=bare.pk).exists())
         self.assertTrue(IPAddress.objects.filter(address="198.18.10.1/24").exists())
 
+    def test_device_prefix_length_outside_the_address_family_is_blocked(self):
+        self.interface("lo0.0")
+        native = IPAddress.objects.create(address="198.18.20.1/24", assigned_object=self.lag)
+        transport = self.transport(
+            ips=[
+                ip_observation("lo0.0", "198.18.21.1", prefix_length=33),
+                ip_observation("lag-60", "198.18.20.1", prefix_length=64),
+            ]
+        )
+        _response, plan = self.preview(transport, {"scope": "ip"})
+
+        self.assertEqual(self.changes(plan), [])
+        reason = "the device prefix length is not valid for the address family"
+        self.assertEqual(
+            sorted((blocker.target, blocker.reason) for blocker in plan.blockers),
+            [("lag-60 198.18.20.1/64", reason), ("lo0.0 198.18.21.1/33", reason)],
+        )
+        self.confirm(plan, {"scope": "ip"})
+        native.refresh_from_db()
+        self.assertEqual(str(native.address), "198.18.20.1/24")
+        self.assertFalse(IPAddress.objects.filter(address__net_host="198.18.21.1").exists())
+
     def test_ip_delete_that_changes_other_objects_or_is_protected_is_blocked(self):
         from ipam.models import ASN, RIR
         from netbox_routing.models import BGPPeer, BGPRouter, BGPScope

@@ -338,6 +338,18 @@ def _plan_ip_change(planner, label, before, after, *, action, detail, target):
     planner.ip_interfaces.update({target[0], before.assigned_object_id})
 
 
+def _device_address(planner, label, host, prefix_length):
+    """Return the device address, or block the row when the device prefix length cannot form one."""
+    if type(prefix_length) is not int:
+        planner.block("ip", label, "the device reports no prefix length")
+        return None
+    try:
+        return str(ip_interface(f"{host}/{prefix_length}"))
+    except ValueError:
+        planner.block("ip", label, "the device prefix length is not valid for the address family")
+        return None
+
+
 def _plan_ip_device_only(planner, context, row, label, moved_from):
     from dcim.models import Interface
     from ipam.models import VRF, IPAddress
@@ -352,8 +364,7 @@ def _plan_ip_device_only(planner, context, row, label, moved_from):
     if interface.pk not in context.visible_interfaces:
         planner.block("ip", label, NOT_VISIBLE)
         return
-    if type(item["prefix_length"]) is not int:
-        planner.block("ip", label, "the device reports no prefix length")
+    if (address := _device_address(planner, label, item["host"], item["prefix_length"])) is None:
         return
     vrf = None
     if item["vrf"]:
@@ -365,7 +376,6 @@ def _plan_ip_device_only(planner, context, row, label, moved_from):
             planner.block("ip", label, NOT_VISIBLE)
             return
         vrf = vrfs[0]
-    address = str(ip_interface(f"{item['host']}/{item['prefix_length']}"))
     target = (interface.pk, address, vrf.name if vrf else "")
     candidate = row.association_candidate
     if candidate is None:
@@ -524,10 +534,8 @@ def _plan_ip(planner, rows):
             if native is None:
                 planner.block("ip", label, "NetBox has no single matching address")
                 continue
-            if type(row.device_value) is not int:
-                planner.block("ip", label, "the device reports no prefix length")
+            if (address := _device_address(planner, label, row.identity[1], row.device_value)) is None:
                 continue
-            address = str(ip_interface(f"{row.identity[1]}/{row.device_value}"))
             after = _candidate(native)
             after.address = address
             target = (native.assigned_object_id, address, native.vrf.name if native.vrf else "")
