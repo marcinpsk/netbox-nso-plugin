@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12.0"
 
 [[package]]
@@ -544,7 +544,7 @@ wheels = [
 
 [[package]]
 name = "netbox-nso-plugin"
-version = "1.8.0"
+version = "1.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
