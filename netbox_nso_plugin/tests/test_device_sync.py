@@ -278,6 +278,20 @@ class TestIPSync(SyncCase):
         self.assertTrue(Interface.objects.filter(pk=bare.pk).exists())
         self.assertTrue(IPAddress.objects.filter(address="198.18.10.1/24").exists())
 
+    def test_global_table_mismatch_reported_with_an_empty_vrf_is_modified(self):
+        native = IPAddress.objects.create(address="198.18.22.1/24", assigned_object=self.lag)
+        transport = self.transport(ips=[ip_observation("lag-60", "198.18.22.1/25", vrf="", prefix_length=25)])
+        _response, plan = self.preview(transport, {"scope": "ip"})
+
+        self.assertEqual(plan.blockers, [])
+        self.assertEqual(
+            [(step.action, step.detail) for step in self.changes(plan)],
+            [("modify", "198.18.22.1/24 -> 198.18.22.1/25")],
+        )
+        self.confirm(plan, {"scope": "ip"})
+        native.refresh_from_db()
+        self.assertEqual(str(native.address), "198.18.22.1/25")
+
     def test_device_prefix_length_outside_the_address_family_is_blocked(self):
         self.interface("lo0.0")
         native = IPAddress.objects.create(address="198.18.20.1/24", assigned_object=self.lag)

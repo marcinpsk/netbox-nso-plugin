@@ -300,7 +300,8 @@ class _IPContext:
 
     def native(self, identity):
         interface, host, _prefix_length, vrf = identity
-        matches = self.natives[(interface, host, vrf)]
+        # The adapter reports the global table as "", the native key uses None.
+        matches = self.natives[(interface, host, vrf or None)]
         return matches[0] if len(matches) == 1 else None
 
 
