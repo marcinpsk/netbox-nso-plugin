@@ -75,7 +75,7 @@ PRODUCERS = {
     ("views.py", "NSOLACPBundleStateAcceptView.post"): ("accept", 4),
     ("views.py", "_switchport_accept_plan"): ("accept", 2),
     ("views.py", "_ip_edit_plan_and_operations"): ("operator_edit", 2),
-    ("views.py", "NSOInterfaceIPStateAcceptView.post"): ("accept", 1),
+    ("views.py", "NSOInterfaceIPStateAcceptView.post"): ("accept", 2),
     ("views.py", "NSOStaticRouteStateAcceptView._arm_accept"): ("accept", 1),
     ("views.py", "NSOBGPPeerTemplateStateAcceptView.post"): ("accept", 2),
     ("views.py", "NSORoutePolicyStateAcceptView.post"): ("accept", 2),

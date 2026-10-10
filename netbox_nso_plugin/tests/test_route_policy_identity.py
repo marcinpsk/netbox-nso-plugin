@@ -31,6 +31,7 @@ from netbox_nso_plugin import shared_object_ownership as ownership
 from netbox_nso_plugin.deployment import is_quiesced, resume
 from netbox_nso_plugin.intent_state import offline_mutation, route_policy_footprint
 from netbox_nso_plugin.models import (
+    NSOFamilyObservation,
     NSOIntentOutboxEntry,
     NSOIntentRevision,
     NSORoutePolicyObjectClass,
@@ -44,6 +45,7 @@ from netbox_nso_plugin.signals import route_policy_intent_item, suppress_intent_
 from ._adapter_http import make_response
 from ._outbox_case import ReceiptAdapter, content_update, make_managed, own_route, without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._routing_observation_case import route_policy_document, routing_observation
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_read_gate import _rs
 
@@ -56,7 +58,15 @@ class _PolicyAdapter(ReceiptAdapter):
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith("/route-policy"):
             device_id = int(url.split("/devices/")[1].split("/")[0])
-            return make_response(200, self.captures[device_id])
+            payload = copy.deepcopy(self.captures[device_id])
+            state = payload["read_state"]
+            payload["observation"] = routing_observation(
+                "route_policy",
+                document=route_policy_document(payload),
+                revision=state["payload_revision"],
+                source_epoch=state["source_epoch"],
+            )
+            return make_response(200, payload)
         return super()._handle(method, url, **kwargs)
 
 
@@ -166,6 +176,10 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
         with config, session:
             context = reconcile_category(self.device_a, self.mgmt_a, "route_policy")
         self.assertEqual(context["_gate"]["route_policy"], "ran")
+        observed = NSOFamilyObservation.objects.get(
+            read_state__management=self.mgmt_a, read_state__family="route_policy"
+        ).document
+        self.assertEqual({policy["name"] for policy in observed["route_maps"]}, {"accept-all", "ACCEPT-ALL"})
         self.assertEqual(len(context["route_policy_states"]), 4)
         self.assertEqual(set(RouteMap.objects.values_list("name", flat=True)), {"accept-all", "ACCEPT-ALL"})
         self.assertEqual(set(PrefixList.objects.values_list("name", flat=True)), {"BGP_PEERS_V6", "BGP_PEERS_v6"})

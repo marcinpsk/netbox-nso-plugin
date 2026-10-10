@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Authorize and render the read-only Differences panel through real Django views."""
 
-import json
 from uuid import uuid4
 
 from core.models import ObjectType
@@ -118,15 +117,41 @@ class TestDeviceDifferencesView(TestCase):
     def test_post_is_refused(self):
         self.assertEqual(self.client.post(self.url).status_code, 405)
 
-    def test_unsupported_scopes_collapse_into_one_line_and_ip_identity_is_readable(self):
+    def test_service_null_value_and_unsupported_sync_are_visible(self):
+        from ._scope_observation_case import entry, scope_observation
+
+        self.user = get_user_model().objects.create_superuser(username=f"service{uuid4().hex[:8]}")
+        self.client.force_login(self.user)
+        observed = scope_observation(
+            "logging",
+            document={
+                "hosts": [
+                    entry(address="198.18.0.1", port=None, severity="", facility="", transport="", vrf="", source="")
+                ],
+                "local_levels": None,
+                "present": ["hosts", "local_levels"],
+                "unprojectable": [],
+            },
+        )
+        state = NSOFamilyReadState.objects.create(management=self.management, family="logging")
+        NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("logging", 1, 1, observed))
+        response = self.client.get(self.url, {"scope": "logging"})
+        self.assertContains(response, "port: null")
+        self.assertContains(response, "sync not supported yet")
+        self.assertNotContains(response, "#1790")
+
+    def test_all_scopes_are_compared_and_ip_identity_is_readable(self):
+        from netbox_nso_plugin.ownership_planner import converted_scope_rules
+
         from ._observation_case import ip_observation
 
         state = NSOFamilyReadState.objects.create(management=self.management, family="interface_ip")
         snapshot = observation("interface_ip", interfaces=[ip_observation("Ethernet2", vrf="example-vrf")])
         NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("interface_ip", 1, 1, snapshot))
         response = self.client.get(self.url)
-        self.assertContains(response, "Not compared yet: ", count=1)
-        self.assertNotContains(response, "not supported yet")
+        self.assertNotContains(response, "Not compared yet:")
+        self.assertEqual(set(response.context["scopes"]), set(converted_scope_rules()))
+        self.assertContains(response, "no successful read yet")
         self.assertContains(response, "Ethernet2 198.18.0.1/24 (VRF example-vrf)")
         self.assertNotContains(response, "&#x27;Ethernet2&#x27;")
 
@@ -280,8 +305,7 @@ class TestDeviceDifferencesView(TestCase):
         self.assertEqual((row["kind"], row["reason"]), ("ambiguous", "NetBox object is not visible to you"))
         self.assertNotContains(response, "non-unique VRF name")
         self.assertEqual(row["identity"], "lag-60 198.18.0.9/24")
-        self.assertEqual(json.loads(row["device_value"])["vrf"], None)
-        self.assertEqual(json.loads(row["device_value"])["address"], "198.18.0.9/24")
+        self.assertEqual(row["device_value"], "198.18.0.9/24")
 
     def test_visible_ip_in_a_hidden_vrf_is_not_visible_and_never_names_the_vrf(self):
         from ipam.models import VRF
@@ -335,3 +359,108 @@ class TestDeviceDifferencesView(TestCase):
         response = self.client.get(self.url, {"scope": "ip"})
         (row,) = self._scope_rows(response, "ip")
         self.assertEqual((row["kind"], row["identity"]), ("netbox_only", "lag-60 198.18.0.9/24"))
+
+    def test_present_values_render_readably_without_raw_json(self):
+        from ._observation_case import ip_observation
+
+        native = self._assigned_ip("198.18.0.9/24")
+        self._grant_view(native)
+        self._ip_snapshot(ip_observation("lag-60", "198.18.0.20/32", prefix_length=32, vrf="example-vrf"))
+        response = self.client.get(self.url)
+        rows = {(row["scope"], row["kind"], row["identity"]): row for row in response.context["page_obj"]}
+
+        self.assertEqual(
+            rows[("interface", "device_only", "Ethernet2")]["device_value"],
+            'description: "device description"; enabled: true',
+        )
+        self.assertEqual(rows[("interface", "netbox_only", "lag-60")]["netbox_value"], 'description: ""')
+        self.assertEqual(rows[("ip", "netbox_only", "lag-60 198.18.0.9/24")]["netbox_value"], "198.18.0.9/24 on lag-60")
+        self.assertEqual(
+            rows[("ip", "device_only", "lag-60 198.18.0.20/32 (VRF example-vrf)")]["device_value"],
+            "198.18.0.20/32 on lag-60 (VRF example-vrf)",
+        )
+        self.assertEqual(
+            rows[("ip", "device_only", "lag-60 198.18.0.20/32 (VRF example-vrf)")]["netbox_value"], "missing"
+        )
+        values = [row[side] for row in response.context["page_obj"] for side in ("netbox_value", "device_value")]
+        self.assertFalse([value for value in values if "{" in value or "}" in value])
+        self.assertNotContains(response, "encap_tag")
+        self.assertNotContains(response, "prefix_length")
+
+    def test_hidden_service_name_is_redacted_in_missing_sap_coverage(self):
+        from netbox_nso_plugin.models import NSOL2SapState
+
+        from ._scope_observation_case import entry, scope_observation
+
+        NSOL2SapState.objects.create(
+            management=self.management,
+            service_name="hidden-service",
+            service_type="epipe",
+            service_id=100,
+            sap_id="hidden-sap",
+            port="Ethernet1",
+            outer_tag=100,
+        )
+        observed = scope_observation(
+            "l2_service",
+            document={
+                "present": ["services"],
+                "unprojectable": [],
+                "services": [entry(service_name="hidden-service", service_type="epipe", service_id=100)],
+            },
+        )
+        state = NSOFamilyReadState.objects.create(management=self.management, family="l2_service")
+        NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("l2_service", 1, 1, observed))
+        response = self.client.get(self.url, {"scope": "l2_sap"})
+        self.assertContains(response, "not visible")
+        self.assertNotContains(response, "hidden-service")
+        self.assertNotContains(response, "hidden-sap")
+
+    def test_hidden_invalid_service_is_redacted_in_missing_sap_coverage(self):
+        from netbox_nso_plugin.models import NSOL2SapState
+
+        from ._scope_observation_case import entry, scope_observation
+
+        NSOL2SapState.objects.create(
+            management=self.management,
+            service_name="hidden-invalid-service",
+            service_type="unsupported",
+            sap_id="hidden-invalid-sap",
+            port="Ethernet1",
+        )
+        observed = scope_observation(
+            "l2_service",
+            document={
+                "present": ["services"],
+                "unprojectable": [],
+                "services": [entry(service_name="hidden-invalid-service", service_type="epipe", service_id=100)],
+            },
+        )
+        state = NSOFamilyReadState.objects.create(management=self.management, family="l2_service")
+        NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("l2_service", 1, 1, observed))
+        response = self.client.get(self.url, {"scope": "l2_sap"})
+        self.assertContains(response, "not visible")
+        self.assertNotContains(response, "hidden-invalid-service")
+        self.assertNotContains(response, "hidden-invalid-sap")
+
+    def test_hidden_bundle_name_is_redacted_in_missing_member_coverage(self):
+        from dcim.models import Interface
+
+        from ._scope_observation_case import entry, scope_observation
+
+        Interface.objects.create(device=self.device, name="hidden-bundle", type="lag")
+        self.user = self._viewer(interfaces=False)
+        self.client.force_login(self.user)
+        observed = scope_observation(
+            "lag_config",
+            document={
+                "present": ["bundles"],
+                "unprojectable": [],
+                "bundles": [entry(name="hidden-bundle", lag_id=1)],
+            },
+        )
+        state = NSOFamilyReadState.objects.create(management=self.management, family="lag_config")
+        NSOFamilyObservation.objects.create(read_state=state, **observation_defaults("lag_config", 1, 1, observed))
+        response = self.client.get(self.url, {"scope": "lacp"})
+        self.assertContains(response, "not visible")
+        self.assertNotContains(response, "hidden-bundle")

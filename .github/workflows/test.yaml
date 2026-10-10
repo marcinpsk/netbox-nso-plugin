@@ -30,13 +30,11 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
+        # One lane: the Python of the official NetBox v4.7.2 image (and of NetBox's own coverage job).
         environment: &netbox-environments
-          - python-version: "3.12"
-            netbox-version: &netbox-version "v4.7.0"
-            netbox-ref: &netbox-ref "5f06007e4c9bacc93ce17c1e645fc1143d60df3d"
-          - python-version: "3.13"
-            netbox-version: *netbox-version
-            netbox-ref: *netbox-ref
+          - python-version: "3.14"
+            netbox-version: "v4.7.2"
+            netbox-ref: "251458b89a5eb2f5fe0d20ecd1140ba08f141a9c"
         shard: [1, 2, 3]
 
     services:
@@ -354,7 +352,7 @@ jobs:
         run: >-
           uv run -- pytest
           -c /dev/null --rootdir=.
-          contract_tests/test_live_adapter_contract.py
+          contract_tests/
           --quiet
 
       - name: Show adapter logs on failure

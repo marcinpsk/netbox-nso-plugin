@@ -23,12 +23,14 @@ keywords = [
     "networking",
 ]
 dependencies = [
+    "jsonschema>=4.26.0,<5",
     "requests>=2.34.2",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Framework :: Django",
     "Environment :: Plugins",
     "Topic :: System :: Networking",
@@ -42,7 +44,7 @@ Issues = "https://github.com/marcinpsk/netbox-nso-plugin/issues"
 include = ["netbox_nso_plugin*"]
 
 [tool.setuptools.package-data]
-netbox_nso_plugin = ["templates/**/*", "static/**/*"]
+netbox_nso_plugin = ["templates/**/*", "static/**/*", "schemas/*.json"]
 
 [tool.semantic_release]
 allow_zero_version = true

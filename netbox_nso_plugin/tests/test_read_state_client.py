@@ -136,6 +136,17 @@ class TestReadStatePassthrough(unittest.TestCase):
         )
         self.assertEqual(out.get("read_state"), _READ_STATE)
 
+    def test_isis_rebuilder_keeps_observation(self):
+        from ._routing_observation_case import routing_observation
+
+        observed = routing_observation("isis")
+        out = self._fetch(
+            "get_isis_interfaces",
+            {"device_id": 9, "read_state": _READ_STATE, "processes": [], "interfaces": [], "observation": observed},
+            9,
+        )
+        self.assertEqual(out.get("observation"), observed)
+
     def test_isis_rebuilder_rejects_non_object_bodies(self):
         from netbox_nso_plugin import adapter_client
 
@@ -170,6 +181,20 @@ class TestReadStatePassthrough(unittest.TestCase):
                 with self.assertRaises(adapter_client.AdapterError) as raised:
                     self._fetch("get_bfd", body, 9, raw=True)
                 self.assertEqual(raised.exception.code, "invalid_response")
+
+    def test_observation_survives_shape_rebuilders(self):
+        from ._scope_observation_case import scope_observation
+
+        for family, fetcher, collection in (
+            ("bfd", "get_bfd", "interfaces"),
+            ("l2_service", "get_l2_services", "services"),
+        ):
+            with self.subTest(family=family):
+                observed = scope_observation(family)
+                payload = {"device_id": 9, "read_state": _READ_STATE, collection: [], "observation": observed}
+                result = self._fetch(fetcher, payload, 9)
+                self.assertEqual(result.get("observation"), observed)
+                self.assertEqual(result["read_state"], _READ_STATE)
 
     def test_passthrough_fetcher_keeps_read_state(self):
         out = self._fetch("get_static_routes", {"device_id": 9, "read_state": _READ_STATE, "routes": []}, 9)

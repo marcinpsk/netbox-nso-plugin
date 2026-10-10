@@ -48,7 +48,7 @@ def test_authoritative_empty_is_valid_and_has_an_aware_timestamp():
         ("digest", "A" * 64),
         ("observed_at", "2026-10-01T12:00:00"),
         ("observed_at", "invalid"),
-        ("coverage", {"attributes": ["enabled", "description"]}),
+        ("coverage", {"attributes": [False]}),
         ("revision", True),
         ("document", None),
         ("document", {"interfaces": [{"name": None}], "unprojectable": []}),

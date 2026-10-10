@@ -700,7 +700,9 @@ rules:
   - id: nso-differences-unrestricted-netbox-query
     languages: [python]
     severity: ERROR
-    message: The Differences panel uses only rows the user can view. Query this model through .restrict(user, "view").
+    message: >-
+      The Differences panel and Sync from NSO use only rows the user may see or change. Query this model through
+      .restrict(user, action).
     patterns:
       - pattern: $MODEL.objects.$METHOD(...)
       - metavariable-regex:
@@ -710,4 +712,4 @@ rules:
           metavariable: $METHOD
           regex: ^(?!restrict$)
     paths:
-      include: ["netbox_nso_plugin/device_differences.py"]
+      include: ["netbox_nso_plugin/device_differences.py", "netbox_nso_plugin/device_sync.py"]

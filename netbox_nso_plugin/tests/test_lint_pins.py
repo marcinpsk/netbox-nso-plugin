@@ -41,6 +41,18 @@ def test_packaging_is_a_direct_test_dependency():
     assert any(Requirement(dependency).name.casefold() == "packaging" for dependency in dependencies)
 
 
+def test_runtime_dependencies_are_ranges_not_exact_pins():
+    # The plugin installs into NetBox's environment, which pins its own versions; uv.lock holds the exact ones.
+    dependencies = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    pinned = [
+        dependency
+        for dependency in dependencies
+        if any(spec.operator in {"==", "==="} for spec in Requirement(dependency).specifier)
+    ]
+
+    assert not pinned, f"exact runtime pins conflict with NetBox's own requirements: {pinned}"
+
+
 def _workflow_tool_commands(tool: str) -> list[list[str]]:
     workflow_text = WORKFLOW.read_text(encoding="utf-8")
     assert not re.search(rf"(?<![\w-]){tool}==", workflow_text), f"the lint workflow hardcodes a {tool} version"

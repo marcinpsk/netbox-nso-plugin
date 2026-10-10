@@ -1017,6 +1017,8 @@ def get_isis_interfaces(adapter_device_id: int) -> dict:
     out = {"processes": data.get("processes", []), "interfaces": data.get("interfaces", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
+    if "observation" in data:
+        out["observation"] = data["observation"]
     return out
 
 
@@ -1031,6 +1033,8 @@ def get_l2_services(adapter_device_id: int) -> dict:
     out = {"services": data.get("services", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
+    if "observation" in data:
+        out["observation"] = data["observation"]
     return out
 
 
@@ -1045,6 +1049,8 @@ def get_bfd(adapter_device_id: int) -> dict:
     out = {"interfaces": data.get("interfaces", [])}
     if "read_state" in data:
         out["read_state"] = data["read_state"]
+    if "observation" in data:
+        out["observation"] = data["observation"]
     return out
 
 
