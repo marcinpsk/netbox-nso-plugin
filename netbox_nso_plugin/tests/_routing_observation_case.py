@@ -325,6 +325,22 @@ COVERAGE = {
 }
 
 
+def route_policy_document(payload):
+    """The canonical route-policy document for the policies a route-policy read payload carries."""
+    keys = ["as_paths", "community_lists", "prefix_lists", "route_maps"]
+    document = {"present": keys, "unprojectable": []}
+    for key in keys:
+        # The adapter always returns all four lists, so a list the test payload omits is empty.
+        document[key] = [
+            entry(
+                **{name: value for name, value in policy.items() if name != "entries"},
+                entry=[entry(**values) for values in policy["entries"]],
+            )
+            for policy in payload.get(key, [])
+        ]
+    return document
+
+
 def routing_observation(family, *, document=None, coverage=None, revision=1, source_epoch=1):
     document = copy.deepcopy(DOCUMENTS[family] if document is None else document)
     if coverage is None:
