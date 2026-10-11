@@ -85,7 +85,7 @@ dev = [
     "build",
     "packaging",
     "reuse",
-    "ruff==0.16.9",
+    "ruff==0.16.10",
     "pre-commit",
     "pytest",
     "pytest-django",
