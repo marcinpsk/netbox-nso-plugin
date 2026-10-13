@@ -1057,7 +1057,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if value not in seen:
                 self.operations.delete(row)
 
-    def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: PLR0915
+    def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: C901, PLR0915
         from . import status_machine as sm
 
         address = entry["peer_address"]
@@ -1106,11 +1106,6 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.peer_state_raw_keys,
         )
         state.bgp_peer = peer
-        state.remote_as_str, state.enabled = (
-            (str(entry.get("remote_as") or ""), entry.get("enabled"))
-            if not sm.is_owned(state.status)
-            else (state.remote_as_str, state.enabled)
-        )
         state.last_sync_at = self.planned_at
         device_hash = _content_hash(
             _peer_device_content(
@@ -1156,6 +1151,9 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.plan_address_family_rows(peer, af_entries, scope)
         elif peer_ip_changed:
             self.save(peer, update_fields=("peer",))
+        if mirror or not sm.is_owned(state.status):
+            state.remote_as_str = str(entry.get("remote_as") or "")
+            state.enabled = entry.get("enabled")
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         self.peer_states[state_key] = state
         self.seen_peers.add(state_key)
