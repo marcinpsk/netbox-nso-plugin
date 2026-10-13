@@ -17,6 +17,28 @@ from ._adapter_http import make_response, make_transport_session
 class TestApplyPreviewHTTP(blocked.BlockedRemovalTestBase):
     """External HTTP is the only substituted boundary."""
 
+    def test_preview_respects_constrained_device_view_permission(self):
+        from core.models import ObjectType
+        from dcim.models import Device
+        from django.urls import reverse
+        from users.models import ObjectPermission, User
+
+        from ._outbox_case import make_device
+
+        other = make_device("preview-hidden")
+        user = User.objects.create_user("preview-viewer")
+        permission = ObjectPermission.objects.create(
+            name="View one preview device", actions=["view"], constraints={"pk": self.device.pk}
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(Device))
+        permission.users.add(user)
+        self.client.force_login(user)
+        self.assertEqual(
+            self.client.get(reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[other.pk])).status_code,
+            404,
+        )
+        self._get_preview(_preview())
+
     def _get_preview(self, payload, *, outformat="native", error=None):
         from django.urls import reverse
 

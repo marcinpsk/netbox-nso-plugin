@@ -6173,7 +6173,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         """Return {auto_apply, changes:[{interface, attribute, device, netbox}], routing}."""
         from django.http import JsonResponse
 
-        device = get_object_or_404(Device, pk=device_pk)
+        device = get_object_or_404(Device.objects.restrict(request.user, "view"), pk=device_pk)
         mgmt = getattr(device, "nso_management", None)
         auto_apply = bool(mgmt and mgmt.auto_apply)
 
