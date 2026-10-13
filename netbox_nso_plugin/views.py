@@ -8459,15 +8459,28 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
                 references=(("assigned_object_id", peer),),
             )
         if new_router:
-            router_state = NSOBGPRouterState(
-                management=management,
-                asn_str=str(data["local_asn"].asn),
-                bgp_router=router,
-                router_id=str(router.router_id or ""),
-                status="accepted",
-                accepted_at=planned_at,
-            )
-            save(router_state, force_insert=True, natural_key=("management", "asn_str"))
+            current_router_state = NSOBGPRouterState.objects.filter(
+                management=management, asn_str=str(data["local_asn"].asn)
+            ).first()
+            if current_router_state is None:
+                router_state = NSOBGPRouterState(
+                    management=management,
+                    asn_str=str(data["local_asn"].asn),
+                    bgp_router=router,
+                    router_id=str(router.router_id or ""),
+                    status="accepted",
+                    accepted_at=planned_at,
+                )
+                save(router_state, force_insert=True, natural_key=("management", "asn_str"))
+            else:
+                if is_owned(current_router_state.status):
+                    raise ValueError("Resolve the existing BGP router state for this ASN before adding a peer.")
+                router_state = copy.copy(current_router_state)
+                router_state.bgp_router = router
+                router_state.router_id = str(router.router_id or "")
+                router_state.status = "accepted"
+                router_state.accepted_at = planned_at
+                save(router_state)
         state = NSOBGPPeerState(
             management=management,
             asn_str=str(data["local_asn"].asn),

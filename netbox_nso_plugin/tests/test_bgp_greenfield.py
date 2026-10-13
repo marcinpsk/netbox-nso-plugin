@@ -472,6 +472,85 @@ class TestBgpPeerAddView(BgpGreenfieldBase):
 
         self.client.force_login(User.objects.create_user("bgpgfadmin", is_superuser=True))
 
+    def test_add_peer_reuses_retained_unowned_router_state(self):
+        from netbox_nso_plugin.models import NSOBGPRouterState
+
+        mgmt = self._mgmt()
+        state = NSOBGPRouterState.objects.create(
+            management=mgmt, asn_str=str(self.asn.asn), router_id="198.18.0.1", status="imported"
+        )
+        ip = self._ip("198.18.0.7/32")
+        self._login_superuser()
+        url = reverse("plugins:netbox_nso_plugin:bgp_peer_add", kwargs={"device_pk": self.device.pk})
+        with (
+            patch("netbox_nso_plugin.adapter_client.put_bgp_intent"),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            response = self.client.post(
+                url,
+                {
+                    "local_asn": self.asn.pk,
+                    "peer": ip.pk,
+                    "remote_as": self.remote_asn.pk,
+                    "address_families": ["ipv4-unicast"],
+                    "enabled": "on",
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        peer = BGPPeer.objects.get(peer=ip)
+        self.assertEqual(state.bgp_router_id, peer.scope.router_id)
+        self.assertEqual(state.router_id, str(peer.scope.router.router_id or ""))
+        self.assertEqual(state.status, "accepted")
+        self.assertIsNotNone(state.accepted_at)
+        self.assertEqual(NSOBGPRouterState.objects.filter(management=mgmt, asn_str=str(self.asn.asn)).count(), 1)
+
+    def test_add_peer_refuses_retained_owned_router_state(self):
+        from netbox_routing.models import BGPAddressFamily, BGPPeerAddressFamily
+
+        from netbox_nso_plugin.models import NSOBGPRouterState
+
+        mgmt = self._mgmt()
+        router = self._router()
+        state = acquire_bgp_router(mgmt, router)
+        with without_commit_drain():
+            router.delete()
+        state.refresh_from_db()
+        self.assertIsNone(state.bgp_router_id)
+        self.assertEqual(state.status, "accepted")
+        ip = self._ip("198.18.0.8/32")
+        self._login_superuser()
+        models = (
+            BGPRouter,
+            BGPScope,
+            BGPPeer,
+            BGPAddressFamily,
+            BGPPeerAddressFamily,
+            NSOBGPRouterState,
+            NSOBGPPeerState,
+        )
+        before = [model.objects.count() for model in models]
+        url = reverse("plugins:netbox_nso_plugin:bgp_peer_add", kwargs={"device_pk": self.device.pk})
+        response = self.client.post(
+            url,
+            {
+                "local_asn": self.asn.pk,
+                "peer": ip.pk,
+                "remote_as": self.remote_asn.pk,
+                "address_families": ["ipv4-unicast"],
+                "enabled": "on",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.context["form"].non_field_errors(),
+            ["Resolve the existing BGP router state for this ASN before adding a peer."],
+        )
+        self.assertEqual([model.objects.count() for model in models], before)
+        state.refresh_from_db()
+        self.assertIsNone(state.bgp_router_id)
+        self.assertEqual(state.status, "accepted")
+
     def test_add_peer_builds_graph_owns_and_pushes(self):
         mgmt = self._mgmt()
         ip = self._ip("10.0.0.7/32")
