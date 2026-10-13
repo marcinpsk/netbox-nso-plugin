@@ -828,8 +828,8 @@ def _require_qualifying_acquisition(instance, binding, acquisition, *, signature
         raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
 
 
-def require_qualifying_ownership(instance):
-    """Check a producer's resolved binding before it builds an acquisition plan."""
+def require_qualifying_ownership(instance, *, signatures=None):
+    """Check a producer's resolved binding; ``signatures`` caches device scans across calls."""
     binding = manifest_binding(instance)
     if binding is None and instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
         management = _manifest_management(instance)
@@ -837,8 +837,18 @@ def require_qualifying_ownership(instance):
             "Link the BGP router to its matching native device and ASN before accepting it.",
             device_id=management.device_id if management is not None else None,
         )
-    if binding is not None:
-        _require_qualifying_acquisition(instance, binding, True)
+    if binding is None:
+        return
+    rule, scope, device_id, *_identity = binding
+    qualifying = None
+    if signatures is not None and rule.qualification == "native_binding":
+        key = (device_id, scope)
+        if key not in signatures:
+            signatures[key] = _qualifying_overlay_signatures(
+                device_id, frozenset({scope}), management=_manifest_management(instance)
+            )
+        qualifying = signatures[key]
+    _require_qualifying_acquisition(instance, binding, True, signatures=qualifying)
 
 
 def require_router_acquisition_observation(instance):
@@ -853,13 +863,18 @@ def require_router_acquisition_observation(instance):
     ).first()
     if snapshot is None:
         return
-    names = {
-        scope["vrf"]
-        for router in snapshot.document.get("routers") or ()
-        if canonical_asn(router["asn"]) == instance.asn_str
-        for scope in router.get("scope") or ()
-        if scope.get("vrf")
-    }
+    try:
+        routers = [
+            router
+            for router in snapshot.document.get("routers") or ()
+            if canonical_asn(router.get("asn")) == instance.asn_str
+        ]
+    except ValueError as exc:
+        raise OwnershipNotQualified(
+            "The observed BGP router ASN is invalid. Refresh BGP before accepting it.",
+            device_id=instance.management.device_id,
+        ) from exc
+    names = {scope["vrf"] for router in routers for scope in router.get("scope") or () if scope.get("vrf")}
     matches = Counter(VRF.objects.filter(name__in=names).values_list("name", flat=True))
     if any(matches[name] != 1 for name in names):
         raise OwnershipNotQualified(

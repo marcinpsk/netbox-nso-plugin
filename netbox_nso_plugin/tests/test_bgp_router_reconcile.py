@@ -314,3 +314,23 @@ def test_router_content_canonicalizes_scope_afs_and_clearing(router_case):
         )["routers"][0]
     )
     assert observed_router_content(entry) == content
+
+
+def test_unqualified_owned_router_still_marks_reported_peers_seen(router_case):
+    from ipam.models import ASN
+
+    from netbox_nso_plugin.models import NSOBGPPeerState
+
+    _device, management = router_case
+    state, _ = import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
+    peer = NSOBGPPeerState.objects.get(management=management, peer_address_str="192.0.2.1")
+    assert peer.bgp_peer_id is not None
+    with without_commit_drain():
+        state = content_update(state, status="in_sync")
+        peer = content_update(peer, status="in_sync")
+        router = state.bgp_router
+        router.asn = ASN.objects.create(asn=64999, rir=router.asn.rir)
+        router.save()
+    import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
+    peer.refresh_from_db()
+    assert peer.status == "in_sync"

@@ -209,3 +209,22 @@ class TestBgpRouterOwnership(TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
         self.assertTrue(BGPScope.objects.filter(pk=self.scope.pk).exists())
+
+    def test_router_accept_refuses_malformed_observed_asn(self):
+        from django.contrib.messages import get_messages
+        from django.urls import reverse
+
+        state = self.router_model().objects.create(
+            management=self.management, bgp_router=self.router, asn_str="64512", status="imported"
+        )
+        self.publish()
+        observation = NSOFamilyObservation.objects.get(read_state__management=self.management, read_state__family="bgp")
+        observation.document["routers"].append(entry(asn="not-an-asn"))
+        observation.save(update_fields=("document",))
+        self.client.force_login(self.user)
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:routing_accept_bgp_router", args=(state.pk,)))
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        [message] = [str(message) for message in get_messages(response.wsgi_request)]
+        self.assertTrue(message.endswith(": The observed BGP router ASN is invalid. Refresh BGP before accepting it."))

@@ -60,6 +60,14 @@ def redistribution_reconcile_plan(device, payload):
     return replace(plan, lock_footprint=lock_footprint)
 
 
+def bgp_destination_parts(dest_ref):
+    """Split a BGP destination reference ``<asn>/<vrf>/<af>``; a VRF name with ``/`` is not representable."""
+    parts = (dest_ref or "").split("/")
+    if len(parts) != 3:
+        raise ValueError("BGP redistribution has an invalid destination identity.")
+    return tuple(parts)
+
+
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     """Resolve the native destination object for one redistribution entry."""
     from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, ISISInstance, OSPFInstance
@@ -79,10 +87,10 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     from django.contrib.contenttypes.models import ContentType
     from ipam.models import ASN, VRF
 
-    parts = (dest_ref or "").split("/")
-    if len(parts) != 3:
+    try:
+        asn_value, vrf_name, address_family = bgp_destination_parts(dest_ref)
+    except ValueError:
         return None
-    asn_value, vrf_name, address_family = parts
     try:
         asn = ASN.objects.filter(asn=int(asn_value)).first()
     except (TypeError, ValueError):

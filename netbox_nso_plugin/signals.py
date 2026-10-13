@@ -2817,11 +2817,10 @@ def _bgp_child_scope(entries, asn, vrf, afs=()):
 
 
 def _bgp_redistribution_members(entries, device_id):
+    from .redistribution_reconciler import bgp_destination_parts
+
     for dest_ref, redist in _collect_redistribution_by_dest_ref(device_id, "bgp").items():
-        parts = dest_ref.split("/", 2)
-        if len(parts) != 3:
-            raise ValueError("BGP redistribution has an invalid destination identity.")
-        asn, vrf, af_name = parts
+        asn, vrf, af_name = bgp_destination_parts(dest_ref)
         scope = _bgp_child_scope(entries, asn, vrf, (af_name,))
         af = next(af for af in scope["address_families"] if af["af"] == af_name)
         af["redistribution"] = redist
@@ -2844,6 +2843,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         .prefetch_related(Prefetch("bgp_peer__address_families", queryset=families))
     )
     entries, blocked = _bgp_owned_router_entries(device_id)
+    signatures = {}
     if blocked is None:
         for row in peers:
             if row.bgp_peer_id is None:
@@ -2859,7 +2859,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
                 }
                 break
             try:
-                require_qualifying_ownership(row)
+                require_qualifying_ownership(row, signatures=signatures)
                 afs = [bgp_peer_address_family_intent_item(af) for af in row.bgp_peer.address_families.all()]
                 scope = _bgp_child_scope(entries, row.asn_str, row.vrf_name or "", (af["af"] for af in afs))
                 scope["peers"].append(bgp_peer_intent_item(row, afs))

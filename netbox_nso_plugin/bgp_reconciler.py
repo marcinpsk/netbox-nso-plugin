@@ -1244,12 +1244,21 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         for router_entry, asn_str, asn in valid_routers:
             router, owned, mirror = self.reconcile_router(router_entry, asn_str, asn)
             if router is None:
+                self.observe_router_children(router_entry, asn_str)
                 continue
             self.reconcile_router_children(router, router_entry, asn_str, owned, mirror, reported_templates)
         for name in sorted(reported_templates, key=str.casefold):
             self.reconcile_template(*reported_templates[name])
         self.plan_stale_states()
         return self.operations
+
+    def observe_router_children(self, router_entry, asn_str):
+        """Record the reported children of an unusable router without native writes."""
+        for scope_entry in sorted(router_entry["scopes"], key=lambda row: row["vrf"]):
+            for entry in self.peer_entries_by_scope.get(id(scope_entry), ()):
+                self.reconcile_observed_peer(entry, asn_str, scope_entry["vrf"])
+            for entry in sorted(scope_entry["peer_groups"], key=lambda row: row["name"].casefold()):
+                self.reconcile_observed_template(entry)
 
     def reconcile_router_children(self, router, router_entry, asn_str, owned, mirror, reported_templates):
         for scope_entry in sorted(router_entry["scopes"], key=lambda row: row["vrf"]):

@@ -533,6 +533,9 @@ class TestBgpPeerAddView(BgpGreenfieldBase):
         resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.context["form"].fields["local_asn"].initial, self.asn.pk)
+        self.assertIn(
+            "The next <strong>Apply</strong> writes the change to the device.", " ".join(resp.content.decode().split())
+        )
 
     def test_add_peer_requires_permission(self):
         """An authenticated user without change_nsodevicemanagement is denied (403)."""

@@ -314,3 +314,56 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(response.status_code, 403)
         state.refresh_from_db()
         self.assertIsNone(state.accepted_at)
+
+    def owned_peer(self, address):
+        peer = BGPPeer.objects.create(
+            scope=self.scope, peer=IPAddress.objects.create(address=f"{address}/32"), name=None
+        )
+        return acquire_overlay(
+            NSOBGPPeerState,
+            management=self.management,
+            asn_str="65123",
+            vrf_name="",
+            peer_address_str=address,
+            bgp_peer=peer,
+            status="accepted",
+        )
+
+    def router_reads(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as queries:
+            self.payload()
+        return sum('FROM "netbox_routing_bgprouter"' in query["sql"] for query in queries.captured_queries)
+
+    def test_peer_qualification_reads_routers_once_per_render(self):
+        with without_commit_drain():
+            self.router_state(owned=True)
+            self.owned_peer("198.18.0.2")
+        single = self.router_reads()
+        with without_commit_drain():
+            self.owned_peer("198.18.0.3")
+            self.owned_peer("198.18.0.4")
+        self.assertEqual(self.router_reads(), single)
+
+    def test_redistribution_reference_with_slash_vrf_is_rejected_as_invalid(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        vrf = VRF.objects.create(name="placeholder/blue")
+        scope = BGPScope.objects.create(router=self.router, vrf=vrf)
+        BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+        with without_commit_drain():
+            self.router_state(owned=True)
+            acquire_overlay(
+                NSORedistributionState,
+                management=self.management,
+                dest_protocol="bgp",
+                dest_ref="65123/placeholder/blue/ipv4-unicast",
+                source_protocol="connected",
+                source_ref="",
+                status="accepted",
+            )
+        blocked = self.payload()["blocked"]
+        self.assertEqual(blocked["detail"]["reason"], "blocked_bgp_router")
+        self.assertEqual(blocked["message"], "BGP redistribution has an invalid destination identity.")
