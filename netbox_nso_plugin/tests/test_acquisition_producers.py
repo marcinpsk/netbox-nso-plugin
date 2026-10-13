@@ -63,6 +63,7 @@ PRODUCERS = {
     ("views.py", "_save_owned_redistribution_edit"): ("operator_edit", 2),
     ("views.py", "_save_owned_ospf_edit"): ("operator_edit", 2),
     ("views.py", "_save_owned_isis_edit"): ("operator_edit", 2),
+    ("views.py", "_save_owned_bgp_router_edit"): ("operator_edit", 2),
     ("views.py", "_save_owned_bgp_edit"): ("operator_edit", 2),
     ("views.py", "_save_owned_overlay_only_edit"): ("operator_edit", 2),
     ("views.py", "_save_owned_interface_mtu_edit"): ("operator_edit", 2),
@@ -84,7 +85,7 @@ PRODUCERS = {
     ("views.py", "OverlayStateAcceptMixin._post_with_renderer_writer"): ("accept", 2),
     ("views.py", "NSOInterfaceMtuStateAcceptView._accept"): ("accept", 2),
     ("views.py", "NSORoutePolicyAttachView.post"): ("create", 2),
-    ("views.py", "NSOBgpPeerCreateView._create_peer"): ("create", 1),
+    ("views.py", "NSOBgpPeerCreateView._create_peer"): ("create", 2),
     ("views.py", "NSOVLANAttachView.post"): ("create", 2),
     ("vlan_reconciler.py", "_vlan_repoint_plan"): ("operator_edit_from_view", 2),
 }
@@ -101,9 +102,18 @@ CONTINUATIONS = {
 }
 
 UNRESOLVED_DISPOSITIONS = {
+    ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_router"): (
+        1,
+        "Read transitions update only unowned router rows.",
+    ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_peer"): (1, "Reconcile preserves existing ownership."),
+    ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_observed_peer"): (1, "Reconcile preserves existing ownership."),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_template"): (1, "Reconcile preserves existing ownership."),
-    ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_states"): (2, "Absent rows retain or release ownership."),
+    ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_observed_template"): (
+        1,
+        "Reconcile preserves existing ownership.",
+    ),
+    ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_states"): (4, "Absent rows retain or release ownership."),
     ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_peer_state"): (2, "Absent rows retain or release ownership."),
     ("bgp_reconciler.py", "_BGPGraphPlanner.plan_invalid_peer_state"): (
         2,

@@ -26,7 +26,7 @@ from ._outbox_case import (
     wait_until_postgres_blocks,
     without_commit_drain,
 )
-from ._ownership_case import acquire_overlay, save_overlay_fixture
+from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_STREAMS = {
@@ -2197,6 +2197,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 name="65040",
             )
             scope = BGPScope.objects.create(router=router)
+            acquire_bgp_router(self.mgmt, router, status="in_sync")
             peer_address = IPAddress.objects.create(address="198.18.40.2/32")
             peer = BGPPeer.objects.create(
                 scope=scope,

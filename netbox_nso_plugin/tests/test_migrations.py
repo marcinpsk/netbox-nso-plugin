@@ -14,7 +14,7 @@ import importlib
 from io import StringIO
 
 from django.core.management import call_command
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
@@ -91,6 +91,7 @@ class TestMigrationGraph(SimpleTestCase):
             "nsoapplyexecution",
             "nsoapplyoverlaysnapshot",
             "nsooverlaysettlementfence",
+            "nsobgprouterstate",
         ):
             assert (APP, name) in state.models, f"missing refusal ledger model: {name}"
 
@@ -112,6 +113,7 @@ class TestMigrationsMatchTheModels(TestCase):
             "NSOApplyExecution",
             "NSOApplyOverlaySnapshot",
             "NSOOverlaySettlementFence",
+            "NSOBGPRouterState",
         ):
             self.assertIsNotNone(apps.get_model(APP, name))
 
@@ -150,6 +152,135 @@ class TestRefusalLedgerMigration(_CascadeFlushMixin, TransactionTestCase):
         self.assertIsNone(logging.last_apply_at)
         self.assertIsNone(logging.apply_attempt_id)
         self.assertEqual(logging.last_apply_error, "")
+
+
+class TestBGPRouterMigration(_CascadeFlushMixin, TransactionTestCase):
+    def test_bgp_router_schema_upgrades_from_refusal_ledger(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        from ._outbox_case import make_managed
+
+        _device, management = make_managed("router-ledger-migration", 1767)
+        executor = MigrationExecutor(connection)
+        leaves = executor.loader.graph.leaf_nodes(APP)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
+        parent = (APP, "0034_refusal_settlement_ledger")
+        executor.migrate([parent])
+        old = executor.loader.project_state([parent]).apps
+        attempt = old.get_model(APP, "NSOApplyAttempt").objects.create(management_id=management.pk)
+        peer = old.get_model(APP, "NSOBGPPeerState").objects.create(
+            management_id=management.pk,
+            asn_str="64512",
+            peer_address_str="192.0.2.1",
+            status="accepted",
+            last_apply_error="placeholder old evidence",
+        )
+        selection = old.get_model(APP, "NSOAcceptedSelection").objects.create(
+            management_id=management.pk,
+            mapping_epoch="a" * 64,
+            stream="bgp",
+            source_push_seq=41,
+            plugin_revision=7,
+            request_digest="b" * 64,
+            contributor_manifest=[{"model_label": peer._meta.label_lower, "overlay_pk": peer.pk}],
+        )
+        snapshot_values = {
+            "attempt_id": attempt.pk,
+            "selection_id": selection.pk,
+            "model_label": peer._meta.label_lower,
+            "overlay_pk": peer.pk,
+            "mapping_epoch": "a" * 64,
+            "prior_status": "accepted",
+            "expected_status": "deploying",
+            "content_digest": "c" * 64,
+            "prior_last_apply_error": "placeholder old evidence",
+        }
+        snapshot = old.get_model(APP, "NSOApplyOverlaySnapshot").objects.create(**snapshot_values)
+        fence_values = {
+            "management_id": management.pk,
+            "mapping_epoch": "a" * 64,
+            "model_label": peer._meta.label_lower,
+            "overlay_pk": peer.pk,
+            "current_attempt_id": attempt.pk,
+            "bookkeeping_revision": 7,
+        }
+        fence = old.get_model(APP, "NSOOverlaySettlementFence").objects.create(**fence_values)
+        router_label = f"{APP}.nsobgprouterstate"
+        for name, values in (
+            ("NSOApplyOverlaySnapshot", snapshot_values),
+            ("NSOOverlaySettlementFence", fence_values),
+        ):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                old.get_model(APP, name).objects.create(**(values | {"model_label": router_label}))
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaves)
+        current = executor.loader.project_state(leaves).apps
+        Router = current.get_model(APP, "NSOBGPRouterState")
+        router = Router.objects.create(management_id=management.pk, asn_str="64512")
+        self.assertEqual(router.status, "unknown")
+        self.assertIsNone(router.accepted_at)
+        self.assertIsNone(router.bgp_router_id)
+        self.assertEqual(
+            current.get_model(APP, "NSOBGPPeerState").objects.get(pk=peer.pk).last_apply_error,
+            "placeholder old evidence",
+        )
+        self.assertEqual(
+            current.get_model(APP, "NSOAcceptedSelection").objects.get(pk=selection.pk).contributor_manifest,
+            selection.contributor_manifest,
+        )
+        self.assertEqual(
+            current.get_model(APP, "NSOApplyOverlaySnapshot").objects.get(pk=snapshot.pk).prior_last_apply_error,
+            "placeholder old evidence",
+        )
+        self.assertEqual(
+            current.get_model(APP, "NSOOverlaySettlementFence").objects.get(pk=fence.pk).bookkeeping_revision, 7
+        )
+        for name, values in (
+            ("NSOApplyOverlaySnapshot", snapshot_values),
+            ("NSOOverlaySettlementFence", fence_values),
+        ):
+            row = current.get_model(APP, name).objects.create(
+                **(values | {"model_label": router_label, "overlay_pk": router.pk})
+            )
+            row.refresh_from_db()
+            self.assertEqual(row.model_label, router_label)
+        additions = [name for (app, name) in executor.loader.disk_migrations if app == APP and name > parent[1]]
+        self.assertEqual(len(additions), 1)
+
+    def test_router_label_is_persistable_after_ledger_migration(self):
+        from django.apps import apps
+
+        from ._outbox_case import make_managed
+
+        Router = apps.get_model(APP, "NSOBGPRouterState")
+        _device, management = make_managed("router-label-migration", 1767)
+        from netbox_nso_plugin.intent_state import offline_mutation
+
+        with transaction.atomic(), offline_mutation():
+            router = Router.objects.create(management=management, asn_str="64512")
+        attempt = apps.get_model(APP, "NSOApplyAttempt").objects.create(management=management)
+        snapshot = apps.get_model(APP, "NSOApplyOverlaySnapshot").objects.create(
+            attempt=attempt,
+            model_label=router._meta.label_lower,
+            overlay_pk=router.pk,
+            mapping_epoch="a" * 64,
+            prior_status="imported",
+            expected_status="deploying",
+            content_digest="b" * 64,
+        )
+        fence = apps.get_model(APP, "NSOOverlaySettlementFence").objects.create(
+            management=management,
+            mapping_epoch="a" * 64,
+            model_label=router._meta.label_lower,
+            overlay_pk=router.pk,
+            current_attempt=attempt,
+        )
+        snapshot.refresh_from_db()
+        fence.refresh_from_db()
+        self.assertEqual(snapshot.overlay_pk, router.pk)
+        self.assertEqual(fence.overlay_pk, router.pk)
+        for ledger_row in (snapshot, fence):
+            self.assertIn(router._meta.label_lower, dict(ledger_row._meta.get_field("model_label").choices))
 
 
 class TestDeploymentControlMigration(TestCase):

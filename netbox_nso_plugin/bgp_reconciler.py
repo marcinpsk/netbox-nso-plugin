@@ -162,6 +162,46 @@ def _content_hash(content: dict) -> str:
     return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _bgp_complete_observation(payload):
+    """Require complete collection coverage before changing the native graph or lifecycle."""
+    from types import SimpleNamespace
+
+    from .routing_policy_projection import nested_gaps
+
+    observation = payload.get("observation")
+    if observation is None:
+        return "read_state" not in payload
+    document = observation.get("document") or {}
+    attributes = set((observation.get("coverage") or {}).get("attributes") or ())
+    required = {"asn", "router_id", "scope", "vrf", "address_family", "afi"}
+    return (
+        required <= attributes
+        and "routers" in (document.get("present") or ())
+        and document.get("routers") is not None
+        and not document.get("unprojectable")
+        and all(_bgp_router_fields_present(router) for router in document["routers"])
+        and not nested_gaps("bgp", SimpleNamespace(document=document))
+    )
+
+
+def _bgp_router_fields_present(router):
+    if not {"asn", "router_id"} <= set(router.get("present") or ()) or "router_id" not in router:
+        return False
+    for scope in router.get("scope") or ():
+        if "vrf" not in (scope.get("present") or ()) or not isinstance(scope.get("vrf"), str):
+            return False
+        for family in scope.get("address_family") or ():
+            if "afi" not in (family.get("present") or ()) or not family.get("afi"):
+                return False
+    return True
+
+
+def _router_membership(content):
+    scopes = {scope["vrf"] for scope in content["scopes"]}
+    families = {(scope["vrf"], family["af"]) for scope in content["scopes"] for family in scope["address_families"]}
+    return scopes, families
+
+
 _BGP_SCALAR_FIELDS = {
     "router": {
         "asn": ((str,), True, "asn"),
@@ -551,10 +591,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         )
 
         from .intent_state import route_policy_footprint
-        from .models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSODeviceManagement
+        from .models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSOBGPRouterState, NSODeviceManagement
 
         self.device = device
         self.payload = _validated_bgp_document(payload)
+        self.complete_observation = _bgp_complete_observation(self.payload)
         self.planned_at = planned_at
         self.operations = _Operations()
         self.management = NSODeviceManagement.objects.filter(device=device).first()
@@ -570,6 +611,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.BGPScope = BGPScope
         self.NSOBGPPeerState = NSOBGPPeerState
         self.NSOBGPPeerTemplateState = NSOBGPPeerTemplateState
+        self.NSOBGPRouterState = NSOBGPRouterState
         self.device_content_type = ContentType.objects.get_for_model(Device)
         self.peer_content_type = ContentType.objects.get_for_model(BGPPeer)
         self.template_content_type = ContentType.objects.get_for_model(BGPPeerTemplate)
@@ -659,16 +701,15 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if row.assigned_object_type_id == interface_type.pk and row.assigned_object_id in device_interface_ids:
                 self.device_source_ips.setdefault(str(row.address.ip), []).append(row)
         self.vrfs = {row.name: row for row in VRF.objects.filter(name__in=vrf_names).order_by("pk")}
-        self.routers = {
-            int(row.asn.asn): row
-            for row in BGPRouter.objects.filter(
+        router_rows = tuple(
+            BGPRouter.objects.filter(
                 assigned_object_type=self.device_content_type,
                 assigned_object_id=device.pk,
             )
             .select_related("asn")
             .order_by("pk")
-            if row.asn_id is not None
-        }
+        )
+        self.routers, self.duplicate_router_asns = self.index_routers(router_rows)
         self.scopes = {}
         for row in (
             BGPScope.objects.filter(router__in=self.routers.values())
@@ -746,6 +787,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             else {}
         )
         self.seen_peers = set()
+        self.router_states = (
+            {row.asn_str: row for row in NSOBGPRouterState.objects.filter(management=self.management).order_by("pk")}
+            if self.management is not None
+            else {}
+        )
+        self.seen_routers = set()
         self.seen_templates = set()
         policy_entries = tuple(
             address_family for _router, _scope, peer in peer_entries for address_family in peer["address_families"]
@@ -768,6 +815,20 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
     def save(self, *args, **kwargs):
         self.operations.save(*args, **kwargs)
+
+    @staticmethod
+    def index_routers(rows):
+        routers = {}
+        duplicates = set()
+        for row in rows:
+            if row.asn_id is None:
+                continue
+            number = int(row.asn.asn)
+            if number in routers:
+                duplicates.add(number)
+            else:
+                routers[number] = row
+        return routers, duplicates
 
     @staticmethod
     def _router_key(router):
@@ -886,7 +947,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def scope(self, router, vrf_name):
         vrf = self.vrfs.get(vrf_name) if vrf_name else None
         if vrf is None and vrf_name:
-            logger.warning("BGP: VRF %r not found in NetBox, using the global scope", vrf_name)
+            logger.warning("BGP: VRF %r not found in NetBox; the scope remains unresolved", vrf_name)
+            return None
         key = (self._router_key(router), vrf.pk if vrf is not None else None)
         current = self.scopes.get(key)
         if current is None:
@@ -1163,7 +1225,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         )
 
     def build(self):
-        if self.management is None:
+        if self.management is None or not self.complete_observation:
             return self.operations
         for state in self.invalid_peer_states:
             self.plan_invalid_peer_state(state)
@@ -1180,26 +1242,174 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if asn is not None:
                 valid_routers.append((router_entry, asn_str, asn))
         for router_entry, asn_str, asn in valid_routers:
-            router = self.router(asn, router_entry.get("router_id"))
-            for scope_entry in sorted(router_entry.get("scopes") or [], key=lambda row: row.get("vrf") or ""):
-                vrf_name = scope_entry.get("vrf") or ""
-                scope = self.scope(router, vrf_name)
-                for value in sorted(scope_entry["address_families"]):
-                    self.address_family(scope, value)
-                for entry in self.peer_entries_by_scope.get(id(scope_entry), ()):
-                    self.reconcile_peer(scope, entry, asn_str, vrf_name)
-                for entry in sorted(
-                    scope_entry["peer_groups"],
-                    key=lambda row: row["name"].casefold(),
-                ):
-                    if id(entry) in self.reported_group_entry_ids:
-                        reported_templates[entry["name"]] = (scope, entry)
+            router, owned, mirror = self.reconcile_router(router_entry, asn_str, asn)
+            if router is None:
+                continue
+            self.reconcile_router_children(router, router_entry, asn_str, owned, mirror, reported_templates)
         for name in sorted(reported_templates, key=str.casefold):
             self.reconcile_template(*reported_templates[name])
         self.plan_stale_states()
         return self.operations
 
+    def reconcile_router_children(self, router, router_entry, asn_str, owned, mirror, reported_templates):
+        for scope_entry in sorted(router_entry["scopes"], key=lambda row: row["vrf"]):
+            vrf_name = scope_entry["vrf"]
+            vrf = self.vrfs.get(vrf_name) if vrf_name else None
+            scope = (
+                self.scopes.get((self._router_key(router), vrf.pk if vrf else None))
+                if owned or not mirror
+                else self.scope(router, vrf_name)
+            )
+            if vrf_name and vrf is None:
+                scope = None
+            if scope is not None and mirror:
+                for value in sorted(scope_entry["address_families"]):
+                    self.address_family(scope, value)
+            available = (
+                {key[-1] for key in self.address_families if key[:2] == self._scope_key(scope)}
+                if scope is not None
+                else set()
+            )
+            for entry in self.peer_entries_by_scope.get(id(scope_entry), ()):
+                required = {value["af"] for value in entry["address_families"]}
+                if scope is None or not required <= available:
+                    self.reconcile_observed_peer(entry, asn_str, vrf_name)
+                else:
+                    self.reconcile_peer(scope, entry, asn_str, vrf_name)
+            for entry in sorted(scope_entry["peer_groups"], key=lambda row: row["name"].casefold()):
+                required = {value["af"] for value in entry["address_families"]}
+                if scope is None or not required <= available:
+                    self.reconcile_observed_template(entry)
+                elif id(entry) in self.reported_group_entry_ids:
+                    reported_templates[entry["name"]] = (scope, entry)
+
+    def reconcile_router(self, entry, asn_str, asn):
+        from . import status_machine as sm
+        from .bgp_router_content import observed_router_content, qualified_router, router_content, router_content_digest
+
+        current = self.router_states.get(asn_str)
+        created = current is None
+        state = self.NSOBGPRouterState(management=self.management, asn_str=asn_str) if created else copy.copy(current)
+        owned = sm.is_owned(state.status)
+        if owned:
+            try:
+                qualified_router(current, self.device.pk)
+            except ValueError:
+                state.router_id = entry.get("router_id") or ""
+                state.last_sync_at = self.planned_at
+                self.seen_routers.add(asn_str)
+                self.save(state, update_fields=("router_id", "last_sync_at"))
+                return None, True, False
+        device_hash = router_content_digest(observed_router_content(entry))
+        router = self.routers.get(int(asn.asn))
+        new_native = router is None
+        ambiguous = int(asn.asn) in self.duplicate_router_asns
+        unknown_vrf = any(scope["vrf"] and scope["vrf"] not in self.vrfs for scope in entry["scopes"])
+        conflict = ambiguous or unknown_vrf
+        mirror = not owned and not conflict
+        if ambiguous:
+            router = None
+        elif new_native:
+            router = self.router(asn, entry.get("router_id"))
+        else:
+            object_content = router_content(router)
+            object_hash = router_content_digest(object_content)
+            base = state.device_base_hash
+            if created or (not base and object_hash != device_hash):
+                conflict = True
+                mirror = False
+            elif object_hash != device_hash and base and object_hash != base:
+                mirror = False
+                conflict = device_hash != base
+            native_scopes, native_families = _router_membership(object_content)
+            observed_scopes, observed_families = _router_membership(observed_router_content(entry))
+            if not native_scopes <= observed_scopes or not native_families <= observed_families:
+                mirror = False
+                conflict = True
+            if mirror and object_content["scopes"] != observed_router_content(entry)["scopes"]:
+                owned_children = any(
+                    sm.is_owned(peer.status)
+                    and peer.bgp_peer_id is not None
+                    and peer.bgp_peer.scope.router_id == router.pk
+                    for peer in self.peer_states.values()
+                )
+                if owned_children:
+                    mirror = False
+                    conflict = True
+            if mirror:
+                router = copy.copy(router)
+                router.router_id = entry.get("router_id") or None
+                self.routers[int(asn.asn)] = router
+                self.save(router, update_fields=("router_id",))
+        state.bgp_router = router
+        state.router_id = entry.get("router_id") or ""
+        state.last_sync_at = self.planned_at
+        if not owned:
+            state.status = sm.on_reconcile(state.status, matches=None, conflict=conflict)
+            if mirror:
+                state.device_base_hash = device_hash
+        self.router_states[asn_str] = state
+        self.seen_routers.add(asn_str)
+        self.save(state, force_insert=created, natural_key=("management", "asn_str") if created else ())
+        return router, owned, mirror
+
+    def reconcile_observed_peer(self, entry, asn_str, vrf_name):
+        from . import status_machine as sm
+
+        key = (asn_str, vrf_name, entry["peer_address"])
+        current = self.peer_states.get(key)
+        created = current is None
+        state = (
+            self.NSOBGPPeerState(
+                management=self.management,
+                asn_str=asn_str,
+                vrf_name=vrf_name,
+                peer_address_str=entry["peer_address"],
+            )
+            if created
+            else copy.copy(current)
+        )
+        state.remote_as_str = entry.get("remote_as") or ""
+        state.enabled = entry.get("enabled")
+        state.last_sync_at = self.planned_at
+        state.status = sm.on_reconcile(state.status, matches=None, settles_owned=False, settles_deploying=False)
+        self.peer_states[key] = state
+        self.seen_peers.add(key)
+        self.save(
+            state,
+            force_insert=created,
+            natural_key=("management", "asn_str", "vrf_name", "peer_address_str") if created else (),
+        )
+
+    def reconcile_observed_template(self, entry):
+        from . import status_machine as sm
+
+        name = entry["name"]
+        current = self.template_states.get(name)
+        created = current is None
+        state = (
+            self.NSOBGPPeerTemplateState(management=self.management, template_name=name)
+            if created
+            else copy.copy(current)
+        )
+        state.remote_as_str = entry.get("remote_as") or ""
+        state.last_sync_at = self.planned_at
+        state.status = sm.on_reconcile(state.status, matches=None, settles_owned=False, settles_deploying=False)
+        self.template_states[name] = state
+        self.seen_templates.add(name)
+        self.save(state, force_insert=created, natural_key=("management", "template_name") if created else ())
+
     def plan_stale_states(self):
+        from . import status_machine as sm
+
+        for asn_str, current in self.router_states.items():
+            if asn_str in self.seen_routers:
+                continue
+            status = sm.on_reconcile(current.status, present=False)
+            if status != current.status:
+                state = copy.copy(current)
+                state.status = status
+                self.save(state, update_fields=("status",))
         for key, current in self.peer_states.items():
             if key in self.seen_peers:
                 continue

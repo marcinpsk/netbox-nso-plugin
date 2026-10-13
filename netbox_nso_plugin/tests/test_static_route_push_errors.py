@@ -632,12 +632,17 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
             self.assertNotIn("the device does not", _kind(code)["headline"], code)
 
     def test_a_category_without_a_banner_omits_the_key_entirely(self):
-        """codex P2 — a null on every category would let another category's own grid reload
-        clear the static banner over a failure that is still live. No key, no clearing."""
-        from netbox_nso_plugin.views import NSOCategoryView
-
-        self.assertNotIn("push_error", NSOCategoryView()._grid_payload("bgp", self.device, self.mgmt))
-        self.assertIn("push_error", NSOCategoryView()._grid_payload("static", self.device, self.mgmt))
+        """Only categories with their own push banner expose its key."""
+        user = get_user_model().objects.create_user("push-banner-operator", is_superuser=True)
+        self.client.force_login(user)
+        for category, has_banner in (("bfd", False), ("static", True), ("bgp", True)):
+            with self.subTest(category=category):
+                response = self.client.get(
+                    reverse("plugins:netbox_nso_plugin:device_nso_category", args=(self.device.pk, category)),
+                    {"format": "json"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual("push_error" in response.json(), has_banner)
 
     def test_another_category_never_grows_a_push_banner(self):
         """Only scopes whose rejection is persisted and rendered are mapped; a category with

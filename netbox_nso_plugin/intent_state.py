@@ -100,6 +100,7 @@ OVERLAY_MODEL_RANKS = (
     "netbox_nso_plugin.nsol2sapstate",
     "netbox_nso_plugin.nsoisisinstancestate",
     "netbox_nso_plugin.nsoisisinterfacestate",
+    "netbox_nso_plugin.nsobgprouterstate",
     "netbox_nso_plugin.nsobgppeerstate",
     "netbox_nso_plugin.nsobgppeertemplatestate",
     "netbox_nso_plugin.nsoroutepolicystate",
@@ -170,6 +171,7 @@ _PROMOTED_CONTENT_FIELDS = {
         "vrf",
         "source",
     },
+    "netbox_nso_plugin.nsobgprouterstate": {"management", "asn_str", "bgp_router"},
     "netbox_nso_plugin.nsobgppeertemplatestate": set(),
     "netbox_nso_plugin.nsovlanstate": {"management", "vlan"},
     "netbox_nso_plugin.nsoswitchportstate": {
@@ -304,6 +306,7 @@ _ROUTE_POLICY_CONTENT_FIELDS = {
 
 _FRAGMENT_GATE_FIELDS = {
     "netbox_nso_plugin.nsobfdinterfacestate": {"status"},
+    "netbox_nso_plugin.nsobgprouterstate": {"status"},
     "netbox_nso_plugin.nsobgppeerstate": {"status"},
     "netbox_nso_plugin.nsointerfaceipstate": {"accepted_at", "status"},
     "netbox_nso_plugin.nsointerfacemtustate": {"status"},
@@ -954,6 +957,7 @@ def _snmp_host_fragment(instance):
 def _direct_overlay_fragment(instance):
     """Dispatch direct overlay rows to the pure helper their renderer calls."""
     from . import signals
+    from .status_machine import is_owned
 
     helpers = {
         "netbox_nso_plugin.nsointerfaceipstate": signals.interface_ip_intent_item,
@@ -983,8 +987,6 @@ def _direct_overlay_fragment(instance):
     if label == "netbox_nso_plugin.nsoisisinterfacestate":
         return _owned_wire_fragment(instance, signals.isis_interface_intent_item)
     if label == "netbox_nso_plugin.nsoisisinstancestate":
-        from .status_machine import is_owned
-
         if not is_owned(instance.status):
             return ABSENT
         redist = signals._collect_redistribution_by_dest_ref(
@@ -999,6 +1001,27 @@ def _direct_overlay_fragment(instance):
                 redistribution=redist,
                 levels=levels,
             ),
+        )
+    if label == "netbox_nso_plugin.nsobgprouterstate":
+        if not is_owned(instance.status):
+            return ABSENT
+        try:
+            content = signals.bgp_router_intent_item(instance)
+        except ValueError as exc:
+            content = {"asn": instance.asn_str, "blocked_router": str(exc)}
+        router = instance._state.fields_cache.get("bgp_router")
+        if router is None and instance.bgp_router_id is not None:
+            router = instance.bgp_router
+        return _normal(
+            {
+                "content": content,
+                "native_identity": {
+                    "pk": instance.bgp_router_id,
+                    "assigned_object_type_id": router.assigned_object_type_id if router is not None else None,
+                    "assigned_object_id": router.assigned_object_id if router is not None else None,
+                    "asn_id": router.asn_id if router is not None else None,
+                },
+            }
         )
     if label == "netbox_nso_plugin.nsobgppeerstate":
         address_families = []
@@ -1313,7 +1336,7 @@ def _protocol_native_source_is_rendered(instance) -> bool | None:
 
 def _bgp_native_source_is_rendered(instance) -> bool | None:
     """Resolve indirect BGP ownership, if the row belongs to the BGP graph."""
-    from .models import NSOBGPPeerState, NSOBGPPeerTemplateState
+    from .models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSOBGPRouterState
     from .status_machine import OWNED_STATES
 
     label = instance._meta.label_lower
@@ -1333,11 +1356,16 @@ def _bgp_native_source_is_rendered(instance) -> bool | None:
             ).exists()
         return False
     if label == "netbox_routing.bgpaddressfamily":
+        if NSOBGPRouterState.objects.filter(bgp_router_id=instance.scope.router_id, status__in=OWNED_STATES).exists():
+            return True
         PeerAddressFamily = apps.get_model("netbox_routing.bgppeeraddressfamily")
         return any(
             _native_source_is_rendered(row) for row in PeerAddressFamily.objects.filter(address_family_id=instance.pk)
         )
     if label in {"netbox_routing.bgpscope", "netbox_routing.bgprouter"}:
+        router_id = instance.router_id if label == "netbox_routing.bgpscope" else instance.pk
+        if NSOBGPRouterState.objects.filter(bgp_router_id=router_id, status__in=OWNED_STATES).exists():
+            return True
         BGPPeer = apps.get_model("netbox_routing.bgppeer")
         peers = BGPPeer.objects.all()
         if label == "netbox_routing.bgpscope":
@@ -1354,6 +1382,12 @@ def _bgp_native_source_is_rendered(instance) -> bool | None:
 def _native_source_is_rendered(instance) -> bool:
     """Return whether an owned intent currently consumes this native source row."""
     if instance.pk is None:
+        if instance._meta.label_lower in {
+            "netbox_routing.bgpscope",
+            "netbox_routing.bgpaddressfamily",
+            "netbox_routing.bgppeeraddressfamily",
+        }:
+            return bool(_bgp_native_source_is_rendered(instance))
         return False
     if _direct_owned_overlay_exists(instance):
         return True
@@ -1384,16 +1418,24 @@ def _native_source_is_rendered(instance) -> bool:
             status__in=OWNED_STATES,
         ).exists()
     if label == "ipam.vrf":
+        RouterState = apps.get_model("netbox_nso_plugin.nsobgprouterstate")
         StaticRouteState = apps.get_model("netbox_nso_plugin.nsostaticroutestate")
-        return StaticRouteState.objects.filter(
-            static_route__vrf_id=instance.pk,
-            status__in=OWNED_STATES,
-        ).exists()
+        return (
+            RouterState.objects.filter(bgp_router__scopes__vrf_id=instance.pk, status__in=OWNED_STATES).exists()
+            or StaticRouteState.objects.filter(
+                static_route__vrf_id=instance.pk,
+                status__in=OWNED_STATES,
+            ).exists()
+        )
     if label == "ipam.asn":
-        return NSOBGPPeerState.objects.filter(
-            Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk),
-            status__in=OWNED_STATES,
-        ).exists()
+        RouterState = apps.get_model("netbox_nso_plugin.nsobgprouterstate")
+        return (
+            RouterState.objects.filter(bgp_router__asn_id=instance.pk, status__in=OWNED_STATES).exists()
+            or NSOBGPPeerState.objects.filter(
+                Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk),
+                status__in=OWNED_STATES,
+            ).exists()
+        )
     if label == "netbox_routing.bgppeertemplate":
         return NSOBGPPeerState.objects.filter(
             bgp_peer__peer_group_id=instance.pk,
@@ -1567,7 +1609,11 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
         device_ids = StaticRouteState.objects.filter(
             static_route__vrf_id=instance.pk,
         ).values_list("management__device_id", flat=True)
-        return _management_keys(set(device_ids), spec.scopes)
+        RouterState = apps.get_model("netbox_nso_plugin.nsobgprouterstate")
+        router_device_ids = RouterState.objects.filter(bgp_router__scopes__vrf_id=instance.pk).values_list(
+            "management__device_id", flat=True
+        )
+        return _management_keys(set(device_ids), ("static_route",)) | _management_keys(set(router_device_ids), ("bgp",))
     if instance._meta.label_lower == "ipam.asn":
         from django.db.models import Q
 
@@ -1575,7 +1621,11 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
         device_ids = PeerState.objects.filter(
             Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk)
         ).values_list("management__device_id", flat=True)
-        return _management_keys(set(device_ids), spec.scopes)
+        RouterState = apps.get_model("netbox_nso_plugin.nsobgprouterstate")
+        router_device_ids = RouterState.objects.filter(bgp_router__asn_id=instance.pk).values_list(
+            "management__device_id", flat=True
+        )
+        return _management_keys(set(device_ids) | set(router_device_ids), spec.scopes)
     if instance._meta.label_lower == "netbox_routing.bgppeertemplate":
         PeerState = apps.get_model("netbox_nso_plugin.nsobgppeerstate")
         device_ids = PeerState.objects.filter(
@@ -1807,6 +1857,7 @@ def _regular_instance_footprint(instance, spec, *, stored_before=None) -> Mutati
             ),
         )
     future_overlays = {
+        "netbox_routing.bgprouter": (SourceRow("netbox_nso_plugin.nsobgprouterstate", None),),
         "netbox_routing.bgppeer": (SourceRow("netbox_nso_plugin.nsobgppeerstate", None),),
         "netbox_routing.ospfinstance": (SourceRow("netbox_nso_plugin.nsoospfinstancestate", None),),
         "netbox_routing.redistribution": (SourceRow("netbox_nso_plugin.nsoredistributionstate", None),),
@@ -2896,6 +2947,7 @@ def register_builtin_renderer_inputs() -> None:
         "netbox_nso_plugin.nsol2sapstate": ("l2_sap",),
         "netbox_nso_plugin.nsoisisinstancestate": ("isis",),
         "netbox_nso_plugin.nsoisisinterfacestate": ("isis",),
+        "netbox_nso_plugin.nsobgprouterstate": ("bgp",),
         "netbox_nso_plugin.nsobgppeerstate": ("bgp",),
         "netbox_nso_plugin.nsobgppeertemplatestate": ("bgp",),
         "netbox_nso_plugin.nsoredistributionstate": ("bgp", "isis", "ospf"),
@@ -2922,7 +2974,7 @@ def register_builtin_renderer_inputs() -> None:
             "switchport",
         ),
         "ipam.ipaddress": ("ip", "bgp"),
-        "ipam.vrf": ("static_route",),
+        "ipam.vrf": ("static_route", "bgp"),
         "ipam.asn": ("bgp",),
         "netbox_routing.bgppeertemplate": ("bgp",),
     }
@@ -2969,6 +3021,7 @@ def register_builtin_renderer_inputs() -> None:
     )
     exact_direct_fragments = {
         "netbox_nso_plugin.nsobfdinterfacestate": _direct_overlay_fragment,
+        "netbox_nso_plugin.nsobgprouterstate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsobgppeerstate": _direct_overlay_fragment,
         "netbox_nso_plugin.nsobgppeertemplatestate": _lifecycle_only_fragment,
         "netbox_nso_plugin.nsointerfaceipstate": _direct_overlay_fragment,

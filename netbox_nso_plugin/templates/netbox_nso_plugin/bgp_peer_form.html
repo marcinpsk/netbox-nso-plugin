@@ -3,7 +3,7 @@
 {% extends 'base/layout.html' %}
 {% load form_helpers %}
 
-{% block title %}Add BGP Peer — {{ object }}{% endblock %}
+{% block title %}Add BGP Peer: {{ object }}{% endblock %}
 
 {% block content %}
 <div class="row">
@@ -13,8 +13,10 @@
       <div class="card-body">
         <p class="text-muted">
           Create a new BGP neighbor under <strong>{{ object }}</strong>. This builds the
-          netbox-routing objects (BGP router, scope and peer) scoped to this device and marks
-          the peer <strong>accepted</strong>, so it is written to the device on the next
+          netbox-routing objects scoped to this device and marks the peer <strong>accepted</strong>.
+          A newly created router is also accepted and owns its router ID and complete scope / AF membership.
+          Accept an existing unowned router before adding a peer. This operation adds the selected
+          scope and AF membership to an owned router in the same plan. The next
           <strong>Apply</strong>. Give the local ASN (the device's own AS), the neighbor
           address and its remote AS; the rest is optional.
         </p>

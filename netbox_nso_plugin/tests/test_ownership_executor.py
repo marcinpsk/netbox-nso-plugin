@@ -773,11 +773,13 @@ class TestSymmetricOwnershipExecutor(TestCase):
         )
 
         from ._outbox_case import without_commit_drain
+        from ._ownership_case import acquire_bgp_router
 
         type(self.management).objects.filter(pk=self.management.pk).update(manage_description=True)
         interface = Interface.objects.create(device=self.device, name="Loopback1", type="virtual", description="old")
         peer = self._make_native_bgp_peers("198.18.0.12/32")[0]
         with without_commit_drain():
+            acquire_bgp_router(self.management, peer.scope.router, status="in_sync")
             acquire_overlay(NSOInterfaceState, interface=interface, attribute="description", status="in_sync")
             bgp = acquire_overlay(
                 NSOBGPPeerState,

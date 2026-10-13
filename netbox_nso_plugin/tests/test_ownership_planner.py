@@ -427,14 +427,22 @@ class TestConvertedScopeRuleTable(SimpleTestCase):
             ("netbox_nso_plugin.nsoisisinterfacestate", "isis_interface"),
         )
 
-    def test_bgp_rule_names_peer_root_and_keeps_graph_rows_as_dependencies(self):
+    def test_bgp_rule_names_independent_router_and_peer_roots(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules
 
         rule = converted_scope_rules()["bgp"]
 
-        assert rule.native_model_labels == ("netbox_routing.bgppeer",)
+        assert rule.native_model_labels == ("netbox_routing.bgprouter", "netbox_routing.bgppeer")
         assert rule.native_key_fields == ("scope_id", "peer_id", "name")
-        assert rule.overlay_native_fields == (("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),)
+        assert dict(rule.native_key_fields_by_model)["netbox_routing.bgprouter"] == (
+            "assigned_object_type_id",
+            "assigned_object_id",
+            "asn_id",
+        )
+        assert rule.overlay_native_fields == (
+            ("netbox_nso_plugin.nsobgprouterstate", "bgp_router"),
+            ("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),
+        )
 
     def test_route_policy_rule_names_shared_roots_and_keeps_graph_rows_as_dependencies(self):
         from netbox_nso_plugin.ownership_planner import converted_scope_rules

@@ -23,7 +23,7 @@ from netbox_nso_plugin.models import NSOBGPPeerState, NSODeviceManagement, NSOIn
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import enqueue, entries, make_managed, state_of, without_commit_drain
-from ._ownership_case import acquire_overlay
+from ._ownership_case import acquire_bgp_router, acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 
@@ -108,6 +108,7 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
         management = self._mgmt()
         scope = self._scope(self._router())
         address_family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+        acquire_bgp_router(management, scope.router)
         peer_type = ContentType.objects.get_for_model(BGPPeer)
         for host in (31, 32):
             peer, _push = self._create_peer(

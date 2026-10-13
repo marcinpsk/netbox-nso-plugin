@@ -23,7 +23,7 @@ from django.utils import timezone
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import content_bulk_update, in_thread, mirror_update, wait_until_postgres_blocks
-from ._ownership_case import acquire_overlay, save_overlay_fixture
+from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 _MOD = "netbox_nso_plugin.adapter_client"
@@ -1941,7 +1941,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
     # change-detection cache), then DELETE it — without a post_delete receiver no
     # push fires and the adapter keeps applying the deleted intent forever.
 
-    def _delete_pushes(self, row, patch_target, expect_empty_list=True):
+    def _delete_pushes(self, row, patch_target, expect_empty_list=True, *, expected_snapshot=None):
         """Delete *row* and assert the reduced snapshot push fired at the client boundary."""
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
 
@@ -1953,7 +1953,9 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
             with renderer_writes(plan) as writer:
                 writer.delete(row)
         mock_put.assert_called_once()
-        if expect_empty_list:
+        if expected_snapshot is not None:
+            self.assertEqual(mock_put.call_args[0][1], expected_snapshot)
+        elif expect_empty_list:
             self.assertEqual(mock_put.call_args[0][1], [], "Deleted row must not appear in the push snapshot")
         return mock_put
 
@@ -2178,6 +2180,7 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 name=str(local_as.asn),
             )
             scope = BGPScope.objects.create(router=router)
+            acquire_bgp_router(mgmt, router)
             peer = BGPPeer.objects.create(
                 scope=scope,
                 peer=IPAddress.objects.create(address="198.18.0.2/32"),
@@ -2193,25 +2196,76 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 remote_as_str=str(remote_as.asn),
                 status="accepted",
             )
-        self._delete_pushes(row, "put_bgp_intent")
+        self._delete_pushes(
+            row,
+            "put_bgp_intent",
+            expected_snapshot=[
+                {
+                    "asn": "64512",
+                    "router_id": None,
+                    "accepted_at": None,
+                    "scopes": [{"vrf": "", "address_families": [], "peers": []}],
+                }
+            ],
+        )
 
     def test_redistribution_delete_pushes_reduced_snapshot(self):
         """No native pre_delete exists for Redistribution — the overlay post_delete is
         the ONLY retraction path. The push rides the DEST protocol (bgp here)."""
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR
+        from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, Redistribution
+
         from netbox_nso_plugin.models import NSORedistributionState
 
         mgmt = self._mgmt()
         with patch("netbox_nso_plugin.adapter_client.put_bgp_intent"), self.captureOnCommitCallbacks(execute=True):
+            rir = RIR.objects.create(
+                name="Redistribution signal ASNs", slug="redistribution-signal-asns", is_private=True
+            )
+            local_as = ASN.objects.create(asn=64512, rir=rir)
+            router = BGPRouter.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(type(self.device)),
+                assigned_object_id=self.device.pk,
+                asn=local_as,
+                name=str(local_as.asn),
+            )
+            scope = BGPScope.objects.create(router=router)
+            address_family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+            native = Redistribution.objects.create(
+                destination_type=ContentType.objects.get_for_model(BGPAddressFamily),
+                destination_id=address_family.pk,
+                source_protocol="connected",
+            )
+            acquire_bgp_router(mgmt, router)
             row = acquire_overlay(
                 NSORedistributionState,
                 management=mgmt,
                 dest_protocol="bgp",
-                dest_ref="65100::ipv4-unicast",
+                dest_ref="64512//ipv4-unicast",
                 source_protocol="connected",
                 source_ref="",
+                redistribution=native,
                 status="accepted",
             )
-        self._delete_pushes(row, "put_bgp_intent")
+        self._delete_pushes(
+            row,
+            "put_bgp_intent",
+            expected_snapshot=[
+                {
+                    "asn": "64512",
+                    "router_id": None,
+                    "accepted_at": None,
+                    "scopes": [
+                        {
+                            "vrf": "",
+                            "address_families": [{"af": "ipv4-unicast", "redistribution": []}],
+                            "peers": [],
+                        }
+                    ],
+                }
+            ],
+        )
 
     def test_route_policy_delete_pushes_reduced_snapshot(self):
         from django.contrib.contenttypes.models import ContentType

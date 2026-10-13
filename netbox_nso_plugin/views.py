@@ -61,6 +61,7 @@ from .models import (
     AdapterConnection,
     NSOBFDInterfaceState,
     NSOBGPPeerState,
+    NSOBGPRouterState,
     NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOFailoverSettings,
@@ -334,6 +335,51 @@ class DeviceNSOTabView(generic.ObjectView):
 
 # ── Lazy category load: rows for one expanded category (HTML fragment) ─────────
 
+
+def _can_change_bgp_router(user, state):
+    from netbox_routing.models import BGPRouter
+
+    return (
+        state.bgp_router_id is not None
+        and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
+        and user.has_perm("netbox_routing.change_bgprouter")
+        and NSODeviceManagement.objects.restrict(user, "change").filter(pk=state.management_id).exists()
+        and BGPRouter.objects.restrict(user, "change").filter(pk=state.bgp_router_id).exists()
+    )
+
+
+def _prepare_bgp_router_edit(user, family, state):
+    if family == "bgp_router" and not _can_change_bgp_router(user, state):
+        raise PermissionDenied
+    if family == "bgp_router":
+        state.router_id = str(state.bgp_router.router_id or "")
+
+
+def _visible_bgp_router_states(user, device=None):
+    from django.db.models import Q
+    from netbox_routing.models import BGPRouter
+
+    visible = BGPRouter.objects.restrict(user, "view").values("pk")
+    states = (
+        NSOBGPRouterState.objects.restrict(user, "view")
+        .filter(
+            Q(bgp_router__isnull=True) | Q(bgp_router_id__in=visible),
+        )
+        .select_related("management", "bgp_router__asn")
+        .order_by("asn_str")
+    )
+    return states.filter(management__device=device) if device is not None else states
+
+
+def _bgp_router_display_scopes(state):
+    from .bgp_router_content import router_content
+
+    try:
+        return router_content(state)["scopes"]
+    except ValueError:
+        return []
+
+
 # "Accept" makes NetBox the source of truth, so it applies to values NetBox does not
 # yet own (imported) and to drift (resolve). Already-owned states (in_sync, accepted,
 # deploying, apply_failed) offer no Accept — that was the repeatable-no-op bug.
@@ -346,6 +392,7 @@ def _ctx_has_unowned(ctx) -> bool:
         "static_routes",
         "isis_interfaces",
         "isis_processes",
+        "bgp_routers",
         "bgp_peers",
         "route_policy_states",
         "redistribution_states",
@@ -499,6 +546,7 @@ _KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "i
 
 # Each category maps to the independent push scopes shown on its banner.
 _CATEGORY_PUSH_SCOPES = {
+    "bgp": ("bgp",),
     "static": ("static_route",),
     "subinterface": ("subinterface",),
     "svi": ("svi",),
@@ -511,6 +559,7 @@ _PUBLIC_PUSH_REASONS = frozenset(
         "backfill_missing_route_id",
         "backfill_only_unsupported",
         "blocked_owned_row",
+        "blocked_bgp_router",
         "device_claimed",
         "duplicate_deleted_route_id",
         "duplicate_route_id",
@@ -531,6 +580,7 @@ _PUSH_UNSENT_CODES = frozenset({"configuration_error"})
 _PUSH_UNKNOWN_CODES = frozenset({"nso_unreachable", "nso_timeout", ""})
 _PUSH_HEADLINES = {
     "blocked_owned_row": "An owned row fails identity validation, so NetBox did not send the snapshot.",
+    "blocked_bgp_router": "Router ownership or membership is incomplete. NetBox did not send the BGP snapshot.",
     "rejected": "The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.",
     "unsent": "The last intent push for this category never reached the adapter — NetBox holds the edit, the device does not.",
     "unknown": "The last intent push for this category did not complete — whether the adapter stored it is unknown.",
@@ -539,7 +589,9 @@ _PUSH_HEADLINES = {
 
 def _push_error_kind(code, reason):
     """Classify a recorded push failure as rejected / unsent / unknown."""
-    if code in _PUSH_UNSENT_CODES or (code == "validation_error" and reason == "blocked_owned_row"):
+    if code in _PUSH_UNSENT_CODES or (
+        code == "validation_error" and reason in {"blocked_owned_row", "blocked_bgp_router"}
+    ):
         return "unsent"
     if code in _PUSH_UNKNOWN_CODES:
         return "unknown"
@@ -582,7 +634,10 @@ def _scope_push_error(entry):
     result = {
         "code": code,
         "message": (
-            "The server log names the row and the failed check."
+            "Refresh BGP and Accept the router after reviewing its router ID and scope / AF membership. "
+            "Relink missing native routers and add required child membership before retrying."
+            if headline_key == "blocked_bgp_router"
+            else "The server log names the row and the failed check."
             if headline_key == "blocked_owned_row"
             else public_error_message(AdapterError("", code=code))
         ),
@@ -1594,6 +1649,24 @@ class NSOCategoryView(LoginRequiredMixin, View):
             "bgp": {
                 "reconcile_on_expand": True,
                 "sections": {
+                    "routers": dict(
+                        ctx="bgp_routers",
+                        qs=lambda d: _visible_bgp_router_states(self.request.user, d),
+                        accept=r + "routing_accept_bgp_router",
+                        fields={
+                            "asn": lambda st: st.asn_str,
+                            "router_id": lambda st: (
+                                str(st.bgp_router.router_id or "") if st.bgp_router_id else st.router_id
+                            ),
+                            "router": lambda st: linked(st.bgp_router),
+                            "scopes": _bgp_router_display_scopes,
+                            "edit_url": lambda st: (
+                                reverse(r + "overlay_field_edit", args=["bgp_router", st.pk])
+                                if st.bgp_router_id and _can_change_bgp_router(self.request.user, st)
+                                else None
+                            ),
+                        },
+                    ),
                     "peers": dict(
                         ctx="bgp_peers",
                         qs=lambda d: (
@@ -1847,6 +1920,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 related=section.get("related"),
                 distinguish_failed=section.get("distinguish_failed", False),
             )
+            if key == "bgp" and name == "routers":
+                for state, row in zip(states[name], built["rows"], strict=True):
+                    if not _can_change_bgp_router(self.request.user, state):
+                        row["accept_url"] = None
             if name is None:
                 payload.update(built)
             else:
@@ -3813,7 +3890,13 @@ def _residue_matchers():
         "vlan": ("vlan", [("vlan_states", "vlan", lambda r: (r.vlan.vid,))]),
         "logging": ("logging", [("logging_data.hosts", "host", lambda r: (r.address,))]),
         "l2_services": ("l2_sap", [("l2_sap_states", "sap", lambda r: (r.service_name or "", r.sap_id or ""))]),
-        "bgp": ("bgp", [("bgp_peers", "peer", lambda r: (r.peer_address_str or "",))]),
+        "bgp": (
+            "bgp",
+            [
+                ("bgp_routers", "router", lambda r: (r.asn_str,)),
+                ("bgp_peers", "peer", lambda r: (r.peer_address_str or "",)),
+            ],
+        ),
         "isis": (
             "isis",
             [
@@ -5013,6 +5096,45 @@ def _save_owned_isis_edit(obj, key, old_values):
         writer.save(candidate, update_fields=state_fields)
 
 
+def _bgp_router_errors(state):
+    from .bgp_router_content import qualified_router, router_fragment
+    from .ownership_planner import OwnershipNotQualified, require_router_acquisition_observation
+    from .status_machine import is_owned
+
+    try:
+        qualified_router(state)
+        router_fragment(state.asn_str, state.router_id, [])
+        if not is_owned(state.status):
+            require_router_acquisition_observation(state)
+    except ValueError as exc:
+        return {"router_id": [str(exc)]}
+    except OwnershipNotQualified as exc:
+        return {"router_id": [exc.public_message]}
+    return {}
+
+
+def _save_owned_bgp_router_edit(state, old_values):
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    native = copy.copy(state.bgp_router)
+    native.router_id = state.router_id or None
+    candidate = copy.copy(state)
+    candidate.bgp_router = native
+    candidate.status = sm.on_operator_edit(candidate.status)
+    candidate.accepted_at = candidate.accepted_at or planned_at
+    fields = ("router_id", "status", "accepted_at")
+    plan = RendererMutationPlan.build(
+        grant=OwnershipGrant("operator_edit"),
+        saves=(planned_save(native, update_fields=("router_id",)), planned_save(candidate, update_fields=fields)),
+        planned_at=planned_at,
+    )
+    with renderer_writes(plan) as writer:
+        writer.save(native, update_fields=("router_id",))
+        writer.save(candidate, update_fields=fields)
+
+
 def _save_owned_bgp_edit(obj, old_values):
     """Claim one BGP peer edit and update its native root through an exact plan."""
     from ipam.models import ASN, RIR
@@ -5253,6 +5375,9 @@ def _save_owned_overlay_edit(obj, key, old_values):
         return None
     if key in {"isis_instance", "isis_interface"}:
         _save_owned_isis_edit(obj, key, old_values)
+        return None
+    if key == "bgp_router":
+        _save_owned_bgp_router_edit(obj, old_values)
         return None
     if key == "bgp_peer":
         _save_owned_bgp_edit(obj, old_values)
@@ -5702,6 +5827,8 @@ def _overlay_family_errors(key, obj, old_values):
         return _isis_instance_errors(obj)
     if key == "isis_interface":
         return _isis_interface_errors(obj)
+    if key == "bgp_router":
+        return _bgp_router_errors(obj)
     if key == "bgp_peer":
         return _bgp_peer_errors(obj)
     if key == "redistribution":
@@ -5772,6 +5899,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             "NSOISISInterfaceState",
             ("circuit_type", "network_type", "metric", "passive", "bfd_enabled", "frr_enabled", "frr_protection"),
         ),
+        "bgp_router": ("NSOBGPRouterState", ("router_id",)),
         "bgp_peer": ("NSOBGPPeerState", ("remote_as_str", "enabled")),
         "redistribution": ("NSORedistributionState", ("route_map", "metric", "metric_type")),
         "static_route": ("NSOStaticRouteState", ("metric", "permanent", "tag")),
@@ -5808,6 +5936,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
         if key == "vlan_name":
             self._require_vlan_name_permissions(request, obj)
+        _prepare_bgp_router_edit(request.user, key, obj)
         edit_obj = obj.static_route if key == "static_route" else obj.vlan if key == "vlan_name" else obj
         old_values = {field: getattr(edit_obj, field) for field in editable}
         errors: dict[str, list[str]] = {}
@@ -6105,6 +6234,13 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or "", "isis"),
             (NSOOSPFInterfaceState, "OSPF interface", _iface, _ospf_iface_detail, "ospf"),
             (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or "", "ospf"),
+            (
+                NSOBGPRouterState,
+                "BGP router",
+                lambda r: f"AS {r.asn_str}",
+                lambda r: str(r.bgp_router.router_id or "") if r.bgp_router_id else "",
+                "bgp",
+            ),
             (
                 NSOBGPPeerState,
                 "BGP peer",
@@ -6901,6 +7037,21 @@ class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
 
 class NSOISISInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOISISInstanceState
+
+
+class NSOBGPRouterStateAcceptView(RoutingStateAcceptMixin):
+    model_class = NSOBGPRouterState
+    required_permission = ("netbox_nso_plugin.change_nsodevicemanagement", "netbox_routing.change_bgprouter")
+
+    def _accept_blocker(self, state):
+        errors = _bgp_router_errors(state)
+        return " ".join(message for values in errors.values() for message in values)
+
+    def post(self, request, pk):
+        state = get_object_or_404(self.model_class, pk=pk)
+        if not _can_change_bgp_router(request.user, state):
+            raise PermissionDenied
+        return super().post(request, pk)
 
 
 class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
@@ -8178,10 +8329,14 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         form = NSOBgpPeerGreenfieldForm(request.POST, device=mgmt.device)
         if not form.is_valid():
             return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
-        peer = self._create_peer(mgmt.device, form.cleaned_data)
+        try:
+            peer = self._create_peer(mgmt.device, form.cleaned_data, user=request.user)
+        except ValueError as exc:
+            form.add_error(None, str(exc))
+            return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
         messages.success(
             request,
-            f"Created BGP peer {peer.peer.address.ip} on {mgmt.device.name} — Apply to write it.",
+            f"Created BGP peer {peer.peer.address.ip} on {mgmt.device.name}. Apply to write it.",
         )
         return redirect(_device_nso_tab_url(mgmt.device_id))
 
@@ -8190,7 +8345,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         return {"form": form, "object": mgmt.device, "mgmt": mgmt}
 
     @staticmethod
-    def _create_peer(device, data):
+    def _create_peer(device, data, *, user=None):
         """Create one owned router, scope, peer, and AF graph through an exact plan."""
         from dcim.models import Device
         from django.contrib.contenttypes.models import ContentType
@@ -8202,18 +8357,35 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             BGPScope,
         )
 
-        from .models import NSOBGPPeerState, NSODeviceManagement
+        from .bgp_router_content import qualified_router
+        from .models import NSOBGPPeerState, NSOBGPRouterState, NSODeviceManagement
+        from .ownership_planner import require_qualifying_ownership
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
         from .signals import _schedule_intent_push, suppress_intent_push
+        from .status_machine import is_owned
 
         management = NSODeviceManagement.objects.get(device=device)
         planned_at = timezone.now()
         device_type = ContentType.objects.get_for_model(Device)
-        router = BGPRouter.objects.filter(
-            assigned_object_type=device_type,
-            assigned_object_id=device.pk,
-            asn=data["local_asn"],
-        ).first()
+        routers = list(
+            BGPRouter.objects.filter(
+                assigned_object_type=device_type,
+                assigned_object_id=device.pk,
+                asn=data["local_asn"],
+            )
+        )
+        if len(routers) > 1:
+            raise ValueError("Resolve duplicate BGP routers for this device and ASN before adding a peer.")
+        router = routers[0] if routers else None
+        new_router = router is None
+        if router is not None:
+            state = NSOBGPRouterState.objects.filter(management=management, asn_str=str(data["local_asn"].asn)).first()
+            if state is None or not is_owned(state.status) or state.bgp_router_id != router.pk:
+                raise ValueError("Accept the router and its scope / AF membership before adding a BGP peer.")
+            qualified_router(state)
+            require_qualifying_ownership(state)
+            if user is not None and not _can_change_bgp_router(user, state):
+                raise PermissionDenied
         saves = []
         operations = []
 
@@ -8286,6 +8458,16 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
                 natural_key=("assigned_object_type", "assigned_object_id", "address_family"),
                 references=(("assigned_object_id", peer),),
             )
+        if new_router:
+            router_state = NSOBGPRouterState(
+                management=management,
+                asn_str=str(data["local_asn"].asn),
+                bgp_router=router,
+                router_id=str(router.router_id or ""),
+                status="accepted",
+                accepted_at=planned_at,
+            )
+            save(router_state, force_insert=True, natural_key=("management", "asn_str"))
         state = NSOBGPPeerState(
             management=management,
             asn_str=str(data["local_asn"].asn),

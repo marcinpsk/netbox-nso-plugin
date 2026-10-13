@@ -89,6 +89,7 @@ _SPECS = (
     ),
     _spec("nsoisisinterfacestate", ("isis",), ("isis.interface-config",), ("isis",), ("isis",)),
     _spec("nsoisisflexalgostate", ("isis_flex_algo",), ("isis.process-config.flex-algo",), ("isis",), ("isis",)),
+    _spec("nsobgprouterstate", ("bgp",), ("bgp.router",), ("bgp",), ("bgp",)),
     _spec("nsobgppeerstate", ("bgp",), ("bgp.router.scope.peer",), ("bgp",), ("bgp",)),
     _spec(
         "nsoredistributionstate",
@@ -116,7 +117,6 @@ _SPECS = (
 )
 OVERLAYS = MappingProxyType({spec.model_label: spec for spec in _SPECS})
 EXCLUDED_MODELS = MappingProxyType({"netbox_nso_plugin.nsobgppeertemplatestate": "read_only_not_pushed"})
-BLOCKED_SUBJECTS = MappingProxyType({"bgp.router": "no_router_overlay"})
 _SUBJECT_OWNERS = {subject: spec for spec in _SPECS for subject in spec.subjects}
 if len(_SUBJECT_OWNERS) != sum(len(spec.subjects) for spec in _SPECS):
     raise RegistryError("duplicate registry subject owner")
@@ -158,8 +158,6 @@ def model_spec(label: str) -> OverlaySpec:
 
 
 def owner_spec(subject: str) -> OverlaySpec:
-    if isinstance(subject, str) and subject in BLOCKED_SUBJECTS:
-        raise RegistryError("logical outcome is blocked: no router overlay")
     try:
         return _SUBJECT_OWNERS[subject]
     except (KeyError, TypeError):

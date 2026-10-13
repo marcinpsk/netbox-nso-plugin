@@ -44,7 +44,7 @@ from netbox_nso_plugin.signals import route_policy_intent_item, suppress_intent_
 
 from ._adapter_http import make_response
 from ._outbox_case import ReceiptAdapter, content_update, make_managed, own_route, without_commit_drain
-from ._ownership_case import acquire_overlay
+from ._ownership_case import acquire_bgp_router, acquire_overlay
 from ._routing_observation_case import route_policy_document, routing_observation
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_read_gate import _rs
@@ -787,6 +787,7 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
                 )
                 scope = BGPScope.objects.create(router=router)
                 family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+                acquire_bgp_router(management, router)
                 peer = BGPPeer.objects.create(
                     scope=scope,
                     peer=IPAddress.objects.create(address=f"198.18.0.{index}/32"),

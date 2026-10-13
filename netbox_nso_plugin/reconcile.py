@@ -51,6 +51,7 @@ def _empty_context() -> dict:
         "ospf_data": {"instances": [], "interfaces": []},
         "redistribution_states": [],
         "bgp_peers": [],
+        "bgp_routers": [],
         "bfd_interfaces": [],
         "interface_ips": [],
         "l2_sap_states": [],
@@ -105,6 +106,15 @@ def _safe_reconcile(ctx: dict, key: str, mgmt, model_names: tuple[str, ...], fn,
         raise
     except Exception as exc:  # noqa: BLE001 — the gate rolls the scope transaction back
         raise ReconcileScopeError(mgmt, model_names, fn.__name__) from exc
+
+
+def _bgp_gated_body(ctx, management, device, payload):
+    from .bgp_reconciler import _reconcile_bgp_config
+    from .models import NSOBGPRouterState
+
+    peers = _reconcile_bgp_config(device, payload)
+    ctx["bgp_routers"] = list(NSOBGPRouterState.objects.filter(management=management).select_related("bgp_router"))
+    return peers
 
 
 # ── READSEM S4 (D5/D9): the device-wide read mutex + per-family gate plumbing ───
@@ -356,7 +366,7 @@ def _isis_gated_body(ctx, mgmt, device, payload):
 def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
     """Reconcile each opted-in routing protocol into *ctx* (gated by kill-switches)."""
     from .bfd_reconciler import bfd_reconcile_plan, reconcile_bfd
-    from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .bgp_reconciler import bgp_reconcile_plan
     from .isis_reconciler import isis_reconcile_plan
     from .ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
@@ -448,7 +458,15 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
             "bgp",
             bgp_doc,
             lambda: _safe_reconcile(
-                ctx, "bgp_peers", mgmt, ("NSOBGPPeerState",), _reconcile_bgp_config, device, bgp_doc
+                ctx,
+                "bgp_peers",
+                mgmt,
+                ("NSOBGPRouterState", "NSOBGPPeerState"),
+                _bgp_gated_body,
+                ctx,
+                mgmt,
+                device,
+                bgp_doc,
             ),
             epoch=dev_id,
             pre_body=lambda: bgp_reconcile_plan(device, bgp_doc),
@@ -778,7 +796,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     adapter failure — the caller renders a per-category error.
     """
     from . import adapter_client as client
-    from .bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
+    from .bgp_reconciler import bgp_reconcile_plan
     from .isis_reconciler import isis_reconcile_plan
     from .ospf_reconciler import ospf_reconcile_plan, reconcile_ospf
     from .redistribution_reconciler import reconcile_redistribution, redistribution_reconcile_plan
@@ -1175,7 +1193,7 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
                 mgmt,
                 "bgp",
                 bgp_doc,
-                lambda: _reconcile_bgp_config(device, bgp_doc),
+                lambda: _bgp_gated_body(ctx, mgmt, device, bgp_doc),
                 epoch=dev_id,
                 ctx_key="bgp_peers",
                 pre_body=lambda: bgp_reconcile_plan(device, bgp_doc),
