@@ -337,6 +337,69 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         for _, row in self.rows:
             self._assert_prior_bookkeeping(row)
 
+    def test_manual_no_op_restores_after_read_watermark_advances(self):
+        self.mtu = mirror_update(self.mtu, status="accepted")
+        key = (self.mtu._meta.label_lower, self.mtu.pk)
+        self.prior[key]["status"] = "accepted"
+
+        def advance_read_watermark(body):
+            self.mtu.refresh_from_db()
+            self.assertEqual(self.mtu.status, "deploying")
+            families = OVERLAYS[self.mtu._meta.label_lower].read_families
+            NSOFamilyReadState.objects.filter(management=self.management, family__in=families).update(
+                applied_attempt_id=1000,
+                applied_incarnation="manual-read-store",
+                applied_source_epoch=3,
+                applied_payload_revision=1010,
+                applied_publication_sequence=1020,
+            )
+
+        def no_op(body):
+            return 200, {
+                "device_id": self.management.adapter_device_id,
+                "outcome": "no_op",
+                "job_id": None,
+                "selected": body["selected"],
+                "skipped": dict.fromkeys(body["selected"], "already_applied"),
+                "skipped_detail": None,
+                "generations": [],
+            }
+
+        adapter = ManualAdmissionAdapter(no_op, before_apply=advance_read_watermark)
+        response = self._apply(adapter)
+
+        self.assertEqual(response.status_code, 200)
+        self._assert_prior_bookkeeping(self.mtu)
+        snapshot = NSOApplyOverlaySnapshot.objects.get(
+            attempt_id=adapter.apply_requests[0]["apply_attempt_id"], model_label=key[0], overlay_pk=key[1]
+        )
+        self.assertEqual(snapshot.settlement_disposition, "not_applied")
+        for family, watermark in snapshot.observation_watermark.items():
+            current = NSOFamilyReadState.objects.get(management=self.management, family=family)
+            self.assertNotEqual(current.applied_attempt_id, watermark["attempt_id"])
+
+    def test_manual_rejection_keeps_newer_bookkeeping_superseded(self):
+        def change_bookkeeping(body):
+            self.mtu.refresh_from_db()
+            self.assertEqual(self.mtu.status, "deploying")
+            mirror_update(self.mtu, last_apply_error="Newer Apply error.")
+
+        adapter = ManualAdmissionAdapter(
+            lambda _body: (409, ManualAdmissionAdapter.rejection()), before_apply=change_bookkeeping
+        )
+        response = self._apply(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.mtu.refresh_from_db()
+        self.assertEqual(self.mtu.status, "deploying")
+        self.assertEqual(self.mtu.last_apply_error, "Newer Apply error.")
+        snapshot = NSOApplyOverlaySnapshot.objects.get(
+            attempt_id=adapter.apply_requests[0]["apply_attempt_id"],
+            model_label=self.mtu._meta.label_lower,
+            overlay_pk=self.mtu.pk,
+        )
+        self.assertEqual(snapshot.settlement_disposition, "superseded")
+
     def test_manual_skipped_stream_restores_only_its_snapshot(self):
         def promoted(body):
             selected = body["selected"]

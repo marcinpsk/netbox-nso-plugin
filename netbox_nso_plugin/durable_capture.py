@@ -383,7 +383,7 @@ def _snapshot_rows(management, snapshots):
     return rows
 
 
-def _matches(snapshot, row, management, revisions, prefix):
+def _matches(snapshot, row, management, revisions, prefix, *, check_watermark=True):
     from .selection_manifest import current_content_digest
 
     if row is None or snapshot.mapping_epoch != mapping_epoch(management):
@@ -394,7 +394,10 @@ def _matches(snapshot, row, management, revisions, prefix):
         all(getattr(row, field) == getattr(snapshot, f"{prefix}_{field}") for field in _BOOKKEEPING)
         and row.accepted_at == snapshot.accepted_at
         and current_content_digest(row) == snapshot.content_digest
-        and _watermark(management, OVERLAYS[snapshot.model_label]) == snapshot.observation_watermark
+        and (
+            not check_watermark
+            or _watermark(management, OVERLAYS[snapshot.model_label]) == snapshot.observation_watermark
+        )
         and _fence_revision(management, snapshot.mapping_epoch, row) == snapshot.expected_fence_revision
         and _static_fences(row) == snapshot.static_route_fences
     )
@@ -479,7 +482,7 @@ def restore_attempt(attempt_id, keep_streams=()):
             if any(contributor["stream"] in keep_streams for contributor in contributors):
                 continue
             row = rows.get((item.model_label, item.overlay_pk))
-            if _matches(item, row, management, revisions, "expected"):
+            if _matches(item, row, management, revisions, "expected", check_watermark=False):
                 if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
                     _write_bookkeeping(row, item, "prior")
                 item.settlement_disposition = "not_applied"
