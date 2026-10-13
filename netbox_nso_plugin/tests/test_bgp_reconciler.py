@@ -693,7 +693,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertIsNotNone(state.bgp_peer)
         self.assertTrue(state.enabled)
 
-    def test_unknown_vrf_reuses_resolved_global_scope(self):
+    def test_unknown_vrf_stays_blocked_without_global_scope(self):
         """An unresolved named VRF stays blocked across repeated observations."""
         mgmt = self._make_mgmt()
 
