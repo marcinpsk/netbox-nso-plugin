@@ -1154,6 +1154,15 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if mirror or not sm.is_owned(state.status):
             state.remote_as_str = str(entry.get("remote_as") or "")
             state.enabled = entry.get("enabled")
+        else:
+            intent_as = _parse_asn(state.remote_as_str) if state.remote_as_str else None
+            intent_enabled = state.enabled if state.enabled is not None else True
+            observed_enabled = entry.get("enabled") if entry.get("enabled") is not None else True
+            matches = (
+                matches
+                and intent_as == (int(remote_as.asn) if remote_as is not None else None)
+                and intent_enabled == observed_enabled
+            )
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         self.peer_states[state_key] = state
         self.seen_peers.add(state_key)
