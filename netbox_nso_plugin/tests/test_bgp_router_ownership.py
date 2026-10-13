@@ -151,6 +151,17 @@ class TestBgpRouterOwnership(TestCase):
         self.assertFalse(model.objects.filter(management=self.management).exists())
         self.assertFalse(NSOOwnershipManifest.objects.filter(device_id=self.device.pk, scope="bgp").exists())
 
+    def test_router_qualification_checks_native_identity_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.bgp_router_content import qualified_router
+
+        state = self.own_router()
+        with CaptureQueriesContext(connection) as queries:
+            self.assertEqual(qualified_router(state), self.router)
+        self.assertEqual(sum(f'FROM "{BGPRouter._meta.db_table}"' in query["sql"] for query in queries), 1)
+
     def test_router_native_asn_move_cannot_reown_old_identity(self):
         model = self.router_model()
         state = self.own_router()

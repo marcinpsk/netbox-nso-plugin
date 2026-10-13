@@ -104,7 +104,7 @@ def qualified_router(state, device_id=None):
         assigned_object_id=device_id,
         asn__asn=int(canonical),
     )
-    if matches.count() != 1 or not matches.filter(pk=router.pk).exists():
+    if list(matches.values_list("pk", flat=True)[:2]) != [router.pk]:
         raise ValueError("Resolve duplicate BGP routers for this device and ASN before accepting it.")
     router_content(router)
     return router
