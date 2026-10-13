@@ -73,6 +73,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             )
         self.client.force_login(user)
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        adapter.preparation_revisions = self.adapter.preparation_revisions
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"])
         config, session = adapter.patches()
         with config, session:
@@ -113,6 +114,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                     self._delete_native_root(create, name)
                     enqueue(self.device, scope)
                     adapter = ReceiptAdapter()
+                    adapter.preparation_revisions = self.adapter.preparation_revisions
                     if isinstance(outcome, Exception):
                         adapter.fail_with = outcome
                     else:
@@ -125,7 +127,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                         management=self.management, scope=scope, root_name=name
                     ).exists()
                     adapter.fail_with = None
-                    adapter._respond = ReceiptAdapter._default_response
+                    adapter._respond = adapter.default_response
                     config, session = adapter.patches()
                     with config, session:
                         assert drain.drain_key(self.device.pk, scope) == drain.SUCCEEDED
@@ -213,7 +215,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 return 409, {
                     "error": {"code": "conflict", "message": "recheck", "detail": {"reason": "revision_conflict"}}
                 }
-            return ReceiptAdapter._default_response(body)
+            return adapter.default_response(body)
 
         adapter = ReceiptAdapter(respond=respond)
         config, session = adapter.patches()
@@ -320,6 +322,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                         adapter = self._apply()
                     else:
                         adapter = ReceiptAdapter()
+                        adapter.preparation_revisions = self.adapter.preparation_revisions
                         config, session = adapter.patches()
                         with config, session:
                             if trigger == "audit":
@@ -827,12 +830,12 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         ):
             body = next(request["body"] for request in adapter.requests if request["url"].endswith(path))
             assert name in body["deleted_roots"]
-            response_adapter = ReceiptAdapter(
-                respond=lambda body: {
-                    **ReceiptAdapter._default_response(body),
-                    "unauthorized_deleted_roots": list(body["deleted_roots"]),
-                }
-            )
+            response_adapter = ReceiptAdapter()
+            response_adapter.preparation_revisions = adapter.preparation_revisions
+            response_adapter._respond = lambda body: {
+                **response_adapter.default_response(body),
+                "unauthorized_deleted_roots": list(body["deleted_roots"]),
+            }
             config, session = response_adapter.patches()
             with config, session:
                 assert drain.push_now(self.device.pk, scope, force=True) is not None
@@ -846,12 +849,12 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from netbox_nso_plugin.models import NSOSwitchingRootDeletion
 
         self._delete_native_root(self._switchport, "Ethernet64")
-        adapter = ReceiptAdapter(
-            respond=lambda body: {
-                **ReceiptAdapter._default_response(body),
-                "unauthorized_deleted_roots": list(body["deleted_roots"]),
-            }
-        )
+        adapter = ReceiptAdapter()
+        adapter.preparation_revisions = self.adapter.preparation_revisions
+        adapter._respond = lambda body: {
+            **adapter.default_response(body),
+            "unauthorized_deleted_roots": list(body["deleted_roots"]),
+        }
         config, session = adapter.patches()
         with config, session:
             assert drain.push_now(self.device.pk, "switchport", force=True) is not None
@@ -1168,12 +1171,19 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
         ) as writer:
             writer.delete(deleted)
-        self.adapter._respond = lambda body: {
-            "status": "prepared",
-            "stream": "lag",
-            "selection_revision": 1,
-            "unauthorized_deleted_roots": list(body["deleted_roots"]),
-        }
+        selection_revision = 0
+
+        def respond(body):
+            nonlocal selection_revision
+            selection_revision += 1
+            return {
+                "status": "prepared",
+                "stream": "lag",
+                "selection_revision": selection_revision,
+                "unauthorized_deleted_roots": list(body["deleted_roots"]),
+            }
+
+        self.adapter._respond = respond
         config, session = self.adapter.patches()
         with config, session:
             assert drain.push_now(self.device.pk, "lacp", force=True) is not None

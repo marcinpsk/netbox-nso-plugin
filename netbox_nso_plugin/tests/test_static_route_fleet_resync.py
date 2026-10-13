@@ -22,8 +22,8 @@ import contextlib
 import threading
 from io import StringIO
 from unittest.mock import patch
-from uuid import uuid4
 
+import requests
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.core.management import CommandError, call_command
 from django.db import connection, transaction
@@ -31,11 +31,39 @@ from django.test import TransactionTestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
-from ._outbox_case import without_commit_drain
+from ._outbox_case import ReceiptAdapter, without_commit_drain
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 COMMAND = "nso_resync_static_route_intent"
+
+
+_DEFAULT_RESPONSE = object()
+
+
+def _apply_attempt(management):
+    from netbox_nso_plugin.models import NSOApplyAttempt
+
+    return NSOApplyAttempt.objects.create(management=management).pk
+
+
+@contextlib.contextmanager
+def _route_http(*, respond=None, response=_DEFAULT_RESPONSE, error=None):
+    adapter = ReceiptAdapter()
+    if respond is not None:
+
+        def at_http(body):
+            request = adapter.requests[-1]
+            device_id = int(request["url"].split("/devices/", 1)[1].split("/", 1)[0])
+            return respond(device_id, body["routes"])
+
+        adapter._respond = at_http
+    elif response is not _DEFAULT_RESPONSE:
+        adapter._respond = lambda _body: response
+    adapter.fail_with = error
+    config, session = adapter.patches()
+    with config, session:
+        yield adapter
 
 
 @contextlib.contextmanager
@@ -86,7 +114,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 management=mgmt,
                 static_route=sr,
                 status=status,
-                apply_attempt_id=uuid4() if status == "deploying" else None,
+                apply_attempt_id=_apply_attempt(mgmt) if status == "deploying" else None,
                 nso_prefix=prefix,
                 nso_next_hop=next_hop,
                 accepted_at=timezone.now(),
@@ -115,15 +143,12 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         state = self._own_route(mgmt, "10.60.0.0/16", "10.0.0.60")
 
         with patch("netbox_nso_plugin.intent_drift.compute_intent_drift", return_value=[]) as drift:
-            with patch(
-                "netbox_nso_plugin.adapter_client.put_static_route_intent",
-                return_value={"device_id": 8001, "count": 1, "routes": []},
-            ) as put:
+            with _route_http(response={"device_id": 8001, "count": 1, "routes": []}) as put:
                 results = resync_static_route_intent_fleet()
 
         drift.assert_not_called()
-        put.assert_called_once()
-        assert put.call_args.args[1][0]["route_id"] == state.static_route.pk
+        assert len(put.requests) == 1
+        assert put.requests[0]["body"]["routes"][0]["route_id"] == state.static_route.pk
         assert [r["ok"] for r in results] == [True]
 
     def test_pushes_store_only_and_carries_every_route_id(self):
@@ -144,7 +169,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             seen["routes"] = routes
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_record):
+        with _route_http(respond=_record):
             resync_static_route_intent_fleet()
 
         assert seen["store_only"] is True
@@ -167,10 +192,10 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         def _reject_one(adapter_device_id, routes):
             if adapter_device_id == 8004:
-                raise RuntimeError("422 duplicate_triple")
+                return 422, {"error": {"code": "duplicate_triple", "message": "duplicate route triple"}}
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_reject_one):
+        with _route_http(respond=_reject_one):
             results = resync_static_route_intent_fleet()
 
         by_device = {r["device_id"]: r for r in results}
@@ -192,7 +217,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
         out = StringIO()
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_reject_one):
+        with _route_http(respond=_reject_one):
             with self.assertRaises(CommandError) as raised:
                 call_command(COMMAND, stdout=out, stderr=StringIO())
 
@@ -205,13 +230,12 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self._own_route(mgmt, "10.66.0.0/16", "10.0.0.67")
 
         out = StringIO()
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_static_route_intent",
-            side_effect=lambda adapter_device_id, routes: {
+        with _route_http(
+            respond=lambda adapter_device_id, routes: {
                 "device_id": adapter_device_id,
                 "count": len(routes),
                 "routes": [],
-            },
+            }
         ):
             call_command(COMMAND, stdout=out, stderr=StringIO())
 
@@ -235,7 +259,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
         with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_malformed_echo),
+            _route_http(respond=_malformed_echo),
             self.assertLogs("netbox_nso_plugin.signals", level="ERROR"),
         ):
             results = resync_static_route_intent_fleet()
@@ -280,7 +304,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             return execute(sql, params, many, context)
 
         with (
-            patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_unacknowledged),
+            _route_http(respond=_unacknowledged),
             connection.execute_wrapper(die_on_the_restore),
             self.assertLogs("netbox_nso_plugin.intent_drift", level="ERROR"),
         ):
@@ -310,7 +334,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         def _answer(adapter_device_id, routes):
             return {"device_id": adapter_device_id, "count": answers[adapter_device_id], "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_answer):
+        with _route_http(respond=_answer):
             results = resync_static_route_intent_fleet()
 
         by_device = {r["device_id"]: r for r in results}
@@ -328,13 +352,12 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self._own_route(mgmt, "10.69.0.0/16", "10.0.0.70")
 
         out = StringIO()
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_static_route_intent",
-            side_effect=lambda adapter_device_id, routes: {
+        with _route_http(
+            respond=lambda adapter_device_id, routes: {
                 "device_id": adapter_device_id,
                 "count": len(routes),
                 "routes": [],
-            },
+            }
         ):
             with self.assertRaises(CommandError) as raised:
                 call_command(COMMAND, "--device", str(device.pk), "--device", "424242", stdout=out, stderr=StringIO())
@@ -369,7 +392,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 return None  # the adapter refused this device's intent
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_ack_but_one):
+        with _route_http(respond=_ack_but_one):
             results = resync_static_route_intent_fleet()
 
         by_device = {r["device_id"]: r for r in results}
@@ -395,20 +418,19 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         # The operator has to see the partial pass, and a re-run must arm nothing twice.
         out = StringIO()
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_ack_but_one):
+        with _route_http(respond=_ack_but_one):
             with self.assertRaises(CommandError) as raised:
                 call_command(COMMAND, stdout=out, stderr=StringIO())
         assert "fleet-genbad" in str(raised.exception)
         assert "0 generation(s) armed" in out.getvalue()
         assert "1 generation(s) rolled back" in out.getvalue()
 
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_static_route_intent",
-            side_effect=lambda adapter_device_id, routes: {
+        with _route_http(
+            respond=lambda adapter_device_id, routes: {
                 "device_id": adapter_device_id,
                 "count": len(routes),
                 "routes": [],
-            },
+            }
         ):
             second_pass = {r["device_id"]: r for r in resync_static_route_intent_fleet()}
 
@@ -454,9 +476,9 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             self.assertEqual(skipped.intent_generation, UNALLOCATED)
             self.assertEqual(_restore_static_route_generations(armed), 1)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
+        with _route_http() as put:
             results = resync_static_route_intent_fleet()
-        put.assert_not_called()
+        assert put.requests == []
 
         carried.refresh_from_db()
         skipped.refresh_from_db()
@@ -529,18 +551,21 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         device tab shows and what the operator acts on. The arming is undone by an explicit
         inverse now, so the two are independent, and this is what keeps them so.
         """
-        from netbox_nso_plugin.adapter_client import AdapterError
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
 
         _, mgmt = self._managed_device("keepreason", 8106)
         row = self._own_route(mgmt, "10.79.0.0/16", "10.0.0.80")
 
         def _reject(adapter_device_id, routes):
-            raise AdapterError(
-                "422 duplicate_triple", code="duplicate_triple", detail={"route_ids": [row.static_route_id]}
-            )
+            return 422, {
+                "error": {
+                    "code": "duplicate_triple",
+                    "message": "duplicate route triple",
+                    "detail": {"route_ids": [row.static_route_id]},
+                }
+            }
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_reject):
+        with _route_http(respond=_reject):
             results = resync_static_route_intent_fleet()
 
         mgmt.refresh_from_db()
@@ -570,7 +595,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         _, mgmt = self._managed_device("staleclaim", 8108)
         row = self._own_route(mgmt, "10.81.0.0/16", "10.0.0.82")
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=ConnectionError("down")):
+        with _route_http(error=requests.exceptions.ConnectionError("down")):
             assert drain.drain_key(mgmt.device_id, "static_route") == drain.FAILED
         NSOIntentOutboxState.objects.filter(device_id=mgmt.device_id, scope="static_route").update(
             claimed_at=timezone.now() - 2 * drain.LEASE
@@ -581,7 +606,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             sent.append({"routes": routes, "store_only": adapter_client._store_only_push.get()})
             return {"device_id": adapter_device_id, "count": len(routes), "routes": []}
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_record):
+        with _route_http(respond=_record):
             results = resync_static_route_intent_fleet()
 
         row.refresh_from_db()
@@ -622,7 +647,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 live.save(update_fields=list(_STATIC_ROUTE_ARMED_FIELDS))
             edited["generation"] = live.intent_generation
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", side_effect=_edit_then_refuse):
+        with _route_http(respond=_edit_then_refuse):
             results = resync_static_route_intent_fleet()
 
         row.refresh_from_db()
@@ -659,13 +684,10 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
                     locked.status = status
                     if status == "deploying":
-                        locked.apply_attempt_id = uuid4()
+                        locked.apply_attempt_id = _apply_attempt(mgmt)
                     locked.save(update_fields=fields)
 
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_static_route_intent",
-            side_effect=_change_statuses_then_refuse,
-        ):
+        with _route_http(respond=_change_statuses_then_refuse):
             results = resync_static_route_intent_fleet()
 
         for row, status in ((deploying, "deploying"), (in_sync, "in_sync")):
@@ -874,10 +896,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 locked.status = "in_sync"
                 locked.save(update_fields=["status"])
 
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_static_route_intent",
-            side_effect=_move_one_then_refuse,
-        ):
+        with _route_http(respond=_move_one_then_refuse):
             results = resync_static_route_intent_fleet()
 
         restored.refresh_from_db()
@@ -916,8 +935,6 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         breaks out of ``_safe_restore``, leaving the row armed on a generation the adapter
         never stored. The inverse disables re-pending while it restores the captured Apply identity.
         """
-        from uuid import uuid4
-
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
         from netbox_nso_plugin.intent_generation import UNALLOCATED
         from netbox_nso_plugin.intent_state import mirror_refresh
@@ -927,7 +944,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         _, mgmt = self._managed_device("deploying-rollback", 8111)
         accepted = self._own_route(mgmt, "10.86.0.0/16", "10.0.0.87")
         deploying = self._own_route(mgmt, "10.87.0.0/16", "10.0.0.88")
-        attempt_id = uuid4()
+        attempt_id = _apply_attempt(mgmt)
         current = NSOStaticRouteState.objects.get(pk=deploying.pk)
         fields = {"status", "apply_attempt_id"}
         with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
@@ -935,7 +952,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
             locked.apply_attempt_id = attempt_id
             locked.save(update_fields=fields)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=None):
+        with _route_http(response=None):
             results = resync_static_route_intent_fleet()
 
         accepted.refresh_from_db()
@@ -957,8 +974,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         _, mgmt = self._managed_device("two-deploying-rollback", 8113)
         first = self._own_route(mgmt, "198.18.86.0/24", "198.18.0.86")
         second = self._own_route(mgmt, "198.18.87.0/24", "198.18.0.87")
-        first_attempt_id = uuid4()
-        second_attempt_id = uuid4()
+        first_attempt_id = _apply_attempt(mgmt)
+        second_attempt_id = _apply_attempt(mgmt)
         fields = {"status", "apply_attempt_id"}
         for state, attempt_id in ((first, first_attempt_id), (second, second_attempt_id)):
             current = NSOStaticRouteState.objects.get(pk=state.pk)
@@ -972,7 +989,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert (first.status, first.apply_attempt_id) == ("deploying", first_attempt_id)
         assert (second.status, second.apply_attempt_id) == ("deploying", second_attempt_id)
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent", return_value=None):
+        with _route_http(response=None):
             results = resync_static_route_intent_fleet()
 
         first.refresh_from_db()
@@ -1003,13 +1020,12 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         owned_since = deploying.accepted_at
         assert NSOStaticRouteState.objects.get(pk=deploying.pk).status == "deploying"
 
-        with patch(
-            "netbox_nso_plugin.adapter_client.put_static_route_intent",
-            side_effect=lambda adapter_device_id, routes: {
+        with _route_http(
+            respond=lambda adapter_device_id, routes: {
                 "device_id": adapter_device_id,
                 "count": len(routes),
                 "routes": [],
-            },
+            }
         ):
             resync_static_route_intent_fleet()
 
@@ -1033,8 +1049,6 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         snapshot this pass returns tells the demotion apart from that, so it is what pins the
         branch.
         """
-        from uuid import uuid4
-
         from django.db.models.signals import pre_save
 
         from netbox_nso_plugin.intent_drift import _backfill_static_route_generations
@@ -1045,7 +1059,7 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         _, mgmt = self._managed_device("armdemote", 8112)
         route = self._own_route(mgmt, "10.88.0.0/16", "10.0.0.89")
-        attempt_id = uuid4()
+        attempt_id = _apply_attempt(mgmt)
         current = NSOStaticRouteState.objects.get(pk=route.pk)
         fields = {"status", "apply_attempt_id"}
         with transaction.atomic(), suppress_intent_push(), mirror_refresh(current, fields) as locked:
@@ -1087,8 +1101,8 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 device=device, nso_instance=inst, nso_device_name="nso-fleet-unlinked", adapter_device_id=None
             )
 
-        with patch("netbox_nso_plugin.adapter_client.put_static_route_intent") as put:
+        with _route_http() as put:
             results = resync_static_route_intent_fleet()
 
-        put.assert_not_called()
+        assert put.requests == []
         assert results == []

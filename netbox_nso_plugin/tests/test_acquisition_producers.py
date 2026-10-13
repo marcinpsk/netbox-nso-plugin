@@ -91,13 +91,12 @@ PRODUCERS = {
 }
 
 CONTINUATIONS = {
-    ("apply_state.py", "promote_current_intent"): (2, "Promote only accepted or apply_failed rows."),
+    ("durable_capture.py", "_snapshot"): (3, "Snapshot values do not acquire overlay ownership."),
     ("forms.py", "NSOInterfaceMtuStateForm.save"): (2, "Repends owned rows; unowned edits remain changed."),
     ("intent_drift.py", "_backfill_static_route_generations"): (2, "Repends deploying static routes only."),
     ("intent_state.py", "_repend_locked_rows"): (1, "Repends previously owned rows under the scope locks."),
     ("renderer_audit.py", "_repair_plan"): (3, "Repairs rows selected from owned statuses."),
     ("settlement.py", "_settle"): (1, "Correlated Apply verdicts preserve existing ownership."),
-    ("views.py", "_rollback_prepare_apply"): (1, "Restores owned rows selected by the Apply attempt."),
     ("vlan_reconciler.py", "save_vlan_content"): (1, "Repends only owned attachments after a native edit."),
 }
 

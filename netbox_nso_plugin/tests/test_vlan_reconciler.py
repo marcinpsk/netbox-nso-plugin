@@ -20,9 +20,9 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-from ._outbox_case import without_commit_drain
+from ._outbox_case import ReceiptAdapter, without_commit_drain
 from ._ownership_case import acquire_overlay, save_overlay_fixture
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 def _make_device(tag="m34"):
@@ -2191,36 +2191,32 @@ class TestVlanApplyPush(_CascadeFlushMixin, IntentPushResetMixin, TransactionTes
             )
 
     def test_prepare_apply_pushes_vlan_intent(self):
-        """_prepare_apply ships owned VLAN intent (not just LACP/switchport)."""
-        from unittest.mock import patch
-
+        """_prepare_apply ships the current owned VLAN through a forced receipt."""
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.views import _prepare_apply
 
-        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}):
-            drain.drain_key(self.device.pk, "vlan")  # the acknowledged baseline, carrying "OLD"
         from ._outbox_case import content_update
 
-        content_update(self.state.vlan, name="LIVE_RENAMED")
-
-        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as rename_push:
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            self.assertEqual(drain.drain_key(self.device.pk, "vlan"), drain.SUCCEEDED)
+            with without_commit_drain():
+                content_update(self.state.vlan, name="LIVE_RENAMED")
+            self.assertEqual(drain.drain_key(self.device.pk, "vlan"), drain.SUCCEEDED)
+            vlan_pushes = [request for request in adapter.requests if request["url"].endswith("/vlan-intent")]
+            self.assertEqual(len(vlan_pushes), 2)
             drain.drain_key(self.device.pk, "vlan")
-        rename_push.assert_called_once()
+            self.assertEqual(
+                len([request for request in adapter.requests if request["url"].endswith("/vlan-intent")]), 2
+            )
+            _prepared, selected = _prepare_apply(self.management)
 
-        # The rename claim is acknowledged, so another ordinary drain sends nothing.
-        with patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as unforced:
-            drain.drain_key(self.device.pk, "vlan")
-        unforced.assert_not_called()
-
-        # Every other scope is isolated from the registry, so this asserts on the VLAN push
-        # alone instead of relying on _prepare_apply swallowing the others' adapter failures.
-        with (
-            isolate_other_scopes("vlan"),
-            patch("netbox_nso_plugin.adapter_client.put_vlan_intent", return_value={}) as mock_vlan,
-        ):
-            _prepare_apply(self.management)
-        mock_vlan.assert_called_once()
-        self.assertEqual(mock_vlan.call_args[0][1], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
+        vlan_pushes = [request for request in adapter.requests if request["url"].endswith("/vlan-intent")]
+        self.assertEqual(len(vlan_pushes), 3)
+        self.assertEqual(vlan_pushes[-1]["body"]["vlans"], [{"vlan_id": 2213, "name": "LIVE_RENAMED"}])
+        self.assertEqual(vlan_pushes[-1]["params"].get("store_only"), "true")
+        self.assertEqual(vlan_pushes[-1]["push_seq"], selected["vlan"])
 
     def test_foreign_vlan_rename_commits_without_plugin_bookkeeping(self):
         from netbox_nso_plugin.models import NSOIntentOutboxEntry

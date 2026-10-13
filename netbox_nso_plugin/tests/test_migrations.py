@@ -154,6 +154,60 @@ class TestRefusalLedgerMigration(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(logging.last_apply_error, "")
 
 
+class TestDirectSelectionMigration(_CascadeFlushMixin, TransactionTestCase):
+    def test_direct_selection_upgrade_preserves_captured_evidence(self):
+        from django.db import IntegrityError, transaction
+        from django.db.migrations.executor import MigrationExecutor
+        from django.utils import timezone
+
+        from ._outbox_case import make_managed
+
+        _device, management = make_managed("direct-selection-migration", 1767)
+        executor = MigrationExecutor(connection)
+        leaves = executor.loader.graph.leaf_nodes(APP)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
+        parent = (APP, "0035_bgp_router_state")
+        executor.migrate([parent])
+        old = executor.loader.project_state([parent]).apps
+        selection = old.get_model(APP, "NSOAcceptedSelection").objects.create(
+            management_id=management.pk,
+            mapping_epoch="a" * 64,
+            stream="vlan",
+            source_push_seq=41,
+            plugin_revision=7,
+            request_digest="b" * 64,
+            contributor_manifest=[{"model_label": "netbox_nso_plugin.nsovlanstate", "overlay_pk": 17}],
+        )
+        before = old.get_model(APP, "NSOAcceptedSelection").objects.filter(pk=selection.pk).values().get()
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaves)
+        current = executor.loader.project_state(leaves).apps
+        model = current.get_model(APP, "NSOAcceptedSelection")
+        self.assertEqual(model.objects.filter(pk=selection.pk).values().get(), before)
+        values = {
+            "management_id": management.pk,
+            "mapping_epoch": "c" * 64,
+            "stream": "lag",
+            "plugin_revision": 8,
+            "request_digest": "d" * 64,
+        }
+        provisional = model.objects.create(**values)
+        self.assertIsNone(provisional.source_push_seq)
+        self.assertIsNone(provisional.selection_revision)
+        for changes in (
+            {"stream": "vlan"},
+            {"acknowledged_at": timezone.now()},
+            {"binding_state": "bound", "store_incarnation": "placeholder-store", "frozen_revision": 1},
+            {"selection_revision": 0},
+        ):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                model.objects.create(**(values | changes))
+        provisional.selection_revision = 91
+        provisional.acknowledged_at = timezone.now()
+        provisional.save(update_fields=("selection_revision", "acknowledged_at"))
+        self.assertEqual(model.objects.get(pk=provisional.pk).selection_revision, 91)
+
+
 class TestBGPRouterMigration(_CascadeFlushMixin, TransactionTestCase):
     def test_bgp_router_schema_upgrades_from_refusal_ledger(self):
         from django.db.migrations.executor import MigrationExecutor
@@ -245,7 +299,7 @@ class TestBGPRouterMigration(_CascadeFlushMixin, TransactionTestCase):
             row.refresh_from_db()
             self.assertEqual(row.model_label, router_label)
         additions = [name for (app, name) in executor.loader.disk_migrations if app == APP and name > parent[1]]
-        self.assertEqual(len(additions), 1)
+        self.assertEqual(sorted(additions), ["0035_bgp_router_state", "0036_direct_selection_capture"])
 
     def test_router_label_is_persistable_after_ledger_migration(self):
         from django.apps import apps
