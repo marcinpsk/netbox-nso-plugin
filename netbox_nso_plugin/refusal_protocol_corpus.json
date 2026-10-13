@@ -1,0 +1,689 @@
+{
+  "description": "Shared refusal-protocol contract cases. Both repos run them against their generated codec.",
+  "row_refs": [
+    {
+      "name": "static-route-global-interface-only",
+      "family": "static-route",
+      "subject": "static-route.route",
+      "natural_path": [
+        [
+          "route",
+          [
+            "",
+            "10.0.0.0/8",
+            ""
+          ]
+        ]
+      ],
+      "canonical": "[\"static-route\",\"static-route.route\",[[\"route\",[\"\",\"10.0.0.0/8\",\"\"]]]]",
+      "key": "2714c7cd1e054027c8a48b4d344c15a3e947dbba92a84cb54face016e38cb9be"
+    },
+    {
+      "name": "static-route-vrf-ipv6",
+      "family": "static-route",
+      "subject": "static-route.route",
+      "natural_path": [
+        [
+          "route",
+          [
+            "CUST-A",
+            "2001:db8::/32",
+            "2001:db8::1"
+          ]
+        ]
+      ],
+      "canonical": "[\"static-route\",\"static-route.route\",[[\"route\",[\"CUST-A\",\"2001:db8::/32\",\"2001:db8::1\"]]]]",
+      "key": "7f6b21e0a530775ec5d39e55d335816bd1e6f530f0a3d6266d020f8c2d4460ba"
+    },
+    {
+      "name": "static-route-singleton",
+      "family": "static-route",
+      "subject": "static-route",
+      "natural_path": [],
+      "canonical": "[\"static-route\",\"static-route\",[]]",
+      "key": "2d6b84df6eb8d7d70eea10c02663b52eccf8d292919937cce1103919879c3baf"
+    },
+    {
+      "name": "interface-description",
+      "family": "interface",
+      "subject": "interface.description",
+      "natural_path": [
+        [
+          "interface",
+          [
+            "GigabitEthernet0/1"
+          ]
+        ]
+      ],
+      "canonical": "[\"interface\",\"interface.description\",[[\"interface\",[\"GigabitEthernet0/1\"]]]]",
+      "key": "23b507616227dafa7ce998ad33a2131c9c619ca261717c1a73cbbd8084b6375d"
+    },
+    {
+      "name": "interface-ipv4-address",
+      "family": "interface",
+      "subject": "interface.ipv4-address",
+      "natural_path": [
+        [
+          "interface",
+          [
+            "GigabitEthernet0/1"
+          ]
+        ],
+        [
+          "ipv4-address",
+          [
+            "192.0.2.1/24"
+          ]
+        ]
+      ],
+      "canonical": "[\"interface\",\"interface.ipv4-address\",[[\"interface\",[\"GigabitEthernet0/1\"]],[\"ipv4-address\",[\"192.0.2.1/24\"]]]]",
+      "key": "a2335f17043fd85fc7aee90cdf38061764c0e27d2019180541f3c15aa927af9c"
+    },
+    {
+      "name": "bgp-peer-global-scope",
+      "family": "bgp",
+      "subject": "bgp.router.scope.peer",
+      "natural_path": [
+        [
+          "router",
+          [
+            "65001"
+          ]
+        ],
+        [
+          "scope",
+          [
+            ""
+          ]
+        ],
+        [
+          "peer",
+          [
+            "192.0.2.1"
+          ]
+        ]
+      ],
+      "canonical": "[\"bgp\",\"bgp.router.scope.peer\",[[\"router\",[\"65001\"]],[\"scope\",[\"\"]],[\"peer\",[\"192.0.2.1\"]]]]",
+      "key": "94cb63598b0cdc6f7001bc3aafee62d5a8459557cd9cf740117fa9fe98156b32"
+    },
+    {
+      "name": "non-ascii-key-escapes",
+      "family": "interface",
+      "subject": "interface.enabled",
+      "natural_path": [
+        [
+          "interface",
+          [
+            "Gi0/1-\u00fc"
+          ]
+        ]
+      ],
+      "canonical": "[\"interface\",\"interface.enabled\",[[\"interface\",[\"Gi0/1-\\u00fc\"]]]]",
+      "key": "488437ef1169b82b8432502856faadba6559a2c45ca3be208d19eae03785f571"
+    }
+  ],
+  "valid": [
+    {
+      "name": "one-static-route-refusal",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "static-route",
+          "row": {
+            "subject": "static-route.route",
+            "key": "339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f"
+          },
+          "field": "static-route.next_hop_vrf",
+          "reason": "inexpressible-on-ned",
+          "message_id": "static-route.next-hop-vrf-no-home",
+          "message": "This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "two-families-in-family-order",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"vlan\",\"row\":{\"subject\":\"vlan\",\"key\":\"03d70c457b5f7a6957bc2b127af45fb88b6b25ee732bddae37ca20ba51bd3d81\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":null},{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "vlan",
+          "row": {
+            "subject": "vlan",
+            "key": "03d70c457b5f7a6957bc2b127af45fb88b6b25ee732bddae37ca20ba51bd3d81"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": null
+        },
+        {
+          "family": "static-route",
+          "row": {
+            "subject": "static-route.route",
+            "key": "339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f"
+          },
+          "field": "static-route.next_hop_vrf",
+          "reason": "inexpressible-on-ned",
+          "message_id": "static-route.next-hop-vrf-no-home",
+          "message": "This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "related-site-with-row-and-field",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.metric\",\"reason\":\"ownership-conflict\",\"message_id\":\"write-site-conflict\",\"message\":\"Another family writes a different value to the same device setting in this transaction.\",\"related\":{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp.router.scope.peer\",\"key\":\"94cb63598b0cdc6f7001bc3aafee62d5a8459557cd9cf740117fa9fe98156b32\"},\"field\":\"bgp.peer.remote_as\"}}]}",
+      "refusals": [
+        {
+          "family": "static-route",
+          "row": {
+            "subject": "static-route.route",
+            "key": "339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f"
+          },
+          "field": "static-route.metric",
+          "reason": "ownership-conflict",
+          "message_id": "write-site-conflict",
+          "message": "Another family writes a different value to the same device setting in this transaction.",
+          "related": {
+            "family": "bgp",
+            "row": {
+              "subject": "bgp.router.scope.peer",
+              "key": "94cb63598b0cdc6f7001bc3aafee62d5a8459557cd9cf740117fa9fe98156b32"
+            },
+            "field": "bgp.peer.remote_as"
+          }
+        }
+      ]
+    },
+    {
+      "name": "related-site-of-an-unconverted-family",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.tag\",\"reason\":\"ownership-conflict\",\"message_id\":\"write-site-conflict\",\"message\":\"Another family writes a different value to the same device setting in this transaction.\",\"related\":{\"family\":\"snmp\",\"row\":null,\"field\":null}}]}",
+      "refusals": [
+        {
+          "family": "static-route",
+          "row": {
+            "subject": "static-route.route",
+            "key": "339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f"
+          },
+          "field": "static-route.tag",
+          "reason": "ownership-conflict",
+          "message_id": "write-site-conflict",
+          "message": "Another family writes a different value to the same device setting in this transaction.",
+          "related": {
+            "family": "snmp",
+            "row": null,
+            "field": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "maximum-record-set",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"vlan\",\"row\":{\"subject\":\"vlan\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"interface\",\"row\":{\"subject\":\"interface.description\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"interface.attrs.description\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"subinterface\",\"row\":{\"subject\":\"subinterface\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"svi\",\"row\":{\"subject\":\"svi\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"switchport\",\"row\":{\"subject\":\"switchport\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"mtu\",\"row\":{\"subject\":\"mtu\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"l2-sap\",\"row\":{\"subject\":\"l2-sap\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\",\"reason\":\"ownership-conflict\",\"message_id\":\"static-route.device-hop-unmodeled\",\"message\":\"The device route has next-hop settings the static-route model cannot show (for example a track binding or per-hop qualifiers); adopting it would delete them on retract.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"bfd\",\"row\":{\"subject\":\"bfd\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"ospf\",\"row\":{\"subject\":\"ospf\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp.router.scope.peer\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"bgp.peer.peer_group\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"snmp\",\"row\":{\"subject\":\"snmp\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}},{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"field\":\"static-route.interface_next_hop\"}}]}",
+      "refusals": [
+        {
+          "family": "vlan",
+          "row": {
+            "subject": "vlan",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "interface",
+          "row": {
+            "subject": "interface.description",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": "interface.attrs.description",
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "subinterface",
+          "row": {
+            "subject": "subinterface",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "svi",
+          "row": {
+            "subject": "svi",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "switchport",
+          "row": {
+            "subject": "switchport",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "mtu",
+          "row": {
+            "subject": "mtu",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "l2-sap",
+          "row": {
+            "subject": "l2-sap",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "static-route",
+          "row": {
+            "subject": "static-route.route",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": "static-route.interface_next_hop",
+          "reason": "ownership-conflict",
+          "message_id": "static-route.device-hop-unmodeled",
+          "message": "The device route has next-hop settings the static-route model cannot show (for example a track binding or per-hop qualifiers); adopting it would delete them on retract.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "bfd",
+          "row": {
+            "subject": "bfd",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "ospf",
+          "row": {
+            "subject": "ospf",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "bgp",
+          "row": {
+            "subject": "bgp.router.scope.peer",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": "bgp.peer.peer_group",
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "snmp",
+          "row": {
+            "subject": "snmp",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        },
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "write-blocked",
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "related": {
+            "family": "static-route",
+            "row": {
+              "subject": "static-route.route",
+              "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            },
+            "field": "static-route.interface_next_hop"
+          }
+        }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "truncated",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reaso",
+      "claims": true
+    },
+    {
+      "name": "duplicate-member",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "unknown-family",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"ntp\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "invented-message",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"the device carries community s3cret\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "reason-mismatch",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"invalid-value\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "unknown-message-id",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.no-such-message\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "trailing-text",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]} (see log)",
+      "claims": true
+    },
+    {
+      "name": "prefixed-by-nso",
+      "message": "Python cb_create error. device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "out-of-order-families",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":null},{\"family\":\"vlan\",\"row\":{\"subject\":\"vlan\",\"key\":\"03d70c457b5f7a6957bc2b127af45fb88b6b25ee732bddae37ca20ba51bd3d81\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"write-blocked\",\"message\":\"The device rejected a value this intent requires, and the field cannot be left out.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "two-records-one-family",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null},{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.metric\",\"reason\":\"ownership-conflict\",\"message_id\":\"write-site-conflict\",\"message\":\"Another family writes a different value to the same device setting in this transaction.\",\"related\":{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp.router.scope.peer\",\"key\":\"94cb63598b0cdc6f7001bc3aafee62d5a8459557cd9cf740117fa9fe98156b32\"},\"field\":\"bgp.peer.remote_as\"}}]}",
+      "claims": true
+    },
+    {
+      "name": "not-compact",
+      "message": "device-intent: refused {\n \"refusals\": [\n  {\n   \"family\": \"static-route\",\n   \"row\": {\n    \"subject\": \"static-route.route\",\n    \"key\": \"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"\n   },\n   \"field\": \"static-route.next_hop_vrf\",\n   \"reason\": \"inexpressible-on-ned\",\n   \"message_id\": \"static-route.next-hop-vrf-no-home\",\n   \"message\": \"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\n   \"related\": null\n  }\n ]\n}",
+      "claims": true
+    },
+    {
+      "name": "empty-set",
+      "message": "device-intent: refused {\"refusals\":[]}",
+      "claims": true
+    },
+    {
+      "name": "missing-member",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\"}]}",
+      "claims": true
+    },
+    {
+      "name": "extra-member",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null,\"detail\":\"x\"}]}",
+      "claims": true
+    },
+    {
+      "name": "extra-top-level-member",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}],\"version\":\"1\"}",
+      "claims": true
+    },
+    {
+      "name": "bad-digest",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339EAAB1FD999232B9B1B7AAA4FBDC8DA38BD17335DCC2E4A27700964F9E226F\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "short-digest",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "unknown-subject",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.hop\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "subject-of-another-family",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"bgp.router.scope.peer\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "null-row",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":null,\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "undeclared-field",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"bgp.peer.remote_as\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "message-of-another-family",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"vlan\",\"row\":{\"subject\":\"vlan\",\"key\":\"03d70c457b5f7a6957bc2b127af45fb88b6b25ee732bddae37ca20ba51bd3d81\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "related-field-without-row",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":{\"family\":\"bgp\",\"row\":null,\"field\":\"bgp.peer.remote_as\"}}]}",
+      "claims": true
+    },
+    {
+      "name": "related-unknown-family",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":{\"family\":\"ntp\",\"row\":null,\"field\":null}}]}",
+      "claims": true
+    },
+    {
+      "name": "escaped-ascii",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static\\u002droute\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "non-finite-number",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":NaN,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "missing-space-after-marker",
+      "message": "device-intent: refused{\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": true
+    },
+    {
+      "name": "over-bound",
+      "message": "device-intent: refused {\"refusals\":[                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ]}",
+      "claims": true
+    },
+    {
+      "name": "plain-device-error",
+      "message": "Device rejected the commit: bad value",
+      "claims": false
+    },
+    {
+      "name": "internal-fault",
+      "message": "device-intent: internal fault, the transaction was not committed; the NSO python-vm log has the details",
+      "claims": false
+    },
+    {
+      "name": "bare-json",
+      "message": "{\"refusals\":[{\"family\":\"static-route\",\"row\":{\"subject\":\"static-route.route\",\"key\":\"339eaab1fd999232b9b1b7aaa4fbdc8da38bd17335dcc2e4a27700964f9e226f\"},\"field\":\"static-route.next_hop_vrf\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"static-route.next-hop-vrf-no-home\",\"message\":\"This NED has no next-hop VRF selector for static routes; the route would resolve its next hop in its own table.\",\"related\":null}]}",
+      "claims": false
+    }
+  ]
+}

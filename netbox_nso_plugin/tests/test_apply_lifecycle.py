@@ -47,6 +47,11 @@ class TestApplyAttemptSchema(SimpleTestCase):
                 "selected",
                 "http_status",
                 "response",
+                "trigger_kind",
+                "adapter_apply_attempt_id",
+                "source_epoch",
+                "lifecycle",
+                "completed_at",
             },
             {field.name for field in attempt._meta.fields if field.name not in {"id", "created_at", "last_updated"}},
         )

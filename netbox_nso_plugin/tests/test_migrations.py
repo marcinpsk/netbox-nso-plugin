@@ -85,6 +85,14 @@ class TestMigrationGraph(SimpleTestCase):
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
+        state = loader.project_state([(APP, leaves[0])])
+        for name in (
+            "nsoacceptedselection",
+            "nsoapplyexecution",
+            "nsoapplyoverlaysnapshot",
+            "nsooverlaysettlementfence",
+        ):
+            assert (APP, name) in state.models, f"missing refusal ledger model: {name}"
 
 
 class TestMigrationsMatchTheModels(TestCase):
@@ -97,6 +105,51 @@ class TestMigrationsMatchTheModels(TestCase):
             call_command("makemigrations", APP, check=True, dry_run=True, verbosity=1, stdout=out)
         except SystemExit:
             self.fail(f"{APP} has model changes with no migration:\n{out.getvalue()}")
+        from django.apps import apps
+
+        for name in (
+            "NSOAcceptedSelection",
+            "NSOApplyExecution",
+            "NSOApplyOverlaySnapshot",
+            "NSOOverlaySettlementFence",
+        ):
+            self.assertIsNotNone(apps.get_model(APP, name))
+
+
+class TestRefusalLedgerMigration(_CascadeFlushMixin, TransactionTestCase):
+    def test_refusal_schema_upgrades_from_family_observation(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        from ._outbox_case import make_device
+
+        device = make_device("refusal-migration")
+        instance = NSOInstance.objects.create(name="placeholder-migration", adapter_instance_id="placeholder-migration")
+        management = NSODeviceManagement.objects.create(
+            device=device, nso_instance=instance, nso_device_name="placeholder-device", adapter_device_id=17
+        )
+        executor = MigrationExecutor(connection)
+        leaves = executor.loader.graph.leaf_nodes(APP)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
+        parent = (APP, "0033_family_observation")
+        executor.migrate([parent])
+        old = executor.loader.project_state([parent]).apps
+        attempt = old.get_model(APP, "NSOApplyAttempt").objects.create(management_id=management.pk)
+        host = old.get_model(APP, "NSOLoggingHostState").objects.create(
+            management_id=management.pk, address="192.0.2.1", status="accepted"
+        )
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaves)
+        current = executor.loader.project_state(leaves).apps
+        upgraded = current.get_model(APP, "NSOApplyAttempt").objects.get(pk=attempt.pk)
+        self.assertEqual(upgraded.trigger_kind, "manual")
+        self.assertIsNone(upgraded.completed_at)
+        logging = current.get_model(APP, "NSOLoggingHostState").objects.get(pk=host.pk)
+        self.assertEqual(logging.status, "accepted")
+        self.assertIsNone(logging.last_apply_at)
+        self.assertIsNone(logging.apply_attempt_id)
+        self.assertEqual(logging.last_apply_error, "")
 
 
 class TestDeploymentControlMigration(TestCase):
@@ -271,9 +324,9 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
         self._migrate(DEPLOYMENT_CONTROL)
         self._migrate(APPLY_IDENTITY)
 
-        single.refresh_from_db()
-        peer.refresh_from_db()
-        point_to_point.refresh_from_db()
+        single.refresh_from_db(fields=["allocation_kind"])
+        peer.refresh_from_db(fields=["allocation_kind"])
+        point_to_point.refresh_from_db(fields=["allocation_kind"])
         self.assertEqual(single.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
         self.assertEqual(peer.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
         self.assertEqual(point_to_point.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
