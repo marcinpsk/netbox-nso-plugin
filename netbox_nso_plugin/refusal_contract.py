@@ -159,6 +159,10 @@ def validate_generation(raw) -> dict:
     )
     for field in ("carrier_job_result", "carrier_job_error"):
         _require(raw[field] is None or isinstance(raw[field], dict), "invalid carrier snapshot")
+    _require(
+        raw["carrier_job_status"] != "succeeded" or isinstance(raw["carrier_job_result"], dict),
+        "succeeded carrier without result",
+    )
     if raw["status"] == "settled":
         _require(
             raw["carrier_job_status"] == "succeeded"

@@ -138,6 +138,15 @@ def test_cutover_generation_rejects_invalid_terminal_evidence(field, value):
         validate_generation(raw)
 
 
+def test_cutover_generation_rejects_succeeded_carrier_without_result():
+    from netbox_nso_plugin.refusal_contract import ContractError, validate_generation
+
+    raw = generation()
+    raw.update(status="failed", carrier_job_result=None, row_outcomes=None, refusals=None)
+    with pytest.raises(ContractError, match="succeeded carrier without result"):
+        validate_generation(raw)
+
+
 def test_cutover_generation_preserves_nullable_preterminal_projections():
     from netbox_nso_plugin.refusal_contract import validate_generation
 
