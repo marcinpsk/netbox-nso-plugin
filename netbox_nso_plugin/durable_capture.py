@@ -123,11 +123,32 @@ def _selector(manifest, selector):
     return manifest
 
 
+def _redact_error(value, secrets):
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, "[redacted]")
+    elif isinstance(value, dict):
+        value = {key: _redact_error(child, secrets) for key, child in value.items()}
+    elif isinstance(value, list):
+        value = [_redact_error(child, secrets) for child in value]
+    return value
+
+
 def _snapshot(attempt, selection, owner, row, revisions, *, promote=False, at=None, secrets=()):
-    from .intent_state import canonical_fragment
+    from .intent_state import canonical_fragment, mirror_refresh
+    from .signals import suppress_intent_push
 
     error = json.dumps(row.last_apply_error, ensure_ascii=False)
     secrets = set(secrets) | _secret_values(canonical_fragment(row))
+    if any(secret in error for secret in secrets):
+        redacted = _redact_error(row.last_apply_error, sorted(secrets, key=len, reverse=True))
+        with suppress_intent_push(), mirror_refresh(row, ("last_apply_error",)) as target:
+            if target is None:
+                raise RegistryError("captured overlay disappeared before error redaction")
+            target.last_apply_error = redacted
+            target.save(update_fields=("last_apply_error",))
+        row.last_apply_error = redacted
+        error = json.dumps(row.last_apply_error, ensure_ascii=False)
     if any(secret in error for secret in secrets):
         raise RegistryError("snapshot bookkeeping contains an emitted secret")
     spec = OVERLAYS[row._meta.label_lower]
