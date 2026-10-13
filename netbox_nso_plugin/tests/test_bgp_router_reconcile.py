@@ -334,3 +334,28 @@ def test_unqualified_owned_router_still_marks_reported_peers_seen(router_case):
     import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
     peer.refresh_from_db()
     assert peer.status == "in_sync"
+
+
+@pytest.mark.parametrize("unusable_router", [False, True], ids=["usable", "observation-only"])
+@pytest.mark.parametrize("status", ["accepted", "in_sync", "imported"])
+def test_peer_read_preserves_owned_intent(router_case, status, unusable_router):
+    from ipam.models import ASN
+
+    from netbox_nso_plugin.models import NSOBGPPeerState
+    from netbox_nso_plugin.status_machine import is_owned
+
+    _device, management = router_case
+    state, _ = import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
+    peer = NSOBGPPeerState.objects.get(management=management, peer_address_str="192.0.2.1")
+    with without_commit_drain():
+        state = content_update(state, status="accepted")
+        peer = content_update(peer, status=status)
+        if unusable_router:
+            router = state.bgp_router
+            router.asn = ASN.objects.create(asn=64999, rir=router.asn.rir)
+            router.save()
+    observed = {**peer_entry(), "remote_as": "64514", "enabled": False}
+    import_router(router_case, scopes=[scope_entry(peers=[observed])])
+    peer.refresh_from_db()
+    assert (peer.remote_as_str, peer.enabled) == (("64513", True) if is_owned(status) else ("64514", False))
+    assert peer.last_sync_at is not None

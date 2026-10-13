@@ -1106,8 +1106,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.peer_state_raw_keys,
         )
         state.bgp_peer = peer
-        state.remote_as_str = str(entry.get("remote_as") or "")
-        state.enabled = entry.get("enabled")
+        state.remote_as_str, state.enabled = (
+            (str(entry.get("remote_as") or ""), entry.get("enabled"))
+            if not sm.is_owned(state.status)
+            else (state.remote_as_str, state.enabled)
+        )
         state.last_sync_at = self.planned_at
         device_hash = _content_hash(
             _peer_device_content(
@@ -1378,8 +1381,9 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if created
             else copy.copy(current)
         )
-        state.remote_as_str = entry.get("remote_as") or ""
-        state.enabled = entry.get("enabled")
+        if not sm.is_owned(state.status):
+            state.remote_as_str = entry.get("remote_as") or ""
+            state.enabled = entry.get("enabled")
         state.last_sync_at = self.planned_at
         state.status = sm.on_reconcile(state.status, matches=None, settles_owned=False, settles_deploying=False)
         self.peer_states[key] = state
