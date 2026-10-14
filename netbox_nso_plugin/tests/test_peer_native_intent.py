@@ -7,13 +7,14 @@ import copy
 import inspect
 import textwrap
 
+from dcim.models import Interface
 from django.contrib.auth import get_user_model
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from ipam.models import ASN, VRF, IPAddress
-from netbox_routing.models import BGPPeer, BGPPeerAddressFamily, BGPRouter, BGPScope
+from netbox_routing.models import BGPPeer, BGPPeerAddressFamily, BGPRouter, BGPScope, PrefixList, RouteMap
 
 from netbox_nso_plugin import delivery
 from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
@@ -258,6 +259,52 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
         native = self.read(ttl=4)
         self.assertEqual((native.ttl, self.state.status), (3, "conflict"))
         self.assertFalse({"remote_as_str", "enabled"} & {field.name for field in self.state._meta.concrete_fields})
+
+    def test_unowned_import_attaches_policy_when_missing_dependency_appears(self):
+        policies = {
+            "routemap_in": "example-in",
+            "routemap_out": "example-out",
+            "prefixlist_in": "example-prefix-in",
+            "prefixlist_out": "example-prefix-out",
+        }
+        leaves = {"address_families": [{"af": "ipv4-unicast", "enabled": True, **policies}]}
+        native = self.read(**leaves)
+        af = BGPPeerAddressFamily.objects.get(assigned_object_id=native.pk)
+        for field in policies:
+            self.assertIsNone(getattr(af, f"{field}_id"))
+        resolved = {
+            field: (RouteMap if field.startswith("routemap") else PrefixList).objects.create(name=name)
+            for field, name in policies.items()
+        }
+        for _ in range(2):
+            self.read(**leaves)
+            af.refresh_from_db()
+            for field, policy in resolved.items():
+                with self.subTest(field=field):
+                    self.assertEqual(getattr(af, f"{field}_id"), policy.pk)
+            self.assertEqual(self.state.status, "imported")
+
+    def test_unowned_import_attaches_update_source_when_missing_interface_appears(self):
+        native = self.read(source="Loopback1803")
+        self.assertIsNone(native.update_source_id)
+        interface = Interface.objects.create(device=self.device, name="Loopback1803", type="virtual")
+        for _ in range(2):
+            native = self.read(source=interface.name)
+            self.assertEqual(native.update_source_id, interface.pk)
+            self.assertEqual(self.state.status, "imported")
+
+    def test_owned_unresolved_policy_cannot_settle_as_absent_native_policy(self):
+        base = self.own("accepted")
+        self.read(address_families=[{"af": "ipv4-unicast", "enabled": True, "routemap_in": "example-missing"}])
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
+        af = BGPPeerAddressFamily.objects.get(assigned_object_id=self.state.bgp_peer_id)
+        self.assertIsNone(af.routemap_in_id)
+
+    def test_owned_unresolved_update_source_cannot_settle_as_absent_native_source(self):
+        base = self.own("accepted")
+        native = self.read(source="Loopback1803")
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
+        self.assertIsNone(native.update_source_id)
 
     def test_peer_schema_contains_only_identity_link_and_lifecycle_fields(self):
         self.assertEqual(

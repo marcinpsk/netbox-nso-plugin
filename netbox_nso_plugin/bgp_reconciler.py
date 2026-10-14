@@ -835,7 +835,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         self.ips[key] = current
         return current
 
-    def source(self, value, vrf, current_peer):
+    def source(self, value, vrf, current_peer, *, create=True):
         if not value:
             return None, None
         try:
@@ -861,7 +861,9 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             and str(current_peer.source.address.ip) == address
         ):
             return current_peer.source, None
-        return self.peer_ip(value, vrf), None
+        if create:
+            return self.peer_ip(value, vrf), None
+        return self.ips.get((address, vrf.pk if vrf is not None else None)), None
 
     def router(self, asn, router_id):
         number = int(asn.asn)
@@ -958,6 +960,34 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             "prefixlist_out": self.prefix_lists_by_name.get(entry.get("prefixlist_out")),
         }
 
+    def resolved_peer_content(self, entry, source, update_source):
+        """Render device content with the same references as the native mirror."""
+        from .bgp_peer_content import peer_content
+
+        resolved = {
+            **entry,
+            "source": update_source.name
+            if update_source is not None
+            else str(source.address.ip)
+            if source is not None
+            else None,
+        }
+        families = []
+        for family in entry["address_families"]:
+            policy = self._policy(family)
+            families.append(
+                {
+                    "af": family["af"],
+                    "enabled": policy["enabled"],
+                    **{
+                        field: value.name if value is not None else None
+                        for field, value in policy.items()
+                        if field != "enabled"
+                    },
+                }
+            )
+        return peer_content(resolved, families)
+
     def plan_address_family_rows(self, owner, entries, scope):
         content_type = self.peer_content_type if isinstance(owner, self.BGPPeer) else self.template_content_type
         existing = (
@@ -1020,7 +1050,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if state.bgp_peer_id is not None:
                 native = self.peers_by_id.get(state.bgp_peer_id, state.bgp_peer)
                 families = self.peer_address_families.get((self.peer_content_type.pk, native.pk))
-                device_content = peer_content(entry)
+                source, update_source = self.source(entry.get("source"), scope.vrf, native, create=False)
+                device_content = self.resolved_peer_content(entry, source, update_source)
                 native_identity = (
                     canonical_bgp_peer_identity(
                         str(native.scope.router.asn.asn),
@@ -1030,7 +1061,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                     if native.scope_id is not None
                     else None
                 )
-                matches = native_identity == state_key and peer_content(native, families) == device_content
+                matches = (
+                    native_identity == state_key
+                    and device_content == peer_content(entry)
+                    and peer_content(native, families) == device_content
+                )
                 if matches:
                     state.device_base_hash = _content_hash(device_content)
             state.last_sync_at = self.planned_at
@@ -1084,7 +1119,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         )
         state.bgp_peer = peer
         state.last_sync_at = self.planned_at
-        device_hash = _content_hash(peer_content(entry))
+        device_hash = _content_hash(self.resolved_peer_content(entry, source, update_source))
         peer_address_families = (
             () if created_peer else self.peer_address_families.get((self.peer_content_type.pk, current_peer.pk), ())
         )
