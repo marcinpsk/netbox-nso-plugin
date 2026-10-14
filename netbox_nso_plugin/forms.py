@@ -432,6 +432,7 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
         changed_content = bool(set(self.changed_data) - {"tags"})
         if not created and changed_content:
             obj.status = sm.on_operator_edit(obj.status)
+            obj.apply_attempt_id = None
             if obj.accepted_at is None:
                 obj.accepted_at = timezone.now()
         rekeys_hosts = bool(self._old_hash and self._old_hash != obj.community_hash)
@@ -474,7 +475,8 @@ class NSOSnmpCommunityStateForm(NetBoxModelForm):
                     update_fields = ["community_hash"]
                     if candidate.status == "deploying":
                         candidate.status = "accepted"
-                        update_fields.append("status")
+                        candidate.apply_attempt_id = None
+                        update_fields.extend(("status", "apply_attempt_id"))
                     host_candidates.append((candidate, tuple(update_fields)))
                     saves.append(planned_save(candidate, update_fields=update_fields))
             plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves)

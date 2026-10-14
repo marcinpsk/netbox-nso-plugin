@@ -5038,6 +5038,7 @@ def _save_owned_redistribution_edit(obj, old_values):
         field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
     }
     state_fields.add("status")
+    _clear_apply_attempt(candidate, state_fields)
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
     plan = RendererMutationPlan.build(
@@ -5108,6 +5109,7 @@ def _save_owned_ospf_edit(obj, key, old_values):
         field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
     }
     state_fields.add("status")
+    _clear_apply_attempt(candidate, state_fields)
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
     saves.append(planned_save(candidate, update_fields=state_fields))
@@ -5174,6 +5176,7 @@ def _save_owned_isis_edit(obj, key, old_values):
         if hasattr(candidate, field_name) and getattr(candidate, field_name) != old_value
     }
     state_fields.add("status")
+    _clear_apply_attempt(candidate, state_fields)
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
     plan = RendererMutationPlan.build(
@@ -5217,7 +5220,8 @@ def _save_owned_bgp_router_edit(state, old_values):
     candidate.bgp_router = native
     candidate.status = sm.on_operator_edit(candidate.status)
     candidate.accepted_at = candidate.accepted_at or planned_at
-    fields = ("router_id", "status", "accepted_at")
+    fields = {"router_id", "status", "accepted_at"}
+    _clear_apply_attempt(candidate, fields)
     plan = RendererMutationPlan.build(
         grant=OwnershipGrant("operator_edit"),
         saves=(planned_save(native, update_fields=("router_id",)), planned_save(candidate, update_fields=fields)),

@@ -137,6 +137,29 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(self.adapter.applied[-1][1]["routers"][0]["router_id"], "198.18.0.9")
         self.assertFalse(NSOBGPPeerState.objects.exists())
 
+    def test_router_id_edit_of_a_deploying_router_clears_its_apply_attempt(self):
+        from uuid import uuid4
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from ._outbox_case import mirror_update
+
+        attempt = NSOApplyAttempt.objects.create(
+            id=uuid4(),
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            selected={},
+            scope_revisions={},
+        )
+        state = mirror_update(self.router_state(owned=True), status="deploying", apply_attempt_id=attempt.pk)
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:overlay_field_edit", args=("bgp_router", state.pk)),
+            {"router_id": "198.18.0.9"},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        state.refresh_from_db()
+        self.assertEqual((state.status, state.apply_attempt_id), ("accepted", None))
+
     def test_native_router_id_edit_pushes_without_peer_save(self):
         self.router_state(owned=True)
         before = self.payload()
