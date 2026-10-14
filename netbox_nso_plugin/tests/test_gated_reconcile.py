@@ -441,7 +441,7 @@ class TestRealReconcilerGateFootprints(TestCase):
         state = NSOBFDInterfaceState.objects.get(management=self.mgmt, interface=interface)
         self.assertEqual(state.status, "imported")
 
-    def test_bgp_gate_predicts_an_owned_native_peer_change(self):
+    def test_bgp_gate_keeps_owned_native_peer_on_device_drift(self):
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentRevision
         from netbox_nso_plugin.reconcile import reconcile_category
 
@@ -464,8 +464,9 @@ class TestRealReconcilerGateFootprints(TestCase):
 
         state.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(state.bgp_peer.ttl, 2)
-        self.assertEqual(revision.revision, before + 1)
+        self.assertIsNone(state.bgp_peer.ttl)
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(revision.revision, before)
 
     @staticmethod
     def _bgp_payload(*, ttl=None, attempt_id=1):
