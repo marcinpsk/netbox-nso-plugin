@@ -12,8 +12,8 @@ from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
-from ipam.models import ASN
-from netbox_routing.models import BGPPeer, BGPPeerAddressFamily
+from ipam.models import ASN, VRF, IPAddress
+from netbox_routing.models import BGPPeer, BGPPeerAddressFamily, BGPRouter, BGPScope
 
 from netbox_nso_plugin import delivery
 from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
@@ -130,6 +130,47 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
         rendered = payload[0]["scopes"][0]["peers"][0]
         self.assertEqual((rendered["remote_as"], rendered["enabled"]), ("64514", False))
         self.assertFalse(rendered["address_families"][0]["enabled"])
+
+    def test_owned_native_address_edit_cannot_settle_old_identity(self):
+        base = self.own("accepted")
+        native = self.state.bgp_peer
+        address = IPAddress.objects.create(address="198.18.0.3/32")
+        content_update(native, peer=address)
+        self.read()
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
+        self.assertEqual(self.state.bgp_peer.peer_id, address.pk)
+
+    def test_owned_native_router_asn_edit_cannot_settle_old_identity(self):
+        base = self.own("accepted")
+        router = self.state.bgp_peer.scope.router
+        asn = ASN.objects.create(asn=64514, rir=router.asn.rir)
+        content_update(router, asn=asn)
+        self.read()
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
+
+    def test_owned_native_scope_router_edit_cannot_settle_old_identity(self):
+        base = self.own("accepted")
+        native = self.state.bgp_peer
+        router = native.scope.router
+        other_router = BGPRouter.objects.create(
+            assigned_object_type=router.assigned_object_type,
+            assigned_object_id=router.assigned_object_id,
+            asn=ASN.objects.create(asn=64514, rir=router.asn.rir),
+        )
+        other_scope = BGPScope.objects.create(router=other_router)
+        content_update(native, scope=other_scope)
+        self.read()
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
+        self.assertEqual(self.state.bgp_peer.scope_id, other_scope.pk)
+
+    def test_owned_native_scope_vrf_edit_cannot_settle_old_identity(self):
+        base = self.own("accepted")
+        native = self.state.bgp_peer
+        other_scope = BGPScope.objects.create(router=native.scope.router, vrf=VRF.objects.create(name="example-blue"))
+        content_update(native, scope=other_scope)
+        self.read()
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
+        self.assertEqual(self.state.bgp_peer.scope_id, other_scope.pk)
 
     def test_owned_native_disappearance_is_not_recreated_and_audit_retracts(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest

@@ -1021,7 +1021,16 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 native = self.peers_by_id.get(state.bgp_peer_id, state.bgp_peer)
                 families = self.peer_address_families.get((self.peer_content_type.pk, native.pk))
                 device_content = peer_content(entry)
-                matches = peer_content(native, families) == device_content
+                native_identity = (
+                    canonical_bgp_peer_identity(
+                        str(native.scope.router.asn.asn),
+                        native.scope.vrf.name if native.scope.vrf_id else "",
+                        str(native.peer.address),
+                    )
+                    if native.scope_id is not None
+                    else None
+                )
+                matches = native_identity == state_key and peer_content(native, families) == device_content
                 if matches:
                     state.device_base_hash = _content_hash(device_content)
             state.last_sync_at = self.planned_at
