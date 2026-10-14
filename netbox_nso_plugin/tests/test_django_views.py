@@ -5181,21 +5181,19 @@ class TestOverlayFieldEditView(ViewTestBase):
             management=self.mgmt,
             asn_str="64512",
             peer_address_str="192.0.2.20",
-            remote_as_str="64513",
-            enabled=True,
             bgp_peer=native,
             status="imported",
         )
 
         response = self.client.post(
             self._url("bgp_peer", row.pk),
-            {"remote_as_str": "64514", "enabled": "False"},
+            {"remote_as": "64514", "enabled": "False"},
         )
 
         self.assertEqual(response.status_code, 200, response.content)
         row.refresh_from_db()
         native.refresh_from_db()
-        self.assertEqual((row.remote_as_str, row.enabled, row.status), ("64514", False, "accepted"))
+        self.assertEqual(row.status, "accepted")
         self.assertIsNotNone(row.accepted_at)
         self.assertEqual(native.remote_as.asn, 64514)
         self.assertFalse(native.enabled)
@@ -5227,19 +5225,17 @@ class TestOverlayFieldEditView(ViewTestBase):
             management=self.mgmt,
             asn_str="64520",
             peer_address_str="192.0.2.21",
-            remote_as_str="64521",
-            enabled=True,
             bgp_peer=native,
             status="imported",
         )
 
-        response = self.client.post(self._url("bgp_peer", row.pk), {"remote_as_str": "9999999999"})
+        response = self.client.post(self._url("bgp_peer", row.pk), {"remote_as": "9999999999"})
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("remote_as_str", response.json()["errors"])
+        self.assertIn("remote_as", response.json()["errors"])
         row.refresh_from_db()
         native.refresh_from_db()
-        self.assertEqual((row.remote_as_str, row.status), ("64521", "imported"))
+        self.assertEqual(row.status, "imported")
         self.assertEqual(native.remote_as.asn, 64521)
 
     def test_bgp_template_json_does_not_require_a_nonexistent_detail_url(self):

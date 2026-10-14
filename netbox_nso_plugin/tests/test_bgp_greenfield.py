@@ -120,8 +120,6 @@ class TestBgpPeerGreenfieldCreate(BgpGreenfieldBase):
                 management=management,
                 asn_str=str(self.asn.asn),
                 peer_address_str=f"198.18.0.{host}",
-                remote_as_str=str(self.remote_asn.asn),
-                enabled=True,
                 bgp_peer=peer,
                 status="accepted",
             )
@@ -587,7 +585,7 @@ class TestBgpPeerAddView(BgpGreenfieldBase):
         peer_state.refresh_from_db()
         self.assertEqual(router_state.bgp_router_id, peer.scope.router_id)
         self.assertEqual(peer_state.bgp_peer_id, peer.pk)
-        self.assertEqual((peer_state.remote_as_str, peer_state.enabled), (str(self.remote_asn.asn), True))
+        self.assertEqual((peer.remote_as_id, peer.enabled), (self.remote_asn.pk, True))
         self.assertEqual(peer_state.status, "accepted")
         self.assertIsNotNone(peer_state.accepted_at)
         self.assertEqual(NSOBGPPeerState.objects.filter(management=mgmt).count(), 1)
