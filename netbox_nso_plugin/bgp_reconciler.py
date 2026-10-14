@@ -1151,12 +1151,19 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.plan_address_family_rows(peer, af_entries, scope)
         elif peer_ip_changed:
             self.save(peer, update_fields=("peer",))
-        if mirror or not sm.is_owned(state.status):
+        owned = sm.is_owned(state.status)
+        if owned:
+            intent_as = _parse_asn(state.remote_as_str) if state.remote_as_str else None
+            intent_enabled = state.enabled if state.enabled is not None else True
+            # Intent that already differs from the native peer is pending; a mirror must not erase it.
+            intent_pending = not created_peer and (
+                intent_as != (current_peer.remote_as.asn if current_peer.remote_as_id else None)
+                or intent_enabled != (current_peer.enabled if current_peer.enabled is not None else True)
+            )
+        if not owned or (mirror and not intent_pending):
             state.remote_as_str = str(entry.get("remote_as") or "")
             state.enabled = entry.get("enabled")
         else:
-            intent_as = _parse_asn(state.remote_as_str) if state.remote_as_str else None
-            intent_enabled = state.enabled if state.enabled is not None else True
             observed_enabled = entry.get("enabled") if entry.get("enabled") is not None else True
             matches = (
                 matches
