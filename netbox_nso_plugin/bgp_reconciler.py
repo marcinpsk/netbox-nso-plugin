@@ -1302,7 +1302,9 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 self.seen_routers.add(asn_str)
                 self.save(state, update_fields=("router_id", "last_sync_at"))
                 return None, True, False
-        device_hash = router_content_digest(observed_router_content(entry))
+        observed = observed_router_content(entry)
+        device_hash = router_content_digest(observed)
+        matches = False
         router = self.routers.get(int(asn.asn))
         new_native = router is None
         ambiguous = int(asn.asn) in self.duplicate_router_asns
@@ -1324,11 +1326,14 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 mirror = False
                 conflict = device_hash != base
             native_scopes, native_families = _router_membership(object_content)
-            observed_scopes, observed_families = _router_membership(observed_router_content(entry))
-            if not native_scopes <= observed_scopes or not native_families <= observed_families:
+            observed_scopes, observed_families = _router_membership(observed)
+            membership_held = native_scopes <= observed_scopes and native_families <= observed_families
+            # Device-only scopes and AFs never join owned membership, so they are not drift.
+            matches = membership_held and object_content["router_id"] == observed["router_id"]
+            if not membership_held:
                 mirror = False
                 conflict = True
-            if mirror and object_content["scopes"] != observed_router_content(entry)["scopes"]:
+            if mirror and object_content["scopes"] != observed["scopes"]:
                 owned_children = any(
                     sm.is_owned(peer.status)
                     and peer.bgp_peer_id is not None
@@ -1346,7 +1351,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         state.bgp_router = router
         state.router_id = entry.get("router_id") or ""
         state.last_sync_at = self.planned_at
-        if not owned:
+        if owned:
+            state.status = sm.on_reconcile(state.status, matches=matches)
+            if matches:
+                state.device_base_hash = device_hash
+        else:
             state.status = sm.on_reconcile(state.status, matches=None, conflict=conflict)
             if mirror:
                 state.device_base_hash = device_hash
@@ -1405,7 +1414,10 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         for asn_str, current in self.router_states.items():
             if asn_str in self.seen_routers:
                 continue
-            status = sm.on_reconcile(current.status, present=False)
+            if sm.is_owned(current.status):
+                status = sm.on_reconcile(current.status, matches=False)
+            else:
+                status = sm.on_reconcile(current.status, present=False)
             if status != current.status:
                 state = copy.copy(current)
                 state.status = status

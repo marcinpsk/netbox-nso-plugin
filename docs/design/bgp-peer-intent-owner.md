@@ -24,6 +24,9 @@ operator intent or to report `in_sync` falsely.
   overlay value. `matches` is canonical native content equal to device
   content. The base advances only when they match. Device drift re-pends the
   row to `accepted`, and the next Apply restores the intent.
+- Owned routers follow the same drift and absence rule. `matches` is an equal
+  canonical router-id and a native scope / AF membership that is a subset of
+  the observed membership. Device-only scopes and AFs are not drift.
 - Owned rows whose native peer is gone: the read does not recreate the native
   peer and does not settle the row. The ownership audit retracts the identity,
   as it does today, until owned native deletes are refused (#1691).

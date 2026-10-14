@@ -94,8 +94,11 @@ def test_router_identity_is_asn_across_multiple_vrf_scopes(router_case):
             router_model().objects.create(management=router_case[1], asn_str="64512")
 
 
-@pytest.mark.parametrize("status", ["accepted", "deploying", "in_sync", "apply_failed"])
-def test_bgp_router_reconcile_preserves_owned_bookkeeping(router_case, status):
+@pytest.mark.parametrize(
+    "status, expected",
+    [("accepted", "accepted"), ("deploying", "deploying"), ("in_sync", "accepted"), ("apply_failed", "accepted")],
+)
+def test_bgp_router_reconcile_preserves_owned_bookkeeping(router_case, status, expected):
     state, _ = import_router(router_case)
     stamp = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
     attempt_id = uuid.uuid4()
@@ -111,7 +114,7 @@ def test_bgp_router_reconcile_preserves_owned_bookkeeping(router_case, status):
     import_router(router_case, router_id="192.0.2.253")
     state.refresh_from_db()
     assert (state.status, state.accepted_at, state.last_apply_at, state.last_apply_error, state.apply_attempt_id) == (
-        status,
+        expected,
         stamp,
         stamp,
         "placeholder prior error",
@@ -219,19 +222,29 @@ def test_router_read_does_not_acquire_new_device_scope_or_af(router_case):
     assert delivery.render("bgp", device.pk, management.adapter_device_id).payload == rendered
 
 
-def test_missing_confirmed_router_becomes_changed(router_case):
+def test_missing_confirmed_router_repends_and_keeps_owned_peers_deliverable(router_case):
+    from netbox_nso_plugin import delivery
     from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+    from netbox_nso_plugin.models import NSOBGPPeerState
 
-    state, _ = import_router(router_case)
+    device, management = router_case
+    state, _ = import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
+    peer = NSOBGPPeerState.objects.get(management=management, peer_address_str="192.0.2.1")
     with without_commit_drain():
         state = content_update(state, status="in_sync")
-    _reconcile_bgp_config(router_case[0], {"device_id": router_case[0].pk, "routers": []})
+        content_update(peer, status="in_sync")
+    _reconcile_bgp_config(device, {"device_id": device.pk, "routers": []})
     state.refresh_from_db()
-    assert state.status == "changed"
+    assert state.status == "accepted"
+    payload = delivery.render("bgp", device.pk, management.adapter_device_id).payload
+    assert isinstance(payload, list), payload
+    assert [p["peer_address"] for s in payload[0]["scopes"] for p in s["peers"]] == ["192.0.2.1"]
 
 
-@pytest.mark.parametrize("status", ["accepted", "deploying", "apply_failed"])
-def test_missing_pending_router_preserves_intent(router_case, status):
+@pytest.mark.parametrize(
+    "status, expected", [("accepted", "accepted"), ("deploying", "deploying"), ("apply_failed", "accepted")]
+)
+def test_missing_pending_router_preserves_intent(router_case, status, expected):
     from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
     state, _ = import_router(router_case)
@@ -239,7 +252,38 @@ def test_missing_pending_router_preserves_intent(router_case, status):
         state = content_update(state, status=status)
     _reconcile_bgp_config(router_case[0], {"device_id": router_case[0].pk, "routers": []})
     state.refresh_from_db()
-    assert state.status == status
+    assert state.status == expected
+
+
+@pytest.mark.parametrize("extra", ["af", "scope", "unknown-vrf-scope"])
+def test_owned_router_ignores_device_only_scope_and_af(router_case, extra):
+    VRF.objects.create(name="placeholder-blue")
+    state, _ = import_router(router_case)
+    with without_commit_drain():
+        state = content_update(state, status="in_sync")
+    scopes = {
+        "af": [scope_entry(afs=("ipv4-unicast", "ipv6-unicast"))],
+        "scope": [scope_entry(), scope_entry("placeholder-blue")],
+        "unknown-vrf-scope": [scope_entry(), scope_entry("placeholder-unknown")],
+    }[extra]
+    import_router(router_case, scopes=scopes)
+    state.refresh_from_db()
+    assert state.status == "in_sync"
+    assert BGPScope.objects.filter(router=state.bgp_router).count() == 1
+
+
+def test_owned_router_matching_read_stays_in_sync_and_advances_base(router_case):
+    from netbox_nso_plugin.bgp_router_content import observed_router_content, router_content_digest
+
+    device, _management = router_case
+    state, _ = import_router(router_case)
+    with without_commit_drain():
+        state = content_update(state, status="in_sync", device_base_hash="0" * 64)
+    import_router(router_case)
+    state.refresh_from_db()
+    assert state.status == "in_sync"
+    observed = observed_router_content(router_document(device)["routers"][0])
+    assert state.device_base_hash == router_content_digest(observed)
 
 
 def test_router_unknown_vrf_never_acquires_global_scope(router_case):

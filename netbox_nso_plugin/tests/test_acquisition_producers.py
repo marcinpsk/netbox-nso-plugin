@@ -104,8 +104,8 @@ CONTINUATIONS = {
 
 UNRESOLVED_DISPOSITIONS = {
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_router"): (
-        1,
-        "Read transitions update only unowned router rows.",
+        2,
+        "The owned branch only settles or repends; the unowned branch never acquires.",
     ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_peer"): (
         2,
@@ -117,7 +117,10 @@ UNRESOLVED_DISPOSITIONS = {
         1,
         "Reconcile preserves existing ownership.",
     ),
-    ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_states"): (4, "Absent rows retain or release ownership."),
+    ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_states"): (
+        5,
+        "Absent owned routers repend; other absent rows retain or release ownership.",
+    ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_peer_state"): (
         3,
         "Absent owned rows repend; unowned absence and invalid identities cannot acquire.",
