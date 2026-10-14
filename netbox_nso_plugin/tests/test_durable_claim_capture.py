@@ -16,7 +16,7 @@ from django.db import connection, transaction
 from django.test import TransactionTestCase
 from netbox_routing.models import Community, CommunityList, CommunityListEntry
 
-from netbox_nso_plugin import delivery, drain
+from netbox_nso_plugin import delivery, drain, read_gate
 from netbox_nso_plugin.models import (
     NSOAcceptedSelection,
     NSOApplyAttempt,
@@ -28,9 +28,12 @@ from netbox_nso_plugin.models import (
     NSORoutePolicyState,
 )
 from netbox_nso_plugin.refusal_protocol import row_ref
+from netbox_nso_plugin.refusal_registry import RegistryError
 
 from ._outbox_case import (
     ReceiptAdapter,
+    entries,
+    expire_claim,
     make_managed,
     mirror_update,
     own_vlan,
@@ -107,6 +110,100 @@ class TestDurableClaimCapture(_CascadeFlushMixin, IntentPushResetMixin, Transact
             apply_attempt_id=prior.pk,
         )
         return state, prior
+
+    def _adopt_source_epoch(self, source_epoch):
+        result = read_gate.gated_family_run(
+            self.management,
+            "vlan",
+            {
+                "outcome": "unavailable",
+                "reason": "not_ready",
+                "incarnation": "11111111-aaaa-4aaa-8aaa-111111111111",
+                "incarnation_born": "2026-07-01T00:00:10Z",
+                "source_epoch": source_epoch,
+            },
+            lambda: self.fail("an unavailable read must not run its body"),
+            epoch=self.management.adapter_device_id,
+        )
+        self.assertEqual(result.disposition, read_gate.SKIPPED_UNAVAILABLE)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.adapter_source_epoch, source_epoch)
+
+    def test_takeover_reforms_claim_after_source_epoch_changes(self):
+        self._vlan(776)
+        self._adopt_source_epoch(1)
+        self.adapter._respond = lambda body: (503, {"error": {"code": "unavailable", "message": "retry"}})
+        self.assertEqual(self._drain(), drain.FAILED)
+        old = NSOAcceptedSelection.objects.get(management=self.management, stream="vlan")
+        consumed = entries(self.device, "vlan", unconsumed=False)
+        self.assertTrue(consumed)
+        self.assertEqual({row.consumed_by_push_seq for row in consumed}, {old.source_push_seq})
+        identity = state_of(self.device, "vlan").claim_identity
+
+        self._adopt_source_epoch(2)
+
+        with self.assertLogs("netbox_nso_plugin.drain", level="INFO") as logged:
+            self.assertEqual(self._drain(), drain.FAILED)
+
+        current = state_of(self.device, "vlan")
+        self.assertGreater(current.push_seq, old.source_push_seq)
+        self.assertEqual(current.claim_identity, identity)
+        self.assertEqual(self.adapter.sequences, [old.source_push_seq, current.push_seq])
+        reformed = entries(self.device, "vlan", unconsumed=False)
+        self.assertEqual([row.pk for row in reformed], [row.pk for row in consumed])
+        self.assertEqual({row.consumed_by_push_seq for row in reformed}, {current.push_seq})
+        new = NSOAcceptedSelection.objects.get(
+            management=self.management, stream="vlan", source_push_seq=current.push_seq
+        )
+        self.assertNotEqual(new.mapping_epoch, old.mapping_epoch)
+        old.refresh_from_db()
+        self.assertIsNone(old.acknowledged_at)
+        self.assertIsNone(new.acknowledged_at)
+        self.assertTrue(any("abandoning push_seq" in line for line in logged.output))
+
+    def test_exact_acknowledgement_settles_after_source_epoch_changes(self):
+        self._vlan(777)
+        self._adopt_source_epoch(1)
+        claimed = drain.claim(self.device.pk, "vlan")
+        selection = NSOAcceptedSelection.objects.get(management=self.management, source_push_seq=claimed.push_seq)
+        consumed = entries(self.device, "vlan", unconsumed=False)
+        self.assertTrue(consumed)
+        config, session = self.adapter.patches()
+        with config, session:
+            response = drain.send_claim(claimed)
+        self.assertTrue(drain.acknowledgement(claimed, response).exact)
+
+        self._adopt_source_epoch(2)
+
+        with self.assertLogs("netbox_nso_plugin.drain", level="WARNING") as logged:
+            self.assertEqual(drain.settle(claimed, response), drain.SUCCEEDED)
+
+        self.assertFalse(entries(self.device, "vlan"))
+        current = state_of(self.device, "vlan")
+        self.assertIsNone(current.push_seq)
+        self.assertIsNone(current.claimed_at)
+        self.assertEqual(current.last_success_identity, claimed.identity)
+        selection.refresh_from_db()
+        self.assertIsNone(selection.acknowledged_at)
+        self.assertEqual(selection.publication_state, "recorded")
+        self.assertTrue(any("earlier source epoch" in line and "unacknowledged" in line for line in logged.output))
+
+    def test_claim_without_any_selection_fails_loudly(self):
+        self._vlan(778)
+        self._adopt_source_epoch(1)
+        claimed = drain.claim(self.device.pk, "vlan")
+        NSOApplyOverlaySnapshot.objects.filter(selection__management=self.management).delete()
+        NSOAcceptedSelection.objects.filter(management=self.management).delete()
+        self._adopt_source_epoch(2)
+        expire_claim(self.device, "vlan")
+
+        for operation in (lambda: self._drain(), lambda: drain.settle(claimed, {"count": 1})):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(RegistryError, "claim has no original durable selection") as caught:
+                    operation()
+                self.assertIs(type(caught.exception), RegistryError)
+                self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
+                self.assertTrue(entries(self.device, "vlan", unconsumed=False))
 
     def _bundle(self, name="Port-channel71"):
         with without_commit_drain(), transaction.atomic():

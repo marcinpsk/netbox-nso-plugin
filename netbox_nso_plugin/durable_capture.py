@@ -35,6 +35,10 @@ _SECRET_FIELDS = frozenset(
 )
 
 
+class CaptureEpochChanged(RegistryError):
+    pass
+
+
 def mapping_epoch(management):
     """Hash the local mapping and the adapter store identity used by delivery."""
     from . import drain
@@ -242,14 +246,17 @@ def capture_direct(management, rendered, revision, deleted_roots):
 
 
 def _claim_selection(management, scope, push_seq):
+    epoch = mapping_epoch(management)
+    selections = NSOAcceptedSelection.objects.filter(
+        management=management,
+        stream=delivery.delivery_keys()[scope].section,
+        source_push_seq=push_seq,
+    )
     try:
-        return NSOAcceptedSelection.objects.get(
-            management=management,
-            mapping_epoch=mapping_epoch(management),
-            stream=delivery.delivery_keys()[scope].section,
-            source_push_seq=push_seq,
-        )
+        return selections.get(mapping_epoch=epoch)
     except NSOAcceptedSelection.DoesNotExist:
+        if selections.exclude(mapping_epoch=epoch).exists():
+            raise CaptureEpochChanged("claim durable selection belongs to an earlier mapping epoch") from None
         raise RegistryError("claim has no original durable selection") from None
 
 
