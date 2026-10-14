@@ -123,6 +123,7 @@ class TestAttemptSettlement(TestCase):
         response = _response(self.adapter_device_id, generation_id, selected)
         return NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,
@@ -199,6 +200,7 @@ class TestAttemptSettlement(TestCase):
         response = _response(self.adapter_device_id, 72, selected)
         NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,
@@ -658,6 +660,7 @@ class TestAttemptSettlement(TestCase):
         )
         local = NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,

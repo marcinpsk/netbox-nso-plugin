@@ -1821,6 +1821,49 @@ _BGP_STATUS_CHOICES = [
 _BGP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
 
 
+class NSOBGPRouterState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
+    """One ASN owner for router-id and native scope/address-family membership."""
+
+    management = models.ForeignKey("NSODeviceManagement", on_delete=models.CASCADE, related_name="bgp_router_states")
+    asn_str = models.CharField(max_length=10)
+    bgp_router = models.ForeignKey(
+        "netbox_routing.BGPRouter",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_router_states",
+    )
+    router_id = models.CharField(max_length=64, blank=True, default="")
+    status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        ordering = ["management", "asn_str"]
+        unique_together = [("management", "asn_str")]
+        verbose_name = "NSO BGP Router State"
+        verbose_name_plural = "NSO BGP Router States"
+
+    def clean(self):
+        from .bgp_router_content import router_fragment
+
+        super().clean()
+        try:
+            content = router_fragment(self.asn_str, self.router_id, ())
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        self.asn_str = content["asn"]
+        self.router_id = content["router_id"] or ""
+
+    def __str__(self):
+        return f"{self.management} / ASN:{self.asn_str} [{self.status}]"
+
+
 class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     """Per-(device, asn, vrf, peer_address) BGP peer compliance overlay.
 
@@ -1853,8 +1896,6 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         blank=True,
         related_name="nso_bgp_states",
     )
-    remote_as_str = models.CharField(max_length=10, blank=True, default="")
-    enabled = models.BooleanField(null=True, blank=True)
     status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)

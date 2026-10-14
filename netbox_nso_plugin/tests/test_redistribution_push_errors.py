@@ -19,7 +19,7 @@ from netbox_nso_plugin.models import (
 )
 
 from ._outbox_case import ReceiptAdapter, make_managed, mirror_update
-from ._ownership_case import acquire_overlay
+from ._ownership_case import acquire_bgp_router, acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 SOURCE_AS_MESSAGE = "The device's NED requires a source AS for this BGP redistribution."
@@ -133,6 +133,7 @@ class TestRedistributionPushErrors(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
     def test_all_stream_failures_remain_visible_after_an_ospf_success(self):
         self.rejections.update(ospf="invalid_response", bgp="asn_rule_violation")
+        acquire_bgp_router(self.mgmt, self.destinations["bgp"].scope.router, status="in_sync")
         self._accept()
         self._accept("ospf")
         self._accept("bgp")
@@ -155,6 +156,7 @@ class TestRedistributionPushErrors(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
     def test_asn_rule_violation_keeps_generic_public_text(self):
         self.rejections = {"bgp": "asn_rule_violation"}
+        acquire_bgp_router(self.mgmt, self.destinations["bgp"].scope.router, status="in_sync")
         self._accept("bgp", source="static")
 
         self.assertEqual(self.mgmt.intent_push_errors["bgp"]["code"], "asn_rule_violation")

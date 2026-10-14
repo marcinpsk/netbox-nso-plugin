@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 from django.db import IntegrityError, transaction
-from django.db.models.deletion import ProtectedError
+from django.db.models.deletion import RestrictedError
 
 
 @pytest.fixture
@@ -132,10 +132,14 @@ def test_apply_snapshot_round_trips_json_and_text_errors(ledger):
     fence.refresh_from_db()
     assert fence.last_execution.store_incarnation == "placeholder-store"
     assert fence.last_settle_seq == 11
-    with pytest.raises(ProtectedError):
+    with pytest.raises(RestrictedError):
         prior.delete()
-    with pytest.raises(ProtectedError):
+    with pytest.raises(RestrictedError):
         selection.delete()
+    with pytest.raises(RestrictedError):
+        execution.delete()
+    management.delete()
+    assert not any(model.objects.exists() for model in (Selection, Execution, Snapshot, Fence))
 
 
 def test_execution_identity_survives_carrier_pruning(ledger):

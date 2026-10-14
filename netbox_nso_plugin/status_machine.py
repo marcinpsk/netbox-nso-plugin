@@ -370,7 +370,7 @@ def on_reconcile(
       FK/content overlay it is "materialized in NetBox". ``None`` for pure mirrors with
       no value at all (resting unowned state is simply ``imported``).
     - ``conflict`` — a native NetBox object exists that we did not create (adoption
-      ambiguity); only meaningful for an unowned row.
+      ambiguity), or NetBox and the device both moved. Unowned → ``conflict``; owned never settles.
     - ``settles_owned`` — whether ``matches`` reflects genuine device confirmation and
       may therefore settle an owned row (``accepted → in_sync``). Pass ``False`` for
       FK/content overlays, where ``matches`` means "materialized at import" (NOT applied
@@ -398,6 +398,8 @@ def on_reconcile(
             return current
         return advance(current, DRIFT, to=CHANGED)
     if is_owned(current):
+        if conflict and matches is not None:
+            matches = False
         if current == DEPLOYING:
             if not settles_deploying:
                 return current  # only a correlated apply result may settle this family

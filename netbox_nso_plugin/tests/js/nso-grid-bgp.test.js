@@ -32,6 +32,7 @@ function mount(section, row) {
   payload.id = "nso-bgp-data";
   payload.type = "application/json";
   payload.textContent = JSON.stringify({
+    routers: { rows: section === "routers" ? [row] : [], counts: { all: 1 } },
     peers: { rows: section === "peers" ? [row] : [], counts: { all: 1 } },
     templates: { rows: section === "templates" ? [row] : [], counts: { all: 1 } },
   });
@@ -50,11 +51,30 @@ beforeEach(() => {
   document.body.innerHTML = "";
   delete window.__nsoGrid_bgp_peers;
   delete window.__nsoGrid_bgp_templates;
+  delete window.__nsoGrid_bgp_routers;
 });
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("BGP grid", () => {
+  it("shows router identity, membership, and explicit actions", () => {
+    const row = {
+      asn: "64512",
+      router_id: "198.18.0.1",
+      router: { label: "Router placeholder", url: "/plugins/routing/bgp/router/1/" },
+      scopes: [{ vrf: "", address_families: [{ af: "ipv4-unicast" }] }],
+      edit_url: "/overlay/bgp_router/7/edit-field/",
+      accept_url: "/routing/bgp-router-state/7/accept/",
+      state: "drift",
+    };
+    const table = mount("routers", row);
+    expect(table).toBeDefined();
+    const content = table.config.columns.find((column) => column.field === "_router_config").formatter(cell(row));
+    expect(content.textContent).toContain("198.18.0.1");
+    expect(content.textContent).toContain("ipv4-unicast");
+    expect(content.querySelector(".nso-popedit").dataset.peFields).toBe("router_id:text:Router ID");
+    expect(table.config.columns.map((column) => column.field)).toContain("accept_url");
+  });
   it("compacts peer identity and session details into a laptop-width grid", () => {
     const row = {
       asn: "64512",
@@ -92,7 +112,23 @@ describe("BGP grid", () => {
     expect(session.textContent).toContain("ipv4-unicast");
     expect(session.querySelector('[title*="in RM-IN"]')).not.toBeNull();
     const edit = session.querySelector(".nso-popedit");
-    expect(edit.getAttribute("data-pe-fields")).toBe("remote_as_str:text:Remote AS,enabled:select:State");
+    expect(edit.getAttribute("data-pe-fields")).toBe("remote_as:text:Remote AS,enabled:select:State");
+  });
+
+  it.each([null, undefined])("shows unavailable peer leaves for %s", (value) => {
+    const row = { asn: "64512", peer_address: "198.18.0.2", remote_as: value, enabled: value };
+    const table = mount("peers", row);
+    const session = table.config.columns.find((column) => column.field === "_session").formatter(cell(row));
+    expect(session.textContent).toContain("remote AS unavailable");
+    expect(session.textContent).toContain("state unavailable");
+    expect(session.textContent).not.toContain("enabled");
+  });
+
+  it("shows explicit false as disabled", () => {
+    const row = { asn: "64512", peer_address: "198.18.0.2", remote_as: "64513", enabled: false };
+    const table = mount("peers", row);
+    const session = table.config.columns.find((column) => column.field === "_session").formatter(cell(row));
+    expect(session.textContent).toContain("disabled");
   });
 
   it("shows peer-group templates without assuming they have detail URLs", () => {

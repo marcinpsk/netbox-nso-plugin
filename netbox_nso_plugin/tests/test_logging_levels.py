@@ -24,9 +24,9 @@ from django.utils import timezone
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_session
-from ._outbox_case import content_bulk_update, mirror_update, without_commit_drain
+from ._outbox_case import ReceiptAdapter, content_bulk_update, mirror_update, without_commit_drain
 from ._ownership_case import acquire_overlay
-from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
+from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
 
 User = get_user_model()
 TEST_PASSWORD = "levelstestpass123"  # noqa: S105
@@ -762,42 +762,54 @@ class TestLoggingLevelsApplyPush(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 NSOLoggingLevelState, management=self.mgmt, status="accepted", accepted_at=timezone.now()
             )
 
-    def test_apply_sends_an_owned_logging_retraction_and_the_read_keeps_it_deploying(self):
+    def test_apply_sends_an_owned_logging_retraction_without_promoting_an_omitted_singleton(self):
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOAcceptedSelection, NSOApplyOverlaySnapshot
         from netbox_nso_plugin.template_content import _reconcile_logging_config
         from netbox_nso_plugin.views import _prepare_apply
 
-        # The acknowledged baseline an accept-time push leaves behind, which the Apply overrides.
-        with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}):
-            drain.drain_key(self.device.pk, "logging")
-        with patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={}) as unforced:
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            self.assertEqual(drain.drain_key(self.device.pk, "logging", force=True), drain.SUCCEEDED)
+            logging_pushes = [request for request in adapter.requests if request["url"].endswith("/logging-intent")]
+            self.assertEqual(len(logging_pushes), 1)
             drain.push_now(self.device.pk, "logging")
-        unforced.assert_not_called()
-
-        with isolate_other_scopes("logging") as stack:
-            mock_put = stack.enter_context(
-                patch("netbox_nso_plugin.adapter_client.put_logging_intent", return_value={})
+            self.assertEqual(
+                len([request for request in adapter.requests if request["url"].endswith("/logging-intent")]), 1
             )
             prepared, selected = _prepare_apply(self.mgmt)
 
-        mock_put.assert_called_once()
-        self.assertIsNone(mock_put.call_args.args[2])
+        logging_pushes = [request for request in adapter.requests if request["url"].endswith("/logging-intent")]
+        self.assertEqual(len(logging_pushes), 2)
+        self.assertIsNone(logging_pushes[-1]["body"]["local_levels"])
+        self.assertEqual(logging_pushes[-1]["params"].get("store_only"), "true")
+        self.assertEqual(logging_pushes[-1]["push_seq"], selected["logging"])
+        selection = NSOAcceptedSelection.objects.get(
+            management=self.mgmt, stream="logging", source_push_seq=selected["logging"]
+        )
+        self.assertEqual(selection.contributor_manifest, [])
+        self.assertIsNotNone(selection.acknowledged_at)
+        self.assertFalse(
+            NSOApplyOverlaySnapshot.objects.filter(
+                attempt_id=prepared.attempt_id,
+                model_label=self.row._meta.label_lower,
+                overlay_pk=self.row.pk,
+            ).exists()
+        )
         self.row.refresh_from_db()
-        self.assertEqual(self.row.status, "deploying")
-        attempt_id = self.row.apply_attempt_id
-        self.assertIsNotNone(attempt_id)
-        moved_pks = [pk for stream, _model, pks, _previous in prepared.moved for pk in pks if stream == "logging"]
-        self.assertIn(self.row.pk, moved_pks)
+        self.assertEqual(self.row.status, "accepted")
+        self.assertIsNone(self.row.apply_attempt_id)
         self.assertIn("logging", selected)
         with self.assertRaises(TypeError):
             selected["logging"] = 0
 
-        # Removal-generation settlement is tracked by board card #1656.
+        # Explicit null retracts stored intent and emits no logging singleton.
         _reconcile_logging_config(
             self.device,
             {"hosts": [], "last_refreshed_at": None, "refresh_source": "test"},
         )
 
         self.row.refresh_from_db()
-        self.assertEqual(self.row.status, "deploying")
-        self.assertEqual(self.row.apply_attempt_id, attempt_id)
+        self.assertEqual(self.row.status, "accepted")
+        self.assertIsNone(self.row.apply_attempt_id)

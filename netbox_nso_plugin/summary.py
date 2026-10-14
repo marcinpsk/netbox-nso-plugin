@@ -202,6 +202,7 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     from .models import (
         NSOBGPPeerState,
         NSOBGPPeerTemplateState,
+        NSOBGPRouterState,
         NSOInterfaceState,
         NSOISISInstanceState,
         NSOISISInterfaceState,
@@ -265,6 +266,10 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
         tmpl = _status_breakdown(NSOBGPPeerTemplateState.objects.filter(management=mgmt))
         for bucket in ("total", "drift", "pending"):
             out[bucket] = out.get(bucket, 0) + tmpl.get(bucket, 0)
+        routers = _status_breakdown(NSOBGPRouterState.objects.filter(management=mgmt))
+        for bucket in ("total", "drift", "pending"):
+            out[bucket] = out.get(bucket, 0) + routers.get(bucket, 0)
+        out["routers"] = routers["total"]
         out["templates"] = tmpl["total"]
         return out
     if key == "route_policy":

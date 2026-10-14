@@ -126,6 +126,7 @@ PROVEN_NO_EFFECT = ("fence_shut", "store_only_deletion")
 #: The adapter's refusal of the BODY, at the boundary: every raise site precedes the first
 #: statement of the request's own transaction, so it is proven no-effect by the same rule.
 BOUNDARY_REJECTION = "validation_error"
+_CAPTURE_OUTCOME_FIELDS = ("last_success_identity", "last_success_at", "last_error_code", "last_error_at", "attempts")
 
 
 class ClaimBusy(Exception):
@@ -150,6 +151,21 @@ class AuthorityPending(Exception):
     def __init__(self, message, *, management_id):
         super().__init__(message)
         self.management_id = management_id
+
+
+class _CaptureRefused(Exception):
+    """A local body validator refused capture before an HTTP request could run."""
+
+    def __init__(self, failure, management, state, entry_ids, authority):
+        super().__init__(str(failure))
+        self.failure = failure
+        self.management_id = management.pk
+        self.mapping = mapping_epoch(management)
+        self.source_epoch = management.adapter_source_epoch
+        self.revision = state.claim_revision
+        self.entry_ids = tuple(entry_ids)
+        self.authority = authority
+        self.outcome = tuple(getattr(state, field) for field in _CAPTURE_OUTCOME_FIELDS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -469,6 +485,8 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
 
 def _takeover(state, mgmt, now) -> Claim | None:
     """Replay the unacknowledged operation: same sequence, same body, fresh lease."""
+    from .durable_capture import CaptureEpochChanged, validate_claim_capture
+
     flags = ClaimFlags.from_json(state.claim_flags)
     current_identity = request_identity(
         state.claim_payload,
@@ -491,6 +509,27 @@ def _takeover(state, mgmt, now) -> Claim | None:
         raise ProtocolViolation(
             f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
         )
+    rendered = delivery.render(state.scope, state.device_id, mgmt.adapter_device_id)
+    try:
+        validate_claim_capture(
+            mgmt,
+            state.scope,
+            state.push_seq,
+            state.claim_payload,
+            state.claim_revision,
+            state.claim_deletions or [],
+            flags.marking_mode,
+            rendered=rendered,
+        )
+    except CaptureEpochChanged:
+        logger.info(
+            "abandoning push_seq %s for %s/%s after its capture source epoch changed",
+            state.push_seq,
+            state.device_id,
+            state.scope,
+        )
+        _abandon_locked(state)
+        return None
     state.claimed_at = now
     state.save()
     logger.info("taking over push_seq %s for %s/%s", state.push_seq, state.device_id, state.scope)
@@ -507,9 +546,22 @@ def _takeover(state, mgmt, now) -> Claim | None:
         mark_any=flags.mark_any,
         mode=flags.mode,
         marking_mode=flags.marking_mode,
-        rendered=delivery.render(state.scope, state.device_id, mgmt.adapter_device_id),
+        rendered=rendered,
         replayed=True,
     )
+
+
+def _capture_claim(state, management, rendered, mode, deletions, marking_mode, *, entry_ids=(), mark_any=False):
+    """Preserve a proven local refusal while the claim transaction rolls back."""
+    from .adapter_client import AdapterError
+    from .durable_capture import capture_claim
+
+    try:
+        capture_claim(management, rendered, state.push_seq, state.claim_revision, mode, deletions, marking_mode)
+    except AdapterError as exc:
+        if not _rejected_at_boundary(exc):
+            raise
+        raise _CaptureRefused(exc, management, state, entry_ids, bool(mark_any or deletions)) from exc
 
 
 def _form(state, mgmt, now, mode, force) -> Claim | None:
@@ -570,6 +622,7 @@ def _form(state, mgmt, now, mode, force) -> Claim | None:
     state.claim_flags = flags.as_json()
     state.claim_revision = revision
     state.queued_deletions = []
+    _capture_claim(state, mgmt, rendered, mode, deletions, marking_mode, entry_ids=entry_ids, mark_any=flags.mark_any)
     state.save()
     return Claim(
         device_id=device_id,
@@ -632,6 +685,7 @@ def _form_store_only(state, mgmt, now, deletions, untracked_mark, force) -> Clai
     flags = ClaimFlags(delivery.MODE_STORE_ONLY, marking_mode, False, bool(force))
     state.claim_flags = flags.as_json()
     state.claim_revision = revision
+    _capture_claim(state, mgmt, rendered, flags.mode, [], marking_mode)
     state.save()
     return Claim(
         device_id=device_id,
@@ -678,6 +732,7 @@ def _form_backfill(state, mgmt, now) -> Claim:
     flags = ClaimFlags(delivery.MODE_BACKFILL_ONLY, marking_mode, False, True)
     state.claim_flags = flags.as_json()
     state.claim_revision = revision
+    _capture_claim(state, mgmt, rendered, flags.mode, [], marking_mode)
     state.save()
     return Claim(
         device_id=state.device_id,
@@ -1111,6 +1166,7 @@ def _uncorrelated_hit(record, removed) -> bool:
 def settle(claim: Claim, response) -> str:
     """Record the outcome of an acknowledged send, under a compare-and-set on the sequence."""
     _refuse_in_transaction("outcome")
+    from .durable_capture import CaptureEpochChanged, acknowledge_claim_capture
     from .models import NSOIntentOutboxEntry
 
     with transaction.atomic():
@@ -1136,6 +1192,16 @@ def settle(claim: Claim, response) -> str:
             _report_protocol_violation(claim, ack.reason)
             return UNACKNOWLEDGED
 
+        try:
+            acknowledge_claim_capture(claim, response, now)
+        except CaptureEpochChanged:
+            logger.warning(
+                "push_seq %s for %s/%s succeeded; its durable selection from an earlier source epoch "
+                "stays unacknowledged",
+                claim.push_seq,
+                claim.device_id,
+                claim.scope,
+            )
         if claim.mark is False and claim.mark_any and claim.marking_mode == delivery.MARKING_QUERY_FLAG:
             # The fold downgraded a marked contributor, which is the query-flag AND. A
             # per-object scope delivers the deletion itself, so its AND has no wire effect.
@@ -1432,6 +1498,16 @@ def _send_failure_outcome(claimed, exc) -> str:
     return record_failure(claimed, exc)
 
 
+def _claim_refusal_outcome(device_id, scope, refusal) -> str:
+    """Report one claim refusal only while its guarded operation is current."""
+    if isinstance(refusal, _CaptureRefused):
+        return REJECTED if _record_capture_refusal(device_id, scope, refusal) else SUPERSEDED
+    if not _record_claim_refusal(device_id, scope, refusal):
+        return SUPERSEDED
+    _report_refusal(device_id, scope, refusal, expected_management_id=refusal.management_id)
+    return REFUSED
+
+
 @_deployment_guarded("intent drain")
 def _drain_once(
     device_id,
@@ -1475,11 +1551,8 @@ def _drain_once(
     send_mode = _withheld_mode(device_id, scope, mode)
     try:
         claimed, timed_out = _claim_or_compact(device_id, scope, mode=send_mode, force=force)
-    except AuthorityPending as refusal:
-        if not _record_claim_refusal(device_id, scope, refusal):
-            return SUPERSEDED, None
-        _report_refusal(device_id, scope, refusal, expected_management_id=refusal.management_id)
-        return REFUSED, None
+    except (AuthorityPending, _CaptureRefused) as refusal:
+        return _claim_refusal_outcome(device_id, scope, refusal), None
     if timed_out:
         return FAILED, None
     if claimed is None:
@@ -1655,6 +1728,52 @@ def _dissolve(claim: Claim, exc) -> str:
         state.save()
     logger.warning("%s/%s refused push_seq %s at the boundary: %s", claim.device_id, claim.scope, claim.push_seq, exc)
     return REJECTED
+
+
+def _record_capture_refusal(device_id, scope, refusal: _CaptureRefused) -> bool:
+    """Retire only the refused authority-free batch after capture has rolled back."""
+    from .apply_state import _DEVICE_INTENT_LOCK_NAMESPACE
+    from .models import NSODeviceManagement
+
+    with transaction.atomic():
+        state = _lock_state(device_id, scope)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_xact_lock(%s, %s)", [_DEVICE_INTENT_LOCK_NAMESPACE, device_id])
+            if not cursor.fetchone()[0]:
+                transaction.set_rollback(True)
+                return False
+        management = (
+            NSODeviceManagement.objects.order_by()
+            .select_for_update(of=("self",), skip_locked=True)
+            .filter(pk=refusal.management_id, device_id=device_id, adapter_device_id__isnull=False)
+            .first()
+        )
+        if (
+            management is None
+            or state.push_seq is not None
+            or state.claimed_at is not None
+            or tuple(getattr(state, field) for field in _CAPTURE_OUTCOME_FIELDS) != refusal.outcome
+            or mapping_epoch(management) != refusal.mapping
+            or management.adapter_source_epoch != refusal.source_epoch
+            or management.source_rekey_pending
+            or _intent_revision(device_id, scope) != refusal.revision
+        ):
+            transaction.set_rollback(True)
+            return False
+        if not refusal.authority and refusal.entry_ids:
+            entries = _unconsumed(device_id, scope).select_for_update().order_by("pk")
+            if tuple(entries.values_list("pk", flat=True)) != tuple(sorted(refusal.entry_ids)):
+                transaction.set_rollback(True)
+                return False
+            _retire(entries, refusal.entry_ids)
+        now = _db_now()
+        state.attempts += 1
+        state.last_drain_attempted_at = now
+        state.last_error_code = str(refusal.failure.code)[:64]
+        state.last_error_at = now
+        state.save()
+        _report_refusal(device_id, scope, refusal.failure, expected_management_id=refusal.management_id)
+    return True
 
 
 def _record_claim_refusal(device_id, scope, exc: AuthorityPending) -> bool:
@@ -1931,6 +2050,10 @@ def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
 
 def _restored_claim_validation(state, receipt, flags) -> str | None:
     """Return a restore outcome when persisted claim evidence cannot settle."""
+    from .durable_capture import validate_claim_capture
+    from .models import NSODeviceManagement
+    from .refusal_registry import RegistryError
+
     if state.claim_revision is None:
         raise ProtocolViolation(
             f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
@@ -1942,6 +2065,26 @@ def _restored_claim_validation(state, receipt, flags) -> str | None:
             state.scope,
             state.push_seq,
         )
+        return RESTORE_FAILED_CLOSED
+    management = (
+        NSODeviceManagement.objects.select_for_update(of=("self",))
+        .order_by()
+        .filter(device_id=state.device_id, adapter_device_id__isnull=False)
+        .first()
+    )
+    if management is None:
+        return RESTORE_FAILED_CLOSED
+    try:
+        validate_claim_capture(
+            management,
+            state.scope,
+            state.push_seq,
+            state.claim_payload,
+            state.claim_revision,
+            state.claim_deletions or [],
+            flags.marking_mode,
+        )
+    except RegistryError:
         return RESTORE_FAILED_CLOSED
     return None
 

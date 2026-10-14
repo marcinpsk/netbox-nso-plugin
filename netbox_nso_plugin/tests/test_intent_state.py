@@ -34,7 +34,7 @@ from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.signals import suppress_intent_push
 
 from ._outbox_case import make_managed, own_vlan, wait_until_postgres_blocks, without_commit_drain
-from ._ownership_case import acquire_overlay
+from ._ownership_case import acquire_bgp_router, acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _WORKER_JOIN_SECONDS = 30
@@ -925,6 +925,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         declared = set(renderer_input_specs())
         required = {
             "netbox_nso_plugin.nsobgppeerstate",
+            "netbox_nso_plugin.nsobgprouterstate",
             "netbox_nso_plugin.nsoredistributionstate",
             "netbox_nso_plugin.nsoroutepolicystate",
             "netbox_nso_plugin.nsostaticroutestate",
@@ -1126,6 +1127,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             )
             scope = BGPScope.objects.create(router=router)
             address_family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+            acquire_bgp_router(self.management, router)
             peer_group = BGPPeerTemplate.objects.create(name="TRACE-PEERS", remote_as=remote_as)
             peer_source = IPAddress.objects.create(address="198.18.0.1/32")
             peer_source.refresh_from_db()  # .address must be a netaddr IPNetwork, as on a loaded row
@@ -1144,8 +1146,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 management=self.management,
                 asn_str=str(local_as.asn),
                 peer_address_str=str(peer.peer.address).split("/")[0],
-                remote_as_str=str(remote_as.asn),
-                enabled=True,
                 bgp_peer=peer,
                 status="accepted",
             )

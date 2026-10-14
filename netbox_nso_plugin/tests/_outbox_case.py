@@ -523,7 +523,8 @@ class ReceiptAdapter:
         #: per-object marking that decides retract versus detach.
         self.jobs: list[dict] = []
         self._owned: dict[int, set] = {}
-        self._respond = respond or self._default_response
+        self.preparation_revisions: dict[str, int] = {}
+        self._respond = respond or self.default_response
 
     @staticmethod
     def _default_response(body):
@@ -543,6 +544,16 @@ class ReceiptAdapter:
             }
         values = next(iter(body.values()), []) if isinstance(body, dict) else body
         return {"count": len(values or [])}
+
+    def default_response(self, body):
+        """Allocate each accepted preparation's exact per-endpoint revision."""
+        response = self._default_response(body)
+        if response.get("status") == "prepared":
+            endpoint = self.requests[-1]["url"]
+            revision = self.preparation_revisions.get(endpoint, 0) + 1
+            self.preparation_revisions[endpoint] = revision
+            return {**response, "selection_revision": revision}
+        return response
 
     @property
     def sequences(self) -> list[int | None]:

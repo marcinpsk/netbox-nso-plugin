@@ -11,7 +11,7 @@ from django.test import TestCase
 
 from ._adapter_http import make_session
 from ._outbox_case import content_update
-from ._ownership_case import acquire_overlay, save_overlay_fixture
+from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin
 
 _BASE_CFG = {
@@ -171,7 +171,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         )
 
         from netbox_nso_plugin.bgp_reconciler import bgp_reconcile_plan
-        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPPeerTemplateState
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSOBGPRouterState
 
         payload = self._router_payload(
             peers=[self._peer_entry(peer_group="EDGE")],
@@ -201,6 +201,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
                 "netbox_routing.bgprouter",
                 "netbox_routing.bgpscope",
                 "netbox_nso_plugin.nsobgppeerstate",
+                "netbox_nso_plugin.nsobgprouterstate",
                 "netbox_nso_plugin.nsobgppeertemplatestate",
             },
         )
@@ -215,6 +216,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
             BGPRouter,
             BGPScope,
             NSOBGPPeerState,
+            NSOBGPRouterState,
             NSOBGPPeerTemplateState,
         ):
             self.assertFalse(model.objects.exists(), model._meta.label_lower)
@@ -649,12 +651,13 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(materialized_peer.local_as.asn, 4_294_967_293)
         self.assertEqual(BGPPeerTemplate.objects.get(name="GROUP").remote_as.asn, 4_294_967_292)
         state = NSOBGPPeerState.objects.get()
-        self.assertEqual((state.asn_str, state.remote_as_str), ("4294967295", "4294967294"))
+        self.assertEqual((state.asn_str, state.bgp_peer.remote_as.asn), ("4294967295", 4_294_967_294))
         self.assertEqual(second.pk, first.pk)
         self.assertEqual(second.bgp_peer_id, first.bgp_peer_id)
         self.assertEqual(second.device_base_hash, first.device_base_hash)
 
         content_update(state, status="in_sync")
+        acquire_bgp_router(state.management, state.bgp_peer.scope.router)
         captured = {}
 
         def capture_push(adapter_device_id, routers):
@@ -688,15 +691,16 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(state.peer_address_str, "10.0.0.2")
         self.assertEqual(state.management, mgmt)
         self.assertIsNotNone(state.bgp_peer)
-        self.assertTrue(state.enabled)
+        self.assertTrue(state.bgp_peer.enabled)
 
-    def test_unknown_vrf_reuses_resolved_global_scope(self):
-        """An unknown payload VRF resolves to one global scope across reconciles."""
-        self._make_mgmt()
+    def test_unknown_vrf_stays_blocked_without_global_scope(self):
+        """An unresolved named VRF stays blocked across repeated observations."""
+        mgmt = self._make_mgmt()
 
         from netbox_routing.models import BGPPeer, BGPScope
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPRouterState
 
         payload = self._payload(
             self._router_payload(
@@ -708,9 +712,12 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         _reconcile_bgp_config(self.device, payload)
         _reconcile_bgp_config(self.device, payload)
 
-        self.assertEqual(BGPScope.objects.count(), 1)
-        self.assertIsNone(BGPScope.objects.get().vrf_id)
-        self.assertEqual(BGPPeer.objects.count(), 1)
+        self.assertFalse(BGPScope.objects.exists())
+        self.assertFalse(BGPPeer.objects.exists())
+        router = NSOBGPRouterState.objects.get(management=mgmt, asn_str="65100")
+        self.assertEqual(router.status, "conflict")
+        peer = NSOBGPPeerState.objects.get(management=mgmt, vrf_name="MISSING-VRF")
+        self.assertIsNone(peer.bgp_peer_id)
 
     def test_existing_vrf_scope_is_idempotent(self):
         """A resolved payload VRF reuses its scope and peer across reconciles."""
@@ -879,7 +886,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         from ipam.models import VRF, IPAddress
         from netbox_routing.models import BGPPeer
 
-        from netbox_nso_plugin.bgp_reconciler import _content_hash, _peer_object_content, _reconcile_bgp_config
+        from netbox_nso_plugin.bgp_peer_content import peer_content
+        from netbox_nso_plugin.bgp_reconciler import _content_hash, _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         vrf = VRF.objects.create(name="SOURCE-SELECTION-VRF")
@@ -903,7 +911,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer.refresh_from_db()
         self.assertEqual(peer.source_id, selected_source.pk)
         self.assertEqual(result[0].status, "in_sync")
-        self.assertEqual(result[0].device_base_hash, _content_hash(_peer_object_content(peer)))
+        self.assertEqual(result[0].device_base_hash, _content_hash(peer_content(peer)))
         self.assertEqual(IPAddress.objects.filter(address__net_host=source_address).count(), 1)
 
     def test_duplicate_peer_rejects_document_before_materializing_asns(self):
@@ -952,6 +960,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(state.pk, original.pk)
         self.assertEqual(state.status, "in_sync")
         self.assertEqual(state.peer_address_str, canonical)
+        acquire_bgp_router(state.management, state.bgp_peer.scope.router)
         captured = {}
 
         def capture_push(adapter_device_id, routers):
@@ -1022,6 +1031,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(identity.asn_str, "065100")
         self.assertEqual(identity.status, "in_sync")
         self.assertEqual(duplicate.status, "changed")
+        acquire_bgp_router(identity.management, identity.bgp_peer.scope.router)
         captured = {}
 
         def capture_push(adapter_device_id, routers):
@@ -1115,6 +1125,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(identity.peer_address_str, expanded)
         self.assertEqual(identity.status, "in_sync")
         self.assertEqual(duplicate.status, "changed")
+        acquire_bgp_router(identity.management, identity.bgp_peer.scope.router)
         captured = {}
 
         def capture_push(adapter_device_id, routers):
@@ -1194,6 +1205,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         row.status = "in_sync"
         save_overlay_fixture(row, update_fields=["status"])
 
+        acquire_bgp_router(row.management, row.bgp_peer.scope.router)
         captured = {}
 
         def _capture(adapter_device_id, routers):
@@ -1246,6 +1258,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         row.status = "in_sync"
         save_overlay_fixture(row, update_fields=["status"])
 
+        acquire_bgp_router(row.management, row.bgp_peer.scope.router)
         captured = {}
 
         def _capture(adapter_device_id, routers):
@@ -1319,6 +1332,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         row.status = "in_sync"  # own it so the push picks up the router
         save_overlay_fixture(row, update_fields=["status"])
 
+        acquire_bgp_router(row.management, row.bgp_peer.scope.router)
         captured = {}
 
         def _capture(adapter_device_id, routers):
@@ -1628,6 +1642,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         row.status = "in_sync"
         save_overlay_fixture(row, update_fields=["status"])
 
+        acquire_bgp_router(row.management, row.bgp_peer.scope.router)
         captured = {}
 
         def _capture(adapter_device_id, routers):

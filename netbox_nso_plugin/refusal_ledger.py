@@ -12,7 +12,7 @@ _LABEL_CHOICES = tuple((label, label) for label in _LABELS)
 
 
 class NSOAcceptedSelection(models.Model):
-    management = models.ForeignKey("NSODeviceManagement", on_delete=models.PROTECT, related_name="accepted_selections")
+    management = models.ForeignKey("NSODeviceManagement", on_delete=models.CASCADE, related_name="accepted_selections")
     mapping_epoch = models.CharField(max_length=64)
     store_incarnation = models.CharField(max_length=64, null=True, blank=True)
     stream = models.CharField(max_length=32)
@@ -42,6 +42,13 @@ class NSOAcceptedSelection(models.Model):
                 condition=(
                     models.Q(source_push_seq__isnull=False, source_push_seq__gt=0, selection_revision__isnull=True)
                     | models.Q(source_push_seq__isnull=True, selection_revision__isnull=False, selection_revision__gt=0)
+                    | models.Q(
+                        source_push_seq__isnull=True,
+                        selection_revision__isnull=True,
+                        stream__in=("lag", "switchport"),
+                        binding_state="unbound",
+                        acknowledged_at__isnull=True,
+                    )
                 ),
                 name="nso_selection_selector",
             ),
@@ -70,7 +77,7 @@ class NSOAcceptedSelection(models.Model):
 
 class NSOApplyExecution(models.Model):
     attempt = models.ForeignKey("NSOApplyAttempt", on_delete=models.CASCADE, related_name="executions")
-    management = models.ForeignKey("NSODeviceManagement", on_delete=models.PROTECT, related_name="apply_executions")
+    management = models.ForeignKey("NSODeviceManagement", on_delete=models.CASCADE, related_name="apply_executions")
     mapping_epoch = models.CharField(max_length=64)
     adapter_device_id = models.PositiveBigIntegerField()
     store_incarnation = models.CharField(max_length=64, null=True, blank=True)
@@ -132,7 +139,7 @@ class NSOApplyExecution(models.Model):
 class NSOApplyOverlaySnapshot(models.Model):
     attempt = models.ForeignKey("NSOApplyAttempt", on_delete=models.CASCADE, related_name="overlay_snapshots")
     selection = models.ForeignKey(
-        NSOAcceptedSelection, on_delete=models.PROTECT, null=True, blank=True, related_name="overlay_snapshots"
+        NSOAcceptedSelection, on_delete=models.RESTRICT, null=True, blank=True, related_name="overlay_snapshots"
     )
     executions = models.ManyToManyField(NSOApplyExecution, related_name="overlay_snapshots", blank=True)
     model_label = models.CharField(max_length=100, choices=_LABEL_CHOICES)
@@ -142,13 +149,17 @@ class NSOApplyOverlaySnapshot(models.Model):
     prior_last_apply_at = models.DateTimeField(null=True, blank=True)
     prior_last_apply_error = models.JSONField(null=True, blank=True)
     prior_apply_attempt = models.ForeignKey(
-        "NSOApplyAttempt", on_delete=models.PROTECT, null=True, blank=True, related_name="referenced_prior_snapshots"
+        "NSOApplyAttempt", on_delete=models.RESTRICT, null=True, blank=True, related_name="referenced_prior_snapshots"
     )
     expected_status = models.CharField(max_length=32)
     expected_last_apply_at = models.DateTimeField(null=True, blank=True)
     expected_last_apply_error = models.JSONField(null=True, blank=True)
     expected_apply_attempt = models.ForeignKey(
-        "NSOApplyAttempt", on_delete=models.PROTECT, null=True, blank=True, related_name="referenced_expected_snapshots"
+        "NSOApplyAttempt",
+        on_delete=models.RESTRICT,
+        null=True,
+        blank=True,
+        related_name="referenced_expected_snapshots",
     )
     accepted_at = models.DateTimeField(null=True, blank=True)
     scope_revisions = models.JSONField(default=dict)
@@ -178,17 +189,17 @@ class NSOApplyOverlaySnapshot(models.Model):
 
 
 class NSOOverlaySettlementFence(models.Model):
-    management = models.ForeignKey("NSODeviceManagement", on_delete=models.PROTECT, related_name="settlement_fences")
+    management = models.ForeignKey("NSODeviceManagement", on_delete=models.CASCADE, related_name="settlement_fences")
     mapping_epoch = models.CharField(max_length=64)
     model_label = models.CharField(max_length=100, choices=_LABEL_CHOICES)
     overlay_pk = models.PositiveBigIntegerField()
     bookkeeping_revision = models.PositiveBigIntegerField(default=0)
     observation_watermark = models.JSONField(default=dict)
     current_attempt = models.ForeignKey(
-        "NSOApplyAttempt", on_delete=models.PROTECT, null=True, blank=True, related_name="active_settlement_fences"
+        "NSOApplyAttempt", on_delete=models.RESTRICT, null=True, blank=True, related_name="active_settlement_fences"
     )
     last_execution = models.ForeignKey(
-        NSOApplyExecution, on_delete=models.PROTECT, null=True, blank=True, related_name="settlement_fences"
+        NSOApplyExecution, on_delete=models.RESTRICT, null=True, blank=True, related_name="settlement_fences"
     )
     last_settle_seq = models.PositiveBigIntegerField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)

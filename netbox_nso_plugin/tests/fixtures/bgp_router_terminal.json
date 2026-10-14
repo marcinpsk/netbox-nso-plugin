@@ -1,0 +1,255 @@
+{
+  "attribute_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "bfd_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "bgp_count_by_outcome": {
+    "apply_failed": 1,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "commit_acknowledged": false,
+  "interface_mtu_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "ip_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "isis_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "l2_sap_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "lag_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "logging_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "ospf_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "refusals": [
+    {
+      "family": "bgp",
+      "field": null,
+      "logical_rows": [
+        {
+          "acceptance_identity": "2026-01-02T03:04:05+00:00",
+          "carrier": {
+            "accepted_at": "2026-01-02T03:04:05+00:00",
+            "frozen_revision": 1,
+            "generation_id": 1,
+            "row": {
+              "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709",
+              "subject": "bgp.router"
+            },
+            "settlement_cohort": null,
+            "source_push_seq": 41,
+            "stream": "bgp"
+          },
+          "frozen_revision": 1,
+          "generation_id": 1,
+          "row": {
+            "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec",
+            "subject": "bgp.router.scope.peer"
+          },
+          "settlement_cohort": null,
+          "source_push_seq": 41,
+          "stream": "bgp"
+        }
+      ],
+      "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+      "message_id": "write-blocked",
+      "provenance": "current",
+      "reason": "inexpressible-on-ned",
+      "related": null,
+      "row": {
+        "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec",
+        "subject": "bgp.router.scope.peer"
+      },
+      "sender_phase": "commit"
+    }
+  ],
+  "route_policy_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "row_outcomes": [
+    {
+      "acceptance_identity": "2026-01-02T03:04:05+00:00",
+      "carrier": {
+        "accepted_at": "2026-01-02T03:04:05+00:00",
+        "frozen_revision": 1,
+        "generation_id": 1,
+        "row": {
+          "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709",
+          "subject": "bgp.router"
+        },
+        "settlement_cohort": null,
+        "source_push_seq": 41,
+        "stream": "bgp"
+      },
+      "disposition": "refused",
+      "frozen_revision": 1,
+      "generation_id": 1,
+      "refusals": [
+        {
+          "family": "bgp",
+          "field": null,
+          "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+          "message_id": "write-blocked",
+          "reason": "inexpressible-on-ned",
+          "related": null,
+          "row": {
+            "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec",
+            "subject": "bgp.router.scope.peer"
+          }
+        }
+      ],
+      "row": {
+        "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec",
+        "subject": "bgp.router.scope.peer"
+      },
+      "settlement_cohort": null,
+      "source_push_seq": 41,
+      "stream": "bgp"
+    },
+    {
+      "acceptance_identity": "2026-01-02T03:04:05+00:00",
+      "carrier": {
+        "accepted_at": "2026-01-02T03:04:05+00:00",
+        "frozen_revision": 1,
+        "generation_id": 1,
+        "row": {
+          "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709",
+          "subject": "bgp.router"
+        },
+        "settlement_cohort": null,
+        "source_push_seq": 41,
+        "stream": "bgp"
+      },
+      "disposition": "not_applied",
+      "frozen_revision": 1,
+      "generation_id": 1,
+      "refusals": [],
+      "row": {
+        "key": "79361f0251be0a1ad8552c813127e301770cb6ee0a2b7ea7faa82875eeca2e80",
+        "subject": "bgp.router.scope.peer"
+      },
+      "settlement_cohort": null,
+      "source_push_seq": 41,
+      "stream": "bgp"
+    },
+    {
+      "acceptance_identity": "2026-01-02T03:04:05+00:00",
+      "carrier": {
+        "accepted_at": "2026-01-02T03:04:05+00:00",
+        "frozen_revision": 1,
+        "generation_id": 1,
+        "row": {
+          "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709",
+          "subject": "bgp.router"
+        },
+        "settlement_cohort": null,
+        "source_push_seq": 41,
+        "stream": "bgp"
+      },
+      "disposition": "not_applied",
+      "frozen_revision": 1,
+      "generation_id": 1,
+      "refusals": [],
+      "row": {
+        "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709",
+        "subject": "bgp.router"
+      },
+      "settlement_cohort": null,
+      "source_push_seq": 41,
+      "stream": "bgp"
+    }
+  ],
+  "settlement_owners": [
+    {
+      "accepted_at": "2026-01-02T03:04:05+00:00",
+      "disposition": "refused",
+      "frozen_revision": 1,
+      "generation_id": 1,
+      "row": {
+        "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709",
+        "subject": "bgp.router"
+      },
+      "settlement_cohort": null,
+      "source_push_seq": 41,
+      "stream": "bgp"
+    }
+  ],
+  "snmp_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "static_route_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "subinterface_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "svi_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "switchport_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  },
+  "vlan_count_by_outcome": {
+    "apply_failed": 0,
+    "in_sync": 0,
+    "not_applied": 0,
+    "unavailable": 0
+  }
+}

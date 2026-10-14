@@ -387,6 +387,11 @@ urlpatterns = [
         name="routing_accept_isis_instance",
     ),
     path(
+        "routing/bgp-router-state/<int:pk>/accept/",
+        views.NSOBGPRouterStateAcceptView.as_view(),
+        name="routing_accept_bgp_router",
+    ),
+    path(
         "routing/bgp-peer-state/<int:pk>/accept/",
         views.NSOBGPPeerStateAcceptView.as_view(),
         name="routing_accept_bgp_peer",
