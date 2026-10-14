@@ -1431,7 +1431,9 @@ def _native_source_is_rendered(instance) -> bool:
         return (
             RouterState.objects.filter(bgp_router__asn_id=instance.pk, status__in=OWNED_STATES).exists()
             or NSOBGPPeerState.objects.filter(
-                Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk),
+                Q(bgp_peer__remote_as_id=instance.pk)
+                | Q(bgp_peer__local_as_id=instance.pk)
+                | Q(bgp_peer__scope__router__asn_id=instance.pk),
                 status__in=OWNED_STATES,
             ).exists()
         )
@@ -1618,7 +1620,9 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
 
         PeerState = apps.get_model("netbox_nso_plugin.nsobgppeerstate")
         device_ids = PeerState.objects.filter(
-            Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk)
+            Q(bgp_peer__remote_as_id=instance.pk)
+            | Q(bgp_peer__local_as_id=instance.pk)
+            | Q(bgp_peer__scope__router__asn_id=instance.pk)
         ).values_list("management__device_id", flat=True)
         RouterState = apps.get_model("netbox_nso_plugin.nsobgprouterstate")
         router_device_ids = RouterState.objects.filter(bgp_router__asn_id=instance.pk).values_list(

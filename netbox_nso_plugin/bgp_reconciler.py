@@ -410,20 +410,6 @@ def _validated_bgp_document(payload):  # noqa: C901
     return payload
 
 
-_PEER_FIELDS = (
-    "enabled",
-    "remote_as",
-    "local_as",
-    "peer_group",
-    "source",
-    "update_source",
-    "ttl",
-    "password",
-    "bfd_enabled",
-)
-_PEER_FK_FIELDS = {"remote_as", "local_as", "peer_group", "source", "update_source"}
-
-
 def _peer_desired(peer_data, remote_asn_obj, local_asn_obj, peer_group_obj, source_obj, update_source_obj):
     """Return the device-desired BGPPeer field values (objects for FKs)."""
     return {
@@ -501,50 +487,6 @@ def _af_object_content(owner_obj) -> list:
         "prefixlist_out",
     )
     return _af_rows_content(rows)
-
-
-def _drop_unset_update_source(content: dict) -> None:
-    """Keep pre-``update_source`` base hashes valid across the migration.
-
-    ``update_source`` (the IOS/IOS-XR update-source interface) is a new content
-    key. Existing ``device_base_hash`` values were computed without it, so we omit
-    it whenever it is unset: Junos/Nokia and cisco-without-update-source peers then
-    keep their old hash (no phantom drift), while a cisco peer that DOES carry an
-    update-source interface differs only on that key — so the 3-way merge
-    auto-mirrors (adopts) it instead of flagging a conflict, migrating the peer off
-    the old lossy source-IP onto the interface at the same time.
-    """
-    if content.get("update_source") is None:
-        content.pop("update_source", None)
-
-
-def _peer_device_content(
-    desired: dict,
-    af_list: list,
-    *,
-    route_maps_by_name,
-    prefix_lists_by_name,
-) -> dict:
-    """Build canonical device content with stable natural FK identities."""
-    content = {f: (_bgp_fk_identity(desired[f]) if f in _PEER_FK_FIELDS else desired[f]) for f in _PEER_FIELDS}
-    _drop_unset_update_source(content)
-    content["afs"] = _af_device_content(
-        af_list,
-        route_maps_by_name=route_maps_by_name,
-        prefix_lists_by_name=prefix_lists_by_name,
-    )
-    return content
-
-
-def _peer_object_content(bgp_peer, address_families=None) -> dict:
-    """Build canonical content read back from the netbox-routing BGPPeer object + its AFs."""
-    content = {
-        f: (_bgp_fk_identity(getattr(bgp_peer, f)) if f in _PEER_FK_FIELDS else getattr(bgp_peer, f))
-        for f in _PEER_FIELDS
-    }
-    _drop_unset_update_source(content)
-    content["afs"] = _af_object_content(bgp_peer) if address_families is None else _af_rows_content(address_families)
-    return content
 
 
 def _template_device_content(
@@ -742,6 +684,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         ):
             scope_key = (row.scope.router_id, row.scope.vrf_id)
             self.peers[(scope_key, str(row.peer.address.ip))] = row
+        self.peers_by_id = {row.pk: row for row in self.peers.values()}
         self.templates = {
             row.name: row
             for row in BGPPeerTemplate.objects.filter(name__in=template_names)
@@ -1059,10 +1002,36 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
     def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: C901, PLR0915
         from . import status_machine as sm
+        from .bgp_peer_content import peer_content
 
         address = entry["peer_address"]
         state_key = (asn_str, vrf_name, address)
         if state_key in self.seen_peers:
+            return
+        current_state = self.peer_states.get(state_key)
+        if current_state is not None and sm.is_owned(current_state.status):
+            state = copy.copy(current_state)
+            state.asn_str, state.peer_address_str = _available_peer_state_identity(
+                state,
+                state_key,
+                self.peer_state_raw_keys,
+            )
+            matches = False
+            if state.bgp_peer_id is not None:
+                native = self.peers_by_id.get(state.bgp_peer_id, state.bgp_peer)
+                families = self.peer_address_families.get((self.peer_content_type.pk, native.pk))
+                device_content = peer_content(entry)
+                matches = peer_content(native, families) == device_content
+                if matches:
+                    state.device_base_hash = _content_hash(device_content)
+            state.last_sync_at = self.planned_at
+            state.status = sm.on_reconcile(state.status, matches=matches)
+            self.peer_states[state_key] = state
+            self.seen_peers.add(state_key)
+            self.save(
+                state,
+                update_fields=("asn_str", "peer_address_str", "last_sync_at", "status", "device_base_hash"),
+            )
             return
         peer_ip = self.peer_ip(address, scope.vrf)
         if peer_ip is None:
@@ -1091,7 +1060,6 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if peer_ip_changed:
             peer.peer = peer_ip
 
-        current_state = self.peer_states.get(state_key)
         state_created = current_state is None
         state = (
             self.NSOBGPPeerState(
@@ -1107,20 +1075,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         )
         state.bgp_peer = peer
         state.last_sync_at = self.planned_at
-        device_hash = _content_hash(
-            _peer_device_content(
-                desired,
-                af_entries,
-                route_maps_by_name=self.route_maps_by_name,
-                prefix_lists_by_name=self.prefix_lists_by_name,
-            )
-        )
+        device_hash = _content_hash(peer_content(entry))
         peer_address_families = (
             () if created_peer else self.peer_address_families.get((self.peer_content_type.pk, current_peer.pk), ())
         )
-        object_hash = (
-            device_hash if created_peer else _content_hash(_peer_object_content(current_peer, peer_address_families))
-        )
+        object_hash = device_hash if created_peer else _content_hash(peer_content(current_peer, peer_address_families))
         base = state.device_base_hash
         matches = True
         conflict = False
@@ -1151,25 +1110,6 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.plan_address_family_rows(peer, af_entries, scope)
         elif peer_ip_changed:
             self.save(peer, update_fields=("peer",))
-        owned = sm.is_owned(state.status)
-        if owned:
-            intent_as = _parse_asn(state.remote_as_str) if state.remote_as_str else None
-            intent_enabled = state.enabled if state.enabled is not None else True
-            # A recreated native peer, or one that differs from the intent, leaves the intent pending.
-            intent_pending = created_peer or (
-                intent_as != (current_peer.remote_as.asn if current_peer.remote_as_id else None)
-                or intent_enabled != (current_peer.enabled if current_peer.enabled is not None else True)
-            )
-        if not owned or (mirror and not intent_pending):
-            state.remote_as_str = str(entry.get("remote_as") or "")
-            state.enabled = entry.get("enabled")
-        else:
-            observed_enabled = entry.get("enabled") if entry.get("enabled") is not None else True
-            matches = (
-                matches
-                and intent_as == (int(remote_as.asn) if remote_as is not None else None)
-                and intent_enabled == observed_enabled
-            )
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         self.peer_states[state_key] = state
         self.seen_peers.add(state_key)
@@ -1395,9 +1335,6 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if created
             else copy.copy(current)
         )
-        if not sm.is_owned(state.status):
-            state.remote_as_str = entry.get("remote_as") or ""
-            state.enabled = entry.get("enabled")
         state.last_sync_at = self.planned_at
         state.status = sm.on_reconcile(state.status, matches=None, settles_owned=False, settles_deploying=False)
         self.peer_states[key] = state
@@ -1455,7 +1392,12 @@ class _BGPGraphPlanner:  # noqa: PLR0904
     def plan_stale_peer_state(self, current, *, force_changed=False):
         from . import status_machine as sm
 
-        status = sm.CHANGED if force_changed else sm.on_reconcile(current.status, present=False)
+        if force_changed:
+            status = sm.CHANGED
+        elif sm.is_owned(current.status):
+            status = sm.on_reconcile(current.status, matches=False)
+        else:
+            status = sm.on_reconcile(current.status, present=False)
         if status != current.status:
             state = copy.copy(current)
             state.status = status
