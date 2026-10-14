@@ -400,6 +400,32 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         )
         self.assertEqual(snapshot.settlement_disposition, "superseded")
 
+    def test_settlement_releases_a_superseded_row_of_a_rejected_attempt(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+
+        def change_bookkeeping(body):
+            mirror_update(self.mtu, last_apply_error="Newer Apply error.")
+
+        adapter = ManualAdmissionAdapter(
+            lambda _body: (409, ManualAdmissionAdapter.rejection()), before_apply=change_bookkeeping
+        )
+        self.assertEqual(self._apply(adapter).status_code, 409)
+        attempt_id = UUID(adapter.apply_requests[0]["apply_attempt_id"])
+        self.mtu.refresh_from_db()
+        self.assertEqual((self.mtu.status, self.mtu.apply_attempt_id), ("deploying", attempt_id))
+
+        config, session = adapter.patches()
+        with config, session:
+            evidence = adapter_client.get_deployment_evidence(self.management.adapter_device_id, [attempt_id])
+            settle_apply_attempts(self.management, evidence, static_route_feed_drained=True)
+
+        self.mtu.refresh_from_db()
+        self.assertEqual(
+            (self.mtu.status, self.mtu.apply_attempt_id, self.mtu.last_apply_error),
+            ("accepted", None, "Newer Apply error."),
+        )
+
     def test_manual_skipped_stream_restores_only_its_snapshot(self):
         def promoted(body):
             selected = body["selected"]

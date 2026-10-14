@@ -304,6 +304,8 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
             if disposition == "waiting":
                 continue
             if disposition == "not_promoted":
+                # Restoration left this row deploying (superseded snapshot), so release it for the next Apply.
+                decisions.append((scope, model, row, "accepted", row.last_apply_error, True))
                 continue
             if disposition == "settled":
                 if scope == "static_route" and not static_route_feed_drained:
