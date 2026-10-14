@@ -1155,8 +1155,8 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if owned:
             intent_as = _parse_asn(state.remote_as_str) if state.remote_as_str else None
             intent_enabled = state.enabled if state.enabled is not None else True
-            # Intent that already differs from the native peer is pending; a mirror must not erase it.
-            intent_pending = not created_peer and (
+            # A recreated native peer, or one that differs from the intent, leaves the intent pending.
+            intent_pending = created_peer or (
                 intent_as != (current_peer.remote_as.asn if current_peer.remote_as_id else None)
                 or intent_enabled != (current_peer.enabled if current_peer.enabled is not None else True)
             )

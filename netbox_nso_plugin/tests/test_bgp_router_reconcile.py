@@ -435,6 +435,26 @@ def test_peer_mirror_keeps_pending_owned_intent(router_case, status):
 
 
 @pytest.mark.parametrize("status", ["accepted", "in_sync"])
+def test_peer_recreation_keeps_owned_intent(router_case, status):
+    from netbox_nso_plugin.models import NSOBGPPeerState
+
+    _device, management = router_case
+    state, _ = import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
+    peer = NSOBGPPeerState.objects.get(management=management, peer_address_str="192.0.2.1")
+    with without_commit_drain():
+        content_update(state, status="accepted")
+        peer = content_update(peer, status=status)
+        peer.bgp_peer.delete()
+    peer.refresh_from_db()
+    assert peer.bgp_peer_id is None
+    import_router(router_case, scopes=[scope_entry(peers=[{**peer_entry(), "remote_as": "64514"}])])
+    peer.refresh_from_db()
+    assert peer.bgp_peer.remote_as.asn == 64514
+    assert (peer.remote_as_str, peer.enabled) == ("64513", True)
+    assert peer.status == "accepted"
+
+
+@pytest.mark.parametrize("status", ["accepted", "in_sync"])
 def test_peer_read_keeps_conflicted_owned_peer_pending(router_case, status):
     from ipam.models import ASN
 
