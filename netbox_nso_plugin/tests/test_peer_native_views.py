@@ -413,11 +413,17 @@ class TestPeerNativeViews(TestCase):
         permission.object_types.add(ObjectType.objects.get_for_model(model))
         permission.users.add(user)
 
-    def test_inline_edit_requires_native_peer_asn_and_rir_permissions(self):
-        state = self.state()
+    def edit_user(self, *, peer_constraints=None):
         user = get_user_model().objects.create_user(username=f"peeredit{uuid4().hex[:8]}")
         self.grant(user, type(self.management), ["change"])
+        if peer_constraints is not None:
+            self.grant(user, BGPPeer, ["change"], constraints=peer_constraints)
         self.client.force_login(user)
+        return user
+
+    def test_inline_edit_requires_native_peer_asn_and_rir_permissions(self):
+        state = self.state()
+        user = self.edit_user()
         self.assertEqual(self.edit(state, {"enabled": "True"}).status_code, 403)
         self.grant(user, BGPPeer, ["change"], constraints={"pk": self.peer.pk + 1})
         self.assertEqual(self.edit(state, {"enabled": "True"}).status_code, 403)
@@ -428,9 +434,29 @@ class TestPeerNativeViews(TestCase):
         self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 403)
         self.grant(user, ASN, ["add"])
         self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 403)
+        self.grant(user, RIR, ["add"], constraints={"name": "example-other"})
+        self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 403)
         self.assertFalse(ASN.objects.filter(asn=64599).exists())
+        self.assertFalse(RIR.objects.filter(name="NSO Auto-Discovered").exists())
         self.grant(user, RIR, ["add"])
         self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 200)
         self.peer.refresh_from_db()
         self.assertEqual(self.peer.remote_as.asn, 64599)
         self.assertEqual(self.peer.remote_as.rir.name, "NSO Auto-Discovered")
+
+    def test_inline_edit_validates_the_written_peer_and_asn_against_constraints(self):
+        state = self.state()
+        RIR.objects.create(name="NSO Auto-Discovered", slug="nso-auto-discovered", is_private=True)
+        user = self.edit_user(peer_constraints={"remote_as__asn": 64513})
+        self.assertEqual(self.edit(state, {"remote_as": "64512"}).status_code, 403)
+        self.peer.refresh_from_db()
+        self.assertEqual(self.peer.remote_as_id, self.remote.pk)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        user = self.edit_user(peer_constraints={"pk": self.peer.pk})
+        self.grant(user, ASN, ["add"], constraints={"asn": 64600})
+        self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 403)
+        self.assertFalse(ASN.objects.filter(asn=64599).exists())
+        self.assertEqual(self.edit(state, {"remote_as": "64600"}).status_code, 200)
+        self.peer.refresh_from_db()
+        self.assertEqual(self.peer.remote_as.asn, 64600)

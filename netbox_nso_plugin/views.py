@@ -363,16 +363,15 @@ def _can_change_bgp_peer(user, state):
     )
 
 
-def _require_bgp_peer_asn_permissions(user, family, peer):
-    """Require the native add permissions for the ASN and RIR that a peer edit creates."""
-    from ipam.models import RIR
+def _require_bgp_peer_edit_constraints(user, peer, created):
+    """Require the written peer and each created object to satisfy the user's permission constraints."""
+    from netbox_routing.models import BGPPeer
 
-    if family != "bgp_peer" or peer.remote_as is None or peer.remote_as.pk is not None:
-        return
-    if not user.has_perm("ipam.add_asn"):
+    if not BGPPeer.objects.restrict(user, "change").filter(pk=peer.pk).exists():
         raise PermissionDenied
-    if not RIR.objects.filter(name=_AUTO_DISCOVERED_RIR).exists() and not user.has_perm("ipam.add_rir"):
-        raise PermissionDenied
+    for instance in created:
+        if not type(instance).objects.restrict(user, "add").filter(pk=instance.pk).exists():
+            raise PermissionDenied
 
 
 def _prepare_bgp_edit(user, family, state):
@@ -5229,7 +5228,7 @@ def _save_owned_bgp_router_edit(state, old_values):
         writer.save(candidate, update_fields=fields)
 
 
-def _save_owned_bgp_edit(obj, old_values):
+def _save_owned_bgp_edit(obj, old_values, user):
     """Claim one BGP peer edit and update its native root through an exact plan."""
     from ipam.models import RIR
 
@@ -5269,6 +5268,7 @@ def _save_owned_bgp_edit(obj, old_values):
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        _require_bgp_peer_edit_constraints(user, native, [instance for instance, _, created in operations if created])
 
 
 def _owned_overlay_edit_footprint(obj, key):
@@ -5435,7 +5435,7 @@ def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
         _save_owned_interface_mtu_edit(current, current_old_values, _retry_on_stale=False)
 
 
-def _save_owned_overlay_edit(obj, key, old_values):
+def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     if key in {
         "logging_host",
@@ -5466,7 +5466,7 @@ def _save_owned_overlay_edit(obj, key, old_values):
         _save_owned_bgp_router_edit(obj, old_values)
         return None
     if key == "bgp_peer":
-        _save_owned_bgp_edit(obj, old_values)
+        _save_owned_bgp_edit(obj, old_values, user)
         return None
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
@@ -5930,7 +5930,7 @@ def _overlay_family_errors(key, obj, old_values):
     return {}
 
 
-def _save_overlay_edit(obj, key, old_values):
+def _save_overlay_edit(obj, key, old_values, *, user):
     """Dispatch a validated edit to its family-specific atomic save path."""
     if key == "route_map_name":
         return _save_route_map_name_edit(obj, old_values["object_name"])
@@ -5939,7 +5939,7 @@ def _save_overlay_edit(obj, key, old_values):
     elif key == "vlan_name":
         return _save_vlan_name_edit(obj)
     else:
-        return _save_owned_overlay_edit(obj, key, old_values)
+        return _save_owned_overlay_edit(obj, key, old_values, user=user)
     return None
 
 
@@ -6053,7 +6053,6 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         errors = _overlay_family_errors(key, obj, old_values)
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
-        _require_bgp_peer_asn_permissions(request.user, key, edit_obj)
 
         if changed:
             collision = (
@@ -6065,7 +6064,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
             try:
-                errors = _save_overlay_edit(obj, key, old_values)
+                errors = _save_overlay_edit(obj, key, old_values, user=request.user)
             except (IntentPlanStaleError, RendererTargetsChanged):
                 # A retried plan still found a moved preimage; the plan rolled back whole.
                 return JsonResponse(
