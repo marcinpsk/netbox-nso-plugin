@@ -485,7 +485,7 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
 
 def _takeover(state, mgmt, now) -> Claim | None:
     """Replay the unacknowledged operation: same sequence, same body, fresh lease."""
-    from .durable_capture import validate_claim_capture
+    from .durable_capture import CaptureEpochChanged, validate_claim_capture
 
     flags = ClaimFlags.from_json(state.claim_flags)
     current_identity = request_identity(
@@ -510,16 +510,26 @@ def _takeover(state, mgmt, now) -> Claim | None:
             f"push_seq {state.push_seq} for {state.device_id}/{state.scope} has no durable intent revision"
         )
     rendered = delivery.render(state.scope, state.device_id, mgmt.adapter_device_id)
-    validate_claim_capture(
-        mgmt,
-        state.scope,
-        state.push_seq,
-        state.claim_payload,
-        state.claim_revision,
-        state.claim_deletions or [],
-        flags.marking_mode,
-        rendered=rendered,
-    )
+    try:
+        validate_claim_capture(
+            mgmt,
+            state.scope,
+            state.push_seq,
+            state.claim_payload,
+            state.claim_revision,
+            state.claim_deletions or [],
+            flags.marking_mode,
+            rendered=rendered,
+        )
+    except CaptureEpochChanged:
+        logger.info(
+            "abandoning push_seq %s for %s/%s after its capture source epoch changed",
+            state.push_seq,
+            state.device_id,
+            state.scope,
+        )
+        _abandon_locked(state)
+        return None
     state.claimed_at = now
     state.save()
     logger.info("taking over push_seq %s for %s/%s", state.push_seq, state.device_id, state.scope)
@@ -1156,7 +1166,7 @@ def _uncorrelated_hit(record, removed) -> bool:
 def settle(claim: Claim, response) -> str:
     """Record the outcome of an acknowledged send, under a compare-and-set on the sequence."""
     _refuse_in_transaction("outcome")
-    from .durable_capture import acknowledge_claim_capture
+    from .durable_capture import CaptureEpochChanged, acknowledge_claim_capture
     from .models import NSOIntentOutboxEntry
 
     with transaction.atomic():
@@ -1182,7 +1192,16 @@ def settle(claim: Claim, response) -> str:
             _report_protocol_violation(claim, ack.reason)
             return UNACKNOWLEDGED
 
-        acknowledge_claim_capture(claim, response, now)
+        try:
+            acknowledge_claim_capture(claim, response, now)
+        except CaptureEpochChanged:
+            logger.warning(
+                "push_seq %s for %s/%s succeeded; its durable selection from an earlier source epoch "
+                "stays unacknowledged",
+                claim.push_seq,
+                claim.device_id,
+                claim.scope,
+            )
         if claim.mark is False and claim.mark_any and claim.marking_mode == delivery.MARKING_QUERY_FLAG:
             # The fold downgraded a marked contributor, which is the query-flag AND. A
             # per-object scope delivers the deletion itself, so its AND has no wire effect.
