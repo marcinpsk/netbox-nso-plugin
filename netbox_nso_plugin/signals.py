@@ -1510,12 +1510,8 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            from .adapter_client import AdapterError
-
-            raise AdapterError(
-                f"SNMP snapshot is blocked: {'; '.join(body['blocked'])}",
-                code="validation_error",
-                detail={"reason": "blocked_owned_row"},
+            raise _local_push_block(
+                f"SNMP snapshot is blocked: {'; '.join(body['blocked'])}", {"reason": "blocked_owned_row"}
             )
         return client.put_snmp_intent(adapter_device_id, *body)
 
@@ -1661,12 +1657,8 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            from .adapter_client import AdapterError
-
-            raise AdapterError(
-                f"SVI snapshot is blocked: {'; '.join(body['blocked'])}",
-                code="validation_error",
-                detail={"reason": "blocked_owned_row"},
+            raise _local_push_block(
+                f"SVI snapshot is blocked: {'; '.join(body['blocked'])}", {"reason": "blocked_owned_row"}
             )
         return client.put_svi_intent(adapter_device_id, body)
 
@@ -1739,12 +1731,8 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            from .adapter_client import AdapterError
-
-            raise AdapterError(
-                f"Subinterface snapshot is blocked: {'; '.join(body['blocked'])}",
-                code="validation_error",
-                detail={"reason": "blocked_owned_row"},
+            raise _local_push_block(
+                f"Subinterface snapshot is blocked: {'; '.join(body['blocked'])}", {"reason": "blocked_owned_row"}
             )
         return client.put_subinterface_intent(adapter_device_id, body)
 
@@ -2710,6 +2698,19 @@ def bgp_router_intent_item(row):
     return {**router_content(row), "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None}
 
 
+# Reasons for a snapshot that NetBox refuses before it sends any request.
+LOCAL_PUSH_BLOCK_REASONS = frozenset({"blocked_owned_row", "blocked_bgp_router", "missing_bgp_peer"})
+
+
+def _local_push_block(message, detail):
+    """Return the push error for a snapshot that NetBox did not send."""
+    from .adapter_client import AdapterError
+
+    if detail.get("reason") not in LOCAL_PUSH_BLOCK_REASONS:
+        raise ValueError(f"unknown local push block reason {detail.get('reason')!r}")
+    return AdapterError(message, code="validation_error", detail=detail)
+
+
 def _bgp_router_blocker(asn, message, state_id=None):
     return {
         "message": message,
@@ -2826,8 +2827,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            blocker = body["blocked"]
-            raise client.AdapterError(blocker["message"], code="validation_error", detail=blocker["detail"])
+            raise _local_push_block(body["blocked"]["message"], body["blocked"]["detail"])
         return client.put_bgp_intent(adapter_device_id, body)
 
     _push_changed((device_id, "bgp"), payload, push)

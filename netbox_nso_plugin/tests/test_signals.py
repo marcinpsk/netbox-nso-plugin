@@ -1163,6 +1163,26 @@ class TestAdapterLinkConcurrency(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertTrue(committed.is_set())
 
 
+class TestLocalPushBlockReasons(unittest.TestCase):
+    """Every local snapshot block is one shared reason that the banner reports as unsent."""
+
+    def test_every_local_block_reason_is_an_unsent_public_banner(self):
+        from netbox_nso_plugin.signals import LOCAL_PUSH_BLOCK_REASONS
+        from netbox_nso_plugin.views import _scope_push_error
+
+        for reason in sorted(LOCAL_PUSH_BLOCK_REASONS):
+            with self.subTest(reason=reason):
+                error = _scope_push_error({"code": "validation_error", "detail": {"reason": reason}})
+                self.assertEqual((error["kind"], error["detail"]), ("unsent", {"reason": reason}))
+                self.assertIn("NetBox did not send", error["headline"])
+
+    def test_an_unknown_local_block_reason_fails_fast(self):
+        from netbox_nso_plugin.signals import _local_push_block
+
+        with self.assertRaises(ValueError):
+            _local_push_block("Snapshot is blocked.", {"reason": "adapter_rejected"})
+
+
 class TestOffboardDeviceFromAdapter(unittest.TestCase):
     """Tests for the offboard_device_from_adapter signal handler.
 

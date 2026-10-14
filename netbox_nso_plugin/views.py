@@ -92,7 +92,7 @@ from .models import (
 )
 from .ownership_grants import OwnershipGrant
 from .ownership_planner import OwnershipNotQualified
-from .signals import _STATIC_ROUTE_ARMED_FIELDS, _schedule_intent_push
+from .signals import _STATIC_ROUTE_ARMED_FIELDS, LOCAL_PUSH_BLOCK_REASONS, _schedule_intent_push
 from .tables import (
     NSODerivedIntentTemplateTable,
     NSODeviceManagementTable,
@@ -641,13 +641,11 @@ _CATEGORY_PUSH_SCOPES = {
     "redistribution": ("ospf", "isis", "bgp"),
 }
 _PUSH_SCOPE_LABELS = {"ospf": "OSPF", "isis": "IS-IS", "bgp": "BGP"}
-_PUBLIC_PUSH_REASONS = frozenset(
+_PUBLIC_PUSH_REASONS = LOCAL_PUSH_BLOCK_REASONS | frozenset(
     {
         "backfill_carries_deletions",
         "backfill_missing_route_id",
         "backfill_only_unsupported",
-        "blocked_owned_row",
-        "blocked_bgp_router",
         "device_claimed",
         "duplicate_deleted_route_id",
         "duplicate_route_id",
@@ -663,12 +661,13 @@ _PUBLIC_PUSH_REASONS = frozenset(
 # including a socket that drops after the body went out, and `nso_timeout` likewise leaves
 # a PUT that may have committed and auto-applied. Both are unknown, not unsent — claiming
 # either way would state an outcome nobody observed.
-# A `validation_error` with reason `blocked_owned_row` is raised in signals.py before any request, so it is unsent too.
+# A `validation_error` with a reason in LOCAL_PUSH_BLOCK_REASONS is raised before any request, so it is unsent too.
 _PUSH_UNSENT_CODES = frozenset({"configuration_error"})
 _PUSH_UNKNOWN_CODES = frozenset({"nso_unreachable", "nso_timeout", ""})
 _PUSH_HEADLINES = {
     "blocked_owned_row": "An owned row fails identity validation, so NetBox did not send the snapshot.",
     "blocked_bgp_router": "Router ownership or membership is incomplete. NetBox did not send the BGP snapshot.",
+    "missing_bgp_peer": "An owned BGP peer has no linked native peer. NetBox did not send the BGP snapshot.",
     "rejected": "The adapter rejected the last intent push for this category — NetBox holds the edit, the device does not.",
     "unsent": "The last intent push for this category never reached the adapter — NetBox holds the edit, the device does not.",
     "unknown": "The last intent push for this category did not complete — whether the adapter stored it is unknown.",
@@ -677,9 +676,7 @@ _PUSH_HEADLINES = {
 
 def _push_error_kind(code, reason):
     """Classify a recorded push failure as rejected / unsent / unknown."""
-    if code in _PUSH_UNSENT_CODES or (
-        code == "validation_error" and reason in {"blocked_owned_row", "blocked_bgp_router"}
-    ):
+    if code in _PUSH_UNSENT_CODES or (code == "validation_error" and reason in LOCAL_PUSH_BLOCK_REASONS):
         return "unsent"
     if code in _PUSH_UNKNOWN_CODES:
         return "unknown"
@@ -726,7 +723,7 @@ def _scope_push_error(entry):
             "Relink missing native routers and add required child membership before retrying."
             if headline_key == "blocked_bgp_router"
             else "The server log names the row and the failed check."
-            if headline_key == "blocked_owned_row"
+            if headline_key in {"blocked_owned_row", "missing_bgp_peer"}
             else public_error_message(AdapterError("", code=code))
         ),
         "detail": public_detail,

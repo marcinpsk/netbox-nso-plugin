@@ -122,6 +122,29 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertContains(response, "NetBox did not send the BGP snapshot")
         self.assertContains(response, "nso-bgp-routers")
 
+    def test_missing_native_peer_is_reported_as_unsent_in_real_view(self):
+        router = self.router_state(owned=True)
+        state = self.peer_state()
+        drain.drain_intent_outbox()
+        self.adapter.applied.clear()
+        with without_commit_drain():
+            state.bgp_peer.delete()
+        state.refresh_from_db()
+        self.assertIsNone(state.bgp_peer_id)
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:overlay_field_edit", args=("bgp_router", router.pk)),
+            {"router_id": "198.18.0.9"},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.adapter.applied, [])
+        response = self.client.get(
+            reverse("plugins:netbox_nso_plugin:device_nso_category", args=(self.device.pk, "bgp"))
+        )
+        push_error = response.context["push_error"]
+        self.assertEqual(push_error["kind"], "unsent")
+        self.assertEqual(push_error["detail"], {"reason": "missing_bgp_peer"})
+        self.assertIn("NetBox did not send the BGP snapshot", push_error["headline"])
+
     def test_router_id_edit_pushes_without_peer_save(self):
         state = self.router_state()
         self.accept(state)
