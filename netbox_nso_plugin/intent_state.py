@@ -1026,16 +1026,15 @@ def _direct_overlay_fragment(instance):
     if label == "netbox_nso_plugin.nsobgppeerstate":
         address_families = []
         if instance.bgp_peer is not None:
-            address_families = [
-                signals.bgp_peer_address_family_intent_item(row)
-                for row in instance.bgp_peer.address_families.select_related(
+            address_families = list(
+                instance.bgp_peer.address_families.select_related(
                     "address_family",
                     "prefixlist_in",
                     "prefixlist_out",
                     "routemap_in",
                     "routemap_out",
                 )
-            ]
+            )
         return _owned_wire_fragment(
             instance,
             lambda row: signals.bgp_peer_intent_item(row, address_families),
