@@ -1340,6 +1340,9 @@ def _bgp_native_source_is_rendered(instance) -> bool | None:
 
     label = instance._meta.label_lower
     if label == "netbox_routing.bgppeeraddressfamily":
+        # An unsaved owner has no id, and a null filter would match orphaned owned overlays.
+        if instance.assigned_object_id is None:
+            return False
         owner_model = instance.assigned_object_type.model_class()
         if owner_model is None:
             return False
@@ -1355,6 +1358,8 @@ def _bgp_native_source_is_rendered(instance) -> bool | None:
             ).exists()
         return False
     if label == "netbox_routing.bgpaddressfamily":
+        if instance.scope.router_id is None:
+            return False
         if NSOBGPRouterState.objects.filter(bgp_router_id=instance.scope.router_id, status__in=OWNED_STATES).exists():
             return True
         PeerAddressFamily = apps.get_model("netbox_routing.bgppeeraddressfamily")
@@ -1363,6 +1368,8 @@ def _bgp_native_source_is_rendered(instance) -> bool | None:
         )
     if label in {"netbox_routing.bgpscope", "netbox_routing.bgprouter"}:
         router_id = instance.router_id if label == "netbox_routing.bgpscope" else instance.pk
+        if router_id is None:
+            return False
         if NSOBGPRouterState.objects.filter(bgp_router_id=router_id, status__in=OWNED_STATES).exists():
             return True
         BGPPeer = apps.get_model("netbox_routing.bgppeer")

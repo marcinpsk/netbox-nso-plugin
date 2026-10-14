@@ -1360,3 +1360,63 @@ class TestRepeatableReadDegradesUnderATestCaseAtomic(TestCase):
                 inside = cursor.fetchone()[0]
 
         self.assertEqual(inside, "read committed")
+
+
+class TestUnsavedBGPGraphRendering(TestCase):
+    """An unsaved BGP child never matches an owned overlay whose native link was cleared."""
+
+    def setUp(self):
+        from dcim.models import Device
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR, IPAddress
+        from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        self.device, self.management = make_managed("bgp-unsaved", 1803)
+        with without_commit_drain(), suppress_intent_push():
+            asn = ASN.objects.create(asn=64512, rir=RIR.objects.create(name="Unsaved RIR", slug="unsaved-rir"))
+            router = BGPRouter.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(Device),
+                assigned_object_id=self.device.pk,
+                asn=asn,
+                name="64512",
+            )
+            scope = BGPScope.objects.create(router=router)
+            family = BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+            self.router_state = acquire_bgp_router(self.management, router)
+            peer = BGPPeer.objects.create(scope=scope, peer=IPAddress.objects.create(address="198.18.0.2/32"))
+            self.peer_state = acquire_overlay(
+                NSOBGPPeerState,
+                management=self.management,
+                asn_str="64512",
+                peer_address_str="198.18.0.2",
+                bgp_peer=peer,
+                status="accepted",
+            )
+            for native in (peer, family, scope, router):
+                native.delete()
+        self.router_state.refresh_from_db()
+        self.peer_state.refresh_from_db()
+        self.assertEqual((self.router_state.bgp_router_id, self.router_state.status), (None, "accepted"))
+        self.assertEqual((self.peer_state.bgp_peer_id, self.peer_state.status), (None, "accepted"))
+
+    def test_unsaved_scope_and_af_under_unsaved_router_are_not_rendered(self):
+        from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope
+
+        from netbox_nso_plugin.intent_state import ABSENT
+
+        scope = BGPScope(router=BGPRouter())
+        family = BGPAddressFamily(scope=scope, address_family="ipv4-unicast")
+
+        self.assertIs(canonical_fragment(scope), ABSENT)
+        self.assertIs(canonical_fragment(family), ABSENT)
+
+    def test_unsaved_peer_af_under_unsaved_peer_is_not_rendered(self):
+        from netbox_routing.models import BGPPeer, BGPPeerAddressFamily
+
+        from netbox_nso_plugin.intent_state import ABSENT
+
+        family = BGPPeerAddressFamily(assigned_object=BGPPeer(), enabled=True)
+
+        self.assertIs(canonical_fragment(family), ABSENT)
