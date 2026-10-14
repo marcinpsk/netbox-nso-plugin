@@ -348,8 +348,37 @@ def _can_change_bgp_router(user, state):
     )
 
 
-def _prepare_bgp_router_edit(user, family, state):
+_AUTO_DISCOVERED_RIR = "NSO Auto-Discovered"
+
+
+def _can_change_bgp_peer(user, state):
+    from netbox_routing.models import BGPPeer
+
+    return (
+        state.bgp_peer_id is not None
+        and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
+        and user.has_perm("netbox_routing.change_bgppeer")
+        and NSODeviceManagement.objects.restrict(user, "change").filter(pk=state.management_id).exists()
+        and BGPPeer.objects.restrict(user, "change").filter(pk=state.bgp_peer_id).exists()
+    )
+
+
+def _require_bgp_peer_asn_permissions(user, family, peer):
+    """Require the native add permissions for the ASN and RIR that a peer edit creates."""
+    from ipam.models import RIR
+
+    if family != "bgp_peer" or peer.remote_as is None or peer.remote_as.pk is not None:
+        return
+    if not user.has_perm("ipam.add_asn"):
+        raise PermissionDenied
+    if not RIR.objects.filter(name=_AUTO_DISCOVERED_RIR).exists() and not user.has_perm("ipam.add_rir"):
+        raise PermissionDenied
+
+
+def _prepare_bgp_edit(user, family, state):
     if family == "bgp_router" and not _can_change_bgp_router(user, state):
+        raise PermissionDenied
+    if family == "bgp_peer" and state.bgp_peer_id is not None and not _can_change_bgp_peer(user, state):
         raise PermissionDenied
     if family == "bgp_router":
         state.router_id = str(state.bgp_router.router_id or "")
@@ -394,7 +423,10 @@ def _bgp_peer_observations(management_id):
     for router in (document or {}).get("routers") or []:
         for scope in router.get("scope") or []:
             for peer in scope.get("peer") or []:
-                identity = canonical_bgp_peer_identity(router["asn"], scope.get("vrf") or "", peer["peer_address"])
+                try:
+                    identity = canonical_bgp_peer_identity(router["asn"], scope.get("vrf") or "", peer["peer_address"])
+                except ValueError:
+                    continue  # An entry outside the standard notation matches no state.
                 if identity not in peers:
                     peers[identity] = dict(peer)
                 elif peer.get("enabled") is True:
@@ -5210,9 +5242,9 @@ def _save_owned_bgp_edit(obj, old_values):
     native = copy.copy(obj.bgp_peer)
     remote_as = native.remote_as
     if remote_as is not None and remote_as.pk is None:
-        rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
+        rir = RIR.objects.filter(name=_AUTO_DISCOVERED_RIR).first()
         if rir is None:
-            rir = RIR(name="NSO Auto-Discovered", slug="nso-auto-discovered", is_private=True)
+            rir = RIR(name=_AUTO_DISCOVERED_RIR, slug="nso-auto-discovered", is_private=True)
             saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
             operations.append((rir, None, True))
         remote_as.rir = rir
@@ -5990,7 +6022,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
         if key == "vlan_name":
             self._require_vlan_name_permissions(request, obj)
-        _prepare_bgp_router_edit(request.user, key, obj)
+        _prepare_bgp_edit(request.user, key, obj)
         if key == "bgp_peer" and obj.bgp_peer_id is None:
             return JsonResponse({"status": "error", "errors": _bgp_peer_errors(obj)}, status=400)
         edit_obj = (
@@ -6021,6 +6053,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         errors = _overlay_family_errors(key, obj, old_values)
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
+        _require_bgp_peer_asn_permissions(request.user, key, edit_obj)
 
         if changed:
             collision = (

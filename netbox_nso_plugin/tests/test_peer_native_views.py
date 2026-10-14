@@ -387,3 +387,50 @@ class TestPeerNativeViews(TestCase):
         row = self.grid()["invalid-peer"]
         self.assertIsNone(row["remote_as"])
         self.assertIsNone(row["enabled"])
+
+    def test_malformed_published_peer_matches_no_state_and_keeps_grid_usable(self):
+        state = self.state(linked=False, peer_address_str="198.18.0.3")
+        self.publish(
+            [
+                entry(peer_address="Ethernet1", remote_as="64515", enabled=False),
+                entry(peer_address="198.18.0.3", remote_as="64516", enabled=True),
+            ],
+            projected_peers=[
+                {"peer_address": "198.18.0.3", "remote_as": "64516", "enabled": True, "address_families": []}
+            ],
+        )
+        row = self.grid()[state.peer_address_str]
+        self.assertEqual(row["remote_as"], "64516")
+        self.assertIs(row["enabled"], True)
+
+    def grant(self, user, model, actions, constraints=None):
+        from core.models import ObjectType
+        from users.models import ObjectPermission
+
+        permission = ObjectPermission.objects.create(
+            name=f"{model._meta.model_name}-{uuid4().hex[:8]}", actions=actions, constraints=constraints
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(model))
+        permission.users.add(user)
+
+    def test_inline_edit_requires_native_peer_asn_and_rir_permissions(self):
+        state = self.state()
+        user = get_user_model().objects.create_user(username=f"peeredit{uuid4().hex[:8]}")
+        self.grant(user, type(self.management), ["change"])
+        self.client.force_login(user)
+        self.assertEqual(self.edit(state, {"enabled": "True"}).status_code, 403)
+        self.grant(user, BGPPeer, ["change"], constraints={"pk": self.peer.pk + 1})
+        self.assertEqual(self.edit(state, {"enabled": "True"}).status_code, 403)
+        self.peer.refresh_from_db()
+        self.assertFalse(self.peer.enabled)
+        self.grant(user, BGPPeer, ["change"], constraints={"pk": self.peer.pk})
+        self.assertEqual(self.edit(state, {"remote_as": "64512"}).status_code, 200)
+        self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 403)
+        self.grant(user, ASN, ["add"])
+        self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 403)
+        self.assertFalse(ASN.objects.filter(asn=64599).exists())
+        self.grant(user, RIR, ["add"])
+        self.assertEqual(self.edit(state, {"remote_as": "64599"}).status_code, 200)
+        self.peer.refresh_from_db()
+        self.assertEqual(self.peer.remote_as.asn, 64599)
+        self.assertEqual(self.peer.remote_as.rir.name, "NSO Auto-Discovered")
