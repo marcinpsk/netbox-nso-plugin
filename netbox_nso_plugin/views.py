@@ -8345,7 +8345,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         return {"form": form, "object": mgmt.device, "mgmt": mgmt}
 
     @staticmethod
-    def _create_peer(device, data, *, user=None):
+    def _create_peer(device, data, *, user=None):  # noqa: C901
         """Create one owned router, scope, peer, and AF graph through an exact plan."""
         from dcim.models import Device
         from django.contrib.contenttypes.models import ContentType
@@ -8481,23 +8481,35 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
                 router_state.status = "accepted"
                 router_state.accepted_at = planned_at
                 save(router_state)
-        state = NSOBGPPeerState(
-            management=management,
-            asn_str=str(data["local_asn"].asn),
-            vrf_name=data["vrf"].name if data.get("vrf") else "",
-            peer_address_str=str(data["peer"].address).split("/")[0],
-            bgp_peer=peer,
-            remote_as_str=str(data["remote_as"].asn) if data.get("remote_as") else "",
-            enabled=data.get("enabled", True),
-            status="accepted",
-            accepted_at=planned_at,
-            last_sync_at=planned_at,
-        )
-        save(
-            state,
-            force_insert=True,
-            natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
-        )
+        peer_identity = {
+            "management": management,
+            "asn_str": str(data["local_asn"].asn),
+            "vrf_name": data["vrf"].name if data.get("vrf") else "",
+            "peer_address_str": str(data["peer"].address).split("/")[0],
+        }
+        peer_intent = {
+            "bgp_peer": peer,
+            "remote_as_str": str(data["remote_as"].asn) if data.get("remote_as") else "",
+            "enabled": data.get("enabled", True),
+            "status": "accepted",
+            "accepted_at": planned_at,
+            "last_sync_at": planned_at,
+        }
+        current_state = NSOBGPPeerState.objects.filter(**peer_identity).first()
+        if current_state is None:
+            state = NSOBGPPeerState(**peer_identity, **peer_intent)
+            save(
+                state,
+                force_insert=True,
+                natural_key=("management", "asn_str", "vrf_name", "peer_address_str"),
+            )
+        else:
+            if is_owned(current_state.status):
+                raise ValueError("Resolve the existing BGP peer state for this address before adding a peer.")
+            state = copy.copy(current_state)
+            for field, value in peer_intent.items():
+                setattr(state, field, value)
+            save(state)
         plan = RendererMutationPlan.build(grant=OwnershipGrant("create"), saves=saves, planned_at=planned_at)
         with renderer_writes(plan) as writer:
             with suppress_intent_push():
