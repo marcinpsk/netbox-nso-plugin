@@ -338,7 +338,7 @@ def test_unqualified_owned_router_still_marks_reported_peers_seen(router_case):
 
 @pytest.mark.parametrize("unusable_router", [False, True], ids=["usable", "observation-only"])
 @pytest.mark.parametrize("status", ["accepted", "in_sync", "imported"])
-def test_peer_read_mirrors_device_changes(router_case, status, unusable_router):
+def test_peer_read_mirrors_only_unowned_qualified_device_changes(router_case, status, unusable_router):
     from ipam.models import ASN
 
     from netbox_nso_plugin.models import NSOBGPPeerState
@@ -354,21 +354,26 @@ def test_peer_read_mirrors_device_changes(router_case, status, unusable_router):
             router = state.bgp_router
             router.asn = ASN.objects.create(asn=64999, rir=router.asn.rir)
             router.save()
+    base = peer.device_base_hash
     observed = {**peer_entry(), "remote_as": "64514", "enabled": False}
     import_router(router_case, scopes=[scope_entry(peers=[observed])])
     peer.refresh_from_db()
-    preserves_intent = unusable_router and is_owned(status)
-    assert (peer.remote_as_str, peer.enabled) == (("64513", True) if preserves_intent else ("64514", False))
-    if not unusable_router:
-        peer.bgp_peer.refresh_from_db()
-        assert (peer.remote_as_str, peer.enabled) == (str(peer.bgp_peer.remote_as.asn), peer.bgp_peer.enabled)
-        assert peer.status == ("in_sync" if is_owned(status) else "imported")
+    peer.bgp_peer.refresh_from_db()
+    preserves_intent = unusable_router or is_owned(status)
+    assert (peer.bgp_peer.remote_as.asn, peer.bgp_peer.enabled) == (
+        (64513, True) if preserves_intent else (64514, False)
+    )
+    assert peer.status == (status if unusable_router else "accepted" if is_owned(status) else "imported")
+    if preserves_intent:
+        assert peer.device_base_hash == base
+    else:
+        assert peer.device_base_hash != base
     assert peer.last_sync_at is not None
 
 
 @pytest.mark.parametrize("status", ["accepted", "in_sync"])
 @pytest.mark.parametrize("remote_as, enabled", [("64514", True), ("64513", False), ("64514", False)])
-def test_peer_read_preserves_intent_after_native_edit(router_case, status, remote_as, enabled):
+def test_peer_read_settles_matching_native_edit(router_case, status, remote_as, enabled):
     from ipam.models import ASN
 
     from netbox_nso_plugin.models import NSOBGPPeerState
@@ -383,19 +388,22 @@ def test_peer_read_preserves_intent_after_native_edit(router_case, status, remot
         asn, _ = ASN.objects.get_or_create(asn=int(remote_as), defaults={"rir": native.remote_as.rir})
         content_update(native, remote_as=asn, enabled=enabled)
     peer.refresh_from_db()
-    assert (peer.remote_as_str, peer.enabled) == ("64513", True)
+    peer.bgp_peer.refresh_from_db()
+    assert (str(peer.bgp_peer.remote_as.asn), peer.bgp_peer.enabled) == (remote_as, enabled)
     observed = {**peer_entry(), "remote_as": remote_as, "enabled": enabled}
     import_router(router_case, scopes=[scope_entry(peers=[observed])])
     peer.refresh_from_db()
     peer.bgp_peer.refresh_from_db()
-    assert (peer.remote_as_str, peer.enabled) == ("64513", True)
     assert (str(peer.bgp_peer.remote_as.asn), peer.bgp_peer.enabled) == (remote_as, enabled)
-    assert peer.status == "accepted"
+    assert peer.status == "in_sync"
 
 
 @pytest.mark.parametrize("remote_as, observed_as", [("64513", "64513"), ("65536", "1.0"), ("1.0", "65536"), ("", None)])
 @pytest.mark.parametrize("enabled, observed_enabled", [(True, True), (None, True), (False, False)])
 def test_peer_read_settles_matching_intent(router_case, remote_as, observed_as, enabled, observed_enabled):
+    from ipam.models import ASN
+
+    from netbox_nso_plugin.bgp_reconciler import _parse_asn
     from netbox_nso_plugin.models import NSOBGPPeerState
 
     _device, management = router_case
@@ -404,15 +412,24 @@ def test_peer_read_settles_matching_intent(router_case, remote_as, observed_as, 
     peer = NSOBGPPeerState.objects.get(management=management, peer_address_str="192.0.2.1")
     with without_commit_drain():
         content_update(state, status="accepted")
-        peer = content_update(peer, status="accepted", remote_as_str=remote_as, enabled=enabled)
+        peer = content_update(peer, status="accepted")
+        native = peer.bgp_peer
+        asn = None
+        if remote_as:
+            asn, _ = ASN.objects.get_or_create(asn=_parse_asn(remote_as), defaults={"rir": state.bgp_router.asn.rir})
+        content_update(native, remote_as=asn, enabled=enabled)
     import_router(router_case, scopes=[scope_entry(peers=[observed])])
     peer.refresh_from_db()
-    assert (peer.remote_as_str, peer.enabled) == (remote_as, enabled)
+    peer.bgp_peer.refresh_from_db()
+    assert (peer.bgp_peer.remote_as.asn if peer.bgp_peer.remote_as_id else None, peer.bgp_peer.enabled) == (
+        _parse_asn(remote_as) if remote_as else None,
+        enabled,
+    )
     assert peer.status == "in_sync"
 
 
 @pytest.mark.parametrize("status", ["accepted", "in_sync"])
-def test_peer_mirror_keeps_pending_owned_intent(router_case, status):
+def test_peer_read_preserves_native_edit_after_matching_then_divergent_device(router_case, status):
     from ipam.models import ASN
 
     from netbox_nso_plugin.models import NSOBGPPeerState
@@ -427,15 +444,20 @@ def test_peer_mirror_keeps_pending_owned_intent(router_case, status):
         content_update(native, remote_as=ASN.objects.create(asn=64514, rir=native.remote_as.rir))
     for observed_as in ("64514", "64515"):
         import_router(router_case, scopes=[scope_entry(peers=[{**peer_entry(), "remote_as": observed_as}])])
-    peer.refresh_from_db()
-    peer.bgp_peer.refresh_from_db()
-    assert peer.bgp_peer.remote_as.asn == 64515
-    assert (peer.remote_as_str, peer.enabled) == ("64513", True)
-    assert peer.status == "accepted"
+        peer.refresh_from_db()
+        peer.bgp_peer.refresh_from_db()
+        assert (peer.bgp_peer.remote_as.asn, peer.bgp_peer.enabled) == (64514, True)
+        assert peer.status == ("in_sync" if observed_as == "64514" else "accepted")
+        if observed_as == "64514":
+            agreed_base = peer.device_base_hash
+        else:
+            assert peer.device_base_hash == agreed_base
 
 
 @pytest.mark.parametrize("status", ["accepted", "in_sync"])
-def test_peer_recreation_keeps_owned_intent(router_case, status):
+def test_peer_read_never_recreates_missing_owned_native(router_case, status):
+    from netbox_routing.models import BGPPeer
+
     from netbox_nso_plugin.models import NSOBGPPeerState
 
     _device, management = router_case
@@ -447,11 +469,14 @@ def test_peer_recreation_keeps_owned_intent(router_case, status):
         peer.bgp_peer.delete()
     peer.refresh_from_db()
     assert peer.bgp_peer_id is None
-    import_router(router_case, scopes=[scope_entry(peers=[{**peer_entry(), "remote_as": "64514"}])])
-    peer.refresh_from_db()
-    assert peer.bgp_peer.remote_as.asn == 64514
-    assert (peer.remote_as_str, peer.enabled) == ("64513", True)
-    assert peer.status == "accepted"
+    base = peer.device_base_hash
+    for observed_as in ("64514", "64515"):
+        import_router(router_case, scopes=[scope_entry(peers=[{**peer_entry(), "remote_as": observed_as}])])
+        peer.refresh_from_db()
+        assert peer.bgp_peer_id is None
+        assert not BGPPeer.objects.filter(scope__router=state.bgp_router).exists()
+        assert peer.status == "accepted"
+        assert peer.device_base_hash == base
 
 
 @pytest.mark.parametrize("status", ["accepted", "in_sync"])
@@ -465,15 +490,17 @@ def test_peer_read_keeps_conflicted_owned_peer_pending(router_case, status):
     peer = NSOBGPPeerState.objects.get(management=management, peer_address_str="192.0.2.1")
     with without_commit_drain():
         content_update(state, status="accepted")
-        peer = content_update(peer, status=status, remote_as_str="64515")
+        peer = content_update(peer, status=status)
         native = peer.bgp_peer
         content_update(native, remote_as=ASN.objects.create(asn=64514, rir=native.remote_as.rir))
+    base = peer.device_base_hash
     observed = {**peer_entry(), "remote_as": "64515"}
     import_router(router_case, scopes=[scope_entry(peers=[observed])])
     peer.refresh_from_db()
     peer.bgp_peer.refresh_from_db()
     assert peer.bgp_peer.remote_as.asn == 64514
     assert peer.status == "accepted"
+    assert peer.device_base_hash == base
 
 
 def test_peer_read_preserves_operator_edits(router_case):
@@ -490,10 +517,8 @@ def test_peer_read_preserves_operator_edits(router_case):
         native = peer.bgp_peer
         remote_as = ASN.objects.create(asn=64514, rir=native.remote_as.rir)
         content_update(native, remote_as=remote_as, enabled=False)
-        peer = content_update(peer, remote_as_str="64514", enabled=False)
     import_router(router_case, scopes=[scope_entry(peers=[peer_entry()])])
     peer.refresh_from_db()
     peer.bgp_peer.refresh_from_db()
-    assert (peer.remote_as_str, peer.enabled) == ("64514", False)
-    assert (peer.remote_as_str, peer.enabled) == (str(peer.bgp_peer.remote_as.asn), peer.bgp_peer.enabled)
+    assert (peer.bgp_peer.remote_as.asn, peer.bgp_peer.enabled) == (64514, False)
     assert peer.status == "accepted"

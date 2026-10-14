@@ -158,9 +158,9 @@ class TestBgpConfigContractConsumer(TestCase):
         self.assertEqual(NSOBGPPeerState.objects.filter(management=self.mgmt).count(), 2)
         self.assertEqual(len(result), 2)
         maximal = NSOBGPPeerState.objects.get(management=self.mgmt, peer_address_str="192.0.2.1")
-        self.assertEqual(maximal.remote_as_str, "65001")
-        self.assertFalse(maximal.enabled)  # enabled=false consumed
         self.assertIsNotNone(maximal.bgp_peer)
+        self.assertEqual(maximal.bgp_peer.remote_as.asn, 65001)
+        self.assertFalse(maximal.bgp_peer.enabled)  # enabled=false consumed
         # WS-A symmetric fields (ttl + local-as) land on the materialised BGPPeer — proves
         # the plugin consumes the same leaves the reconciler writes back (read==write).
         self.assertEqual(maximal.bgp_peer.ttl, 2)

@@ -1280,8 +1280,6 @@ class _BgpRenderCase(TestCase):
             asn_str=str(self.local_as.asn),
             vrf_name=scope.vrf.name if scope.vrf else "",
             peer_address_str="198.18.0.2",
-            remote_as_str=str(self.remote_as.asn),
-            enabled=True,
             status="accepted",
         )
 

@@ -78,10 +78,12 @@ PRODUCERS = {
     ("views.py", "_ip_edit_plan_and_operations"): ("operator_edit", 2),
     ("views.py", "NSOInterfaceIPStateAcceptView.post"): ("accept", 2),
     ("views.py", "NSOStaticRouteStateAcceptView._arm_accept"): ("accept", 1),
+    ("views.py", "NSOBGPPeerStateAcceptView._arm_accept"): ("accept", 1),
     ("views.py", "NSOBGPPeerTemplateStateAcceptView.post"): ("accept", 2),
     ("views.py", "NSORoutePolicyStateAcceptView.post"): ("accept", 2),
     ("views.py", "RoutingBulkAcceptMixin.post"): ("accept", 1),
     ("views.py", "NSOStaticRouteBulkAcceptView._prepare_accept"): ("accept", 1),
+    ("views.py", "NSOBGPPeerBulkAcceptView._prepare_accept"): ("accept", 1),
     ("views.py", "OverlayStateAcceptMixin._post_with_renderer_writer"): ("accept", 2),
     ("views.py", "NSOInterfaceMtuStateAcceptView._accept"): ("accept", 2),
     ("views.py", "NSORoutePolicyAttachView.post"): ("create", 2),
@@ -105,7 +107,10 @@ UNRESOLVED_DISPOSITIONS = {
         1,
         "Read transitions update only unowned router rows.",
     ),
-    ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_peer"): (1, "Reconcile preserves existing ownership."),
+    ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_peer"): (
+        2,
+        "The owned branch only settles or repends; the unowned branch never acquires.",
+    ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_observed_peer"): (1, "Reconcile preserves existing ownership."),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_template"): (1, "Reconcile preserves existing ownership."),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_observed_template"): (
@@ -113,7 +118,10 @@ UNRESOLVED_DISPOSITIONS = {
         "Reconcile preserves existing ownership.",
     ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_states"): (4, "Absent rows retain or release ownership."),
-    ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_peer_state"): (2, "Absent rows retain or release ownership."),
+    ("bgp_reconciler.py", "_BGPGraphPlanner.plan_stale_peer_state"): (
+        3,
+        "Absent owned rows repend; unowned absence and invalid identities cannot acquire.",
+    ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.plan_invalid_peer_state"): (
         2,
         "Error handling cannot acquire an unowned row.",
@@ -692,8 +700,11 @@ def acquire(row, model):
             ("ownership_planner.py", "_seed_static_route"),
             ("signals.py", "_route_policy_acquisition_plan"),
             ("views.py", "NSOStaticRouteStateAcceptView._arm_accept"),
+            # Peer hooks stage Accept under the enclosing routing view's grant.
+            ("views.py", "NSOBGPPeerStateAcceptView._arm_accept"),
             ("views.py", "RoutingBulkAcceptMixin.post"),
             ("views.py", "NSOStaticRouteBulkAcceptView._prepare_accept"),
+            ("views.py", "NSOBGPPeerBulkAcceptView._prepare_accept"),
             ("vlan_reconciler.py", "_vlan_repoint_plan"),
         }
         for (module, scope), (kind, _count) in PRODUCERS.items():

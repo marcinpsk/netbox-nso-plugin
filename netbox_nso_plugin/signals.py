@@ -2694,75 +2694,13 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
         _schedule_intent_push((device_id, "isis"))
 
 
-def _bgp_peer_source_value(bgp_peer):
-    """Return a BGP peer's session source as the reconciler's polymorphic source string.
-
-    The reconciler dispatches ``peer/source`` per-NED at write time: IOS/IOS-XR
-    update-source is an interface NAME (``BGPPeer.update_source``, a dcim.Interface),
-    while Junos/Nokia local-address is an IP (``BGPPeer.source``, an ipam.IPAddress).
-    The interface name wins when set, else the source host IP — so the session source
-    round-trips for every vendor. Returns None when neither is set (or no peer).
-    """
-    if bgp_peer is None:
-        return None
-    if bgp_peer.update_source is not None:
-        return bgp_peer.update_source.name
-    if bgp_peer.source is not None:
-        return str(bgp_peer.source.address.ip)
-    return None
-
-
-def _bgp_peer_model_fields(bgp_peer) -> dict:
-    """Return the write-path peer leaves the overlay row does not denormalize.
-
-    ``local_as`` / ``ttl`` / ``password`` / ``peer_group`` live only on the linked
-    netbox-routing ``BGPPeer`` (``NSOBGPPeerState`` carries just ``remote_as_str`` +
-    ``enabled``), yet the reconciler + adapter both write them. Dropping them from the
-    pushed intent silently un-managed a brownfield peer's password / ttl / local-AS /
-    peer-group. Absent = the reconciler treats the leaf as "do not touch", so include a
-    key only when it holds a value — mirroring :func:`_bgp_peer_source_value`.
-    """
-    fields: dict = {}
-    if bgp_peer is None:
-        return fields
-    if bgp_peer.local_as is not None:
-        fields["local_as"] = str(bgp_peer.local_as.asn)
-    if bgp_peer.ttl is not None:
-        fields["ttl"] = bgp_peer.ttl
-    if bgp_peer.password:
-        fields["password"] = bgp_peer.password
-    if bgp_peer.peer_group is not None:
-        fields["peer_group"] = bgp_peer.peer_group.name
-    return fields
-
-
-def bgp_peer_address_family_intent_item(row):
-    """Return one BGP peer address family in the adapter's exact nested wire shape."""
-    entry = {
-        "af": row.address_family.address_family,
-        "enabled": row.enabled if row.enabled is not None else True,
-    }
-    for field_name in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
-        if value := getattr(row, field_name):
-            entry[field_name] = value.name
-    return entry
-
-
 def bgp_peer_intent_item(row, address_families):
-    """Return one BGP peer in the adapter's exact nested wire shape."""
+    """Return one native BGP peer in the adapter's canonical wire shape."""
+    from .bgp_peer_content import peer_content
+
     if row.bgp_peer is None:
         return None
-    entry = {
-        "peer_address": row.peer_address_str,
-        "enabled": row.enabled if row.enabled is not None else True,
-        "remote_as": row.remote_as_str or None,
-        "address_families": list(address_families),
-    }
-    source_value = _bgp_peer_source_value(row.bgp_peer)
-    if source_value is not None:
-        entry["source"] = source_value
-    entry.update(_bgp_peer_model_fields(row.bgp_peer))
-    return entry
+    return {"peer_address": row.peer_address_str, **peer_content(row.bgp_peer, address_families)}
 
 
 def bgp_router_intent_item(row):
@@ -2839,7 +2777,18 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     )
     peers = (
         NSOBGPPeerState.objects.filter(management__device_id=device_id, status__in=_OWNED_PUSH_STATUSES)
-        .select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group")
+        .select_related(
+            "management",
+            "bgp_peer",
+            "bgp_peer__scope__router__asn",
+            "bgp_peer__scope__vrf",
+            "bgp_peer__peer",
+            "bgp_peer__remote_as",
+            "bgp_peer__local_as",
+            "bgp_peer__peer_group",
+            "bgp_peer__source",
+            "bgp_peer__update_source",
+        )
         .prefetch_related(Prefetch("bgp_peer__address_families", queryset=families))
     )
     entries, blocked = _bgp_owned_router_entries(device_id)
@@ -2860,8 +2809,10 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
                 break
             try:
                 require_qualifying_ownership(row, signatures=signatures)
-                afs = [bgp_peer_address_family_intent_item(af) for af in row.bgp_peer.address_families.all()]
-                scope = _bgp_child_scope(entries, row.asn_str, row.vrf_name or "", (af["af"] for af in afs))
+                afs = list(row.bgp_peer.address_families.all())
+                scope = _bgp_child_scope(
+                    entries, row.asn_str, row.vrf_name or "", (af.address_family.address_family for af in afs)
+                )
                 scope["peers"].append(bgp_peer_intent_item(row, afs))
             except (ValueError, OwnershipNotQualified) as exc:
                 blocked = _bgp_router_blocker(row.asn_str, str(exc))

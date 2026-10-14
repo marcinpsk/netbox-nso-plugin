@@ -98,12 +98,12 @@
     wrap.className = "d-flex align-items-center gap-1 flex-wrap";
     var remote = document.createElement("span");
     remote.className = "small text-nowrap";
-    remote.textContent = row.remote_as ? "remote AS " + row.remote_as : "remote AS inherited";
+    remote.textContent = row.remote_as != null ? "remote AS " + row.remote_as : "remote AS unavailable";
     wrap.appendChild(remote);
     wrap.appendChild(
       badge(
-        row.enabled === false ? "disabled" : "enabled",
-        row.enabled === false ? "text-bg-warning text-dark" : "text-bg-success",
+        row.enabled == null ? "state unavailable" : row.enabled === false ? "disabled" : "enabled",
+        row.enabled == null ? "text-bg-light border" : row.enabled === false ? "text-bg-warning text-dark" : "text-bg-success",
       ),
     );
     appendSessionDetails(wrap, row);
@@ -117,8 +117,8 @@
       edit.setAttribute("aria-label", "Edit BGP peer " + row.peer_address);
       edit.dataset.peUrl = row.edit_url;
       edit.dataset.peTitle = row.peer_address + " BGP session";
-      edit.dataset.peFields = "remote_as_str:text:Remote AS,enabled:select:State";
-      edit.setAttribute("data-pe-v-remote_as_str", row.remote_as || "");
+      edit.dataset.peFields = "remote_as:text:Remote AS,enabled:select:State";
+      edit.setAttribute("data-pe-v-remote_as", row.remote_as || "");
       edit.setAttribute("data-pe-v-enabled", row.enabled === false ? "False" : "True");
       edit.setAttribute(
         "data-pe-o-enabled",

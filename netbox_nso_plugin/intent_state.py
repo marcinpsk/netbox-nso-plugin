@@ -1026,16 +1026,15 @@ def _direct_overlay_fragment(instance):
     if label == "netbox_nso_plugin.nsobgppeerstate":
         address_families = []
         if instance.bgp_peer is not None:
-            address_families = [
-                signals.bgp_peer_address_family_intent_item(row)
-                for row in instance.bgp_peer.address_families.select_related(
+            address_families = list(
+                instance.bgp_peer.address_families.select_related(
                     "address_family",
                     "prefixlist_in",
                     "prefixlist_out",
                     "routemap_in",
                     "routemap_out",
                 )
-            ]
+            )
         return _owned_wire_fragment(
             instance,
             lambda row: signals.bgp_peer_intent_item(row, address_families),
@@ -1432,7 +1431,9 @@ def _native_source_is_rendered(instance) -> bool:
         return (
             RouterState.objects.filter(bgp_router__asn_id=instance.pk, status__in=OWNED_STATES).exists()
             or NSOBGPPeerState.objects.filter(
-                Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk),
+                Q(bgp_peer__remote_as_id=instance.pk)
+                | Q(bgp_peer__local_as_id=instance.pk)
+                | Q(bgp_peer__scope__router__asn_id=instance.pk),
                 status__in=OWNED_STATES,
             ).exists()
         )
@@ -1619,7 +1620,9 @@ def _specialized_generic_keys(instance, spec: RendererInputSpec) -> set[tuple[in
 
         PeerState = apps.get_model("netbox_nso_plugin.nsobgppeerstate")
         device_ids = PeerState.objects.filter(
-            Q(bgp_peer__local_as_id=instance.pk) | Q(bgp_peer__scope__router__asn_id=instance.pk)
+            Q(bgp_peer__remote_as_id=instance.pk)
+            | Q(bgp_peer__local_as_id=instance.pk)
+            | Q(bgp_peer__scope__router__asn_id=instance.pk)
         ).values_list("management__device_id", flat=True)
         RouterState = apps.get_model("netbox_nso_plugin.nsobgprouterstate")
         router_device_ids = RouterState.objects.filter(bgp_router__asn_id=instance.pk).values_list(

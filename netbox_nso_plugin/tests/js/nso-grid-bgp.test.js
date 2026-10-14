@@ -112,7 +112,23 @@ describe("BGP grid", () => {
     expect(session.textContent).toContain("ipv4-unicast");
     expect(session.querySelector('[title*="in RM-IN"]')).not.toBeNull();
     const edit = session.querySelector(".nso-popedit");
-    expect(edit.getAttribute("data-pe-fields")).toBe("remote_as_str:text:Remote AS,enabled:select:State");
+    expect(edit.getAttribute("data-pe-fields")).toBe("remote_as:text:Remote AS,enabled:select:State");
+  });
+
+  it.each([null, undefined])("shows unavailable peer leaves for %s", (value) => {
+    const row = { asn: "64512", peer_address: "198.18.0.2", remote_as: value, enabled: value };
+    const table = mount("peers", row);
+    const session = table.config.columns.find((column) => column.field === "_session").formatter(cell(row));
+    expect(session.textContent).toContain("remote AS unavailable");
+    expect(session.textContent).toContain("state unavailable");
+    expect(session.textContent).not.toContain("enabled");
+  });
+
+  it("shows explicit false as disabled", () => {
+    const row = { asn: "64512", peer_address: "198.18.0.2", remote_as: "64513", enabled: false };
+    const table = mount("peers", row);
+    const session = table.config.columns.find((column) => column.field === "_session").formatter(cell(row));
+    expect(session.textContent).toContain("disabled");
   });
 
   it("shows peer-group templates without assuming they have detail URLs", () => {

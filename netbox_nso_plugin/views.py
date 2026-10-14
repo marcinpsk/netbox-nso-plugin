@@ -348,8 +348,36 @@ def _can_change_bgp_router(user, state):
     )
 
 
-def _prepare_bgp_router_edit(user, family, state):
+_AUTO_DISCOVERED_RIR = "NSO Auto-Discovered"
+
+
+def _can_change_bgp_peer(user, state):
+    from netbox_routing.models import BGPPeer
+
+    return (
+        state.bgp_peer_id is not None
+        and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
+        and user.has_perm("netbox_routing.change_bgppeer")
+        and NSODeviceManagement.objects.restrict(user, "change").filter(pk=state.management_id).exists()
+        and BGPPeer.objects.restrict(user, "change").filter(pk=state.bgp_peer_id).exists()
+    )
+
+
+def _require_bgp_peer_edit_constraints(user, peer, created):
+    """Require the written peer and each created object to satisfy the user's permission constraints."""
+    from netbox_routing.models import BGPPeer
+
+    if not BGPPeer.objects.restrict(user, "change").filter(pk=peer.pk).exists():
+        raise PermissionDenied
+    for instance in created:
+        if not type(instance).objects.restrict(user, "add").filter(pk=instance.pk).exists():
+            raise PermissionDenied
+
+
+def _prepare_bgp_edit(user, family, state):
     if family == "bgp_router" and not _can_change_bgp_router(user, state):
+        raise PermissionDenied
+    if family == "bgp_peer" and state.bgp_peer_id is not None and not _can_change_bgp_peer(user, state):
         raise PermissionDenied
     if family == "bgp_router":
         state.router_id = str(state.bgp_router.router_id or "")
@@ -378,6 +406,66 @@ def _bgp_router_display_scopes(state):
         return router_content(state)["scopes"]
     except ValueError:
         return []
+
+
+def _bgp_peer_observations(management_id):
+    """Index published peer observations by canonical router, VRF, and address."""
+    from .bgp_reconciler import canonical_bgp_peer_identity
+    from .models import NSOFamilyObservation
+
+    document = (
+        NSOFamilyObservation.objects.filter(read_state__management_id=management_id, read_state__family="bgp")
+        .values_list("document", flat=True)
+        .first()
+    )
+    peers = {}
+    for router in (document or {}).get("routers") or []:
+        for scope in router.get("scope") or []:
+            for peer in scope.get("peer") or []:
+                try:
+                    identity = canonical_bgp_peer_identity(router["asn"], scope.get("vrf") or "", peer["peer_address"])
+                except ValueError:
+                    continue  # An entry outside the standard notation matches no state.
+                if identity not in peers:
+                    peers[identity] = dict(peer)
+                elif peer.get("enabled") is True:
+                    peers[identity]["enabled"] = True
+    return peers
+
+
+def _bgp_peer_display_values(state, observations=None):
+    """Display linked native intent or the matching published observation."""
+    from .bgp_reconciler import canonical_bgp_peer_identity
+
+    if state.bgp_peer_id:
+        peer = state.bgp_peer
+        return {"remote_as": str(peer.remote_as.asn) if peer.remote_as_id else None, "enabled": peer.enabled}
+    if observations is None:
+        observations = _bgp_peer_observations(state.management_id)
+    try:
+        identity = canonical_bgp_peer_identity(state.asn_str, state.vrf_name or "", state.peer_address_str)
+    except ValueError:
+        return {"remote_as": None, "enabled": None}
+    peer = observations.get(identity, {})
+    return {"remote_as": peer.get("remote_as"), "enabled": peer.get("enabled")}
+
+
+def _bgp_peer_preview_detail(state):
+    """Show both peer leaves, including unavailable observation values."""
+    values = _bgp_peer_display_values(state)
+    remote = f"AS {values['remote_as']}" if values["remote_as"] is not None else "remote AS unavailable"
+    enabled = values["enabled"]
+    state = "state unavailable" if enabled is None else "enabled" if enabled else "disabled"
+    return f"{remote}, {state}"
+
+
+def _bgp_peer_grid_values(state, observations_by_management):
+    """Reuse one published peer index for each management row in the grid."""
+    if state.bgp_peer_id:
+        return _bgp_peer_display_values(state)
+    if state.management_id not in observations_by_management:
+        observations_by_management[state.management_id] = _bgp_peer_observations(state.management_id)
+    return _bgp_peer_display_values(state, observations_by_management[state.management_id])
 
 
 # "Accept" makes NetBox the source of truth, so it applies to values NetBox does not
@@ -1459,6 +1547,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
             qs = model.objects.filter(management__device=device)
             return qs.select_related(*sr) if sr else qs
 
+        bgp_observations = {}
+
+        def bgp_peer_values(state):
+            return _bgp_peer_grid_values(state, bgp_observations)
+
         def bgp_source(peer):
             if peer is None:
                 return None
@@ -1675,6 +1768,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                                 d,
                                 "bgp_peer",
                                 "bgp_peer__local_as",
+                                "bgp_peer__remote_as",
                                 "bgp_peer__peer_group",
                                 "bgp_peer__source",
                                 "bgp_peer__update_source",
@@ -1693,11 +1787,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "asn": lambda st: st.asn_str,
                             "vrf": lambda st: st.vrf_name or "global",
                             "peer_address": lambda st: st.peer_address_str,
-                            "remote_as": lambda st: st.remote_as_str or None,
-                            # Junos deactivate / admin-down: the row exists but is inert.
-                            "disabled": lambda st: st.enabled is False,
+                            "remote_as": lambda st: bgp_peer_values(st)["remote_as"],
+                            "disabled": lambda st: bgp_peer_values(st)["enabled"] is False,
                             "peer": lambda st: linked(st.bgp_peer),
-                            "enabled": lambda st: st.enabled,
+                            "enabled": lambda st: bgp_peer_values(st)["enabled"],
                             "local_as": lambda st: (
                                 str(st.bgp_peer.local_as.asn) if st.bgp_peer_id and st.bgp_peer.local_as_id else None
                             ),
@@ -4617,18 +4710,47 @@ def _isis_interface_errors(obj):
 
 
 def _bgp_peer_errors(obj):
-    """Validate the editable BGP peer fields without changing peer identity."""
+    """Validate the editable native BGP peer fields without changing identity."""
     if obj.bgp_peer is None:
-        return {"remote_as_str": ["Only a linked NetBox BGP peer can be edited inline."]}
-    if not obj.remote_as_str:
-        return {}
-    try:
-        asn = int(obj.remote_as_str)
-    except (TypeError, ValueError):
-        return {"remote_as_str": ["Enter a valid ASN."]}
-    if not 1 <= asn <= 4_294_967_295:
-        return {"remote_as_str": ["ASN must be between 1 and 4294967295."]}
+        return {"remote_as": ["Only a linked NetBox BGP peer can be edited inline."]}
     return {}
+
+
+def _clean_bgp_remote_as(raw):
+    """Resolve an ASN number to an existing or planned native ASN."""
+    from django.core.exceptions import ValidationError
+    from ipam.models import ASN
+
+    from .bgp_reconciler import _parse_asn
+
+    if not raw:
+        return None
+    try:
+        number = _parse_asn(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("Enter a valid ASN.") from exc
+    number = ASN._meta.get_field("asn").clean(number, None)
+    return ASN.objects.filter(asn=number).first() or ASN(asn=number)
+
+
+def _clean_overlay_field(key, field, raw, edit_obj):
+    """Clean an inline value with the owning model's field validation."""
+    if key in (
+        "route_map_name",
+        "bgp_peer",
+        "redistribution",
+        "lacp_bundle",
+        "lacp_member",
+        "vlan_name",
+        "svi",
+        "subinterface",
+        "snmp_host",
+    ):
+        raw = raw.strip()
+    if key == "bgp_peer" and field.name == "remote_as":
+        return _clean_bgp_remote_as(raw)
+    value = raw if raw != "" else (None if field.null else "")
+    return field.clean(value, edit_obj)
 
 
 def _redistribution_errors(obj):
@@ -5106,9 +5228,9 @@ def _save_owned_bgp_router_edit(state, old_values):
         writer.save(candidate, update_fields=fields)
 
 
-def _save_owned_bgp_edit(obj, old_values):
+def _save_owned_bgp_edit(obj, old_values, user):
     """Claim one BGP peer edit and update its native root through an exact plan."""
-    from ipam.models import ASN, RIR
+    from ipam.models import RIR
 
     from . import status_machine as sm
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
@@ -5116,24 +5238,18 @@ def _save_owned_bgp_edit(obj, old_values):
     planned_at = timezone.now()
     saves = []
     operations = []
-    remote_as = None
-    if obj.remote_as_str:
-        asn_number = int(obj.remote_as_str)
-        remote_as = ASN.objects.filter(asn=asn_number).first()
-        if remote_as is None:
-            rir = RIR.objects.filter(name="NSO Auto-Discovered").first()
-            if rir is None:
-                rir = RIR(name="NSO Auto-Discovered", slug="nso-auto-discovered", is_private=True)
-                saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
-                operations.append((rir, None, True))
-            remote_as = ASN(asn=asn_number, rir=rir)
-            saves.append(planned_save(remote_as, force_insert=True, natural_key=("asn",)))
-            operations.append((remote_as, None, True))
-
     native = copy.copy(obj.bgp_peer)
-    native.remote_as = remote_as
-    native.enabled = obj.enabled
-    native_fields = ("remote_as", "enabled")
+    remote_as = native.remote_as
+    if remote_as is not None and remote_as.pk is None:
+        rir = RIR.objects.filter(name=_AUTO_DISCOVERED_RIR).first()
+        if rir is None:
+            rir = RIR(name=_AUTO_DISCOVERED_RIR, slug="nso-auto-discovered", is_private=True)
+            saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
+            operations.append((rir, None, True))
+        remote_as.rir = rir
+        saves.append(planned_save(remote_as, force_insert=True, natural_key=("asn",)))
+        operations.append((remote_as, None, True))
+    native_fields = tuple(name for name, old_value in old_values.items() if getattr(native, name) != old_value)
     saves.append(planned_save(native, update_fields=native_fields))
     operations.append((native, native_fields, False))
 
@@ -5141,10 +5257,8 @@ def _save_owned_bgp_edit(obj, old_values):
     if not sm.is_owned(candidate.status):
         candidate.accepted_at = planned_at
     candidate.status = sm.on_operator_edit(candidate.status)
-    state_fields = {
-        field_name for field_name, old_value in old_values.items() if getattr(candidate, field_name) != old_value
-    }
-    state_fields.add("status")
+    state_fields = {"status"}
+    _clear_apply_attempt(candidate, state_fields)
     if candidate.accepted_at is not None:
         state_fields.add("accepted_at")
     saves.append(planned_save(candidate, update_fields=state_fields))
@@ -5154,6 +5268,7 @@ def _save_owned_bgp_edit(obj, old_values):
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
+        _require_bgp_peer_edit_constraints(user, native, [instance for instance, _, created in operations if created])
 
 
 def _owned_overlay_edit_footprint(obj, key):
@@ -5320,7 +5435,7 @@ def _save_owned_interface_mtu_edit(obj, old_values, *, _retry_on_stale=True):
         _save_owned_interface_mtu_edit(current, current_old_values, _retry_on_stale=False)
 
 
-def _save_owned_overlay_edit(obj, key, old_values):
+def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
     """Claim an edited overlay and update its matching native NetBox object atomically."""
     if key in {
         "logging_host",
@@ -5351,7 +5466,7 @@ def _save_owned_overlay_edit(obj, key, old_values):
         _save_owned_bgp_router_edit(obj, old_values)
         return None
     if key == "bgp_peer":
-        _save_owned_bgp_edit(obj, old_values)
+        _save_owned_bgp_edit(obj, old_values, user)
         return None
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
@@ -5815,7 +5930,7 @@ def _overlay_family_errors(key, obj, old_values):
     return {}
 
 
-def _save_overlay_edit(obj, key, old_values):
+def _save_overlay_edit(obj, key, old_values, *, user):
     """Dispatch a validated edit to its family-specific atomic save path."""
     if key == "route_map_name":
         return _save_route_map_name_edit(obj, old_values["object_name"])
@@ -5824,7 +5939,7 @@ def _save_overlay_edit(obj, key, old_values):
     elif key == "vlan_name":
         return _save_vlan_name_edit(obj)
     else:
-        return _save_owned_overlay_edit(obj, key, old_values)
+        return _save_owned_overlay_edit(obj, key, old_values, user=user)
     return None
 
 
@@ -5871,7 +5986,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             ("circuit_type", "network_type", "metric", "passive", "bfd_enabled", "frr_enabled", "frr_protection"),
         ),
         "bgp_router": ("NSOBGPRouterState", ("router_id",)),
-        "bgp_peer": ("NSOBGPPeerState", ("remote_as_str", "enabled")),
+        "bgp_peer": ("NSOBGPPeerState", ("remote_as", "enabled")),
         "redistribution": ("NSORedistributionState", ("route_map", "metric", "metric_type")),
         "static_route": ("NSOStaticRouteState", ("metric", "permanent", "tag")),
         "lacp_bundle": ("NSOLACPBundleState", ("min_links", "system_priority", "timer", "admin_key")),
@@ -5907,29 +6022,25 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
         if key == "vlan_name":
             self._require_vlan_name_permissions(request, obj)
-        _prepare_bgp_router_edit(request.user, key, obj)
-        edit_obj = obj.static_route if key == "static_route" else obj.vlan if key == "vlan_name" else obj
+        _prepare_bgp_edit(request.user, key, obj)
+        if key == "bgp_peer" and obj.bgp_peer_id is None:
+            return JsonResponse({"status": "error", "errors": _bgp_peer_errors(obj)}, status=400)
+        edit_obj = (
+            obj.bgp_peer
+            if key == "bgp_peer"
+            else obj.static_route
+            if key == "static_route"
+            else obj.vlan
+            if key == "vlan_name"
+            else obj
+        )
         old_values = {field: getattr(edit_obj, field) for field in editable}
         errors: dict[str, list[str]] = {}
         changed = []
         for f in supplied:
             field = edit_obj._meta.get_field(f)
-            raw = request.POST.get(f, "")
-            if key in (
-                "route_map_name",
-                "bgp_peer",
-                "redistribution",
-                "lacp_bundle",
-                "lacp_member",
-                "vlan_name",
-                "svi",
-                "subinterface",
-                "snmp_host",
-            ):
-                raw = raw.strip()
-            value = raw if raw != "" else (None if field.null else "")
             try:
-                value = field.clean(value, edit_obj)
+                value = _clean_overlay_field(key, field, request.POST.get(f, ""), edit_obj)
             except ValidationError as exc:
                 errors[f] = [str(m) for m in exc.messages]
                 continue
@@ -5944,14 +6055,16 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
         if changed:
-            collision = None if key in ("static_route", "vlan_name") else _unique_collision_response(obj, editable)
+            collision = (
+                None if key in ("static_route", "vlan_name", "bgp_peer") else _unique_collision_response(obj, editable)
+            )
             if collision is not None:
                 return collision
 
             # Claim ownership (same transition as Accept on a differing value):
             # the edited value is intent the device doesn't have yet.
             try:
-                errors = _save_overlay_edit(obj, key, old_values)
+                errors = _save_overlay_edit(obj, key, old_values, user=request.user)
             except (IntentPlanStaleError, RendererTargetsChanged):
                 # A retried plan still found a moved preimage; the plan rolled back whole.
                 return JsonResponse(
@@ -6216,7 +6329,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 NSOBGPPeerState,
                 "BGP peer",
                 lambda r: r.peer_address_str or "",
-                lambda r: f"AS {r.remote_as_str}" if r.remote_as_str else "",
+                _bgp_peer_preview_detail,
                 "bgp",
             ),
             (
@@ -7028,6 +7141,10 @@ class NSOBGPRouterStateAcceptView(RoutingStateAcceptMixin):
 class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
 
+    def _arm_accept(self, state):
+        """Require a qualified matching read to confirm peer intent after Accept."""
+        state.status = "accepted"
+
     def _accept_blocker(self, state):
         return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
 
@@ -7511,6 +7628,10 @@ class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSOBGPPeerState
+
+    def _prepare_accept(self, current, candidate, *, drift):
+        candidate.status = "accepted"
+        return ()
 
     def _accept_blocker(self, state):
         return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
@@ -8460,8 +8581,6 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         }
         peer_intent = {
             "bgp_peer": peer,
-            "remote_as_str": str(data["remote_as"].asn) if data.get("remote_as") else "",
-            "enabled": data.get("enabled", True),
             "status": "accepted",
             "accepted_at": planned_at,
             "last_sync_at": planned_at,

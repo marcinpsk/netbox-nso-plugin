@@ -792,6 +792,12 @@ def _require_qualifying_acquisition(instance, binding, acquisition, *, signature
     if not acquisition or not is_owned(instance.status):
         return
     rule, scope, device_id, native_model_label, native_id, _native_key, state_model_label, state_key = binding
+    if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
+        from .bgp_peer_content import peer_binding_qualifies
+
+        if not peer_binding_qualifies(instance):
+            raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
+        return
     if state_model_label == "netbox_nso_plugin.nsobgprouterstate":
         from .bgp_router_content import qualified_router
 
@@ -841,7 +847,11 @@ def require_qualifying_ownership(instance, *, signatures=None):
         return
     rule, scope, device_id, *_identity = binding
     qualifying = None
-    if signatures is not None and rule.qualification == "native_binding":
+    if (
+        signatures is not None
+        and rule.qualification == "native_binding"
+        and instance._meta.label_lower != "netbox_nso_plugin.nsobgppeerstate"
+    ):
         key = (device_id, scope)
         if key not in signatures:
             signatures[key] = _qualifying_overlay_signatures(
@@ -1506,8 +1516,6 @@ def _seed_bgp_peer(candidate, native, _manifest):
     candidate.asn_str = str(native.scope.router.asn.asn)
     candidate.vrf_name = native.scope.vrf.name if native.scope.vrf_id else ""
     candidate.peer_address_str = str(native.peer.address.ip)
-    candidate.remote_as_str = str(native.remote_as.asn) if native.remote_as_id else ""
-    candidate.enabled = native.enabled
 
 
 def _seed_bgp_router(candidate, native, _manifest):
