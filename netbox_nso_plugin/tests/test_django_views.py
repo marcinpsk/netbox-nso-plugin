@@ -8489,7 +8489,9 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         response = self._apply(_ApplyBoundaryAdapter(lambda: initial_response))
 
         self.assertEqual(response.status_code, 502)
-        attempt = NSOApplyAttempt.objects.get(management=self.mgmt)
+        attempt = NSOApplyAttempt.objects.get(
+            management=self.mgmt, trigger_kind="manual", adapter_apply_attempt_id__isnull=False
+        )
         self.assertIsNone(attempt.http_status)
         self.assertIsNone(attempt.response)
         self.mtu_state.refresh_from_db()

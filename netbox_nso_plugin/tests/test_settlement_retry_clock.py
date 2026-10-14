@@ -17,6 +17,7 @@ than starving whatever sits behind a permanently broken head.
 from __future__ import annotations
 
 from unittest.mock import patch
+from uuid import uuid4
 
 from ._outbox_case import mirror_update, own_vlan
 from ._settlement_case import (
@@ -212,7 +213,10 @@ class TestTheRepairCapRotates(_SettlementCase):
         _device, management = self._broken_row(0)
         for response in (None, {}, {"generations": []}):
             with self.subTest(response=response):
+                attempt_id = uuid4()
                 attempt = NSOApplyAttempt.objects.create(
+                    id=attempt_id,
+                    adapter_apply_attempt_id=attempt_id,
                     management=management,
                     adapter_device_id=management.adapter_device_id,
                     selected={"static_route": 1},
@@ -497,7 +501,10 @@ class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
             device_id=adapter_device_id,
         )
         selected = {"vlan": push_seq}
+        attempt_id = uuid4()
         attempt = NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=mgmt,
             adapter_device_id=adapter_device_id,
             scope_revisions=selected,
@@ -506,9 +513,21 @@ class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
             response={
                 "device_id": adapter_device_id,
                 "outcome": "promoted",
+                "job_id": generation_id,
                 "selected": selected,
                 "skipped": {},
-                "generations": [{"generation_id": generation_id}],
+                "skipped_detail": None,
+                "generations": [
+                    {
+                        "generation_id": generation_id,
+                        "seq": generation_id,
+                        "job_id": generation_id,
+                        "mode": "networked",
+                        "source_push_seq": selected,
+                        "stream_revisions": selected,
+                        "digest": f"{generation_id:064x}",
+                    }
+                ],
             },
         )
         state = mirror_update(own_vlan(mgmt, vid, tag), status="deploying", apply_attempt_id=attempt.pk)
@@ -588,7 +607,10 @@ class TestTheEvidenceEndpointClosesItsWorkerConnection(_SettlementCase):
         device = _make_device(tag)
         mgmt = _make_mgmt(device, tag, adapter_device_id)
         selected = {"static_route": 1}
+        attempt_id = uuid4()
         return NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=mgmt,
             adapter_device_id=adapter_device_id,
             scope_revisions=selected,

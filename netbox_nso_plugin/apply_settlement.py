@@ -265,6 +265,8 @@ def _load_attempts(management, deployment_evidence, rows_by_scope, required_atte
     local_attempts = NSOApplyAttempt.objects.filter(
         management=management,
         pk__in=attempt_ids,
+        trigger_kind="manual",
+        adapter_apply_attempt_id__isnull=False,
     ).in_bulk()
     validated = {}
     for raw, raw_id in zip(raw_attempts, raw_ids, strict=True):
@@ -302,7 +304,6 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
             if disposition == "waiting":
                 continue
             if disposition == "not_promoted":
-                decisions.append((scope, model, row, "accepted", "", True))
                 continue
             if disposition == "settled":
                 if scope == "static_route" and not static_route_feed_drained:
@@ -325,6 +326,28 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
     return decisions
 
 
+def _admission_keep_streams(attempt, response, *, rejected=False):
+    """Validate admission before choosing which snapshots can be restored."""
+    from .views import _apply_stream_partition, _promoted_stream_coverage
+
+    if rejected:
+        return ()
+    selected, skipped, error = _apply_stream_partition(response, attempt.selected)
+    if error:
+        raise EvidenceInvariantError(error)
+    if response.get("outcome") == "no_op":
+        if set(skipped) != set(selected) or response.get("generations") != []:
+            raise EvidenceInvariantError("Apply no-op does not cover its exact selection")
+        return ()
+    generations = response.get("generations")
+    if response.get("outcome") != "promoted" or not isinstance(generations, list) or not generations:
+        raise EvidenceInvariantError("Apply admission has no valid generation chain")
+    promoted_streams, error = _promoted_stream_coverage(generations, selected, skipped)
+    if error:
+        raise EvidenceInvariantError(error)
+    return tuple(sorted(promoted_streams)) if skipped else None
+
+
 def settle_apply_attempts(
     management,
     deployment_evidence,
@@ -337,6 +360,7 @@ def settle_apply_attempts(
 
     from .adapter_client import DEPLOYMENT_EVIDENCE_FIELDS
     from .apply_state import deploying_models
+    from .durable_capture import restore_attempt
     from .intent_state import mirror_refresh
     from .models import NSOApplyAttempt
     from .signals import suppress_intent_push
@@ -356,6 +380,19 @@ def settle_apply_attempts(
         rows_by_scope,
         required_attempt_ids,
     )
+    restorations = {
+        attempt_id: _admission_keep_streams(
+            local_attempts[attempt_id], evidence["response"], rejected=evidence["admission_state"] == "rejected"
+        )
+        for attempt_id, evidence in validated.items()
+    }
+    for attempt_id, keep_streams in restorations.items():
+        if keep_streams is not None:
+            restore_attempt(attempt_id, keep_streams=keep_streams)
+    rows_by_scope = {
+        (scope, model): list(model.objects.filter(management=management, status="deploying"))
+        for scope, model in rows_by_scope
+    }
     decisions = _settlement_decisions(
         rows_by_scope,
         validated,
@@ -419,6 +456,8 @@ def deploying_attempt_ids(management) -> tuple[UUID, ...]:
     attempt_ids = NSOApplyAttempt.objects.filter(
         management=management,
         pk__in=referenced_ids,
+        trigger_kind="manual",
+        adapter_apply_attempt_id__isnull=False,
     ).values_list("pk", flat=True)
     return tuple(sorted(attempt_ids, key=str))
 
@@ -435,6 +474,8 @@ def route_policy_deploying_attempt_ids(management) -> tuple[UUID, ...]:
     attempt_ids = NSOApplyAttempt.objects.filter(
         management=management,
         pk__in=referenced_ids,
+        trigger_kind="manual",
+        adapter_apply_attempt_id__isnull=False,
     ).values_list("pk", flat=True)
     return tuple(sorted(attempt_ids, key=str))
 
@@ -448,6 +489,9 @@ def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
         NSOApplyAttempt.objects.filter(
             management=management,
             adapter_device_id=management.adapter_device_id,
+            trigger_kind="manual",
+            adapter_apply_attempt_id__isnull=False,
+            lifecycle="open",
             response__isnull=True,
             created_at__gte=timezone.now() - LOST_RESPONSE_REPLAY_WINDOW,
         ).values_list("pk", flat=True)
@@ -456,6 +500,7 @@ def deployment_evidence_attempt_ids(management) -> tuple[UUID, ...]:
 
 
 def _record_replay_answer(attempt, result=None, error=None) -> None:
+    from .durable_capture import restore_attempt
     from .models import NSOApplyAttempt
 
     if isinstance(result, dict):
@@ -468,10 +513,17 @@ def _record_replay_answer(attempt, result=None, error=None) -> None:
         response = error.rejection_response
     else:
         return
-    NSOApplyAttempt.objects.filter(pk=attempt.pk, response__isnull=True).update(
+    keep_streams = _admission_keep_streams(attempt, response, rejected=error is not None)
+    updated = NSOApplyAttempt.objects.filter(pk=attempt.pk, response__isnull=True).update(
         http_status=status,
         response=response,
     )
+    if updated != 1:
+        stored = NSOApplyAttempt.objects.get(pk=attempt.pk)
+        if stored.http_status != status or stored.response != response:
+            raise EvidenceInvariantError("An Apply replay changed its stored admission answer")
+    if keep_streams is not None:
+        restore_attempt(attempt.pk, keep_streams=keep_streams)
 
 
 def _reject_unrequested_attempts(evidence, attempt_ids) -> None:
@@ -538,6 +590,18 @@ def load_deployment_evidence(management, *, attempt_ids=None):
 
     if attempt_ids is None:
         attempt_ids = deployment_evidence_attempt_ids(management)
+    else:
+        attempt_ids = tuple(attempt_ids)
+        eligible = set(
+            NSOApplyAttempt.objects.filter(
+                management=management,
+                adapter_device_id=management.adapter_device_id,
+                trigger_kind="manual",
+                adapter_apply_attempt_id__isnull=False,
+                pk__in=attempt_ids,
+            ).values_list("pk", flat=True)
+        )
+        attempt_ids = tuple(attempt_id for attempt_id in attempt_ids if attempt_id in eligible)
     if not attempt_ids:
         return None
     evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
@@ -548,6 +612,8 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         pk__in=unknown,
         management=management,
         adapter_device_id=management.adapter_device_id,
+        trigger_kind="manual",
+        adapter_apply_attempt_id__isnull=False,
     ):
         # A retained overlay reference or explicit selection cannot reopen a refusal.
         if attempt.response is not None and attempt.http_status not in (200, 202):

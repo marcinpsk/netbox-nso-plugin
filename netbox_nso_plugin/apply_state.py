@@ -7,7 +7,6 @@ import contextvars
 import hashlib
 
 from django.db import connection, transaction
-from django.utils import timezone
 
 
 class IntentChangedDuringPreparation(Exception):
@@ -187,42 +186,6 @@ def lock_intent_revisions(device_id: int, scopes) -> dict[str, int]:
     return current
 
 
-def _promotable_route_policy_rows(rows: list) -> list:
-    """Drop the unmaterialized LOCAL route-policy rows, classifying the whole batch in one query."""
-    from django.contrib.contenttypes.models import ContentType
-
-    from .models import NSORoutePolicyObjectClass
-
-    if not rows:
-        return rows
-    row_keys = {row.pk: (row.family, row.object_name) for row in rows}
-    modes = dict(
-        ((family, name), mode)
-        for family, name, mode in NSORoutePolicyObjectClass.objects.filter(
-            family__in={row.family for row in rows},
-            object_name__in={row.object_name for row in rows},
-        ).values_list("family", "object_name", "mode")
-    )
-    local_rows = [row for row in rows if modes.get(row_keys[row.pk], "master") == "local"]
-    if not local_rows:
-        return rows
-    wanted: dict[int, set[int]] = {}
-    for row in local_rows:
-        if row.content_type_id is not None and row.object_id is not None:
-            wanted.setdefault(row.content_type_id, set()).add(row.object_id)
-    # Both identifiers being set does not prove the target exists, so confirm the ids per content type.
-    existing: dict[int, set[int]] = {}
-    for content_type_id, object_ids in wanted.items():
-        target_model = ContentType.objects.get_for_id(content_type_id).model_class()
-        if target_model is None:
-            continue
-        existing[content_type_id] = set(
-            target_model._base_manager.filter(pk__in=object_ids).values_list("pk", flat=True)
-        )
-    unmaterialized = {row.pk for row in local_rows if row.object_id not in existing.get(row.content_type_id, ())}
-    return [row for row in rows if row.pk not in unmaterialized]
-
-
 def promote_current_intent(
     management,
     registry,
@@ -233,18 +196,9 @@ def promote_current_intent(
     apply_attempt_id,
     static_route_stored: bool,
 ):
-    """CAS stored receipt revisions, create the attempt, and stamp its rows."""
-    from . import status_machine as sm
-    from .intent_state import OVERLAY_MODEL_RANKS, mirror_refresh
-    from .models import (
-        NSOApplyAttempt,
-        NSODeviceManagement,
-        NSOLACPBundleState,
-        NSOLACPMemberState,
-        NSORoutePolicyState,
-        NSOStaticRouteState,
-    )
-    from .signals import lacp_renderable_bundle_filter, suppress_intent_push
+    """Commit selected snapshots before a separately fenced promotion."""
+    from .durable_capture import capture_manual, promote_snapshots
+    from .models import NSOApplyAttempt, NSODeviceManagement
 
     expected_scopes = {entry.key for entry in registry.values() if entry.in_protocol}
     expected_direct = {entry.section for entry in registry.values() if not entry.in_protocol}
@@ -271,38 +225,6 @@ def promote_current_intent(
         ):
             raise IntentChangedDuringPreparation
 
-        locked_rows: list[tuple] = []
-        model_ranks = {label: rank for rank, label in enumerate(OVERLAY_MODEL_RANKS)}
-        for scope, model in sorted(
-            ((scope, model) for scope, models in deploying_models().items() for model in models),
-            key=lambda item: model_ranks[item[1]._meta.label_lower],
-        ):
-            if model is NSOStaticRouteState and not static_route_stored:
-                continue
-            _enter_level(8, (model_ranks[model._meta.label_lower], 0))
-            candidates = model.objects.select_for_update(of=("self",)).filter(
-                management=locked, status__in=(sm.ACCEPTED, sm.APPLY_FAILED)
-            )
-            if model is NSOLACPBundleState:
-                candidates = candidates.filter(lacp_renderable_bundle_filter())
-            if model is NSOLACPMemberState:
-                eligible_bundle_ids = set(
-                    NSOLACPBundleState.objects.filter(lacp_renderable_bundle_filter(), management=locked).values_list(
-                        "interface_id", flat=True
-                    )
-                )
-                from .lacp_topology import member_interfaces
-
-                candidates = candidates.filter(
-                    interface_id__in=member_interfaces(management.device_id)
-                    .filter(lag_id__in=eligible_bundle_ids)
-                    .values("pk")
-                )
-            locked_statuses = list(candidates.order_by("pk"))
-            if model is NSORoutePolicyState:
-                locked_statuses = _promotable_route_policy_rows(locked_statuses)
-            locked_rows.append((scope, model, locked_statuses))
-
         selected = {
             registry[scope].section: pushed[scope].push_seq
             for scope in sorted(pushed, key=lambda candidate: registry[candidate].section)
@@ -312,30 +234,18 @@ def promote_current_intent(
             id=apply_attempt_id,
             management=locked,
             adapter_device_id=locked.adapter_device_id,
+            source_epoch=locked.adapter_source_epoch,
             scope_revisions=current,
             selected=selected,
         )
-
-        moved: list[tuple] = []
-        now = timezone.now()
-        for scope, model, rows in locked_rows:
-            section = registry[scope].section
-            for previous_status in (sm.ACCEPTED, sm.APPLY_FAILED):
-                selected_rows = [row for row in rows if row.status == previous_status]
-                if not selected_rows:
-                    continue
-                pks = []
-                for row in selected_rows:
-                    fields = {"status", "apply_attempt_id", "last_apply_at", "last_apply_error"}
-                    with suppress_intent_push(), mirror_refresh(row, fields) as locked_row:
-                        if locked_row is None:
-                            continue
-                        locked_row.status = sm.advance(previous_status, sm.APPLY)
-                        locked_row.apply_attempt_id = attempt.pk
-                        locked_row.last_apply_at = now
-                        locked_row.last_apply_error = ""
-                        locked_row.save(update_fields=fields)
-                        pks.append(locked_row.pk)
-                if pks:
-                    moved.append((section, model, pks, previous_status))
-    return attempt, moved
+        capture_manual(
+            attempt,
+            locked,
+            registry,
+            pushed,
+            direct_selected,
+            direct_source_revisions,
+            static_route_stored,
+        )
+    promote_snapshots(attempt)
+    return attempt

@@ -2874,10 +2874,9 @@ class ApplyIntentChanged(ApplyRefused):
 
 @dataclass(frozen=True)
 class PreparedApply:
-    """The durable attempt and the exact local rows that it promoted."""
+    """The durable identity of one prepared manual Apply."""
 
     attempt_id: object
-    moved: tuple
 
 
 #: What a preparation step did, in the operator's words. A closed vocabulary: with the
@@ -3038,8 +3037,8 @@ def _prepare_apply(mgmt):
     reconcile once the device reflects them (VLAN value-aware; SVI/subif/BFD when
     re-reported). ``.update()`` avoids firing the per-row push signal.
 
-    Returns the rows moved to 'deploying' and an immutable adapter-stream selector. The
-    caller can roll the rows back via :func:`_rollback_prepare_apply` if no job is enqueued.
+    Returns the durable attempt identity and an immutable adapter-stream selector. The
+    caller restores the attempt's snapshots if no job is enqueued.
     Raises :class:`ApplyRefused` when a preparation call escapes or the SNMP refresh is
     refused. Preparation completes before promotion, so an abort leaves no rows to roll back.
     Completed switching preparations remain selectable until another preparation replaces them.
@@ -3141,7 +3140,7 @@ def _prepare_apply(mgmt):
     try:
         from .apply_state import IntentChangedDuringPreparation, promote_current_intent
 
-        attempt, moved = promote_current_intent(
+        attempt = promote_current_intent(
             mgmt,
             registry,
             pushed,
@@ -3156,44 +3155,16 @@ def _prepare_apply(mgmt):
         logger.warning("Apply deploying-mark transaction failed for device %s: %s", mgmt.device_id, exc)
         raise ApplyPromotionFailed from exc
     attempt.refresh_from_db(fields=["selected"])
-    return PreparedApply(attempt.pk, tuple(moved)), MappingProxyType(attempt.selected)
+    return PreparedApply(attempt.pk), MappingProxyType(attempt.selected)
 
 
-def _rollback_prepare_apply(moved, *, keep_streams=()) -> None:
-    """Restore pre-Apply statuses for streams without an enqueued generation.
+def _rollback_prepare_apply(prepared, *, keep_streams=()) -> None:
+    """Restore durable snapshots for streams without an enqueued generation."""
+    from .durable_capture import restore_attempt
 
-    Only the rows THIS Apply moved are reverted (by pk), so a genuinely in-flight 'deploying'
-    row from a prior Apply is left untouched. Restoring the source status preserves whether the
-    row was pending its first Apply or retrying a failed one. Leaving it 'deploying' with no apply
-    job would strand it as 'applying' forever because nothing can settle it.
-    """
-    keep_streams = set(keep_streams)
-    if not isinstance(moved, PreparedApply):
+    if not isinstance(prepared, PreparedApply):
         raise TypeError("Apply rollback requires a durable prepared attempt")
-    from .intent_state import mirror_refresh
-    from .signals import suppress_intent_push
-
-    for section, model, pks, previous_status in moved.moved:
-        if section in keep_streams:
-            continue
-        try:
-            with transaction.atomic():
-                rows = list(
-                    model.objects.select_for_update(of=("self",)).filter(
-                        pk__in=pks,
-                        status="deploying",
-                        apply_attempt_id=moved.attempt_id,
-                    )
-                )
-                for row in rows:
-                    with suppress_intent_push(), mirror_refresh(row, {"status", "apply_attempt_id"}) as locked:
-                        if locked is None:
-                            continue
-                        locked.status = previous_status
-                        locked.apply_attempt_id = None
-                        locked.save(update_fields=["status", "apply_attempt_id"])
-        except Exception as exc:  # noqa: BLE001 — best-effort rollback; log and move on
-            logger.warning("Apply rollback failed: %s", exc)
+    restore_attempt(prepared.attempt_id, keep_streams=keep_streams)
 
 
 def _record_apply_response(prepared, *, http_status, response) -> None:
