@@ -85,7 +85,7 @@ PRODUCERS = {
     ("views.py", "OverlayStateAcceptMixin._post_with_renderer_writer"): ("accept", 2),
     ("views.py", "NSOInterfaceMtuStateAcceptView._accept"): ("accept", 2),
     ("views.py", "NSORoutePolicyAttachView.post"): ("create", 2),
-    ("views.py", "NSOBgpPeerCreateView._create_peer"): ("create", 2),
+    ("views.py", "NSOBgpPeerCreateView._create_peer"): ("create", 3),
     ("views.py", "NSOVLANAttachView.post"): ("create", 2),
     ("vlan_reconciler.py", "_vlan_repoint_plan"): ("operator_edit_from_view", 2),
 }
