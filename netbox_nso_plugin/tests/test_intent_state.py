@@ -1146,8 +1146,6 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
                 management=self.management,
                 asn_str=str(local_as.asn),
                 peer_address_str=str(peer.peer.address).split("/")[0],
-                remote_as_str=str(remote_as.asn),
-                enabled=True,
                 bgp_peer=peer,
                 status="accepted",
             )

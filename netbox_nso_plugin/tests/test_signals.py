@@ -2193,7 +2193,6 @@ class TestOverlayDeletePushesReducedSnapshot(_SignalDBBase):
                 bgp_peer=peer,
                 asn_str=str(local_as.asn),
                 peer_address_str="198.18.0.2",
-                remote_as_str=str(remote_as.asn),
                 status="accepted",
             )
         self._delete_pushes(

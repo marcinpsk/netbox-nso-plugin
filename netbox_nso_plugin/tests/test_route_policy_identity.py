@@ -809,7 +809,6 @@ class TestExactPolicyIdentity(_CascadeFlushMixin, IntentPushResetMixin, Transact
                     bgp_peer=peer,
                     asn_str="64512",
                     peer_address_str=f"198.18.0.{index}",
-                    remote_as_str="64513",
                     status="accepted",
                 )
                 OSPFInstance.objects.create(

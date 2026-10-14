@@ -761,6 +761,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
 
     def test_description_provision_does_not_certify_foreign_bgp_drift(self):
         from dcim.models import Interface
+        from ipam.models import ASN
+        from netbox_routing.models import BGPPeer
 
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.link_role import provision_link_role
@@ -787,12 +789,12 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 bgp_peer=peer,
                 peer_address_str="198.18.0.12",
                 asn_str="64520",
-                remote_as_str="64521",
                 status="in_sync",
             )
         revision = NSOIntentRevision.objects.get(device=self.device, scope="bgp")
         baseline = (revision.revision, revision.verified_revision, revision.verified_fingerprint, revision.verified_at)
-        NSOBGPPeerState.objects.filter(pk=bgp.pk).update(remote_as_str="64522")
+        remote_as = ASN.objects.create(asn=64522, rir=peer.remote_as.rir)
+        BGPPeer.objects.filter(pk=bgp.bgp_peer_id).update(remote_as=remote_as)
         role = NSOLinkRole.objects.create(
             name="Description drift",
             slug="description-drift",

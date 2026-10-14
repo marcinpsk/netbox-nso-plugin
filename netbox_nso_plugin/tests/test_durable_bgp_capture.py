@@ -184,8 +184,6 @@ class TestDurableBGPCapture(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 asn_str="64512",
                 vrf_name=scope.vrf.name if scope.vrf_id else "",
                 peer_address_str=address,
-                remote_as_str="64513",
-                enabled=True,
                 status="accepted",
             )
         return self.bookkeeping(row, status=status)

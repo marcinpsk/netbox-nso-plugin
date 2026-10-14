@@ -1896,8 +1896,6 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         blank=True,
         related_name="nso_bgp_states",
     )
-    remote_as_str = models.CharField(max_length=10, blank=True, default="")
-    enabled = models.BooleanField(null=True, blank=True)
     status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)

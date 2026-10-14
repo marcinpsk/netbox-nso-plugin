@@ -184,22 +184,25 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
         af = BGPPeerAddressFamily.objects.get(assigned_object_id=native.pk)
         with without_commit_drain():
             content_update(
-                native, remote_as=ASN.objects.create(asn=65536, rir=native.remote_as.rir), bfd_enabled=True, password=""
+                native,
+                remote_as=ASN.objects.create(asn=4200000000, rir=native.remote_as.rir),
+                bfd_enabled=True,
+                password="",
             )
             content_update(af, enabled=None)
         payload = delivery.render("bgp", self.device.pk, self.management.adapter_device_id).payload
         rendered = payload[0]["scopes"][0]["peers"][0]
-        self.assertEqual(rendered["remote_as"], "65536")
+        self.assertEqual(rendered["remote_as"], "4200000000")
         self.assertTrue(rendered["address_families"][0]["enabled"])
         self.assertNotIn("bfd_enabled", rendered)
-        self.read(remote_as="1.0", bfd_enabled=False)
+        self.read(remote_as="64086.59904", bfd_enabled=False)
         self.assertEqual(self.state.status, "in_sync")
         base = self.state.device_base_hash
-        self.read(remote_as="65536", address_families=[{"af": "ipv4-unicast", "enabled": False}])
+        self.read(remote_as="4200000000", address_families=[{"af": "ipv4-unicast", "enabled": False}])
         self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
         with without_commit_drain():
             content_update(native, password="placeholder-secret")
-        self.read(remote_as="65536")
+        self.read(remote_as="4200000000")
         self.assertEqual(self.state.status, "accepted")
 
     def test_unowned_merge_preserves_seed_equality_mirror_freeze_and_conflict(self):
@@ -274,6 +277,24 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
         self.assertGreater(revision.revision, before)
         payload = delivery.render("bgp", self.device.pk, self.management.adapter_device_id).payload
         self.assertEqual(payload[0]["scopes"][0]["peers"][0]["remote_as"], "64517")
+
+    def test_explicit_release_restores_unowned_merge_without_deleting_native(self):
+        from netbox_nso_plugin.models import NSOOwnershipManifest
+        from netbox_nso_plugin.ownership_planner import reconcile_scope_ownership
+
+        self.own("accepted")
+        native_id = self.state.bgp_peer_id
+        with without_commit_drain():
+            self.state = content_update(self.state, status="imported", accepted_at=None)
+            reconcile_scope_ownership(self.device.pk, ("bgp",))
+        manifest = NSOOwnershipManifest.objects.get(state_model_label=self.state._meta.label_lower)
+        self.assertEqual(manifest.ownership_state, "detached")
+        native = self.read(remote_as="64514", enabled=False)
+        self.assertEqual(
+            (native.pk, native.remote_as.asn, native.enabled, self.state.status), (native_id, 64514, False, "imported")
+        )
+        payload = delivery.render("bgp", self.device.pk, self.management.adapter_device_id).payload
+        self.assertEqual(payload[0]["scopes"][0]["peers"], [])
 
 
 class TestPeerIntentMigration(_CascadeFlushMixin, TransactionTestCase):

@@ -1506,8 +1506,6 @@ def _seed_bgp_peer(candidate, native, _manifest):
     candidate.asn_str = str(native.scope.router.asn.asn)
     candidate.vrf_name = native.scope.vrf.name if native.scope.vrf_id else ""
     candidate.peer_address_str = str(native.peer.address.ip)
-    candidate.remote_as_str = str(native.remote_as.asn) if native.remote_as_id else ""
-    candidate.enabled = native.enabled
 
 
 def _seed_bgp_router(candidate, native, _manifest):

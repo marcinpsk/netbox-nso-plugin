@@ -651,7 +651,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(materialized_peer.local_as.asn, 4_294_967_293)
         self.assertEqual(BGPPeerTemplate.objects.get(name="GROUP").remote_as.asn, 4_294_967_292)
         state = NSOBGPPeerState.objects.get()
-        self.assertEqual((state.asn_str, state.remote_as_str), ("4294967295", "4294967294"))
+        self.assertEqual((state.asn_str, state.bgp_peer.remote_as.asn), ("4294967295", 4_294_967_294))
         self.assertEqual(second.pk, first.pk)
         self.assertEqual(second.bgp_peer_id, first.bgp_peer_id)
         self.assertEqual(second.device_base_hash, first.device_base_hash)
@@ -691,7 +691,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(state.peer_address_str, "10.0.0.2")
         self.assertEqual(state.management, mgmt)
         self.assertIsNotNone(state.bgp_peer)
-        self.assertTrue(state.enabled)
+        self.assertTrue(state.bgp_peer.enabled)
 
     def test_unknown_vrf_stays_blocked_without_global_scope(self):
         """An unresolved named VRF stays blocked across repeated observations."""
@@ -886,7 +886,8 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         from ipam.models import VRF, IPAddress
         from netbox_routing.models import BGPPeer
 
-        from netbox_nso_plugin.bgp_reconciler import _content_hash, _peer_object_content, _reconcile_bgp_config
+        from netbox_nso_plugin.bgp_peer_content import peer_content
+        from netbox_nso_plugin.bgp_reconciler import _content_hash, _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState
 
         vrf = VRF.objects.create(name="SOURCE-SELECTION-VRF")
@@ -910,7 +911,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer.refresh_from_db()
         self.assertEqual(peer.source_id, selected_source.pk)
         self.assertEqual(result[0].status, "in_sync")
-        self.assertEqual(result[0].device_base_hash, _content_hash(_peer_object_content(peer)))
+        self.assertEqual(result[0].device_base_hash, _content_hash(peer_content(peer)))
         self.assertEqual(IPAddress.objects.filter(address__net_host=source_address).count(), 1)
 
     def test_duplicate_peer_rejects_document_before_materializing_asns(self):
