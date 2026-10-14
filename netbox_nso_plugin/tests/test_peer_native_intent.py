@@ -173,6 +173,39 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
         self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", base))
         self.assertEqual(self.state.bgp_peer.scope_id, other_scope.pk)
 
+    def test_owned_native_scope_on_another_device_cannot_settle_matching_identity(self):
+        from netbox_nso_plugin.ownership_planner import OwnershipNotQualified, require_qualifying_ownership
+
+        self.own("in_sync")
+        self.state = content_update(self.state, device_base_hash="")
+        native = self.state.bgp_peer
+        router = native.scope.router
+        other_device, _management = make_managed("native-peer-other", 1804)
+        other_router = BGPRouter.objects.create(
+            assigned_object_type=router.assigned_object_type,
+            assigned_object_id=other_device.pk,
+            asn=router.asn,
+        )
+        other_scope = BGPScope.objects.create(router=other_router, vrf=native.scope.vrf)
+        content_update(native, scope=other_scope)
+        before = (list(BGPPeer.objects.values()), list(BGPPeerAddressFamily.objects.values()))
+        plan = bgp_reconcile_plan(self.device, self.document)
+        self.assertFalse(
+            any(
+                write.model_label in {"netbox_routing.bgppeer", "netbox_routing.bgppeeraddressfamily"}
+                for write in plan.write_set
+            )
+        )
+        self.read()
+        self.assertEqual((self.state.status, self.state.device_base_hash), ("accepted", ""))
+        self.assertEqual((list(BGPPeer.objects.values()), list(BGPPeerAddressFamily.objects.values())), before)
+        self.assertTrue(BGPRouter.objects.filter(pk=router.pk, assigned_object_id=self.device.pk).exists())
+        self.assertEqual(self.state.bgp_peer.scope_id, other_scope.pk)
+        with self.assertRaises(OwnershipNotQualified):
+            require_qualifying_ownership(self.state)
+        payload = delivery.render("bgp", self.device.pk, self.management.adapter_device_id).payload
+        self.assertIn("blocked", payload)
+
     def test_owned_native_disappearance_is_not_recreated_and_audit_retracts(self):
         from netbox_nso_plugin.models import NSOOwnershipManifest
         from netbox_nso_plugin.ownership_planner import (
@@ -353,6 +386,31 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
             peer_content(self.state.bgp_peer),
             {"enabled": True, "remote_as": "64513", "address_families": [{"af": "ipv4-unicast", "enabled": True}]},
         )
+
+    def test_render_and_compare_call_the_same_peer_qualification_definition(self):
+        from netbox_nso_plugin import bgp_reconciler, ownership_planner
+
+        for function in (
+            ownership_planner._require_qualifying_acquisition,
+            bgp_reconciler._BGPGraphPlanner.reconcile_peer,
+        ):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+            self.assertTrue(
+                any(
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "bgp_peer_content"
+                    and any(alias.name == "peer_binding_qualifies" for alias in node.names)
+                    for node in ast.walk(tree)
+                )
+            )
+            self.assertTrue(
+                any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "peer_binding_qualifies"
+                    for node in ast.walk(tree)
+                )
+            )
 
     def test_remote_asn_edit_advances_the_owned_peer_renderer_revision(self):
         from netbox_nso_plugin.models import NSOIntentRevision

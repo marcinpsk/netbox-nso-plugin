@@ -2780,6 +2780,9 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
         .select_related(
             "management",
             "bgp_peer",
+            "bgp_peer__scope__router__asn",
+            "bgp_peer__scope__vrf",
+            "bgp_peer__peer",
             "bgp_peer__remote_as",
             "bgp_peer__local_as",
             "bgp_peer__peer_group",

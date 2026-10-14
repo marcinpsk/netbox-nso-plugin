@@ -709,7 +709,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.peer_address_families.setdefault((row.assigned_object_type_id, row.assigned_object_id), []).append(row)
         self.template_saved = set()
         peer_state_rows = (
-            tuple(NSOBGPPeerState.objects.filter(management=self.management).select_related("bgp_peer").order_by("pk"))
+            tuple(
+                NSOBGPPeerState.objects.filter(management=self.management)
+                .select_related("management", "bgp_peer__scope__router__asn", "bgp_peer__scope__vrf", "bgp_peer__peer")
+                .order_by("pk")
+            )
             if self.management is not None
             else ()
         )
@@ -1032,7 +1036,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
     def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: C901, PLR0915
         from . import status_machine as sm
-        from .bgp_peer_content import peer_content
+        from .bgp_peer_content import peer_binding_qualifies, peer_content
 
         address = entry["peer_address"]
         state_key = (asn_str, vrf_name, address)
@@ -1049,25 +1053,13 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             matches = False
             if state.bgp_peer_id is not None:
                 native = self.peers_by_id.get(state.bgp_peer_id, state.bgp_peer)
-                families = self.peer_address_families.get((self.peer_content_type.pk, native.pk))
-                source, update_source = self.source(entry.get("source"), scope.vrf, native, create=False)
-                device_content = self.resolved_peer_content(entry, source, update_source)
-                native_identity = (
-                    canonical_bgp_peer_identity(
-                        str(native.scope.router.asn.asn),
-                        native.scope.vrf.name if native.scope.vrf_id else "",
-                        str(native.peer.address),
-                    )
-                    if native.scope_id is not None
-                    else None
-                )
-                matches = (
-                    native_identity == state_key
-                    and device_content == peer_content(entry)
-                    and peer_content(native, families) == device_content
-                )
-                if matches:
-                    state.device_base_hash = _content_hash(device_content)
+                if peer_binding_qualifies(state, native):
+                    families = self.peer_address_families.get((self.peer_content_type.pk, native.pk))
+                    source, update_source = self.source(entry.get("source"), scope.vrf, native, create=False)
+                    device_content = self.resolved_peer_content(entry, source, update_source)
+                    matches = device_content == peer_content(entry) and peer_content(native, families) == device_content
+                    if matches:
+                        state.device_base_hash = _content_hash(device_content)
             state.last_sync_at = self.planned_at
             state.status = sm.on_reconcile(state.status, matches=matches)
             self.peer_states[state_key] = state

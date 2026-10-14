@@ -6,6 +6,33 @@ import ipaddress
 from contextlib import suppress
 
 
+def peer_binding_qualifies(state, native=None):
+    """Require the linked peer to match the overlay's device and canonical identity."""
+    from dcim.models import Device
+    from django.contrib.contenttypes.models import ContentType
+
+    from .bgp_reconciler import canonical_bgp_peer_identity
+
+    if state.bgp_peer_id is None:
+        return False
+    native = state.bgp_peer if native is None else native
+    if native.scope_id is None or native.peer_id is None:
+        return False
+    router = native.scope.router
+    if (
+        router.assigned_object_type_id != ContentType.objects.get_for_model(Device).pk
+        or router.assigned_object_id != state.management.device_id
+        or router.asn_id is None
+    ):
+        return False
+    try:
+        return canonical_bgp_peer_identity(
+            str(router.asn.asn), native.scope.vrf.name if native.scope.vrf_id else "", str(native.peer.address)
+        ) == canonical_bgp_peer_identity(state.asn_str, state.vrf_name, state.peer_address_str)
+    except ValueError:
+        return False
+
+
 def _native_peer_values(peer):
     source = None
     if peer.update_source is not None:
