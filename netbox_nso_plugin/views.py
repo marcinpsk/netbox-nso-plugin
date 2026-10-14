@@ -395,7 +395,10 @@ def _bgp_peer_observations(management_id):
         for scope in router.get("scope") or []:
             for peer in scope.get("peer") or []:
                 identity = canonical_bgp_peer_identity(router["asn"], scope.get("vrf") or "", peer["peer_address"])
-                peers[identity] = peer
+                if identity not in peers:
+                    peers[identity] = dict(peer)
+                elif peer.get("enabled") is True:
+                    peers[identity]["enabled"] = True
     return peers
 
 

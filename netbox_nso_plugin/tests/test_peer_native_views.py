@@ -79,7 +79,7 @@ class TestPeerNativeViews(TestCase):
         self.assertTrue(response.json()["diff_available"])
         return [row for row in response.json()["routing_changes"] if row["category"] == "BGP peer"]
 
-    def publish(self, peers, *, routers=None, routers_null=False):
+    def publish(self, peers, *, routers=None, routers_null=False, projected_peers=None):
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config, bgp_reconcile_plan
 
         routers = routers if routers is not None else [entry(asn="0.64512", scope=[entry(vrf="", peer=peers)])]
@@ -94,7 +94,9 @@ class TestPeerNativeViews(TestCase):
                         {
                             "vrf": scope.get("vrf") or "",
                             "address_families": [],
-                            "peers": [
+                            "peers": projected_peers
+                            if projected_peers is not None
+                            else [
                                 {
                                     "peer_address": ip_interface(peer["peer_address"]).ip.compressed,
                                     "remote_as": peer.get("remote_as"),
@@ -188,6 +190,38 @@ class TestPeerNativeViews(TestCase):
         self.assertEqual(row["remote_as"], "64515")
         self.assertIs(row["enabled"], False)
         self.assertIs(row["disabled"], True)
+
+    def test_unlinked_duplicate_observations_keep_first_scalars_and_any_enabled(self):
+        self.assert_duplicate_observations(first_enabled=True, second_enabled=False)
+
+    def test_unlinked_later_enabled_observation_keeps_first_scalars(self):
+        self.assert_duplicate_observations(first_enabled=False, second_enabled=True)
+
+    def assert_duplicate_observations(self, *, first_enabled, second_enabled):
+        state = self.state(status="accepted")
+        with without_commit_drain():
+            self.peer.delete()
+        self.publish(
+            [
+                entry(peer_address="198.18.0.2/32", remote_as="64515", enabled=first_enabled),
+                entry(peer_address="198.18.0.2", remote_as="64516", enabled=second_enabled),
+            ],
+            projected_peers=[
+                {
+                    "peer_address": "198.18.0.2",
+                    "remote_as": "64515",
+                    "enabled": True,
+                    "address_families": [],
+                }
+            ],
+        )
+        state.refresh_from_db()
+        self.assertIsNone(state.bgp_peer_id)
+        row = self.grid()[state.peer_address_str]
+        self.assertEqual(row["remote_as"], "64515")
+        self.assertIs(row["enabled"], True)
+        self.assertIs(row["disabled"], False)
+        self.assertEqual(self.preview()[0]["detail"], "AS 64515, enabled")
 
     def test_unlinked_missing_and_null_observations_are_unavailable(self):
         missing = self.state(linked=False, peer_address_str="198.18.0.3")
