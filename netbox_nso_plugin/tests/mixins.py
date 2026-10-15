@@ -48,9 +48,8 @@ class IntentPushResetMixin:
     cell by design (§4.2: a stale cell costs an O(1) callback, never a missing drain), so a
     test whose fixture rolled back would otherwise hand the next test a key to drain.
     ``reset_intent_push_state()`` clears it, but it is wired only as a pytest autouse
-    fixture (``conftest.py``); the Django ``manage.py test`` runner — which CI uses —
-    ignores conftest. Mix this in BEFORE the TestCase base so its ``setUp`` runs and chains
-    via ``super()``.
+    fixture (``conftest.py``); the Django ``manage.py test`` runner ignores conftest. Mix
+    this in BEFORE the TestCase base so its ``setUp`` runs and chains via ``super()``.
     """
 
     def setUp(self):
