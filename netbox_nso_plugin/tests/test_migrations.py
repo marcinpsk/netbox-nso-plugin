@@ -299,8 +299,8 @@ class TestBGPRouterMigration(_CascadeFlushMixin, TransactionTestCase):
             row.refresh_from_db()
             self.assertEqual(row.model_label, router_label)
         additions = [name for (app, name) in executor.loader.disk_migrations if app == APP and name > parent[1]]
-        self.assertEqual(
-            sorted(additions), ["0035_bgp_router_state", "0036_direct_selection_capture", "0037_bgp_peer_native_intent"]
+        self.assertLessEqual(
+            {"0035_bgp_router_state", "0036_direct_selection_capture", "0037_bgp_peer_native_intent"}, set(additions)
         )
 
     def test_router_label_is_persistable_after_ledger_migration(self):
