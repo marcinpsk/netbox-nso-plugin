@@ -358,6 +358,29 @@ class TestPeerNativeViews(TestCase):
         self.publish([entry(peer_address="198.18.0.2/32", remote_as="64515", enabled=False)])
         self.assertEqual(self.preview()[0]["detail"], "AS 64515, disabled")
 
+    def test_unlinked_preview_reads_the_published_peer_index_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOFamilyObservation
+
+        for address in ("198.18.0.4", "198.18.0.5"):
+            self.state(status="accepted", linked=False, peer_address_str=address)
+        self.publish(
+            [
+                entry(peer_address="198.18.0.4/32", remote_as="64515", enabled=False),
+                entry(peer_address="198.18.0.5/32", remote_as="64516", enabled=True),
+            ]
+        )
+        table = NSOFamilyObservation._meta.db_table
+        with CaptureQueriesContext(connection) as queries:
+            rows = self.preview()
+        self.assertEqual(
+            sorted(row["detail"] for row in rows),
+            ["AS 64515, disabled", "AS 64516, enabled"],
+        )
+        self.assertEqual(sum(f'FROM "{table}"' in query["sql"] for query in queries.captured_queries), 1)
+
     def test_inline_resolves_existing_asn_and_can_clear_optional_remote_as(self):
         state = self.state()
         existing = ASN.objects.create(asn=64514, rir=self.rir)

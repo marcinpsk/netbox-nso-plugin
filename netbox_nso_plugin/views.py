@@ -433,15 +433,13 @@ def _bgp_peer_observations(management_id):
     return peers
 
 
-def _bgp_peer_display_values(state, observations=None):
+def _bgp_peer_display_values(state, observations):
     """Display linked native intent or the matching published observation."""
     from .bgp_reconciler import canonical_bgp_peer_identity
 
     if state.bgp_peer_id:
         peer = state.bgp_peer
         return {"remote_as": str(peer.remote_as.asn) if peer.remote_as_id else None, "enabled": peer.enabled}
-    if observations is None:
-        observations = _bgp_peer_observations(state.management_id)
     try:
         identity = canonical_bgp_peer_identity(state.asn_str, state.vrf_name or "", state.peer_address_str)
     except ValueError:
@@ -450,9 +448,9 @@ def _bgp_peer_display_values(state, observations=None):
     return {"remote_as": peer.get("remote_as"), "enabled": peer.get("enabled")}
 
 
-def _bgp_peer_preview_detail(state):
+def _bgp_peer_preview_detail(state, observations_by_management):
     """Show both peer leaves, including unavailable observation values."""
-    values = _bgp_peer_display_values(state)
+    values = _bgp_peer_grid_values(state, observations_by_management)
     remote = f"AS {values['remote_as']}" if values["remote_as"] is not None else "remote AS unavailable"
     enabled = values["enabled"]
     state = "state unavailable" if enabled is None else "enabled" if enabled else "disabled"
@@ -461,11 +459,9 @@ def _bgp_peer_preview_detail(state):
 
 def _bgp_peer_grid_values(state, observations_by_management):
     """Reuse one published peer index for each management row in the grid."""
-    if state.bgp_peer_id:
-        return _bgp_peer_display_values(state)
-    if state.management_id not in observations_by_management:
+    if not state.bgp_peer_id and state.management_id not in observations_by_management:
         observations_by_management[state.management_id] = _bgp_peer_observations(state.management_id)
-    return _bgp_peer_display_values(state, observations_by_management[state.management_id])
+    return _bgp_peer_display_values(state, observations_by_management.get(state.management_id))
 
 
 # "Accept" makes NetBox the source of truth, so it applies to values NetBox does not
@@ -6282,6 +6278,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         def _vlan_item(r):
             return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
 
+        bgp_observations = {}
+
         # (Model, category label, item fn, detail fn) — all read defensively.
         # The fifth element names the intent scope that receives the row's push.
         # None marks a push outside the mirrored scopes. Redistribution uses its
@@ -6334,7 +6332,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 NSOBGPPeerState,
                 "BGP peer",
                 lambda r: r.peer_address_str or "",
-                _bgp_peer_preview_detail,
+                lambda r: _bgp_peer_preview_detail(r, bgp_observations),
                 "bgp",
             ),
             (
