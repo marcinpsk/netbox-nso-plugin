@@ -686,6 +686,34 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
+    def test_a_source_epoch_change_after_its_receipt_refuses_the_apply_as_changed_intent(self):
+        """An adopted source epoch moves the store-only selection to an earlier mapping epoch."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import delivery
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        real_send = delivery.send
+        adopted = []
+
+        def send_then_adopt(rendered, *args, **kwargs):
+            answer = real_send(rendered, *args, **kwargs)
+            if rendered.key[1] == "vlan" and not adopted:
+                adopted.append(True)
+                with without_commit_drain(), transaction.atomic():
+                    mirror_update(self.mgmt, adapter_source_epoch=(self.mgmt.adapter_source_epoch or 0) + 1)
+            return answer
+
+        with patch("netbox_nso_plugin.delivery.send", side_effect=send_then_adopt):
+            response = self._post(adapter)
+
+        self.assertEqual(adopted, [True])
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertIn("changed during preparation", response.json()["message"])
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
     def test_a_foreign_rename_after_preparation_repends_on_the_next_audit(self):
         """A foreign rename stays neutral until the next audit repairs its scope."""
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes

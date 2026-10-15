@@ -343,7 +343,10 @@ def capture_manual(
     owners = {}
     for scope, entry in registry.items():
         if entry.in_protocol:
-            selection = _claim_selection(management, scope, pushed[scope].push_seq)
+            try:
+                selection = _claim_selection(management, scope, pushed[scope].push_seq)
+            except CaptureEpochChanged:
+                raise IntentChangedDuringPreparation from None
             revision = pushed[scope].revision
         else:
             try:
