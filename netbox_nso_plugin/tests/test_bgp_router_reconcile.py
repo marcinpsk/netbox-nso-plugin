@@ -287,6 +287,7 @@ def test_owned_router_matching_read_stays_in_sync_and_advances_base(router_case)
 
 
 def test_router_unknown_vrf_never_acquires_global_scope(router_case):
+    from ipam.models import ASN
     from netbox_routing.models import BGPRouter
 
     from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
@@ -299,6 +300,9 @@ def test_router_unknown_vrf_never_acquires_global_scope(router_case):
 
     device, management = router_case
     payload = router_document(device, scopes=[scope_entry("placeholder-unknown", peers=[peer_entry()])])
+    _reconcile_bgp_config(device, payload)
+    assert not BGPRouter.objects.filter(assigned_object_id=device.pk).exists()
+    BGPRouter.objects.create(assigned_object=device, asn=ASN.objects.get(asn=64512), name="64512")
     _reconcile_bgp_config(device, payload)
     assert not BGPScope.objects.filter(router__assigned_object_id=device.pk, vrf__isnull=True).exists()
     state = router_model().objects.get(management=management, asn_str="64512")
@@ -327,6 +331,22 @@ def test_router_unknown_vrf_never_acquires_global_scope(router_case):
     assert state.status in {"error", "conflict"}
     assert not NSOOwnershipManifest.objects.filter(device_id=device.pk, scope="bgp").exists()
     assert not BGPScope.objects.filter(router=state.bgp_router, vrf__isnull=True).exists()
+
+
+def test_router_unknown_vrf_read_creates_no_native_router_until_the_vrf_exists(router_case):
+    from netbox_routing.models import BGPRouter
+
+    device, _ = router_case
+    scopes = [scope_entry("placeholder-late", peers=[peer_entry()])]
+    state, _ = import_router(router_case, scopes=scopes)
+    assert state.status == "conflict"
+    assert state.bgp_router_id is None
+    assert not BGPRouter.objects.filter(assigned_object_id=device.pk).exists()
+    VRF.objects.create(name="placeholder-late")
+    state, _ = import_router(router_case, scopes=scopes)
+    assert state.status == "imported"
+    assert len(state.device_base_hash) == 64
+    assert BGPScope.objects.filter(router=state.bgp_router, vrf__name="placeholder-late").exists()
 
 
 def test_router_content_canonicalizes_scope_afs_and_clearing(router_case):

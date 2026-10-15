@@ -1318,7 +1318,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         if ambiguous:
             router = None
         elif new_native:
-            router = self.router(asn, entry.get("router_id"))
+            router = None if conflict else self.router(asn, entry.get("router_id"))
         else:
             object_content = router_content(router)
             object_hash = router_content_digest(object_content)
