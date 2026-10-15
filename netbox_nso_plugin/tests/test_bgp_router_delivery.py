@@ -92,6 +92,31 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         drain.drain_intent_outbox()
         self.assertTrue(self.adapter.applied)
 
+    def test_router_id_edit_validates_the_written_router_against_constraints(self):
+        from core.models import ObjectType
+        from users.models import ObjectPermission
+
+        state = self.router_state(owned=True)
+        limited = get_user_model().objects.create_user("router-constrained-editor")
+        management_permission = ObjectPermission.objects.create(name="Router edit management", actions=["change"])
+        management_permission.object_types.add(ObjectType.objects.get_for_model(type(self.management)))
+        management_permission.users.add(limited)
+        native_permission = ObjectPermission.objects.create(
+            name="Router edit range", actions=["change"], constraints={"router_id": "198.18.0.1"}
+        )
+        native_permission.object_types.add(ObjectType.objects.get_for_model(BGPRouter))
+        native_permission.users.add(limited)
+        self.client.force_login(limited)
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:overlay_field_edit", args=("bgp_router", state.pk)),
+            {"router_id": "198.18.0.9"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.router.refresh_from_db()
+        self.assertEqual(str(self.router.router_id), "198.18.0.1")
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+
     def test_router_only_accept_emits_router_id_and_scope_afs(self):
         state = self.router_state()
         response = self.accept(state)

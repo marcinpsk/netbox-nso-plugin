@@ -5206,7 +5206,9 @@ def _bgp_router_errors(state):
     return {}
 
 
-def _save_owned_bgp_router_edit(state, old_values):
+def _save_owned_bgp_router_edit(state, old_values, user):
+    from netbox_routing.models import BGPRouter
+
     from . import status_machine as sm
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
@@ -5227,6 +5229,8 @@ def _save_owned_bgp_router_edit(state, old_values):
     with renderer_writes(plan) as writer:
         writer.save(native, update_fields=("router_id",))
         writer.save(candidate, update_fields=fields)
+        if not BGPRouter.objects.restrict(user, "change").filter(pk=native.pk).exists():
+            raise PermissionDenied
 
 
 def _save_owned_bgp_edit(obj, old_values, user):
@@ -5464,7 +5468,7 @@ def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
         _save_owned_isis_edit(obj, key, old_values)
         return None
     if key == "bgp_router":
-        _save_owned_bgp_router_edit(obj, old_values)
+        _save_owned_bgp_router_edit(obj, old_values, user)
         return None
     if key == "bgp_peer":
         _save_owned_bgp_edit(obj, old_values, user)
