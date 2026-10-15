@@ -1036,7 +1036,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
     def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: C901, PLR0915
         from . import status_machine as sm
-        from .bgp_peer_content import peer_binding_qualifies, peer_content
+        from .bgp_peer_content import peer_binding_qualifies, peer_content, peer_merge_content
 
         address = entry["peer_address"]
         state_key = (asn_str, vrf_name, address)
@@ -1059,7 +1059,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                     device_content = self.resolved_peer_content(entry, source, update_source)
                     matches = device_content == peer_content(entry) and peer_content(native, families) == device_content
                     if matches:
-                        state.device_base_hash = _content_hash(device_content)
+                        state.device_base_hash = _content_hash(peer_merge_content(entry, device_content))
             state.last_sync_at = self.planned_at
             state.status = sm.on_reconcile(state.status, matches=matches)
             self.peer_states[state_key] = state
@@ -1111,11 +1111,15 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         )
         state.bgp_peer = peer
         state.last_sync_at = self.planned_at
-        device_hash = _content_hash(self.resolved_peer_content(entry, source, update_source))
+        device_hash = _content_hash(peer_merge_content(entry, self.resolved_peer_content(entry, source, update_source)))
         peer_address_families = (
             () if created_peer else self.peer_address_families.get((self.peer_content_type.pk, current_peer.pk), ())
         )
-        object_hash = device_hash if created_peer else _content_hash(peer_content(current_peer, peer_address_families))
+        object_hash = (
+            device_hash
+            if created_peer
+            else _content_hash(peer_merge_content(current_peer, peer_content(current_peer, peer_address_families)))
+        )
         base = state.device_base_hash
         matches = True
         conflict = False

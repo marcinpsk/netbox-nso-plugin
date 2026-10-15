@@ -293,6 +293,15 @@ class TestNativePeerIntent(IntentPushResetMixin, TestCase):
         self.assertEqual((native.ttl, self.state.status), (3, "conflict"))
         self.assertFalse({"remote_as_str", "enabled"} & {field.name for field in self.state._meta.concrete_fields})
 
+    def test_unowned_merge_mirrors_and_freezes_bfd_enabled(self):
+        native = self.read(bfd_enabled=False)
+        self.assertEqual((native.bfd_enabled, self.state.status), (False, "imported"))
+        native = self.read(bfd_enabled=True)
+        self.assertEqual((native.bfd_enabled, self.state.status), (True, "imported"))
+        content_update(native, bfd_enabled=False)
+        native = self.read(bfd_enabled=True)
+        self.assertEqual((native.bfd_enabled, self.state.status), (False, "changed"))
+
     def test_unowned_import_attaches_policy_when_missing_dependency_appears(self):
         policies = {
             "routemap_in": "example-in",

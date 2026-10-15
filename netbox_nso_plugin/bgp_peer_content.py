@@ -90,3 +90,8 @@ def peer_content(peer, address_families=None):
         content[field] = value
     content["address_families"] = sorted((_peer_af_content(row) for row in rows), key=lambda row: row["af"])
     return content
+
+
+def peer_merge_content(peer, content):
+    """Add the read-only bfd_enabled leaf that the read merge tracks but the push never sends."""
+    return content | {"bfd_enabled": peer.get("bfd_enabled") if isinstance(peer, dict) else peer.bfd_enabled}

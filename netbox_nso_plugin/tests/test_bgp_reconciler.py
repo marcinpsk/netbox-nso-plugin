@@ -886,7 +886,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         from ipam.models import VRF, IPAddress
         from netbox_routing.models import BGPPeer
 
-        from netbox_nso_plugin.bgp_peer_content import peer_content
+        from netbox_nso_plugin.bgp_peer_content import peer_content, peer_merge_content
         from netbox_nso_plugin.bgp_reconciler import _content_hash, _reconcile_bgp_config
         from netbox_nso_plugin.models import NSOBGPPeerState
 
@@ -911,7 +911,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         peer.refresh_from_db()
         self.assertEqual(peer.source_id, selected_source.pk)
         self.assertEqual(result[0].status, "in_sync")
-        self.assertEqual(result[0].device_base_hash, _content_hash(peer_content(peer)))
+        self.assertEqual(result[0].device_base_hash, _content_hash(peer_merge_content(peer, peer_content(peer))))
         self.assertEqual(IPAddress.objects.filter(address__net_host=source_address).count(), 1)
 
     def test_duplicate_peer_rejects_document_before_materializing_asns(self):
