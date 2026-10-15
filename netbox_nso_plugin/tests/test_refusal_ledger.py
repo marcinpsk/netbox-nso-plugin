@@ -231,3 +231,24 @@ def test_selection_requires_exactly_one_source_selector(ledger):
     invalid["source_push_seq"] = None
     prepared = Selection.objects.create(**invalid)
     assert prepared.selection_revision == 7
+
+
+def test_unbound_selection_uniqueness_does_not_need_nulls_not_distinct(ledger):
+    from django.db import connection
+
+    _, management, _, (Selection, _, _, _) = ledger
+    # PostgreSQL 14 (NetBox 4.6) ignores NULLS NOT DISTINCT, so an unbound row needs its own partial index.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = %s AND indexdef LIKE %s",
+            [Selection._meta.db_table, "%NULLS NOT DISTINCT%"],
+        )
+        assert cursor.fetchall() == []
+    prepared = selection_values(management) | {"source_push_seq": None, "selection_revision": 7}
+    for values in (selection_values(management), prepared):
+        Selection.objects.create(**values)
+        with pytest.raises(IntegrityError), transaction.atomic():
+            Selection.objects.create(**values)
+        Selection.objects.create(**(values | {"store_incarnation": "placeholder-store"}))
+        with pytest.raises(IntegrityError), transaction.atomic():
+            Selection.objects.create(**(values | {"store_incarnation": "placeholder-store"}))

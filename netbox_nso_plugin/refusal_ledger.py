@@ -52,17 +52,26 @@ class NSOAcceptedSelection(models.Model):
                 ),
                 name="nso_selection_selector",
             ),
+            # Not nulls_distinct=False: PostgreSQL 14 (NetBox 4.6) ignores it.
+            models.UniqueConstraint(
+                fields=["management", "mapping_epoch", "stream", "source_push_seq"],
+                condition=models.Q(source_push_seq__isnull=False, store_incarnation__isnull=True),
+                name="nso_selection_push_unbound",
+            ),
             models.UniqueConstraint(
                 fields=["management", "mapping_epoch", "store_incarnation", "stream", "source_push_seq"],
-                condition=models.Q(source_push_seq__isnull=False),
-                nulls_distinct=False,
-                name="nso_selection_push",
+                condition=models.Q(source_push_seq__isnull=False, store_incarnation__isnull=False),
+                name="nso_selection_push_bound",
+            ),
+            models.UniqueConstraint(
+                fields=["management", "mapping_epoch", "stream", "selection_revision"],
+                condition=models.Q(selection_revision__isnull=False, store_incarnation__isnull=True),
+                name="nso_selection_preparation_unbound",
             ),
             models.UniqueConstraint(
                 fields=["management", "mapping_epoch", "store_incarnation", "stream", "selection_revision"],
-                condition=models.Q(selection_revision__isnull=False),
-                nulls_distinct=False,
-                name="nso_selection_preparation",
+                condition=models.Q(selection_revision__isnull=False, store_incarnation__isnull=False),
+                name="nso_selection_preparation_bound",
             ),
             models.CheckConstraint(
                 condition=~models.Q(binding_state="bound")

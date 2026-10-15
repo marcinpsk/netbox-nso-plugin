@@ -389,19 +389,33 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name="nsoacceptedselection",
             constraint=models.UniqueConstraint(
-                condition=models.Q(("source_push_seq__isnull", False)),
-                fields=("management", "mapping_epoch", "store_incarnation", "stream", "source_push_seq"),
-                name="nso_selection_push",
-                nulls_distinct=False,
+                condition=models.Q(("source_push_seq__isnull", False), ("store_incarnation__isnull", True)),
+                fields=("management", "mapping_epoch", "stream", "source_push_seq"),
+                name="nso_selection_push_unbound",
             ),
         ),
         migrations.AddConstraint(
             model_name="nsoacceptedselection",
             constraint=models.UniqueConstraint(
-                condition=models.Q(("selection_revision__isnull", False)),
+                condition=models.Q(("source_push_seq__isnull", False), ("store_incarnation__isnull", False)),
+                fields=("management", "mapping_epoch", "store_incarnation", "stream", "source_push_seq"),
+                name="nso_selection_push_bound",
+            ),
+        ),
+        migrations.AddConstraint(
+            model_name="nsoacceptedselection",
+            constraint=models.UniqueConstraint(
+                condition=models.Q(("selection_revision__isnull", False), ("store_incarnation__isnull", True)),
+                fields=("management", "mapping_epoch", "stream", "selection_revision"),
+                name="nso_selection_preparation_unbound",
+            ),
+        ),
+        migrations.AddConstraint(
+            model_name="nsoacceptedselection",
+            constraint=models.UniqueConstraint(
+                condition=models.Q(("selection_revision__isnull", False), ("store_incarnation__isnull", False)),
                 fields=("management", "mapping_epoch", "store_incarnation", "stream", "selection_revision"),
-                name="nso_selection_preparation",
-                nulls_distinct=False,
+                name="nso_selection_preparation_bound",
             ),
         ),
         migrations.AddConstraint(
