@@ -1360,7 +1360,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if matches:
                 state.device_base_hash = device_hash
         else:
-            state.status = sm.on_reconcile(state.status, matches=None, conflict=conflict)
+            state.status = sm.on_reconcile(state.status, matches=mirror or matches, conflict=conflict)
             if mirror:
                 state.device_base_hash = device_hash
         self.router_states[asn_str] = state

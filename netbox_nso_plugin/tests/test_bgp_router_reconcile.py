@@ -349,6 +349,20 @@ def test_router_unknown_vrf_read_creates_no_native_router_until_the_vrf_exists(r
     assert BGPScope.objects.filter(router=state.bgp_router, vrf__name="placeholder-late").exists()
 
 
+def test_unowned_router_netbox_edit_reads_as_changed_and_device_move_mirrors(router_case):
+    state, _ = import_router(router_case)
+    content_update(state.bgp_router, router_id="192.0.2.1")
+    state, _ = import_router(router_case)
+    assert state.status == "changed"
+    state.bgp_router.refresh_from_db()
+    assert str(state.bgp_router.router_id) == "192.0.2.1"
+    content_update(state.bgp_router, router_id="192.0.2.254")
+    state, _ = import_router(router_case, router_id="192.0.2.253")
+    assert state.status == "imported"
+    state.bgp_router.refresh_from_db()
+    assert str(state.bgp_router.router_id) == "192.0.2.253"
+
+
 def test_router_content_canonicalizes_scope_afs_and_clearing(router_case):
     from netbox_nso_plugin.bgp_router_content import observed_router_content, router_content
 
