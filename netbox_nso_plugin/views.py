@@ -7132,6 +7132,10 @@ class NSOBGPRouterStateAcceptView(RoutingStateAcceptMixin):
     model_class = NSOBGPRouterState
     required_permission = ("netbox_nso_plugin.change_nsodevicemanagement", "netbox_routing.change_bgprouter")
 
+    def _arm_accept(self, state):
+        """Require a qualified matching read to confirm router intent after Accept."""
+        state.status = "accepted"
+
     def _accept_blocker(self, state):
         errors = _bgp_router_errors(state)
         return " ".join(message for values in errors.values() for message in values)

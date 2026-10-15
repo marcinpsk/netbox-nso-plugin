@@ -78,6 +78,7 @@ PRODUCERS = {
     ("views.py", "_ip_edit_plan_and_operations"): ("operator_edit", 2),
     ("views.py", "NSOInterfaceIPStateAcceptView.post"): ("accept", 2),
     ("views.py", "NSOStaticRouteStateAcceptView._arm_accept"): ("accept", 1),
+    ("views.py", "NSOBGPRouterStateAcceptView._arm_accept"): ("accept", 1),
     ("views.py", "NSOBGPPeerStateAcceptView._arm_accept"): ("accept", 1),
     ("views.py", "NSOBGPPeerTemplateStateAcceptView.post"): ("accept", 2),
     ("views.py", "NSORoutePolicyStateAcceptView.post"): ("accept", 2),
@@ -703,7 +704,8 @@ def acquire(row, model):
             ("ownership_planner.py", "_seed_static_route"),
             ("signals.py", "_route_policy_acquisition_plan"),
             ("views.py", "NSOStaticRouteStateAcceptView._arm_accept"),
-            # Peer hooks stage Accept under the enclosing routing view's grant.
+            # Router and peer hooks stage Accept under the enclosing routing view's grant.
+            ("views.py", "NSOBGPRouterStateAcceptView._arm_accept"),
             ("views.py", "NSOBGPPeerStateAcceptView._arm_accept"),
             ("views.py", "RoutingBulkAcceptMixin.post"),
             ("views.py", "NSOStaticRouteBulkAcceptView._prepare_accept"),

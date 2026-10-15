@@ -92,6 +92,14 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         drain.drain_intent_outbox()
         self.assertTrue(self.adapter.applied)
 
+    def test_router_accept_of_an_imported_router_yields_accepted(self):
+        state = self.router_state()
+        with without_commit_drain():
+            response = self.accept(state)
+        self.assertEqual(response.status_code, 302)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "accepted")
+
     def test_router_id_edit_validates_the_written_router_against_constraints(self):
         from core.models import ObjectType
         from users.models import ObjectPermission
