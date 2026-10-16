@@ -215,6 +215,27 @@ def test_cutover_generation_requires_promised_count_maps(section):
         validate_generation(raw)
 
 
+@pytest.mark.parametrize(
+    ("stream", "section", "counters"),
+    [
+        ("ip", "interface_config", ("attribute_count_by_outcome", "ip_count_by_outcome")),
+        ("isis_flex_algo", "isis", ("isis_count_by_outcome",)),
+    ],
+)
+def test_split_section_streams_count_under_their_document_section(stream, section, counters):
+    """The adapter reports generation sections through stream_section(), never as stream names."""
+    from netbox_nso_plugin.refusal_contract import ContractError, validate_generation
+
+    raw = generation()
+    counts = raw["carrier_job_result"]["bgp_count_by_outcome"]
+    raw.update(sections=[section], stream_revisions={stream: 7}, source_push_seq={stream: 41})
+    raw["carrier_job_result"] = {**{key: dict(counts) for key in counters}, "row_outcomes": [], "refusals": []}
+    assert validate_generation(raw) == raw
+    raw["sections"] = [stream]
+    with pytest.raises(ContractError, match="invalid counted section"):
+        validate_generation(raw)
+
+
 def test_cutover_generation_rejects_unknown_carrier_status():
     from netbox_nso_plugin.refusal_contract import ContractError, validate_generation
 
