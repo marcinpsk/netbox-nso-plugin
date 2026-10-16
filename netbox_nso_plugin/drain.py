@@ -127,6 +127,7 @@ PROVEN_NO_EFFECT = ("fence_shut", "store_only_deletion")
 #: statement of the request's own transaction, so it is proven no-effect by the same rule.
 BOUNDARY_REJECTION = "validation_error"
 _CAPTURE_OUTCOME_FIELDS = ("last_success_identity", "last_success_at", "last_error_code", "last_error_at", "attempts")
+_TAKEOVER_ABANDONED = object()
 
 
 class ClaimBusy(Exception):
@@ -436,7 +437,11 @@ def claim(device_id, scope, *, mode=delivery.MODE_NORMAL, force=False) -> Claim 
 
 def _claim_after_audit(device_id, scope, *, mode, force) -> Claim | None:
     """Capture one claim after its public or drain-level audit has completed."""
-    return _repeatable_read(lambda: _claim_locked(device_id, scope, mode, force))
+    claimed = _TAKEOVER_ABANDONED
+    while claimed is _TAKEOVER_ABANDONED:
+        # The abandon commits alone, so a refused re-form cannot roll it back.
+        claimed = _repeatable_read(lambda: _claim_locked(device_id, scope, mode, force))
+    return claimed
 
 
 def _claim_locked(device_id, scope, mode, force) -> Claim | None:
@@ -477,9 +482,7 @@ def _claim_locked(device_id, scope, mode, force) -> Claim | None:
 
     if state.push_seq is not None:
         replay = _takeover(state, mgmt, now)
-        if replay is not None:
-            return replay
-        return _form(state, mgmt, now, mode, force)
+        return _TAKEOVER_ABANDONED if replay is None else replay
     return _form(state, mgmt, now, mode, force)
 
 

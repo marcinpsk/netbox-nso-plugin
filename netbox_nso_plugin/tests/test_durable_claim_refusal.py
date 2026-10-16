@@ -13,13 +13,14 @@ from django.test import TransactionTestCase
 from ipam.models import ASN, RIR, IPAddress
 from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPRouter, BGPScope
 
-from netbox_nso_plugin import drain
+from netbox_nso_plugin import drain, read_gate
 from netbox_nso_plugin.apply_state import lock_device_intent_transaction
 from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentOutboxState
 
 from ._outbox_case import (
     ReceiptAdapter,
     entries,
+    expire_claim,
     make_managed,
     own_vlan,
     state_of,
@@ -250,3 +251,40 @@ class TestDurableClaimRefusal(_CascadeFlushMixin, IntentPushResetMixin, Transact
         self.assertNotIn("bgp", self.management.intent_push_errors)
         self.assertIn("unrequested ids", self.management.intent_push_errors["vlan"]["message"])
         self.assertEqual(state_of(self.device, "vlan").push_seq, claimed.push_seq)
+
+    def _adopt_source_epoch(self, source_epoch):
+        result = read_gate.gated_family_run(
+            self.management,
+            "bgp",
+            {
+                "outcome": "unavailable",
+                "reason": "not_ready",
+                "incarnation": "11111111-aaaa-4aaa-8aaa-111111111111",
+                "incarnation_born": "2026-07-01T00:00:10Z",
+                "source_epoch": source_epoch,
+            },
+            lambda: self.fail("an unavailable read must not run its body"),
+            epoch=self.management.adapter_device_id,
+        )
+        self.assertEqual(result.disposition, read_gate.SKIPPED_UNAVAILABLE)
+        self.management.refresh_from_db()
+
+    def test_capture_refusal_after_a_takeover_abandon_is_recorded(self):
+        with without_commit_drain():
+            acquire_bgp_router(self.management, self.router)
+        self._adopt_source_epoch(1)
+        claimed = drain.claim(self.device.pk, "bgp")
+        self.assertIsNotNone(claimed)
+        self._adopt_source_epoch(2)
+        with without_commit_drain():
+            BGPPeer.objects.get(scope__router=self.router).delete()
+        self.assertTrue(expire_claim(self.device, "bgp"))
+
+        self.assertEqual(drain.drain_key(self.device.pk, "bgp"), drain.REJECTED)
+
+        state = state_of(self.device, "bgp")
+        self.assertIsNone(state.push_seq)
+        self.assertIsNone(state.claimed_at)
+        self.assertNotEqual(state.last_error_code, "")
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.intent_push_errors["bgp"]["detail"]["reason"], "missing_bgp_peer")
