@@ -210,6 +210,30 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(caught.exception.code, "invalid_response")
         self.assertFalse(NSORedistributionState.objects.exists())
 
+    def test_malformed_bgp_destination_shape_rejects_the_read(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        for dest_ref in ("64512", "64512/CUST/A/ipv4-unicast"):
+            with self.subTest(dest_ref=dest_ref):
+                with self.assertRaises(AdapterError) as caught:
+                    entry = self._entry(dest_protocol="bgp", dest_ref=dest_ref)
+                    reconcile_redistribution(self.device, {"entries": [entry]})
+                self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertFalse(NSORedistributionState.objects.exists())
+
+    def test_bgp_destination_without_address_family_is_read_canonically(self):
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        entry = self._entry(dest_protocol="bgp", dest_ref="1.10/CUST-A")
+
+        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+
+        self.assertEqual(state.dest_ref, "65546/CUST-A")
+
     def test_missing_named_vrf_clears_a_previous_redistribution_link(self):
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import ASN, RIR, VRF

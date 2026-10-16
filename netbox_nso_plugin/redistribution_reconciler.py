@@ -69,11 +69,13 @@ def bgp_destination_parts(dest_ref):
 
 
 def _canonical_bgp_destination_ref(dest_ref):
-    """Return a BGP destination reference with its ASN in canonical asplain."""
+    """Return an adapter BGP destination ``<asn>/<vrf>[/<af>]`` with its ASN in canonical asplain."""
     from .bgp_router_content import canonical_asn
 
-    asn, separator, rest = dest_ref.partition("/")
-    return f"{canonical_asn(asn)}{separator}{rest}"
+    parts = dest_ref.split("/")
+    if len(parts) not in (2, 3):
+        raise ValueError("BGP redistribution has an invalid destination identity.")
+    return "/".join((canonical_asn(parts[0]), *parts[1:]))
 
 
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
@@ -210,7 +212,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
                 destination_ref = _canonical_bgp_destination_ref(destination_ref)
             except ValueError:
                 raise AdapterError(
-                    "Adapter returned a redistribution entry with an invalid BGP destination ASN",
+                    "Adapter returned a redistribution entry with an invalid BGP destination identity",
                     code="invalid_response",
                 ) from None
         key = (destination_protocol, destination_ref, source_protocol, source_ref)
