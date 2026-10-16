@@ -145,6 +145,15 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.management.refresh_from_db()
         self.assertEqual(self.management.intent_push_errors["bgp"]["detail"]["reason"], "blocked_bgp_router")
 
+    def test_unqualified_peer_blocker_keeps_the_operator_message_and_state_id(self):
+        with without_commit_drain():
+            self.router_state(owned=True)
+            state = self.peer_state()
+            BGPPeer.objects.filter(pk=state.bgp_peer_id).update(peer=IPAddress.objects.create(address="198.18.0.7/32"))
+        blocked = self.payload()["blocked"]
+        self.assertEqual(blocked["message"], "The bgp binding does not qualify for ownership.")
+        self.assertEqual(blocked["detail"], {"reason": "blocked_bgp_router", "asn": "65123", "state_id": state.pk})
+
     def test_blocked_router_has_actionable_message_in_real_view(self):
         self.peer_state()
         drain.drain_intent_outbox()

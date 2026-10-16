@@ -2815,8 +2815,11 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
                     entries, row.asn_str, row.vrf_name or "", (af.address_family.address_family for af in afs)
                 )
                 scope["peers"].append(bgp_peer_intent_item(row, afs))
-            except (ValueError, OwnershipNotQualified) as exc:
-                blocked = _bgp_router_blocker(row.asn_str, str(exc))
+            except OwnershipNotQualified as exc:
+                blocked = _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
+                break
+            except ValueError as exc:
+                blocked = _bgp_router_blocker(row.asn_str, str(exc), row.pk)
                 break
     if blocked is None:
         try:
