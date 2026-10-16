@@ -2039,8 +2039,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         # Bulk-accept shows only when something is still unowned — i.e. some row offers
         # an Accept, which is exactly the accept_url the grid itself renders.
-        sections = [payload] if None in spec["sections"] else [payload[n] for n in spec["sections"]]
-        has_unowned = any(row["accept_url"] for s in sections for row in s["rows"])
+        sections = {None: payload} if None in spec["sections"] else {n: payload[n] for n in spec["sections"]}
+        section_has_unowned = {name: any(row["accept_url"] for row in s["rows"]) for name, s in sections.items()}
 
         from .template_content import _STATUS_BADGE
 
@@ -2055,7 +2055,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "counts": payload.get("counts"),
                 "adapter_error": adapter_error,
                 "push_error": payload.get("push_error"),
-                "category_has_unowned": has_unowned,
+                "category_has_unowned": any(section_has_unowned.values()),
+                "section_has_unowned": section_has_unowned,
             },
         )
 

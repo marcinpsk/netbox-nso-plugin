@@ -164,6 +164,29 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertContains(response, "NetBox did not send the BGP snapshot")
         self.assertContains(response, "nso-bgp-routers")
 
+    def test_peer_bulk_accept_is_offered_only_for_unowned_peers(self):
+        self.router_state()
+        self.peer_state()
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category", args=(self.device.pk, "bgp"))
+        bulk_url = reverse("plugins:netbox_nso_plugin:routing_bulk_accept_bgp_peers", args=(self.device.pk,))
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(response.context["grid_payload"]["routers"]["rows"][0]["accept_url"])
+        self.assertNotContains(response, bulk_url)
+        NSOBGPPeerState.objects.create(
+            management=self.management,
+            asn_str="65123",
+            vrf_name="",
+            peer_address_str="198.18.0.3",
+            bgp_peer=BGPPeer.objects.create(
+                scope=self.scope, peer=IPAddress.objects.create(address="198.18.0.3/32"), name=None
+            ),
+            status="imported",
+        )
+        response = self.client.get(url)
+        self.assertContains(response, bulk_url)
+        self.assertContains(response, "Accept All Peers")
+
     def test_missing_native_peer_is_reported_as_unsent_in_real_view(self):
         router = self.router_state(owned=True)
         state = self.peer_state()
