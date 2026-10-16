@@ -328,13 +328,90 @@ def _settlement_decisions(rows_by_scope, validated, unknown_ids, *, static_route
     return decisions
 
 
+_APPLY_GENERATION_FIELDS = frozenset(
+    {"generation_id", "seq", "job_id", "mode", "source_push_seq", "stream_revisions", "digest"}
+)
+_APPLY_SKIP_REASONS = frozenset(
+    {"superseded", "already_applied", "already_authorized", "no_receipt", "backfill_only", "revision_mismatch"}
+)
+
+
+def apply_stream_partition(result, selected):
+    """Validate the selector echo and return its selected and skipped stream sets."""
+    expected_selected = dict(selected)
+    returned_selected = result.get("selected")
+    skipped = result.get("skipped")
+    if not isinstance(returned_selected, dict) or returned_selected != expected_selected:
+        return None, None, "Adapter returned an invalid Apply selector."
+    if (
+        not isinstance(skipped, dict)
+        or not set(skipped).issubset(expected_selected)
+        or any(type(reason) is not str or reason not in _APPLY_SKIP_REASONS for reason in skipped.values())
+    ):
+        return None, None, "Adapter returned invalid Apply skip results."
+    return expected_selected, skipped, None
+
+
+def promoted_stream_coverage(generations, expected_selected, skipped):
+    """Return the promoted stream union when every generation proves its selector."""
+    from .delivery import direct_streams
+
+    switching_streams = direct_streams()
+    promoted_streams = set()
+    generation_ids = set()
+    previous_seq = None
+    for link in generations:
+        if not isinstance(link, dict) or not _APPLY_GENERATION_FIELDS.issubset(link):
+            return None, "Adapter returned an invalid Apply generation."
+        generation_id = link.get("generation_id")
+        seq = link.get("seq")
+        job_id = link.get("job_id")
+        mode = link.get("mode")
+        sources = link.get("source_push_seq")
+        revisions = link.get("stream_revisions")
+        digest = link.get("digest")
+        valid_shape = (
+            type(generation_id) is int
+            and generation_id > 0
+            and generation_id not in generation_ids
+            and type(seq) is int
+            and seq > 0
+            and (previous_seq is None or seq > previous_seq)
+            and (job_id is None or (type(job_id) is int and job_id > 0))
+            and isinstance(mode, str)
+            and mode in {"networked", "detach"}
+            and isinstance(sources, dict)
+            and isinstance(revisions, dict)
+            and bool(revisions)
+            and isinstance(digest, str)
+        )
+        if not valid_shape:
+            return None, "Adapter returned an invalid Apply generation."
+        streams = set(revisions)
+        if streams != set(sources) or not streams.issubset(expected_selected):
+            return None, "Adapter returned an invalid Apply generation."
+        if any(type(revision) is not int for revision in revisions.values()) or any(
+            (
+                revisions[stream] != expected_selected[stream] or sources[stream] is not None
+                if stream in switching_streams
+                else type(sources[stream]) is not int or sources[stream] != expected_selected[stream]
+            )
+            for stream in streams
+        ):
+            return None, "Adapter returned an invalid Apply generation provenance."
+        promoted_streams.update(revisions)
+        generation_ids.add(generation_id)
+        previous_seq = seq
+    if promoted_streams != set(expected_selected) - set(skipped):
+        return None, "Adapter returned incomplete Apply generation coverage."
+    return promoted_streams, None
+
+
 def _admission_keep_streams(attempt, response, *, rejected=False):
     """Validate admission before choosing which snapshots can be restored."""
-    from .views import _apply_stream_partition, _promoted_stream_coverage
-
     if rejected:
         return ()
-    selected, skipped, error = _apply_stream_partition(response, attempt.selected)
+    selected, skipped, error = apply_stream_partition(response, attempt.selected)
     if error:
         raise EvidenceInvariantError(error)
     if response.get("outcome") == "no_op":
@@ -344,7 +421,7 @@ def _admission_keep_streams(attempt, response, *, rejected=False):
     generations = response.get("generations")
     if response.get("outcome") != "promoted" or not isinstance(generations, list) or not generations:
         raise EvidenceInvariantError("Apply admission has no valid generation chain")
-    promoted_streams, error = _promoted_stream_coverage(generations, selected, skipped)
+    promoted_streams, error = promoted_stream_coverage(generations, selected, skipped)
     if error:
         raise EvidenceInvariantError(error)
     return tuple(sorted(promoted_streams)) if skipped else None

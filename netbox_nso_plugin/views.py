@@ -25,6 +25,7 @@ from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
 from .adapter_client import AdapterError, public_error_message
+from .apply_settlement import apply_stream_partition, promoted_stream_coverage
 from .deployment import DeploymentQuiesced
 from .filters import (
     NSODerivedIntentTemplateFilterSet,
@@ -3279,28 +3280,6 @@ def _stream_reason_message(prefix, reasons) -> str:
     return f"{prefix}: {detail}."
 
 
-def _apply_stream_partition(result, selected):
-    """Validate the selector echo and return its selected and skipped stream sets."""
-    expected_selected = dict(selected)
-    returned_selected = result.get("selected")
-    skipped = result.get("skipped")
-    if not isinstance(returned_selected, dict) or returned_selected != expected_selected:
-        return None, None, "Adapter returned an invalid Apply selector."
-    if (
-        not isinstance(skipped, dict)
-        or not set(skipped).issubset(expected_selected)
-        or any(type(reason) is not str or reason not in _APPLY_SKIP_REASONS for reason in skipped.values())
-    ):
-        return None, None, "Adapter returned invalid Apply skip results."
-    return expected_selected, skipped, None
-
-
-_APPLY_GENERATION_FIELDS = frozenset(
-    {"generation_id", "seq", "job_id", "mode", "source_push_seq", "stream_revisions", "digest"}
-)
-_APPLY_SKIP_REASONS = frozenset(
-    {"superseded", "already_applied", "already_authorized", "no_receipt", "backfill_only", "revision_mismatch"}
-)
 _APPLY_UNEXECUTABLE_REASONS = frozenset(
     {
         "interface_attribute_eligibility_unresolved",
@@ -3331,61 +3310,6 @@ def _validated_unexecutable_reasons(detail) -> dict:
     ):
         return {}
     return streams
-
-
-def _promoted_stream_coverage(generations, expected_selected, skipped):
-    """Return the promoted stream union when every generation proves its selector."""
-    from .delivery import direct_streams
-
-    switching_streams = direct_streams()
-    promoted_streams = set()
-    generation_ids = set()
-    previous_seq = None
-    for link in generations:
-        if not isinstance(link, dict) or not _APPLY_GENERATION_FIELDS.issubset(link):
-            return None, "Adapter returned an invalid Apply generation."
-        generation_id = link.get("generation_id")
-        seq = link.get("seq")
-        job_id = link.get("job_id")
-        mode = link.get("mode")
-        sources = link.get("source_push_seq")
-        revisions = link.get("stream_revisions")
-        digest = link.get("digest")
-        valid_shape = (
-            type(generation_id) is int
-            and generation_id > 0
-            and generation_id not in generation_ids
-            and type(seq) is int
-            and seq > 0
-            and (previous_seq is None or seq > previous_seq)
-            and (job_id is None or (type(job_id) is int and job_id > 0))
-            and isinstance(mode, str)
-            and mode in {"networked", "detach"}
-            and isinstance(sources, dict)
-            and isinstance(revisions, dict)
-            and bool(revisions)
-            and isinstance(digest, str)
-        )
-        if not valid_shape:
-            return None, "Adapter returned an invalid Apply generation."
-        streams = set(revisions)
-        if streams != set(sources) or not streams.issubset(expected_selected):
-            return None, "Adapter returned an invalid Apply generation."
-        if any(type(revision) is not int for revision in revisions.values()) or any(
-            (
-                revisions[stream] != expected_selected[stream] or sources[stream] is not None
-                if stream in switching_streams
-                else type(sources[stream]) is not int or sources[stream] != expected_selected[stream]
-            )
-            for stream in streams
-        ):
-            return None, "Adapter returned an invalid Apply generation provenance."
-        promoted_streams.update(revisions)
-        generation_ids.add(generation_id)
-        previous_seq = seq
-    if promoted_streams != set(expected_selected) - set(skipped):
-        return None, "Adapter returned incomplete Apply generation coverage."
-    return promoted_streams, None
 
 
 class NSODeviceActionView(NSOActionPermissionMixin, View):
@@ -3445,7 +3369,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
                 request, mgmt, "Adapter returned an invalid Apply outcome.", is_ajax=is_ajax
             )
         _record_apply_response(prepared, http_status=200 if outcome == "no_op" else 202, response=result)
-        expected_selected, skipped, partition_error = _apply_stream_partition(result, selected)
+        expected_selected, skipped, partition_error = apply_stream_partition(result, selected)
         if partition_error:
             if outcome == "no_op" and result.get("generations") == []:
                 _rollback_prepare_apply(prepared)
@@ -3475,7 +3399,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
             return self._apply_unreadable_response(
                 request, mgmt, "Adapter promoted Apply without a generation chain.", is_ajax=is_ajax
             )
-        promoted_streams, coverage_error = _promoted_stream_coverage(generations, expected_selected, skipped)
+        promoted_streams, coverage_error = promoted_stream_coverage(generations, expected_selected, skipped)
         if coverage_error:
             return self._apply_unreadable_response(request, mgmt, coverage_error, is_ajax=is_ajax)
         job_id = generations[0]["job_id"]

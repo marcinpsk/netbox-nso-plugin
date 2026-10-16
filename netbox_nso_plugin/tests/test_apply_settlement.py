@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from uuid import uuid4
@@ -106,6 +109,44 @@ def test_evidence_fixture_generations_match_the_adapter_evidence_field_set():
         assert set(_attempt(uuid4(), 1626, 73, selected, status, result={})["generations"][0]) == _GENERATION_FIELDS
     for settled_scopes in ((), ("lag", "switchport")):
         assert set(_evidence_generation(73, selected, settled_scopes)) == _GENERATION_FIELDS
+
+
+_ADMISSION_WITHOUT_VIEWS = """
+import sys
+import django
+django.setup()
+from netbox_nso_plugin import delivery
+from netbox_nso_plugin.apply_settlement import _admission_keep_streams
+
+class Attempt:
+    selected = {"vlan": 4, "lag": 5}
+
+source = {s: None if s in delivery.direct_streams() else r for s, r in Attempt.selected.items()}
+link = {"generation_id": 1, "seq": 1, "job_id": None, "mode": "networked",
+        "source_push_seq": source, "stream_revisions": dict(Attempt.selected), "digest": "d"}
+promoted = {"selected": dict(Attempt.selected), "skipped": {}, "outcome": "promoted", "generations": [link]}
+no_op = {"selected": dict(Attempt.selected), "skipped": {"vlan": "superseded", "lag": "superseded"},
+         "outcome": "no_op", "generations": []}
+assert _admission_keep_streams(Attempt(), promoted) is None
+assert _admission_keep_streams(Attempt(), no_op) == ()
+print("views-loaded" if "netbox_nso_plugin.views" in sys.modules else "views-absent")
+"""
+
+
+def test_admission_validation_runs_without_the_view_module():
+    # A fresh process: the test session has already imported views through the URLconf.
+    env = dict(os.environ, DJANGO_SETTINGS_MODULE="netbox.settings", PYTHONPATH=os.pathsep.join(filter(None, sys.path)))
+    child = subprocess.run(  # noqa: S603 — a fixed argv, no shell
+        [sys.executable, "-c", _ADMISSION_WITHOUT_VIEWS],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip().splitlines()[-1] == "views-absent"
 
 
 class TestAttemptSettlement(TestCase):
