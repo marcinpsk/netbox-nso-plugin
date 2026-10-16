@@ -363,6 +363,27 @@ def test_unowned_router_netbox_edit_reads_as_changed_and_device_move_mirrors(rou
     assert str(state.bgp_router.router_id) == "192.0.2.253"
 
 
+@pytest.mark.parametrize("removed", ["af", "scope"])
+def test_unowned_router_netbox_scope_or_af_removal_reads_as_changed(router_case, removed):
+    VRF.objects.create(name="placeholder-blue")
+    scopes = [scope_entry(afs=("ipv4-unicast", "ipv6-unicast")), scope_entry("placeholder-blue")]
+    state, _ = import_router(router_case, scopes=scopes)
+    assert state.status == "imported"
+    natives = {
+        "af": BGPAddressFamily.objects.filter(
+            scope__router=state.bgp_router, scope__vrf__isnull=True, address_family="ipv6-unicast"
+        ),
+        "scope": BGPScope.objects.filter(router=state.bgp_router, vrf__name="placeholder-blue"),
+    }[removed]
+    with without_commit_drain():
+        if removed == "scope":
+            BGPAddressFamily.objects.filter(scope__in=natives).delete()
+        natives.delete()
+    state, _ = import_router(router_case, scopes=scopes)
+    assert state.status == "changed"
+    assert not natives.exists()
+
+
 def test_router_content_canonicalizes_scope_afs_and_clearing(router_case):
     from netbox_nso_plugin.bgp_router_content import observed_router_content, router_content
 

@@ -1332,8 +1332,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             native_scopes, native_families = _router_membership(object_content)
             observed_scopes, observed_families = _router_membership(observed)
             membership_held = native_scopes <= observed_scopes and native_families <= observed_families
-            # Device-only scopes and AFs never join owned membership, so they are not drift.
-            matches = membership_held and object_content["router_id"] == observed["router_id"]
+            if owned:
+                # Device-only scopes and AFs never join owned membership, so they are not drift.
+                matches = membership_held and object_content["router_id"] == observed["router_id"]
+            else:
+                matches = object_hash == device_hash
             if not membership_held:
                 mirror = False
                 conflict = True
