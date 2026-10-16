@@ -168,6 +168,48 @@ class TestReconcileRedistribution(TestCase):
         self.assertIsNone(state.redistribution_id)
         self.assertFalse(Redistribution.objects.exists())
 
+    def _global_bgp_destination(self, asn_value):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR
+        from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope
+
+        rir = RIR.objects.create(name="Notation private ASNs", slug="notation-private-asns")
+        router = BGPRouter.objects.create(
+            name=str(asn_value),
+            assigned_object_type=ContentType.objects.get_for_model(type(self.device)),
+            assigned_object_id=self.device.pk,
+            asn=ASN.objects.create(asn=asn_value, rir=rir),
+        )
+        return BGPAddressFamily.objects.create(
+            scope=BGPScope.objects.create(router=router), address_family="ipv4-unicast"
+        )
+
+    def test_asdot_bgp_destination_is_stored_canonically_and_links_its_native(self):
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        family = self._global_bgp_destination(65546)
+        entry = self._entry(dest_protocol="bgp", dest_ref="1.10//ipv4-unicast")
+
+        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+
+        self.assertEqual(state.dest_ref, "65546//ipv4-unicast")
+        self.assertEqual(state.redistribution.destination, family)
+
+    def test_malformed_bgp_destination_asn_rejects_the_read(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        entry = self._entry(dest_protocol="bgp", dest_ref="65536.1//ipv4-unicast")
+
+        with self.assertRaises(AdapterError) as caught:
+            reconcile_redistribution(self.device, {"entries": [entry]})
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertFalse(NSORedistributionState.objects.exists())
+
     def test_missing_named_vrf_clears_a_previous_redistribution_link(self):
         from django.contrib.contenttypes.models import ContentType
         from ipam.models import ASN, RIR, VRF
