@@ -87,6 +87,7 @@ References checked on 2026-09-12:
 | Frozen identity, timestamp, or pre-image lost during replay | `test_gated_reconcile.py`, `test_renderer_writer.py`, and reconcile tests | Real state changes prove refusal and replay behaviour. |
 | Lock order, lifecycle transitions, ownership, permissions, malformed responses, and retry boundaries | Existing integration suites | Requires behavioural assertions. A syntax rule cannot establish these contracts. |
 | Unclassified ownership acquisition | `nso-ownership-grant-literal`, `nso-ownership-grant-passive`, `nso-ownership-grant-planner` | Constructors use literal grant kinds. Passive modules cannot construct grants. The ownership planner can construct only `manifest_reown`. Import aliases are resolved; dynamic constructor lookup is not followed. |
+| Caught exception text shown to the operator | `nso-caught-exception-text-to-operator` | Reports `str()` of an `except ... as` binding passed to `OwnershipNotQualified`, `_bgp_router_blocker`, or `<receiver>.add_error`, bare or module-qualified. A call on `self`, such as `self.add_error` in a form, is allowed because a form reports errors in its own input. An alias of the exception, an f-string, `repr`, or a helper that formats the text is not followed. CodeQL checks exception text in HTTP responses. |
 
 No finite ruleset catches every review finding. These rules reject concrete,
 repeated source patterns. Keep integration tests for stateful contracts and add
