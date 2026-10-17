@@ -441,15 +441,17 @@ class TestRealReconcilerGateFootprints(TestCase):
         state = NSOBFDInterfaceState.objects.get(management=self.mgmt, interface=interface)
         self.assertEqual(state.status, "imported")
 
-    def test_bgp_gate_predicts_an_owned_native_peer_change(self):
+    def test_bgp_gate_keeps_owned_native_peer_on_device_drift(self):
         from netbox_nso_plugin.models import NSOBGPPeerState, NSOIntentRevision
         from netbox_nso_plugin.reconcile import reconcile_category
 
         from ._outbox_case import content_update
+        from ._ownership_case import acquire_bgp_router
 
         with patch("netbox_nso_plugin.adapter_client.get_bgp_config", return_value=self._bgp_payload()):
             reconcile_category(self.device, self.mgmt, "bgp")
         state = NSOBGPPeerState.objects.get(management=self.mgmt)
+        acquire_bgp_router(self.mgmt, state.bgp_peer.scope.router)
         content_update(state, status="accepted")
         revision = NSOIntentRevision.objects.get(device=self.device, scope="bgp")
         before = revision.revision
@@ -462,11 +464,15 @@ class TestRealReconcilerGateFootprints(TestCase):
 
         state.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(state.bgp_peer.ttl, 2)
-        self.assertEqual(revision.revision, before + 1)
+        self.assertIsNone(state.bgp_peer.ttl)
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(revision.revision, before)
 
     @staticmethod
     def _bgp_payload(*, ttl=None, attempt_id=1):
+        from ._routing_observation_case import routing_observation
+        from ._scope_observation_case import entry
+
         peer = {
             "peer_address": "198.18.0.1",
             "remote_as": "64513",
@@ -475,6 +481,29 @@ class TestRealReconcilerGateFootprints(TestCase):
         }
         if ttl is not None:
             peer["ttl"] = ttl
+        document = {
+            "routers": [
+                entry(
+                    asn="64512",
+                    router_id=None,
+                    scope=[
+                        entry(
+                            vrf="",
+                            address_family=[entry(afi="ipv4-unicast")],
+                            peer_group=[],
+                            peer=[
+                                entry(
+                                    **{name: value for name, value in peer.items() if name != "address_families"},
+                                    peer_address_family=[entry(afi="ipv4-unicast", enabled=True)],
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+            "present": ["routers"],
+            "unprojectable": [],
+        }
         return {
             "routers": [
                 {
@@ -490,7 +519,8 @@ class TestRealReconcilerGateFootprints(TestCase):
                     ],
                 }
             ],
-            "read_state": _rs(attempt_id=attempt_id),
+            "read_state": _rs(attempt_id=attempt_id) | {"source_epoch": 1, "payload_revision": attempt_id},
+            "observation": routing_observation("bgp", document=document, revision=attempt_id),
         }
 
 

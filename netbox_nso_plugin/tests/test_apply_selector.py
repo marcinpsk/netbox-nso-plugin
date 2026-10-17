@@ -16,17 +16,17 @@ from requests.exceptions import ConnectionError
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_response
+from ._manual_capture_case import store_apply_selection
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
-    direct_test_selection,
     make_managed,
     mirror_update,
     own_vlan,
     wait_until_postgres_blocks,
     without_commit_drain,
 )
-from ._ownership_case import acquire_overlay, save_overlay_fixture
+from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 _ADAPTER_STREAMS = {
@@ -241,6 +241,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.client.force_login(self.user)
         self.device, self.mgmt = make_managed("apply-selector", 1558)
         self.vlan_state = own_vlan(self.mgmt, 1558, "apply-selector")
+        self.preparation_revisions = {}
 
     def _create_interface(self, **values):
         with without_commit_drain(), transaction.atomic():
@@ -277,6 +278,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 current = type(interface).objects.get(pk=interface.pk)
 
     def _post(self, adapter):
+        adapter.preparation_revisions = self.preparation_revisions
         config, session = adapter.patches()
         url = reverse(
             "plugins:netbox_nso_plugin:nsodevicemanagement_action",
@@ -286,22 +288,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             return self.client.post(url, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
     def _promotion_snapshot(self):
-        from types import SimpleNamespace
-
-        from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision
-
-        registry = delivery.delivery_keys()
-        pushed = {}
-        for push_seq, entry in enumerate(
-            (candidate for candidate in registry.values() if candidate.in_protocol),
-            start=1,
-        ):
-            revision, _created = NSOIntentRevision.objects.get_or_create(
-                device=self.device,
-                scope=entry.key,
-            )
-            pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
+        registry, pushed, self.direct_selection = store_apply_selection(self.mgmt)
         return registry, pushed
 
     def test_promoted_apply_selects_the_store_only_receipt_and_returns_the_whole_chain(self):
@@ -321,7 +308,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(adapter.apply_requests[0]["selected"]["vlan"], receipt["push_seq"])
         for stream, path in (("lag", "/lag-config/apply"), ("switchport", "/switchport/apply")):
             request = next(request for request in adapter.requests if request["url"].endswith(path))
-            self.assertEqual(adapter.apply_requests[0]["selected"][stream], max(1, request["body"]["source_revision"]))
+            self.assertEqual(
+                adapter.apply_requests[0]["selected"][stream], adapter.preparation_revisions[request["url"]]
+            )
             self.assertEqual(request["body"]["deleted_roots"], [])
         self.assertEqual(receipt["params"], {"store_only": "true"})
         pushed = next(request for request in adapter.requests if request["url"] == vlan_url)
@@ -697,6 +686,34 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "accepted")
 
+    def test_a_source_epoch_change_after_its_receipt_refuses_the_apply_as_changed_intent(self):
+        """An adopted source epoch moves the store-only selection to an earlier mapping epoch."""
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import delivery
+
+        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        real_send = delivery.send
+        adopted = []
+
+        def send_then_adopt(rendered, *args, **kwargs):
+            answer = real_send(rendered, *args, **kwargs)
+            if rendered.key[1] == "vlan" and not adopted:
+                adopted.append(True)
+                with without_commit_drain(), transaction.atomic():
+                    mirror_update(self.mgmt, adapter_source_epoch=(self.mgmt.adapter_source_epoch or 0) + 1)
+            return answer
+
+        with patch("netbox_nso_plugin.delivery.send", side_effect=send_then_adopt):
+            response = self._post(adapter)
+
+        self.assertEqual(adopted, [True])
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertIn("changed during preparation", response.json()["message"])
+        self.assertEqual(adapter.apply_requests, [])
+        self.vlan_state.refresh_from_db()
+        self.assertEqual(self.vlan_state.status, "accepted")
+
     def test_a_foreign_rename_after_preparation_repends_on_the_next_audit(self):
         """A foreign rename stays neutral until the next audit repairs its scope."""
         from netbox_nso_plugin.renderer_audit import audit_renderer_scopes
@@ -853,7 +870,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             registry,
             pushed,
             apply_attempt_id=next_attempt_id,
-            **direct_test_selection(self.mgmt, registry),
+            **self.direct_selection,
             static_route_stored=False,
         )
 
@@ -2197,6 +2214,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 name="65040",
             )
             scope = BGPScope.objects.create(router=router)
+            acquire_bgp_router(self.mgmt, router, status="in_sync")
             peer_address = IPAddress.objects.create(address="198.18.40.2/32")
             peer = BGPPeer.objects.create(
                 scope=scope,
@@ -2649,16 +2667,18 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         registry, pushed = self._promotion_snapshot()
         with patch("netbox_nso_plugin.delivery.render", side_effect=AssertionError("promotion rendered")):
-            _attempt, moved = apply_state.promote_current_intent(
+            attempt = apply_state.promote_current_intent(
                 self.mgmt,
                 registry,
                 pushed,
                 apply_attempt_id=uuid4(),
-                **direct_test_selection(self.mgmt, registry),
+                **self.direct_selection,
                 static_route_stored=False,
             )
 
-        self.assertEqual(moved[0][2], [self.vlan_state.pk])
+        snapshot = attempt.overlay_snapshots.get(model_label=self.vlan_state._meta.label_lower)
+        self.assertEqual(snapshot.overlay_pk, self.vlan_state.pk)
+        self.assertEqual(snapshot.prior_status, "accepted")
 
     def test_promotion_waits_for_an_unchanged_reconcile_transaction(self):
         import threading
@@ -2708,12 +2728,12 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         worker.start()
         try:
             self.assertTrue(row_locked.wait(10), "the reconcile did not lock the intent row")
-            _attempt, moved = apply_state.promote_current_intent(
+            attempt = apply_state.promote_current_intent(
                 self.mgmt,
                 registry,
                 pushed,
                 apply_attempt_id=uuid4(),
-                **direct_test_selection(self.mgmt, registry),
+                **self.direct_selection,
                 static_route_stored=False,
             )
         finally:
@@ -2724,7 +2744,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertFalse(worker.is_alive())
         if errors:
             raise errors[0]
-        self.assertEqual(moved, [(registry["vlan"].section, NSOVLANState, [self.vlan_state.pk], "accepted")])
+        snapshot = attempt.overlay_snapshots.get(model_label=NSOVLANState._meta.label_lower)
+        self.assertEqual(snapshot.overlay_pk, self.vlan_state.pk)
+        self.assertEqual(snapshot.prior_status, "accepted")
         self.vlan_state.refresh_from_db()
         self.assertEqual(self.vlan_state.status, "deploying")
 
@@ -2751,7 +2773,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=attempt_id,
-                **direct_test_selection(self.mgmt, registry),
+                **self.direct_selection,
                 static_route_stored=False,
             )
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
@@ -2787,7 +2809,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 registry,
                 pushed,
                 apply_attempt_id=attempt_id,
-                **direct_test_selection(self.mgmt, registry),
+                **self.direct_selection,
                 static_route_stored=False,
             )
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt_id).exists())
@@ -2807,7 +2829,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             registry,
             pushed,
             apply_attempt_id=uuid4(),
-            **direct_test_selection(self.mgmt, registry),
+            **self.direct_selection,
             static_route_stored=False,
         )
 

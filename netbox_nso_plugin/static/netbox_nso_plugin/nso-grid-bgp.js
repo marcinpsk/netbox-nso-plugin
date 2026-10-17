@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* SPDX-FileCopyrightText: 2026 Marcin Zieba <marcinpsk@gmail.com> */
 
-/* Compact BGP peer/template grids. Only non-identity peer state is editable inline. */
+/* BGP router, peer, and template grids use explicit ownership actions. */
 (function () {
   "use strict";
 
@@ -98,12 +98,12 @@
     wrap.className = "d-flex align-items-center gap-1 flex-wrap";
     var remote = document.createElement("span");
     remote.className = "small text-nowrap";
-    remote.textContent = row.remote_as ? "remote AS " + row.remote_as : "remote AS inherited";
+    remote.textContent = row.remote_as != null ? "remote AS " + row.remote_as : "remote AS unavailable";
     wrap.appendChild(remote);
     wrap.appendChild(
       badge(
-        row.enabled === false ? "disabled" : "enabled",
-        row.enabled === false ? "text-bg-warning text-dark" : "text-bg-success",
+        row.enabled == null ? "state unavailable" : row.enabled === false ? "disabled" : "enabled",
+        row.enabled == null ? "text-bg-light border" : row.enabled === false ? "text-bg-warning text-dark" : "text-bg-success",
       ),
     );
     appendSessionDetails(wrap, row);
@@ -117,8 +117,8 @@
       edit.setAttribute("aria-label", "Edit BGP peer " + row.peer_address);
       edit.dataset.peUrl = row.edit_url;
       edit.dataset.peTitle = row.peer_address + " BGP session";
-      edit.dataset.peFields = "remote_as_str:text:Remote AS,enabled:select:State";
-      edit.setAttribute("data-pe-v-remote_as_str", row.remote_as || "");
+      edit.dataset.peFields = "remote_as:text:Remote AS,enabled:select:State";
+      edit.setAttribute("data-pe-v-remote_as", row.remote_as != null ? row.remote_as : "");
       edit.setAttribute("data-pe-v-enabled", row.enabled === false ? "False" : "True");
       edit.setAttribute(
         "data-pe-o-enabled",
@@ -146,7 +146,7 @@
     wrap.className = "d-flex align-items-center gap-1 flex-wrap";
     var remote = document.createElement("span");
     remote.className = "small";
-    remote.textContent = row.remote_as ? "remote AS " + row.remote_as : "remote AS inherited";
+    remote.textContent = row.remote_as != null && row.remote_as !== "" ? "remote AS " + row.remote_as : "remote AS inherited";
     wrap.appendChild(remote);
     appendAddressFamilies(wrap, row.address_families);
     return wrap;
@@ -200,9 +200,52 @@
     ];
   }
 
+  function fmtRouter(cell) {
+    var row = cell.getRow().getData();
+    var link = row.router && row.router.url ? document.createElement("a") : document.createElement("span");
+    if (row.router && row.router.url) link.href = row.router.url;
+    link.textContent = "AS" + row.asn;
+    return link;
+  }
+
+  function fmtRouterConfig(cell) {
+    var row = cell.getRow().getData();
+    var wrap = document.createElement("div");
+    wrap.className = "d-flex align-items-center gap-1 flex-wrap";
+    wrap.appendChild(badge(row.router_id || "No router ID", "text-bg-light border"));
+    (row.scopes || []).forEach(function (scope) {
+      var afs = (scope.address_families || []).map(function (af) { return af.af; });
+      wrap.appendChild(badge((scope.vrf || "global") + ": " + afs.join(", "), "text-bg-secondary"));
+    });
+    if (row.edit_url) {
+      var edit = document.createElement("a");
+      edit.href = "#";
+      edit.className = "nso-popedit text-secondary";
+      edit.title = "Edit router ID (editing takes ownership)";
+      edit.setAttribute("aria-label", "Edit AS" + row.asn + " router ID");
+      edit.dataset.peUrl = row.edit_url;
+      edit.dataset.peTitle = "AS" + row.asn + " router";
+      edit.dataset.peFields = "router_id:text:Router ID";
+      edit.setAttribute("data-pe-v-router_id", row.router_id || "");
+      edit.innerHTML = '<span class="mdi mdi-pencil"></span>';
+      wrap.appendChild(edit);
+    }
+    return wrap;
+  }
+
+  function routerColumns() {
+    return [
+      { title: "Router", field: "_router", formatter: fmtRouter, minWidth: 100, headerFilter: "input" },
+      { title: "Router ID and scope / AF membership", field: "_router_config", formatter: fmtRouterConfig, minWidth: 265, widthGrow: 3 },
+      G.stateColumn({ minWidth: 85 }),
+      G.lastSyncColumn({ minWidth: 95 }),
+      G.acceptColumn({ minWidth: 45 }),
+    ];
+  }
+
   function mount(root, section) {
     var payloadEl = document.getElementById("nso-bgp-data");
-    if (!root || !payloadEl || !G || ["peers", "templates"].includes(section) === false) return;
+    if (!root || !payloadEl || !G || ["routers", "peers", "templates"].includes(section) === false) return;
     return G.mount(root, {
       key: "bgp_" + section,
       payload: JSON.parse(payloadEl.textContent),
@@ -211,18 +254,20 @@
       },
       jsonUrl: root.dataset.jsonUrl,
       maxHeight: false,
-      placeholder: section === "peers" ? "No BGP peers." : "No peer-group templates.",
+      placeholder: section === "routers" ? "No BGP routers." : section === "peers" ? "No BGP peers." : "No peer-group templates.",
       flatten: function (rows) {
         return rows.map(function (row) {
           row._local = [row.asn || "", row.vrf || "global"].join(" ");
           row._peer = row.peer_address || "";
-          row._session = [row.remote_as || "", row.peer_group || "", row.source || ""].join(" ");
+          row._session = [row.remote_as != null ? row.remote_as : "", row.peer_group || "", row.source || ""].join(" ");
           row._template = row.template_name || "";
-          row._config = [row.remote_as || "", ...(row.address_families || []).map(function (af) { return af.af; })].join(" ");
+          row._config = [row.remote_as != null ? row.remote_as : "", ...(row.address_families || []).map(function (af) { return af.af; })].join(" ");
+          row._router = row.asn || "";
+          row._router_config = [row.router_id || "", ...(row.scopes || []).map(function (scope) { return scope.vrf; })].join(" ");
           return row;
         });
       },
-      columns: section === "peers" ? peerColumns() : templateColumns(),
+      columns: section === "routers" ? routerColumns() : section === "peers" ? peerColumns() : templateColumns(),
     });
   }
 

@@ -180,7 +180,7 @@ class TestBgpDifferences(_RoutingDifferences, TestCase):
         self.assertFalse([row for row in self.rows() if row.kind != "unavailable"])
 
     def test_omitted_peer_and_group_af_fields_match_after_reconciliation(self):
-        from netbox_routing.models import BGPPeerAddressFamily
+        from netbox_routing.models import BGPAddressFamily, BGPPeerAddressFamily
 
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
 
@@ -192,6 +192,7 @@ class TestBgpDifferences(_RoutingDifferences, TestCase):
         scope["peer_group"] = [
             entry(name="EXAMPLE", remote_as="64513", peer_group_address_family=[entry(afi="ipv4-unicast")])
         ]
+        BGPAddressFamily.objects.create(scope=self.native_scope, address_family="ipv4-unicast")
         self.native.delete()
         _reconcile_bgp_config(
             self.device,

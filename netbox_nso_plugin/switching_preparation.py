@@ -71,11 +71,13 @@ class Captured:
     deletion_versions: dict[str, int]
     deleted_roots: tuple[str, ...]
     source_revision: int
+    selection_id: int
 
 
 def _capture(device_id: int, scope: str, force: bool):
     """Read one content revision and snapshot under the direct drain's lock order."""
     from . import drain
+    from .durable_capture import capture_direct
     from .models import NSODeviceManagement, NSOIntentRevision, NSOSwitchingRootDeletion
 
     state = drain._lock_state(device_id, scope)
@@ -106,13 +108,16 @@ def _capture(device_id: int, scope: str, force: bool):
         if row.root_name in rendered_names:
             NSOSwitchingRootDeletion.objects.filter(pk=row.pk, event_version=row.event_version).delete()
     versions = {row.root_name: row.event_version for row in deletions if row.root_name not in rendered_names}
+    deleted_roots = tuple(sorted(set(versions) - rendered_names))
+    selection_id = capture_direct(management, rendered, int(revision.revision), deleted_roots)
     return "sending", Captured(
         rendered,
         management.adapter_device_id,
         tuple(row.pk for row in rows),
         versions,
-        tuple(sorted(set(versions) - rendered_names)),
+        deleted_roots,
         int(revision.revision),
+        selection_id,
     )
 
 
@@ -179,12 +184,15 @@ def _validate(answer, captured: Captured) -> tuple[str, ...]:
     return tuple(unauthorized)
 
 
-def _retire(captured: Captured, unauthorized: tuple[str, ...]) -> None:
+def _retire(captured: Captured, unauthorized: tuple[str, ...], *, answer=None) -> None:
     from . import drain
+    from .durable_capture import acknowledge_direct_capture
     from .models import NSOIntentOutboxEntry, NSOSwitchingRootDeletion
 
     with transaction.atomic():
         drain._lock_state(*captured.rendered.key)
+        if answer is not None:
+            acknowledge_direct_capture(captured.selection_id, answer)
         if captured.entry_ids:
             drain._retire(NSOIntentOutboxEntry.objects.filter(id__in=captured.entry_ids), captured.entry_ids)
         for root_name in unauthorized:
@@ -199,6 +207,7 @@ def _retire(captured: Captured, unauthorized: tuple[str, ...]) -> None:
 def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
     """Capture, repair if needed, prepare, and discharge only proven superseded facts."""
     from . import drain, renderer_audit
+    from .durable_capture import release_direct_capture
 
     repaired = False
     conflicted = False
@@ -236,6 +245,7 @@ def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
             answer = send(captured, deadline=drain._remaining_send_deadline(deadline_at))
             unauthorized = _validate(answer, captured)
         except adapter_client.AdapterError as exc:
+            release_direct_capture(captured.selection_id)
             reason = exc.detail.get("reason") if isinstance(exc.detail, dict) else exc.code
             if exc.status_code == 409 and reason == "stale_preparation":
                 _retire(captured, ())
@@ -253,7 +263,8 @@ def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
             drain._report_refusal(device_id, scope, exc)
             return drain.FAILED, None
         except Exception as exc:  # noqa: BLE001 (the entry remains for a later tick)
+            release_direct_capture(captured.selection_id)
             drain._report_refusal(device_id, scope, exc)
             return drain.FAILED, None
-        _retire(captured, unauthorized)
+        _retire(captured, unauthorized, answer=answer)
         return drain.SUCCEEDED, {**answer, "source_revision": captured.source_revision}

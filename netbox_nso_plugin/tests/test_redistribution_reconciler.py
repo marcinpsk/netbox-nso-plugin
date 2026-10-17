@@ -16,7 +16,7 @@ from django.test import TestCase
 
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
-from ._ownership_case import acquire_overlay, save_overlay_fixture
+from ._ownership_case import acquire_bgp_router, acquire_overlay, save_overlay_fixture
 
 
 class TestReconcileRedistribution(TestCase):
@@ -167,6 +167,72 @@ class TestReconcileRedistribution(TestCase):
 
         self.assertIsNone(state.redistribution_id)
         self.assertFalse(Redistribution.objects.exists())
+
+    def _global_bgp_destination(self, asn_value):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR
+        from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope
+
+        rir = RIR.objects.create(name="Notation private ASNs", slug="notation-private-asns")
+        router = BGPRouter.objects.create(
+            name=str(asn_value),
+            assigned_object_type=ContentType.objects.get_for_model(type(self.device)),
+            assigned_object_id=self.device.pk,
+            asn=ASN.objects.create(asn=asn_value, rir=rir),
+        )
+        return BGPAddressFamily.objects.create(
+            scope=BGPScope.objects.create(router=router), address_family="ipv4-unicast"
+        )
+
+    def test_asdot_bgp_destination_is_stored_canonically_and_links_its_native(self):
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        family = self._global_bgp_destination(65546)
+        entry = self._entry(dest_protocol="bgp", dest_ref="1.10//ipv4-unicast")
+
+        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+
+        self.assertEqual(state.dest_ref, "65546//ipv4-unicast")
+        self.assertEqual(state.redistribution.destination, family)
+
+    def test_malformed_bgp_destination_asn_rejects_the_read(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        entry = self._entry(dest_protocol="bgp", dest_ref="65536.1//ipv4-unicast")
+
+        with self.assertRaises(AdapterError) as caught:
+            reconcile_redistribution(self.device, {"entries": [entry]})
+
+        self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertFalse(NSORedistributionState.objects.exists())
+
+    def test_malformed_bgp_destination_shape_rejects_the_read(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        for dest_ref in ("64512", "64512/CUST/A/ipv4-unicast"):
+            with self.subTest(dest_ref=dest_ref):
+                with self.assertRaises(AdapterError) as caught:
+                    entry = self._entry(dest_protocol="bgp", dest_ref=dest_ref)
+                    reconcile_redistribution(self.device, {"entries": [entry]})
+                self.assertEqual(caught.exception.code, "invalid_response")
+        self.assertFalse(NSORedistributionState.objects.exists())
+
+    def test_bgp_destination_without_address_family_is_read_canonically(self):
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        self._make_mgmt()
+        entry = self._entry(dest_protocol="bgp", dest_ref="1.10/CUST-A")
+
+        state = reconcile_redistribution(self.device, {"entries": [entry]})[0]
+
+        self.assertEqual(state.dest_ref, "65546/CUST-A")
 
     def test_missing_named_vrf_clears_a_previous_redistribution_link(self):
         from django.contrib.contenttypes.models import ContentType
@@ -1222,54 +1288,135 @@ class TestReconcileRedistribution(TestCase):
         self.assertEqual(Redistribution.objects.count(), 1)  # object kept (operator owns it)
 
 
-class TestBuildBgpRouterList(TestCase):
-    """_build_bgp_router_list must materialize redistribution-only scopes.
+class _BgpRenderCase(TestCase):
+    def setUp(self):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import ASN, RIR
+        from netbox_routing.models import BGPRouter
 
-    An accepted BGP redistribution whose (asn, vrf) has no owned peer previously
-    produced an empty router list — the dest_ref join at apply time then found no
-    AF and the redistribution silently never reached the device.
-    """
+        from ._outbox_case import make_managed
+
+        self.device, self.management = make_managed("owned-bgp-render", 9912)
+        rir = RIR.objects.create(name="Renderer private ASNs", slug="renderer-private-asns", is_private=True)
+        self.local_as = ASN.objects.create(asn=64512, rir=rir)
+        self.remote_as = ASN.objects.create(asn=64513, rir=rir)
+        self.router = BGPRouter.objects.create(
+            assigned_object_type=ContentType.objects.get_for_model(Device),
+            assigned_object_id=self.device.pk,
+            asn=self.local_as,
+            name=str(self.local_as.asn),
+        )
+
+    def _scope(self, address_families=(), vrf=""):
+        from ipam.models import VRF
+        from netbox_routing.models import BGPAddressFamily, BGPScope
+
+        native_vrf = VRF.objects.create(name=vrf) if vrf else None
+        scope = BGPScope.objects.create(router=self.router, vrf=native_vrf)
+        for address_family in address_families:
+            BGPAddressFamily.objects.create(scope=scope, address_family=address_family)
+        return scope
+
+    def _peer(self, scope, address_families=(), routemap_in=""):
+        from django.contrib.contenttypes.models import ContentType
+        from ipam.models import IPAddress
+        from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPPeerAddressFamily, RouteMap
+
+        from netbox_nso_plugin.models import NSOBGPPeerState
+
+        peer = BGPPeer.objects.create(
+            scope=scope,
+            peer=IPAddress.objects.create(address="198.18.0.2/32"),
+            remote_as=self.remote_as,
+            enabled=True,
+        )
+        route_map = RouteMap.objects.create(name=routemap_in) if routemap_in else None
+        for address_family in address_families:
+            BGPPeerAddressFamily.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(BGPPeer),
+                assigned_object_id=peer.pk,
+                address_family=BGPAddressFamily.objects.get(scope=scope, address_family=address_family),
+                enabled=True,
+                routemap_in=route_map,
+            )
+        acquire_overlay(
+            NSOBGPPeerState,
+            management=self.management,
+            bgp_peer=peer,
+            asn_str=str(self.local_as.asn),
+            vrf_name=scope.vrf.name if scope.vrf else "",
+            peer_address_str="198.18.0.2",
+            status="accepted",
+        )
+
+    def _redistribution(self, scope, address_family, source_protocol="static", route_map=""):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import BGPAddressFamily, Redistribution, RouteMap
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        native_af = BGPAddressFamily.objects.get(scope=scope, address_family=address_family)
+        native_route_map = RouteMap.objects.create(name=route_map) if route_map else None
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(BGPAddressFamily),
+            destination_id=native_af.pk,
+            source_protocol=source_protocol,
+            route_map=native_route_map,
+        )
+        vrf_name = scope.vrf.name if scope.vrf else ""
+        acquire_overlay(
+            NSORedistributionState,
+            management=self.management,
+            redistribution=native,
+            dest_protocol="bgp",
+            dest_ref=f"{self.local_as.asn}/{vrf_name}/{address_family}",
+            source_protocol=source_protocol,
+            source_ref="",
+            route_map=route_map,
+            status="accepted",
+        )
+        entry = {"source_protocol": source_protocol, "source_ref": ""}
+        if route_map:
+            entry["route_map"] = route_map
+        return [entry]
+
+    def _render(self):
+        from netbox_nso_plugin.delivery import render
+
+        return render("bgp", self.device.pk, self.management.adapter_device_id).payload
+
+
+class TestBuildBgpRouterList(_BgpRenderCase):
+    """The renderer attaches redistribution to explicitly owned router membership."""
 
     def test_redistribution_only_scope_materializes_router(self):
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope(["ipv4-unicast"])
+        acquire_bgp_router(self.management, self.router)
+        redist = self._redistribution(scope, "ipv4-unicast", route_map="PCE-BGP-EXPORT")
 
-        redist = [{"source_protocol": "static", "source_ref": "", "route_map": "PCE-BGP-EXPORT"}]
-        out = _build_bgp_router_list({}, {("2222", ""): {"ipv4-unicast": redist}})
+        out = self._render()
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["asn"], "64512")
         self.assertEqual(
-            out,
+            out[0]["scopes"],
             [
                 {
-                    "asn": "2222",
-                    "scopes": [
-                        {
-                            "vrf": "",
-                            "peers": [],
-                            "address_families": [{"af": "ipv4-unicast", "redistribution": redist}],
-                        }
-                    ],
+                    "vrf": "",
+                    "peers": [],
+                    "address_families": [{"af": "ipv4-unicast", "redistribution": redist}],
                 }
             ],
         )
 
     def test_peer_scope_keeps_redistribution_and_no_duplicate(self):
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope(["ipv4-unicast"])
+        acquire_bgp_router(self.management, self.router)
+        self._peer(scope)
+        redist = self._redistribution(scope, "ipv4-unicast")
 
-        redist = [{"source_protocol": "static", "source_ref": ""}]
-        routers = {
-            "2222": {
-                "asn": "2222",
-                "scopes": {
-                    "": {
-                        "vrf": "",
-                        "address_families": [],
-                        "peers": [
-                            {"peer_address": "192.0.2.1", "enabled": True, "remote_as": "1", "address_families": []}
-                        ],
-                    }
-                },
-            }
-        }
-        out = _build_bgp_router_list(routers, {("2222", ""): {"ipv4-unicast": redist}})
+        out = self._render()
+
         self.assertEqual(len(out), 1)
         self.assertEqual(len(out[0]["scopes"]), 1)
         scope = out[0]["scopes"][0]
@@ -1277,101 +1424,56 @@ class TestBuildBgpRouterList(TestCase):
         self.assertEqual(len(scope["peers"]), 1)
 
 
-def _peer(addr="192.0.2.1", afs=()):
-    return {
-        "peer_address": addr,
-        "enabled": True,
-        "remote_as": "1",
-        "address_families": list(afs),
-    }
-
-
-def _routers(vrf="", peers=()):
-    return {
-        "2222": {
-            "asn": "2222",
-            "scopes": {vrf: {"vrf": vrf, "address_families": [], "peers": list(peers)}},
-        }
-    }
-
-
-class TestScopeAddressFamiliesIncludePeerAfs(TestCase):
-    """BGP-T1-1: the scope's address-family list was built from REDISTRIBUTION ROWS ONLY.
-
-    `_build_bgp_router_list` did::
-
-        af_map = scope_afs.get((asn_str, vrf_str), {})   # scope_afs <- accepted redistribution
-        scope_out["address_families"] = afs_out          # OVERWRITES the scope's own list
-
-    A peer's address-families are built separately into `peer["address_families"]` and never
-    reached the scope. So on the ORDINARY path — peers accepted, no redistribution accepted —
-    the scope arrived at bgp-reconciler with an EMPTY address-family list, and the writer drives
-    all of the following off `scope.address_family`:
-
-      * AF activation,
-      * per-AF policy binding (route-map / prefix-list in+out), and
-      * `_apply_ios_vrf_scope` in its ENTIRETY (its whole body is inside that loop).
-
-    Consequences, all silent — the commit succeeds and NetBox reports in_sync:
-      * the peer's route-maps and prefix-lists NEVER BIND -> the peer comes up UNFILTERED;
-      * every IOS VRF peer is NEVER WRITTEN AT ALL;
-      * IPv6 / VPNv4 address-families are never explicitly activated.
-
-    (IOS auto-activates ipv4-unicast for a `neighbor ... remote-as`, which is why global peers
-    still came up and the bug looked like nothing was wrong.)
-
-    The scope's AFs must therefore be the UNION of the AFs carrying redistribution and the AFs
-    any peer in that scope actually uses.
-    """
+class TestScopeAddressFamiliesIncludePeerAfs(_BgpRenderCase):
+    """The router's explicit scope AFs retain independent child contributions."""
 
     def test_peer_af_reaches_the_scope_without_any_redistribution(self):
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope(["ipv4-unicast"])
+        acquire_bgp_router(self.management, self.router)
+        self._peer(scope, ["ipv4-unicast"], routemap_in="RM-IN")
 
-        peer = _peer(afs=[{"af": "ipv4-unicast", "enabled": True, "routemap_in": "RM-IN"}])
-        out = _build_bgp_router_list(_routers(peers=[peer]), {})
-        scope = out[0]["scopes"][0]
-        self.assertEqual(
-            scope["address_families"],
-            [{"af": "ipv4-unicast", "redistribution": []}],
-            "the peer's AF never reached the scope — the writer binds no policy and the peer comes up UNFILTERED",
-        )
+        scope = self._render()[0]["scopes"][0]
+
+        self.assertEqual(scope["address_families"], [{"af": "ipv4-unicast", "redistribution": []}])
+        self.assertEqual(scope["peers"][0]["address_families"][0]["routemap_in"], "RM-IN")
 
     def test_peer_af_and_redistribution_af_are_unioned_not_replaced(self):
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope(["ipv4-unicast", "ipv6-unicast"])
+        acquire_bgp_router(self.management, self.router)
+        self._peer(scope, ["ipv6-unicast"])
+        redist = self._redistribution(scope, "ipv4-unicast")
 
-        redist = [{"source_protocol": "static", "source_ref": ""}]
-        peer = _peer(afs=[{"af": "ipv6-unicast", "enabled": True}])
-        out = _build_bgp_router_list(_routers(peers=[peer]), {("2222", ""): {"ipv4-unicast": redist}})
-        afs = {a["af"]: a["redistribution"] for a in out[0]["scopes"][0]["address_families"]}
+        afs = {entry["af"]: entry["redistribution"] for entry in self._render()[0]["scopes"][0]["address_families"]}
+
         self.assertEqual(afs, {"ipv4-unicast": redist, "ipv6-unicast": []})
 
     def test_an_af_carrying_both_is_not_duplicated_and_keeps_its_redistribution(self):
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope(["ipv4-unicast"])
+        acquire_bgp_router(self.management, self.router)
+        self._peer(scope, ["ipv4-unicast"])
+        redist = self._redistribution(scope, "ipv4-unicast", source_protocol="connected")
 
-        redist = [{"source_protocol": "connected", "source_ref": ""}]
-        peer = _peer(afs=[{"af": "ipv4-unicast", "enabled": True}])
-        out = _build_bgp_router_list(_routers(peers=[peer]), {("2222", ""): {"ipv4-unicast": redist}})
         self.assertEqual(
-            out[0]["scopes"][0]["address_families"],
+            self._render()[0]["scopes"][0]["address_families"],
             [{"af": "ipv4-unicast", "redistribution": redist}],
         )
 
     def test_vrf_scope_peer_af_reaches_the_scope(self):
-        """The IOS VRF writer's ENTIRE body is inside `for af_entry in scope.address_family`."""
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope(["ipv4-unicast"], vrf="CUST-A")
+        acquire_bgp_router(self.management, self.router)
+        self._peer(scope, ["ipv4-unicast"])
 
-        peer = _peer(addr="10.9.9.1", afs=[{"af": "ipv4-unicast", "enabled": True}])
-        out = _build_bgp_router_list(_routers(vrf="CUST-A", peers=[peer]), {})
-        scope = out[0]["scopes"][0]
+        scope = self._render()[0]["scopes"][0]
+
         self.assertEqual(scope["vrf"], "CUST-A")
-        self.assertEqual(
-            scope["address_families"],
-            [{"af": "ipv4-unicast", "redistribution": []}],
-            "with an empty AF list the IOS VRF writer is a total no-op — the peer is never written",
-        )
+        self.assertEqual(scope["address_families"], [{"af": "ipv4-unicast", "redistribution": []}])
 
     def test_a_peer_with_no_afs_still_yields_an_empty_list(self):
-        from netbox_nso_plugin.signals import _build_bgp_router_list
+        scope = self._scope()
+        acquire_bgp_router(self.management, self.router)
+        self._peer(scope)
 
-        out = _build_bgp_router_list(_routers(peers=[_peer()]), {})
-        self.assertEqual(out[0]["scopes"][0]["address_families"], [])
+        scope = self._render()[0]["scopes"][0]
+
+        self.assertEqual(scope["address_families"], [])
+        self.assertEqual(scope["peers"][0]["address_families"], [])

@@ -9,7 +9,7 @@ from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.test import TestCase
-from netbox_routing.models import PrefixList
+from netbox_routing.models import BGPAddressFamily, BGPScope, PrefixList
 
 from netbox_nso_plugin.models import NSOOwnershipAcquisition, NSOOwnershipManifest
 from netbox_nso_plugin.ownership_grants import GRANTS, OwnershipGrant
@@ -63,6 +63,8 @@ def _native_content_values(name, native, factory_index):
         values.update(process_tag=native.instance.process_tag, algo_id=native.algo_id)
     elif name == "nsoospfinstancestate":
         values["process_id"] = str(native.process_id)
+    elif name == "nsobgprouterstate":
+        values.update(asn_str=str(native.asn.asn), router_id=str(native.router_id or ""))
     elif name == "nsobgppeerstate":
         values.update(
             asn_str=str(native.scope.router.asn.asn), vrf_name="", peer_address_str=str(native.peer.address.ip)
@@ -83,6 +85,9 @@ def qualifying_overlay(device, management, label, factory_index=0):
     name = label.split(".")[-1]
     if label in NATIVE_FACTORIES:
         native = NATIVE_FACTORIES[label][1][factory_index](device)
+        if name == "nsobgprouterstate":
+            scope = BGPScope.objects.create(router=native)
+            BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
         native.refresh_from_db()
         rule = next(rule for rule in converted_scope_rules().values() if label in rule.overlay_model_labels)
         field = dict(rule.overlay_native_fields)[label]

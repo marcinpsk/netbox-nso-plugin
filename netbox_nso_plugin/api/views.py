@@ -16,6 +16,7 @@ from ..filters import (
     NSOPlatformNedMappingFilterSet,
 )
 from ..models import (
+    NSOBGPRouterState,
     NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOInstance,
@@ -25,6 +26,7 @@ from ..models import (
     NSOPlatformNedMapping,
 )
 from .serializers import (
+    NSOBGPRouterStateSerializer,
     NSODerivedIntentTemplateSerializer,
     NSODeviceManagementSerializer,
     NSOInstanceSerializer,
@@ -38,6 +40,19 @@ from .serializers import (
 def _request_body(request):
     body = request.data
     return body if isinstance(body, dict) else None
+
+
+class NSOBGPRouterStateViewSet(NetBoxModelViewSet):
+    """Expose router observations and lifecycle through the overlay API."""
+
+    queryset = NSOBGPRouterState.objects.select_related("management", "bgp_router")
+    serializer_class = NSOBGPRouterStateSerializer
+    http_method_names = ("get", "head", "options")
+
+    def get_queryset(self):
+        from ..views import _visible_bgp_router_states
+
+        return _visible_bgp_router_states(self.request.user)
 
 
 class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):

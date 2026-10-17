@@ -5181,21 +5181,19 @@ class TestOverlayFieldEditView(ViewTestBase):
             management=self.mgmt,
             asn_str="64512",
             peer_address_str="192.0.2.20",
-            remote_as_str="64513",
-            enabled=True,
             bgp_peer=native,
             status="imported",
         )
 
         response = self.client.post(
             self._url("bgp_peer", row.pk),
-            {"remote_as_str": "64514", "enabled": "False"},
+            {"remote_as": "64514", "enabled": "False"},
         )
 
         self.assertEqual(response.status_code, 200, response.content)
         row.refresh_from_db()
         native.refresh_from_db()
-        self.assertEqual((row.remote_as_str, row.enabled, row.status), ("64514", False, "accepted"))
+        self.assertEqual(row.status, "accepted")
         self.assertIsNotNone(row.accepted_at)
         self.assertEqual(native.remote_as.asn, 64514)
         self.assertFalse(native.enabled)
@@ -5227,19 +5225,17 @@ class TestOverlayFieldEditView(ViewTestBase):
             management=self.mgmt,
             asn_str="64520",
             peer_address_str="192.0.2.21",
-            remote_as_str="64521",
-            enabled=True,
             bgp_peer=native,
             status="imported",
         )
 
-        response = self.client.post(self._url("bgp_peer", row.pk), {"remote_as_str": "9999999999"})
+        response = self.client.post(self._url("bgp_peer", row.pk), {"remote_as": "9999999999"})
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("remote_as_str", response.json()["errors"])
+        self.assertIn("remote_as", response.json()["errors"])
         row.refresh_from_db()
         native.refresh_from_db()
-        self.assertEqual((row.remote_as_str, row.status), ("64521", "imported"))
+        self.assertEqual(row.status, "imported")
         self.assertEqual(native.remote_as.asn, 64521)
 
     def test_bgp_template_json_does_not_require_a_nonexistent_detail_url(self):
@@ -5573,6 +5569,246 @@ class TestOverlayFieldEditView(ViewTestBase):
         edited_state.refresh_from_db()
         sibling_state.refresh_from_db()
         self.assertEqual((bundle.status, edited_state.status, sibling_state.status), ("accepted",) * 3)
+
+    def _assert_edit_clears_apply_attempt(self, key, rows, data, url=None, expected_code=200):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = NSOApplyAttempt.objects.create(
+            id=uuid4(),
+            management=self.mgmt,
+            adapter_device_id=self.mgmt.adapter_device_id,
+            selected={},
+            scope_revisions={},
+        )
+        rows = [mirror_update(row, status="deploying", apply_attempt_id=attempt.pk) for row in rows]
+        response = self.client.post(url or self._url(key, rows[0].pk), data)
+        self.assertEqual(response.status_code, expected_code, response.content)
+        for row in rows:
+            row.refresh_from_db()
+            self.assertEqual((row.status, row.apply_attempt_id), ("accepted", None), row._meta.label_lower)
+
+    def test_edit_bfd_clears_the_deploying_apply_attempt(self):
+        from netbox_routing.models import BFDInterface, BFDProfile
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState
+
+        profile = BFDProfile.objects.create(name="bfd-attempt", min_tx_int=300, min_rx_int=300, multiplier=3)
+        BFDInterface.objects.create(interface=self.interface, bfd_profile=profile, micro_bfd=False, enabled=True)
+        row = NSOBFDInterfaceState.objects.create(
+            management=self.mgmt,
+            interface=self.interface,
+            min_tx=300,
+            min_rx=300,
+            multiplier=3,
+            micro_bfd=False,
+            status="imported",
+        )
+        self._assert_edit_clears_apply_attempt("bfd", [row], {"min_tx": "500"})
+
+    def test_edit_static_route_clears_the_deploying_apply_attempt(self):
+        from netbox_routing.models import StaticRoute
+
+        from netbox_nso_plugin.models import NSOStaticRouteState
+
+        from ._static_route_case import _assign_without_push
+
+        native = StaticRoute.objects.create(prefix="198.51.100.0/24", next_hop="192.0.2.1", metric=10)
+        _assign_without_push(native, self.device)
+        row = NSOStaticRouteState.objects.create(
+            management=self.mgmt,
+            static_route=native,
+            nso_prefix=str(native.prefix),
+            nso_next_hop=str(native.next_hop),
+            status="imported",
+        )
+        self._assert_edit_clears_apply_attempt("static_route", [row], {"metric": "25"})
+
+    def test_edit_redistribution_clears_the_deploying_apply_attempt(self):
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        instance = OSPFInstance.objects.create(
+            device=self.device, name="attempt-redistribution", process_id="12", router_id="192.0.2.12"
+        )
+        route_map = RouteMap.objects.create(name="RM-ATTEMPT")
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(instance),
+            destination_id=instance.pk,
+            source_protocol="static",
+            route_map=route_map,
+            metric=10,
+            metric_type="2",
+        )
+        row = NSORedistributionState.objects.create(
+            management=self.mgmt,
+            dest_protocol="ospf",
+            dest_ref="12",
+            source_protocol="static",
+            route_map=route_map.name,
+            metric=10,
+            metric_type="2",
+            redistribution=native,
+            status="imported",
+        )
+        self._assert_edit_clears_apply_attempt("redistribution", [row], {"metric": "25"})
+
+    def test_edit_ospf_instance_clears_the_deploying_apply_attempt(self):
+        from netbox_routing.models import OSPFInstance
+
+        from netbox_nso_plugin.models import NSOOSPFInstanceState
+
+        native = OSPFInstance.objects.create(
+            device=self.device, name="attempt-ospf", process_id="13", router_id="192.0.2.13"
+        )
+        row = NSOOSPFInstanceState.objects.create(
+            management=self.mgmt, process_id="13", router_id="192.0.2.13", ospf_instance=native, status="imported"
+        )
+        self._assert_edit_clears_apply_attempt("ospf_instance", [row], {"router_id": "192.0.2.14"})
+
+    def test_edit_isis_instance_clears_the_deploying_apply_attempt(self):
+        from netbox_routing.models import ISISInstance
+
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        native = ISISInstance.objects.create(
+            device=self.device,
+            process_tag="CORE",
+            net="49.0001.0000.0000.0001.00",
+            is_type="level-1-2",
+            metric_style="narrow",
+        )
+        row = NSOISISInstanceState.objects.create(
+            management=self.mgmt,
+            process_tag="CORE",
+            net=native.net,
+            is_type=native.is_type,
+            metric_style=native.metric_style,
+            isis_instance=native,
+            status="imported",
+        )
+        self._assert_edit_clears_apply_attempt("isis_instance", [row], {"metric_style": "wide"})
+
+    def test_edit_mtu_clears_the_deploying_apply_attempt(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        self.interface.mtu = 9214
+        self.interface.save(update_fields=("mtu",))
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        self._assert_edit_clears_apply_attempt("interface_mtu", [row], {"l2_mtu": "9000"})
+
+    def test_full_mtu_form_edit_clears_the_deploying_apply_attempt(self):
+        from netbox_nso_plugin.models import NSOInterfaceMtuState
+
+        self.interface.mtu = 9214
+        self.interface.save(update_fields=("mtu",))
+        row = NSOInterfaceMtuState.objects.create(
+            management=self.mgmt, interface=self.interface, l2_mtu=9214, status="imported"
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacemtustate_edit", kwargs={"pk": row.pk})
+        self._assert_edit_clears_apply_attempt(
+            None, [row], {"l2_mtu": "9000", "ip_mtu": "", "mpls_mtu": ""}, url=url, expected_code=302
+        )
+
+    def test_full_snmp_community_edit_clears_the_deploying_apply_attempt(self):
+        from netbox_nso_plugin.models import NSOSnmpCommunityState
+
+        row = NSOSnmpCommunityState.objects.create(
+            management=self.mgmt, community_hash="1111222233334445", access="RO", status="imported"
+        )
+        url = reverse("plugins:netbox_nso_plugin:nsosnmpcommunitystate_edit", kwargs={"pk": row.pk})
+        self._assert_edit_clears_apply_attempt(
+            None, [row], {"access": "RW", "acl": "", "vault_ref": "", "secret_value": ""}, url=url, expected_code=302
+        )
+
+    def test_snmp_community_rekey_clears_the_deploying_host_apply_attempt(self):
+        from netbox_nso_plugin.models import (
+            NSOApplyAttempt,
+            NSOSnmpCommunityState,
+            NSOSnmpHostState,
+            NSOVaultSettings,
+        )
+        from netbox_nso_plugin.vault_refs import secret_fingerprint
+
+        NSOVaultSettings.objects.create(kv_mount="network", base_path="netbox/snmp", enabled=True)
+        community = NSOSnmpCommunityState.objects.create(
+            management=self.mgmt, community_hash="oldhash1234567891", access="RO", status="imported"
+        )
+        host = NSOSnmpHostState.objects.create(
+            management=self.mgmt,
+            address="198.51.100.41",
+            version="v2c",
+            notify_type="trap",
+            community_hash=community.community_hash,
+            status="imported",
+        )
+        attempt = NSOApplyAttempt.objects.create(
+            id=uuid4(),
+            management=self.mgmt,
+            adapter_device_id=self.mgmt.adapter_device_id,
+            selected={},
+            scope_revisions={},
+        )
+        host = mirror_update(host, status="deploying", apply_attempt_id=attempt.pk)
+        new_hash = secret_fingerprint("attempt-c0mmunity")
+        session = make_session(
+            json_data={
+                "vault_ref": f"network/netbox/snmp/community/{new_hash}#community",
+                "version": 5,
+                "hashes": {"community": new_hash},
+            }
+        )
+        config = {
+            "url": "http://adapter.local",
+            "token": "test-token",
+            "verify_tls": True,
+            "ca_cert_path": None,
+            "timeout": 30,
+        }
+        with (
+            without_commit_drain(),
+            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=config),
+            patch("netbox_nso_plugin.adapter_client._get_session", return_value=session),
+        ):
+            response = self.client.post(
+                reverse("plugins:netbox_nso_plugin:nsosnmpcommunitystate_edit", kwargs={"pk": community.pk}),
+                {"access": "RO", "acl": "", "vault_ref": "", "secret_value": "attempt-c0mmunity"},
+            )
+
+        self.assertEqual(response.status_code, 302, response.content)
+        host.refresh_from_db()
+        self.assertEqual((host.community_hash, host.status, host.apply_attempt_id), (new_hash, "accepted", None))
+
+    def test_edit_lacp_member_clears_every_deploying_apply_attempt(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        lag = Interface.objects.create(device=self.device, name="Port-channel13", type="lag")
+        edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/13", type="1000base-t", lag=lag)
+        sibling = Interface.objects.create(device=self.device, name="GigabitEthernet0/14", type="1000base-t", lag=lag)
+        bundle = acquire_overlay(
+            NSOLACPBundleState,
+            management=self.mgmt,
+            interface=lag,
+            lag_id=13,
+            min_links=1,
+            status="accepted",
+            observed_members=[edited.name, sibling.name],
+        )
+        members = [
+            acquire_overlay(
+                NSOLACPMemberState,
+                management=self.mgmt,
+                interface=interface,
+                mode="active",
+                port_priority=100,
+                status="accepted",
+            )
+            for interface in (edited, sibling)
+        ]
+        self._assert_edit_clears_apply_attempt("lacp_member", [*members, bundle], {"mode": "passive"})
 
     def test_edit_shared_vlan_name_updates_native_object_and_owns_every_attached_device(self):
         from django.utils import timezone
@@ -8489,7 +8725,9 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         response = self._apply(_ApplyBoundaryAdapter(lambda: initial_response))
 
         self.assertEqual(response.status_code, 502)
-        attempt = NSOApplyAttempt.objects.get(management=self.mgmt)
+        attempt = NSOApplyAttempt.objects.get(
+            management=self.mgmt, trigger_kind="manual", adapter_apply_attempt_id__isnull=False
+        )
         self.assertIsNone(attempt.http_status)
         self.assertIsNone(attempt.response)
         self.mtu_state.refresh_from_db()

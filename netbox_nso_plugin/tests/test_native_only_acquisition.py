@@ -161,16 +161,19 @@ def native_ospf_interface(device):
     )
 
 
-def native_bgp_scope(device):
+def native_bgp_router(device):
     rir, _ = RIR.objects.get_or_create(name="Native private", slug="native-private")
     asn, _ = ASN.objects.get_or_create(asn=64520, rir=rir)
-    router = BGPRouter.objects.create(
+    return BGPRouter.objects.create(
         assigned_object_type=ContentType.objects.get_for_model(Device),
         assigned_object_id=device.pk,
         asn=asn,
         name="64520",
     )
-    return BGPScope.objects.create(router=router)
+
+
+def native_bgp_scope(device):
+    return BGPScope.objects.create(router=native_bgp_router(device))
 
 
 def native_bgp_peer(device):
@@ -211,6 +214,7 @@ NATIVE_FACTORIES = {
     ),
     "netbox_nso_plugin.nsointerfaceipstate": ("ip", (native_ip,), {"address": "198.18.0.101/24"}),
     "netbox_nso_plugin.nsostaticroutestate": ("static_route", (native_route,), {"prefix": "198.18.101.0/24"}),
+    "netbox_nso_plugin.nsobgprouterstate": ("bgp", (native_bgp_router,), {"asn": "64520"}),
     "netbox_nso_plugin.nsobgppeerstate": ("bgp", (native_bgp_peer,), {"peer_address": "198.18.0.2"}),
     "netbox_nso_plugin.nsoisisinstancestate": ("isis", (native_isis,), {"process_tag": "CORE"}),
     "netbox_nso_plugin.nsoisisinterfacestate": (

@@ -614,6 +614,7 @@ class TestOwnershipCascade(_RPBase):
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         from ._outbox_case import content_update
+        from ._ownership_case import acquire_bgp_router
 
         owner_management = self._mgmt()
         route_map = RouteMap.objects.create(name="RM-FIRST-ACQUISITION")
@@ -671,7 +672,9 @@ class TestOwnershipCascade(_RPBase):
             ],
         }
         _reconcile_bgp_config(acquiring_device, payload)
-        content_update(NSOBGPPeerState.objects.get(management=acquiring_management), status="in_sync")
+        peer_state = NSOBGPPeerState.objects.get(management=acquiring_management)
+        acquire_bgp_router(acquiring_management, peer_state.bgp_peer.scope.router, status="in_sync")
+        content_update(peer_state, status="in_sync")
         NSOIntentOutboxEntry.objects.filter(device_id__in=(self.device.pk, acquiring_device.pk)).delete()
         reset_intent_push_state()
 

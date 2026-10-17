@@ -74,7 +74,6 @@ class TestInterfaceIPPlanning(TestCase):
             asn_str="64530",
             vrf_name="",
             peer_address_str="198.18.0.1",
-            remote_as_str="64531",
             status="accepted",
         )
         before, after, plan = self._unassignment_plan()
