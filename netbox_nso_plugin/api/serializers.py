@@ -261,6 +261,7 @@ from ..models import (  # noqa: E402
     NSOBFDInterfaceState,
     NSOBGPPeerState,
     NSOBGPPeerTemplateState,
+    NSOBGPRouterState,
     NSOInterfaceIPState,
     NSOISISFlexAlgoState,
     NSOISISInstanceState,
@@ -369,6 +370,15 @@ class NSOISISInstanceStateSerializer(ModelSerializer):  # noqa: D101
 class NSOISISFlexAlgoStateSerializer(ModelSerializer):  # noqa: D101
     class Meta:
         model = NSOISISFlexAlgoState
+        fields = "__all__"
+        read_only_fields = ["status"]
+
+
+class NSOBGPRouterStateSerializer(ModelSerializer):
+    """Serialize the independent BGP router overlay."""
+
+    class Meta:
+        model = NSOBGPRouterState
         fields = "__all__"
         read_only_fields = ["status"]
 

@@ -225,8 +225,8 @@ def publish_scope_observation(management, family, read_state, body, **kwargs):
         make_observation = scope_observation if family in DOCUMENTS else routing_observation
     else:
         make_observation = None
-    if make_observation is not None and isinstance(read_state, dict) and "observation" not in kwargs:
-        kwargs["observation"] = make_observation(
-            family, revision=read_state.get("payload_revision"), source_epoch=read_state.get("source_epoch")
-        )
+    # The adapter publishes no observation for a payload without a revision.
+    revision = read_state.get("payload_revision") if isinstance(read_state, dict) else None
+    if make_observation is not None and revision is not None and "observation" not in kwargs:
+        kwargs["observation"] = make_observation(family, revision=revision, source_epoch=read_state.get("source_epoch"))
     return gated_family_run(management, family, read_state, body, **kwargs)

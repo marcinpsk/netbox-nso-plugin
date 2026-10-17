@@ -14,6 +14,10 @@ from netbox.models import NetBoxModel
 from .outbox import CONTRIBUTION_KIND_CHOICES, CONTRIBUTION_KIND_ORDINARY
 from .ownership_grants import GRANTS
 from .ownership_querysets import OwnershipQuerySet
+from .refusal_ledger import NSOAcceptedSelection as NSOAcceptedSelection
+from .refusal_ledger import NSOApplyExecution as NSOApplyExecution
+from .refusal_ledger import NSOApplyOverlaySnapshot as NSOApplyOverlaySnapshot
+from .refusal_ledger import NSOOverlaySettlementFence as NSOOverlaySettlementFence
 
 
 class _OwnedOverlayModel(NetBoxModel):
@@ -904,6 +908,8 @@ class NSOInterfaceState(_OwnedOverlayModel):
         help_text="Populated when status=apply_failed. Contains code/message/detail.",
     )
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["interface", "attribute"]
@@ -1020,6 +1026,8 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         help_text="The other end of a P2P pair (reserve-then-activate).",
     )
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["interface", "address", "vrf"]
@@ -1123,6 +1131,10 @@ class NSOSnmpCommunityState(_OwnedOverlayModel):
         null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
     )
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "community_hash"]
@@ -1199,6 +1211,10 @@ class NSOSnmpV3UserState(_OwnedOverlayModel):
         null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
     )
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "username"]
@@ -1254,6 +1270,10 @@ class NSOSnmpHostState(_OwnedOverlayModel):
         null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
     )
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "address"]
@@ -1290,6 +1310,10 @@ class NSOSnmpSystemInfoState(_OwnedOverlayModel):
         null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
     )
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+
     class Meta:
         base_manager_name = "objects"
         verbose_name = "NSO SNMP System Info State"
@@ -1325,6 +1349,10 @@ class NSOLoggingHostState(_OwnedOverlayModel):
     accepted_at = models.DateTimeField(
         null=True, blank=True, help_text="When an operator accepted this row (NetBox becomes source of truth)."
     )
+
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
 
     class Meta:
         base_manager_name = "objects"
@@ -1654,6 +1682,8 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     last_apply_error = models.TextField(blank=True, default="")
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "interface", "af"]
@@ -1714,6 +1744,8 @@ class NSOISISInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     last_apply_error = models.TextField(blank=True, default="")
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "process_tag"]
@@ -1761,6 +1793,8 @@ class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     last_apply_error = models.TextField(blank=True, default="")
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "process_tag", "algo_id"]
@@ -1785,6 +1819,49 @@ _BGP_STATUS_CHOICES = [
 ]
 
 _BGP_WRITE_PATH_STATUSES = {"accepted", "deploying", "in_sync", "apply_failed"}
+
+
+class NSOBGPRouterState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
+    """One ASN owner for router-id and native scope/address-family membership."""
+
+    management = models.ForeignKey("NSODeviceManagement", on_delete=models.CASCADE, related_name="bgp_router_states")
+    asn_str = models.CharField(max_length=10)
+    bgp_router = models.ForeignKey(
+        "netbox_routing.BGPRouter",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="nso_router_states",
+    )
+    router_id = models.CharField(max_length=64, blank=True, default="")
+    status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    last_apply_at = models.DateTimeField(null=True, blank=True)
+    last_apply_error = models.TextField(blank=True, default="")
+    device_base_hash = models.CharField(max_length=64, blank=True, default="")
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
+    class Meta:
+        base_manager_name = "objects"
+        ordering = ["management", "asn_str"]
+        unique_together = [("management", "asn_str")]
+        verbose_name = "NSO BGP Router State"
+        verbose_name_plural = "NSO BGP Router States"
+
+    def clean(self):
+        from .bgp_router_content import router_fragment
+
+        super().clean()
+        try:
+            content = router_fragment(self.asn_str, self.router_id, ())
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        self.asn_str = content["asn"]
+        self.router_id = content["router_id"] or ""
+
+    def __str__(self):
+        return f"{self.management} / ASN:{self.asn_str} [{self.status}]"
 
 
 class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -1819,8 +1896,6 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         blank=True,
         related_name="nso_bgp_states",
     )
-    remote_as_str = models.CharField(max_length=10, blank=True, default="")
-    enabled = models.BooleanField(null=True, blank=True)
     status = models.CharField(max_length=32, choices=_BGP_STATUS_CHOICES, default="unknown")
     last_sync_at = models.DateTimeField(null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
@@ -1830,6 +1905,8 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     # reconciler tell an operator edit (object moved, device == base → freeze/drift)
     # apart from a device-side change (device moved, object == base → auto-mirror).
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
+
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         base_manager_name = "objects"
@@ -2130,6 +2207,8 @@ class NSOOSPFInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     last_apply_error = models.TextField(blank=True, default="")
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
 
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
+
     class Meta:
         base_manager_name = "objects"
         ordering = ["management", "process_id"]
@@ -2172,6 +2251,8 @@ class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
+
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         base_manager_name = "objects"
@@ -2245,6 +2326,8 @@ class NSORedistributionState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
     last_apply_at = models.DateTimeField(null=True, blank=True)
     last_apply_error = models.TextField(blank=True, default="")
     device_base_hash = models.CharField(max_length=64, blank=True, default="")
+
+    apply_attempt_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         base_manager_name = "objects"
@@ -3078,7 +3161,7 @@ class NSOSwitchingRootDeletion(models.Model):
 
 
 class NSOApplyAttempt(models.Model):
-    """One manual Apply identity and the exact request available for replay."""
+    """One local Apply parent and its exact manual request, when present."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     management = models.ForeignKey(
@@ -3092,8 +3175,32 @@ class NSOApplyAttempt(models.Model):
     selected = models.JSONField(default=dict, blank=True)
     http_status = models.PositiveSmallIntegerField(null=True, blank=True)
     response = models.JSONField(null=True, blank=True)
+    trigger_kind = models.CharField(
+        max_length=16,
+        default="manual",
+        choices=(("manual", "Manual"), ("push", "Push"), ("cadence", "Cadence"), ("explicit_retry", "Explicit retry")),
+    )
+    adapter_apply_attempt_id = models.UUIDField(null=True, blank=True)
+    source_epoch = models.BigIntegerField(null=True, blank=True)
+    lifecycle = models.CharField(max_length=16, default="open", choices=(("open", "Open"), ("terminal", "Terminal")))
+    completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(trigger_kind="manual") | models.Q(adapter_apply_attempt_id__isnull=True),
+                name="nso_attempt_manual_identity",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(lifecycle="open") | models.Q(completed_at__isnull=False),
+                name="nso_attempt_terminal_time",
+            ),
+            models.UniqueConstraint(
+                fields=["adapter_apply_attempt_id"],
+                condition=models.Q(adapter_apply_attempt_id__isnull=False),
+                name="nso_attempt_adapter_request",
+            ),
+        ]
         indexes = [models.Index(fields=["management", "-created_at"], name="nso_apply_attempt_device")]
         ordering = ["-created_at"]
         verbose_name = "NSO Apply Attempt"

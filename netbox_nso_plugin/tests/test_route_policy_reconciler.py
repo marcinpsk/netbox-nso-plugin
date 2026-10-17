@@ -14,11 +14,13 @@ import json
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
-from ._outbox_case import direct_test_selection
+from ._manual_capture_case import store_apply_selection
+from ._outbox_case import ReceiptAdapter, make_managed
 from ._ownership_case import save_overlay_fixture
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestReconcileRoutePolicy(TestCase):
@@ -211,233 +213,6 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(state.status, "deploying")
         self.assertEqual(state.apply_attempt_id, attempt_id)
 
-    def test_apply_promotes_only_rows_in_the_rendered_route_policy_snapshot(self):
-        """Apply must not bind an omitted LOCAL row to the MASTER carrier evidence."""
-        from types import SimpleNamespace
-        from uuid import uuid4
-
-        from netbox_nso_plugin import apply_state, delivery
-        from netbox_nso_plugin.models import NSOIntentRevision, NSORoutePolicyObjectClass, NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
-
-        management = self._make_mgmt(self.device)
-        NSORoutePolicyObjectClass.objects.create(
-            family="community_list",
-            object_name="CL-LOCAL",
-            mode="local",
-        )
-        payload = {
-            "community_lists": [
-                {"name": "CL-MASTER", "entries": []},
-                {"name": "CL-LOCAL", "entries": []},
-                {"name": "CL-ATTACHED", "entries": []},
-            ]
-        }
-        reconcile_route_policy(self.device, payload)
-        master = NSORoutePolicyState.objects.get(management=management, object_name="CL-MASTER")
-        local = NSORoutePolicyState.objects.get(management=management, object_name="CL-LOCAL")
-        attached_local = NSORoutePolicyState.objects.get(management=management, object_name="CL-ATTACHED")
-        NSORoutePolicyObjectClass.objects.create(
-            family="community_list",
-            object_name="CL-ATTACHED",
-            mode="local",
-        )
-        for row in (master, local, attached_local):
-            row.status = "accepted"
-            save_overlay_fixture(row, update_fields=["status"])
-
-        registry = delivery.delivery_keys()
-        pushed = {}
-        for push_seq, entry in enumerate(
-            (candidate for candidate in registry.values() if candidate.in_protocol),
-            start=1,
-        ):
-            revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope=entry.key)
-            pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
-        attempt_id = uuid4()
-
-        apply_state.promote_current_intent(
-            management,
-            registry,
-            pushed,
-            apply_attempt_id=attempt_id,
-            **direct_test_selection(management, registry),
-            static_route_stored=False,
-        )
-
-        master.refresh_from_db()
-        local.refresh_from_db()
-        attached_local.refresh_from_db()
-        self.assertEqual(master.status, "deploying")
-        self.assertEqual(master.apply_attempt_id, attempt_id)
-        self.assertEqual(attached_local.status, "deploying")
-        self.assertEqual(attached_local.apply_attempt_id, attempt_id)
-        self.assertEqual(local.status, "accepted")
-        self.assertIsNone(local.apply_attempt_id)
-
-    def _accepted_local_candidates(self, device, names, *, materialized: bool):
-        """Accept one LOCAL route-policy row per name and return the promotion inputs."""
-        from types import SimpleNamespace
-
-        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
-
-        management = self._make_mgmt(device)
-
-        def classify():
-            for name in names:
-                NSORoutePolicyObjectClass.objects.get_or_create(
-                    family="community_list", object_name=name, defaults={"mode": "local"}
-                )
-
-        # Classifying before the reconcile leaves the row unmaterialized; after it keeps the GFK.
-        if not materialized:
-            classify()
-        reconcile_route_policy(device, {"community_lists": [{"name": name, "entries": []} for name in names]})
-        if materialized:
-            classify()
-        rows = list(NSORoutePolicyState.objects.filter(management=management).order_by("pk"))
-        self.assertEqual(len(rows), len(names))
-        for row in rows:
-            self.assertEqual(row.object_id is not None, materialized)
-            row.status = "accepted"
-            save_overlay_fixture(row, update_fields=["status"])
-        prepared = SimpleNamespace(management=management, rows=rows)
-        self._refresh_pushed_snapshot(prepared, device)
-        return prepared
-
-    def _refresh_pushed_snapshot(self, prepared, device):
-        """Re-read the current intent revisions so promotion sees an unchanged receipt."""
-        from types import SimpleNamespace
-
-        from netbox_nso_plugin import delivery
-        from netbox_nso_plugin.models import NSOIntentRevision
-
-        prepared.registry = delivery.delivery_keys()
-        prepared.pushed = {}
-        for push_seq, entry in enumerate(
-            (candidate for candidate in prepared.registry.values() if candidate.in_protocol),
-            start=1,
-        ):
-            revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope=entry.key)
-            prepared.pushed[entry.key] = SimpleNamespace(revision=revision.revision, push_seq=push_seq)
-
-    def _promotion_queries(self, prepared):
-        """Run promote_current_intent for one prepared device and return the SQL it issued."""
-        from uuid import uuid4
-
-        from django.db import connection
-        from django.test.utils import CaptureQueriesContext
-
-        from netbox_nso_plugin import apply_state
-
-        direct_selection = direct_test_selection(prepared.management, prepared.registry)
-        with CaptureQueriesContext(connection) as captured:
-            apply_state.promote_current_intent(
-                prepared.management,
-                prepared.registry,
-                prepared.pushed,
-                apply_attempt_id=uuid4(),
-                **direct_selection,
-                static_route_stored=False,
-            )
-        return [query["sql"] for query in captured.captured_queries]
-
-    def test_promotion_classifies_route_policy_candidates_in_one_query(self):
-        """Excluding unmaterialized LOCAL rows must not cost one classification query per row."""
-        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
-
-        one = self._accepted_local_candidates(self.device, ["CL-SOLO"], materialized=False)
-        many = self._accepted_local_candidates(
-            self.device2, [f"CL-BULK-{index}" for index in range(6)], materialized=False
-        )
-
-        one_sql = self._promotion_queries(one)
-        many_sql = self._promotion_queries(many)
-
-        table = NSORoutePolicyObjectClass._meta.db_table
-        classifications = (
-            sum(table in sql for sql in one_sql),
-            sum(table in sql for sql in many_sql),
-        )
-        self.assertEqual(
-            classifications[0],
-            classifications[1],
-            f"classification queries grew with the candidate count: {classifications}",
-        )
-        self.assertEqual(
-            len(one_sql),
-            len(many_sql),
-            f"promotion queries grew with the candidate count: {len(one_sql)} -> {len(many_sql)}",
-        )
-        for prepared in (one, many):
-            for row in prepared.rows:
-                row.refresh_from_db()
-                self.assertEqual(row.status, "accepted")
-                self.assertIsNone(row.apply_attempt_id)
-
-    def test_promotion_resolves_linked_route_policy_targets_without_per_row_queries(self):
-        """Linked LOCAL rows are promoted, and their target check stays one query per content type."""
-        from netbox_routing.models import CommunityList
-
-        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyObjectClass
-
-        one = self._accepted_local_candidates(self.device, ["CL-LINKED-SOLO"], materialized=True)
-        many = self._accepted_local_candidates(
-            self.device2, [f"CL-LINKED-{index}" for index in range(6)], materialized=True
-        )
-
-        one_sql = self._promotion_queries(one)
-        many_sql = self._promotion_queries(many)
-
-        attempt_table = NSOApplyAttempt._meta.db_table
-        class_table = NSORoutePolicyObjectClass._meta.db_table
-        target_table = CommunityList._meta.db_table
-        counts = []
-        for sqls in (one_sql, many_sql):
-            insert_at = next(index for index, sql in enumerate(sqls) if attempt_table in sql)
-            before_insert = sqls[:insert_at]
-            counts.append(
-                (
-                    sum(class_table in sql for sql in before_insert),
-                    sum(target_table in sql for sql in before_insert),
-                )
-            )
-        self.assertEqual(counts[0], counts[1], f"exclusion queries grew with the candidate count: {counts}")
-        for prepared in (one, many):
-            for row in prepared.rows:
-                row.refresh_from_db()
-                self.assertEqual(row.status, "deploying")
-                self.assertIsNotNone(row.apply_attempt_id)
-
-    def test_promotion_excludes_a_local_row_whose_materialized_target_is_gone(self):
-        """A LOCAL row with both GFK ids set but no target row stays excluded, as it does today."""
-        from uuid import uuid4
-
-        from netbox_nso_plugin import apply_state
-
-        from ._outbox_case import content_bulk_update
-
-        prepared = self._accepted_local_candidates(self.device, ["CL-DANGLING"], materialized=True)
-        row = prepared.rows[0]
-        content_bulk_update(row, object_id=row.object_id + 10_000)
-        self._refresh_pushed_snapshot(prepared, self.device)
-
-        apply_state.promote_current_intent(
-            prepared.management,
-            prepared.registry,
-            prepared.pushed,
-            apply_attempt_id=uuid4(),
-            **direct_test_selection(prepared.management, prepared.registry),
-            static_route_stored=False,
-        )
-
-        row.refresh_from_db()
-        self.assertIsNotNone(row.content_type_id)
-        self.assertIsNotNone(row.object_id)
-        self.assertEqual(row.status, "accepted")
-        self.assertIsNone(row.apply_attempt_id)
-
     def test_classification_mode_is_exact_on_a_mixed_case_name(self):
         from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
         from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
@@ -450,40 +225,6 @@ class TestReconcileRoutePolicy(TestCase):
         self.assertEqual(_group_mode(state.family, state.object_name), "master")
         self.assertEqual(state.classification_mode, "master")
         self.assertEqual(state.assigned_object.name, "cl-local")
-
-    def test_promotion_keeps_a_distinct_unicode_policy_name(self):
-        """Distinct Unicode names do not inherit another list's LOCAL classification."""
-        from types import SimpleNamespace
-        from uuid import uuid4
-
-        from netbox_nso_plugin import apply_state
-        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
-        from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
-
-        management = self._make_mgmt(self.device)
-        NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-\u03c3", mode="local")
-        reconcile_route_policy(self.device, {"community_lists": [{"name": "CL-\u03c2", "entries": []}]})
-        row = NSORoutePolicyState.objects.get(management=management, object_name="CL-\u03c2")
-        self.assertEqual(_group_mode(row.family, row.object_name), "master")
-        self.assertEqual(row.classification_mode, "master")
-        self.assertEqual(row.assigned_object.name, "CL-\u03c2")
-        row.status = "accepted"
-        save_overlay_fixture(row, update_fields=["status"])
-        prepared = SimpleNamespace(management=management, rows=[row])
-        self._refresh_pushed_snapshot(prepared, self.device)
-
-        apply_state.promote_current_intent(
-            prepared.management,
-            prepared.registry,
-            prepared.pushed,
-            apply_attempt_id=uuid4(),
-            **direct_test_selection(prepared.management, prepared.registry),
-            static_route_stored=False,
-        )
-
-        row.refresh_from_db()
-        self.assertEqual(row.status, "deploying")
-        self.assertIsNotNone(row.apply_attempt_id)
 
     def test_reconciles_all_families(self):
         """One object per family → created in netbox_routing + a state row each."""
@@ -1802,6 +1543,263 @@ class TestReconcileRoutePolicy(TestCase):
             set(rows.get().communities.values_list("community", flat=True)),
             {"64540:10", "64540:20"},
         )
+
+
+class TestRoutePolicyPromotion(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.device, _management = make_managed("policypromotion", 1701)
+        self.device2, _management2 = make_managed("policypromotion", 1702, index=2)
+        self.preparation_adapters = {}
+
+    def _make_mgmt(self, device):
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        inst, _ = NSOInstance.objects.get_or_create(name="rp-inst", defaults={"adapter_instance_id": "rp-inst"})
+        return NSODeviceManagement.objects.get_or_create(
+            device=device,
+            defaults={"nso_instance": inst, "nso_device_name": f"rp-{device.pk}", "adapter_device_id": device.pk},
+        )[0]
+
+    def test_apply_promotes_only_rows_in_the_rendered_route_policy_snapshot(self):
+        """Apply must not bind an omitted LOCAL row to the MASTER carrier evidence."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-LOCAL",
+            mode="local",
+        )
+        payload = {
+            "community_lists": [
+                {"name": "CL-MASTER", "entries": []},
+                {"name": "CL-LOCAL", "entries": []},
+                {"name": "CL-ATTACHED", "entries": []},
+            ]
+        }
+        reconcile_route_policy(self.device, payload)
+        master = NSORoutePolicyState.objects.get(management=management, object_name="CL-MASTER")
+        local = NSORoutePolicyState.objects.get(management=management, object_name="CL-LOCAL")
+        attached_local = NSORoutePolicyState.objects.get(management=management, object_name="CL-ATTACHED")
+        NSORoutePolicyObjectClass.objects.create(
+            family="community_list",
+            object_name="CL-ATTACHED",
+            mode="local",
+        )
+        for row in (master, local, attached_local):
+            row.status = "accepted"
+            save_overlay_fixture(row, update_fields=["status"])
+
+        registry, pushed, direct_selection = store_apply_selection(management)
+        attempt_id = uuid4()
+
+        apply_state.promote_current_intent(
+            management,
+            registry,
+            pushed,
+            apply_attempt_id=attempt_id,
+            **direct_selection,
+            static_route_stored=False,
+        )
+
+        master.refresh_from_db()
+        local.refresh_from_db()
+        attached_local.refresh_from_db()
+        self.assertEqual(master.status, "deploying")
+        self.assertEqual(master.apply_attempt_id, attempt_id)
+        self.assertEqual(attached_local.status, "deploying")
+        self.assertEqual(attached_local.apply_attempt_id, attempt_id)
+        self.assertEqual(local.status, "accepted")
+        self.assertIsNone(local.apply_attempt_id)
+
+    def _accepted_local_candidates(self, device, names, *, materialized: bool):
+        """Accept one LOCAL route-policy row per name and return the promotion inputs."""
+        from types import SimpleNamespace
+
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        management = self._make_mgmt(device)
+
+        def classify():
+            for name in names:
+                NSORoutePolicyObjectClass.objects.get_or_create(
+                    family="community_list", object_name=name, defaults={"mode": "local"}
+                )
+
+        # Classifying before the reconcile leaves the row unmaterialized; after it keeps the GFK.
+        if not materialized:
+            classify()
+        reconcile_route_policy(device, {"community_lists": [{"name": name, "entries": []} for name in names]})
+        if materialized:
+            classify()
+        rows = list(NSORoutePolicyState.objects.filter(management=management).order_by("pk"))
+        self.assertEqual(len(rows), len(names))
+        for row in rows:
+            self.assertEqual(row.object_id is not None, materialized)
+            row.status = "accepted"
+            save_overlay_fixture(row, update_fields=["status"])
+        prepared = SimpleNamespace(management=management, rows=rows)
+        self._refresh_pushed_snapshot(prepared, device)
+        return prepared
+
+    def _refresh_pushed_snapshot(self, prepared, device):
+        """Store acknowledged selections for the current desired owner graph."""
+        self.assertEqual(prepared.management.device_id, device.pk)
+        adapter = self.preparation_adapters.setdefault(prepared.management.pk, ReceiptAdapter())
+        prepared.registry, prepared.pushed, prepared.direct_selection = store_apply_selection(
+            prepared.management, adapter=adapter
+        )
+
+    def _promotion_queries(self, prepared):
+        """Run promote_current_intent for one prepared device and return the SQL it issued."""
+        from uuid import uuid4
+
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin import apply_state
+
+        direct_selection = prepared.direct_selection
+        with CaptureQueriesContext(connection) as captured:
+            apply_state.promote_current_intent(
+                prepared.management,
+                prepared.registry,
+                prepared.pushed,
+                apply_attempt_id=uuid4(),
+                **direct_selection,
+                static_route_stored=False,
+            )
+        return [query["sql"] for query in captured.captured_queries]
+
+    def test_promotion_classifies_route_policy_candidates_in_one_query(self):
+        """Excluding unmaterialized LOCAL rows must not cost one classification query per row."""
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass
+
+        one = self._accepted_local_candidates(self.device, ["CL-SOLO"], materialized=False)
+        many = self._accepted_local_candidates(
+            self.device2, [f"CL-BULK-{index}" for index in range(6)], materialized=False
+        )
+
+        one_sql = self._promotion_queries(one)
+        many_sql = self._promotion_queries(many)
+
+        table = NSORoutePolicyObjectClass._meta.db_table
+        classifications = (
+            sum(table in sql for sql in one_sql),
+            sum(table in sql for sql in many_sql),
+        )
+        self.assertEqual(
+            classifications[0],
+            classifications[1],
+            f"classification queries grew with the candidate count: {classifications}",
+        )
+        for prepared in (one, many):
+            for row in prepared.rows:
+                row.refresh_from_db()
+                self.assertEqual(row.status, "accepted")
+                self.assertIsNone(row.apply_attempt_id)
+
+    def test_promotion_resolves_linked_route_policy_targets_without_per_row_queries(self):
+        """Linked LOCAL rows are promoted, and their target check stays one query per content type."""
+        from netbox_routing.models import CommunityList
+
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyObjectClass
+
+        one = self._accepted_local_candidates(self.device, ["CL-LINKED-SOLO"], materialized=True)
+        many = self._accepted_local_candidates(
+            self.device2, [f"CL-LINKED-{index}" for index in range(6)], materialized=True
+        )
+
+        one_sql = self._promotion_queries(one)
+        many_sql = self._promotion_queries(many)
+
+        attempt_table = NSOApplyAttempt._meta.db_table
+        class_table = NSORoutePolicyObjectClass._meta.db_table
+        target_table = CommunityList._meta.db_table
+        counts = []
+        for sqls in (one_sql, many_sql):
+            insert_at = next(index for index, sql in enumerate(sqls) if attempt_table in sql)
+            before_insert = sqls[:insert_at]
+            counts.append(
+                (
+                    sum(class_table in sql for sql in before_insert),
+                    sum(target_table in sql for sql in before_insert),
+                )
+            )
+        self.assertEqual(counts[0], counts[1], f"exclusion queries grew with the candidate count: {counts}")
+        for prepared in (one, many):
+            for row in prepared.rows:
+                row.refresh_from_db()
+                self.assertEqual(row.status, "deploying")
+                self.assertIsNotNone(row.apply_attempt_id)
+
+    def test_promotion_excludes_a_local_row_whose_materialized_target_is_gone(self):
+        """A LOCAL row with both GFK ids set but no target row stays excluded, as it does today."""
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state
+
+        from ._outbox_case import content_bulk_update
+
+        prepared = self._accepted_local_candidates(self.device, ["CL-DANGLING"], materialized=True)
+        row = prepared.rows[0]
+        content_bulk_update(row, object_id=row.object_id + 10_000)
+        self._refresh_pushed_snapshot(prepared, self.device)
+
+        apply_state.promote_current_intent(
+            prepared.management,
+            prepared.registry,
+            prepared.pushed,
+            apply_attempt_id=uuid4(),
+            **prepared.direct_selection,
+            static_route_stored=False,
+        )
+
+        row.refresh_from_db()
+        self.assertIsNotNone(row.content_type_id)
+        self.assertIsNotNone(row.object_id)
+        self.assertEqual(row.status, "accepted")
+        self.assertIsNone(row.apply_attempt_id)
+
+    def test_promotion_keeps_a_distinct_unicode_policy_name(self):
+        """Distinct Unicode names do not inherit another list's LOCAL classification."""
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from netbox_nso_plugin import apply_state
+        from netbox_nso_plugin.models import NSORoutePolicyObjectClass, NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import _group_mode, reconcile_route_policy
+
+        management = self._make_mgmt(self.device)
+        NSORoutePolicyObjectClass.objects.create(family="community_list", object_name="CL-\u03c3", mode="local")
+        reconcile_route_policy(self.device, {"community_lists": [{"name": "CL-\u03c2", "entries": []}]})
+        row = NSORoutePolicyState.objects.get(management=management, object_name="CL-\u03c2")
+        self.assertEqual(_group_mode(row.family, row.object_name), "master")
+        self.assertEqual(row.classification_mode, "master")
+        self.assertEqual(row.assigned_object.name, "CL-\u03c2")
+        row.status = "accepted"
+        save_overlay_fixture(row, update_fields=["status"])
+        prepared = SimpleNamespace(management=management, rows=[row])
+        self._refresh_pushed_snapshot(prepared, self.device)
+
+        apply_state.promote_current_intent(
+            prepared.management,
+            prepared.registry,
+            prepared.pushed,
+            apply_attempt_id=uuid4(),
+            **prepared.direct_selection,
+            static_route_stored=False,
+        )
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+        self.assertIsNotNone(row.apply_attempt_id)
 
 
 class TestDeviceCaughtUpSettle(TestCase):

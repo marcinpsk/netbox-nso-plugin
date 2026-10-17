@@ -15,6 +15,23 @@ def acquire_overlay(model, **values):
     return save_overlay_fixture(model(**values))
 
 
+def acquire_bgp_router(management, router, **values):
+    """Acquire the linked router and its explicit native scope and AF graph."""
+    from netbox_nso_plugin.models import NSOBGPRouterState
+
+    return update_or_acquire_overlay(
+        NSOBGPRouterState,
+        management=management,
+        asn_str=str(router.asn.asn),
+        defaults={
+            "bgp_router": router,
+            "router_id": str(router.router_id or ""),
+            "status": "accepted",
+            **values,
+        },
+    )[0]
+
+
 def save_overlay_fixture(instance, *, update_fields=None):
     from ._outbox_case import without_commit_drain
 

@@ -38,7 +38,7 @@ from netbox_nso_plugin.models import (
     NSOLinkRoleAssignment,
 )
 
-from ._outbox_case import without_commit_drain
+from ._outbox_case import ReceiptAdapter, without_commit_drain
 from ._ownership_case import update_or_acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
@@ -374,15 +374,20 @@ class TestProvisionForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             description_template="{self_host}",
             igp="none",
         )
-        with patch("netbox_nso_plugin.adapter_client.put_intent", return_value={"count": 1}) as mock_put:
-            with content_mutation({(self.dev_a.pk, "interface")}):
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
+            with without_commit_drain(), content_mutation({(self.dev_a.pk, "interface")}):
                 outbox.enqueue(self.dev_a.pk, "interface")
-            drain.drain_key(self.dev_a.pk, "interface")  # the baseline the claim dedupes against
-            self.assertEqual(mock_put.call_count, 1)
-            drain.push_now(self.dev_a.pk, "interface")  # the control: no queued revision, so nothing to send
-            self.assertEqual(mock_put.call_count, 1)
-            _push_provisioned(role, [self.dev_a.pk])  # re-provision must send AGAIN (forced)
-            self.assertEqual(mock_put.call_count, 2)
+            self.assertEqual(drain.drain_key(self.dev_a.pk, "interface"), drain.SUCCEEDED)
+            self.assertEqual(len(adapter.requests), 1)
+            drain.push_now(self.dev_a.pk, "interface")
+            self.assertEqual(len(adapter.requests), 1)
+            _push_provisioned(role, [self.dev_a.pk])
+            self.assertEqual(len(adapter.requests), 2)
+        self.assertTrue(all(request["url"].endswith("/intent") for request in adapter.requests))
+        self.assertEqual(adapter.requests[0]["body"], adapter.requests[1]["body"])
+        self.assertNotEqual(adapter.requests[0]["push_seq"], adapter.requests[1]["push_seq"])
 
 
 class TestProvisionActionView(_Base):

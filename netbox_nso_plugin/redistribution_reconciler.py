@@ -60,6 +60,26 @@ def redistribution_reconcile_plan(device, payload):
     return replace(plan, lock_footprint=lock_footprint)
 
 
+def bgp_destination_parts(dest_ref):
+    """Split a BGP destination reference ``<asn>/<vrf>/<af>``; a VRF name with ``/`` is not representable."""
+    from .bgp_router_content import BGPIntentError
+
+    parts = (dest_ref or "").split("/")
+    if len(parts) != 3:
+        raise BGPIntentError("BGP redistribution has an invalid destination identity.")
+    return tuple(parts)
+
+
+def _canonical_bgp_destination_ref(dest_ref):
+    """Return an adapter BGP destination ``<asn>/<vrf>[/<af>]`` with its ASN in canonical asplain."""
+    from .bgp_router_content import canonical_asn
+
+    parts = dest_ref.split("/")
+    if len(parts) not in (2, 3):
+        raise ValueError("BGP redistribution has an invalid destination identity.")
+    return "/".join((canonical_asn(parts[0]), *parts[1:]))
+
+
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     """Resolve the native destination object for one redistribution entry."""
     from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, ISISInstance, OSPFInstance
@@ -79,10 +99,10 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     from django.contrib.contenttypes.models import ContentType
     from ipam.models import ASN, VRF
 
-    parts = (dest_ref or "").split("/")
-    if len(parts) != 3:
+    try:
+        asn_value, vrf_name, address_family = bgp_destination_parts(dest_ref)
+    except ValueError:
         return None
-    asn_value, vrf_name, address_family = parts
     try:
         asn = ASN.objects.filter(asn=int(asn_value)).first()
     except (TypeError, ValueError):
@@ -189,6 +209,14 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
                 "Adapter returned a redistribution entry without a destination or source protocol",
                 code="invalid_response",
             )
+        if destination_protocol == "bgp":
+            try:
+                destination_ref = _canonical_bgp_destination_ref(destination_ref)
+            except ValueError:
+                raise AdapterError(
+                    "Adapter returned a redistribution entry with an invalid BGP destination identity",
+                    code="invalid_response",
+                ) from None
         key = (destination_protocol, destination_ref, source_protocol, source_ref)
         if key in seen:
             raise AdapterError("Adapter returned duplicate redistribution identity", code="invalid_response")

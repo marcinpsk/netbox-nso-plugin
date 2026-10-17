@@ -14,7 +14,7 @@ import importlib
 from io import StringIO
 
 from django.core.management import call_command
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
@@ -85,6 +85,15 @@ class TestMigrationGraph(SimpleTestCase):
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
+        state = loader.project_state([(APP, leaves[0])])
+        for name in (
+            "nsoacceptedselection",
+            "nsoapplyexecution",
+            "nsoapplyoverlaysnapshot",
+            "nsooverlaysettlementfence",
+            "nsobgprouterstate",
+        ):
+            assert (APP, name) in state.models, f"missing refusal ledger model: {name}"
 
 
 class TestMigrationsMatchTheModels(TestCase):
@@ -97,6 +106,131 @@ class TestMigrationsMatchTheModels(TestCase):
             call_command("makemigrations", APP, check=True, dry_run=True, verbosity=1, stdout=out)
         except SystemExit:
             self.fail(f"{APP} has model changes with no migration:\n{out.getvalue()}")
+        from django.apps import apps
+
+        for name in (
+            "NSOAcceptedSelection",
+            "NSOApplyExecution",
+            "NSOApplyOverlaySnapshot",
+            "NSOOverlaySettlementFence",
+            "NSOBGPRouterState",
+        ):
+            self.assertIsNotNone(apps.get_model(APP, name))
+
+
+class TestRefusalLedgerMigration(_CascadeFlushMixin, TransactionTestCase):
+    def test_refusal_schema_upgrades_from_family_observation(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
+
+        from ._outbox_case import make_device
+
+        device = make_device("refusal-migration")
+        instance = NSOInstance.objects.create(name="placeholder-migration", adapter_instance_id="placeholder-migration")
+        management = NSODeviceManagement.objects.create(
+            device=device, nso_instance=instance, nso_device_name="placeholder-device", adapter_device_id=17
+        )
+        executor = MigrationExecutor(connection)
+        leaves = executor.loader.graph.leaf_nodes(APP)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
+        parent = (APP, "0033_family_observation")
+        executor.migrate([parent])
+        old = executor.loader.project_state([parent]).apps
+        attempt = old.get_model(APP, "NSOApplyAttempt").objects.create(management_id=management.pk)
+        host = old.get_model(APP, "NSOLoggingHostState").objects.create(
+            management_id=management.pk, address="192.0.2.1", status="accepted"
+        )
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaves)
+        current = executor.loader.project_state(leaves).apps
+        upgraded = current.get_model(APP, "NSOApplyAttempt").objects.get(pk=attempt.pk)
+        self.assertEqual(upgraded.trigger_kind, "manual")
+        self.assertIsNone(upgraded.completed_at)
+        logging = current.get_model(APP, "NSOLoggingHostState").objects.get(pk=host.pk)
+        self.assertEqual(logging.status, "accepted")
+        self.assertIsNone(logging.last_apply_at)
+        self.assertIsNone(logging.apply_attempt_id)
+        self.assertEqual(logging.last_apply_error, "")
+
+
+class TestDirectSelectionSchema(TestCase):
+    def test_direct_selection_constraints(self):
+        from django.apps import apps
+        from django.utils import timezone
+
+        from ._outbox_case import make_managed
+
+        _device, management = make_managed("direct-selection-migration", 1767)
+        model = apps.get_model(APP, "NSOAcceptedSelection")
+        model.objects.create(
+            management_id=management.pk,
+            mapping_epoch="a" * 64,
+            stream="vlan",
+            source_push_seq=41,
+            plugin_revision=7,
+            request_digest="b" * 64,
+            contributor_manifest=[{"model_label": "netbox_nso_plugin.nsovlanstate", "overlay_pk": 17}],
+        )
+        values = {
+            "management_id": management.pk,
+            "mapping_epoch": "c" * 64,
+            "stream": "lag",
+            "plugin_revision": 8,
+            "request_digest": "d" * 64,
+        }
+        provisional = model.objects.create(**values)
+        self.assertIsNone(provisional.source_push_seq)
+        self.assertIsNone(provisional.selection_revision)
+        for changes in (
+            {"stream": "vlan"},
+            {"acknowledged_at": timezone.now()},
+            {"binding_state": "bound", "store_incarnation": "placeholder-store", "frozen_revision": 1},
+            {"selection_revision": 0},
+        ):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                model.objects.create(**(values | changes))
+        provisional.selection_revision = 91
+        provisional.acknowledged_at = timezone.now()
+        provisional.save(update_fields=("selection_revision", "acknowledged_at"))
+        self.assertEqual(model.objects.get(pk=provisional.pk).selection_revision, 91)
+
+
+class TestBGPRouterLedgerSchema(TestCase):
+    def test_router_label_is_persistable_after_ledger_migration(self):
+        from django.apps import apps
+
+        from ._outbox_case import make_managed
+
+        Router = apps.get_model(APP, "NSOBGPRouterState")
+        _device, management = make_managed("router-label-migration", 1767)
+        from netbox_nso_plugin.intent_state import offline_mutation
+
+        with transaction.atomic(), offline_mutation():
+            router = Router.objects.create(management=management, asn_str="64512")
+        attempt = apps.get_model(APP, "NSOApplyAttempt").objects.create(management=management)
+        snapshot = apps.get_model(APP, "NSOApplyOverlaySnapshot").objects.create(
+            attempt=attempt,
+            model_label=router._meta.label_lower,
+            overlay_pk=router.pk,
+            mapping_epoch="a" * 64,
+            prior_status="imported",
+            expected_status="deploying",
+            content_digest="b" * 64,
+        )
+        fence = apps.get_model(APP, "NSOOverlaySettlementFence").objects.create(
+            management=management,
+            mapping_epoch="a" * 64,
+            model_label=router._meta.label_lower,
+            overlay_pk=router.pk,
+            current_attempt=attempt,
+        )
+        snapshot.refresh_from_db()
+        fence.refresh_from_db()
+        self.assertEqual(snapshot.overlay_pk, router.pk)
+        self.assertEqual(fence.overlay_pk, router.pk)
+        for ledger_row in (snapshot, fence):
+            self.assertIn(router._meta.label_lower, dict(ledger_row._meta.get_field("model_label").choices))
 
 
 class TestDeploymentControlMigration(TestCase):
@@ -271,9 +405,9 @@ class TestApplyIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
         self._migrate(DEPLOYMENT_CONTROL)
         self._migrate(APPLY_IDENTITY)
 
-        single.refresh_from_db()
-        peer.refresh_from_db()
-        point_to_point.refresh_from_db()
+        single.refresh_from_db(fields=["allocation_kind"])
+        peer.refresh_from_db(fields=["allocation_kind"])
+        point_to_point.refresh_from_db(fields=["allocation_kind"])
         self.assertEqual(single.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_SINGLE)
         self.assertEqual(peer.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)
         self.assertEqual(point_to_point.allocation_kind, NSOInterfaceIPState.ALLOCATION_KIND_P2P)

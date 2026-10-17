@@ -23,14 +23,19 @@ from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import connections, transaction
 from django.test import SimpleTestCase, TransactionTestCase
 
-from ._outbox_case import content_bulk_update, mirror_update, wait_until_postgres_blocks, without_commit_drain
+from ._outbox_case import (
+    ReceiptAdapter,
+    content_bulk_update,
+    mirror_update,
+    wait_until_postgres_blocks,
+    without_commit_drain,
+)
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 from .test_sync_cache import _SyncCacheTestBase
 
 PREFIX = "10.90.0.0/16"
 NEXT_HOP = "10.90.0.1"
-PUT = "netbox_nso_plugin.adapter_client.put_static_route_intent"
 STALE_ADVISORY = "an advisory about the generation the backfill supersedes"
 
 
@@ -68,7 +73,7 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
             self.route = StaticRoute.objects.create(prefix=PREFIX, next_hop=NEXT_HOP, metric=1)
         _assign_without_push(self.route, self.device)
         attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
-        with patch(PUT), without_commit_drain(), transaction.atomic():
+        with without_commit_drain(), transaction.atomic():
             self.state = acquire_overlay(
                 NSOStaticRouteState,
                 management=self.mgmt,
@@ -135,16 +140,19 @@ class _ClobberBarrierCase(IntentPushResetMixin, _CascadeFlushMixin, TransactionT
         """Run the real fleet pass, and return the generation it armed this row with."""
         from netbox_nso_plugin.intent_drift import resync_static_route_intent_fleet
 
-        def _ack(adapter_device_id, routes):
+        def _ack(body):
+            routes = body["routes"]
             return {
-                "device_id": adapter_device_id,
+                "device_id": self.mgmt.adapter_device_id,
                 "count": len(routes),
                 "routes": [
                     {"route_id": r["route_id"], "generation": r["generation"], "fingerprint": "fp-new"} for r in routes
                 ],
             }
 
-        with patch(PUT, side_effect=_ack):
+        adapter = ReceiptAdapter(respond=_ack)
+        config, session = adapter.patches()
+        with config, session:
             results = resync_static_route_intent_fleet(device_ids=[self.device.pk])
         assert [row["armed"] for row in results] == [1], results
         self.state.refresh_from_db()
