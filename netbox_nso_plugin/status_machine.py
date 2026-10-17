@@ -403,7 +403,7 @@ def on_reconcile(
         if current == DEPLOYING:
             if not settles_deploying:
                 return current  # only a correlated apply result may settle this family
-            if matches is False and settles_owned:
+            if conflict or (matches is False and settles_owned):
                 return current
             return advance(current, RECONCILE, to=IN_SYNC)
         if matches is None or not settles_owned:

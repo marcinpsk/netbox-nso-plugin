@@ -118,7 +118,7 @@
       edit.dataset.peUrl = row.edit_url;
       edit.dataset.peTitle = row.peer_address + " BGP session";
       edit.dataset.peFields = "remote_as:text:Remote AS,enabled:select:State";
-      edit.setAttribute("data-pe-v-remote_as", row.remote_as || "");
+      edit.setAttribute("data-pe-v-remote_as", row.remote_as != null ? row.remote_as : "");
       edit.setAttribute("data-pe-v-enabled", row.enabled === false ? "False" : "True");
       edit.setAttribute(
         "data-pe-o-enabled",
@@ -146,7 +146,7 @@
     wrap.className = "d-flex align-items-center gap-1 flex-wrap";
     var remote = document.createElement("span");
     remote.className = "small";
-    remote.textContent = row.remote_as ? "remote AS " + row.remote_as : "remote AS inherited";
+    remote.textContent = row.remote_as != null && row.remote_as !== "" ? "remote AS " + row.remote_as : "remote AS inherited";
     wrap.appendChild(remote);
     appendAddressFamilies(wrap, row.address_families);
     return wrap;
@@ -259,9 +259,9 @@
         return rows.map(function (row) {
           row._local = [row.asn || "", row.vrf || "global"].join(" ");
           row._peer = row.peer_address || "";
-          row._session = [row.remote_as || "", row.peer_group || "", row.source || ""].join(" ");
+          row._session = [row.remote_as != null ? row.remote_as : "", row.peer_group || "", row.source || ""].join(" ");
           row._template = row.template_name || "";
-          row._config = [row.remote_as || "", ...(row.address_families || []).map(function (af) { return af.af; })].join(" ");
+          row._config = [row.remote_as != null ? row.remote_as : "", ...(row.address_families || []).map(function (af) { return af.af; })].join(" ");
           row._router = row.asn || "";
           row._router_config = [row.router_id || "", ...(row.scopes || []).map(function (scope) { return scope.vrf; })].join(" ");
           return row;

@@ -227,6 +227,55 @@ class TestDurableClaimCapture(_CascadeFlushMixin, IntentPushResetMixin, Transact
                 )
             )
 
+    def test_manifest_reads_owner_relations_without_per_row_queries(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOInterfaceState
+        from netbox_nso_plugin.selection_manifest import frozen_manifest
+
+        with without_commit_drain():
+            self.management.manage_description = True
+            self.management.save(update_fields=("manage_description",))
+        bundle = self._bundle()
+        expected = {"vlan": set(), "lacp": {(bundle._meta.label_lower, bundle.pk)}, "interface": set()}
+        with without_commit_drain(), transaction.atomic():
+            for index in range(4):
+                vlan = own_vlan(self.management, 1800 + index, f"manifest-{index}")
+                member = self._member(bundle, f"Ethernet{index}")
+                interface = save_overlay_fixture(
+                    NSOInterfaceState(
+                        interface=member.interface,
+                        attribute="description",
+                        status="accepted",
+                    )
+                )
+                for scope, row in (("vlan", vlan), ("lacp", member), ("interface", interface)):
+                    expected[scope].add((row._meta.label_lower, row.pk))
+
+        for scope, owners in expected.items():
+            with self.subTest(scope=scope):
+                payload = delivery.render(scope, self.device.pk, self.management.adapter_device_id).payload
+                with transaction.atomic(), CaptureQueriesContext(connection) as queries:
+                    manifest, selected = frozen_manifest(self.management, scope, payload)
+                self.assertEqual(set(selected), owners)
+                self.assertEqual({(row["model_label"], row["overlay_pk"]) for row in manifest}, owners)
+                relation_reads = [
+                    query["sql"]
+                    for query in queries
+                    if any(
+                        f'FROM "{table}"' in query["sql"]
+                        for table in ("dcim_interface", "ipam_vlan", "netbox_nso_plugin_nsodevicemanagement")
+                    )
+                ]
+                self.assertEqual(relation_reads, [])
+                locks = [
+                    query["sql"].split("FOR UPDATE OF ")[1] for query in queries if "FOR UPDATE OF " in query["sql"]
+                ]
+                self.assertTrue(locks)
+                self.assertTrue(
+                    all(lock.strip().startswith('"netbox_nso_plugin_nso') and "," not in lock for lock in locks)
+                )
+
     def _selection(self, stream, *, before_send=False):
         records = (
             self.adapter.observations[-1]["selections"]

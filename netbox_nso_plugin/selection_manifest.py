@@ -85,8 +85,16 @@ def lock_manifest_rows(management, scopes):
         if spec is None or not scopes.intersection(spec.delivery_keys):
             continue
         _enter_level(8, (rank, 0))
-        queryset = spec.model.objects.select_for_update(of=("self",)).filter(
-            **{spec.device_lookup: management.device_id}, status__in=OWNED_STATES
+        related = {spec.device_lookup.rsplit("__", 1)[0]}
+        related.update(
+            field.rsplit(".", 1)[0].replace(".", "__")
+            for field in _IDENTITY_FIELDS[spec.model._meta.model_name]
+            if "." in field
+        )
+        queryset = (
+            spec.model.objects.select_for_update(of=("self",))
+            .select_related(*sorted(related))
+            .filter(**{spec.device_lookup: management.device_id}, status__in=OWNED_STATES)
         )
         if spec.model._meta.model_name == "nsoredistributionstate":
             queryset = queryset.filter(dest_protocol__in=scopes.intersection({"bgp", "ospf", "isis"}))

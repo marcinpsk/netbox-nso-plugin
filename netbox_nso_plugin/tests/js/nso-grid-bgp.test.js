@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "../../static/netbox_nso_plugin/nso-grid.js";
 import "../../static/netbox_nso_plugin/nso-grid-bgp.js";
+import "../../static/netbox_nso_plugin/nso-popedit.js";
 
 class FakeTabulator {
   constructor(el, config) {
@@ -54,7 +55,10 @@ beforeEach(() => {
   delete window.__nsoGrid_bgp_routers;
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  vi.unstubAllGlobals();
+});
 
 describe("BGP grid", () => {
   it("shows router identity, membership, and explicit actions", () => {
@@ -122,6 +126,36 @@ describe("BGP grid", () => {
     expect(session.textContent).toContain("remote AS unavailable");
     expect(session.textContent).toContain("state unavailable");
     expect(session.textContent).not.toContain("enabled");
+  });
+
+  it.each([0, "64513", null, undefined])("seeds the peer editor and search text with remote AS %s", (remoteAs) => {
+    const row = {
+      asn: "64512",
+      peer_address: "198.18.0.2",
+      remote_as: remoteAs,
+      enabled: true,
+      edit_url: "/overlay/bgp_peer/7/edit-field/",
+    };
+    const table = mount("peers", row);
+    const session = table.config.columns.find((column) => column.field === "_session").formatter(cell(row));
+    document.body.appendChild(session);
+    session.querySelector(".nso-popedit").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    const expected = remoteAs == null ? "" : String(remoteAs);
+    expect(document.querySelector('.nso-popedit-card input[aria-label="Remote AS"]').value).toBe(expected);
+    expect(table.config.data[0]._session.trim()).toBe(expected);
+  });
+
+  it.each([0, "64513", "", null, undefined])("renders template remote AS %s in its display and search text", (remoteAs) => {
+    const row = { template_name: "PEERS", remote_as: remoteAs };
+    const table = mount("templates", row);
+    const config = table.config.columns.find((column) => column.field === "_config").formatter(cell(row));
+    expect(config.textContent).toContain((remoteAs == null || remoteAs === "") ? "remote AS inherited" : "remote AS " + remoteAs);
+    expect(table.config.data[0]._config).toBe(remoteAs == null ? "" : String(remoteAs));
+  });
+
+  it.each([["peers", "_session"], ["templates", "_config"]])("keeps zero in the %s search text", (section, field) => {
+    const table = mount(section, { remote_as: 0 });
+    expect(table.config.data[0][field].trim()).toBe("0");
   });
 
   it("shows explicit false as disabled", () => {

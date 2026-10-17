@@ -234,6 +234,38 @@ class TestOnReconcile(SimpleTestCase):
         self.assertEqual(sm.on_reconcile(sm.IN_SYNC, matches=True, conflict=True), sm.ACCEPTED)
         self.assertEqual(sm.on_reconcile(sm.DEPLOYING, matches=True, conflict=True), sm.DEPLOYING)
 
+    def test_deploying_conflict_never_settles_for_any_confirmation_mode(self):
+        for matches in (None, False, True):
+            for settles_owned in (False, True):
+                for settles_deploying in (False, True):
+                    with self.subTest(
+                        matches=matches, settles_owned=settles_owned, settles_deploying=settles_deploying
+                    ):
+                        self.assertEqual(
+                            sm.on_reconcile(
+                                sm.DEPLOYING,
+                                matches=matches,
+                                conflict=True,
+                                settles_owned=settles_owned,
+                                settles_deploying=settles_deploying,
+                            ),
+                            sm.DEPLOYING,
+                        )
+                        expected = (
+                            sm.IN_SYNC
+                            if settles_deploying and (matches is not False or not settles_owned)
+                            else sm.DEPLOYING
+                        )
+                        self.assertEqual(
+                            sm.on_reconcile(
+                                sm.DEPLOYING,
+                                matches=matches,
+                                settles_owned=settles_owned,
+                                settles_deploying=settles_deploying,
+                            ),
+                            expected,
+                        )
+
     def test_owned_mirror_is_preserved(self):
         # Owned, no value to compare: accepted/in_sync stay put (deploying settles).
         self.assertEqual(sm.on_reconcile(sm.ACCEPTED, matches=None), sm.ACCEPTED)
