@@ -163,7 +163,7 @@ jobs:
 
       - name: Upload shard evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-shard-${{ matrix.shard }}
           path: netbox-nso-plugin/.ci-results/
@@ -215,7 +215,7 @@ jobs:
         working-directory: netbox-nso-plugin
         run: python -m unittest discover -s .github/ci -v
       - name: Download this version's shard evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-shard-*
           path: netbox-nso-plugin/.ci-results
@@ -224,7 +224,7 @@ jobs:
         run: |
           python .github/ci/sharding.py aggregate .ci-results --shards "$CI_SHARDS"
       - name: Upload refreshed timing data
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: netbox-${{ matrix.environment.python-version }}-${{ matrix.environment.netbox-version }}-durations
           path: netbox-nso-plugin/.ci-results/durations.json
@@ -268,6 +268,14 @@ jobs:
           repository: marcinpsk/nso-adapter
           ref: main
           path: nso-adapter
+          persist-credentials: false
+
+      - name: Check out the pinned refusal contract artifacts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: marcinpsk/nso-adapter
+          ref: 615eaa54bd7fd42ad309f73463963ea23cfee61c
+          path: refusal-adapter
           persist-credentials: false
 
       - name: Install uv
@@ -349,6 +357,7 @@ jobs:
           NSO_LIVE_ADAPTER_TEST: "1"
           NSO_LIVE_ADAPTER_URL: http://127.0.0.1:18000
           NSO_LIVE_ADAPTER_TOKEN: contract-adapter-token
+          REFUSAL_SETTLEMENT_FIXTURE: ${{ github.workspace }}/refusal-adapter/tests/fixtures/refusal_settlement.json
         run: >-
           uv run -- pytest
           -c /dev/null --rootdir=.

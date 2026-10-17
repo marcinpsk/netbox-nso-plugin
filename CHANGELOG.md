@@ -2,6 +2,61 @@
 
 <!-- version list -->
 
+## v1.9.0 (2026-10-10)
+
+### Bug Fixes
+
+- **differences**: Key a redistribution destination VRF by its protocol
+  ([`7133590`](https://github.com/marcinpsk/netbox-nso-plugin/commit/71335909cb9ad6985707681eb19fa10d165c3fa0))
+
+- **differences**: Name the redistribute collection in a destination coverage gap
+  ([`1579f26`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1579f266df0f7687780012dc551e45ed7f1740e2))
+
+- **sync**: Block a device prefix length that the address family cannot hold
+  ([`5ca8590`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5ca8590a0a138efcda1bd43043a7b2ffab720813))
+
+- **sync**: Match a global-table address that the adapter reports with an empty VRF
+  ([`341b03a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/341b03a2780f38f94528ac637929ec65863ff6f0))
+
+### Build System
+
+- **deps**: Declare jsonschema as a range, not an exact pin
+  ([`b5c7390`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b5c7390e7a61138a2d971dcc3db16fb3f72c5a85))
+
+### Chores
+
+- **deps**: Bump source-map-js from 1.2.1 to 1.2.2
+  ([`f9926df`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f9926df7856de409454cee410f809871bb259ddf))
+
+### Continuous Integration
+
+- Test one lane, NetBox v4.7.2 on Python 3.14
+  ([`28423ba`](https://github.com/marcinpsk/netbox-nso-plugin/commit/28423ba0c8ebf26c9743ec34927860c230a99096))
+
+### Features
+
+- **differences**: Compare routing scopes with device observations
+  ([`0c3b4ef`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0c3b4ef918357ad75d6dae0dcb99893bbc3719a1))
+
+### Performance Improvements
+
+- **differences**: Resolve the NED and route VRFs once per pass, not per route
+  ([`54d9d4d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/54d9d4dd32719fe98672cf78992a0ba9a947c2a7))
+
+### Refactoring
+
+- **differences**: Define the routing scope set once
+  ([`88aabb5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/88aabb56552f5b82f20c094387a30b7f516230ac))
+
+### Testing
+
+- **route-policy**: Build the fake observation from the captured payload
+  ([`c2d7f63`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c2d7f631886f998b94a437e0fbf9e126fed34eb1))
+
+- **views**: Name the plugin action and the adapter path in the refresh docstring
+  ([`d85604b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d85604bca56951964487dd5e13f1c71cea8eb411))
+
+
 ## v1.8.0 (2026-10-07)
 
 
