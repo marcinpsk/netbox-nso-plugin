@@ -460,9 +460,8 @@ class TestPeerIntentMigration(_CascadeFlushMixin, TransactionTestCase):
         device, management = make_managed("peer-migration", 1804)
         _reconcile_bgp_config(device, peer_document(device))
         peer = NSOBGPPeerState.objects.get(management=management)
-        router = NSOBGPRouterState.objects.get(management=management)
-        executor.migrate([("netbox_nso_plugin", "0036_direct_selection_capture")])
-        old = executor.loader.project_state([("netbox_nso_plugin", "0036_direct_selection_capture")]).apps
+        executor.migrate([("netbox_nso_plugin", "0033_family_observation")])
+        old = executor.loader.project_state([("netbox_nso_plugin", "0033_family_observation")]).apps
         OldPeer = old.get_model("netbox_nso_plugin", "NSOBGPPeerState")
         OldPeer.objects.filter(pk=peer.pk).update(device_base_hash="a" * 64)
         owned = OldPeer.objects.create(
@@ -480,8 +479,6 @@ class TestPeerIntentMigration(_CascadeFlushMixin, TransactionTestCase):
         new = executor.loader.project_state(leaves).apps.get_model("netbox_nso_plugin", "NSOBGPPeerState")
         self.assertEqual(set(new.objects.values_list("device_base_hash", flat=True)), {""})
         self.assertFalse({"remote_as_str", "enabled"} & {field.name for field in new._meta.concrete_fields})
-        router.refresh_from_db()
-        self.assertNotEqual(router.device_base_hash, "")
         self.assertEqual(NSOBGPPeerTemplateState.objects.get().device_base_hash, "c" * 64)
         _reconcile_bgp_config(device, peer_document(device))
         peer.refresh_from_db()

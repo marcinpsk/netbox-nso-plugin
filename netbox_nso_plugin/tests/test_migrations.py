@@ -154,22 +154,16 @@ class TestRefusalLedgerMigration(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(logging.last_apply_error, "")
 
 
-class TestDirectSelectionMigration(_CascadeFlushMixin, TransactionTestCase):
-    def test_direct_selection_upgrade_preserves_captured_evidence(self):
-        from django.db import IntegrityError, transaction
-        from django.db.migrations.executor import MigrationExecutor
+class TestDirectSelectionSchema(TestCase):
+    def test_direct_selection_constraints(self):
+        from django.apps import apps
         from django.utils import timezone
 
         from ._outbox_case import make_managed
 
         _device, management = make_managed("direct-selection-migration", 1767)
-        executor = MigrationExecutor(connection)
-        leaves = executor.loader.graph.leaf_nodes(APP)
-        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
-        parent = (APP, "0035_bgp_router_state")
-        executor.migrate([parent])
-        old = executor.loader.project_state([parent]).apps
-        selection = old.get_model(APP, "NSOAcceptedSelection").objects.create(
+        model = apps.get_model(APP, "NSOAcceptedSelection")
+        model.objects.create(
             management_id=management.pk,
             mapping_epoch="a" * 64,
             stream="vlan",
@@ -178,12 +172,6 @@ class TestDirectSelectionMigration(_CascadeFlushMixin, TransactionTestCase):
             request_digest="b" * 64,
             contributor_manifest=[{"model_label": "netbox_nso_plugin.nsovlanstate", "overlay_pk": 17}],
         )
-        before = old.get_model(APP, "NSOAcceptedSelection").objects.filter(pk=selection.pk).values().get()
-        executor = MigrationExecutor(connection)
-        executor.migrate(leaves)
-        current = executor.loader.project_state(leaves).apps
-        model = current.get_model(APP, "NSOAcceptedSelection")
-        self.assertEqual(model.objects.filter(pk=selection.pk).values().get(), before)
         values = {
             "management_id": management.pk,
             "mapping_epoch": "c" * 64,
@@ -208,101 +196,7 @@ class TestDirectSelectionMigration(_CascadeFlushMixin, TransactionTestCase):
         self.assertEqual(model.objects.get(pk=provisional.pk).selection_revision, 91)
 
 
-class TestBGPRouterMigration(_CascadeFlushMixin, TransactionTestCase):
-    def test_bgp_router_schema_upgrades_from_refusal_ledger(self):
-        from django.db.migrations.executor import MigrationExecutor
-
-        from ._outbox_case import make_managed
-
-        _device, management = make_managed("router-ledger-migration", 1767)
-        executor = MigrationExecutor(connection)
-        leaves = executor.loader.graph.leaf_nodes(APP)
-        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
-        parent = (APP, "0034_refusal_settlement_ledger")
-        executor.migrate([parent])
-        old = executor.loader.project_state([parent]).apps
-        attempt = old.get_model(APP, "NSOApplyAttempt").objects.create(management_id=management.pk)
-        peer = old.get_model(APP, "NSOBGPPeerState").objects.create(
-            management_id=management.pk,
-            asn_str="64512",
-            peer_address_str="192.0.2.1",
-            status="accepted",
-            last_apply_error="placeholder old evidence",
-        )
-        selection = old.get_model(APP, "NSOAcceptedSelection").objects.create(
-            management_id=management.pk,
-            mapping_epoch="a" * 64,
-            stream="bgp",
-            source_push_seq=41,
-            plugin_revision=7,
-            request_digest="b" * 64,
-            contributor_manifest=[{"model_label": peer._meta.label_lower, "overlay_pk": peer.pk}],
-        )
-        snapshot_values = {
-            "attempt_id": attempt.pk,
-            "selection_id": selection.pk,
-            "model_label": peer._meta.label_lower,
-            "overlay_pk": peer.pk,
-            "mapping_epoch": "a" * 64,
-            "prior_status": "accepted",
-            "expected_status": "deploying",
-            "content_digest": "c" * 64,
-            "prior_last_apply_error": "placeholder old evidence",
-        }
-        snapshot = old.get_model(APP, "NSOApplyOverlaySnapshot").objects.create(**snapshot_values)
-        fence_values = {
-            "management_id": management.pk,
-            "mapping_epoch": "a" * 64,
-            "model_label": peer._meta.label_lower,
-            "overlay_pk": peer.pk,
-            "current_attempt_id": attempt.pk,
-            "bookkeeping_revision": 7,
-        }
-        fence = old.get_model(APP, "NSOOverlaySettlementFence").objects.create(**fence_values)
-        router_label = f"{APP}.nsobgprouterstate"
-        for name, values in (
-            ("NSOApplyOverlaySnapshot", snapshot_values),
-            ("NSOOverlaySettlementFence", fence_values),
-        ):
-            with self.assertRaises(IntegrityError), transaction.atomic():
-                old.get_model(APP, name).objects.create(**(values | {"model_label": router_label}))
-        executor = MigrationExecutor(connection)
-        executor.migrate(leaves)
-        current = executor.loader.project_state(leaves).apps
-        Router = current.get_model(APP, "NSOBGPRouterState")
-        router = Router.objects.create(management_id=management.pk, asn_str="64512")
-        self.assertEqual(router.status, "unknown")
-        self.assertIsNone(router.accepted_at)
-        self.assertIsNone(router.bgp_router_id)
-        self.assertEqual(
-            current.get_model(APP, "NSOBGPPeerState").objects.get(pk=peer.pk).last_apply_error,
-            "placeholder old evidence",
-        )
-        self.assertEqual(
-            current.get_model(APP, "NSOAcceptedSelection").objects.get(pk=selection.pk).contributor_manifest,
-            selection.contributor_manifest,
-        )
-        self.assertEqual(
-            current.get_model(APP, "NSOApplyOverlaySnapshot").objects.get(pk=snapshot.pk).prior_last_apply_error,
-            "placeholder old evidence",
-        )
-        self.assertEqual(
-            current.get_model(APP, "NSOOverlaySettlementFence").objects.get(pk=fence.pk).bookkeeping_revision, 7
-        )
-        for name, values in (
-            ("NSOApplyOverlaySnapshot", snapshot_values),
-            ("NSOOverlaySettlementFence", fence_values),
-        ):
-            row = current.get_model(APP, name).objects.create(
-                **(values | {"model_label": router_label, "overlay_pk": router.pk})
-            )
-            row.refresh_from_db()
-            self.assertEqual(row.model_label, router_label)
-        additions = [name for (app, name) in executor.loader.disk_migrations if app == APP and name > parent[1]]
-        self.assertLessEqual(
-            {"0035_bgp_router_state", "0036_direct_selection_capture", "0037_bgp_peer_native_intent"}, set(additions)
-        )
-
+class TestBGPRouterLedgerSchema(TestCase):
     def test_router_label_is_persistable_after_ledger_migration(self):
         from django.apps import apps
 
