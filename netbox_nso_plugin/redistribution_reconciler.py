@@ -62,9 +62,11 @@ def redistribution_reconcile_plan(device, payload):
 
 def bgp_destination_parts(dest_ref):
     """Split a BGP destination reference ``<asn>/<vrf>/<af>``; a VRF name with ``/`` is not representable."""
+    from .bgp_router_content import BGPIntentError
+
     parts = (dest_ref or "").split("/")
     if len(parts) != 3:
-        raise ValueError("BGP redistribution has an invalid destination identity.")
+        raise BGPIntentError("BGP redistribution has an invalid destination identity.")
     return tuple(parts)
 
 

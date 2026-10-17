@@ -5111,7 +5111,7 @@ def _save_owned_isis_edit(obj, key, old_values):
 
 
 def _bgp_router_errors(state):
-    from .bgp_router_content import qualified_router, router_fragment
+    from .bgp_router_content import BGPIntentError, qualified_router, router_fragment
     from .ownership_planner import OwnershipNotQualified, require_router_acquisition_observation
     from .status_machine import is_owned
 
@@ -5120,8 +5120,8 @@ def _bgp_router_errors(state):
         router_fragment(state.asn_str, state.router_id, [])
         if not is_owned(state.status):
             require_router_acquisition_observation(state)
-    except ValueError as exc:
-        return {"router_id": [str(exc)]}
+    except BGPIntentError as exc:
+        return {"router_id": [exc.public_message]}
     except OwnershipNotQualified as exc:
         return {"router_id": [exc.public_message]}
     return {}
@@ -8349,14 +8349,16 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
 
     def post(self, request, device_pk):  # noqa: D102
+        from .bgp_router_content import BGPIntentError
+
         mgmt = self._mgmt_for(request, device_pk)
         form = NSOBgpPeerGreenfieldForm(request.POST, device=mgmt.device)
         if not form.is_valid():
             return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
         try:
             peer = self._create_peer(mgmt.device, form.cleaned_data, user=request.user)
-        except ValueError as exc:
-            form.add_error(None, str(exc))
+        except BGPIntentError as exc:
+            form.add_error(None, exc.public_message)
             return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
         messages.success(
             request,
@@ -8381,7 +8383,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             BGPScope,
         )
 
-        from .bgp_router_content import qualified_router
+        from .bgp_router_content import BGPIntentError, qualified_router
         from .models import NSOBGPPeerState, NSOBGPRouterState, NSODeviceManagement
         from .ownership_planner import require_qualifying_ownership
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
@@ -8399,13 +8401,13 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             )
         )
         if len(routers) > 1:
-            raise ValueError("Resolve duplicate BGP routers for this device and ASN before adding a peer.")
+            raise BGPIntentError("Resolve duplicate BGP routers for this device and ASN before adding a peer.")
         router = routers[0] if routers else None
         new_router = router is None
         if router is not None:
             state = NSOBGPRouterState.objects.filter(management=management, asn_str=str(data["local_asn"].asn)).first()
             if state is None or not is_owned(state.status) or state.bgp_router_id != router.pk:
-                raise ValueError("Accept the router and its scope / AF membership before adding a BGP peer.")
+                raise BGPIntentError("Accept the router and its scope / AF membership before adding a BGP peer.")
             qualified_router(state)
             require_qualifying_ownership(state)
             if user is not None and not _can_change_bgp_router(user, state):
@@ -8498,7 +8500,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
                 save(router_state, force_insert=True, natural_key=("management", "asn_str"))
             else:
                 if is_owned(current_router_state.status):
-                    raise ValueError("Resolve the existing BGP router state for this ASN before adding a peer.")
+                    raise BGPIntentError("Resolve the existing BGP router state for this ASN before adding a peer.")
                 router_state = copy.copy(current_router_state)
                 router_state.bgp_router = router
                 router_state.router_id = str(router.router_id or "")
@@ -8527,7 +8529,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
             )
         else:
             if is_owned(current_state.status):
-                raise ValueError("Resolve the existing BGP peer state for this address before adding a peer.")
+                raise BGPIntentError("Resolve the existing BGP peer state for this address before adding a peer.")
             state = copy.copy(current_state)
             for field, value in peer_intent.items():
                 setattr(state, field, value)

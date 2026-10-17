@@ -799,12 +799,12 @@ def _require_qualifying_acquisition(instance, binding, acquisition, *, signature
             raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
         return
     if state_model_label == "netbox_nso_plugin.nsobgprouterstate":
-        from .bgp_router_content import qualified_router
+        from .bgp_router_content import BGPIntentError, qualified_router
 
         try:
             qualified_router(instance, device_id=device_id)
-        except ValueError as exc:
-            raise OwnershipNotQualified(str(exc), device_id=device_id) from exc
+        except BGPIntentError as exc:
+            raise OwnershipNotQualified(exc.public_message, device_id=device_id) from exc
     signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
     management = _manifest_management(instance)
     native = _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label])

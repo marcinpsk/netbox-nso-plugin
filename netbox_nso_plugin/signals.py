@@ -2719,7 +2719,7 @@ def _bgp_router_blocker(asn, message, state_id=None):
 
 
 def _bgp_owned_router_entries(device_id):
-    from .bgp_router_content import qualified_router
+    from .bgp_router_content import BGPIntentError, qualified_router
     from .models import NSOBGPRouterState
 
     entries = {}
@@ -2729,8 +2729,8 @@ def _bgp_owned_router_entries(device_id):
         try:
             qualified_router(row, device_id=device_id)
             entry = bgp_router_intent_item(row)
-        except ValueError as exc:
-            return {}, _bgp_router_blocker(row.asn_str, str(exc), row.pk)
+        except BGPIntentError as exc:
+            return {}, _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
         for scope in entry["scopes"]:
             scope["peers"] = []
             for af in scope["address_families"]:
@@ -2740,18 +2740,20 @@ def _bgp_owned_router_entries(device_id):
 
 
 def _bgp_child_scope(entries, asn, vrf, afs=()):
-    from .bgp_router_content import canonical_asn
+    from .bgp_router_content import BGPIntentError, canonical_asn
 
     asn = canonical_asn(asn)
     entry = entries.get(asn)
     if entry is None:
-        raise ValueError("Accept the router before delivering BGP intent.")
+        raise BGPIntentError("Accept the router before delivering BGP intent.")
     scope = next((scope for scope in entry["scopes"] if scope["vrf"] == vrf), None)
     if scope is None:
-        raise ValueError("The owned router does not contain the required VRF scope. Edit its desired membership.")
+        raise BGPIntentError("The owned router does not contain the required VRF scope. Edit its desired membership.")
     membership = {af["af"] for af in scope["address_families"]}
     if not set(afs) <= membership:
-        raise ValueError("The owned router does not contain the required address family. Edit its desired membership.")
+        raise BGPIntentError(
+            "The owned router does not contain the required address family. Edit its desired membership."
+        )
     return scope
 
 
@@ -2770,6 +2772,7 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
     from netbox_routing.models import BGPPeerAddressFamily
 
     from . import adapter_client as client
+    from .bgp_router_content import BGPIntentError
     from .models import NSOBGPPeerState
     from .ownership_planner import OwnershipNotQualified, require_qualifying_ownership
 
@@ -2818,14 +2821,14 @@ def _push_bgp_intent_for_device(device_id, adapter_device_id):
             except OwnershipNotQualified as exc:
                 blocked = _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
                 break
-            except ValueError as exc:
-                blocked = _bgp_router_blocker(row.asn_str, str(exc), row.pk)
+            except BGPIntentError as exc:
+                blocked = _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
                 break
     if blocked is None:
         try:
             _bgp_redistribution_members(entries, device_id)
-        except ValueError as exc:
-            blocked = _bgp_router_blocker("", str(exc))
+        except BGPIntentError as exc:
+            blocked = _bgp_router_blocker("", exc.public_message)
     payload = {"blocked": blocked} if blocked else [entries[asn] for asn in sorted(entries, key=int)]
 
     def push(body):

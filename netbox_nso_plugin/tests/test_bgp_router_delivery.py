@@ -478,3 +478,66 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         blocked = self.payload()["blocked"]
         self.assertEqual(blocked["detail"]["reason"], "blocked_bgp_router")
         self.assertEqual(blocked["message"], "BGP redistribution has an invalid destination identity.")
+
+    def relink_router_to_other_asn(self):
+        BGPRouter.objects.filter(pk=self.router.pk).update(asn=ASN.objects.create(asn=65124, rir=self.asn.rir))
+
+    def internal_failure(self):
+        return patch(
+            "netbox_nso_plugin.bgp_router_content.router_content",
+            side_effect=ValueError("placeholder internal detail"),
+        )
+
+    def test_router_id_edit_returns_only_curated_reasons(self):
+        state = self.router_state(owned=True)
+        url = reverse("plugins:netbox_nso_plugin:overlay_field_edit", args=("bgp_router", state.pk))
+        with self.internal_failure(), self.assertRaisesMessage(ValueError, "placeholder internal detail"):
+            self.client.post(url, {"router_id": "198.18.0.9"})
+        self.relink_router_to_other_asn()
+        response = self.client.post(url, {"router_id": "198.18.0.9"})
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(
+            response.json()["errors"]["router_id"],
+            ["Relink the BGP router to the matching device and ASN before accepting it."],
+        )
+
+    def test_router_blocker_publishes_only_curated_reasons(self):
+        with without_commit_drain():
+            state = self.router_state(owned=True)
+        with self.internal_failure(), self.assertRaisesMessage(ValueError, "placeholder internal detail"):
+            self.payload()
+        self.relink_router_to_other_asn()
+        blocked = self.payload()["blocked"]
+        self.assertEqual(
+            blocked["message"], "Relink the BGP router to the matching device and ASN before accepting it."
+        )
+        self.assertEqual(blocked["detail"], {"reason": "blocked_bgp_router", "asn": "65123", "state_id": state.pk})
+
+    def test_router_qualification_refusal_carries_only_curated_reasons(self):
+        from netbox_nso_plugin.ownership_planner import OwnershipNotQualified, require_qualifying_ownership
+
+        with without_commit_drain():
+            state = self.router_state(owned=True)
+        with self.internal_failure(), self.assertRaisesMessage(ValueError, "placeholder internal detail"):
+            require_qualifying_ownership(state)
+        self.relink_router_to_other_asn()
+        state.refresh_from_db()
+        with self.assertRaises(OwnershipNotQualified) as raised:
+            require_qualifying_ownership(state)
+        self.assertEqual(
+            raised.exception.public_message, "Relink the BGP router to the matching device and ASN before accepting it."
+        )
+
+    def test_greenfield_peer_form_shows_only_curated_reasons(self):
+        with without_commit_drain():
+            self.router_state(owned=True)
+        url = reverse("plugins:netbox_nso_plugin:bgp_peer_add", args=(self.device.pk,))
+        data = {"local_asn": self.asn.pk, "enabled": "on", "address_families": ["ipv4-unicast"]}
+        ip = IPAddress.objects.create(address="198.18.0.3/32")
+        with self.internal_failure(), self.assertRaisesMessage(ValueError, "placeholder internal detail"):
+            self.client.post(url, {**data, "peer": ip.pk})
+        self.relink_router_to_other_asn()
+        response = self.client.post(url, {**data, "peer": ip.pk})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Resolve the existing BGP router state for this ASN before adding a peer.")
+        self.assertFalse(NSOBGPPeerState.objects.exists())
