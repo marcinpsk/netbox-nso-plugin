@@ -270,14 +270,6 @@ jobs:
           path: nso-adapter
           persist-credentials: false
 
-      - name: Check out the pinned refusal contract artifacts
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: marcinpsk/nso-adapter
-          ref: 615eaa54bd7fd42ad309f73463963ea23cfee61c
-          path: refusal-adapter
-          persist-credentials: false
-
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
@@ -357,7 +349,6 @@ jobs:
           NSO_LIVE_ADAPTER_TEST: "1"
           NSO_LIVE_ADAPTER_URL: http://127.0.0.1:18000
           NSO_LIVE_ADAPTER_TOKEN: contract-adapter-token
-          REFUSAL_SETTLEMENT_FIXTURE: ${{ github.workspace }}/refusal-adapter/tests/fixtures/refusal_settlement.json
         run: >-
           uv run -- pytest
           -c /dev/null --rootdir=.
