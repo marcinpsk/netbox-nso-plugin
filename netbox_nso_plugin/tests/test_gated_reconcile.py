@@ -406,6 +406,42 @@ class TestRealReconcilerGateFootprints(TestCase):
         state = NSOBGPPeerState.objects.get(management=self.mgmt)
         self.assertEqual(state.bgp_peer_id, peer.pk)
 
+    def test_bgp_malformed_observation_is_an_invalid_response_before_planning(self):
+        from netbox_routing.models import BGPRouter
+
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPRouterState, NSOFamilyObservation
+        from netbox_nso_plugin.reconcile import reconcile_category
+
+        def malformed(shape, payload):
+            if shape == "observation":
+                payload["observation"] = ["placeholder"]
+            elif shape == "document":
+                payload["observation"]["document"] = ["placeholder"]
+            else:
+                payload["observation"]["document"]["routers"] = ["placeholder"]
+            return payload
+
+        for read_state in ("bound", "unbound", "legacy"):
+            for shape in ("observation", "document", "router"):
+                with self.subTest(read_state=read_state, shape=shape):
+                    device, mgmt = _make(f"gm{uuid.uuid4().hex[:6]}", manage_routing=True, manage_bgp=True)
+                    payload = malformed(shape, self._bgp_payload())
+                    if read_state == "unbound":
+                        payload["read_state"]["payload_revision"] = None
+                    elif read_state == "legacy":
+                        del payload["read_state"]
+                    with (
+                        patch("netbox_nso_plugin.adapter_client.get_bgp_config", return_value=payload),
+                        self.assertRaises(AdapterError) as raised,
+                    ):
+                        reconcile_category(device, mgmt, "bgp")
+                    self.assertEqual(raised.exception.code, "invalid_response")
+                    self.assertFalse(BGPRouter.objects.filter(assigned_object_id=device.pk).exists())
+                    self.assertFalse(NSOBGPRouterState.objects.filter(management=mgmt).exists())
+                    self.assertFalse(NSOBGPPeerState.objects.filter(management=mgmt).exists())
+                    self.assertFalse(NSOFamilyObservation.objects.filter(read_state__management=mgmt).exists())
+
     def test_bfd_gate_covers_native_and_overlay_creations(self):
         from netbox_routing.models import BFDInterface
 
