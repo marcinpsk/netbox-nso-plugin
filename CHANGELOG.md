@@ -2,6 +2,229 @@
 
 <!-- version list -->
 
+## v1.10.0 (2026-10-18)
+
+### Bug Fixes
+
+- **apply**: Redact emitted secrets in capture bookkeeping
+  ([`db20b47`](https://github.com/marcinpsk/netbox-nso-plugin/commit/db20b47772d574e5f82cbc2b0d4df8547bb42bdc))
+
+- **apply**: Report a mid-preparation epoch change as changed intent
+  ([`e217743`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e217743e12ca61cd6bb0c7d7d46378ca600f1cb5))
+
+- **apply**: Restore manual bookkeeping after read progress
+  ([`aa1fb0d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/aa1fb0d837ebe074bc500bbe73b3dda9e2192896))
+
+- **bgp**: Align owned peer overlays on device mirrors
+  ([`760ef28`](https://github.com/marcinpsk/netbox-nso-plugin/commit/760ef28089c40274fe326b871dd665b07fc98d71))
+
+- **bgp**: Create no native router on a conflicted read
+  ([`5f12dc6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5f12dc6ff88795a5a5f319abae1cd6778edef797))
+
+- **bgp**: Keep owned peer intent when a read recreates the native peer
+  ([`23f1702`](https://github.com/marcinpsk/netbox-nso-plugin/commit/23f1702e520d99f36d3a10a9f36a09c76fa3f873))
+
+- **bgp**: Keep pending owned peer intent through a device mirror
+  ([`3a2235a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3a2235ad13b5de051742bdde9fc0e5014a376c69))
+
+- **bgp**: Keep the operator message and state id in the peer push blocker
+  ([`7b996a8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7b996a89a383ac1c41d637cefc13f92ccc910807))
+
+- **bgp**: Make router Accept yield accepted
+  ([`5ff7d8a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5ff7d8afcdfec686ed8a2ed9f54220c628f7c618))
+
+- **bgp**: Merge duplicate peer observations for display
+  ([`1e3accc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1e3accce9708812838a694b47aed863ea902c46d))
+
+- **bgp**: Offer peer bulk accept only for unowned peers
+  ([`56d57a3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/56d57a3cf5b01abdf57bf66953508fb41cad8987))
+
+- **bgp**: Preserve native owned peer intent across reads
+  ([`a612291`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a6122917ed9803b6c740884a4ea3fc9da3abbfe0))
+
+- **bgp**: Preserve owned peer intent on reads
+  ([`b601caf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b601caffc3119d0537650b29c925d8e4c5bb40f8))
+
+- **bgp**: Read a NetBox-side scope or AF removal on an unowned router as changed
+  ([`6cfa916`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6cfa9165513a918b268ee32a13f571040edd2d1f))
+
+- **bgp**: Repend owned routers on device drift and absence
+  ([`e35dc87`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e35dc87d42333f5d2eb0401577abc583e8d3e8f7))
+
+- **bgp**: Report NetBox drift on an unowned router as changed
+  ([`6e98add`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6e98add17b238bc124e59a21a0c3056e5608cfa0))
+
+- **bgp**: Require native identity agreement before settlement
+  ([`1393c36`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1393c36f16343e127e93f0ebed7b5913c5001918))
+
+- **bgp**: Require native permissions for inline peer edits
+  ([`28b8ac0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/28b8ac04d45285fb12ce1499ab84561f975ff398))
+
+- **bgp**: Require owned peer intent for read settlement
+  ([`946ac88`](https://github.com/marcinpsk/netbox-nso-plugin/commit/946ac885310ab1a58d2167fcfb05326d87662211))
+
+- **bgp**: Resolve device references before peer merge
+  ([`ed1042f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ed1042f5c88ee88ce13ed239c2886201eb9db85b))
+
+- **bgp**: Reuse retained peer state on peer creation
+  ([`2bdfc0b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2bdfc0bd210ecbc95f72cf5c821533723c4809f5))
+
+- **bgp**: Reuse retained router state on peer creation
+  ([`cce5759`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cce5759a92400e786a27dd812bd287f0a1f41917))
+
+- **bgp**: Settle review findings on the router overlay
+  ([`50c9a12`](https://github.com/marcinpsk/netbox-nso-plugin/commit/50c9a12a75fe818c1d45cec4472ab245ba10cc51))
+
+- **bgp**: Share peer qualification for rendering and settlement
+  ([`88835cc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/88835cc2c753ceba54a1652334522cfde83f8b42))
+
+- **bgp**: Show operators only authored BGP intent reasons
+  ([`3a608af`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3a608af1800cfb85aa1ef2ab37f1daf29ec9bb83))
+
+- **bgp**: Track device bfd_enabled in the peer read merge
+  ([`31b73b8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/31b73b8f80c35f1df9a9e451ae93af8ffc3890a4))
+
+- **bgp**: Validate inline peer edits against permission constraints
+  ([`41a428d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/41a428da272057029c02e17972f41086752a8fa5))
+
+- **bgp**: Validate inline router edits against permission constraints
+  ([`4c5e760`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4c5e760fbb4cb664ad4b4183fa3ba81f971a9acf))
+
+- **drain**: Commit a takeover abandon before the claim re-forms
+  ([`d782cf7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d782cf7a4d29ee303418dfb12b706f78f42e07bc))
+
+- **drain**: Handle capture source epoch changes
+  ([`f4ac4f6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f4ac4f62470f415e599371d11c996ae790d73555))
+
+- **intent**: Keep unsaved BGP graph rows off orphaned owned overlays
+  ([`ca19fa7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ca19fa701aa37b444c7526feda52aaa2f2cc5799))
+
+- **ownership**: Clear the Apply attempt when an operator edit repends a row
+  ([`998adf6`](https://github.com/marcinpsk/netbox-nso-plugin/commit/998adf6fdac3647ef25a9df840e3740303a8fa6d))
+
+- **permissions**: Restrict device apply previews
+  ([`13b6899`](https://github.com/marcinpsk/netbox-nso-plugin/commit/13b68997e51dc331a17d29b3c3b4fd178b22b9ac))
+
+- **read-gate**: Validate the observation before the family planner runs
+  ([`72ae179`](https://github.com/marcinpsk/netbox-nso-plugin/commit/72ae1790a3cf12e33a335488e7a2bfae7cd120dc))
+
+- **redistribution**: Reject a malformed BGP destination shape at the read
+  ([`97c496c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/97c496c8c4325f6b83bd88ba8ef1c2b66a7c66cc))
+
+- **redistribution**: Store a BGP destination reference with a canonical ASN
+  ([`e5df5de`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e5df5de2aa73ec2306544ad01e43288792f44efb))
+
+- **refusal**: Enforce unbound selection uniqueness without NULLS NOT DISTINCT
+  ([`86ed5f7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/86ed5f73727bc6c98f108fd2d15a1ad8b5c89334))
+
+- **refusal**: Reject succeeded carriers without results
+  ([`a6b3a23`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a6b3a2344c05e5b1ae86c8034420d1bb6b75ae00))
+
+- **review**: Preserve owner conflicts and batch manifest relations
+  ([`f79bd59`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f79bd59d9a7027e823e55bb9eab854fe879e522d))
+
+- **review**: Qualify BGP observations and retain failed deliveries
+  ([`d01ff43`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d01ff434cb27b86aa030ee6d9b2680ec6473fc24))
+
+- **settlement**: Release superseded rows of an attempt that was not promoted
+  ([`9242217`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9242217e3d80bd698b784523e056b8427356ad5c))
+
+- **signals**: Report a missing native BGP peer as an unsent local block
+  ([`f9a2fc1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f9a2fc15e18f09826017d2ea9b45d5144b960886))
+
+- **status**: Never settle an owned row on a reconcile conflict
+  ([`c248956`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c248956eb92e138557c04d8fd1d2af73e15263c5))
+
+### Chores
+
+- Move the docs and workflow changes to their own PR to main
+  ([`a0cbf31`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a0cbf31e9927f085dfbd40cb7a05dae02d1a2f7e))
+
+- **ci**: Bump the actions group with 3 updates
+  ([`60eaa0a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/60eaa0a103c7607d3ae6c1e4ee87959b954ffbd7))
+
+- **deps**: Bump jsdom
+  ([`7d9c67f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7d9c67fb1cf3729513e1d1b776d5ebd8b2cf1970))
+
+- **deps**: Bump the python-minor-patch group with 2 updates
+  ([`cf1491e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/cf1491ee2132f5c16038aebbd9513a28341f56c0))
+
+- **opengrep**: Reject caught exception text at operator message sinks
+  ([`a98bfc2`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a98bfc2c7c333e03546c9cca494c132f8174e372))
+
+### Continuous Integration
+
+- **contract**: Pin the refusal settlement fixture and add the BGP peer intent design
+  ([`5989899`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5989899d2cc9f58989be9d0e086ffa6b25e17141))
+
+### Documentation
+
+- **bgp**: Record native peer intent ownership design
+  ([`e793d3e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e793d3eeb4318dde9243848d96e8115ffe3241d1))
+
+- **tests**: Drop the stale CI runner claim from IntentPushResetMixin
+  ([`d52b036`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d52b036e2e305069114c1c9978aabf9db8aa4989))
+
+### Features
+
+- **apply**: Capture durable selections and overlay snapshots before send
+  ([`183da8f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/183da8f3b685da64b5211df39fa5478117e4f50f))
+
+- **bgp**: Add NSOBGPRouterState overlay that owns the bgp.router outcome
+  ([`b25614d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b25614d979cf6e56f48bd8d2669a862e13a8de22))
+
+- **bgp**: Edit and display native peer intent
+  ([`060655f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/060655fdd2fd66a61d32671cbdfc93e612736164))
+
+- **refusal**: Add the refusal settlement ledger, registry and contract
+  ([`8024646`](https://github.com/marcinpsk/netbox-nso-plugin/commit/80246468f5784e9f72aeaee2031977f6d1605d4b))
+
+### Performance Improvements
+
+- **bgp**: Qualify router identity with one query
+  ([`d279ee7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d279ee7a57ae40e84a19ef0752575b7dc23bae90))
+
+- **preview**: Read the published BGP peer index once per Apply preview
+  ([`6b395dc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6b395dc8f93fb5134788dbd74dfb653ce67a36a0))
+
+### Refactoring
+
+- **apply**: Move Apply admission checks out of views
+  ([`a0af5c3`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a0af5c34273de9026766615c85f98685048ac0bf))
+
+- **bgp**: Remove overlay peer value storage
+  ([`468cb65`](https://github.com/marcinpsk/netbox-nso-plugin/commit/468cb6521a447cd875926cda70aec4761a38d580))
+
+- **bgp**: Share canonical native peer wire content
+  ([`ad5f7f8`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ad5f7f835784ca38f0464a335eb71b362345b3bb))
+
+- **migrations**: Squash 0034-0037 into one refusal settlement migration
+  ([`9debef5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9debef5fad76d863ac9900b1608ae6630c7ff909))
+
+### Testing
+
+- **bgp**: Expect owned peers to keep native intent on device drift
+  ([`c7b1788`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c7b17887bc57312ef4f1ed195e9a0f733ef18407))
+
+- **bgp**: Name blocked unknown VRF behavior
+  ([`fc87053`](https://github.com/marcinpsk/netbox-nso-plugin/commit/fc870537dd5cef31d2dcbf82680e24fc2c3f536d))
+
+- **bgp**: Pin the retained router-state producer in peer creation
+  ([`827489f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/827489f6bf5a96829237cdf4f2b7c3be451f2f04))
+
+- **migrations**: Accept later migrations after the router ledger chain
+  ([`5b19175`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5b19175b6d9decbbb2002799bf5daa7cc2fbe85c))
+
+- **refusal**: Pin document-section names for split-section streams
+  ([`e77bc54`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e77bc542a131906a524e3aae7681e4879fe1d98c))
+
+- **renderer**: Use canonical redistribution destinations
+  ([`e8df15e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/e8df15e771cd54e253a827dc94c2577ce3e74429))
+
+- **review**: Align fixtures with explicit BGP destinations
+  ([`2bd52bf`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2bd52bfad90698d9720bdde9e9fabfc5c0e07798))
+
+
 ## v1.9.0 (2026-10-10)
 
 ### Bug Fixes
