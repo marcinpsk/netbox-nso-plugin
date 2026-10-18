@@ -2631,6 +2631,7 @@ class TestNSOApplyPreviewView(ViewTestBase):
             NSORedistributionState,
             management=self.mgmt,
             dest_protocol="bgp",
+            dest_ref="64512//ipv4-unicast",
             source_protocol="connected",
             route_map="RM-CONN",
             status="in_sync",  # accepted-as-matching (brownfield adoption), never yet applied
@@ -2683,6 +2684,7 @@ class TestRoutingStateAcceptView(ViewTestBase):
         state = NSORedistributionState.objects.create(
             management=self.mgmt,
             dest_protocol="bgp",
+            dest_ref="64512//ipv4-unicast",
             source_protocol="static",
             status="changed",
         )
@@ -8511,7 +8513,7 @@ class TestReviewRegressionPins(ViewTestBase):
             NSORedistributionState,
             management=self.mgmt,
             dest_protocol="bgp",
-            dest_ref="65001",
+            dest_ref="65001//ipv4-unicast",
             source_protocol="static",
             status="accepted",
         )
@@ -8519,7 +8521,7 @@ class TestReviewRegressionPins(ViewTestBase):
             NSORedistributionState,
             management=self.mgmt,
             dest_protocol="bgp",
-            dest_ref="65001",
+            dest_ref="65001//ipv4-unicast",
             source_protocol="connected",
             status="in_sync",
         )
@@ -8558,6 +8560,7 @@ class TestReviewRegressionPins(ViewTestBase):
         row = NSORedistributionState.objects.create(
             management=self.mgmt,
             dest_protocol="bgp",
+            dest_ref="64512//ipv4-unicast",
             source_protocol="static",
             status="changed",
         )

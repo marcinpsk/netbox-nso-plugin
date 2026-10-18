@@ -105,8 +105,8 @@ CONTINUATIONS = {
 
 UNRESOLVED_DISPOSITIONS = {
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_router"): (
-        2,
-        "The owned branch only settles or repends; the unowned branch never acquires.",
+        3,
+        "Owned rows only settle or repend; invalid unowned native content remains a conflict.",
     ),
     ("bgp_reconciler.py", "_BGPGraphPlanner.reconcile_peer"): (
         2,

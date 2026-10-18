@@ -632,24 +632,24 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
     def test_redistribution_reference_with_slash_vrf_is_rejected_as_invalid(self):
         from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.ownership_planner import OwnershipNotQualified
 
         vrf = VRF.objects.create(name="placeholder/blue")
         scope = BGPScope.objects.create(router=self.router, vrf=vrf)
         BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
         with without_commit_drain():
             self.router_state(owned=True)
-            acquire_overlay(
-                NSORedistributionState,
-                management=self.management,
-                dest_protocol="bgp",
-                dest_ref="65123/placeholder/blue/ipv4-unicast",
-                source_protocol="connected",
-                source_ref="",
-                status="accepted",
-            )
-        blocked = self.payload()["blocked"]
-        self.assertEqual(blocked["detail"]["reason"], "blocked_bgp_router")
-        self.assertEqual(blocked["message"], "BGP redistribution has an invalid destination identity.")
+            with self.assertRaises(OwnershipNotQualified):
+                acquire_overlay(
+                    NSORedistributionState,
+                    management=self.management,
+                    dest_protocol="bgp",
+                    dest_ref="65123/placeholder/blue/ipv4-unicast",
+                    source_protocol="connected",
+                    source_ref="",
+                    status="accepted",
+                )
+        self.assertFalse(NSORedistributionState.objects.filter(management=self.management).exists())
 
     def relink_router_to_other_asn(self):
         BGPRouter.objects.filter(pk=self.router.pk).update(asn=ASN.objects.create(asn=65124, rir=self.asn.rir))

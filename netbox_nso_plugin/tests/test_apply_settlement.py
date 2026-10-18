@@ -137,14 +137,15 @@ print("views-loaded" if "netbox_nso_plugin.views" in sys.modules else "views-abs
 """
 
 
-@pytest.mark.parametrize("settings_module", ["netbox.settings", "isolated_test_settings"])
-def test_admission_validation_runs_without_the_view_module(settings_module):
+@pytest.mark.parametrize("settings_module", ["netbox.settings", "admission_test_settings"])
+def test_admission_validation_runs_without_the_view_module(settings_module, tmp_path):
     # A fresh process: the test session has already imported views through the URLconf.
+    (tmp_path / "admission_test_settings.py").write_text("from netbox.settings import *\n", encoding="utf-8")
     with override_settings(SETTINGS_MODULE=settings_module):
         env = dict(
             os.environ,
             DJANGO_SETTINGS_MODULE=settings.SETTINGS_MODULE,
-            PYTHONPATH=os.pathsep.join(filter(None, sys.path)),
+            PYTHONPATH=os.pathsep.join((str(tmp_path), *filter(None, sys.path))),
         )
         child = subprocess.run(  # noqa: S603 (a fixed argv, no shell)
             [sys.executable, "-c", _ADMISSION_WITHOUT_VIEWS, settings_module],
