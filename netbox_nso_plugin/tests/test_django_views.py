@@ -1232,14 +1232,16 @@ class TestNSOJobStatusView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = make_session(response=make_response(200, json_data={"job_id": 42, "status": "completed"}))
+        session = make_session(
+            response=make_response(200, json_data={"id": 42, "type": "apply", "status": "succeeded"})
+        )
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[42])
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.content)
-        self.assertEqual(data["job_id"], 42)
+        self.assertEqual(data["id"], 42)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -1913,7 +1915,9 @@ class TestNSORefreshStateRace(_CascadeFlushMixin, IntentPushResetMixin, Transact
             nonlocal read_finished
             management_read = sql.lstrip().upper().startswith("SELECT") and table in sql
             unlocked_read = before_planning and read_finished and management_read and "FOR UPDATE" not in sql
-            acquisition = not before_planning and management_read and "FOR UPDATE" in sql and " IN " in sql
+            acquisition = (
+                not before_planning and read_finished and management_read and "FOR UPDATE" in sql and " IN " in sql
+            )
             if unlocked_read or acquisition:
                 read_finished = False
                 sequence = next(changes, None)

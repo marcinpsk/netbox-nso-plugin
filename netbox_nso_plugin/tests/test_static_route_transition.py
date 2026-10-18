@@ -687,7 +687,9 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
             grant=OwnershipGrant("create"), saves=(planned_save(candidate, update_fields=("metric",)),)
         )
         overlay_label = NSOStaticRouteState._meta.label_lower
-        expected_pks = tuple(row.pk for row in plan.lock_footprint.overlay_rows if row.model_label == overlay_label)
+        expected_pks = tuple(
+            sorted(row.pk for row in plan.lock_footprint.overlay_rows if row.model_label == overlay_label)
+        )
         self.assertEqual(set(expected_pks), {first.pk, second.pk})
         statements = []
         probe_results = []
@@ -722,9 +724,10 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         overlay_table = NSOStaticRouteState._meta.db_table
         native_table = route._meta.db_table
         overlay_locks = [
-            (index, params[-1])
+            (index, pk)
             for index, (sql, params) in enumerate(statements)
             if f'FROM "{overlay_table}"' in sql and "FOR UPDATE" in sql
+            for pk in params
         ]
         native_updates = [index for index, (sql, _params) in enumerate(statements) if f'UPDATE "{native_table}"' in sql]
         self.assertEqual(list(dict.fromkeys(pk for _index, pk in overlay_locks)), list(expected_pks))

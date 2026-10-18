@@ -1028,10 +1028,10 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     def test_get_job(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import get_job
 
-        session = self._make_session(200, {"id": 99, "status": "done"})
+        session = self._make_session(200, {"id": 99, "type": "apply", "status": "succeeded"})
         mock_s.return_value = session
         result = get_job(99)
-        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["status"], "succeeded")
         args, _ = session.request.call_args
         self.assertIn("jobs/99", args[1])
 

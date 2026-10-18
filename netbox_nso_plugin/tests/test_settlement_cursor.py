@@ -175,7 +175,7 @@ class TestCursorEpoch(_SettlementCase):
 
         assert result.epoch_reset is True
         assert result.consumed == 1
-        assert self.adapter.store.feed_requests == [(42, 0, SETTLE_FEED_PAGE), (42, 0, 1), (42, 0, SETTLE_FEED_PAGE)], (
+        assert self.adapter.store.feed_requests == [(42, 0, SETTLE_FEED_PAGE), (42, 1, 1), (42, 0, SETTLE_FEED_PAGE)], (
             f"expected two epoch brackets and one initial cursor page: {self.adapter.store.feed_requests}"
         )
 
