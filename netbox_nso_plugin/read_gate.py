@@ -44,6 +44,8 @@ from typing import Any
 from django.db import IntegrityError, transaction
 from django.utils.dateparse import parse_datetime
 
+from .lifecycle_fence import read_refresh
+
 logger = logging.getLogger(__name__)
 
 # ── Dispositions (D9 vocabulary; GateResult carries one of these) ───────────────
@@ -930,6 +932,7 @@ def _publication_observation(family, decision, observation):
     return None
 
 
+@read_refresh()
 def gated_family_run(
     mgmt,
     family: str,
@@ -970,6 +973,16 @@ def gated_family_run(
         scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
         # Planners read the payload observation, so validate it before pre_body.
         snapshot = _publication_observation(family, decision, observation)
+        identity = {
+            "incarnation": decision.incarnation,
+            "source_epoch": decision.source_epoch,
+            "payload_revision": decision.payload_revision,
+            "digest": snapshot["digest"] if snapshot is not None else None,
+        }
+        if snapshot is not None:
+            from .lifecycle_fence import bind_read_observation
+
+            bind_read_observation(family, identity)
         planning = pre_body is not None
         plan = pre_body() if pre_body is not None else None
         planning = False
@@ -980,7 +993,11 @@ def gated_family_run(
             )
         elif isinstance(plan, MutationFootprint):
             plan = ReconcileMutationPlan(plan, detect_content_changes=True)
+        from .lifecycle_fence import capture_read_tokens, owner_rows, publish_observation
         from .renderer_writer import RendererMutationPlan, renderer_mirror_writes, renderer_writes
+
+        footprint = plan.lock_footprint if isinstance(plan, RendererMutationPlan) else plan.footprint
+        capture_read_tokens(owner_rows(footprint))
 
         if isinstance(plan, RendererMutationPlan):
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
@@ -1015,6 +1032,7 @@ def gated_family_run(
                     "last_updated",
                 ]
             )
+            publish_observation(footprint, family, identity)
     except (RendererTargetsChanged, IntentPlanStaleError, _SupersededPublication):
         return GateResult(SKIPPED_STALE_ATTEMPT)
     except Exception as exc:

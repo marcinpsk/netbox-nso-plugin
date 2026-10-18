@@ -118,17 +118,16 @@ class TestInterfaceOwnershipLifecycle(IntentPushDeliveryMixin, TestCase):
         self._adapter_writes(status="in_sync", nso_value="operator-desc")
         self.assertEqual(self._classify(), ("in_sync", "in sync", True))
 
-    def test_edit_back_to_device_value_clears_pending(self):
+    def test_edit_back_to_device_value_requires_new_apply_evidence(self):
         # Own a differing value → pending apply.
         self._adapter_writes(status="changed", nso_value="dev-current")
         self._operator_edit(description="operator-typo")
         self.assertEqual(self._classify(), ("pending", "pending apply", True))
 
-        # Operator edits back to the device's current value → nothing to apply → in sync
-        # (still owned). Regression guard for the "phantom pending" bug.
+        # The old observation cannot certify the new intent after an edit and revert.
         self._operator_edit(description="dev-current")
         st = NSOInterfaceState.objects.get(interface=self.iface, attribute="description")
-        self.assertEqual(st.status, "in_sync")
+        self.assertEqual(st.status, "accepted")
         self.assertEqual(self._classify(), ("in_sync", "in sync", True))
 
     def test_enabled_toggle_arc(self):

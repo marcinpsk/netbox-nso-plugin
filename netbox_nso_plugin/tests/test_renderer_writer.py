@@ -1153,8 +1153,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             delivery.render("vlan", device.pk, management.adapter_device_id).payload
         )
         assert target.status == "accepted"
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id is not None
         assert revision.revision == before + 1
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == expected

@@ -3721,7 +3721,17 @@ class NSOJobStatusView(LoginRequiredMixin, View):
 
         try:
             job = client.get_job(job_id)
-            return JsonResponse(job)
+            result = job.get("result")
+            counts = (
+                [
+                    {"scope": key.removesuffix("_count_by_outcome"), **value}
+                    for key, value in sorted(result.items())
+                    if key.endswith("_count_by_outcome")
+                ]
+                if isinstance(result, dict)
+                else []
+            )
+            return JsonResponse({**job, "outcome_counts": counts})
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
 
@@ -5687,8 +5697,8 @@ def _save_lacp_edit(obj, key, old_values):
             for field_name, value in changed_values.items():
                 setattr(candidate, field_name, value)
             target_status = sm.on_operator_edit(member.status)
-        elif member.status == "deploying":
-            target_status = sm.on_operator_edit(member.status)
+        elif sm.is_owned(member.status):
+            target_status = member.status
         else:
             target_status = _status_after_accept(member.status)
         if not sm.is_owned(member.status):
@@ -5706,7 +5716,11 @@ def _save_lacp_edit(obj, key, old_values):
             setattr(bundle_candidate, field_name, value)
     if not sm.is_owned(bundle.status):
         bundle_candidate.accepted_at = now
-    bundle_candidate.status = sm.on_operator_edit(bundle.status) if bundle.status == "deploying" else "accepted"
+    bundle_candidate.status = (
+        (sm.on_operator_edit(bundle.status) if key == "lacp_bundle" else bundle.status)
+        if sm.is_owned(bundle.status)
+        else "accepted"
+    )
     bundle_update_fields = {"status", "accepted_at"}
     if key == "lacp_bundle":
         bundle_update_fields.update(changed_values)
@@ -6345,6 +6359,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         diff_available = False
         generation_id = None
         document_digest = None
+        preview_status = "unavailable"
+        preview_refusals = []
         diff_error = "preview_unavailable"
         if mgmt is not None and mgmt.adapter_device_id is not None:
             from . import adapter_client as client
@@ -6353,12 +6369,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 preview = client.get_apply_diff(mgmt.adapter_device_id, outformat=outformat)
                 generation_id = preview["generation_id"]
                 document_digest = preview["document_digest"]
-                unavailable = (
-                    preview["diffs"]
-                    .get(client.APPLY_PREVIEW_KEY, "")
-                    .startswith(client.APPLY_PREVIEW_UNAVAILABLE_PREFIX)
-                )
-                if not unavailable:
+                preview_status = preview["status"]
+                preview_refusals = preview["refusals"]
+                if preview_status == "ready":
                     device_diff = preview["diffs"]
                     diff_available = True
                     diff_error = None
@@ -6395,6 +6408,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 "diff_available": diff_available,
                 "generation_id": generation_id,
                 "document_digest": document_digest,
+                "preview_status": preview_status,
+                "refusals": preview_refusals,
                 "diff_error": diff_error,
             }
         )

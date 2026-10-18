@@ -370,6 +370,33 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence
         from netbox_nso_plugin.models import NSOApplyAttempt
 
+        class EmptyEvidenceAdapter(_ApplyContractAdapter):
+            incarnation = "55555555-eeee-4eee-8eee-555555555555"
+
+            def _handle(self, method, url, **kwargs):
+                if method == "GET" and url.endswith("/api/v1/jobs"):
+                    response = make_response(200, [])
+                    response.headers["X-Store-Incarnation"] = self.incarnation
+                    return response
+                if method == "GET" and url.endswith("/devices/1558/generations"):
+                    return make_response(200, [])
+                if method == "POST" and url.endswith("/devices/1558/deployment-evidence"):
+                    self.evidence_requests.append(kwargs["json"])
+                    return make_response(
+                        200,
+                        {
+                            "device_id": 1558,
+                            "head": None,
+                            "blocked": False,
+                            "write_work_pending": False,
+                            "held_jobs": [],
+                            "pending_generations": 0,
+                            "attempts": [],
+                            "unknown_apply_attempt_ids": [],
+                        },
+                    )
+                return super()._handle(method, url, **kwargs)
+
         for status, payload in ((400, None), (400, []), (400, "rejected"), (None, None)):
             with self.subTest(status=status, payload=payload):
 
@@ -378,7 +405,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                         raise AdapterError("Adapter configuration unavailable", code="configuration_error")
                     return status, payload
 
-                adapter = _ApplyContractAdapter(refuse)
+                adapter = EmptyEvidenceAdapter(refuse)
+                adapter.evidence_requests = []
 
                 response = self._post(adapter)
 
@@ -391,7 +419,11 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
                 self.assertIsNotNone(attempt.response)
                 config, session = adapter.patches()
                 with config, session:
-                    self.assertIsNone(load_deployment_evidence(self.mgmt))
+                    evidence = load_deployment_evidence(self.mgmt)
+                self.assertEqual(evidence["attempts"], [])
+                self.assertEqual(evidence.store_incarnation, adapter.incarnation)
+                self.assertEqual(evidence.automatic_generations, [])
+                self.assertEqual(adapter.evidence_requests, [{"apply_attempt_ids": []}])
                 self.assertEqual(len(adapter.apply_requests), 1)
 
     def test_no_op_retry_restores_apply_failed_intent(self):
@@ -840,7 +872,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         state.refresh_from_db()
         self.assertEqual(state.status, "accepted")
 
-    def test_a_stale_edit_footprint_repends_rows_promoted_by_the_next_apply(self):
+    def test_a_stale_edit_footprint_repends_only_the_changed_promoted_owner(self):
         from netbox_nso_plugin import apply_state
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOInterfaceMtuState
@@ -887,9 +919,9 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
 
         first.refresh_from_db()
         second.refresh_from_db()
-        self.assertEqual((first.status, second.status), ("accepted", "accepted"))
+        self.assertEqual((first.status, second.status), ("accepted", "deploying"))
         self.assertIsNone(first.apply_attempt_id)
-        self.assertIsNone(second.apply_attempt_id)
+        self.assertEqual(second.apply_attempt_id, next_attempt_id)
 
     def test_a_stale_overlay_instance_cannot_restore_deploying(self):
 
@@ -2362,7 +2394,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertEqual(after[:4], ["accepted"] * 4)
         # The renamed switching rows re-pend with the four other promoted rows.
         self.assertEqual(after[8:10], ["accepted", "accepted"])
-        self.assertEqual(after[4:8] + after[10:], prepared[4:8] + prepared[10:])
+        # Each renamed native reference changes its own contribution, including confirmed rows.
+        self.assertEqual(after[4:8] + after[10:], ["accepted"] * 5)
 
     def test_the_finalize_audit_runs_before_switching_preparations(self):
         """A finalize repair must run before the Apply selects switching slots.
@@ -2467,7 +2500,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         )
         lacp.refresh_from_db()
         switchport.refresh_from_db()
-        self.assertEqual((lacp.status, switchport.status), ("in_sync", "in_sync"))
+        self.assertEqual((lacp.status, switchport.status), ("accepted", "accepted"))
 
     def test_a_vlan_id_change_keeps_an_import_placeholder_out_of_the_wire_payload(self):
         from netbox_nso_plugin import delivery
@@ -2564,7 +2597,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         vlan.refresh_from_db()
         self.assertEqual((vlan.vid, vlan.name), (new_vid, old_placeholder))
 
-    def test_editing_one_deploying_row_locks_and_repends_the_complete_scope(self):
+    def test_editing_one_deploying_row_locks_the_scope_and_repends_only_that_owner(self):
         import threading
 
         from django.db import connections
@@ -2656,8 +2689,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             raise errors[0]
         first.refresh_from_db()
         second.refresh_from_db()
-        self.assertEqual((first.status, second.status), ("accepted", "accepted"))
-        self.assertIsNone(first.apply_attempt_id)
+        self.assertEqual((first.status, second.status), ("deploying", "accepted"))
+        self.assertEqual(first.apply_attempt_id, attempt_id)
         self.assertIsNone(second.apply_attempt_id)
 
     def test_promotion_does_not_render_under_its_locks(self):

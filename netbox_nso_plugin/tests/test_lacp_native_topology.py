@@ -58,6 +58,27 @@ class LACPNativeTopologyAdapter(NativeOnlyAdapter):
         return 202, result
 
     def _handle(self, method, url, **kwargs):
+        if method == "GET" and url.endswith(f"/devices/{self.device_id}/generations"):
+            rows = []
+            for attempt in self.attempts.values():
+                projections = {row["generation_id"]: row for row in attempt["generations"]}
+                for admitted in attempt["response"]["generations"]:
+                    projection = projections[admitted["generation_id"]]
+                    rows.append(
+                        {
+                            **deepcopy(admitted),
+                            "status": projection["status"],
+                            "settlement_cohort": None,
+                            "created_at": projection["updated_at"],
+                            "updated_at": projection["updated_at"],
+                        }
+                    )
+            params = kwargs["params"]
+            rows = sorted(
+                (row for row in rows if row["seq"] > params.get("since_seq", 0)),
+                key=lambda row: row["seq"],
+            )
+            return make_response(200, rows[: params["limit"]])
         if method == "POST" and url.endswith("/deployment-evidence"):
             requested = kwargs["json"]["apply_attempt_ids"]
             self.evidence_reads.append(deepcopy(requested))
@@ -191,10 +212,14 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
             self.assertEqual(manifest.grant_kind, "accept", manifest)
             self.assertEqual(manifest.native_id, row.interface_id)
 
-    def assert_in_sync(self):
+    def assert_apply_bookkeeping(self, expected):
         for row in self.lacp_states:
             row.refresh_from_db()
-            self.assertEqual(row.status, "in_sync", row)
+            self.assertEqual(
+                (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
+                expected[(row._meta.label_lower, row.pk)],
+                row,
+            )
 
     def apply_device(self):
         request_start = len(self.adapter.requests)
@@ -247,18 +272,22 @@ class TestLACPNativeTopology(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         self.assertEqual([row.status for row in self.lacp_states], ["deploying"] * 3)
         attempt_id = self.adapter.apply_requests[-1]["apply_attempt_id"]
         self.assertEqual({str(row.apply_attempt_id) for row in self.lacp_states}, {attempt_id})
+        bookkeeping = {
+            (row._meta.label_lower, row.pk): (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id)
+            for row in self.lacp_states
+        }
         self.adapter.evidence_reads.clear()
         self.assert_reconcile_ran()
         self.assertTrue(self.adapter.evidence_reads, "Reconcile must read the Apply result from the adapter")
         self.assertIn(attempt_id, self.adapter.evidence_reads[-1])
-        self.assert_in_sync()
+        self.assert_apply_bookkeeping(bookkeeping)
         self.assert_owned()
         self.assert_native_topology()
         self.adapter.documents["lag-config"] = {"bundles": []}
         for observation in range(2):
             with self.subTest(observation=observation + 1):
                 self.assert_reconcile_ran()
-                self.assert_in_sync()
+                self.assert_apply_bookkeeping(bookkeeping)
                 self.assert_owned()
                 self.assert_native_topology()
         requests = self.apply_device()

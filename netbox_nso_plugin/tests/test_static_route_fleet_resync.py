@@ -1019,6 +1019,36 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         deploying = self._own_route(mgmt, "10.73.0.0/16", "10.0.0.74", status="deploying")
         owned_since = deploying.accepted_at
         assert NSOStaticRouteState.objects.get(pk=deploying.pk).status == "deploying"
+        from netbox_nso_plugin.durable_capture import _matches, _static_fences, _watermark, mapping_epoch
+        from netbox_nso_plugin.lifecycle_fence import fence_for
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyOverlaySnapshot
+        from netbox_nso_plugin.refusal_registry import OVERLAYS
+        from netbox_nso_plugin.selection_manifest import current_content_digest
+
+        with transaction.atomic():
+            fences = {row.pk: fence_for(row) for row in (deploying, in_sync, failed, accepted)}
+            revisions = {pk: fence.bookkeeping_revision for pk, fence in fences.items()}
+            owner_revisions = {pk: fence.owner_revision for pk, fence in fences.items()}
+            snapshot = NSOApplyOverlaySnapshot.objects.create(
+                attempt=NSOApplyAttempt.objects.create(management=mgmt),
+                mapping_epoch=mapping_epoch(mgmt),
+                model_label=in_sync._meta.label_lower,
+                overlay_pk=in_sync.pk,
+                prior_status=in_sync.status,
+                expected_status=in_sync.status,
+                prior_last_apply_at=in_sync.last_apply_at,
+                expected_last_apply_at=in_sync.last_apply_at,
+                prior_last_apply_error=in_sync.last_apply_error,
+                expected_last_apply_error=in_sync.last_apply_error,
+                expected_apply_attempt_id=in_sync.apply_attempt_id,
+                accepted_at=in_sync.accepted_at,
+                content_digest=current_content_digest(in_sync),
+                expected_fence_revision=revisions[in_sync.pk],
+                expected_owner_revision=owner_revisions[in_sync.pk],
+                observation_watermark=_watermark(mgmt, OVERLAYS[in_sync._meta.label_lower]),
+                static_route_fences=_static_fences(in_sync),
+            )
+            self.assertTrue(_matches(snapshot, in_sync, mgmt, {}, "expected", check_revisions=False))
 
         with _route_http(
             respond=lambda adapter_device_id, routes: {
@@ -1040,6 +1070,13 @@ class TestStaticRouteFleetResync(_CascadeFlushMixin, IntentPushResetMixin, Trans
         assert in_sync.status == "in_sync", "a settled row's badge flickered on a pass that changed no content"
         assert failed.status == "apply_failed"
         assert accepted.status == "accepted"
+        with transaction.atomic():
+            for row in (deploying, in_sync, failed, accepted):
+                fence = fence_for(row)
+                self.assertGreater(fence.bookkeeping_revision, revisions[row.pk])
+                self.assertGreater(fence.owner_revision, owner_revisions[row.pk])
+            self.assertNotEqual(current_content_digest(in_sync), snapshot.content_digest)
+            self.assertFalse(_matches(snapshot, in_sync, mgmt, {}, "expected", check_revisions=False))
 
     def test_the_arming_write_records_the_demotion_in_its_rollback_snapshot(self):
         """S6.2 at its own site — the rollback reads ``armed_status`` to decide what to put back.

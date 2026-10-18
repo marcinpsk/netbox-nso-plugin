@@ -943,23 +943,46 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         """A pre-canonical owned state remains linked and included in the owned snapshot."""
         mgmt = self._make_mgmt()
 
+        from ipam.models import IPAddress
+        from netbox_routing.models import BGPPeer
+
         from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
         from netbox_nso_plugin.delivery import deliver
-        from netbox_nso_plugin.models import NSOBGPPeerState
+        from netbox_nso_plugin.models import NSOBGPPeerState, NSOOwnershipManifest
 
         canonical = "2001:db8::2"
         expanded = "2001:0db8:0000:0000:0000:0000:0000:0002"
         payload = self._payload(self._router_payload(peers=[self._peer_entry(canonical)]))
         original = _reconcile_bgp_config(self.device, payload)[0]
-        content_update(original, status="in_sync", peer_address_str=expanded)
+        peer_id, address_id = original.bgp_peer_id, original.bgp_peer.peer_id
+        content_update(original, status="accepted", peer_address_str=expanded)
+        ownership = NSOOwnershipManifest.objects.get(
+            device_id=self.device.pk,
+            state_model_label=original._meta.label_lower,
+            native_id=peer_id,
+            ownership_state="owned",
+        )
 
         result = _reconcile_bgp_config(self.device, payload)
 
         state = NSOBGPPeerState.objects.get()
         self.assertEqual(len(result), 1)
         self.assertEqual(state.pk, original.pk)
-        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.status, "accepted")
         self.assertEqual(state.peer_address_str, canonical)
+        self.assertEqual((state.bgp_peer_id, state.bgp_peer.peer_id), (peer_id, address_id))
+        self.assertEqual(BGPPeer.objects.count(), 1)
+        self.assertEqual(IPAddress.objects.filter(address=f"{canonical}/128").count(), 1)
+        self.assertEqual(
+            list(
+                NSOOwnershipManifest.objects.filter(
+                    device_id=self.device.pk,
+                    state_model_label=state._meta.label_lower,
+                    ownership_state="owned",
+                ).values_list("pk", flat=True)
+            ),
+            [ownership.pk],
+        )
         acquire_bgp_router(state.management, state.bgp_peer.scope.router)
         captured = {}
 
@@ -1053,7 +1076,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
 
         payload = self._payload(self._router_payload(peers=[self._peer_entry()]))
         original = _reconcile_bgp_config(self.device, payload)[0]
-        content_update(original, asn_str="065100", status="in_sync")
+        content_update(original, asn_str="065100", status="accepted")
 
         result = _reconcile_bgp_config(self.device, payload)
 
@@ -1061,7 +1084,7 @@ class TestReconcileBgpConfig(IntentPushResetMixin, TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(state.pk, original.pk)
         self.assertEqual(state.asn_str, "65100")
-        self.assertEqual(state.status, "in_sync")
+        self.assertEqual(state.status, "accepted")
 
     def test_persisted_peer_aliases_keep_lower_canonical_pk(self):
         """The lower canonical row remains the identity when an expanded alias follows it."""

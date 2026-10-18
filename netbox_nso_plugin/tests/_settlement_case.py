@@ -35,19 +35,27 @@ def _make_device(tag: str):
     return Device.objects.create(name=f"se-{tag}-rtr", device_type=dt, role=role, site=site)
 
 
-def _make_mgmt(device, tag: str, adapter_device_id: int | None):
+def _make_mgmt(device, tag: str, adapter_device_id: int | None, *, adapter=None):
     from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
     inst, _ = NSOInstance.objects.get_or_create(
         name=f"se-{tag}-inst", defaults={"adapter_instance_id": f"se-{tag}-inst"}
     )
     with patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"):
-        return NSODeviceManagement.objects.create(
+        management = NSODeviceManagement.objects.create(
             device=device,
             nso_instance=inst,
             nso_device_name=f"nso-se-{tag}",
             adapter_device_id=adapter_device_id,
         )
+    if adapter is not None and adapter_device_id is not None:
+        adapter.store.add_device(
+            nso_instance=inst.name,
+            nso_device_name=management.nso_device_name,
+            netbox_device_id=device.pk,
+            device_id=adapter_device_id,
+        )
+    return management
 
 
 def _route(prefix, next_hop, *, devices=()):
@@ -127,23 +135,40 @@ def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT,
 
 def _evidence_generation(generation_id, selected, settled_scopes=()):
     from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.refusal_contract import COUNT_KEYS
+    from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
 
     settled = bool(settled_scopes)
+    sections_by_stream = {
+        entry.section: delivery.delivery_keys()[{"ip": "interface", "isis_flex_algo": "isis"}.get(scope, scope)].section
+        for scope, entry in delivery.delivery_keys().items()
+    }
+    sections = sorted({sections_by_stream[stream] for stream in selected})
+    result = (
+        None
+        if not settled
+        else {
+            **{key: dict.fromkeys(COUNT_KEYS, 0) for section in sections for key in SECTION_COUNTER_KEYS[section]},
+            "row_outcomes": [],
+            "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": True,
+        }
+    )
     return {
         "generation_id": generation_id,
         "seq": generation_id,
         "status": "settled" if settled else "running",
-        "sections": sorted(selected),
+        "sections": sections,
         "stream_revisions": selected,
         "source_push_seq": {
             stream: None if stream in delivery.direct_streams() else revision for stream, revision in selected.items()
         },
         "carrier_job_id": generation_id,
         "carrier_job_status": "succeeded" if settled else "running",
-        "carrier_job_result": {
-            f"{scope}_count_by_outcome": {"in_sync": 1, "apply_failed": 0} for scope in settled_scopes
-        }
-        or None,
+        "carrier_job_result": result,
+        "row_outcomes": [] if settled else None,
+        "refusals": [] if settled else None,
         "carrier_job_error": None,
         "updated_at": timezone.now().isoformat(),
     }
@@ -356,3 +381,57 @@ class _CarrierMixin:
 
 class _CarrierCase(_CarrierMixin, _SettlementCase):
     """A settlement case whose Step 4 is reached through the real queued carrier."""
+
+
+def _execution_result():
+    return {
+        "row_outcomes": [],
+        "refusals": [],
+        "settlement_owners": [],
+        "commit_acknowledged": True,
+        "static_route_count_by_outcome": {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0},
+    }
+
+
+def _record_execution(management, store, job, *, state="consumed"):
+    import copy
+
+    from netbox_nso_plugin.durable_capture import mapping_epoch
+    from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
+
+    attempt = NSOApplyAttempt.objects.create(
+        management=management,
+        adapter_device_id=management.adapter_device_id,
+        source_epoch=management.adapter_source_epoch,
+        trigger_kind="cadence",
+    )
+    result = copy.deepcopy(job["result"])
+    projection = {
+        "generation_id": job["id"],
+        "seq": job["id"],
+        "status": "settled",
+        "sections": ["static_route"],
+        "stream_revisions": {"static_route": 7},
+        "source_push_seq": {"static_route": 41},
+        "carrier_job_id": job["id"],
+        "carrier_job_status": job["status"],
+        "carrier_job_result": result,
+        "carrier_job_error": None,
+        "updated_at": job["updated_at"],
+        "row_outcomes": result["row_outcomes"],
+        "refusals": result["refusals"],
+    }
+    return NSOApplyExecution.objects.create(
+        attempt=attempt,
+        management=management,
+        mapping_epoch=mapping_epoch(management),
+        adapter_device_id=management.adapter_device_id,
+        store_incarnation=store.incarnation,
+        generation_id=job["id"],
+        generation_seq=job["id"],
+        carrier_job_id=job["id"],
+        terminal_at=timezone.now(),
+        terminal_projection=projection,
+        consumption_state=state,
+        consumed_at=timezone.now(),
+    )

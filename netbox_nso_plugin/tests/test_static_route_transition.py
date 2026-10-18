@@ -729,7 +729,8 @@ class TestStaticRouteTransitionFanOut(_CascadeFlushMixin, IntentPushResetMixin, 
         native_updates = [index for index, (sql, _params) in enumerate(statements) if f'UPDATE "{native_table}"' in sql]
         self.assertEqual(list(dict.fromkeys(pk for _index, pk in overlay_locks)), list(expected_pks))
         self.assertEqual(len(native_updates), 1)
-        self.assertTrue(all(index < native_updates[0] for index, _pk in overlay_locks))
+        locked_before_update = {pk for index, pk in overlay_locks if index < native_updates[0]}
+        self.assertEqual(locked_before_update, set(expected_pks))
 
     def test_a_foreign_fan_out_edit_takes_no_plugin_overlay_locks(self):
         """A foreign save does not lock plugin overlays in its transaction."""

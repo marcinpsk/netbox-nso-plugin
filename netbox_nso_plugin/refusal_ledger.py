@@ -175,6 +175,7 @@ class NSOApplyOverlaySnapshot(models.Model):
     content_digest = models.CharField(max_length=64)
     observation_watermark = models.JSONField(default=dict)
     expected_fence_revision = models.PositiveBigIntegerField(default=0)
+    expected_owner_revision = models.PositiveBigIntegerField(null=True, blank=True)
     contributors = models.JSONField(default=dict)
     static_route_fences = models.JSONField(null=True, blank=True)
     settlement_disposition = models.CharField(
@@ -203,6 +204,7 @@ class NSOOverlaySettlementFence(models.Model):
     model_label = models.CharField(max_length=100, choices=_LABEL_CHOICES)
     overlay_pk = models.PositiveBigIntegerField()
     bookkeeping_revision = models.PositiveBigIntegerField(default=0)
+    owner_revision = models.PositiveBigIntegerField(default=0)
     observation_watermark = models.JSONField(default=dict)
     current_attempt = models.ForeignKey(
         "NSOApplyAttempt", on_delete=models.RESTRICT, null=True, blank=True, related_name="active_settlement_fences"

@@ -65,7 +65,6 @@ class Command(BaseCommand):
                     f"cursor {result.cursor}"
                     + (", epoch reset" if result.epoch_reset else "")
                     + (", stalled" if result.stalled else "")
-                    + (", advanced past a stalled sequence" if result.advanced_past_stall else "")
                 )
 
         missing = sorted(set(requested or []) - {mgmt.device_id for mgmt in rows})

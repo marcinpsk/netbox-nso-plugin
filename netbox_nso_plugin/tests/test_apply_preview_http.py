@@ -94,18 +94,24 @@ class TestApplyPreviewHTTP(blocked.BlockedRemovalTestBase):
         self.assertEqual(result["outformat"], "native")
         self.assertTrue(result["diff_available"])
 
-    def test_http_success_unavailable_marker_is_not_an_empty_success(self):
+    def test_http_success_unavailable_status_is_not_an_empty_success(self):
         marker = "!! preview unavailable: executable generation changed during preview"
         for identity in ((None, None), (81, "a" * 64)):
             with self.subTest(identity=identity):
                 result = self._get_preview(
-                    _preview(diffs={"device_intent": marker}, generation_id=identity[0], document_digest=identity[1])
+                    _preview(
+                        diffs={"device_intent": marker},
+                        generation_id=identity[0],
+                        document_digest=identity[1],
+                        status="unavailable",
+                    )
                 )
 
                 self.assertFalse(result["diff_available"])
                 self.assertFalse(result["nothing_pending"])
                 self.assertEqual(result["device_diff"], {})
                 self.assertEqual(result["diff_error"], "preview_unavailable")
+                self.assertEqual(result["preview_status"], "unavailable")
                 self.assertEqual(result["generation_id"], identity[0])
                 self.assertEqual(result["document_digest"], identity[1])
 

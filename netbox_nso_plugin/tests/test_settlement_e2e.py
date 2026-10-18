@@ -50,6 +50,7 @@ from ._settlement_adapter import FakeAdapter, SettlementStore
 from ._settlement_case import _AdapterDoubleMixin, _CarrierMixin, _make_device, _make_mgmt
 from ._static_route_case import _assign_and_accept, _edit_owned_route
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
+from .test_durable_bgp_capture import TestDurableBGPCapture as _BGPCaptureBase
 
 ADAPTER_DEVICE_ID = 70
 
@@ -90,12 +91,15 @@ class ApplyingStore(SettlementStore):
         self.pushes: list[tuple[int, list[dict]]] = []
         #: what the apply reports; a test overrides these to drive an uncorrelated result
         self.apply_outcome = "in_sync"
+        self.logical_disposition = "in_sync"
         self.apply_generation_delta = 0
         self.apply_fingerprint: str | None = None
         #: called with the adapter device id — the adapter's own sync-complete callback
         self.notify = None
+        self.source_selectors = {}
+        self.revisions = {}
 
-    def put_static_route_intent(self, device_id: int, routes: list[dict]) -> dict:
+    def put_static_route_intent(self, device_id: int, routes: list[dict], *, source_push_seq=None) -> dict:
         """Replace this device's intent, then report an apply for it and notify.
 
         The apply and the notification run **before** the response is written, which is the
@@ -104,6 +108,8 @@ class ApplyingStore(SettlementStore):
         plugin's push runs from ``transaction.on_commit``, so its transaction is committed
         and holds no lock the callback could block on.
         """
+        self.source_selectors[device_id] = source_push_seq
+        self.revisions[device_id] = self.revisions.get(device_id, 0) + 1
         self.pushes.append((device_id, routes))
         stored = self.intent.setdefault(device_id, {})
         echoes = []
@@ -144,9 +150,103 @@ class ApplyingStore(SettlementStore):
             }
             for index, row in enumerate(rows)
         ]
-        self.terminal_job(device_id, results=results)
+        from netbox_nso_plugin.refusal_protocol import row_ref
+
+        generation_id = len(self.jobs) + 1
+        outcomes = []
+        for row in rows:
+            reference = row_ref(
+                "static-route",
+                "static-route.route",
+                (("route", (row.get("vrf") or "", row["prefix"], row["next_hop"])),),
+            )
+            carrier = {
+                "stream": "static_route",
+                "row": {"subject": reference.subject, "key": reference.key},
+                "source_push_seq": self.source_selectors[device_id],
+                "frozen_revision": self.revisions[device_id],
+                "accepted_at": row.get("accepted_at"),
+                "generation_id": generation_id,
+                "settlement_cohort": generation_id,
+            }
+            logical = {key: value for key, value in carrier.items() if key != "accepted_at"}
+            logical.update(
+                acceptance_identity=row.get("accepted_at"),
+                carrier=carrier,
+                disposition=self.logical_disposition,
+                refusals=[],
+            )
+            outcomes.append(logical)
+        job = self.terminal_job(
+            device_id,
+            results=results,
+            extra={
+                "row_outcomes": outcomes,
+                "refusals": [],
+                "commit_acknowledged": self.logical_disposition == "in_sync",
+                "settlement_owners": [{**row["carrier"], "disposition": self.logical_disposition} for row in outcomes],
+                "static_route_count_by_outcome": {
+                    "in_sync": len(outcomes) if self.logical_disposition == "in_sync" else 0,
+                    "apply_failed": 0,
+                    "not_applied": len(outcomes) if self.logical_disposition == "not_applied" else 0,
+                    "unavailable": len(outcomes) if self.logical_disposition == "unavailable" else 0,
+                },
+            },
+        )
+        self.add_generation(
+            device_id,
+            generation_id=generation_id,
+            seq=generation_id,
+            status="settled" if self.logical_disposition == "in_sync" else "failed",
+            job_id=job["id"],
+            mode="networked",
+            settlement_cohort=generation_id,
+            digest="a" * 64,
+            stream_revisions={"static_route": self.revisions[device_id]},
+            source_push_seq={"static_route": self.source_selectors[device_id]},
+        )
         if self.notify is not None:
             self.notify(device_id)
+
+    def deployment_evidence(self, device_id, apply_attempt_ids):
+        generations = self.generations.get(device_id, [])
+        if not generations:
+            return super().deployment_evidence(device_id, apply_attempt_ids)
+        generation = generations[-1]
+        job = next(job for job in self.jobs if job["id"] == generation["job_id"])
+        head = {
+            key: generation[key]
+            for key in (
+                "generation_id",
+                "seq",
+                "status",
+                "mode",
+                "settlement_cohort",
+                "source_push_seq",
+                "created_at",
+                "updated_at",
+            )
+        }
+        head.update(
+            sections=["static_route"],
+            apply_attempt_id=None,
+            carrier_job_id=job["id"],
+            carrier_job_status=job["status"],
+            carrier_job_result=job["result"],
+            carrier_job_error=job["error"],
+            row_outcomes=job["row_outcomes"],
+            refusals=job["refusals"],
+        )
+        return {
+            "device_id": device_id,
+            "head": head,
+            "blocked": generation["status"] in {"failed", "outcome_unknown"},
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "attempts": [],
+            "unknown_apply_attempt_ids": [str(value) for value in apply_attempt_ids],
+        }
 
 
 class ApplyingAdapter(FakeAdapter):
@@ -262,6 +362,24 @@ class TestTheIdentityEditSettlesEndToEnd(
         self.assertEqual(state.last_apply_error, "")
         self.assertGreater(self._cursor().settle_cursor_seq, 1, "the feed was not walked to its end")
 
+    def test_static_not_applied_restores_prior_state_despite_legacy_failure(self):
+        from netbox_nso_plugin.models import NSOApplyExecution
+
+        self.store.logical_disposition = "not_applied"
+        self.store.apply_outcome = "apply_failed"
+        self._own()
+        self._drain()
+        state = self._state()
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(state.last_apply_error, "")
+        self.assertIsNone(state.last_apply_at)
+        self.assertEqual(state.expected_generation, state.intent_generation)
+        execution = NSOApplyExecution.objects.get()
+        self.assertEqual(execution.overlay_snapshots.get().settlement_disposition, "not_applied")
+        self.assertEqual(
+            execution.terminal_projection["carrier_job_result"]["static_route_results"][0]["outcome"], "apply_failed"
+        )
+
     def test_an_apply_reporting_the_superseded_content_does_not_settle(self):
         """The forbidden outcome of S7.1: reaching ``in_sync`` on an uncorrelated result."""
         self._own()
@@ -275,7 +393,13 @@ class TestTheIdentityEditSettlesEndToEnd(
 
         state = self._state()
         self.assertEqual(state.status, "accepted", "a stale fingerprint settled the row green")
-        self.assertIn("did not settle", state.last_result_advisory)
+        from netbox_nso_plugin.models import NSOApplyExecution
+
+        self.assertTrue(
+            NSOApplyExecution.objects.filter(
+                overlay_snapshots__overlay_pk=state.pk, overlay_snapshots__settlement_disposition="unavailable"
+            ).exists()
+        )
         self.assertGreater(self._cursor().settle_cursor_seq, 1, "an unsettled result must still advance")
 
     def test_an_apply_naming_a_superseded_generation_does_not_settle(self):
@@ -317,3 +441,146 @@ class TestTheIdentityEditSettlesEndToEnd(
         from netbox_nso_plugin.models import NSODeviceManagement
 
         return NSODeviceManagement.objects.get(pk=self.mgmt.pk)
+
+
+class TestRefusalCallbackEndToEnd(_BGPCaptureBase, LiveServerTestCase):
+    """Deliver catalog refusal over both HTTP sockets and run the real RQ carrier."""
+
+    host = "127.0.0.1"
+
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        from uuid import uuid4
+
+        import django_rq
+        from rq import Queue
+        from users.constants import TOKEN_PREFIX
+        from users.models import Token, User
+
+        user = User.objects.create_user(username="placeholder-refusal-callback", is_superuser=True)
+        token = Token.objects.create(user=user)
+        self.authorization = f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}"
+        connection = django_rq.get_queue("default").connection
+        self.queue = Queue(f"nso-refusal-{uuid4().hex}", connection=connection)
+        self.assertTrue(self.queue.is_async)
+        self.addCleanup(self.queue.delete, delete_jobs=True)
+        queue_boundary = patch("django_rq.get_queue", autospec=True, return_value=self.queue)
+        queue_boundary.start()
+        self.addCleanup(queue_boundary.stop)
+
+    def notify_and_run(self, *, restart=False):
+        from rq import SimpleWorker
+
+        from netbox_nso_plugin.read_gate import carrier_key, marker_key
+
+        self.addCleanup(self.queue.connection.delete, carrier_key(self.device.pk), marker_key(self.device.pk))
+        response = requests.post(
+            f"{self.live_server_url}/api/plugins/nso/sync-complete/",
+            json={"netbox_device_id": self.device.pk},
+            headers={"Authorization": self.authorization, "X-NSO-Adapter-Import": "1"},
+            proxies={"http": None, "https": None},
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        if restart:
+            import os
+            import subprocess
+            import sys
+
+            from django.db import connection
+
+            from netbox_nso_plugin.models import AdapterConnection
+
+            AdapterConnection.objects.create(url=self.server.adapter_url, enabled=True)
+            child = subprocess.run(
+                [sys.executable, "-c", _REFUSAL_RESTART_WORKER, connection.settings_dict["NAME"], self.queue.name],
+                env={
+                    **os.environ,
+                    "DJANGO_SETTINGS_MODULE": "netbox.settings",
+                    "PYTHONPATH": os.pathsep.join(filter(None, sys.path)),
+                },
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+        else:
+            SimpleWorker([self.queue], connection=self.queue.connection).work(burst=True, with_scheduler=False)
+        self.assertEqual(self.queue.failed_job_registry.get_job_ids(), [])
+
+    def test_child_refusal_restores_unnamed_peer_after_callback_restart(self):
+        from django.db import connections
+
+        from .test_refusal_settlement_runtime import TestRefusalSettlementRuntime
+
+        TestRefusalSettlementRuntime.prepare(self)
+        generation = TestRefusalSettlementRuntime.terminal(self)
+        TestRefusalSettlementRuntime.serve_terminal_evidence(self, generation)
+        # Preserve the exact manual UUID returned by the adapter's accepted response.
+        original = self.adapter._handle
+
+        def manual_evidence(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                from ._adapter_http import make_response
+
+                body = response.json()
+                body["head"]["apply_attempt_id"] = str(self.attempt.pk)
+                body["attempts"] = (
+                    [
+                        {
+                            "apply_attempt_id": str(self.attempt.pk),
+                            "admission_state": "admitted",
+                            "http_status": 202,
+                            "response": self.attempt.response,
+                            "generations": [generation],
+                        }
+                    ]
+                    if str(self.attempt.pk) in kwargs["json"]["apply_attempt_ids"]
+                    else []
+                )
+                return make_response(200, body)
+            return response
+
+        self.adapter._handle = manual_evidence
+        puts = len(self.adapter.capture_reads)
+        self.notify_and_run()
+        for index, row in enumerate(self.owners):
+            row.refresh_from_db()
+            if index == 1:
+                self.assertEqual(row.status, "apply_failed")
+            else:
+                self.assertEqual(
+                    (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
+                    self.prior[(row._meta.label_lower, row.pk)],
+                )
+        connections.close_all()
+        self.notify_and_run(restart=True)
+        self.assertEqual(len(self.adapter.capture_reads), puts)
+        self.assertEqual(len(self.adapter.apply_requests), 1)
+        from netbox_nso_plugin.models import NSOApplyExecution
+
+        self.assertEqual(NSOApplyExecution.objects.count(), 1)
+
+
+_REFUSAL_RESTART_WORKER = """
+import sys
+import django
+django.setup()
+from django.conf import settings
+from django.db import connections
+connections.close_all()
+settings.DATABASES["default"]["NAME"] = sys.argv[1]
+connections["default"].settings_dict["NAME"] = sys.argv[1]
+from netbox_nso_plugin import adapter_client
+from netbox_nso_plugin.tests._settlement_adapter import LoopbackOnlySession
+adapter_client.requests.Session = LoopbackOnlySession
+import django_rq
+from rq import Queue, SimpleWorker
+connection = django_rq.get_queue("default").connection
+queue = Queue(sys.argv[2], connection=connection)
+SimpleWorker([queue], connection=connection).work(burst=True, with_scheduler=False)
+assert not queue.failed_job_registry.get_job_ids()
+"""

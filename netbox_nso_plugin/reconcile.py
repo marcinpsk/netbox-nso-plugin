@@ -341,9 +341,6 @@ _CATEGORY_RECONCILE_FAMILIES: dict[str, tuple[str, ...]] = {
     "l2_services": ("l2_service",),
 }
 
-_ROUTE_POLICY_ATTEMPT_IDS = "_route_policy_attempt_ids"
-_ROUTE_POLICY_ADAPTER_DEVICE_ID = "_route_policy_adapter_device_id"
-
 
 def _isis_gated_body(ctx, mgmt, device, payload):
     """Publish both IS-IS result sets through one guarded reconciliation body."""
@@ -405,14 +402,13 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
             pre_body=lambda: isis_reconcile_plan(device, isis_payload),
         )
     if mgmt.manage_route_policy:
-        from .apply_settlement import route_policy_deploying_attempt_ids
-
         rp_doc = client.get_route_policy(dev_id)
-
-        def _route_policy_body():
-            ctx[_ROUTE_POLICY_ATTEMPT_IDS] = route_policy_deploying_attempt_ids(mgmt)
-            ctx[_ROUTE_POLICY_ADAPTER_DEVICE_ID] = mgmt.adapter_device_id
-            return _safe_reconcile(
+        _gated(
+            ctx,
+            mgmt,
+            "route_policy",
+            rp_doc,
+            lambda: _safe_reconcile(
                 ctx,
                 "route_policy_states",
                 mgmt,
@@ -420,14 +416,7 @@ def _reconcile_routing(device, mgmt, client, ctx: dict) -> None:
                 reconcile_route_policy,
                 device,
                 rp_doc,
-            )
-
-        _gated(
-            ctx,
-            mgmt,
-            "route_policy",
-            rp_doc,
-            _route_policy_body,
+            ),
             epoch=dev_id,
             pre_body=lambda: route_policy_reconcile_plan(device, rp_doc),
         )
@@ -1267,192 +1256,126 @@ def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
 _RECONCILE_QUEUE = "default"
 
 
-def _counts_for(result: dict | None, scope: str) -> dict:
-    """Return the apply's ``<scope>_count_by_outcome`` map, or an empty one.
-
-    ``result`` is an object by contract but each counts map inside it is free-form JSON.
-    An empty map reads as "this job says nothing about this scope", which is what a junk
-    one should mean: raising here loses the whole device's settle to the caller's blanket
-    except, not just this scope.
-    """
-    counts = (result or {}).get(f"{scope}_count_by_outcome")
-    return counts if isinstance(counts, dict) else {}
-
-
-def _count_of(counts: dict, outcome: str) -> int:
-    """Return one outcome's non-negative integer tally, or zero."""
-    count = counts.get(outcome)
-    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
-
-
-def _scope_failure_messages(job: dict | None, scope: str) -> str:
-    """Join the real per-item error messages for *scope* from a failed apply job.
-
-    The adapter records each failed item under ``job.error.detail.items`` as
-    ``{"type": <scope>, "error": <message>, ...}`` (jobs API exposes ``error``).
-    Returns a de-duplicated, human-readable string, or "" when none are present.
-    """
-    if not job:
-        return ""
-    # ``error`` is an object by contract; ``detail`` and ``items`` inside it are free-form:
-    # a scalar items raises on iteration and a string one iterates its characters.
-    detail = (job.get("error") or {}).get("detail")
-    items = (detail if isinstance(detail, dict) else {}).get("items")
-    items = items if isinstance(items, list) else []
-    msgs: list[str] = []
-    for it in items:
-        if not isinstance(it, dict) or it.get("type") != scope:
-            continue
-        name = it.get("name") or it.get("interface") or it.get("attribute") or ""
-        err = str(it.get("error") or "").strip()
-        if not err:
-            continue
-        msg = f"{name}: {err}" if name else err
-        if msg not in msgs:
-            msgs.append(msg)
-    return "; ".join(msgs)
-
-
-def _stuck_deploying_grace():
-    """How long a 'deploying' row may outlive a SUCCEEDED apply before it's a silent drop.
-
-    Must comfortably cover the apply-triggered refresh + the follow-up sync/reconcile
-    round-trip, so a row that DID land has had every chance to value-match settle first.
-    Configurable: PLUGINS_CONFIG["netbox_nso_plugin"]["stuck_deploying_grace_minutes"].
-    """
-    from datetime import timedelta
-
-    from django.conf import settings as dj_settings
-
-    cfg = dj_settings.PLUGINS_CONFIG.get("netbox_nso_plugin", {})
-    return timedelta(minutes=cfg.get("stuck_deploying_grace_minutes", 10))
-
-
 def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
-    """Write a coarse per-object JournalEntry recording this device's route-policy apply.
-
-    Route-policy is the one intent scope with no deploying→in_sync settle, so the
-    operator has no per-row apply outcome for it. To give a consolidated "what applied
-    where" view we drop a single JournalEntry onto each linked netbox-routing object
-    (community-list / route-map / prefix-list / as-path) carrying the device + the
-    route_policy scope outcome; the per-member skip/error detail stays on the device's
-    NSO tab. Idempotent per apply job via ``mgmt.last_journaled_apply_job`` so a re-run
-    of this post-apply reconcile does not re-post the same apply.
-    """
-    if not job:
+    """Journal only policy owners certified by this consumed execution."""
+    if not isinstance(job, dict):
         return
-    from . import status_machine as sm
+    from .durable_capture import mapping_epoch
     from .intent_state import MutationFootprint, SourceRow, mirror_transaction
-    from .models import NSORoutePolicyState
+    from .models import NSOApplyExecution, NSORoutePolicyState
 
-    rows = list(
-        NSORoutePolicyState.objects.filter(
-            management=mgmt,
-            content_type__isnull=False,
-            object_id__isnull=False,
-            status__in=sm.OWNED_STATES,
-        )
-    )
+    if (
+        type(job.get("id")) is not int
+        or type(job.get("generation_id")) is not int
+        or not isinstance(job.get("store_incarnation"), str)
+        or not job["store_incarnation"]
+    ):
+        return
+    identity = {
+        "management_id": mgmt.pk,
+        "mapping_epoch": mapping_epoch(mgmt),
+        "adapter_device_id": mgmt.adapter_device_id,
+        "store_incarnation": job["store_incarnation"],
+        "generation_id": job["generation_id"],
+        "carrier_job_id": job["id"],
+        "consumption_state": "consumed",
+    }
+    execution = NSOApplyExecution.objects.filter(**identity).first()
+    if execution is None:
+        return
+    snapshots = execution.overlay_snapshots.filter(model_label=NSORoutePolicyState._meta.label_lower)
+    row_ids = tuple(snapshots.values_list("overlay_pk", flat=True))
     footprint = MutationFootprint.for_keys(
         {(mgmt.device_id, "route_policy")},
-        overlay_rows=tuple(SourceRow(row._meta.label_lower, row.pk) for row in rows),
+        overlay_rows=tuple(SourceRow(NSORoutePolicyState._meta.label_lower, pk) for pk in row_ids),
     )
     with mirror_transaction(footprint):
-        _journal_route_policy_apply_locked(type(mgmt).objects.get(pk=mgmt.pk), job, [row.pk for row in rows])
-
-
-def _journal_route_policy_apply_locked(mgmt, job: dict, row_ids) -> None:
-    """Journal one carrier while its device revision and owned policy rows are locked."""
-    apply_attempt_id = job.get("apply_attempt_id")
-    if apply_attempt_id is not None:
-        from django.core.exceptions import ValidationError
-
-        from .models import NSOApplyAttempt, NSOIntentRevision
-
-        try:
-            attempt = NSOApplyAttempt.objects.filter(pk=apply_attempt_id, management=mgmt).first()
-        except (TypeError, ValueError, ValidationError):
+        current = type(mgmt).objects.get(pk=mgmt.pk)
+        if mapping_epoch(current) != identity["mapping_epoch"]:
             return
-        if attempt is None or not isinstance(attempt.scope_revisions, dict):
+        store = current.reset_pending_incarnation or current.adapter_incarnation
+        if store and store != identity["store_incarnation"]:
             return
-        expected_revision = attempt.scope_revisions.get("route_policy")
-        current_revision = (
-            NSOIntentRevision.objects.filter(device_id=mgmt.device_id, scope="route_policy")
-            .values_list("revision", flat=True)
-            .first()
-        )
-        if type(expected_revision) is not int or current_revision != expected_revision:
-            return
-    job_id = str(job.get("id") or "")
-    if not job_id or job_id == (mgmt.last_journaled_apply_job or ""):
-        return
-    counts = _counts_for(job.get("result"), "route_policy")
-    applied = _count_of(counts, "in_sync")
-    failed = _count_of(counts, "apply_failed")
-    # Mark the job seen FIRST so a failure mid-write can't double-post next reconcile.
-    mgmt.last_journaled_apply_job = job_id
-    type(mgmt).objects.filter(pk=mgmt.pk).update(last_journaled_apply_job=job_id)
-    if applied == 0 and failed == 0:
-        return  # this apply committed no route-policy scope → nothing to journal
+        execution = NSOApplyExecution.objects.filter(**identity).first()
+        if execution is not None:
+            _journal_route_policy_apply_locked(current, job, execution, row_ids)
 
+
+def _journal_route_policy_apply_locked(mgmt, job, execution, row_ids) -> None:
+    """Commit all journals and their durable marker under the device lock."""
+    from django.contrib.contenttypes.models import ContentType
     from django.urls import reverse
-    from django.utils import timezone
     from extras.models import JournalEntry
 
-    from . import models
-    from . import status_machine as sm
+    from .delivery import canonical_fingerprint
+    from .models import NSORoutePolicyState
+    from .refusal_contract import validate_result
+    from .selection_manifest import current_content_digest
 
-    # Only objects the operator owns on this device were part of the apply — an
-    # imported-only object was never pushed, so it gets no apply log here (it still
-    # shows on the "Applied to devices" panel, which lists every device).
-    rows = list(
-        models.NSORoutePolicyState.objects.filter(
-            pk__in=row_ids,
-            management=mgmt,
-            content_type__isnull=False,
-            object_id__isnull=False,
-            status__in=sm.OWNED_STATES,
+    projection = execution.terminal_projection
+    if not isinstance(projection, dict) or projection.get("carrier_job_result") != job.get("result"):
+        return
+    result = validate_result(job["result"], sections=("route_policy",))
+    journal_identity = canonical_fingerprint(
+        (
+            mgmt.pk,
+            execution.mapping_epoch,
+            execution.store_incarnation,
+            execution.generation_id,
+            execution.carrier_job_id,
         )
     )
-    if not rows:
+    marker = f"<!-- NSO policy execution: {journal_identity} -->"
+    device_type = ContentType.objects.get_for_model(mgmt.device)
+    if JournalEntry.objects.filter(
+        assigned_object_type=device_type,
+        assigned_object_id=mgmt.device_id,
+        comments__endswith=marker,
+    ).exists():
         return
-
-    if failed:
-        kind, verb = "danger", f"**failed** ({applied} applied, {failed} failed)"
-    else:
-        kind, verb = "success", f"**succeeded** ({applied} applied)"
-    try:
+    outcomes = {(item["stream"], item["row"]["subject"], item["row"]["key"]): item for item in result["row_outcomes"]}
+    rows = {row.pk: row for row in NSORoutePolicyState.objects.filter(pk__in=row_ids, management=mgmt)}
+    entries = []
+    for snapshot in execution.overlay_snapshots.filter(model_label=NSORoutePolicyState._meta.label_lower):
+        if snapshot.settlement_disposition not in {"in_sync", "refused"}:
+            continue
+        row = rows.get(snapshot.overlay_pk)
+        if (
+            row is None
+            or row.assigned_object is None
+            or snapshot.mapping_epoch != execution.mapping_epoch
+            or row.accepted_at != snapshot.accepted_at
+            or current_content_digest(row) != snapshot.content_digest
+        ):
+            continue
+        members = [
+            outcomes[(item["stream"], item["logical_ref"]["subject"], item["logical_ref"]["key"])]
+            for item in snapshot.contributors["rows"]
+        ]
+        if not members:
+            continue
+        failed = snapshot.settlement_disposition == "refused"
+        messages = sorted({cause["message"] for member in members for cause in member["refusals"]}) if failed else []
+        kind, verb = ("danger", "failed") if failed else ("success", "succeeded")
+        detail = " " + " ".join(messages) if messages else ""
         tab = reverse("dcim:device_nso", kwargs={"pk": mgmt.device_id})
-        pointer = f" Member-level detail is on the device's [NSO tab]({tab})."
-    except Exception:  # noqa: BLE001 — URL reverse is best-effort decoration
-        pointer = " Member-level detail is on the device's NSO tab."
-    detail = _scope_failure_messages(job, "route_policy") if failed else ""
-    failure_note = f" Failures: {detail}." if detail else ""
-    comment = f"NSO apply on **{mgmt.device}** — route-policy {verb}, adapter job #{job_id}.{failure_note}{pointer}"
-
-    # Device-level journal entry: the operator is pointed at the device journal for apply
-    # outcomes, so record the apply (with the real failure reason) there too — not only on
-    # the per-object journals.
-    try:
-        device = mgmt.device
-        if device is not None:
-            JournalEntry.objects.create(assigned_object=device, kind=kind, created_by=None, comments=comment)
-    except Exception as exc:  # noqa: BLE001 — the device entry must not block per-object ones
-        logger.warning("nso journal: route-policy apply device entry skipped for %s: %s", mgmt.device_id, exc)
-
-    now = timezone.now()
-    for row in rows:
-        obj = row.assigned_object
-        if obj is None:
-            continue
-        try:
-            JournalEntry.objects.create(assigned_object=obj, kind=kind, created_by=None, comments=comment)
-        except Exception as exc:  # noqa: BLE001 — one object's journal must not block the rest
-            logger.warning("nso journal: route-policy apply entry skipped for %s: %s", row.object_name, exc)
-            continue
-        # Stamp the apply time so the "Applied to devices" panel shows a real timestamp.
-        row.last_apply_at = now
-        row.save(update_fields=["last_apply_at"])
+        comment = (
+            f"NSO apply on **{mgmt.device}**: route-policy **{verb}**, "
+            f"adapter job #{execution.carrier_job_id}.{detail} "
+            f"Member detail is on the device's [NSO tab]({tab})."
+        )
+        entries.append((row.assigned_object, kind, comment))
+    if not entries:
+        return
+    for obj, kind, comment in entries:
+        JournalEntry.objects.create(assigned_object=obj, kind=kind, created_by=None, comments=comment)
+    JournalEntry.objects.create(
+        assigned_object=mgmt.device,
+        kind="danger" if any(kind == "danger" for _, kind, _ in entries) else "success",
+        created_by=None,
+        comments="\n\n".join(comment for _, _, comment in entries) + "\n\n" + marker,
+    )
+    type(mgmt).objects.filter(pk=mgmt.pk).update(last_journaled_apply_job=journal_identity)
 
 
 def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
@@ -1480,6 +1403,28 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         logger.warning("nso reconcile: device %s no longer exists; skipping", device_id)
         return {"device_id": device_id, "skipped": "device_gone"}
 
+    # Settle and journal one coherent execution snapshot before publishing observations.
+    from .apply_settlement import EvidenceInvariantError, latest_route_policy_carrier
+    from .durable_capture import mapping_epoch
+
+    try:
+        mgmt = getattr(device, "nso_management", None)
+        if mgmt is not None and mgmt.adapter_device_id is not None:
+            with suppress_intent_push(), operation("reconcile"):
+                outcome = settle_static_routes(mgmt)
+                # A link repair or unmanage operation can commit during the evidence fetch.
+                mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
+                if (
+                    mgmt is not None
+                    and outcome.deployment_evidence is not None
+                    and mgmt.adapter_device_id == outcome.adapter_device_id
+                    and mapping_epoch(mgmt) == outcome.mapping_epoch
+                ):
+                    _journal_route_policy_apply(mgmt, latest_route_policy_carrier(outcome.deployment_evidence))
+    except (AdapterError, EvidenceInvariantError, DeploymentQuiesced, NSODeviceManagement.DoesNotExist) as exc:
+        logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
+
+    device._state.fields_cache.pop("nso_management", None)
     try:
         ctx = reconcile_device(device, call_class="notify" if notify_class else "rq")
     except (AdapterError, DeploymentQuiesced) as exc:
@@ -1497,102 +1442,6 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         return {"device_id": device_id, "deferred": True, "attempts": ctx["_deferred"]}
     if ctx.get("_lock_unavailable"):
         return {"device_id": device_id, "skipped": "lock_unavailable"}
-
-    route_policy_attempt_ids = ctx.pop(_ROUTE_POLICY_ATTEMPT_IDS, ())
-    route_policy_adapter_device_id = ctx.pop(_ROUTE_POLICY_ADAPTER_DEVICE_ID, None)
-    route_policy_evidence = None
-    if route_policy_adapter_device_id is not None and route_policy_attempt_ids:
-        from .apply_settlement import deployment_evidence_attempt_ids, load_deployment_evidence
-
-        evidence_management = NSODeviceManagement.objects.filter(
-            device=device,
-            adapter_device_id=route_policy_adapter_device_id,
-        ).first()
-        if evidence_management is not None:
-            requested_attempt_ids = tuple(
-                sorted(
-                    set(route_policy_attempt_ids) | set(deployment_evidence_attempt_ids(evidence_management)),
-                    key=str,
-                )
-            )
-            try:
-                with operation("reconcile"):
-                    route_policy_evidence = load_deployment_evidence(
-                        evidence_management,
-                        attempt_ids=requested_attempt_ids,
-                    )
-            except AdapterError as exc:
-                logger.warning(
-                    "nso reconcile: route-policy evidence failed for device %s: %s",
-                    device.pk,
-                    exc,
-                )
-            except DeploymentQuiesced as exc:
-                logger.warning("nso reconcile deferred for device %s: %s", device_id, exc)
-                return {"device_id": device_id, "error": str(exc)}
-
-    # Step 4: after the post-sync reconcile, walk this device's settlement feed (the
-    # production carrier for #1502's consumer), settle any rows left 'deploying' whose
-    # scope's last apply reported a failure → apply_failed (no longer stuck), escalate
-    # rows a SUCCEEDED apply left 'deploying' past the grace (silent drop, #26), and
-    # record the route-policy apply outcome in the netbox-routing journals (idempotent).
-    try:
-        # Reverse one-to-one: a plain attribute read raises for an unmanaged device.
-        mgmt = getattr(device, "nso_management", None)
-        if mgmt is not None and mgmt.adapter_device_id is not None:
-            static_route_feed_drained = False
-            # Drain exact route results before attempt evidence. A settled generation may
-            # judge a route only after this walk proves that no precise verdict remains.
-            try:
-                static_route_feed_drained = settle_static_routes(mgmt).drained
-            except Exception as exc:  # noqa: BLE001 — narrow: only the static backstop stands down
-                logger.warning(
-                    "nso reconcile: static-route settlement failed for device %s: %s — "
-                    "the static backstop stands down for this invocation",
-                    device_id,
-                    exc,
-                )
-            # settle_static_routes locks the row and consumes the id IT reads, so a link repair
-            # committing in that window leaves the state read above about another adapter device.
-            # A fresh fetch, not refresh_from_db: an unmanaged device must skip here, not raise.
-            mgmt = NSODeviceManagement.objects.filter(pk=mgmt.pk).first()
-            if mgmt is not None and mgmt.adapter_device_id is not None:
-                # These are mirror writes, not operator intent: without the suppression the
-                # first status flip's push-on-save signal refuses (no writer transaction) and
-                # takes the rest of Step 4 with it.
-                with suppress_intent_push():
-                    from .apply_settlement import (
-                        latest_route_policy_carrier,
-                        settle_apply_attempts,
-                        settle_device_apply_attempts,
-                    )
-
-                    with operation("reconcile"):
-                        if (
-                            isinstance(route_policy_evidence, dict)
-                            and route_policy_evidence.get("device_id") == mgmt.adapter_device_id
-                        ):
-                            evidence = route_policy_evidence
-                            settle_apply_attempts(
-                                mgmt,
-                                evidence,
-                                static_route_feed_drained=static_route_feed_drained,
-                                required_attempt_ids=route_policy_attempt_ids,
-                            )
-                        else:
-                            evidence = settle_device_apply_attempts(
-                                mgmt,
-                                static_route_feed_drained=static_route_feed_drained,
-                            )
-                    _journal_route_policy_apply(
-                        mgmt,
-                        latest_route_policy_carrier(
-                            evidence,
-                            attempt_ids=route_policy_attempt_ids or None,
-                        ),
-                    )
-    except Exception as exc:  # noqa: BLE001 — settling is best-effort, never crash the worker
-        logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 
     summary = {"device_id": device_id, "interface_states": len(ctx.get("interface_states") or {})}
     logger.info("nso reconcile complete: %s", summary)

@@ -486,10 +486,8 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned BFD overlay must NOT be hard-deleted when the device stops reporting it.
 
-        The scope is in ``_prepare_apply``/`_APPLY_DEPLOYING_SCOPES``, so a bulk delete of
-        stale rows destroys operator ownership. A confirmed row (in_sync) that vanishes
-        surfaces as drift (``changed``), never data loss. That scope mutation also re-pends
-        its deploying sibling and clears the stale Apply attempt.
+        A confirmed row that vanishes surfaces as ``changed``. An unchanged deploying
+        sibling retains its own Apply attempt.
         """
         from uuid import uuid4
 
@@ -506,6 +504,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
             multiplier=3,
             status="in_sync",
         )
+        attempt = uuid4()
         deploying = acquire_overlay(
             NSOBFDInterfaceState,
             management=self.management,
@@ -514,7 +513,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
             min_rx=300,
             multiplier=3,
             status="deploying",
-            apply_attempt_id=uuid4(),
+            apply_attempt_id=attempt,
         )
         reconcile_bfd(self.device, [])  # device no longer reports BFD on any interface
         assert NSOBFDInterfaceState.objects.filter(pk=deploying.pk).exists(), (
@@ -522,8 +521,7 @@ class TestBfdWritePath(IntentPushResetMixin, TestCase):
         )
         assert NSOBFDInterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         deploying.refresh_from_db()
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
         assert NSOBFDInterfaceState.objects.get(pk=confirmed.pk).status == "changed"
 
     def test_direct_reconcile_replans_after_status_changes_during_acquisition(self):

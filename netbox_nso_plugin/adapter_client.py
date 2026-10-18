@@ -777,12 +777,18 @@ def list_devices():
 
 def get_intent_receipts(*, device_id: int | None = None, section: str | None = None) -> dict:
     """GET the adapter's per-key receipts and fleet-wide restore watermarks."""
+    from .intent_receipt_contract import validate_intent_receipts
+    from .refusal_contract import ContractError
+
     params = {}
     if device_id is not None:
         params["device_id"] = int(device_id)
     if section is not None:
         params["section"] = section
-    return _request("GET", "/api/v1/intent-receipts", params=params)
+    try:
+        return validate_intent_receipts(_request("GET", "/api/v1/intent-receipts", params=params))
+    except ContractError:
+        raise AdapterError("Adapter returned invalid intent receipts.", code="invalid_response") from None
 
 
 def get_interfaces(adapter_device_id):
@@ -898,12 +904,13 @@ def get_apply_diff(adapter_device_id: int, outformat: str = "native") -> dict:
         _request("GET", f"/api/v1/devices/{adapter_device_id}/actions/apply-diff", params={"outformat": outformat}),
         "Apply preview",
     )
-    expected_fields = {"device_id", "outformat", "diffs", "generation_id", "document_digest"}
+    expected_fields = {"device_id", "outformat", "diffs", "generation_id", "document_digest", "status", "refusals"}
     if (
         set(preview) != expected_fields
         or type(preview["device_id"]) is not int
         or preview["device_id"] != adapter_device_id
         or preview["outformat"] != outformat
+        or preview["status"] not in {"ready", "refused", "unavailable", "error"}
     ):
         raise AdapterError("Adapter returned a malformed Apply preview envelope.", code="invalid_response")
     diffs = preview["diffs"]
@@ -922,9 +929,18 @@ def get_apply_diff(adapter_device_id: int, outformat: str = "native") -> dict:
         and len(digest) == 64
         and all(char in "0123456789abcdef" for char in digest)
     )
-    unavailable = diffs.get(APPLY_PREVIEW_KEY, "").startswith(APPLY_PREVIEW_UNAVAILABLE_PREFIX)
-    if not valid_identity and not (unavailable and generation_id is None and digest is None):
+    if not valid_identity and not (preview["status"] != "ready" and generation_id is None and digest is None):
         raise AdapterError("Adapter returned a malformed Apply preview identity.", code="invalid_response")
+    from .refusal_contract import ContractError, validate_refusals
+
+    try:
+        validate_refusals(preview["refusals"])
+        if (preview["status"] == "refused") != bool(preview["refusals"]):
+            raise ContractError("preview refusal status mismatch")
+    except ContractError:
+        raise AdapterError(
+            "Adapter returned malformed Apply preview refusal evidence.", code="invalid_response"
+        ) from None
     return preview
 
 
@@ -1228,6 +1244,20 @@ def _validated_job(job, what):
                 f"Adapter returned a malformed {what}: {member} is not an object.",
                 code="invalid_response",
             )
+    result = job.get("result")
+    if isinstance(result, dict) and (
+        "row_outcomes" in result or any(key.endswith("_count_by_outcome") for key in result)
+    ):
+        from .refusal_contract import ContractError, validate_result
+
+        try:
+            validate_result(result)
+            if any(key not in job or job[key] != result[key] for key in ("row_outcomes", "refusals")):
+                raise ContractError("job projection mismatch")
+        except ContractError:
+            raise AdapterError("Adapter returned invalid execution evidence.", code="invalid_response") from None
+    elif any(job.get(key) is not None for key in ("row_outcomes", "refusals")):
+        raise AdapterError("Adapter returned invalid execution evidence.", code="invalid_response")
     return job
 
 

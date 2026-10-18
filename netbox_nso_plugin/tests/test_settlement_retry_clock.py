@@ -19,7 +19,8 @@ from __future__ import annotations
 from unittest.mock import patch
 from uuid import uuid4
 
-from ._outbox_case import mirror_update, own_vlan
+from ._outbox_case import enqueue, mirror_update, own_vlan, without_commit_drain
+from ._settlement_adapter import FakeAdapter
 from ._settlement_case import (
     _CarrierCase,
     _make_device,
@@ -31,20 +32,23 @@ from ._settlement_case import (
     _SettlementCase,
     _stale_clock,
 )
+from .test_settlement_e2e import ApplyingAdapter, ApplyingStore
 
 
 class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
     """S5.6 — the tick settles a row the dead callback channel can no longer settle."""
 
+    adapter_factory = ApplyingAdapter
+
     def test_the_scheduled_tick_settles_without_any_callback(self):
         device = _make_device("clock")
-        mgmt = _make_mgmt(device, "clock", 10)
+        mgmt = _make_mgmt(device, "clock", 10, adapter=self.adapter)
         sr = _route("10.40.0.0/16", "10.40.0.1", devices=[device])
         state = _own(sr, mgmt, generation=201)
         self.adapter.store.add_device(
             nso_instance="se-clock-inst", nso_device_name="nso-se-clock", netbox_device_id=device.pk, device_id=10
         )
-        self.adapter.store.terminal_job(10, results=[_result(sr.pk, 201)])
+        enqueue(device, "static_route")
 
         # One consumer failure through the real carrier (S5.5(b)).
         self.adapter.store.feed_error_devices.add(10)
@@ -70,9 +74,9 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
         busy = _make_device("busy")
         quiet = _make_device("quiet")
         broken = _make_device("brokenfeed")
-        busy_mgmt = _make_mgmt(busy, "busy", 11)
-        quiet_mgmt = _make_mgmt(quiet, "quiet", 12)
-        broken_mgmt = _make_mgmt(broken, "brokenfeed", 13)
+        busy_mgmt = _make_mgmt(busy, "busy", 11, adapter=self.adapter)
+        quiet_mgmt = _make_mgmt(quiet, "quiet", 12, adapter=self.adapter)
+        broken_mgmt = _make_mgmt(broken, "brokenfeed", 13, adapter=self.adapter)
         for mgmt, device, tag, adapter_id in (
             (busy_mgmt, busy, "busy", 11),
             (quiet_mgmt, quiet, "quiet", 12),
@@ -89,7 +93,7 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
 
         busy_route = _route("10.41.0.0/16", "10.41.0.1", devices=[busy])
         busy_state = _own(busy_route, busy_mgmt, generation=202)
-        self.adapter.store.terminal_job(11, results=[_result(busy_route.pk, 202)])
+        enqueue(busy, "static_route")
         # The quiet device's only overlay is already terminal: nothing is owed.
         quiet_route = _route("10.42.0.0/16", "10.42.0.1", devices=[quiet])
         _own(quiet_route, quiet_mgmt, generation=203, status="in_sync")
@@ -122,6 +126,8 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
     pk. ``_MOVED``, which does mutate the caller's object, is the control.
     """
 
+    adapter_factory = ApplyingAdapter
+
     def _settle_after_repair(self, tag, octet, stored_id, expected_id, *, seed):
         """Run one tick over a device whose mapping *seed* has broken, and assert both halves."""
         device = _make_device(tag)
@@ -131,7 +137,7 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
         seed(device)
         # The settlement waits on the id the repair will produce, so a sweep that polled the
         # stale one would find nothing at all.
-        self.adapter.store.terminal_job(expected_id, results=[_result(sr.pk, 205)])
+        enqueue(device, "static_route")
 
         self._tick()
 
@@ -183,11 +189,13 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
         from netbox_nso_plugin.settlement import ConsumeResult, sweep_static_route_settlements
 
         device = _make_device("remapped-after-drain")
-        mgmt = _make_mgmt(device, "remapped-after-drain", 70)
+        mgmt = _make_mgmt(device, "remapped-after-drain", 70, adapter=self.adapter)
         route = _route("198.18.70.0/24", "198.18.0.70", devices=[device])
         _own(route, mgmt, generation=270)
         mirror_update(mgmt, adapter_device_id=71)
-        old_epoch = ConsumeResult(70, 1, False, False, False, 1, drained=True)
+        old_epoch = ConsumeResult(
+            adapter_device_id=70, consumed=1, stalled=False, epoch_reset=False, cursor=1, drained=True
+        )
 
         with (
             patch("netbox_nso_plugin.settlement.settle_static_routes", return_value=old_epoch),
@@ -200,6 +208,8 @@ class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
 
 class TestTheRepairCapRotates(_SettlementCase):
     """S5.6d — a bounded loop over a fleet needs a durable least-recently-attempted order."""
+
+    adapter_factory = ApplyingAdapter
 
     def _broken_row(self, index):
         """A management row pointing at an adapter device that does not exist."""
@@ -239,7 +249,7 @@ class TestTheRepairCapRotates(_SettlementCase):
         state = _own(sr, tail_mgmt, generation=206)
         # The tail's repair mints adapter id 1 (nothing else is registered), and its
         # settlement is already waiting there.
-        self.adapter.store.terminal_job(1, results=[_result(sr.pk, 206)])
+        enqueue(tail_device, "static_route")
 
         doomed = {mgmt.nso_device_name for _device, mgmt in rows[:-1]}
         real_onboard = adapter_client.onboard_device
@@ -255,7 +265,7 @@ class TestTheRepairCapRotates(_SettlementCase):
             tail_mgmt.refresh_from_db()
             assert tail_mgmt.adapter_link_attempted_at is None, "the setup did not put the tail behind the cap"
             state.refresh_from_db()
-            assert state.status == "deploying"
+            assert state.status in {"accepted", "deploying"}, "unrepaired mapping received a certificate"
 
             self._tick()
 
@@ -337,15 +347,14 @@ class TestTheRepairCapRotates(_SettlementCase):
 class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
     """An exact feed result cannot replace missing Apply-attempt evidence.
 
-    The tick still bounds and advances past an unresolvable legacy feed row. It must not
-    turn that unrelated result into a verdict for a UUID that has no local attempt row.
+    The tick retains an unresolvable carrier and its cursor. It cannot turn unrelated
+    results into a verdict for a UUID that has no local attempt row.
     """
 
     def test_the_tick_leaves_an_orphan_attempt_non_actionable(self):
-        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS
 
         device = _make_device("noresolve")
-        mgmt = _make_mgmt(device, "noresolve", 15)
+        mgmt = _make_mgmt(device, "noresolve", 15, adapter=self.adapter)
         self.adapter.store.add_device(
             nso_instance="se-noresolve-inst",
             nso_device_name="nso-se-noresolve",
@@ -363,14 +372,14 @@ class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
             "netbox_nso_plugin.reconcile.enqueue_device_reconcile",
             side_effect=AssertionError("the pin fired a callback — the very channel this removes"),
         ):
-            for tick in range(SETTLE_STALL_MAX_ATTEMPTS):
+            for _ in range(5):
                 self._tick()
                 state.refresh_from_db()
-                if tick < SETTLE_STALL_MAX_ATTEMPTS - 1:
-                    assert state.status == "deploying", "the bound was short-circuited before attempt five"
+                assert state.status == "deploying", "uncorrelated evidence changed the owner"
+                assert self._cursor(mgmt).settle_cursor_seq == 0
 
         state.refresh_from_db()
-        assert self._cursor(mgmt).settle_cursor_seq == 1, "the stall bound never released the cursor"
+        assert self._cursor(mgmt).settle_cursor_seq == 0, "unconsumed evidence was discarded"
         assert state.status == "deploying", "an exact Apply-attempt identity was invented from unrelated evidence"
 
     def test_the_tick_does_not_escalate_while_an_apply_is_in_flight(self):
@@ -382,7 +391,7 @@ class TestTheClockDoesNotJudgeAnOrphanAttempt(_CarrierCase):
         row back out of ``apply_failed``.
         """
         device = _make_device("inflighttick")
-        mgmt = _make_mgmt(device, "inflighttick", 17)
+        mgmt = _make_mgmt(device, "inflighttick", 17, adapter=self.adapter)
         self.adapter.store.add_device(
             nso_instance="se-inflighttick-inst",
             nso_device_name="nso-se-inflighttick",
@@ -410,7 +419,7 @@ class TestTheSweepStandsDownOnAGlobalOutage(_SettlementCase):
 
     def test_a_failed_snapshot_skips_the_per_device_polling(self):
         device = _make_device("hung")
-        mgmt = _make_mgmt(device, "hung", 16)
+        mgmt = _make_mgmt(device, "hung", 16, adapter=self.adapter)
         sr = _route("10.47.0.0/16", "10.47.0.1", devices=[device])
         _own(sr, mgmt, generation=208)
         self.adapter.store.terminal_job(16, results=[_result(sr.pk, 208)])
@@ -432,9 +441,11 @@ class TestADrainErrorCannotStopTheSweep(_SettlementCase):
     stop the settlement clock on every five-minute run, with no summary line to show it.
     """
 
+    adapter_factory = ApplyingAdapter
+
     def test_a_failed_drain_still_sweeps_and_still_summarises(self):
         device = _make_device("drainerr")
-        mgmt = _make_mgmt(device, "drainerr", 21)
+        mgmt = _make_mgmt(device, "drainerr", 21, adapter=self.adapter)
         sr = _route("10.48.0.0/16", "10.48.0.1", devices=[device])
         state = _own(sr, mgmt, generation=209)
         self.adapter.store.add_device(
@@ -443,7 +454,10 @@ class TestADrainErrorCannotStopTheSweep(_SettlementCase):
             netbox_device_id=device.pk,
             device_id=21,
         )
-        self.adapter.store.terminal_job(21, results=[_result(sr.pk, 209)])
+        from netbox_nso_plugin import drain
+
+        enqueue(device, "static_route")
+        drain.drain_intent_outbox()
 
         with (
             patch("netbox_nso_plugin.drain.drain_intent_outbox", side_effect=RuntimeError("candidates exploded")),
@@ -480,6 +494,72 @@ class TestADrainErrorCannotStopTheSweep(_SettlementCase):
         ), "the compaction error was never reported"
 
 
+class _VlanClockStore(ApplyingStore):
+    settle_vlan = True
+
+    def put_vlan_intent(self, device_id, vlans, push_seq):
+        from netbox_nso_plugin.refusal_protocol import row_ref
+
+        generation_id = len(self.jobs) + 1
+        outcomes = []
+        for vlan in vlans:
+            ref = row_ref("vlan", "vlan.vlan", (("vlan", (vlan["vlan_id"],)),))
+            carrier = {
+                "stream": "vlan",
+                "row": {"subject": ref.subject, "key": ref.key},
+                "source_push_seq": push_seq,
+                "frozen_revision": generation_id,
+                "accepted_at": None,
+                "generation_id": generation_id,
+                "settlement_cohort": generation_id,
+            }
+            logical = {key: value for key, value in carrier.items() if key != "accepted_at"}
+            logical.update(acceptance_identity=None, carrier=carrier, disposition="in_sync", refusals=[])
+            outcomes.append(logical)
+        if self.settle_vlan:
+            job = self.terminal_job(
+                device_id,
+                extra={
+                    "row_outcomes": outcomes,
+                    "refusals": [],
+                    "commit_acknowledged": True,
+                    "settlement_owners": [{**row["carrier"], "disposition": "in_sync"} for row in outcomes],
+                    "vlan_count_by_outcome": {
+                        "in_sync": len(outcomes),
+                        "apply_failed": 0,
+                        "not_applied": 0,
+                        "unavailable": 0,
+                    },
+                },
+            )
+        else:
+            job = self.queued_job(device_id)
+        self.add_generation(
+            device_id,
+            generation_id=generation_id,
+            seq=generation_id,
+            status="settled" if self.settle_vlan else "running",
+            job_id=job["id"],
+            mode="networked",
+            settlement_cohort=generation_id,
+            digest="a" * 64,
+            stream_revisions={"vlan": generation_id},
+            source_push_seq={"vlan": push_seq},
+        )
+        return {"count": len(vlans)}
+
+    def deployment_evidence(self, device_id, apply_attempt_ids):
+        evidence = super().deployment_evidence(device_id, apply_attempt_ids)
+        if evidence["head"] is not None:
+            evidence["head"]["sections"] = ["vlan"]
+        return evidence
+
+
+class _VlanClockAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__(_VlanClockStore())
+
+
 class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
     """The sweep is the fleet's only plugin-to-adapter clock, so it must reach every scope.
 
@@ -488,49 +568,40 @@ class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
     that Apply and, with the callback channel dead, the row stayed ``deploying`` forever.
     """
 
+    adapter_factory = _VlanClockAdapter
+
+    def setUp(self):
+        super().setUp()
+        from urllib.parse import urlparse
+
+        from ._settlement_adapter import _Handler
+
+        previous = _Handler.do_PUT
+
+        def put(handler):
+            if urlparse(handler.path).path.endswith("/vlan-intent"):
+                body = handler._body()
+                device_id = handler._device_id_from_path(urlparse(handler.path))
+                answer = handler._store.put_vlan_intent(device_id, body["vlans"], int(handler.headers["X-Push-Seq"]))
+                handler._send(200, answer)
+                return
+            previous(handler)
+
+        transport = patch.object(_Handler, "do_PUT", put)
+        transport.start()
+        self.addCleanup(transport.stop)
+
     def _deploying_vlan(self, tag, adapter_device_id, vid, generation_id, push_seq):
-        """One deploying VLAN overlay with the durable attempt the evidence is addressed to."""
+        """Capture a real rendered VLAN before its HTTP publication can execute."""
+        from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         device = _make_device(tag)
-        mgmt = _make_mgmt(device, tag, adapter_device_id)
-        self.adapter.store.add_device(
-            nso_instance=f"se-{tag}-inst",
-            nso_device_name=f"nso-se-{tag}",
-            netbox_device_id=device.pk,
-            device_id=adapter_device_id,
-        )
-        selected = {"vlan": push_seq}
-        attempt_id = uuid4()
-        attempt = NSOApplyAttempt.objects.create(
-            id=attempt_id,
-            adapter_apply_attempt_id=attempt_id,
-            management=mgmt,
-            adapter_device_id=adapter_device_id,
-            scope_revisions=selected,
-            selected=selected,
-            http_status=202,
-            response={
-                "device_id": adapter_device_id,
-                "outcome": "promoted",
-                "job_id": generation_id,
-                "selected": selected,
-                "skipped": {},
-                "skipped_detail": None,
-                "generations": [
-                    {
-                        "generation_id": generation_id,
-                        "seq": generation_id,
-                        "job_id": generation_id,
-                        "mode": "networked",
-                        "source_push_seq": selected,
-                        "stream_revisions": selected,
-                        "digest": f"{generation_id:064x}",
-                    }
-                ],
-            },
-        )
-        state = mirror_update(own_vlan(mgmt, vid, tag), status="deploying", apply_attempt_id=attempt.pk)
+        mgmt = _make_mgmt(device, tag, adapter_device_id, adapter=self.adapter)
+        prior = NSOApplyAttempt.objects.create(management=mgmt, trigger_kind="push")
+        with without_commit_drain():
+            state = mirror_update(own_vlan(mgmt, vid, tag), status="deploying", apply_attempt_id=prior.pk)
+        drain.drain_key(device.pk, "vlan", force=True)
         return mgmt, state
 
     def test_the_tick_settles_a_deploying_vlan_with_no_static_route_overlay(self):
@@ -538,7 +609,6 @@ class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
 
         mgmt, state = self._deploying_vlan("vlanonly", 60, 601, 310, 501)
         assert not NSOStaticRouteState.objects.filter(management=mgmt).exists(), "the pin grew a static-route candidate"
-        self.settled_evidence_scopes = ("vlan",)
 
         # No callback of any kind: the tick is the only clock running.
         with patch(
@@ -552,6 +622,7 @@ class TestTheTickSweepsEveryDeployingScope(_SettlementCase):
 
     def test_a_still_running_apply_keeps_its_vlan_deploying(self):
         """Control: the widened candidate set judges from evidence, not from being polled."""
+        self.adapter.store.settle_vlan = False
         _mgmt, state = self._deploying_vlan("vlanrunning", 61, 611, 311, 502)
 
         self._tick()
@@ -605,7 +676,7 @@ class TestTheEvidenceEndpointClosesItsWorkerConnection(_SettlementCase):
         from netbox_nso_plugin.models import NSOApplyAttempt
 
         device = _make_device(tag)
-        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        mgmt = _make_mgmt(device, tag, adapter_device_id, adapter=self.adapter)
         selected = {"static_route": 1}
         attempt_id = uuid4()
         return NSOApplyAttempt.objects.create(

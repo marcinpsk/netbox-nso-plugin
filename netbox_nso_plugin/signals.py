@@ -2119,7 +2119,7 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
         if generation is None or generations.get(route_id) != generation:
             continue  # never pushed by us at this generation — not an expectation we may record
         with transaction.atomic(), suppress_intent_push():
-            rows = NSOStaticRouteState.objects.select_for_update(of=("self",)).filter(
+            rows = NSOStaticRouteState.objects.filter(
                 management__device_id=device_id,
                 static_route_id=route_id,
                 intent_generation=generation,
@@ -2127,7 +2127,7 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
             for row in rows:
                 fields = {"expected_generation", "expected_fingerprint"}
                 with mirror_refresh(row, fields) as locked:
-                    if locked is None:
+                    if locked is None or locked.intent_generation != generation:
                         continue
                     locked.expected_generation = generation
                     locked.expected_fingerprint = fingerprint
