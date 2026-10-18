@@ -35,7 +35,7 @@ def own_redistribution(management, dest_protocol, source_protocol):
     state = NSORedistributionState(
         management=management,
         dest_protocol=dest_protocol,
-        dest_ref="65100::ipv4-unicast",
+        dest_ref={"bgp": "65100//ipv4-unicast", "isis": "CORE", "ospf": "1"}[dest_protocol],
         source_protocol=source_protocol,
         source_ref="",
         status="accepted",
