@@ -1510,12 +1510,8 @@ def _push_snmp_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            from .adapter_client import AdapterError
-
-            raise AdapterError(
-                f"SNMP snapshot is blocked: {'; '.join(body['blocked'])}",
-                code="validation_error",
-                detail={"reason": "blocked_owned_row"},
+            raise _local_push_block(
+                f"SNMP snapshot is blocked: {'; '.join(body['blocked'])}", {"reason": "blocked_owned_row"}
             )
         return client.put_snmp_intent(adapter_device_id, *body)
 
@@ -1661,12 +1657,8 @@ def _push_svi_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            from .adapter_client import AdapterError
-
-            raise AdapterError(
-                f"SVI snapshot is blocked: {'; '.join(body['blocked'])}",
-                code="validation_error",
-                detail={"reason": "blocked_owned_row"},
+            raise _local_push_block(
+                f"SVI snapshot is blocked: {'; '.join(body['blocked'])}", {"reason": "blocked_owned_row"}
             )
         return client.put_svi_intent(adapter_device_id, body)
 
@@ -1739,12 +1731,8 @@ def _push_subinterface_intent_for_device(device_id, adapter_device_id):
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            from .adapter_client import AdapterError
-
-            raise AdapterError(
-                f"Subinterface snapshot is blocked: {'; '.join(body['blocked'])}",
-                code="validation_error",
-                detail={"reason": "blocked_owned_row"},
+            raise _local_push_block(
+                f"Subinterface snapshot is blocked: {'; '.join(body['blocked'])}", {"reason": "blocked_owned_row"}
             )
         return client.put_subinterface_intent(adapter_device_id, body)
 
@@ -2694,258 +2682,199 @@ def _on_isis_instance_state_save(sender, instance, **kwargs):
         _schedule_intent_push((device_id, "isis"))
 
 
-def _build_bgp_router_list(routers: dict, scope_afs: dict, router_ids: dict | None = None) -> list:
-    """Convert the routers dict + scope_afs into the adapter router_list format.
-
-    ``router_ids`` maps asn_str → the owned global router-id; when present for an ASN it
-    is emitted as ``router_id`` on that router so the adapter/bgp-reconciler adopts it.
-    """
-    router_ids = router_ids or {}
-    router_list = []
-    covered: set[tuple[str, str]] = set()
-    for asn_str, router_data in routers.items():
-        scopes_out = []
-        for vrf_str, scope_data in router_data["scopes"].items():
-            af_map = scope_afs.get((asn_str, vrf_str), {})
-            covered.add((asn_str, vrf_str))
-            # The scope's AF list must be the UNION of the AFs that carry an accepted
-            # redistribution row AND the AFs the scope's peers actually use.
-            #
-            # It used to be the redistribution AFs alone, which on the ORDINARY path (peers
-            # accepted, no redistribution) left it EMPTY — and bgp-reconciler drives AF
-            # activation, per-AF policy binding, and the whole of `_apply_ios_vrf_scope` off
-            # `scope.address_family`. So the peer's route-maps and prefix-lists never bound (the
-            # peer came up UNFILTERED) and every IOS VRF peer was never written at all, silently,
-            # with the commit reporting success. IOS auto-activates ipv4-unicast for a plain
-            # `neighbor … remote-as`, which is why the peer still came up and nothing looked wrong.
-            peer_afs = [
-                af["af"]
-                for peer in scope_data.get("peers", [])
-                for af in peer.get("address_families", [])
-                if af.get("af") and af["af"] not in af_map
-            ]
-            afs_out = [{"af": af_str, "redistribution": redist} for af_str, redist in af_map.items()]
-            afs_out += [{"af": af_str, "redistribution": []} for af_str in dict.fromkeys(peer_afs)]
-            scope_out = dict(scope_data)
-            scope_out["address_families"] = afs_out
-            scopes_out.append(scope_out)
-        router_entry = {"asn": asn_str, "scopes": scopes_out}
-        if router_ids.get(asn_str):
-            router_entry["router_id"] = router_ids[asn_str]
-        router_list.append(router_entry)
-
-    # Redistribution-only scopes: an accepted redistribution row whose (asn, vrf)
-    # has no owned peer still needs its router/scope/AF in the payload — without
-    # it the dest_ref join at apply time finds no AF and the entry is dropped.
-    by_asn = {r["asn"]: r for r in router_list}
-    for (asn_str, vrf_str), af_map in scope_afs.items():
-        if (asn_str, vrf_str) in covered:
-            continue
-        router = by_asn.get(asn_str)
-        if router is None:
-            router = {"asn": asn_str, "scopes": []}
-            if router_ids.get(asn_str):
-                router["router_id"] = router_ids[asn_str]
-            by_asn[asn_str] = router
-            router_list.append(router)
-        router["scopes"].append(
-            {
-                "vrf": vrf_str,
-                "peers": [],
-                "address_families": [
-                    {"af": af_str, "redistribution": redist_entries} for af_str, redist_entries in af_map.items()
-                ],
-            }
-        )
-    return router_list
-
-
-def _bgp_peer_source_value(bgp_peer):
-    """Return a BGP peer's session source as the reconciler's polymorphic source string.
-
-    The reconciler dispatches ``peer/source`` per-NED at write time: IOS/IOS-XR
-    update-source is an interface NAME (``BGPPeer.update_source``, a dcim.Interface),
-    while Junos/Nokia local-address is an IP (``BGPPeer.source``, an ipam.IPAddress).
-    The interface name wins when set, else the source host IP — so the session source
-    round-trips for every vendor. Returns None when neither is set (or no peer).
-    """
-    if bgp_peer is None:
-        return None
-    if bgp_peer.update_source is not None:
-        return bgp_peer.update_source.name
-    if bgp_peer.source is not None:
-        return str(bgp_peer.source.address.ip)
-    return None
-
-
-def _bgp_peer_model_fields(bgp_peer) -> dict:
-    """Return the write-path peer leaves the overlay row does not denormalize.
-
-    ``local_as`` / ``ttl`` / ``password`` / ``peer_group`` live only on the linked
-    netbox-routing ``BGPPeer`` (``NSOBGPPeerState`` carries just ``remote_as_str`` +
-    ``enabled``), yet the reconciler + adapter both write them. Dropping them from the
-    pushed intent silently un-managed a brownfield peer's password / ttl / local-AS /
-    peer-group. Absent = the reconciler treats the leaf as "do not touch", so include a
-    key only when it holds a value — mirroring :func:`_bgp_peer_source_value`.
-    """
-    fields: dict = {}
-    if bgp_peer is None:
-        return fields
-    if bgp_peer.local_as is not None:
-        fields["local_as"] = str(bgp_peer.local_as.asn)
-    if bgp_peer.ttl is not None:
-        fields["ttl"] = bgp_peer.ttl
-    if bgp_peer.password:
-        fields["password"] = bgp_peer.password
-    if bgp_peer.peer_group is not None:
-        fields["peer_group"] = bgp_peer.peer_group.name
-    return fields
-
-
-def bgp_peer_address_family_intent_item(row):
-    """Return one BGP peer address family in the adapter's exact nested wire shape."""
-    entry = {
-        "af": row.address_family.address_family,
-        "enabled": row.enabled if row.enabled is not None else True,
-    }
-    for field_name in ("routemap_in", "routemap_out", "prefixlist_in", "prefixlist_out"):
-        if value := getattr(row, field_name):
-            entry[field_name] = value.name
-    return entry
-
-
 def bgp_peer_intent_item(row, address_families):
-    """Return one BGP peer in the adapter's exact nested wire shape."""
+    """Return one native BGP peer in the adapter's canonical wire shape."""
+    from .bgp_peer_content import peer_content
+
     if row.bgp_peer is None:
         return None
-    entry = {
-        "peer_address": row.peer_address_str,
-        "enabled": row.enabled if row.enabled is not None else True,
-        "remote_as": row.remote_as_str or None,
-        "address_families": list(address_families),
+    return {"peer_address": row.peer_address_str, **peer_content(row.bgp_peer, address_families)}
+
+
+def bgp_router_intent_item(row):
+    """Render only the explicitly owned router aggregate."""
+    from .bgp_router_content import router_content
+
+    return {**router_content(row), "accepted_at": row.accepted_at.isoformat() if row.accepted_at else None}
+
+
+# Reasons for a snapshot that NetBox refuses before it sends any request.
+LOCAL_PUSH_BLOCK_REASONS = frozenset({"blocked_owned_row", "blocked_bgp_router", "missing_bgp_peer"})
+
+
+def _local_push_block(message, detail):
+    """Return the push error for a snapshot that NetBox did not send."""
+    from .adapter_client import AdapterError
+
+    if detail.get("reason") not in LOCAL_PUSH_BLOCK_REASONS:
+        raise ValueError(f"unknown local push block reason {detail.get('reason')!r}")
+    return AdapterError(message, code="validation_error", detail=detail)
+
+
+def _bgp_router_blocker(asn, message, state_id=None):
+    return {
+        "message": message,
+        "detail": {"reason": "blocked_bgp_router", "asn": asn, "state_id": state_id},
     }
-    source_value = _bgp_peer_source_value(row.bgp_peer)
-    if source_value is not None:
-        entry["source"] = source_value
-    entry.update(_bgp_peer_model_fields(row.bgp_peer))
-    return entry
 
 
-def _bgp_router_id_map(device_id) -> dict:
-    """Map asn_str → owned global router-id for every BGPRouter on this device.
+def _bgp_owned_router_entries(device_id):
+    from .bgp_router_content import BGPIntentError, qualified_router
+    from .models import NSOBGPRouterState
 
-    Empty when netbox_routing is absent or no router-id is set. Only routers already in
-    the peer/redistribution-driven push pick their entry up (router-id rides along with
-    an owned peer under the same ASN).
-    """
-    try:
-        from netbox_routing.models import BGPRouter
-    except ImportError:
-        return {}
-    from dcim.models import Device
-    from django.contrib.contenttypes.models import ContentType
+    entries = {}
+    for row in NSOBGPRouterState.objects.filter(
+        management__device_id=device_id, status__in=_OWNED_PUSH_STATUSES
+    ).select_related("management", "bgp_router__asn"):
+        try:
+            qualified_router(row, device_id=device_id)
+            entry = bgp_router_intent_item(row)
+        except BGPIntentError as exc:
+            return {}, _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
+        for scope in entry["scopes"]:
+            scope["peers"] = []
+            for af in scope["address_families"]:
+                af["redistribution"] = []
+        entries[row.asn_str] = entry
+    return entries, None
 
-    ct = ContentType.objects.get_for_model(Device)
-    out: dict = {}
-    for router in BGPRouter.objects.filter(assigned_object_type=ct, assigned_object_id=device_id).select_related("asn"):
-        if router.router_id:
-            out[str(router.asn.asn)] = str(router.router_id)
-    return out
+
+def _bgp_child_scope(entries, asn, vrf, afs=()):
+    from .bgp_router_content import BGPIntentError, canonical_asn
+
+    asn = canonical_asn(asn)
+    entry = entries.get(asn)
+    if entry is None:
+        raise BGPIntentError("Accept the router before delivering BGP intent.")
+    scope = next((scope for scope in entry["scopes"] if scope["vrf"] == vrf), None)
+    if scope is None:
+        raise BGPIntentError("The owned router does not contain the required VRF scope. Edit its desired membership.")
+    membership = {af["af"] for af in scope["address_families"]}
+    if not set(afs) <= membership:
+        raise BGPIntentError(
+            "The owned router does not contain the required address family. Edit its desired membership."
+        )
+    return scope
+
+
+def _bgp_redistribution_members(entries, device_id):
+    from .bgp_router_content import BGPIntentError
+    from .models import NSOOwnershipManifest, NSORedistributionState
+    from .ownership_planner import manifest_binding
+    from .redistribution_reconciler import bgp_destination_parts, bgp_observation_only_destination
+
+    rows = list(
+        NSORedistributionState.objects.filter(
+            management__device_id=device_id, dest_protocol="bgp", status__in=_OWNED_PUSH_STATUSES
+        ).select_related("management", "redistribution", "redistribution__route_map")
+    )
+    observations = [
+        row for row in rows if row.redistribution_id is None and bgp_observation_only_destination(row.dest_ref)
+    ]
+    observation_ids = {row.pk for row in observations}
+    intent = [row for row in rows if row.pk not in observation_ids]
+    if observations:
+
+        def identity(native_id, native_key, state_key):
+            return native_id, json.dumps(native_key, sort_keys=True), json.dumps(state_key, sort_keys=True)
+
+        represented = {
+            identity(binding[4], binding[5], binding[7])
+            for row in intent
+            if (binding := manifest_binding(row)) is not None
+        }
+        owners = NSOOwnershipManifest.objects.filter(
+            device_id=device_id,
+            scope="bgp",
+            native_model_label="netbox_routing.redistribution",
+            state_model_label=NSORedistributionState._meta.label_lower,
+            ownership_state="owned",
+        )
+        if any(identity(owner.native_id, owner.native_key, owner.state_key) not in represented for owner in owners):
+            raise BGPIntentError("Restore the owned BGP redistribution destination before sending BGP intent.")
+        for row in observations:
+            logger.warning("BGP redistribution state %s has no address family and remains observation-only", row.pk)
+
+    by_ref = {}
+    for row in intent:
+        by_ref.setdefault(row.dest_ref, []).append(redistribution_intent_item(row))
+    for dest_ref, redist in by_ref.items():
+        asn, vrf, af_name = bgp_destination_parts(dest_ref)
+        scope = _bgp_child_scope(entries, asn, vrf, (af_name,))
+        af = next(af for af in scope["address_families"] if af["af"] == af_name)
+        af["redistribution"] = redist
 
 
 def _push_bgp_intent_for_device(device_id, adapter_device_id):
-    """Build and push the full BGP intent snapshot for a device."""
+    """Deliver one complete BGP snapshot with independently qualified owners."""
     from netbox_routing.models import BGPPeerAddressFamily
 
     from . import adapter_client as client
+    from .bgp_router_content import BGPIntentError
     from .models import NSOBGPPeerState
+    from .ownership_planner import OwnershipNotQualified, require_qualifying_ownership
 
-    peer_address_families = BGPPeerAddressFamily.objects.select_related(
-        "address_family",
-        "prefixlist_in",
-        "prefixlist_out",
-        "routemap_in",
-        "routemap_out",
+    families = BGPPeerAddressFamily.objects.select_related(
+        "address_family", "prefixlist_in", "prefixlist_out", "routemap_in", "routemap_out"
     )
-    owned_rows = list(
-        NSOBGPPeerState.objects.filter(
-            management__device_id=device_id,
-            status__in=_OWNED_PUSH_STATUSES,
+    peers = (
+        NSOBGPPeerState.objects.filter(management__device_id=device_id, status__in=_OWNED_PUSH_STATUSES)
+        .select_related(
+            "management",
+            "bgp_peer",
+            "bgp_peer__scope__router__asn",
+            "bgp_peer__scope__vrf",
+            "bgp_peer__peer",
+            "bgp_peer__remote_as",
+            "bgp_peer__local_as",
+            "bgp_peer__peer_group",
+            "bgp_peer__source",
+            "bgp_peer__update_source",
         )
-        .select_related("management", "bgp_peer", "bgp_peer__local_as", "bgp_peer__peer_group")
-        .prefetch_related(Prefetch("bgp_peer__address_families", queryset=peer_address_families))
+        .prefetch_related(Prefetch("bgp_peer__address_families", queryset=families))
     )
-    incomplete = next((row for row in owned_rows if row.bgp_peer_id is None), None)
-    blocked = (
-        {
-            "message": f"BGP snapshot is blocked by peer state {incomplete.pk} without a linked BGP peer.",
-            "detail": {
-                "reason": "missing_bgp_peer",
-                "state_id": incomplete.pk,
-                "asn": incomplete.asn_str,
-                "vrf": incomplete.vrf_name,
-                "peer_address": incomplete.peer_address_str,
-            },
-        }
-        if incomplete is not None
-        else None
-    )
-    renderable_rows = () if blocked is not None else owned_rows
-
-    # BGP redistribution: dest_ref = f"{asn}:{vrf}:{af}"
-    redist_by_af = _collect_redistribution_by_dest_ref(device_id, "bgp")
-
-    # Build scope-level address_families from redistribution dest_refs.
-    # Greenfield rows use "asn:vrf:af"; rows imported off the adapter mirror
-    # carry its "asn/vrf/af" form — accept both.
-    scope_afs: dict[tuple[str, str], dict[str, list[dict]]] = {}
-    for dest_ref, redist_entries in redist_by_af.items():
-        parts = dest_ref.split(":", 2)
-        if len(parts) != 3:
-            parts = dest_ref.split("/", 2)
-        if len(parts) != 3:
-            continue
-        asn_str, vrf_str, af_str = parts
-        scope_afs.setdefault((asn_str, vrf_str), {})[af_str] = redist_entries
-
-    routers: dict[str, dict] = {}
-    for row in renderable_rows:
-        asn_str = row.asn_str
-        vrf_name = row.vrf_name or ""
-        if asn_str not in routers:
-            routers[asn_str] = {"asn": asn_str, "scopes": {}}
-        scopes = routers[asn_str]["scopes"]
-        if vrf_name not in scopes:
-            scopes[vrf_name] = {"vrf": vrf_name, "address_families": [], "peers": []}
-
-        # Build the address-family list from the validated BGPPeer link.
-        peer_afs = []
-        for paf in row.bgp_peer.address_families.all():
-            peer_afs.append(bgp_peer_address_family_intent_item(paf))
-
-        scopes[vrf_name]["peers"].append(bgp_peer_intent_item(row, peer_afs))
-
-    router_list = (
-        {"blocked": blocked}
-        if blocked is not None
-        else _build_bgp_router_list(routers, scope_afs, _bgp_router_id_map(device_id))
-    )
+    entries, blocked = _bgp_owned_router_entries(device_id)
+    signatures = {}
+    if blocked is None:
+        for row in peers:
+            if row.bgp_peer_id is None:
+                blocked = {
+                    "message": f"BGP snapshot is blocked by peer state {row.pk} without a linked BGP peer.",
+                    "detail": {
+                        "reason": "missing_bgp_peer",
+                        "state_id": row.pk,
+                        "asn": row.asn_str,
+                        "vrf": row.vrf_name,
+                        "peer_address": row.peer_address_str,
+                    },
+                }
+                break
+            try:
+                require_qualifying_ownership(row, signatures=signatures)
+                afs = list(row.bgp_peer.address_families.all())
+                scope = _bgp_child_scope(
+                    entries, row.asn_str, row.vrf_name or "", (af.address_family.address_family for af in afs)
+                )
+                scope["peers"].append(bgp_peer_intent_item(row, afs))
+            except OwnershipNotQualified as exc:
+                blocked = _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
+                break
+            except BGPIntentError as exc:
+                blocked = _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
+                break
+    if blocked is None:
+        try:
+            _bgp_redistribution_members(entries, device_id)
+        except BGPIntentError as exc:
+            blocked = _bgp_router_blocker("", exc.public_message)
+    payload = {"blocked": blocked} if blocked else [entries[asn] for asn in sorted(entries, key=int)]
 
     def push(body):
         if isinstance(body, dict) and body.get("blocked"):
-            blocker = body["blocked"]
-            raise client.AdapterError(
-                blocker["message"],
-                code="validation_error",
-                detail=blocker["detail"],
-            )
+            raise _local_push_block(body["blocked"]["message"], body["blocked"]["detail"])
         return client.put_bgp_intent(adapter_device_id, body)
 
-    _push_changed(
-        (device_id, "bgp"),
-        router_list,
-        push,
-    )
+    _push_changed((device_id, "bgp"), payload, push)
 
 
 @_skip_on_render
@@ -4089,8 +4018,17 @@ def _connect_g_activated():  # pragma: no cover
         weak=False,
     )
 
-    # BGP peer state → intent push
-    from .models import NSOBGPPeerState
+    from .models import NSOBGPPeerState, NSOBGPRouterState
+
+    post_save.connect(
+        _on_bgp_peer_state_save, sender=NSOBGPRouterState, dispatch_uid="nso_plugin_bgp_router_state_post_save"
+    )
+    post_delete.connect(
+        _as_delete_origin(_on_bgp_peer_state_save),
+        sender=NSOBGPRouterState,
+        dispatch_uid="nso_plugin_bgp_router_state_post_delete",
+        weak=False,
+    )
 
     post_save.connect(
         _on_bgp_peer_state_save,
@@ -4270,23 +4208,21 @@ def _connect_g_activated():  # pragma: no cover
     except ImportError:
         logger.debug("netbox_routing not installed — OSPF greenfield signals not registered")
 
-    # netbox_routing.BGPPeer exact-writer delivery notifications.
     try:
-        from netbox_routing.models import BGPPeer
+        from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPPeerAddressFamily, BGPRouter, BGPScope
 
-        post_save.connect(
-            _on_routing_bgp_peer_save,
-            sender=BGPPeer,
-            dispatch_uid="nso_plugin_routing_bgp_peer_post_save",
-        )
-        pre_delete.connect(
-            _as_delete_origin(_on_routing_bgp_peer_pre_delete),
-            sender=BGPPeer,
-            dispatch_uid="nso_plugin_routing_bgp_peer_pre_delete",
-            weak=False,
-        )
+        for native in (BGPRouter, BGPScope, BGPAddressFamily, BGPPeer, BGPPeerAddressFamily):
+            post_save.connect(
+                _on_routing_bgp_peer_save, sender=native, dispatch_uid=f"nso_plugin_{native._meta.model_name}_post_save"
+            )
+            pre_delete.connect(
+                _as_delete_origin(_on_routing_bgp_peer_pre_delete),
+                sender=native,
+                dispatch_uid=f"nso_plugin_{native._meta.model_name}_pre_delete",
+                weak=False,
+            )
     except ImportError:
-        logger.debug("netbox_routing not installed — BGP peer greenfield signals not registered")
+        logger.debug("netbox_routing not installed, BGP graph signals not registered")
 
     # netbox_routing.ISISFlexAlgo greenfield write path (operator-created flex-algos → push)
     try:

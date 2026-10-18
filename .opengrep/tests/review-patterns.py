@@ -2906,3 +2906,76 @@ def differences_unrestricted_netbox_query(user, query):
     rows = IPAddress.objects.restrict(user, "view").filter(query)
     # ok: nso-differences-unrestricted-netbox-query
     rows = NSOFamilyObservation.objects.filter(query)
+
+
+def caught_exception_text_to_operator(form, row, ownership_planner, signals_module):
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        blocked = _bgp_router_blocker(row.asn_str, repr(exc), row.pk)
+        # ruleid: nso-caught-exception-text-to-operator
+        blocked = signals_module._bgp_router_blocker("", exc.args)
+        # ruleid: nso-caught-exception-text-to-operator
+        form.add_error(None, repr(exc))
+        # ruleid: nso-caught-exception-text-to-operator
+        form.add_error(None, exc.args)
+        # ruleid: nso-caught-exception-text-to-operator
+        raise ownership_planner.OwnershipNotQualified(repr(exc)) from exc
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise OwnershipNotQualified(exc.args) from exc
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise OwnershipNotQualified(str(exc), device_id=row.device_id) from exc
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise ownership_planner.OwnershipNotQualified(str(exc)) from exc
+    try:
+        qualified_router(row)
+    except (TypeError, ValueError) as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        blocked = _bgp_router_blocker(row.asn_str, str(exc), row.pk)
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        blocked = signals_module._bgp_router_blocker("", str(exc))
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        form.add_error(None, str(exc))
+    try:
+        qualified_router(row)
+    except BGPIntentError as exc:
+        # ok: nso-caught-exception-text-to-operator
+        raise OwnershipNotQualified(exc.public_message, device_id=row.device_id) from exc
+    try:
+        qualified_router(row)
+    except BGPIntentError as exc:
+        # ok: nso-caught-exception-text-to-operator
+        blocked = _bgp_router_blocker(row.asn_str, exc.public_message, row.pk)
+    try:
+        qualified_router(row)
+    except BGPIntentError as exc:
+        # ok: nso-caught-exception-text-to-operator
+        form.add_error(None, exc.public_message)
+    # ok: nso-caught-exception-text-to-operator
+    blocked = _bgp_router_blocker(str(row.asn_str), "Accept the router before delivering BGP intent.")
+    return blocked
+
+
+class CaughtExceptionTextForm:
+    def clean(self, ref):
+        try:
+            parse_vault_ref(ref)
+        except VaultRefError as exc:
+            # ok: nso-caught-exception-text-to-operator
+            self.add_error("vault_ref", str(exc))

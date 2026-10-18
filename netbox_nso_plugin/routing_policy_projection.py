@@ -455,6 +455,38 @@ def _native_structured_blobs(row, objects):
     return match_data, set_data, edited
 
 
+def _native_bgp_routers(routers, router_states):
+    result, router_entries = [], {}
+    for router in routers:
+        reason = "native BGP source AS is unavailable" if router.asn is None else ""
+        identity = ("router", int(router.asn.asn) if router.asn else None)
+        states = tuple(router_states[router.pk])
+        if any(state.asn_str != str(identity[1]) for state in states):
+            reason = reason or "native and overlay BGP router identities are inconsistent"
+        projected = ProjectedEntry(
+            identity,
+            {"router_id": str(router.router_id) if router.router_id else None},
+            (router, router.asn, *states),
+            reason=reason,
+        )
+        result.append(projected)
+        router_entries[router.pk] = projected
+    for native_id, states in router_states.items():
+        if native_id in router_entries:
+            continue
+        for state in states:
+            native = state.bgp_router
+            result.append(
+                ProjectedEntry(
+                    ("router", _bgp_asn_identity(state.asn_str)),
+                    {},
+                    (state, native, native.asn if native is not None else None),
+                    reason="native BGP router binding is unavailable for this device",
+                )
+            )
+    return result, router_entries
+
+
 def _native_bgp(management):
     from dcim.models import Device
     from django.contrib.contenttypes.models import ContentType
@@ -468,7 +500,7 @@ def _native_bgp(management):
         BGPScope,
     )
 
-    from .models import NSOBGPPeerState, NSOBGPPeerTemplateState
+    from .models import NSOBGPPeerState, NSOBGPPeerTemplateState, NSOBGPRouterState
 
     routers = list(
         BGPRouter.objects.filter(
@@ -480,6 +512,11 @@ def _native_bgp(management):
         .order_by("pk")
     )
     scopes = list(BGPScope.objects.filter(router__in=routers).select_related("vrf").order_by("pk"))
+    router_states = defaultdict(list)
+    for state in (
+        NSOBGPRouterState.objects.filter(management=management).select_related("bgp_router__asn").order_by("pk")
+    ):
+        router_states[state.bgp_router_id].append(state)
     peers = list(
         BGPPeer.objects.filter(scope__in=scopes)
         .select_related(
@@ -517,22 +554,12 @@ def _native_bgp(management):
         .order_by("pk")
     ):
         afs[(row.assigned_object_type_id, row.assigned_object_id)].append(row)
-    result, router_entries, scope_entries = [], {}, {}
-    for router in routers:
-        reason = "native BGP source AS is unavailable" if router.asn is None else ""
-        identity = ("router", int(router.asn.asn) if router.asn else None)
-        projected = ProjectedEntry(
-            identity,
-            {"router_id": str(router.router_id) if router.router_id else None},
-            (router, router.asn),
-            reason=reason,
-        )
-        result.append(projected)
-        router_entries[router.pk] = projected
+    result, router_entries = _native_bgp_routers(routers, router_states)
+    scope_entries = {}
     for scope in scopes:
         parent = router_entries[scope.router_id]
         identity = (*parent.identity, "scope", scope.vrf.name if scope.vrf else "")
-        projected = ProjectedEntry(identity, {}, (scope, scope.vrf), reason=parent.reason)
+        projected = ProjectedEntry(identity, {}, (scope, scope.vrf, *parent.objects), reason=parent.reason)
         result.append(projected)
         scope_entries[scope.pk] = projected
     for row in BGPAddressFamily.objects.filter(scope__in=scopes).order_by("pk"):
@@ -541,7 +568,7 @@ def _native_bgp(management):
             ProjectedEntry(
                 (*parent.identity, "address_family", row.address_family),
                 {},
-                (row,),
+                (row, *parent.objects),
                 reason=parent.reason,
             )
         )

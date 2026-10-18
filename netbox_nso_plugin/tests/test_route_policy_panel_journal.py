@@ -238,6 +238,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         revision = NSOIntentRevision.objects.get(device=self.device, scope="route_policy").revision
         NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
             selected=selected,
@@ -254,6 +255,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         unrelated_selected = {"vlan": 42}
         NSOApplyAttempt.objects.create(
             id=unrelated_attempt_id,
+            adapter_apply_attempt_id=unrelated_attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
             selected=unrelated_selected,
@@ -265,6 +267,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         lost_response_selected = {"ip": 43}
         lost_response_attempt = NSOApplyAttempt.objects.create(
             id=lost_response_attempt_id,
+            adapter_apply_attempt_id=lost_response_attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
             selected=lost_response_selected,
@@ -367,7 +370,10 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         self._owned_reconcile()
         for revisions in ([], "invalid", 1, True):
             with self.subTest(revisions=revisions):
+                attempt_id = uuid4()
                 attempt = NSOApplyAttempt.objects.create(
+                    id=attempt_id,
+                    adapter_apply_attempt_id=attempt_id,
                     management=mgmt,
                     adapter_device_id=mgmt.adapter_device_id,
                     selected={"route_policy": 41},
@@ -397,6 +403,7 @@ class TestRoutePolicyApplyJournal(_RoutePolicyFixture):
         revision = NSOIntentRevision.objects.get(device=self.device, scope="route_policy").revision
         NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=mgmt,
             adapter_device_id=mgmt.adapter_device_id,
             selected={"route_policy": 41},

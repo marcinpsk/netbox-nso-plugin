@@ -1,0 +1,263 @@
+{
+  "bgp": {
+    "accepted_payload": {
+      "asn": "64512",
+      "router_id": "192.0.2.254",
+      "scopes": [
+        {
+          "vrf": "",
+          "peers": [
+            {
+              "peer_address": "192.0.2.1",
+              "remote_as": "64513",
+              "address_families": [
+                {
+                  "af": "ipv4-unicast",
+                  "enabled": true
+                }
+              ]
+            },
+            {
+              "peer_address": "192.0.2.2",
+              "remote_as": "64514"
+            }
+          ]
+        }
+      ]
+    },
+    "fence": {
+      "stream": "bgp",
+      "source_push_seq": 41,
+      "frozen_revision": 7,
+      "acceptance_identity": "2026-01-02T03:04:05+00:00",
+      "generation_id": 17,
+      "settlement_cohort": 9
+    },
+    "prior": [
+      {
+        "row": {
+          "subject": "bgp.router.scope.peer",
+          "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec"
+        },
+        "status": "in_sync",
+        "accepted_at": "2026-01-02T03:04:05+00:00",
+        "last_apply_at": "2025-12-31T01:02:03+00:00",
+        "last_apply_error": "placeholder prior error"
+      },
+      {
+        "row": {
+          "subject": "bgp.router.scope.peer",
+          "key": "79361f0251be0a1ad8552c813127e301770cb6ee0a2b7ea7faa82875eeca2e80"
+        },
+        "status": "in_sync",
+        "accepted_at": "2026-01-02T03:04:05+00:00",
+        "last_apply_at": "2025-12-31T01:02:03+00:00",
+        "last_apply_error": "placeholder prior error"
+      }
+    ],
+    "refusal": {
+      "family": "bgp",
+      "row": {
+        "subject": "bgp.router.scope.peer",
+        "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec"
+      },
+      "field": null,
+      "reason": "inexpressible-on-ned",
+      "message_id": "write-blocked",
+      "message": "The device rejected a value this intent requires, and the field cannot be left out.",
+      "related": null
+    },
+    "expected": [
+      {
+        "stream": "bgp",
+        "source_push_seq": 41,
+        "frozen_revision": 7,
+        "acceptance_identity": "2026-01-02T03:04:05+00:00",
+        "generation_id": 17,
+        "settlement_cohort": 9,
+        "row": {
+          "subject": "bgp.router.scope.peer",
+          "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec"
+        },
+        "carrier": {
+          "stream": "bgp",
+          "row": {
+            "subject": "bgp.router",
+            "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709"
+          },
+          "source_push_seq": 41,
+          "frozen_revision": 7,
+          "accepted_at": "2026-01-02T03:04:05+00:00",
+          "generation_id": 17,
+          "settlement_cohort": 9
+        },
+        "outcome": "refused",
+        "cause": "write-blocked"
+      },
+      {
+        "stream": "bgp",
+        "source_push_seq": 41,
+        "frozen_revision": 7,
+        "acceptance_identity": "2026-01-02T03:04:05+00:00",
+        "generation_id": 17,
+        "settlement_cohort": 9,
+        "row": {
+          "subject": "bgp.router.scope.peer",
+          "key": "79361f0251be0a1ad8552c813127e301770cb6ee0a2b7ea7faa82875eeca2e80"
+        },
+        "carrier": {
+          "stream": "bgp",
+          "row": {
+            "subject": "bgp.router",
+            "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709"
+          },
+          "source_push_seq": 41,
+          "frozen_revision": 7,
+          "accepted_at": "2026-01-02T03:04:05+00:00",
+          "generation_id": 17,
+          "settlement_cohort": 9
+        },
+        "outcome": "not_applied",
+        "cause": null
+      }
+    ],
+    "failed_carrier_count": 1,
+    "executions": [
+      {
+        "name": "terminal"
+      },
+      {
+        "name": "restart",
+        "checkpoint": "refusal_recorded",
+        "extra_puts": 0
+      },
+      {
+        "name": "successor",
+        "row": {
+          "subject": "bgp.router.scope.peer",
+          "key": "79361f0251be0a1ad8552c813127e301770cb6ee0a2b7ea7faa82875eeca2e80"
+        },
+        "fence": {
+          "stream": "bgp",
+          "source_push_seq": 42,
+          "frozen_revision": 8,
+          "acceptance_identity": "2026-01-03T03:04:05+00:00",
+          "generation_id": 18,
+          "settlement_cohort": 9
+        },
+        "preserve": {
+          "status": "accepted",
+          "last_apply_at": "2026-01-01T01:02:03+00:00",
+          "last_apply_error": "placeholder successor error"
+        }
+      }
+    ]
+  },
+  "mapping_cases": [
+    {
+      "family": "lag",
+      "cause": {
+        "subject": "lag.bundle.member",
+        "key": "02c7bfc6081ab143fc6f02f546d73be855e4e146d91492e42ecb7ea37633b082"
+      },
+      "logical": {
+        "subject": "lag.bundle.member",
+        "key": "02c7bfc6081ab143fc6f02f546d73be855e4e146d91492e42ecb7ea37633b082"
+      },
+      "carrier": {
+        "subject": "lag.bundle",
+        "key": "f5aae6274c43469943d69f1c2e2e92b4a0644e4a8b12ec15ccdec2aaaa15981d"
+      }
+    },
+    {
+      "family": "bgp",
+      "cause": {
+        "subject": "bgp.router.scope.peer.peer-address-family",
+        "key": "3a55a6ecbbc32ca806643f77e5d67adc0afad12bbd44595eff33df7625f1bc6c"
+      },
+      "logical": {
+        "subject": "bgp.router.scope.peer",
+        "key": "235ef85596fd0b271cd75e12cdff7d255aeb54dece62dae9ae4f9fe413d021ec"
+      },
+      "carrier": {
+        "subject": "bgp.router",
+        "key": "ed79b917fa762d600c5f9fae2f9368b791e9fe3899f07c905534b62b25c44709"
+      }
+    },
+    {
+      "family": "switchport",
+      "cause": {
+        "subject": "switchport.interface",
+        "key": "2b483c6b357a3c829dc81e07052a482f9ee03e7ae3144a05be83d8c8a8c5ecc4"
+      },
+      "logical": {
+        "subject": "switchport.interface",
+        "key": "2b483c6b357a3c829dc81e07052a482f9ee03e7ae3144a05be83d8c8a8c5ecc4"
+      },
+      "carrier": {
+        "subject": "switchport.interface",
+        "key": "2b483c6b357a3c829dc81e07052a482f9ee03e7ae3144a05be83d8c8a8c5ecc4"
+      }
+    },
+    {
+      "family": "route-policy",
+      "cause": {
+        "subject": "route-policy.prefix-list.entry",
+        "key": "b1790971b44b2faa4e3fb1fda68a8aedd888360804bd9bd3f914aec2adae7916"
+      },
+      "logical": {
+        "subject": "route-policy.prefix-list",
+        "key": "bfb439e2cec7c05f22cfec6ef0eed79b07edaf3d6c28762f7a2ff1dfed6f4075"
+      },
+      "carrier": {
+        "subject": "route-policy.prefix-list",
+        "key": "bfb439e2cec7c05f22cfec6ef0eed79b07edaf3d6c28762f7a2ff1dfed6f4075"
+      }
+    },
+    {
+      "family": "bgp",
+      "cause": {
+        "subject": "bgp.router.scope.address-family.redistribute",
+        "key": "e93d1572df4970c0b1dc52d5b1f90ac1e1ad044d76be5e0cf14d363c441a41df"
+      },
+      "logical": {
+        "subject": "bgp.router.scope.address-family.redistribute",
+        "key": "e93d1572df4970c0b1dc52d5b1f90ac1e1ad044d76be5e0cf14d363c441a41df"
+      },
+      "carrier": {
+        "subject": "bgp.router.scope.address-family.redistribute",
+        "key": "e93d1572df4970c0b1dc52d5b1f90ac1e1ad044d76be5e0cf14d363c441a41df"
+      }
+    },
+    {
+      "family": "ospf",
+      "cause": {
+        "subject": "ospf.process-config.redistribute",
+        "key": "3a530b9e77db060982b7e4ed7dc6fc2755772cc459670333a6f2225882391395"
+      },
+      "logical": {
+        "subject": "ospf.process-config.redistribute",
+        "key": "3a530b9e77db060982b7e4ed7dc6fc2755772cc459670333a6f2225882391395"
+      },
+      "carrier": {
+        "subject": "ospf.process-config.redistribute",
+        "key": "3a530b9e77db060982b7e4ed7dc6fc2755772cc459670333a6f2225882391395"
+      }
+    },
+    {
+      "family": "isis",
+      "cause": {
+        "subject": "isis.process-config.redistribute",
+        "key": "3a723bce8b5cf400d3ae15957937e33283879dd0e997b233dec43921cb1d917f"
+      },
+      "logical": {
+        "subject": "isis.process-config.redistribute",
+        "key": "3a723bce8b5cf400d3ae15957937e33283879dd0e997b233dec43921cb1d917f"
+      },
+      "carrier": {
+        "subject": "isis.process-config.redistribute",
+        "key": "3a723bce8b5cf400d3ae15957937e33283879dd0e997b233dec43921cb1d917f"
+      }
+    }
+  ]
+}

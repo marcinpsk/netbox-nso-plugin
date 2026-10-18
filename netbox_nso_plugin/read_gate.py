@@ -916,15 +916,18 @@ def mark_publication_error_if_current(mgmt, family: str, decision: _Decision, ep
 
 
 def _publication_observation(family, decision, observation):
+    """Validate the observation; return a snapshot only for a revision-bound publication."""
     from .adapter_client import AdapterError
-    from .observations import ObservationProtocolError, observation_defaults
+    from .observations import ObservationProtocolError, observation_defaults, validate_observation_schema
 
-    if decision.disposition != RAN or decision.payload_revision is None:
-        return None
     try:
-        return observation_defaults(family, decision.payload_revision, decision.source_epoch, observation)
+        if decision.disposition == RAN and decision.payload_revision is not None:
+            return observation_defaults(family, decision.payload_revision, decision.source_epoch, observation)
+        if observation is not None:
+            validate_observation_schema(family, observation)
     except ObservationProtocolError as exc:
         raise AdapterError(str(exc), code="invalid_response") from exc
+    return None
 
 
 def gated_family_run(
@@ -965,6 +968,8 @@ def gated_family_run(
         )
 
         scopes = _INTENT_SCOPES_BY_READ_FAMILY.get(family, (family,))
+        # Planners read the payload observation, so validate it before pre_body.
+        snapshot = _publication_observation(family, decision, observation)
         planning = pre_body is not None
         plan = pre_body() if pre_body is not None else None
         planning = False
@@ -986,7 +991,6 @@ def gated_family_run(
             row = NSOFamilyReadState.objects.select_for_update().get(management=current_management, family=family)
             if not _locked_publication_matches(current_management, row, decision, epoch):
                 raise _SupersededPublication
-            snapshot = _publication_observation(family, decision, observation)
             value = body()
             if snapshot is not None:
                 from .models import NSOFamilyObservation

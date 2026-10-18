@@ -360,16 +360,35 @@ class TestStampingFollowsTheAcknowledgedBody(_OutcomeCase):
         assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
         assert last_acked(self.mgmt, self.route) == self.mirror
 
-    def test_a_string_route_id_in_the_body_stamps_the_row_it_names(self):
-        """The ORM filter matches a string id, so the stamp's own lookup must match it too."""
+    def test_acknowledgement_rejects_changed_captured_route_id_type(self):
+        """The captured wire digest retains the exact type of each route identity."""
         from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOAcceptedSelection, NSOApplyOverlaySnapshot, NSOStaticRouteState
+        from netbox_nso_plugin.refusal_registry import RegistryError
 
         self._touch()
         claimed = drain.claim(self.device.pk, "static_route")
+        states = NSOStaticRouteState.objects.filter(management=self.mgmt)
+        selections = NSOAcceptedSelection.objects.filter(management=self.mgmt)
+        snapshots = NSOApplyOverlaySnapshot.objects.filter(attempt__management=self.mgmt)
+        prior_states = list(states.values())
+        prior_selections = list(selections.values())
+        prior_snapshots = list(snapshots.values())
+        prior_outbox = state_of(self.device, "static_route")
+        prior_entries = list(entries(self.device, "static_route", unconsumed=False))
         claimed.payload = [{**route, "route_id": str(route["route_id"])} for route in claimed.payload]
 
-        assert drain.settle(claimed, {"count": 1}) == drain.SUCCEEDED
-        assert last_acked(self.mgmt, self.route) == self.mirror
+        with self.assertRaisesRegex(RegistryError, "original durable selection"):
+            drain.settle(claimed, {"count": 1})
+
+        self.assertEqual(list(states.values()), prior_states)
+        self.assertEqual(list(selections.values()), prior_selections)
+        self.assertEqual(list(snapshots.values()), prior_snapshots)
+        self.assertEqual(state_of(self.device, "static_route").claim_payload, prior_outbox.claim_payload)
+        self.assertEqual(state_of(self.device, "static_route").push_seq, claimed.push_seq)
+        self.assertEqual(entries(self.device, "static_route", unconsumed=False), prior_entries)
+        self.assertIsNone(last_acked(self.mgmt, self.route))
+        self.assertEqual(self.adapter.requests, [])
 
     def test_stamping_many_routes_uses_one_update(self):
         from netbox_nso_plugin import drain
@@ -972,6 +991,31 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
         state = state_of(self.device, "vlan")
         assert state.push_seq is None, "the operation is resolved, so the key can allocate again"
         assert entries(self.device, "vlan") == []
+
+    def test_an_exact_restored_receipt_settles_after_the_mapping_epoch_changes(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        own_vlan(self.mgmt, 916, self.tag)
+        self._lost_response()
+        receipt = self._receipt()
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=2)
+
+        assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_SETTLED
+        assert state_of(self.device, "vlan").push_seq is None
+        assert entries(self.device, "vlan") == []
+
+    def test_a_missing_durable_selection_keeps_the_restored_claim_closed(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOAcceptedSelection
+
+        own_vlan(self.mgmt, 917, self.tag)
+        claimed = self._lost_response()
+        receipt = self._receipt()
+        NSOAcceptedSelection.objects.filter(management=self.mgmt).update(source_push_seq=claimed.push_seq + 1)
+
+        assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
+        assert state_of(self.device, "vlan").push_seq == claimed.push_seq
 
     def test_a_claim_without_a_revision_is_rejected_as_corrupt(self):
         from netbox_nso_plugin import drain

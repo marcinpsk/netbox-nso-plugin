@@ -44,7 +44,7 @@ Issues = "https://github.com/marcinpsk/netbox-nso-plugin/issues"
 include = ["netbox_nso_plugin*"]
 
 [tool.setuptools.package-data]
-netbox_nso_plugin = ["templates/**/*", "static/**/*", "schemas/*.json"]
+netbox_nso_plugin = ["templates/**/*", "static/**/*", "schemas/*.json", "refusal_protocol_corpus.json"]
 
 [tool.semantic_release]
 allow_zero_version = true
@@ -101,6 +101,7 @@ docs = [
 ]
 
 [tool.pytest.ini_options]
+testpaths = ["netbox_nso_plugin/tests"]
 pythonpath = ["/opt/netbox/netbox", "netbox_stubs"]
 DJANGO_SETTINGS_MODULE = "netbox.settings"
 # Coverage has ONE source of truth: the [tool.coverage.*] tables below. Every entry

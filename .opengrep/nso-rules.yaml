@@ -713,3 +713,34 @@ rules:
           regex: ^(?!restrict$)
     paths:
       include: ["netbox_nso_plugin/device_differences.py", "netbox_nso_plugin/device_sync.py"]
+  - id: nso-caught-exception-text-to-operator
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Do not show the text of a caught exception to the operator. Catch an exception type with an authored
+      public_message, such as BGPIntentError, and pass that message.
+    patterns:
+      - pattern-inside: |
+          try:
+              ...
+          except $TYPE as $EXC:
+              ...
+      - pattern-either:
+          - pattern: OwnershipNotQualified(..., $RAW, ...)
+          - pattern: $MODULE.OwnershipNotQualified(..., $RAW, ...)
+          - pattern: _bgp_router_blocker(..., $RAW, ...)
+          - pattern: $MODULE._bgp_router_blocker(..., $RAW, ...)
+          - patterns:
+              - pattern: $FORM.add_error(..., $RAW, ...)
+              - metavariable-regex:
+                  metavariable: $FORM
+                  regex: ^(?!self$)
+      - metavariable-pattern:
+          metavariable: $RAW
+          pattern-either:
+            - pattern: str($EXC)
+            - pattern: repr($EXC)
+            - pattern: $EXC.args
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]

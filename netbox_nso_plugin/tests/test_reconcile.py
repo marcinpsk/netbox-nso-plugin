@@ -8,18 +8,19 @@ from contextlib import contextmanager
 from unittest.mock import ANY, patch
 from uuid import uuid4
 
+import requests
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from django.db import transaction
 from django.test import TestCase, TransactionTestCase
 from rest_framework import status
 from utilities.testing import APITestCase
 
-from netbox_nso_plugin import drain
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-from ._outbox_case import without_commit_drain
+from ._adapter_http import make_response
+from ._outbox_case import ReceiptAdapter, without_commit_drain
 from ._ownership_case import acquire_overlay
-from .mixins import IntentPushResetMixin, _CascadeFlushMixin, isolate_other_scopes
+from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
 class TestProvisionTombstoneEnqueue(TestCase):
@@ -59,52 +60,57 @@ def _make_device(name="rec-dev"):
 
 
 @contextmanager
-def _patch_apply_pushes(answers=None):
-    """Double the forced preparation claims, keyed by delivery scope.
-
-    Apply routes every scope except SNMP through ``drain.push_now``. SNMP uses
-    ``drain_key`` because its acknowledgement is an outcome. *answers* maps a scope to
-    the answer from ``push_now``. Every other required scope succeeds.
-    """
-    from netbox_nso_plugin import delivery
-    from netbox_nso_plugin.models import NSOIntentRevision
-
-    from ._outbox_case import ReceiptAdapter
-
+def _patch_apply_pushes(answers=None, *, apply_error=None):
+    """Run actual preparation claims against one adapter HTTP double."""
     answers = answers or {}
-    next_push_seq = iter(range(1, 100))
-    real_push_now = drain.push_now
-    adapter = ReceiptAdapter()
 
-    def record(device_id, scope):
-        captured = drain._SUCCESSFUL_PUSHES.get()
-        if captured is not None:
-            revision, _created = NSOIntentRevision.objects.get_or_create(device_id=device_id, scope=scope)
-            captured[scope] = drain.SuccessfulPush(next(next_push_seq), f"test-{scope}", int(revision.revision))
+    def respond(body):
+        if isinstance(body, dict) and "deleted_routes" in body and "static_route" in answers:
+            answer = answers["static_route"]
+            if isinstance(answer, dict):
+                default = ReceiptAdapter._default_response(body)
+                return {**{name: value for name, value in default.items() if name != "count"}, **answer}
+            return answer
+        return ReceiptAdapter._default_response(body)
 
-    def push_now(device_id, scope, **kwargs):
-        if scope in delivery.direct_keys():
-            return real_push_now(device_id, scope, **kwargs)
-        record(device_id, scope)
-        return answers.get(scope, {"status": "deployed"})
+    class PreparationAdapter(ReceiptAdapter):
+        def _handle(self, method, url, **kwargs):
+            if method == "POST" and url.endswith("/actions/apply") and apply_error is not None:
+                if apply_error.status_code is None:
+                    raise requests.ConnectionError("Apply admission answer was lost.")
+                return make_response(
+                    apply_error.status_code,
+                    {
+                        "error": {
+                            "code": apply_error.code,
+                            "message": "Adapter admission failed.",
+                            "detail": apply_error.detail or {},
+                        }
+                    },
+                )
+            return super()._handle(method, url, **kwargs)
 
-    def drain_key(device_id, scope, **kwargs):
-        record(device_id, scope)
-        return drain.SUCCEEDED
-
+    adapter = PreparationAdapter(respond=respond)
     config, session = adapter.patches()
-    with (
-        config,
-        session,
-        patch("netbox_nso_plugin.drain.push_now", side_effect=push_now) as push,
-        patch("netbox_nso_plugin.drain.drain_key", side_effect=drain_key),
-    ):
-        yield push
+    with config, session:
+        yield adapter
 
 
-def _forced_scopes(push, device_id):
-    """The scopes the Apply forced for *device_id*, in call order."""
-    return [call.args[1] for call in push.call_args_list if call.args[0] == device_id and call.kwargs.get("force")]
+def _forced_scopes(adapter, device_id):
+    """Return the scopes with real acknowledged store-only requests."""
+    from netbox_nso_plugin import delivery
+    from netbox_nso_plugin.models import NSOAcceptedSelection
+
+    scopes = {entry.section: entry.key for entry in delivery.delivery_keys().values()}
+    requests_ = [request for request in adapter.requests if request["params"].get("store_only") == "true"]
+    selections = dict(
+        NSOAcceptedSelection.objects.filter(
+            management__device_id=device_id,
+            source_push_seq__in=[request["push_seq"] for request in requests_],
+            acknowledged_at__isnull=False,
+        ).values_list("source_push_seq", "stream")
+    )
+    return [scopes[selections[request["push_seq"]]] for request in requests_ if request["push_seq"] in selections]
 
 
 class TestRunDeviceReconcile(APITestCase):
@@ -225,6 +231,7 @@ class TestRunDeviceReconcile(APITestCase):
         for attempt_id in (requested_id, extra_id):
             NSOApplyAttempt.objects.create(
                 id=attempt_id,
+                adapter_apply_attempt_id=attempt_id,
                 management=mgmt,
                 adapter_device_id=mgmt.adapter_device_id,
                 selected={"route_policy": 1},
@@ -717,8 +724,18 @@ class TestRoutePolicyApplySettle(_CascadeFlushMixin, IntentPushResetMixin, Trans
         mgmt = NSODeviceManagement.objects.create(
             device=device, nso_instance=inst, nso_device_name="rp-settle", adapter_device_id=88
         )
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CommunityList
+
+        policy = CommunityList.objects.create(name="CL-X")
         row = acquire_overlay(
-            NSORoutePolicyState, management=mgmt, family="community_list", object_name="CL-X", status=status_
+            NSORoutePolicyState,
+            management=mgmt,
+            family="community_list",
+            object_name="CL-X",
+            content_type=ContentType.objects.get_for_model(CommunityList),
+            object_id=policy.pk,
+            status=status_,
         )
         return mgmt, row
 
@@ -784,15 +801,10 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
     """
 
     def test_prepare_apply_force_pushes_snmp_snapshot(self):
-        from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.models import NSOSnmpHostState
         from netbox_nso_plugin.views import _prepare_apply
 
-        with (
-            patch("netbox_nso_plugin.signals._sync_committed_scope_to_adapter"),
-            without_commit_drain(),
-            transaction.atomic(),
-        ):
+        with without_commit_drain(), transaction.atomic():
             device = _make_device("snmp-apply")
             inst, _ = NSOInstance.objects.get_or_create(
                 name="snmp-apply-inst", defaults={"adapter_instance_id": "snmp-apply-inst"}
@@ -809,20 +821,15 @@ class TestSnmpApplyForcePush(_CascadeFlushMixin, IntentPushResetMixin, Transacti
                 community_hash="abcd1234abcd1234",
                 status="accepted",
             )
-        seen = {}
-
-        def _record_store_only(*args, **kwargs):
-            seen["store_only"] = adapter_client._store_only_push.get()
-
-        with isolate_other_scopes("snmp") as stack:
-            put_snmp = stack.enter_context(
-                patch("netbox_nso_plugin.adapter_client.put_snmp_intent", side_effect=_record_store_only)
-            )
+        adapter = ReceiptAdapter()
+        config, session = adapter.patches()
+        with config, session:
             _prepare_apply(mgmt)
-        put_snmp.assert_called_once()
-        self.assertEqual(put_snmp.call_args.args[0], mgmt.adapter_device_id)
-        self.assertEqual([h["address"] for h in put_snmp.call_args.args[3]], ["198.18.0.40"])
-        self.assertTrue(seen.get("store_only"))
+        pushes = [request for request in adapter.requests if request["url"].endswith("/snmp-intent")]
+        self.assertEqual(len(pushes), 1)
+        self.assertIn(f"/devices/{mgmt.adapter_device_id}/", pushes[0]["url"])
+        self.assertEqual([host["address"] for host in pushes[0]["body"]["hosts"]], ["198.18.0.40"])
+        self.assertEqual(pushes[0]["params"].get("store_only"), "true")
 
 
 class TestApplyRollbackOnAdapterError(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -838,8 +845,18 @@ class TestApplyRollbackOnAdapterError(_CascadeFlushMixin, IntentPushResetMixin, 
         mgmt = NSODeviceManagement.objects.create(
             device=device, nso_instance=inst, nso_device_name="apply-rb", adapter_device_id=99
         )
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import CommunityList
+
+        policy = CommunityList.objects.create(name="CL-RB")
         row = acquire_overlay(
-            NSORoutePolicyState, management=mgmt, family="community_list", object_name="CL-RB", status="accepted"
+            NSORoutePolicyState,
+            management=mgmt,
+            family="community_list",
+            object_name="CL-RB",
+            content_type=ContentType.objects.get_for_model(CommunityList),
+            object_id=policy.pk,
+            status="accepted",
         )
         return mgmt, row
 
@@ -848,13 +865,7 @@ class TestApplyRollbackOnAdapterError(_CascadeFlushMixin, IntentPushResetMixin, 
 
         admin = get_user_model().objects.create_superuser(username="apply-rb-admin", password="pw", email="a@x.y")  # noqa: S106
         self.client.force_login(admin)
-        with (
-            _patch_apply_pushes(),
-            patch(
-                "netbox_nso_plugin.adapter_client.trigger_apply",
-                side_effect=error,
-            ),
-        ):
+        with _patch_apply_pushes(apply_error=error):
             return self.client.post(f"/plugins/nso/device-management/{mgmt.pk}/actions/apply/")
 
     def test_an_ambiguous_transport_failure_keeps_deploying_for_reconciliation(self):

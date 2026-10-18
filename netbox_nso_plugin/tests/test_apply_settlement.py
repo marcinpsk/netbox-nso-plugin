@@ -4,11 +4,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.test import TestCase
+import pytest
+from django.conf import settings
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from ._adapter_http import make_response
@@ -108,6 +113,53 @@ def test_evidence_fixture_generations_match_the_adapter_evidence_field_set():
         assert set(_evidence_generation(73, selected, settled_scopes)) == _GENERATION_FIELDS
 
 
+_ADMISSION_WITHOUT_VIEWS = """
+import sys
+import django
+django.setup()
+from django.conf import settings
+assert settings.SETTINGS_MODULE == sys.argv[1]
+from netbox_nso_plugin import delivery
+from netbox_nso_plugin.apply_settlement import _admission_keep_streams
+
+class Attempt:
+    selected = {"vlan": 4, "lag": 5}
+
+source = {s: None if s in delivery.direct_streams() else r for s, r in Attempt.selected.items()}
+link = {"generation_id": 1, "seq": 1, "job_id": None, "mode": "networked",
+        "source_push_seq": source, "stream_revisions": dict(Attempt.selected), "digest": "d"}
+promoted = {"selected": dict(Attempt.selected), "skipped": {}, "outcome": "promoted", "generations": [link]}
+no_op = {"selected": dict(Attempt.selected), "skipped": {"vlan": "superseded", "lag": "superseded"},
+         "outcome": "no_op", "generations": []}
+assert _admission_keep_streams(Attempt(), promoted) is None
+assert _admission_keep_streams(Attempt(), no_op) == ()
+print("views-loaded" if "netbox_nso_plugin.views" in sys.modules else "views-absent")
+"""
+
+
+@pytest.mark.parametrize("settings_module", ["netbox.settings", "admission_test_settings"])
+def test_admission_validation_runs_without_the_view_module(settings_module, tmp_path):
+    # A fresh process: the test session has already imported views through the URLconf.
+    (tmp_path / "admission_test_settings.py").write_text("from netbox.settings import *\n", encoding="utf-8")
+    with override_settings(SETTINGS_MODULE=settings_module):
+        env = dict(
+            os.environ,
+            DJANGO_SETTINGS_MODULE=settings.SETTINGS_MODULE,
+            PYTHONPATH=os.pathsep.join((str(tmp_path), *filter(None, sys.path))),
+        )
+        child = subprocess.run(  # noqa: S603 (a fixed argv, no shell)
+            [sys.executable, "-c", _ADMISSION_WITHOUT_VIEWS, settings_module],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip().splitlines()[-1] == "views-absent"
+
+
 class TestAttemptSettlement(TestCase):
     def setUp(self):
         self.adapter_device_id = 1626
@@ -123,6 +175,7 @@ class TestAttemptSettlement(TestCase):
         response = _response(self.adapter_device_id, generation_id, selected)
         return NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,
@@ -199,6 +252,7 @@ class TestAttemptSettlement(TestCase):
         response = _response(self.adapter_device_id, 72, selected)
         NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,
@@ -658,6 +712,7 @@ class TestAttemptSettlement(TestCase):
         )
         local = NSOApplyAttempt.objects.create(
             id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
             management=self.management,
             adapter_device_id=self.adapter_device_id,
             selected=selected,

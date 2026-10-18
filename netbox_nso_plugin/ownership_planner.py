@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -194,18 +195,25 @@ _CONVERTED_SCOPE_RULES = {
     "bgp": ScopeOwnershipRule(
         scope="bgp",
         qualification="native_binding",
-        native_model_labels=("netbox_routing.bgppeer",),
+        native_model_labels=("netbox_routing.bgprouter", "netbox_routing.bgppeer"),
         native_key_fields=("scope_id", "peer_id", "name"),
-        overlay_model_labels=("netbox_nso_plugin.nsobgppeerstate",),
-        overlay_native_fields=(("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),),
+        overlay_model_labels=("netbox_nso_plugin.nsobgprouterstate", "netbox_nso_plugin.nsobgppeerstate"),
+        overlay_native_fields=(
+            ("netbox_nso_plugin.nsobgprouterstate", "bgp_router"),
+            ("netbox_nso_plugin.nsobgppeerstate", "bgp_peer"),
+        ),
+        native_key_fields_by_model=(
+            ("netbox_routing.bgprouter", ("assigned_object_type_id", "assigned_object_id", "asn_id")),
+        ),
         foreign_overlay_delete="reown",
         deletion_authority=True,
         intentional_semantic_delta=(
             "A native BGP peer qualifies existing ownership. Acquisition requires an explicit operation. Save events are not ownership "
             "evidence. Foreign native peer deletes no longer delete linked overlays and push a reduced snapshot "
             "synchronously. Greenfield acceptance uses exact acquisition planning and outbox delivery instead of "
-            "accepting and pushing directly. Routers, scopes, address families, peer templates, ASNs, and peer IPs "
-            "are graph dependencies. BGP reconciliation no longer suppresses missing netbox-routing or IPAM imports; "
+            "accepting and pushing directly. A native BGP router qualifies its independent router owner. Scopes "
+            "and address families belong to that aggregate. Peer templates, ASNs, and peer IPs remain graph "
+            "dependencies. BGP reconciliation no longer suppresses missing netbox-routing or IPAM imports; "
             "missing graph dependencies fail fast. BGP foreign-key merge identities use natural graph identities. "
             "Legacy PK-shaped peer and template merge bases are reset before reconciliation."
         ),
@@ -725,6 +733,7 @@ def _prepare_acquisition(instance, grant, acquisition):
         discard_acquisition(instance)
         return False
     if acquisition:
+        require_bgp_redistribution_destination(instance)
         _record_acquisition(instance, grant)
         return True
     return NSOOwnershipAcquisition.objects.filter(
@@ -784,6 +793,19 @@ def _require_qualifying_acquisition(instance, binding, acquisition, *, signature
     if not acquisition or not is_owned(instance.status):
         return
     rule, scope, device_id, native_model_label, native_id, _native_key, state_model_label, state_key = binding
+    if state_model_label == "netbox_nso_plugin.nsobgppeerstate":
+        from .bgp_peer_content import peer_binding_qualifies
+
+        if not peer_binding_qualifies(instance):
+            raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
+        return
+    if state_model_label == "netbox_nso_plugin.nsobgprouterstate":
+        from .bgp_router_content import BGPIntentError, qualified_router
+
+        try:
+            qualified_router(instance, device_id=device_id)
+        except BGPIntentError as exc:
+            raise OwnershipNotQualified(exc.public_message, device_id=device_id) from exc
     signature = _valid_overlay_signature(scope, native_model_label, native_id, state_model_label, state_key)
     management = _manifest_management(instance)
     native = _manifest_native(instance, dict(rule.overlay_native_fields)[state_model_label])
@@ -813,22 +835,108 @@ def _require_qualifying_acquisition(instance, binding, acquisition, *, signature
         raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
 
 
-def require_qualifying_ownership(instance):
-    """Check a producer's resolved binding before it builds an acquisition plan."""
+def require_bgp_redistribution_destination(instance):
+    """Require an explicit address family before acquiring BGP redistribution."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsoredistributionstate" or instance.dest_protocol != "bgp":
+        return
+    from .bgp_router_content import BGPIntentError
+    from .redistribution_reconciler import bgp_destination_parts
+
+    try:
+        bgp_destination_parts(instance.dest_ref)
+    except BGPIntentError as exc:
+        raise OwnershipNotQualified(
+            "BGP redistribution requires an explicit address family before accepting it.",
+            device_id=instance.management.device_id,
+        ) from exc
+
+
+def _unbound_bgp_observation(instance):
+    from .redistribution_reconciler import bgp_observation_only_destination
+
+    return (
+        instance._meta.label_lower == "netbox_nso_plugin.nsoredistributionstate"
+        and instance.dest_protocol == "bgp"
+        and instance.redistribution_id is None
+        and bgp_observation_only_destination(instance.dest_ref)
+    )
+
+
+def require_qualifying_ownership(instance, *, signatures=None):
+    """Check a producer's resolved binding; ``signatures`` caches device scans across calls."""
+    require_bgp_redistribution_destination(instance)
     binding = manifest_binding(instance)
-    if binding is not None:
-        _require_qualifying_acquisition(instance, binding, True)
+    if binding is None and instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
+        management = _manifest_management(instance)
+        raise OwnershipNotQualified(
+            "Link the BGP router to its matching native device and ASN before accepting it.",
+            device_id=management.device_id if management is not None else None,
+        )
+    if binding is None:
+        return
+    rule, scope, device_id, *_identity = binding
+    qualifying = None
+    if (
+        signatures is not None
+        and rule.qualification == "native_binding"
+        and instance._meta.label_lower != "netbox_nso_plugin.nsobgppeerstate"
+    ):
+        key = (device_id, scope)
+        if key not in signatures:
+            signatures[key] = _qualifying_overlay_signatures(
+                device_id, frozenset({scope}), management=_manifest_management(instance)
+            )
+        qualifying = signatures[key]
+    _require_qualifying_acquisition(instance, binding, True, signatures=qualifying)
+
+
+def require_router_acquisition_observation(instance):
+    """Require resolvable named scopes before acquiring a reported router."""
+    from ipam.models import VRF
+
+    from .bgp_router_content import canonical_asn
+    from .models import NSOFamilyObservation
+
+    snapshot = NSOFamilyObservation.objects.filter(
+        read_state__management_id=instance.management_id, read_state__family="bgp"
+    ).first()
+    if snapshot is None:
+        return
+    try:
+        routers = [
+            router
+            for router in snapshot.document.get("routers") or ()
+            if canonical_asn(router.get("asn")) == instance.asn_str
+        ]
+    except ValueError as exc:
+        raise OwnershipNotQualified(
+            "The observed BGP router ASN is invalid. Refresh BGP before accepting it.",
+            device_id=instance.management.device_id,
+        ) from exc
+    names = {scope["vrf"] for router in routers for scope in router.get("scope") or () if scope.get("vrf")}
+    matches = Counter(VRF.objects.filter(name__in=names).values_list("name", flat=True))
+    if any(matches[name] != 1 for name in names):
+        raise OwnershipNotQualified(
+            "Resolve each reported BGP VRF name to exactly one VRF before accepting this router.",
+            device_id=instance.management.device_id,
+        )
 
 
 def validate_plan_acquisitions(identities):
     """Qualify each surviving acquisition against the final transaction state."""
+    from .status_machine import is_owned
+
     signatures = {}
     for label, pk in sorted(identities):
         instance = apps.get_model(label)._default_manager.filter(pk=pk).first()
         if instance is None:
             continue
+        if is_owned(instance.status):
+            require_bgp_redistribution_destination(instance)
         binding = manifest_binding(instance)
         if binding is None:
+            if instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
+                require_qualifying_ownership(instance)
             continue
         rule, scope, device_id, *_identity = binding
         qualifying = None
@@ -839,17 +947,43 @@ def validate_plan_acquisitions(identities):
                 signatures[key] = _qualifying_overlay_signatures(device_id, frozenset({scope}), management=management)
             qualifying = signatures[key]
         _require_qualifying_acquisition(instance, binding, True, signatures=qualifying)
+        if instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
+            require_router_acquisition_observation(instance)
         maintain_manifest(instance)
 
 
 def _qualify_or_defer_acquisition(instance, binding, acquisition):
     from .renderer_writer import active_renderer_writer
 
+    if _unbound_bgp_observation(instance):
+        return
     writer = active_renderer_writer()
     if acquisition and writer is not None:
         writer.record_acquisition(instance)
+    if acquisition and binding is None and instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
+        require_qualifying_ownership(instance)
     if binding is not None and writer is None:
         _require_qualifying_acquisition(instance, binding, acquisition)
+
+
+def _router_identity_changed_without_acquisition(instance, binding, acquisition, previous_binding):
+    """Keep passive router writes from transferring a durable ownership identity."""
+    from .status_machine import is_owned
+
+    if (
+        instance._meta.label_lower != "netbox_nso_plugin.nsobgprouterstate"
+        or acquisition
+        or not is_owned(instance.status)
+    ):
+        return False
+    _rule, _scope, device_id, _native_label, native_id, native_key, _state_label, state_key = binding
+    continuing = _continuing_manifest(binding, previous_binding)
+    return continuing is not None and (
+        continuing.device_id != device_id
+        or continuing.native_id != native_id
+        or continuing.native_key != native_key
+        or continuing.state_key != state_key
+    )
 
 
 @transaction.atomic
@@ -862,7 +996,9 @@ def maintain_manifest(instance, *, grant=None, acquisition=False, previous_bindi
 
     binding = manifest_binding(instance)
     _qualify_or_defer_acquisition(instance, binding, acquisition)
-    if binding is None:
+    if binding is None or _router_identity_changed_without_acquisition(
+        instance, binding, acquisition, previous_binding
+    ):
         return
     rule, scope, device_id, native_model_label, native_id, native_key, state_model_label, state_key = binding
     identity = {
@@ -1415,8 +1551,11 @@ def _seed_bgp_peer(candidate, native, _manifest):
     candidate.asn_str = str(native.scope.router.asn.asn)
     candidate.vrf_name = native.scope.vrf.name if native.scope.vrf_id else ""
     candidate.peer_address_str = str(native.peer.address.ip)
-    candidate.remote_as_str = str(native.remote_as.asn) if native.remote_as_id else ""
-    candidate.enabled = native.enabled
+
+
+def _seed_bgp_router(candidate, native, _manifest):
+    candidate.asn_str = str(native.asn.asn)
+    candidate.router_id = str(native.router_id) if native.router_id else ""
 
 
 def _seed_isis_instance(candidate, native, _manifest):
@@ -1460,6 +1599,7 @@ def _seed_redistribution(candidate, native, _manifest):
 
 
 _STATE_SEEDERS = {
+    "netbox_nso_plugin.nsobgprouterstate": _seed_bgp_router,
     "netbox_nso_plugin.nsobgppeerstate": _seed_bgp_peer,
     "netbox_nso_plugin.nsointerfaceipstate": _seed_interface_ip,
     "netbox_nso_plugin.nsointerfacemtustate": _seed_interface_mtu,
@@ -1646,25 +1786,46 @@ def _flex_algo_bindings(management):
 def _bgp_bindings(management):
     from dcim.models import Device
     from django.contrib.contenttypes.models import ContentType
-    from netbox_routing.models import BGPPeer
+    from netbox_routing.models import BGPPeer, BGPRouter
+
+    from .models import NSOBGPRouterState
 
     device_type = ContentType.objects.get_for_model(Device)
+    router_bindings = []
+    routers = list(
+        BGPRouter.objects.filter(
+            assigned_object_type=device_type,
+            assigned_object_id=management.device_id,
+        )
+        .select_related("asn")
+        .order_by("pk")
+    )
+    counts = Counter(router.asn.asn for router in routers if router.asn_id is not None)
+    for router in routers:
+        if router.asn_id is None or counts[router.asn.asn] != 1:
+            continue
+        router_bindings.append(
+            _native_binding("bgp", router, NSOBGPRouterState._meta.label_lower, {"asn_str": str(router.asn.asn)})
+        )
     rows = BGPPeer.objects.filter(
         scope__router__assigned_object_type=device_type,
         scope__router__assigned_object_id=management.device_id,
     ).select_related("scope__router__asn", "scope__vrf", "peer")
-    return tuple(
-        _native_binding(
-            "bgp",
-            row,
-            "netbox_nso_plugin.nsobgppeerstate",
-            {
-                "asn_str": str(row.scope.router.asn.asn),
-                "vrf_name": row.scope.vrf.name if row.scope.vrf_id else "",
-                "peer_address_str": str(row.peer.address.ip),
-            },
-        )
-        for row in rows.order_by("pk")
+    return (
+        *router_bindings,
+        *(
+            _native_binding(
+                "bgp",
+                row,
+                "netbox_nso_plugin.nsobgppeerstate",
+                {
+                    "asn_str": str(row.scope.router.asn.asn),
+                    "vrf_name": row.scope.vrf.name if row.scope.vrf_id else "",
+                    "peer_address_str": str(row.peer.address.ip),
+                },
+            )
+            for row in rows.order_by("pk")
+        ),
     )
 
 

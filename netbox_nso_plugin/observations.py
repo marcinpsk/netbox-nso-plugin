@@ -26,6 +26,15 @@ def _require(condition, reason):
         raise ObservationProtocolError(f"Invalid observation: {reason}.")
 
 
+def validate_observation_schema(family, observation):
+    """Check one observation against its family schema without binding it to a payload identity."""
+    _require(family in OBSERVATION_SCHEMAS, "unsupported family")
+    try:
+        OBSERVATION_SCHEMAS[family].validate(observation)
+    except ValidationError as exc:
+        raise ObservationProtocolError("Invalid observation: schema.") from exc
+
+
 def observation_defaults(family, revision, source_epoch, observation):
     """Return an independent snapshot bound to the admitted payload identity."""
     _require(family in OBSERVATION_SCHEMAS, "unsupported family")
@@ -36,12 +45,12 @@ def observation_defaults(family, revision, source_epoch, observation):
             type(expected) is int and type(observation.get(field)) is int and observation[field] == expected,
             f"{field} mismatch",
         )
+    validate_observation_schema(family, observation)
     try:
-        OBSERVATION_SCHEMAS[family].validate(observation)
         canonical = json.dumps(observation["document"], sort_keys=True, separators=(",", ":"), allow_nan=False)
         observed_at = datetime.fromisoformat(observation["observed_at"])
-    except (ValidationError, TypeError, ValueError) as exc:
-        raise ObservationProtocolError("Invalid observation: schema or timestamp.") from exc
+    except (TypeError, ValueError) as exc:
+        raise ObservationProtocolError("Invalid observation: document or timestamp.") from exc
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     _require(observation["digest"] == digest, "digest mismatch")
     _require(observed_at.utcoffset() is not None, "observed_at needs a UTC offset")
