@@ -250,7 +250,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
         ports:
-          - 55432:5432
+          - 5432/tcp
 
     steps:
       - name: Check out the plugin
@@ -292,7 +292,7 @@ jobs:
 
       - name: Start the adapter with a real PostgreSQL store
         env:
-          ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
+          ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:${{ job.services['adapter-postgres'].ports['5432'] }}/adapter
           ADAPTER_TOKEN: contract-adapter-token
           NETBOX_TOKEN: contract-netbox-token
         # The instance entry is a name the store validates onboarding against, nothing more:
@@ -300,7 +300,7 @@ jobs:
         # request ever leaves for it. Without it the store-side contract checks cannot create
         # the throwaway devices they push intent to.
         run: |
-          cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<'EOF'
+          cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<EOF
           secrets:
             provider: local
           nso_instances:
@@ -314,7 +314,7 @@ jobs:
           api:
             adapter_token_ref: CONTRACT_ADAPTER_TOKEN
           diagnostic_key_ref: CONTRACT_DIAGNOSTIC_KEY
-          database_url: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
+          database_url: ${ADAPTER_DATABASE_URL}
           log_level: WARNING
           log_format: json
           scheduler:
