@@ -36,6 +36,34 @@ class TestOwnerLifecycleFence(_CascadeFlushMixin, IntentPushResetMixin, Transact
         with without_commit_drain():
             self.management.save(update_fields={"manage_description", "manage_bgp", "manage_static"})
 
+    def test_owner_and_source_lock_queries_are_constant_with_footprint_size(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow, mirror_transaction
+
+        from ._outbox_case import own_vlan
+
+        owners = []
+        counts = []
+        for size in (1, 12):
+            while len(owners) < size:
+                owners.append(own_vlan(self.management, 100 + len(owners), f"lock-{len(owners)}"))
+            footprint = MutationFootprint(
+                device_ids=(self.device.pk,),
+                source_rows=tuple(SourceRow("ipam.vlan", row.vlan_id) for row in owners),
+                overlay_rows=tuple(SourceRow(row._meta.label_lower, row.pk) for row in owners),
+            )
+            with CaptureQueriesContext(connection) as queries, mirror_transaction(footprint):
+                pass
+            tables = ("netbox_nso_plugin_nsooverlaysettlementfence", owners[0]._meta.db_table, "ipam_vlan")
+            counts.append(
+                tuple(
+                    sum("FOR UPDATE" in query["sql"] and f'FROM "{table}"' in query["sql"] for query in queries)
+                    for table in tables
+                )
+            )
+        self.assertEqual(counts, [(1, 1, 1), (1, 1, 1)])
+
     def bgp_owners(self):
         asn = ASN.objects.create(asn=64512, rir=RIR.objects.create(name="Private", slug="private"))
         router = BGPRouter.objects.create(

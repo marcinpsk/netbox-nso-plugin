@@ -2177,19 +2177,13 @@ def _lock_rows(rows: tuple[SourceRow, ...], *, level: int, ranks: tuple[str, ...
     if unknown:
         raise IntentMutationProtocolError(f"renderer-input model ranks are missing {sorted(unknown)!r}")
 
-    def sort_key(candidate):
-        return (
-            rank_by_label[candidate.model_label],
-            candidate.pk is None,
-            repr(candidate.pk),
-        )
-
-    for row in sorted(rows, key=sort_key):
-        if row.pk is None:
-            continue
-        _enter_level(level, sort_key(row))
-        model = apps.get_model(row.model_label)
-        list(model.objects.select_for_update(of=("self",)).filter(pk=row.pk).order_by("pk"))
+    for label in sorted({row.model_label for row in rows}, key=rank_by_label.__getitem__):
+        pks = sorted({row.pk for row in rows if row.model_label == label and row.pk is not None})
+        for pk in pks:
+            _enter_level(level, (rank_by_label[label], False, pk))
+        if pks:
+            model = apps.get_model(label)
+            list(model.objects.select_for_update(of=("self",)).filter(pk__in=pks).order_by("pk"))
 
 
 def _revalidate_sources(footprint: MutationFootprint) -> None:

@@ -106,7 +106,7 @@ class _CaptureHandler(BaseHTTPRequestHandler):
         self._serve()
 
 
-class TestDurableBGPCapture(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+class BGPCaptureCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
         self.device, self.management = make_managed("durable-bgp", 1558)
@@ -265,6 +265,8 @@ class TestDurableBGPCapture(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertNotIn("198.18.0.1", json.dumps(selection["contributor_manifest"]))
         return snapshots
 
+
+class TestDurableBGPCapture(BGPCaptureCase):
     def test_bgp_capture_freezes_router_and_two_peer_owners(self):
         scope = self.scope()
         router = self.router_owner()

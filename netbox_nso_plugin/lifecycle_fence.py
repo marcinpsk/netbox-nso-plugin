@@ -105,7 +105,7 @@ def fence_for(row, *, lock=False):
 
 
 def lock_owner_fences(rows, *, managements=()):
-    """Create fences in batches, then lock each owner before ranked overlays."""
+    """Create and lock fences by model rank and owner key before ranked overlays."""
     from .durable_capture import mapping_epoch
     from .intent_state import _ACTIVE_PERMIT, OVERLAY_MODEL_RANKS, SourceRow
     from .models import NSODeviceManagement, NSOOverlaySettlementFence
@@ -114,7 +114,7 @@ def lock_owner_fences(rows, *, managements=()):
     ranks = {label: rank for rank, label in enumerate(OVERLAY_MODEL_RANKS)}
     refs = sorted(
         {ref for ref in rows if ref.pk is not None and ref.model_label in OVERLAYS},
-        key=lambda ref: (ranks[ref.model_label], repr(ref.pk)),
+        key=lambda ref: (ranks[ref.model_label], ref.pk),
     )
     owners = {}
     device_ids = {}
@@ -172,7 +172,7 @@ def lock_owner_fences(rows, *, managements=()):
             missing.append(fence)
         wanted[ref] = fence
     NSOOverlaySettlementFence.objects.bulk_create(missing)
-    locked = {}
+    candidates_by_label = {}
     for ref in refs:
         candidates = (
             [wanted[ref]]
@@ -190,7 +190,16 @@ def lock_owner_fences(rows, *, managements=()):
             )
         )
         for candidate in candidates:
-            fence = NSOOverlaySettlementFence.objects.select_for_update().get(pk=candidate.pk)
+            candidates_by_label.setdefault(ref.model_label, {})[candidate.pk] = ref
+    locked = {}
+    for label in sorted(candidates_by_label, key=ranks.__getitem__):
+        candidates = candidates_by_label[label]
+        for fence in (
+            NSOOverlaySettlementFence.objects.select_for_update()
+            .filter(pk__in=candidates)
+            .order_by("overlay_pk", "management_id")
+        ):
+            ref = candidates[fence.pk]
             fence.management = managements_by_pk[fence.management_id]
             fence._owner_row = owners.get(ref)
             locked[ref] = fence
@@ -298,7 +307,7 @@ def owner_projection(row):
 
 def capture_locked_owners(fences):
     return {
-        ref: (fence.bookkeeping_revision, owner_projection(row))
+        ref: (fence, fence.bookkeeping_revision, owner_projection(row))
         for ref, fence in fences.items()
         if (row := getattr(fence, "_owner_row", None)) is not None
     }
@@ -306,7 +315,7 @@ def capture_locked_owners(fences):
 
 def finish_locked_owners(before, *, repend=False, deleted_rows=()):
     """Re-pend only changed contributions; scope revisions do not change siblings."""
-    from .intent_state import _ACTIVE_PERMIT, IntentMutationProtocolError, locked_mirror_refresh
+    from .intent_state import IntentMutationProtocolError, locked_mirror_refresh
     from .signals import suppress_intent_push
     from .status_machine import OWNED_STATES
 
@@ -323,10 +332,9 @@ def finish_locked_owners(before, *, repend=False, deleted_rows=()):
         for row in apps.get_model(label).objects.filter(pk__in=[ref.pk for ref in before if ref.model_label == label])
     }
     unselected = set()
-    for ref, (_revision, projection) in before.items():
+    for ref, (fence, _revision, projection) in before.items():
         if ref not in deleted_rows or (ref.model_label, ref.pk) in current:
             continue
-        fence = _ACTIVE_PERMIT.get().owner_fences[ref]
         prior = dict(projection[1])
         if (
             prior.get("status") not in OWNED_STATES
@@ -347,14 +355,13 @@ def finish_locked_owners(before, *, repend=False, deleted_rows=()):
             ).values_list("model_label", "overlay_pk")
         )
         unselected = {ref for ref in unselected if (ref.model_label, ref.pk) not in retained}
-    for ref, (revision, projection) in before.items():
+    for ref, (fence, revision, projection) in before.items():
         row = current.get((ref.model_label, ref.pk))
         if row is None:
             if ref not in deleted_rows:
                 raise IntentMutationProtocolError(
                     f"{ref.model_label} row {ref.pk!r} vanished before owner finalization"
                 )
-            fence = _ACTIVE_PERMIT.get().owner_fences[ref]
             if fence.management_id in deleted_managements or ref in unselected:
                 continue
             fence.bookkeeping_revision += 1
@@ -419,7 +426,7 @@ def locked_owner_bookkeeping(row):
         owner_fences={ref: fence},
     )
     token = _ACTIVE_PERMIT.set(permit)
-    before = {ref: (fence.bookkeeping_revision, owner_projection(row))}
+    before = {ref: (fence, fence.bookkeeping_revision, owner_projection(row))}
     try:
         with authoritative_bookkeeping():
             yield

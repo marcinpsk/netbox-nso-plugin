@@ -519,9 +519,17 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     epoch = mapping_epoch(management)
     from .models import NSOAcceptedSelection
 
-    feed, incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=0, limit=100)
+    cursor = (
+        management.settle_cursor_seq or 0
+        if management.settle_cursor_device_id == management.adapter_device_id and management.settle_cursor_incarnation
+        else 0
+    )
+    feed, incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=cursor, limit=100)
+    if cursor and incarnation != management.settle_cursor_incarnation:
+        cursor = 0
+        feed, incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=cursor, limit=100)
     seen_jobs = set()
-    last_sequence = _validate_feed_page(feed, management.adapter_device_id, 0, seen_jobs)
+    last_sequence = _validate_feed_page(feed, management.adapter_device_id, cursor, seen_jobs)
     page = feed
     while len(page) == 100:
         page, next_incarnation = client.get_settlement_feed(
@@ -578,13 +586,14 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     generations = client.list_device_generations(management.adapter_device_id)
     unacknowledged, receipt_document = _load_pending_receipts(management, evidence, generations)
     _last_page, final_incarnation = client.get_settlement_feed(
-        management.adapter_device_id, after_settle_seq=0, limit=1
+        management.adapter_device_id, after_settle_seq=last_sequence, limit=1
     )
-    _validate_feed_page(_last_page, management.adapter_device_id, 0, set())
+    _validate_feed_page(_last_page, management.adapter_device_id, last_sequence, set())
     management.refresh_from_db()
     if incarnation != final_incarnation or mapping_epoch(management) != epoch:
         raise EvidenceInvariantError("evidence_epoch_changed")
     bound = _bound_evidence(evidence, feed, generations, incarnation, management=management)
+    _restore_consumed_sequences(bound, management, incarnation, cursor)
     bound.receipt_recoveries = _prepare_receipt_recoveries(
         management, bound, unacknowledged, receipt_document, incarnation
     )
@@ -599,6 +608,55 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         ).update(binding_state="invalidated")
         bound.replay_restorations = _record_replay_answers(replay_answers)
     return bound
+
+
+def _restore_consumed_sequences(bound, management, incarnation, cursor):
+    """Recover omitted carrier order from exact durable execution certificates."""
+    from .durable_capture import mapping_epoch
+    from .models import NSOApplyExecution
+    from .outcome_settlement import immutable_execution_projection
+
+    generations = list(bound.automatic_generations)
+    generations.extend(
+        generation
+        for attempt in bound["attempts"]
+        for generation in attempt["generations"]
+        if generation["row_outcomes"] is not None
+    )
+    by_identity = {}
+    for generation in generations:
+        identity = generation["generation_id"], generation["carrier_job_id"]
+        by_identity.setdefault(identity, []).append(generation)
+    certificates = NSOApplyExecution.objects.filter(
+        management=management,
+        mapping_epoch=mapping_epoch(management),
+        adapter_device_id=management.adapter_device_id,
+        store_incarnation=incarnation,
+        carrier_job_id__in={identity[1] for identity in by_identity},
+        consumption_state__in=("consumed", "superseded"),
+    )
+    for execution in certificates:
+        identity = execution.generation_id, execution.carrier_job_id
+        candidates = by_identity.get(identity)
+        if candidates is None:
+            continue
+        projection = _validate_generation(execution.terminal_projection)
+        if (projection["generation_id"], projection["carrier_job_id"], projection["seq"]) != (
+            *identity,
+            execution.generation_seq,
+        ) or any(
+            immutable_execution_projection(_validate_generation(candidate))
+            != immutable_execution_projection(projection)
+            for candidate in candidates
+        ):
+            raise EvidenceInvariantError("consumed_execution_changed")
+        sequence = execution.settle_seq
+        known = bound.settlement_sequences.get(execution.carrier_job_id)
+        if sequence is None and (not cursor or known is not None):
+            continue
+        if not _positive_int(sequence) or known is not None and known != sequence:
+            raise EvidenceInvariantError("invalid_consumed_settlement_sequence")
+        bound.settlement_sequences[execution.carrier_job_id] = sequence
 
 
 def _prepare_receipt_recoveries(management, bound, selections, document, incarnation):

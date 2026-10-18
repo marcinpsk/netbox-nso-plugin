@@ -17,6 +17,7 @@ from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.renderer_writer import (
     RendererMutationPlan,
     planned_delete,
+    planned_save,
     renderer_mirror_writes,
     renderer_writes,
 )
@@ -124,6 +125,32 @@ class TestOwnerDeletionFence(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         )
         self.assertIsNone(self.fence.current_attempt_id)
 
+    def _save_management_and_delete_owner(self, *, delete_first):
+        from netbox_nso_plugin.lifecycle_fence import owner_deletion_proven
+
+        self.management.onboard_error = "placeholder metadata"
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("operator_edit"),
+            saves=(planned_save(self.management, update_fields={"onboard_error"}),),
+            deletes=(planned_delete(self.owner),),
+        )
+        with without_commit_drain(), renderer_writes(plan) as writer:
+            if delete_first:
+                writer.delete(self.owner)
+            writer.save(self.management, update_fields={"onboard_error"})
+            if not delete_first:
+                writer.delete(self.owner)
+        self.management.refresh_from_db()
+        self.assertEqual(self.management.onboard_error, "placeholder metadata")
+        self.assertFalse(NSOInterfaceState.objects.filter(pk=self.owner_pk).exists())
+        self.assertTrue(owner_deletion_proven(self.management, self.snapshot))
+
+    def test_management_save_before_deletion_retains_the_captured_fence(self):
+        self._save_management_and_delete_owner(delete_first=False)
+
+    def test_management_save_after_deletion_retains_the_captured_fence(self):
+        self._save_management_and_delete_owner(delete_first=True)
+
     def test_rolled_back_deletion_restores_owner_and_original_fence(self):
         with self.assertRaisesRegex(RuntimeError, "roll back deletion"):
             with transaction.atomic():
@@ -180,7 +207,7 @@ class TestOwnerDeletionFence(_CascadeFlushMixin, IntentPushResetMixin, Transacti
         overlay_locks = [
             index for index, sql in enumerate(locks) if f'FROM "{NSOInterfaceState._meta.db_table}"' in sql
         ]
-        self.assertGreaterEqual(len(fence_locks), 2)
+        self.assertEqual(len(fence_locks), 1)
         self.assertTrue(overlay_locks)
         self.assertLess(max(fence_locks), min(overlay_locks))
 

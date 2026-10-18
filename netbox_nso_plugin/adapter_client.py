@@ -1237,6 +1237,8 @@ def _validated_job(job, what):
     """
     if not isinstance(job, dict):
         raise AdapterError(f"Adapter returned a malformed {what}.", code="invalid_response")
+    if type(job.get("id")) is not int or job["id"] <= 0 or not isinstance(job.get("type"), str) or not job["type"]:
+        raise AdapterError(f"Adapter returned a malformed {what}: invalid identity.", code="invalid_response")
     for member in _JOB_MAPPING_MEMBERS:
         value = job.get(member)
         if value is not None and not isinstance(value, dict):

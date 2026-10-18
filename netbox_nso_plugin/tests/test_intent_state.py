@@ -908,7 +908,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
 
         with without_commit_drain(), intent_transaction(MutationFootprint.for_keys({(self.device.pk, "vlan")})):
             with self.assertRaisesRegex(IntentMutationProtocolError, "vanished"):
-                finish_locked_owners({vanished: (0, ())})
+                finish_locked_owners({vanished: (None, 0, ())})
 
     def test_a_planned_delete_accounts_for_the_deploying_row_it_consumes(self):
         from uuid import uuid4

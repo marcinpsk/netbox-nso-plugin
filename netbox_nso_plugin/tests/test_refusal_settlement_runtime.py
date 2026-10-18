@@ -11,10 +11,10 @@ from django.urls import reverse
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 
 from .test_apply_selector import _promoted
-from .test_durable_bgp_capture import TestDurableBGPCapture as _BGPCaptureBase
+from .test_durable_bgp_capture import BGPCaptureCase
 
 
-class TestRefusalSettlementRuntime(_BGPCaptureBase):
+class TestRefusalSettlementRuntime(BGPCaptureCase):
     def prepare(self, *, redistribution=False, mode="networked"):
         def admission(selected):
             response = _promoted(selected)
@@ -395,7 +395,8 @@ class TestRefusalSettlementRuntime(_BGPCaptureBase):
                     "heartbeat_at": None,
                     "settle_seq": 1,
                 }
-                return make_response(200, [] if pruned else [job])
+                after = int(kwargs["params"]["after_settle_seq"])
+                return make_response(200, [] if pruned or job["settle_seq"] <= after else [job])
             if method == "GET" and url.endswith("/generations"):
                 return make_response(
                     200,
@@ -459,6 +460,178 @@ class TestRefusalSettlementRuntime(_BGPCaptureBase):
         self.assertEqual(self.owners[1].status, "apply_failed")
         self.assertEqual(self.adapter.apply_requests, [])
         self.assertEqual(NSOApplyExecution.objects.get().settle_seq, 1)
+
+    def test_malformed_feed_identity_cannot_settle_or_advance_the_cursor(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_response
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal())
+        original = self.adapter._handle
+        invalid = {}
+        absent = object()
+
+        def malformed(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs"):
+                jobs = response.json()
+                for field, value in invalid.items():
+                    if value is absent:
+                        jobs[0].pop(field)
+                    else:
+                        jobs[0][field] = value
+                return make_response(200, jobs)
+            return response
+
+        self.adapter._handle = malformed
+        for field, value in (
+            ("id", absent),
+            ("id", None),
+            ("id", True),
+            ("id", "501"),
+            ("id", 0),
+            ("type", absent),
+            ("type", None),
+            ("type", ""),
+            ("type", True),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid.clear()
+                invalid[field] = value
+                with self.assertRaises(AdapterError) as raised:
+                    settle_static_routes(self.management)
+                self.assertEqual(raised.exception.code, "invalid_response")
+                self.management.refresh_from_db()
+                self.assertIsNone(self.management.settle_cursor_seq)
+                self.assertFalse(NSOApplyExecution.objects.exists())
+
+    def test_persisted_cursor_skips_large_retained_feed_and_keeps_execution_order(self):
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_response
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        generation = self.terminal()
+        self.serve_terminal_evidence(generation)
+        first = settle_static_routes(self.management)
+        self.assertEqual(first.cursor, 1)
+        self.management.refresh_from_db()
+        mirror_update(self.management, settle_cursor_seq=10001)
+        original = self.adapter._handle
+        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        starts = []
+
+        def retained_history(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs"):
+                params = kwargs["params"]
+                after, limit = int(params["after_settle_seq"]), int(params["limit"])
+                starts.append(after)
+                jobs = []
+                for sequence in range(after + 1, min(after + limit, 10002) + 1):
+                    job = copy.deepcopy(template)
+                    if sequence != 1:
+                        job.update(id=100000 + sequence, type="import", result=None, row_outcomes=None, refusals=None)
+                    job["settle_seq"] = sequence
+                    jobs.append(job)
+                return make_response(200, jobs)
+            return response
+
+        self.adapter._handle = retained_history
+        result = settle_static_routes(self.management)
+        self.assertFalse(result.stalled)
+        self.assertEqual(result.cursor, 10002)
+        self.assertEqual(result.consumed, 1)
+        self.assertTrue(starts)
+        self.assertTrue(all(start >= 10001 for start in starts), starts)
+        self.assertEqual(result.deployment_evidence.settlement_sequences[generation["carrier_job_id"]], 1)
+        self.assertEqual(NSOApplyExecution.objects.get().consumption_state, "consumed")
+
+    def test_cursor_from_another_store_restarts_evidence_from_zero(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
+
+        from ._adapter_http import make_response
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal())
+        mirror_update(
+            self.management,
+            settle_cursor_seq=10001,
+            settle_cursor_incarnation="placeholder-dead-store",
+            settle_cursor_device_id=self.management.adapter_device_id,
+        )
+        original = self.adapter._handle
+        starts = []
+
+        def feed(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs"):
+                after = int(kwargs["params"]["after_settle_seq"])
+                starts.append(after)
+                if after:
+                    return make_response(200, [])
+            return response
+
+        self.adapter._handle = feed
+        evidence = load_deployment_evidence(self.management)
+        self.assertEqual(starts[:2], [10001, 0])
+        self.assertEqual(evidence.settlement_sequences, {501: 1})
+
+    def test_historical_manual_evidence_requires_an_unchanged_ordered_certificate(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), manual=True)
+        self.assertEqual(settle_static_routes(self.management).cursor, 1)
+        self.management.refresh_from_db()
+        evidence = load_deployment_evidence(self.management, attempt_ids=(self.attempt.pk,))
+        self.assertEqual(len(evidence["attempts"]), 1)
+        self.assertEqual(evidence.settlement_sequences, {501: 1})
+        execution = NSOApplyExecution.objects.get()
+        projection = copy.deepcopy(execution.terminal_projection)
+        changed = copy.deepcopy(projection)
+        changed["carrier_job_error"] = {"message": "placeholder changed error"}
+        for sequence, document in ((None, projection), (1, {}), (1, changed)):
+            with self.subTest(sequence=sequence, document=document):
+                NSOApplyExecution.objects.filter(pk=execution.pk).update(
+                    settle_seq=sequence, terminal_projection=document
+                )
+                with self.assertRaises(EvidenceInvariantError):
+                    load_deployment_evidence(self.management, attempt_ids=(self.attempt.pk,))
+                self.management.refresh_from_db()
+                self.assertEqual(self.management.settle_cursor_seq, 1)
+        NSOApplyExecution.objects.filter(pk=execution.pk).update(settle_seq=1, terminal_projection=projection)
+
+    def test_job_that_finishes_during_evidence_fetch_retains_its_sequence(self):
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_response
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal())
+        original = self.adapter._handle
+        first_feed = True
+
+        def late_job(method, url, **kwargs):
+            nonlocal first_feed
+            response = original(method, url, **kwargs)
+            if first_feed and method == "GET" and url.endswith("/jobs"):
+                first_feed = False
+                return make_response(200, [])
+            return response
+
+        self.adapter._handle = late_job
+        self.assertEqual(settle_static_routes(self.management).cursor, 1)
+        self.assertEqual(NSOApplyExecution.objects.get().settle_seq, 1)
+        second = settle_static_routes(self.management)
+        self.assertFalse(second.stalled)
+        self.assertEqual(second.cursor, 1)
+        self.assertEqual(NSOApplyExecution.objects.count(), 1)
 
     def test_evidence_fetch_rejects_incarnation_change(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts

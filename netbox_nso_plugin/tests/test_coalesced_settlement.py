@@ -6,7 +6,7 @@ import copy
 
 import pytest
 
-from .test_durable_bgp_capture import TestDurableBGPCapture as _BGPCaptureBase
+from .test_durable_bgp_capture import BGPCaptureCase
 from .test_refusal_contract import generation
 from .test_refusal_result import refused_bgp_result
 
@@ -69,7 +69,7 @@ def test_coalesced_carrier_rejects_changed_secondary_authority():
         validate_carrier_generations(generations)
 
 
-class TestCoalescedOwnerSettlement(_BGPCaptureBase):
+class TestCoalescedOwnerSettlement(BGPCaptureCase):
     def prepare_carrier(self):
         from uuid import UUID
 
@@ -134,7 +134,7 @@ class TestCoalescedOwnerSettlement(_BGPCaptureBase):
         second["carrier_job_result"] = copy.deepcopy(result)
         return [first, second]
 
-    def settle_carrier(self, generations):
+    def settle_carrier(self, generations, *, settle_seq=1):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
         from .test_apply_settlement import _payload
@@ -151,8 +151,42 @@ class TestCoalescedOwnerSettlement(_BGPCaptureBase):
                 }
             ],
         )
-        evidence.settlement_sequences = {501: 1}
+        evidence.settlement_sequences = {} if settle_seq is None else {501: settle_seq}
         settle_apply_attempts(self.management, evidence)
+
+    def test_feed_binds_every_coalesced_certificate_before_advancing_the_cursor(self):
+        from netbox_nso_plugin.models import NSOApplyExecution
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_response
+        from .test_refusal_settlement_runtime import TestRefusalSettlementRuntime
+
+        generations = self.prepare_carrier()
+        self.settle_carrier(generations, settle_seq=None)
+        self.assertEqual(list(NSOApplyExecution.objects.values_list("settle_seq", flat=True)), [None, None])
+        TestRefusalSettlementRuntime.serve_terminal_evidence(self, generations[0])
+        original = self.adapter._handle
+
+        def complete_metadata(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                metadata = response.json()
+                metadata.append(
+                    {
+                        **metadata[0],
+                        **{
+                            key: generations[1][key]
+                            for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq")
+                        },
+                    }
+                )
+                return make_response(200, metadata)
+            return response
+
+        self.adapter._handle = complete_metadata
+        self.assertEqual(settle_static_routes(self.management).cursor, 1)
+        self.assertEqual(list(NSOApplyExecution.objects.values_list("settle_seq", flat=True)), [1, 1])
+        self.assertFalse(settle_static_routes(self.management).stalled)
 
     def test_coalesced_bgp_and_vlan_settle_as_one_certified_carrier(self):
         from netbox_nso_plugin.models import NSOApplyExecution

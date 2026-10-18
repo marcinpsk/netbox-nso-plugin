@@ -8,7 +8,7 @@ from . import test_durable_bgp_capture as bgp_case
 from . import test_refusal_settlement_runtime as runtime_case
 
 
-class TestLostPublicationReceipt(bgp_case.TestDurableBGPCapture):
+class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
     def test_corrected_automatic_receipt_retains_the_original_manual_attempt(self):
         import copy
 
@@ -42,6 +42,7 @@ class TestLostPublicationReceipt(bgp_case.TestDurableBGPCapture):
         self.attempt = manual
         runtime_case.TestRefusalSettlementRuntime.serve_terminal_evidence(self, bgp, manual=True)
         original = self.adapter._handle
+        base_job = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
         invalid_receipt = True
 
         def mixed_evidence(method, url, **kwargs):
@@ -49,10 +50,10 @@ class TestLostPublicationReceipt(bgp_case.TestDurableBGPCapture):
             if method != "GET":
                 return response
             if url.endswith("/jobs"):
-                jobs = response.json()
+                jobs = [base_job]
                 jobs.append(
                     {
-                        **jobs[0],
+                        **base_job,
                         "id": automatic["carrier_job_id"],
                         "result": automatic["carrier_job_result"],
                         "row_outcomes": automatic["row_outcomes"],
@@ -61,7 +62,9 @@ class TestLostPublicationReceipt(bgp_case.TestDurableBGPCapture):
                         "settle_seq": 2,
                     }
                 )
-                return make_response(200, jobs)
+                params = kwargs["params"]
+                after, limit = int(params["after_settle_seq"]), int(params["limit"])
+                return make_response(200, [job for job in jobs if job["settle_seq"] > after][:limit])
             if url.endswith("/generations"):
                 generations = response.json()
                 generations.append(

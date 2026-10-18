@@ -273,4 +273,30 @@ def _settle_job(row, job, incarnation) -> bool:
         carrier_job_id=job["id"],
         consumption_state__in=("consumed", "superseded"),
     )
-    return any(execution.terminal_projection["carrier_job_result"] == result for execution in executions)
+    matching = [
+        execution
+        for execution in executions
+        if all(
+            execution.terminal_projection[projection_key] == job[job_key]
+            for projection_key, job_key in (
+                ("carrier_job_result", "result"),
+                ("carrier_job_status", "status"),
+                ("carrier_job_error", "error"),
+            )
+        )
+    ]
+    if not matching:
+        return False
+    sequence = job.get("settle_seq")
+    if (
+        type(sequence) is not int
+        or sequence <= 0
+        or any(execution.settle_seq not in (None, sequence) for execution in matching)
+    ):
+        from .apply_settlement import EvidenceInvariantError
+
+        raise EvidenceInvariantError("invalid_consumed_settlement_sequence")
+    missing = [execution.pk for execution in matching if execution.settle_seq is None]
+    if missing:
+        NSOApplyExecution.objects.filter(pk__in=missing, settle_seq__isnull=True).update(settle_seq=sequence)
+    return True

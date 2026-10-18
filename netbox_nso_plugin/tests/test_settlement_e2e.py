@@ -50,7 +50,7 @@ from ._settlement_adapter import FakeAdapter, SettlementStore
 from ._settlement_case import _AdapterDoubleMixin, _CarrierMixin, _make_device, _make_mgmt
 from ._static_route_case import _assign_and_accept, _edit_owned_route
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
-from .test_durable_bgp_capture import TestDurableBGPCapture as _BGPCaptureBase
+from .test_durable_bgp_capture import BGPCaptureCase
 
 ADAPTER_DEVICE_ID = 70
 
@@ -443,7 +443,7 @@ class TestTheIdentityEditSettlesEndToEnd(
         return NSODeviceManagement.objects.get(pk=self.mgmt.pk)
 
 
-class TestRefusalCallbackEndToEnd(_BGPCaptureBase, LiveServerTestCase):
+class TestRefusalCallbackEndToEnd(BGPCaptureCase, LiveServerTestCase):
     """Deliver catalog refusal over both HTTP sockets and run the real RQ carrier."""
 
     host = "127.0.0.1"

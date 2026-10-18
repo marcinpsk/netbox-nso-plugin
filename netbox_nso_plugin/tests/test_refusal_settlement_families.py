@@ -23,10 +23,10 @@ from netbox_nso_plugin.refusal_registry import OVERLAYS
 from ._outbox_case import without_commit_drain
 from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .test_apply_selector import _promoted
-from .test_durable_bgp_capture import TestDurableBGPCapture as _BGPCaptureBase
+from .test_durable_bgp_capture import BGPCaptureCase
 
 
-class TestRefusalSettlementFamilies(_BGPCaptureBase):
+class TestRefusalSettlementFamilies(BGPCaptureCase):
     def apply_owners(self, owners):
         self.owners = owners
         self.prior = {}
