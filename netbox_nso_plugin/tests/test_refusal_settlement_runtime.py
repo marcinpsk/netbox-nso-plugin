@@ -633,6 +633,123 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
         self.assertEqual(second.cursor, 1)
         self.assertEqual(NSOApplyExecution.objects.count(), 1)
 
+    def _serve_retry_evidence(self, first, retry):
+        from ._adapter_http import make_response
+
+        self.serve_terminal_evidence(retry)
+        original = self.adapter._handle
+        template = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
+        jobs = []
+        for sequence, generation in enumerate((first, retry), start=1):
+            job = copy.deepcopy(template)
+            job.update(
+                id=generation["carrier_job_id"],
+                status=generation["carrier_job_status"],
+                result=generation["carrier_job_result"],
+                error=generation["carrier_job_error"],
+                row_outcomes=generation["row_outcomes"],
+                refusals=generation["refusals"],
+                updated_at=generation["updated_at"],
+                settle_seq=sequence,
+            )
+            jobs.append(job)
+
+        def retry_feed(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs"):
+                params = kwargs["params"]
+                after, limit = int(params["after_settle_seq"]), int(params["limit"])
+                return make_response(200, [job for job in jobs if job["settle_seq"] > after][:limit])
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = retry_feed
+
+    def test_interrupted_cursor_fetch_recovers_order_before_a_newer_retry(self):
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_response
+
+        self.prepare_automatic()
+        first = self.terminal(refused=None)
+        self.serve_terminal_evidence(first)
+        original = self.adapter._handle
+        feed_requests = 0
+
+        def interrupted_poll(method, url, **kwargs):
+            nonlocal feed_requests
+            if method == "GET" and url.endswith("/jobs"):
+                feed_requests += 1
+                if feed_requests == 1:
+                    return make_response(200, [])
+                if feed_requests >= 3:
+                    return make_response(503, {"detail": "placeholder interrupted cursor fetch"})
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = interrupted_poll
+        with self.assertRaises(AdapterError):
+            settle_static_routes(self.management)
+        self.assertIsNone(NSOApplyExecution.objects.get().settle_seq)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+        for row in self.owners:
+            row.refresh_from_db()
+            self.assertEqual(row.status, "in_sync")
+
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        self._serve_retry_evidence(first, retry)
+        result = settle_static_routes(self.management)
+        self.assertFalse(result.stalled)
+        self.assertEqual((result.consumed, result.cursor), (2, 2))
+        self.assertEqual(dict(NSOApplyExecution.objects.values_list("carrier_job_id", "settle_seq")), {501: 1, 502: 2})
+        self.owners[1].refresh_from_db()
+        self.assertEqual(self.owners[1].status, "apply_failed")
+        for row in (self.owners[0], self.owners[2]):
+            row.refresh_from_db()
+            self.assertEqual(row.status, "in_sync")
+        replay = settle_static_routes(self.management)
+        self.assertFalse(replay.stalled)
+        self.assertEqual((replay.consumed, replay.cursor), (0, 2))
+        self.assertEqual(NSOApplyExecution.objects.count(), 2)
+        self.assertEqual(self.adapter.apply_requests, [])
+
+    def test_changed_historical_carrier_stalls_before_retry_owner_writes(self):
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        self.prepare_automatic()
+        first = self.terminal(refused=None)
+        settle_terminal_generation(self.management, first, "placeholder-store", settle_seq=1)
+        prior = []
+        for row in self.owners:
+            row.refresh_from_db()
+            prior.append((row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id))
+        changed = copy.deepcopy(first)
+        changed["carrier_job_error"] = {"message": "placeholder changed historical error"}
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        self._serve_retry_evidence(changed, retry)
+        result = settle_static_routes(self.management)
+        self.assertTrue(result.stalled)
+        for row, expected in zip(self.owners, prior, strict=True):
+            row.refresh_from_db()
+            self.assertEqual((row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id), expected)
+        self.assertEqual(NSOApplyExecution.objects.filter(consumption_state="consumed").count(), 1)
+        self.assertEqual(NSOApplyExecution.objects.get().settle_seq, 1)
+        self.management.refresh_from_db()
+        self.assertIsNone(self.management.settle_cursor_seq)
+
+    def test_consumed_execution_rejects_a_different_settlement_sequence(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+
+        self.prepare_automatic()
+        generation = self.terminal(refused=None)
+        settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+            settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=2)
+        self.assertEqual(NSOApplyExecution.objects.get().settle_seq, 1)
+
     def test_evidence_fetch_rejects_incarnation_change(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
 

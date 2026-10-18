@@ -35,6 +35,31 @@ def _require(condition, code):
         raise EvidenceInvariantError(code)
 
 
+def _bind_consumed_sequences(executions, sequence):
+    """Bind verified feed order under the caller's management transaction."""
+    _require(
+        type(sequence) is int
+        and sequence > 0
+        and all(execution.settle_seq in (None, sequence) for execution in executions),
+        "invalid_consumed_settlement_sequence",
+    )
+    missing = [execution.pk for execution in executions if execution.settle_seq is None]
+    if missing:
+        NSOApplyExecution.objects.filter(pk__in=missing, settle_seq__isnull=True).update(settle_seq=sequence)
+    for execution in executions:
+        execution.settle_seq = sequence
+
+
+def _reuse_consumed_execution(execution, generation, settle_seq):
+    _require(
+        immutable_execution_projection(execution.terminal_projection) == immutable_execution_projection(generation),
+        "consumed_execution_changed",
+    )
+    if settle_seq is not None:
+        _bind_consumed_sequences([execution], settle_seq)
+    return execution
+
+
 def _ref(ref):
     return ref["subject"], ref["key"]
 
@@ -416,12 +441,7 @@ def _settle(management, generation, incarnation, *, attempt, settle_seq, mode, a
         )
         execution = NSOApplyExecution.objects.select_for_update().filter(**identity).first()
         if execution is not None and execution.consumption_state in {"consumed", "superseded"}:
-            _require(
-                immutable_execution_projection(execution.terminal_projection)
-                == immutable_execution_projection(generation),
-                "consumed_execution_changed",
-            )
-            return execution
+            return _reuse_consumed_execution(execution, generation, settle_seq)
         if execution is not None:
             recorded_attempt = execution.attempt
             if attempt is not None and attempt.pk != recorded_attempt.pk:

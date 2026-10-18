@@ -260,6 +260,7 @@ def _settle_job(row, job, incarnation) -> bool:
     """Advance only after the exact remote execution has a durable local disposition."""
     from .durable_capture import mapping_epoch
     from .models import NSOApplyExecution
+    from .outcome_settlement import _bind_consumed_sequences
 
     if job.get("type") not in {"apply", "removal"}:
         return True
@@ -287,16 +288,5 @@ def _settle_job(row, job, incarnation) -> bool:
     ]
     if not matching:
         return False
-    sequence = job.get("settle_seq")
-    if (
-        type(sequence) is not int
-        or sequence <= 0
-        or any(execution.settle_seq not in (None, sequence) for execution in matching)
-    ):
-        from .apply_settlement import EvidenceInvariantError
-
-        raise EvidenceInvariantError("invalid_consumed_settlement_sequence")
-    missing = [execution.pk for execution in matching if execution.settle_seq is None]
-    if missing:
-        NSOApplyExecution.objects.filter(pk__in=missing, settle_seq__isnull=True).update(settle_seq=sequence)
+    _bind_consumed_sequences(matching, job.get("settle_seq"))
     return True

@@ -26,6 +26,14 @@ GENERATION_DISPOSITIONS = {
 }
 _ATTEMPT_FIELDS = frozenset({"apply_attempt_id", "admission_state", "http_status", "response", "generations"})
 _GENERATION_FIELDS = GENERATION_FIELDS
+_CARRIER_EVIDENCE_FIELDS = (
+    "carrier_job_id",
+    "carrier_job_status",
+    "carrier_job_result",
+    "carrier_job_error",
+    "row_outcomes",
+    "refusals",
+)
 
 
 class EvidenceInvariantError(RuntimeError):
@@ -612,8 +620,6 @@ def load_deployment_evidence(management, *, attempt_ids=None):
 
 def _restore_consumed_sequences(bound, management, incarnation, cursor):
     """Recover omitted carrier order from exact durable execution certificates."""
-    from .durable_capture import mapping_epoch
-    from .models import NSOApplyExecution
     from .outcome_settlement import immutable_execution_projection
 
     generations = list(bound.automatic_generations)
@@ -627,24 +633,16 @@ def _restore_consumed_sequences(bound, management, incarnation, cursor):
     for generation in generations:
         identity = generation["generation_id"], generation["carrier_job_id"]
         by_identity.setdefault(identity, []).append(generation)
-    certificates = NSOApplyExecution.objects.filter(
-        management=management,
-        mapping_epoch=mapping_epoch(management),
-        adapter_device_id=management.adapter_device_id,
-        store_incarnation=incarnation,
+    certificates = _consumed_executions(management, incarnation).filter(
         carrier_job_id__in={identity[1] for identity in by_identity},
-        consumption_state__in=("consumed", "superseded"),
     )
     for execution in certificates:
         identity = execution.generation_id, execution.carrier_job_id
         candidates = by_identity.get(identity)
         if candidates is None:
             continue
-        projection = _validate_generation(execution.terminal_projection)
-        if (projection["generation_id"], projection["carrier_job_id"], projection["seq"]) != (
-            *identity,
-            execution.generation_seq,
-        ) or any(
+        projection = _execution_projection(execution)
+        if any(
             immutable_execution_projection(_validate_generation(candidate))
             != immutable_execution_projection(projection)
             for candidate in candidates
@@ -808,22 +806,23 @@ def _append_head_evidence(bound, head, by_id, management, incarnation):
 
 
 def _authoritative_carrier_generation(generation, generation_id, carrier, management, incarnation):
-    from .durable_capture import mapping_epoch
-    from .models import NSOApplyExecution
     from .outcome_settlement import _record_invariant
 
     if generation is not None and generation["job_id"] == carrier["carrier_job_id"]:
         return _generation_from_carrier(generation, carrier)
-    cached = NSOApplyExecution.objects.filter(
-        management=management,
-        mapping_epoch=mapping_epoch(management),
-        store_incarnation=incarnation,
-        generation_id=generation_id,
-        carrier_job_id=carrier["carrier_job_id"],
-        terminal_projection__isnull=False,
-    ).first()
+    cached = (
+        _consumed_executions(management, incarnation)
+        .filter(
+            generation_id=generation_id,
+            carrier_job_id=carrier["carrier_job_id"],
+        )
+        .first()
+    )
     if cached is not None:
-        return cached.terminal_projection
+        projection = _execution_projection(cached)
+        if any(projection[key] != carrier[key] for key in _CARRIER_EVIDENCE_FIELDS):
+            raise EvidenceInvariantError("consumed_execution_changed")
+        return projection
     _record_invariant(
         management,
         {"generation_id": generation_id, "carrier_job_id": carrier["carrier_job_id"]},
@@ -836,8 +835,6 @@ def _authoritative_carrier_generation(generation, generation_id, carrier, manage
 
 def _require_terminal_metadata(bound, generations, management, incarnation):
     """Block historical carrier gaps before a later execution can consume its cursor."""
-    from .durable_capture import mapping_epoch
-    from .models import NSOApplyExecution
     from .outcome_settlement import _record_invariant
 
     present = {
@@ -853,17 +850,16 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         identity = generation["generation_id"], generation["job_id"]
         if generation["status"] in {"pending", "running"} or identity in present:
             continue
-        cached = NSOApplyExecution.objects.filter(
-            management=management,
-            mapping_epoch=mapping_epoch(management),
-            store_incarnation=incarnation,
-            generation_id=generation["generation_id"],
-            carrier_job_id=generation["job_id"],
-            consumption_state__in=("consumed", "superseded"),
-            terminal_projection__isnull=False,
-        ).first()
+        cached = (
+            _consumed_executions(management, incarnation)
+            .filter(
+                generation_id=generation["generation_id"],
+                carrier_job_id=generation["job_id"],
+            )
+            .first()
+        )
         if cached is not None:
-            projection = cached.terminal_projection
+            projection = _execution_projection(cached)
             if all(projection[key] == generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
                 bound.automatic_generations.append(projection)
                 continue
@@ -877,6 +873,30 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         raise EvidenceInvariantError("missing_generation_evidence")
 
 
+def _consumed_executions(management, incarnation):
+    from .durable_capture import mapping_epoch
+    from .models import NSOApplyExecution
+
+    return NSOApplyExecution.objects.filter(
+        management=management,
+        mapping_epoch=mapping_epoch(management),
+        adapter_device_id=management.adapter_device_id,
+        store_incarnation=incarnation,
+        consumption_state__in=("consumed", "superseded"),
+    )
+
+
+def _execution_projection(execution):
+    projection = _validate_generation(execution.terminal_projection)
+    if (projection["generation_id"], projection["carrier_job_id"], projection["seq"]) != (
+        execution.generation_id,
+        execution.carrier_job_id,
+        execution.generation_seq,
+    ):
+        raise EvidenceInvariantError("consumed_execution_changed")
+    return projection
+
+
 def _generation_from_carrier(generation, carrier):
     from .refusal_registry import document_section_for_stream
 
@@ -887,17 +907,7 @@ def _generation_from_carrier(generation, carrier):
         "sections": sorted({document_section_for_stream(stream) for stream in generation["stream_revisions"]}),
         "stream_revisions": generation["stream_revisions"],
         "source_push_seq": generation["source_push_seq"],
-        **{
-            key: carrier[key]
-            for key in (
-                "carrier_job_id",
-                "carrier_job_status",
-                "carrier_job_result",
-                "carrier_job_error",
-                "row_outcomes",
-                "refusals",
-            )
-        },
+        **{key: carrier[key] for key in _CARRIER_EVIDENCE_FIELDS},
         "updated_at": generation["updated_at"],
     }
 
