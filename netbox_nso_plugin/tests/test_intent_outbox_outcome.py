@@ -992,6 +992,31 @@ class TestARestoredClaimSettlesAgainstTheReceiptsOwnDigest(_OutcomeCase):
         assert state.push_seq is None, "the operation is resolved, so the key can allocate again"
         assert entries(self.device, "vlan") == []
 
+    def test_an_exact_restored_receipt_settles_after_the_mapping_epoch_changes(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        own_vlan(self.mgmt, 916, self.tag)
+        self._lost_response()
+        receipt = self._receipt()
+        NSODeviceManagement.objects.filter(pk=self.mgmt.pk).update(adapter_source_epoch=2)
+
+        assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_SETTLED
+        assert state_of(self.device, "vlan").push_seq is None
+        assert entries(self.device, "vlan") == []
+
+    def test_a_missing_durable_selection_keeps_the_restored_claim_closed(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOAcceptedSelection
+
+        own_vlan(self.mgmt, 917, self.tag)
+        claimed = self._lost_response()
+        receipt = self._receipt()
+        NSOAcceptedSelection.objects.filter(management=self.mgmt).update(source_push_seq=claimed.push_seq + 1)
+
+        assert drain.resolve_restored_claim(self.device.pk, "vlan", receipt) == drain.RESTORE_FAILED_CLOSED
+        assert state_of(self.device, "vlan").push_seq == claimed.push_seq
+
     def test_a_claim_without_a_revision_is_rejected_as_corrupt(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOIntentOutboxState

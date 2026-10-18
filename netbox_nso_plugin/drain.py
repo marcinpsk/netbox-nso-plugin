@@ -2053,7 +2053,7 @@ def _sent_wire_digest(state, flags: ClaimFlags | None = None) -> str:
 
 def _restored_claim_validation(state, receipt, flags) -> str | None:
     """Return a restore outcome when persisted claim evidence cannot settle."""
-    from .durable_capture import validate_claim_capture
+    from .durable_capture import CaptureEpochChanged, validate_claim_capture
     from .models import NSODeviceManagement
     from .refusal_registry import RegistryError
 
@@ -2087,6 +2087,8 @@ def _restored_claim_validation(state, receipt, flags) -> str | None:
             state.claim_deletions or [],
             flags.marking_mode,
         )
+    except CaptureEpochChanged:
+        return None
     except RegistryError:
         return RESTORE_FAILED_CLOSED
     return None

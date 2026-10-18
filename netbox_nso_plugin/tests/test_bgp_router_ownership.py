@@ -162,6 +162,48 @@ class TestBgpRouterOwnership(TestCase):
             self.assertEqual(qualified_router(state), self.router)
         self.assertEqual(sum(f'FROM "{BGPRouter._meta.db_table}"' in query["sql"] for query in queries), 1)
 
+    def test_router_binding_scan_queries_do_not_grow_with_router_count(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.ownership_planner import _bgp_bindings
+
+        def scan():
+            with CaptureQueriesContext(connection) as queries:
+                bindings = _bgp_bindings(self.management)
+            return bindings, len(queries)
+
+        initial, count = scan()
+        for asn in (64513, 64514, 64515):
+            router = BGPRouter.objects.create(
+                assigned_object_type=ContentType.objects.get_for_model(Device),
+                assigned_object_id=self.device.pk,
+                asn=ASN.objects.create(asn=asn, rir=self.asn.rir),
+                name=f"example-{asn}",
+                router_id="198.18.0.1",
+            )
+            scope = BGPScope.objects.create(router=router)
+            BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
+        bindings, expanded = scan()
+        self.assertEqual(len(bindings), len(initial) + 3)
+        self.assertEqual(expanded, count)
+
+    def test_router_acquisition_names_ambiguous_observed_vrfs(self):
+        from ipam.models import VRF
+
+        self.publish()
+        for _ in range(2):
+            VRF.objects.create(name="placeholder-duplicate")
+        snapshot = NSOFamilyObservation.objects.get(read_state__management=self.management)
+        snapshot.document["routers"][0]["scope"].append(
+            entry(vrf="placeholder-duplicate", address_family=[entry(afi="ipv4-unicast")], peer=[], peer_group=[])
+        )
+        snapshot.save(update_fields=("document",))
+        with self.assertRaises(OwnershipNotQualified) as raised:
+            self.own_router()
+        self.assertIn("exactly one VRF", raised.exception.public_message)
+        self.assertFalse(self.router_model().objects.filter(management=self.management).exists())
+
     def test_router_native_asn_move_cannot_reown_old_identity(self):
         model = self.router_model()
         state = self.own_router()

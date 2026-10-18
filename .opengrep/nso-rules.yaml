@@ -726,15 +726,21 @@ rules:
           except $TYPE as $EXC:
               ...
       - pattern-either:
-          - pattern: OwnershipNotQualified(..., str($EXC), ...)
-          - pattern: $MODULE.OwnershipNotQualified(..., str($EXC), ...)
-          - pattern: _bgp_router_blocker(..., str($EXC), ...)
-          - pattern: $MODULE._bgp_router_blocker(..., str($EXC), ...)
+          - pattern: OwnershipNotQualified(..., $RAW, ...)
+          - pattern: $MODULE.OwnershipNotQualified(..., $RAW, ...)
+          - pattern: _bgp_router_blocker(..., $RAW, ...)
+          - pattern: $MODULE._bgp_router_blocker(..., $RAW, ...)
           - patterns:
-              - pattern: $FORM.add_error(..., str($EXC), ...)
+              - pattern: $FORM.add_error(..., $RAW, ...)
               - metavariable-regex:
                   metavariable: $FORM
                   regex: ^(?!self$)
+      - metavariable-pattern:
+          metavariable: $RAW
+          pattern-either:
+            - pattern: str($EXC)
+            - pattern: repr($EXC)
+            - pattern: $EXC.args
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**"]

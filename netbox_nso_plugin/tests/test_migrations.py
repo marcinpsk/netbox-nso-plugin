@@ -32,6 +32,18 @@ PRE_OWNERSHIP_EXECUTION = "0023_outbox_contribution_kind"
 
 
 class TestMigrationGraph(SimpleTestCase):
+    def test_ledger_choices_are_runtime_metadata(self):
+        from django.apps import apps
+
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        state = loader.project_state(loader.graph.leaf_nodes(APP))
+        for name in ("NSOApplyOverlaySnapshot", "NSOOverlaySettlementFence"):
+            runtime = apps.get_model(APP, name)._meta.get_field("model_label")
+            historical = state.models[APP, name.lower()].fields["model_label"]
+            self.assertTrue(runtime.choices)
+            self.assertNotIn("choices", runtime.deconstruct()[3])
+            self.assertEqual(historical.deconstruct()[1:], runtime.deconstruct()[1:])
+
     def test_interface_ip_allocation_kind_is_added_once(self):
         from django.db import migrations
 

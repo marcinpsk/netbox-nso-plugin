@@ -2758,9 +2758,47 @@ def _bgp_child_scope(entries, asn, vrf, afs=()):
 
 
 def _bgp_redistribution_members(entries, device_id):
-    from .redistribution_reconciler import bgp_destination_parts
+    from .bgp_router_content import BGPIntentError
+    from .models import NSOOwnershipManifest, NSORedistributionState
+    from .ownership_planner import manifest_binding
+    from .redistribution_reconciler import bgp_destination_parts, bgp_observation_only_destination
 
-    for dest_ref, redist in _collect_redistribution_by_dest_ref(device_id, "bgp").items():
+    rows = list(
+        NSORedistributionState.objects.filter(
+            management__device_id=device_id, dest_protocol="bgp", status__in=_OWNED_PUSH_STATUSES
+        ).select_related("management", "redistribution", "redistribution__route_map")
+    )
+    observations = [
+        row for row in rows if row.redistribution_id is None and bgp_observation_only_destination(row.dest_ref)
+    ]
+    observation_ids = {row.pk for row in observations}
+    intent = [row for row in rows if row.pk not in observation_ids]
+    if observations:
+
+        def identity(native_id, native_key, state_key):
+            return native_id, json.dumps(native_key, sort_keys=True), json.dumps(state_key, sort_keys=True)
+
+        represented = {
+            identity(binding[4], binding[5], binding[7])
+            for row in intent
+            if (binding := manifest_binding(row)) is not None
+        }
+        owners = NSOOwnershipManifest.objects.filter(
+            device_id=device_id,
+            scope="bgp",
+            native_model_label="netbox_routing.redistribution",
+            state_model_label=NSORedistributionState._meta.label_lower,
+            ownership_state="owned",
+        )
+        if any(identity(owner.native_id, owner.native_key, owner.state_key) not in represented for owner in owners):
+            raise BGPIntentError("Restore the owned BGP redistribution destination before sending BGP intent.")
+        for row in observations:
+            logger.warning("BGP redistribution state %s has no address family and remains observation-only", row.pk)
+
+    by_ref = {}
+    for row in intent:
+        by_ref.setdefault(row.dest_ref, []).append(redistribution_intent_item(row))
+    for dest_ref, redist in by_ref.items():
         asn, vrf, af_name = bgp_destination_parts(dest_ref)
         scope = _bgp_child_scope(entries, asn, vrf, (af_name,))
         af = next(af for af in scope["address_families"] if af["af"] == af_name)

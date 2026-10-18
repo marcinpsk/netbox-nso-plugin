@@ -363,6 +363,34 @@ def test_unowned_router_netbox_edit_reads_as_changed_and_device_move_mirrors(rou
     assert str(state.bgp_router.router_id) == "192.0.2.253"
 
 
+@pytest.mark.parametrize("invalid_content", ["router-id", "duplicate-vrf"])
+def test_unowned_router_invalid_native_content_is_an_observed_conflict(router_case, invalid_content):
+    from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
+    from netbox_nso_plugin.models import NSOBGPPeerState
+
+    state, _ = import_router(router_case)
+    if invalid_content == "router-id":
+        content_update(state.bgp_router, router_id="2001:db8::1")
+    else:
+        for _ in range(2):
+            vrf = VRF.objects.create(name="placeholder-duplicate")
+            BGPScope.objects.create(router=state.bgp_router, vrf=vrf)
+    router = state.bgp_router
+    before = (str(router.router_id), list(BGPScope.objects.filter(router=router).values_list("pk", flat=True)))
+    payload = router_document(router_case[0], scopes=[scope_entry(peers=[peer_entry()])])
+
+    _reconcile_bgp_config(router_case[0], payload)
+
+    state.refresh_from_db()
+    router.refresh_from_db()
+    assert state.status == "conflict"
+    assert state.bgp_router_id == router.pk
+    assert state.last_sync_at is not None
+    assert (str(router.router_id), list(BGPScope.objects.filter(router=router).values_list("pk", flat=True))) == before
+    peer = NSOBGPPeerState.objects.get(management=router_case[1])
+    assert peer.bgp_peer_id is None
+
+
 @pytest.mark.parametrize("removed", ["af", "scope"])
 def test_unowned_router_netbox_scope_or_af_removal_reads_as_changed(router_case, removed):
     VRF.objects.create(name="placeholder-blue")

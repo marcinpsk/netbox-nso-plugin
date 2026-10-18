@@ -733,6 +733,7 @@ def _prepare_acquisition(instance, grant, acquisition):
         discard_acquisition(instance)
         return False
     if acquisition:
+        require_bgp_redistribution_destination(instance)
         _record_acquisition(instance, grant)
         return True
     return NSOOwnershipAcquisition.objects.filter(
@@ -834,8 +835,36 @@ def _require_qualifying_acquisition(instance, binding, acquisition, *, signature
         raise OwnershipNotQualified(f"The {scope} binding does not qualify for ownership.", device_id=device_id)
 
 
+def require_bgp_redistribution_destination(instance):
+    """Require an explicit address family before acquiring BGP redistribution."""
+    if instance._meta.label_lower != "netbox_nso_plugin.nsoredistributionstate" or instance.dest_protocol != "bgp":
+        return
+    from .bgp_router_content import BGPIntentError
+    from .redistribution_reconciler import bgp_destination_parts
+
+    try:
+        bgp_destination_parts(instance.dest_ref)
+    except BGPIntentError as exc:
+        raise OwnershipNotQualified(
+            "BGP redistribution requires an explicit address family before accepting it.",
+            device_id=instance.management.device_id,
+        ) from exc
+
+
+def _unbound_bgp_observation(instance):
+    from .redistribution_reconciler import bgp_observation_only_destination
+
+    return (
+        instance._meta.label_lower == "netbox_nso_plugin.nsoredistributionstate"
+        and instance.dest_protocol == "bgp"
+        and instance.redistribution_id is None
+        and bgp_observation_only_destination(instance.dest_ref)
+    )
+
+
 def require_qualifying_ownership(instance, *, signatures=None):
     """Check a producer's resolved binding; ``signatures`` caches device scans across calls."""
+    require_bgp_redistribution_destination(instance)
     binding = manifest_binding(instance)
     if binding is None and instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
         management = _manifest_management(instance)
@@ -888,18 +917,22 @@ def require_router_acquisition_observation(instance):
     matches = Counter(VRF.objects.filter(name__in=names).values_list("name", flat=True))
     if any(matches[name] != 1 for name in names):
         raise OwnershipNotQualified(
-            "Resolve every named VRF reported for this BGP router before accepting it.",
+            "Resolve each reported BGP VRF name to exactly one VRF before accepting this router.",
             device_id=instance.management.device_id,
         )
 
 
 def validate_plan_acquisitions(identities):
     """Qualify each surviving acquisition against the final transaction state."""
+    from .status_machine import is_owned
+
     signatures = {}
     for label, pk in sorted(identities):
         instance = apps.get_model(label)._default_manager.filter(pk=pk).first()
         if instance is None:
             continue
+        if is_owned(instance.status):
+            require_bgp_redistribution_destination(instance)
         binding = manifest_binding(instance)
         if binding is None:
             if instance._meta.label_lower == "netbox_nso_plugin.nsobgprouterstate":
@@ -922,6 +955,8 @@ def validate_plan_acquisitions(identities):
 def _qualify_or_defer_acquisition(instance, binding, acquisition):
     from .renderer_writer import active_renderer_writer
 
+    if _unbound_bgp_observation(instance):
+        return
     writer = active_renderer_writer()
     if acquisition and writer is not None:
         writer.record_acquisition(instance)
@@ -1753,12 +1788,11 @@ def _bgp_bindings(management):
     from django.contrib.contenttypes.models import ContentType
     from netbox_routing.models import BGPPeer, BGPRouter
 
-    from .bgp_router_content import qualified_router
     from .models import NSOBGPRouterState
 
     device_type = ContentType.objects.get_for_model(Device)
     router_bindings = []
-    routers = (
+    routers = list(
         BGPRouter.objects.filter(
             assigned_object_type=device_type,
             assigned_object_id=management.device_id,
@@ -1766,18 +1800,12 @@ def _bgp_bindings(management):
         .select_related("asn")
         .order_by("pk")
     )
+    counts = Counter(router.asn.asn for router in routers if router.asn_id is not None)
     for router in routers:
-        candidate = NSOBGPRouterState(
-            management=management,
-            bgp_router=router,
-            asn_str=str(router.asn.asn) if router.asn_id else "",
-        )
-        try:
-            qualified_router(candidate, device_id=management.device_id)
-        except ValueError:
+        if router.asn_id is None or counts[router.asn.asn] != 1:
             continue
         router_bindings.append(
-            _native_binding("bgp", router, candidate._meta.label_lower, {"asn_str": candidate.asn_str})
+            _native_binding("bgp", router, NSOBGPRouterState._meta.label_lower, {"asn_str": str(router.asn.asn)})
         )
     rows = BGPPeer.objects.filter(
         scope__router__assigned_object_type=device_type,

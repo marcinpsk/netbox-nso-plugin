@@ -673,7 +673,9 @@ _PUSH_HEADLINES = {
 
 def _push_error_kind(code, reason):
     """Classify a recorded push failure as rejected / unsent / unknown."""
-    if code in _PUSH_UNSENT_CODES or (code == "validation_error" and reason in LOCAL_PUSH_BLOCK_REASONS):
+    if code in _PUSH_UNSENT_CODES or (
+        code == "validation_error" and type(reason) is str and reason in LOCAL_PUSH_BLOCK_REASONS
+    ):
         return "unsent"
     if code in _PUSH_UNKNOWN_CODES:
         return "unknown"
@@ -7428,8 +7430,21 @@ class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSOOSPFInterfaceState
 
 
+def _redistribution_accept_blocker(state):
+    from .ownership_planner import OwnershipNotQualified, require_bgp_redistribution_destination
+
+    try:
+        require_bgp_redistribution_destination(state)
+    except OwnershipNotQualified as exc:
+        return exc.public_message
+    return ""
+
+
 class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
+
+    def _accept_blocker(self, state):
+        return _redistribution_accept_blocker(state)
 
 
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
@@ -7610,6 +7625,9 @@ class NSOOSPFInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     model_class = NSORedistributionState
+
+    def _accept_blocker(self, state):
+        return _redistribution_accept_blocker(state)
 
     def _push(self, mgmt):
         from .signals import _OWNED_PUSH_STATUSES, redistribution_destinations

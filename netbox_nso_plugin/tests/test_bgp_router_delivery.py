@@ -164,6 +164,178 @@ class TestBGPRouterDelivery(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         self.assertContains(response, "NetBox did not send the BGP snapshot")
         self.assertContains(response, "nso-bgp-routers")
 
+    def test_unhashable_persisted_push_reasons_render_safely(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        self.router_state()
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category", args=(self.device.pk, "bgp"))
+        for reason in ([], {"private": "private-reason-marker"}):
+            for code in ("validation_error", "configuration_error", "nso_timeout"):
+                with self.subTest(reason=reason, code=code):
+                    NSODeviceManagement.objects.filter(pk=self.management.pk).update(
+                        intent_push_errors={"bgp": {"code": code, "detail": {"reason": reason}}}
+                    )
+                    response = self.client.get(url)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertNotContains(response, "private-reason-marker")
+
+    def test_noncanonical_owned_router_identity_is_blocked_before_sorting(self):
+        from netbox_nso_plugin.models import NSOBGPRouterState
+
+        with without_commit_drain():
+            state = self.router_state(owned=True)
+            NSOBGPRouterState.objects.filter(pk=state.pk).update(asn_str="0.65123")
+        blocked = self.payload()["blocked"]
+        self.assertEqual(blocked["detail"]["state_id"], state.pk)
+        self.assertEqual(blocked["message"], "The BGP router identity must use a canonical decimal ASN.")
+
+    def afless_redistribution(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        reconcile_redistribution(
+            self.device,
+            {
+                "entries": [
+                    {
+                        "dest_protocol": "bgp",
+                        "dest_ref": "65123/placeholder-blue",
+                        "source_protocol": "connected",
+                        "source_ref": "",
+                    }
+                ]
+            },
+        )
+        return NSORedistributionState.objects.get(management=self.management, dest_ref="65123/placeholder-blue")
+
+    def owned_redistribution(self):
+        from netbox_routing.models import Redistribution
+
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        native = Redistribution.objects.create(
+            destination_type=ContentType.objects.get_for_model(self.af),
+            destination_id=self.af.pk,
+            source_protocol="connected",
+            source_ref="",
+            metric=7,
+        )
+        return acquire_overlay(
+            NSORedistributionState,
+            management=self.management,
+            redistribution=native,
+            dest_protocol="bgp",
+            dest_ref="65123//ipv4-unicast",
+            source_protocol="connected",
+            source_ref="",
+            metric=7,
+            status="accepted",
+        )
+
+    def test_afless_observation_cannot_be_acquired_by_an_exact_writer(self):
+        from netbox_nso_plugin.ownership_planner import OwnershipNotQualified
+
+        from ._outbox_case import content_update
+
+        state = self.afless_redistribution()
+        with self.assertRaises(OwnershipNotQualified):
+            content_update(state, status="accepted")
+        state.refresh_from_db()
+        self.assertIsNone(state.accepted_at)
+        self.assertNotIn(state.status, {"accepted", "in_sync"})
+
+    def test_afless_observation_cannot_be_accepted_by_single_or_bulk_views(self):
+        state = self.afless_redistribution()
+        for route, pk in (
+            ("routing_accept_redistribution", state.pk),
+            ("routing_bulk_accept_redistribution", self.device.pk),
+        ):
+            with self.subTest(route=route):
+                response = self.client.post(reverse(f"plugins:netbox_nso_plugin:{route}", args=(pk,)))
+                self.assertEqual(response.status_code, 302)
+                state.refresh_from_db()
+                self.assertNotIn(state.status, {"accepted", "in_sync"})
+                self.assertIsNone(state.accepted_at)
+
+    def test_old_unbound_afless_observation_keeps_valid_owned_bgp_deliverable(self):
+        from netbox_nso_plugin.models import NSOOwnershipAcquisition, NSORedistributionState
+        from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
+
+        with without_commit_drain():
+            self.router_state(owned=True)
+            self.peer_state()
+            self.owned_redistribution()
+        state = self.afless_redistribution()
+        # Seed ownership persisted before destination validation.
+        from django.db.models import QuerySet
+
+        QuerySet(model=NSORedistributionState).filter(pk=state.pk).update(status="accepted")
+        NSOOwnershipAcquisition.objects.create(
+            state_model_label=state._meta.label_lower, state_id=state.pk, grant_kind="accept"
+        )
+        reconcile_redistribution(
+            self.device,
+            {
+                "entries": [
+                    {
+                        "dest_protocol": "bgp",
+                        "dest_ref": state.dest_ref,
+                        "source_protocol": "connected",
+                        "source_ref": "",
+                    }
+                ]
+            },
+        )
+        payload = self.payload()
+        self.assertIsInstance(payload, list)
+        self.assertEqual(
+            payload[0]["scopes"][0]["address_families"][0]["redistribution"],
+            [{"source_protocol": "connected", "source_ref": "", "metric": 7}],
+        )
+        self.assertEqual(len(payload[0]["scopes"][0]["peers"]), 1)
+        state.refresh_from_db()
+        self.assertIsNone(state.redistribution_id)
+        self.assertEqual(drain.drain_key(self.device.pk, "bgp", force=True), drain.SUCCEEDED)
+        self.assertEqual(self.adapter.applied[-1][1]["routers"], payload)
+
+    def test_afless_damage_cannot_drop_an_owned_redistribution_contribution(self):
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        with without_commit_drain():
+            self.router_state(owned=True)
+            state = self.owned_redistribution()
+        for linked in (True, False):
+            with self.subTest(linked=linked):
+                changes = {"dest_ref": "65123/"}
+                if not linked:
+                    changes["redistribution_id"] = None
+                NSORedistributionState.objects.filter(pk=state.pk).update(**changes)
+                self.assertIn("blocked", self.payload())
+
+    def test_final_acquisition_validation_rejects_a_destination_that_lost_its_af(self):
+        import copy
+
+        from netbox_nso_plugin.intent_state import offline_mutation
+        from netbox_nso_plugin.models import NSORedistributionState
+        from netbox_nso_plugin.ownership_planner import OwnershipNotQualified
+
+        with without_commit_drain():
+            state = self.owned_redistribution()
+        NSORedistributionState.objects.filter(pk=state.pk).update(status="imported", accepted_at=None)
+        state.refresh_from_db()
+        candidate = copy.copy(state)
+        candidate.status = "accepted"
+        plan = RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"), saves=(planned_save(candidate, update_fields=("status",)),)
+        )
+        with self.assertRaises(OwnershipNotQualified), without_commit_drain(), renderer_writes(plan) as writer:
+            writer.save(candidate, update_fields=("status",))
+            with offline_mutation():
+                NSORedistributionState.objects.filter(pk=state.pk).update(dest_ref="65123/")
+        state.refresh_from_db()
+        self.assertEqual(state.status, "imported")
+        self.assertEqual(state.dest_ref, "65123//ipv4-unicast")
+
     def test_peer_bulk_accept_is_offered_only_for_unowned_peers(self):
         self.router_state()
         self.peer_state()

@@ -134,6 +134,44 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                     assert name in adapter.requests[-1]["body"]["deleted_roots"]
                     assert entries(self.device, scope, unconsumed=True) == []
 
+    def test_durable_acknowledgement_failure_releases_capture_and_retains_work(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOAcceptedSelection, NSOSwitchingRootDeletion
+        from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
+
+        from ._outbox_case import enqueue, entries
+
+        deleted = self._bundle("Port-channel91")
+        with renderer_writes(
+            RendererMutationPlan.build(grant=OwnershipGrant("create"), deletes=(planned_delete(deleted),))
+        ) as writer:
+            writer.delete(deleted)
+        enqueue(self.device, "lacp")
+
+        def respond(body):
+            selection = NSOAcceptedSelection.objects.get(management=self.management, publication_state="recorded")
+            selection.overlay_snapshots.all().delete()
+            selection.contributor_manifest = [{"model_label": "netbox_nso_plugin.nsolacpbundlestate", "overlay_pk": 1}]
+            selection.save(update_fields=("contributor_manifest",))
+            return {
+                "status": "prepared",
+                "stream": "lag",
+                "selection_revision": 1,
+                "unauthorized_deleted_roots": body["deleted_roots"],
+            }
+
+        self.adapter._respond = respond
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "lacp") == drain.FAILED
+        assert entries(self.device, "lacp", unconsumed=True)
+        assert NSOSwitchingRootDeletion.objects.filter(management=self.management, root_name="Port-channel91").exists()
+        assert not NSOAcceptedSelection.objects.filter(
+            management=self.management, publication_state="recorded"
+        ).exists()
+        self.management.refresh_from_db()
+        assert self.management.intent_push_errors["lacp"]
+
     def test_invalid_http_acknowledgements_cannot_discharge_deletion(self):
         from netbox_nso_plugin import drain
         from netbox_nso_plugin.models import NSOSwitchingRootDeletion

@@ -1291,7 +1291,13 @@ class _BGPGraphPlanner:  # noqa: PLR0904
 
     def reconcile_router(self, entry, asn_str, asn):
         from . import status_machine as sm
-        from .bgp_router_content import observed_router_content, qualified_router, router_content, router_content_digest
+        from .bgp_router_content import (
+            BGPIntentError,
+            observed_router_content,
+            qualified_router,
+            router_content,
+            router_content_digest,
+        )
 
         current = self.router_states.get(asn_str)
         created = current is None
@@ -1320,7 +1326,17 @@ class _BGPGraphPlanner:  # noqa: PLR0904
         elif new_native:
             router = None if conflict else self.router(asn, entry.get("router_id"))
         else:
-            object_content = router_content(router)
+            try:
+                object_content = router_content(router)
+            except BGPIntentError:
+                state.bgp_router = router
+                state.router_id = entry.get("router_id") or ""
+                state.last_sync_at = self.planned_at
+                state.status = sm.on_reconcile(state.status, matches=False, conflict=True)
+                self.router_states[asn_str] = state
+                self.seen_routers.add(asn_str)
+                self.save(state, force_insert=created, natural_key=("management", "asn_str") if created else ())
+                return None, False, False
             object_hash = router_content_digest(object_content)
             base = state.device_base_hash
             if created or (not base and object_hash != device_hash):
@@ -1340,16 +1356,18 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if not membership_held:
                 mirror = False
                 conflict = True
-            if mirror and object_content["scopes"] != observed["scopes"]:
-                owned_children = any(
+            if (
+                mirror
+                and object_content["scopes"] != observed["scopes"]
+                and any(
                     sm.is_owned(peer.status)
                     and peer.bgp_peer_id is not None
                     and peer.bgp_peer.scope.router_id == router.pk
                     for peer in self.peer_states.values()
                 )
-                if owned_children:
-                    mirror = False
-                    conflict = True
+            ):
+                mirror = False
+                conflict = True
             if mirror:
                 router = copy.copy(router)
                 router.router_id = entry.get("router_id") or None

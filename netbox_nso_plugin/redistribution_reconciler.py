@@ -65,7 +65,7 @@ def bgp_destination_parts(dest_ref):
     from .bgp_router_content import BGPIntentError
 
     parts = (dest_ref or "").split("/")
-    if len(parts) != 3:
+    if len(parts) != 3 or not parts[2]:
         raise BGPIntentError("BGP redistribution has an invalid destination identity.")
     return tuple(parts)
 
@@ -78,6 +78,16 @@ def _canonical_bgp_destination_ref(dest_ref):
     if len(parts) not in (2, 3):
         raise ValueError("BGP redistribution has an invalid destination identity.")
     return "/".join((canonical_asn(parts[0]), *parts[1:]))
+
+
+def bgp_observation_only_destination(dest_ref):
+    """Recognize a canonical observation that does not identify an address family."""
+    if not isinstance(dest_ref, str) or len(dest_ref.split("/")) != 2:
+        return False
+    try:
+        return dest_ref == _canonical_bgp_destination_ref(dest_ref)
+    except ValueError:
+        return False
 
 
 def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):

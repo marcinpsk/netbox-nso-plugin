@@ -2913,6 +2913,24 @@ def caught_exception_text_to_operator(form, row, ownership_planner, signals_modu
         qualified_router(row)
     except ValueError as exc:
         # ruleid: nso-caught-exception-text-to-operator
+        blocked = _bgp_router_blocker(row.asn_str, repr(exc), row.pk)
+        # ruleid: nso-caught-exception-text-to-operator
+        blocked = signals_module._bgp_router_blocker("", exc.args)
+        # ruleid: nso-caught-exception-text-to-operator
+        form.add_error(None, repr(exc))
+        # ruleid: nso-caught-exception-text-to-operator
+        form.add_error(None, exc.args)
+        # ruleid: nso-caught-exception-text-to-operator
+        raise ownership_planner.OwnershipNotQualified(repr(exc)) from exc
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
+        raise OwnershipNotQualified(exc.args) from exc
+    try:
+        qualified_router(row)
+    except ValueError as exc:
+        # ruleid: nso-caught-exception-text-to-operator
         raise OwnershipNotQualified(str(exc), device_id=row.device_id) from exc
     try:
         qualified_router(row)

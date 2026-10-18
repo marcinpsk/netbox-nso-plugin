@@ -11,7 +11,9 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.test import TestCase
+import pytest
+from django.conf import settings
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from ._adapter_http import make_response
@@ -115,6 +117,8 @@ _ADMISSION_WITHOUT_VIEWS = """
 import sys
 import django
 django.setup()
+from django.conf import settings
+assert settings.SETTINGS_MODULE == sys.argv[1]
 from netbox_nso_plugin import delivery
 from netbox_nso_plugin.apply_settlement import _admission_keep_streams
 
@@ -133,17 +137,23 @@ print("views-loaded" if "netbox_nso_plugin.views" in sys.modules else "views-abs
 """
 
 
-def test_admission_validation_runs_without_the_view_module():
+@pytest.mark.parametrize("settings_module", ["netbox.settings", "isolated_test_settings"])
+def test_admission_validation_runs_without_the_view_module(settings_module):
     # A fresh process: the test session has already imported views through the URLconf.
-    env = dict(os.environ, DJANGO_SETTINGS_MODULE="netbox.settings", PYTHONPATH=os.pathsep.join(filter(None, sys.path)))
-    child = subprocess.run(  # noqa: S603 — a fixed argv, no shell
-        [sys.executable, "-c", _ADMISSION_WITHOUT_VIEWS],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    with override_settings(SETTINGS_MODULE=settings_module):
+        env = dict(
+            os.environ,
+            DJANGO_SETTINGS_MODULE=settings.SETTINGS_MODULE,
+            PYTHONPATH=os.pathsep.join(filter(None, sys.path)),
+        )
+        child = subprocess.run(  # noqa: S603 (a fixed argv, no shell)
+            [sys.executable, "-c", _ADMISSION_WITHOUT_VIEWS, settings_module],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
 
     assert child.returncode == 0, child.stderr
     assert child.stdout.strip().splitlines()[-1] == "views-absent"

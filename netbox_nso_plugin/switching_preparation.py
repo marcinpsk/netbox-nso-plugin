@@ -244,6 +244,7 @@ def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
         try:
             answer = send(captured, deadline=drain._remaining_send_deadline(deadline_at))
             unauthorized = _validate(answer, captured)
+            _retire(captured, unauthorized, answer=answer)
         except adapter_client.AdapterError as exc:
             release_direct_capture(captured.selection_id)
             reason = exc.detail.get("reason") if isinstance(exc.detail, dict) else exc.code
@@ -266,5 +267,4 @@ def prepare(device_id: int, scope: str, *, force: bool, deadline_at: float):
             release_direct_capture(captured.selection_id)
             drain._report_refusal(device_id, scope, exc)
             return drain.FAILED, None
-        _retire(captured, unauthorized, answer=answer)
         return drain.SUCCEEDED, {**answer, "source_revision": captured.source_revision}
