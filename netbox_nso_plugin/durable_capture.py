@@ -429,7 +429,17 @@ def _snapshot_transaction(attempt_id):
         yield attempt, management, snapshots, rows, revisions
 
 
-def _matches(snapshot, row, management, revisions, prefix, *, check_watermark=True, check_revisions=True):
+def _matches(
+    snapshot,
+    row,
+    management,
+    revisions,
+    prefix,
+    *,
+    check_watermark=True,
+    check_revisions=True,
+    check_bookkeeping_revision=True,
+):
     from .selection_manifest import current_content_digest
 
     if row is None or snapshot.mapping_epoch != mapping_epoch(management):
@@ -447,9 +457,16 @@ def _matches(snapshot, row, management, revisions, prefix, *, check_watermark=Tr
             or _watermark(management, OVERLAYS[snapshot.model_label]) == snapshot.observation_watermark
         )
         and snapshot.expected_owner_revision is not None
-        and _fence_revisions(management, snapshot.mapping_epoch, row)
-        == (snapshot.expected_fence_revision, snapshot.expected_owner_revision)
+        and _fence_matches(management, snapshot, row, check_bookkeeping_revision)
         and _static_fences(row) == snapshot.static_route_fences
+    )
+
+
+def _fence_matches(management, snapshot, row, check_bookkeeping_revision):
+    bookkeeping_revision, owner_revision = _fence_revisions(management, snapshot.mapping_epoch, row)
+    # An observation-only read advances the bookkeeping counter without changing the row.
+    return owner_revision == snapshot.expected_owner_revision and (
+        not check_bookkeeping_revision or bookkeeping_revision == snapshot.expected_fence_revision
     )
 
 
@@ -529,7 +546,16 @@ def restore_attempt(attempt_id, keep_streams=()):
             if any(contributor["stream"] in keep_streams for contributor in contributors):
                 continue
             row = rows.get((item.model_label, item.overlay_pk))
-            if _matches(item, row, management, revisions, "expected", check_watermark=False, check_revisions=False):
+            if _matches(
+                item,
+                row,
+                management,
+                revisions,
+                "expected",
+                check_watermark=False,
+                check_revisions=False,
+                check_bookkeeping_revision=False,
+            ):
                 if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
                     _write_bookkeeping(row, item, "prior")
                     advance_fence(row, current_attempt=attempt)

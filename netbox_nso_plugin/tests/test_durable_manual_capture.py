@@ -428,6 +428,43 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         )
         self.assertEqual(snapshot.settlement_disposition, "superseded")
 
+    def test_manual_rejection_restores_after_an_observation_advances_the_fence(self):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
+        from netbox_nso_plugin.lifecycle_fence import fence_for, publish_observation
+
+        advanced = []
+
+        def publish_read(body):
+            self.mtu.refresh_from_db()
+            self.assertEqual(self.mtu.status, "deploying")
+            footprint = footprint_for_instance(self.mtu)
+            family = sorted(OVERLAYS[self.mtu._meta.label_lower].read_families)[0]
+            identity = {
+                "incarnation": "manual-read-store",
+                "source_epoch": 3,
+                "payload_revision": 1010,
+                "digest": "c" * 64,
+            }
+            with without_commit_drain(), mirror_transaction(footprint):
+                before = fence_for(self.mtu).bookkeeping_revision
+                publish_observation(footprint, family, identity)
+                advanced.append(fence_for(self.mtu).bookkeeping_revision > before)
+
+        adapter = ManualAdmissionAdapter(
+            lambda _body: (409, ManualAdmissionAdapter.rejection()), before_apply=publish_read
+        )
+        response = self._apply(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(advanced, [True])
+        self._assert_prior_bookkeeping(self.mtu)
+        snapshot = NSOApplyOverlaySnapshot.objects.get(
+            attempt_id=adapter.apply_requests[0]["apply_attempt_id"],
+            model_label=self.mtu._meta.label_lower,
+            overlay_pk=self.mtu.pk,
+        )
+        self.assertEqual(snapshot.settlement_disposition, "not_applied")
+
     def test_settlement_preserves_superseded_rejected_attempt_bookkeeping(self):
         from netbox_nso_plugin.apply_settlement import load_deployment_evidence, settle_apply_attempts
 
