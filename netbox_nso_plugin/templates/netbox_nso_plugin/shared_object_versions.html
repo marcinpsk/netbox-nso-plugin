@@ -67,7 +67,7 @@
               <td>
                 {% if it.device %}<a href="{% url 'dcim:device_nso' pk=it.device.pk %}">{{ it.device }}</a>{% else %}—{% endif %}
               </td>
-              <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=it.row.status %}</td>
+              <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with state=it.row status=it.row.status %}</td>
               <td>
                 {% if it.has_capture %}
                   {% if it.route_map %}

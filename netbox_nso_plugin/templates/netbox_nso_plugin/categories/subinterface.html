@@ -34,7 +34,7 @@
                  data-pe-v-dot1q_vlan="{{ s.dot1q_vlan|default:'' }}"
                  data-pe-v-vrf="{{ s.vrf }}">dot1q {{ s.dot1q_vlan|default:"—" }} · {{ s.vrf|default:"global" }}</a>
             </td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with state=s status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
             <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td class="text-nowrap">
               {% url 'plugins:netbox_nso_plugin:subinterface_accept' pk=s.pk as accept_url %}{% include "netbox_nso_plugin/categories/_accept_cell.html" with accept_url=accept_url status=s.status form_class="nso-row-form" title="Make NetBox the source of truth for this subinterface (re-materialised on the device on Apply)" %}

@@ -35,7 +35,7 @@
                 <div class="text-warning small text-nowrap" title="Name currently reported by this device">device: {{ s.device_name }}</div>
               {% endif %}
             </td>
-            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
+            <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with state=s status=s.status residue=s.residue_survivor residue_job=s.residue_job_id %}</td>
             <td class="text-nowrap">{% if s.last_sync_at %}{{ s.last_sync_at|date:"Y-m-d H:i" }}{% else %}—{% endif %}</td>
             <td class="text-nowrap">
               <div class="d-flex gap-1 align-items-center">

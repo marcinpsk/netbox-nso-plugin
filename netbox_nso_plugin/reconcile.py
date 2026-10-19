@@ -1356,9 +1356,12 @@ def _journal_route_policy_apply_locked(mgmt, job, execution, row_ids) -> None:
         if not members:
             continue
         failed = snapshot.settlement_disposition == "refused"
-        messages = sorted({cause["message"] for member in members for cause in member["refusals"]}) if failed else []
+        from .refusal_display import format_causes
+
+        causes = [cause for member in members for cause in member["refusals"]]
+        refusal_text = format_causes(causes) if failed else ""
         kind, verb = ("danger", "failed") if failed else ("success", "succeeded")
-        detail = " " + " ".join(messages) if messages else ""
+        detail = " " + refusal_text if refusal_text else ""
         tab = reverse("dcim:device_nso", kwargs={"pk": mgmt.device_id})
         comment = (
             f"NSO apply on **{mgmt.device}**: route-policy **{verb}**, "

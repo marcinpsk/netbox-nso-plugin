@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""Read-only per-category counts for the device NSO tab's collapsed view.
-
-The tab now renders counts-first: each managed scope shows a total and a status
-breakdown, computed with cheap aggregate queries over the persisted NSO*State
-tables — NO adapter calls and NO reconcile writes. Rows are fetched lazily when a
-category is expanded (see views.NSOCategoryView). The persisted state is kept fresh
-by the background reconcile (reconcile.run_device_reconcile) the adapter triggers on
-each sync-complete, so these counts reflect the last sync without touching the page.
-"""
+"""Read-only category counts and execution evidence for the device NSO tab."""
 
 from __future__ import annotations
-
-from django.db.models import Count
 
 from .status_machine import OWNED_STATES
 
@@ -103,7 +93,15 @@ def interface_row_state(st, iface):
     (not owned). In-flight ("deploying") and non-comparable attributes fall back to
     the status-driven :func:`display_state`.
     """
+    from .refusal_display import row_projection, row_state
+
     owned = st.status in OWNED_STATES
+    projection = row_projection(st)
+    invalid = projection["refusal"] is not None and not projection["refusal"]["valid"]
+    retained_failure = st.status == "apply_failed" and projection["execution_disposition"] == "not_applied"
+    if invalid or retained_failure or projection["execution_disposition"] in {"refused", "unavailable"}:
+        kind, label = row_state(st)
+        return kind, label, owned
     if st.status == "deploying" or st.attribute not in _COMPARABLE_IFACE_ATTRS:
         kind, label = display_state(st.status, owned)
         return (kind, label, owned)
@@ -124,11 +122,13 @@ def interface_status_breakdown(qs) -> dict:
     :func:`interface_row_state` (real NetBox vs device value) so a value set
     directly in NetBox is bucketed correctly instead of vanishing into "in sync".
     """
+    from .refusal_display import project_rows
+
     out = {"total": 0, "drift": 0, "pending": 0}
-    for st in qs.select_related("interface"):
+    for st in project_rows(qs.select_related("interface")):
         out["total"] += 1
         kind, _label, _owned = interface_row_state(st, st.interface)
-        if kind in ("pending", "deploying", "apply_failed"):
+        if kind in ("pending", "deploying", "apply_failed", "unavailable"):
             out["pending"] += 1
         elif kind == "drift":
             out["drift"] += 1
@@ -179,27 +179,23 @@ def _status_breakdown(qs) -> dict:
     *anomaly* — reconcilers always set a concrete status — so it is surfaced under drift
     (needs attention) rather than hidden in the in-sync remainder.
     """
-    rows = qs.values_list("status").annotate(total=Count("id"))
+    from .refusal_display import project_rows, row_state
+
     out = {"total": 0, "drift": 0, "pending": 0}
-    for status, total in rows:
-        out["total"] += total
-        if status == "deploying":
-            out["pending"] += total
-        elif status in _DIFFER_STATUSES:
-            if status in OWNED_STATES:
-                out["pending"] += total  # accepted / apply_failed — owned differ
-            else:
-                out["drift"] += total  # changed / conflict — unowned differ
-        elif status in _MATCH_STATUSES:
-            pass  # in sync — the implicit remainder
-        else:
-            out["drift"] += total  # unknown/unrecognized → surface, don't hide
+    for row in project_rows(qs):
+        kind, _label = row_state(row)
+        out["total"] += 1
+        if kind in {"pending", "deploying", "apply_failed", "unavailable"}:
+            out["pending"] += 1
+        elif kind != "in_sync":
+            out["drift"] += 1
     return out
 
 
 def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     """Compute the count breakdown for one category from persisted NSO*State."""
     from .models import (
+        NSOBFDInterfaceState,
         NSOBGPPeerState,
         NSOBGPPeerTemplateState,
         NSOBGPRouterState,
@@ -237,26 +233,21 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
 
         return _status_breakdown(NSOInterfaceIPState.objects.filter(interface__device_id=dev_id))
     if key == "bfd":
-        # Read-only (no NSO*State overlay): just the count of BFD-configured interfaces.
-        try:
-            from netbox_routing.models import BFDInterface
-
-            n = BFDInterface.objects.filter(interface__device_id=dev_id).count()
-        except Exception:
-            n = 0
-        return {"total": n, "drift": 0, "pending": 0}
+        return _status_breakdown(NSOBFDInterfaceState.objects.filter(management=mgmt))
     if key == "isis":
         # interfaces + instances combined for the headline; expand shows both.
         ifaces = _status_breakdown(NSOISISInterfaceState.objects.filter(interface__device_id=dev_id))
-        procs = NSOISISInstanceState.objects.filter(management=mgmt).count()
-        ifaces["total"] = ifaces.get("total", 0) + procs
-        ifaces["processes"] = procs
+        procs = _status_breakdown(NSOISISInstanceState.objects.filter(management=mgmt))
+        for bucket, total in procs.items():
+            ifaces[bucket] += total
+        ifaces["processes"] = procs["total"]
         return ifaces
     if key == "ospf":
         ifaces = _status_breakdown(NSOOSPFInterfaceState.objects.filter(interface__device_id=dev_id))
-        insts = NSOOSPFInstanceState.objects.filter(management=mgmt).count()
-        ifaces["total"] = ifaces.get("total", 0) + insts
-        ifaces["instances"] = insts
+        insts = _status_breakdown(NSOOSPFInstanceState.objects.filter(management=mgmt))
+        for bucket, total in insts.items():
+            ifaces[bucket] += total
+        ifaces["instances"] = insts["total"]
         return ifaces
     if key == "static":
         return _status_breakdown(NSOStaticRouteState.objects.filter(management=mgmt))
@@ -347,14 +338,8 @@ def _snmp_breakdown(querysets) -> dict:
     """
     out = {"total": 0, "drift": 0, "pending": 0}
     for qs in querysets:
-        for status, total in qs.values_list("status").annotate(total=Count("id")):
-            out["total"] += total
-            if status in ("deploying", "accepted", "apply_failed"):
-                out["pending"] += total  # apply_failed is owned + retryable → pending, not drift
-            elif status in _MATCH_STATUSES:
-                pass  # in sync — the implicit remainder
-            else:
-                out["drift"] += total  # changed/conflict/error/unknown
+        for bucket, total in _status_breakdown(qs).items():
+            out[bucket] += total
     return out
 
 
@@ -528,3 +513,9 @@ def category_summaries(device, mgmt) -> list[dict]:
             }
         )
     return summaries
+
+
+def execution_summaries(management):
+    from .refusal_display import device_execution_summaries
+
+    return device_execution_summaries(management)

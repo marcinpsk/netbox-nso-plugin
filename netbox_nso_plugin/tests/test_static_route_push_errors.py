@@ -538,7 +538,7 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         self.assertEqual(row["state"], "apply_failed")
         self.assertEqual(row["label"], "apply failed")
         self.assertIn("NED rejected the route", row["error"])
-        self.assertIsNone(row["advisory"])
+        self.assertEqual(row["advisory"], "")
 
     def test_an_unproven_verdict_carries_its_advisory(self):
         """P6.7 — `unproven` is a statement about evidence, so it keeps the status and gains a

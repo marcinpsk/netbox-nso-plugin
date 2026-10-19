@@ -48,6 +48,15 @@ def test_preview_accepts_the_exact_structured_adapter_shape(status):
         assert adapter_client.get_apply_diff(7, "cli") == preview
 
 
+@pytest.mark.parametrize("payload", [None, [], "placeholder malformed document", 3])
+def test_interface_document_rejects_non_objects_before_reading_errors(payload):
+    adapter_client.reset_interfaces_doc_capability()
+    config, transport = _response(payload)
+    with config, transport, pytest.raises(adapter_client.AdapterError, match="interfaces document") as raised:
+        adapter_client.get_interfaces_doc(7)
+    assert raised.value.code == "invalid_response"
+
+
 def test_job_rejects_typed_projection_drift_before_it_reaches_a_view():
     result = refused_bgp_result()
     job = {"id": 23, "type": "apply", "status": "failed", "result": result, "row_outcomes": [], "refusals": []}

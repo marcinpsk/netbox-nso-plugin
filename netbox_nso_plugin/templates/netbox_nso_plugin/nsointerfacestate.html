@@ -31,19 +31,7 @@
             <tr>
               <th scope="row">Status</th>
               <td>
-                {% if object.status == "in_sync" or object.status == "imported" %}
-                  <span class="badge text-bg-success">{{ object.status }}</span>
-                {% elif object.status == "changed" or object.status == "drifted" %}
-                  <span class="badge text-bg-warning text-dark">{{ object.status }}</span>
-                {% elif object.status == "error" or object.status == "apply_failed" %}
-                  <span class="badge text-bg-danger">{{ object.status }}</span>
-                {% elif object.status == "accepted" %}
-                  <span class="badge text-bg-info">{{ object.status }}</span>
-                {% elif object.status == "deploying" %}
-                  <span class="badge text-bg-primary">{{ object.status }}</span>
-                {% else %}
-                  <span class="badge text-bg-info">{{ object.status }}</span>
-                {% endif %}
+                {% include "netbox_nso_plugin/categories/_state_badge.html" with state=object status=object.status %}
               </td>
             </tr>
             <tr>
@@ -60,7 +48,7 @@
             </tr>
             <tr>
               <th scope="row">Last Apply Error</th>
-              <td>{{ object.last_apply_error|default:"—" }}</td>
+              <td>{{ object.refusal_display.error|default:"—" }}</td>
             </tr>
             <tr>
               <th scope="row">Last Sync At</th>

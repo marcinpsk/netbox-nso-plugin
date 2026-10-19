@@ -25,7 +25,7 @@
            data-pe-v-contact="{{ snmp_data.system_info.contact|default:'' }}">{{ snmp_data.system_info.location|default:"no location" }} · {{ snmp_data.system_info.contact|default:"no contact" }}</a>
       </td>
       <td>
-        {% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}
+        {% include "netbox_nso_plugin/categories/_state_badge.html" with state=snmp_data.system_info status=snmp_data.system_info.status %}
         <div class="text-muted small text-nowrap">{% if snmp_data.system_info.last_sync_at %}{{ snmp_data.system_info.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
       </td>
       <td class="text-nowrap">
@@ -80,7 +80,7 @@
             {% endif %}
           </td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with state=c status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}
             <div class="text-muted small text-nowrap">{% if c.last_sync_at %}{{ c.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
           </td>
           <td>
@@ -136,7 +136,7 @@
             {% endif %}
           </td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with state=u status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}
             <div class="text-muted small text-nowrap">{% if u.last_sync_at %}{{ u.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
           </td>
           <td>
@@ -184,7 +184,7 @@
                data-pe-o-notify_type='[{"value":"trap","label":"Trap"},{"value":"inform","label":"Inform"}]'>{% if h.notify_type == "inform" or h.notify_type == "informs" %}inform{% else %}trap{% endif %} · {% if h.version == "1" or h.version == "v1" %}v1{% elif h.version == "2" or h.version == "2c" or h.version == "v2c" %}v2c{% else %}v3{% endif %}{% if h.username %} · {{ h.username }}{% endif %}</a>
           </td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with state=h status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
             <div class="text-muted small text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
           </td>
           <td class="text-nowrap">

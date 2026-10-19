@@ -707,9 +707,11 @@ def _validate_owner_deletions(management, rows, snapshots, expected):
 
 def refusal_error(causes, *, json_error=False):
     """Format validated catalog causes without interpolating device diagnostics."""
+    from .refusal_display import catalog_causes, format_causes
+
     if json_error:
-        return {"refusals": copy.deepcopy(causes)}
-    return " ".join(sorted({f"{cause['reason']}: {cause['message']}" for cause in causes}))
+        return {"refusals": catalog_causes(causes)}
+    return format_causes(causes)
 
 
 def immutable_execution_projection(generation):

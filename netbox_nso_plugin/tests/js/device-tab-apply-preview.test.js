@@ -51,3 +51,44 @@ it('does not mark staged switching rows unchanged before their Apply preparation
     ] });
   expect(body.querySelectorAll('.text-bg-info')).toHaveLength(0);
 });
+
+it('shows a refused preview and its diff without HTML from catalog text', async () => {
+  const text = 'inexpressible-on-ned: <placeholder> & catalog text';
+  const body = await open({ total: 0, diff_available: false, preview_status: 'refused',
+    device_diff: { device_intent: 'placeholder diff' }, refusal_text: text });
+  expect(body.textContent).toContain(text);
+  expect(body.textContent).toContain('placeholder diff');
+  expect(body.querySelector('placeholder')).toBeNull();
+});
+
+it('shows the current execution advisory beside pending intent', async () => {
+  const advisory = 'Execution unavailable; showing previous state.';
+  const body = await open({ total: 1, diff_available: true, device_diff: {},
+    changes: [{ interface: 'Ethernet1', attribute: 'description', device: 'placeholder',
+      netbox: 'placeholder', advisory }] });
+  expect(body.textContent).toContain(advisory);
+});
+
+it.each([
+  { error: 'placeholder prior <ordinary-error> & failure' },
+  { error: 'inexpressible-on-ned: placeholder prior catalog cause' },
+  { refusal_text: 'inexpressible-on-ned: placeholder catalog refusal' },
+])('shows the projected cause and advisory in separate preview elements: %j', async (projection) => {
+  const advisory = 'Execution unavailable; showing previous state.';
+  const cause = projection.refusal_text || projection.error;
+  const body = await open({ total: 1, diff_available: true, device_diff: {},
+    changes: [{ interface: 'Ethernet1', attribute: 'description', device: 'placeholder',
+      netbox: 'placeholder', ...projection, advisory }] });
+  expect(body.textContent).toContain(cause);
+  expect(body.textContent).toContain(advisory);
+  const notices = [...body.querySelectorAll('td p')];
+  expect(notices.map(node => node.textContent)).toEqual([cause, advisory]);
+  expect(body.querySelector('ordinary-error')).toBeNull();
+});
+
+it('does not call an empty refused preview nothing pending', async () => {
+  const body = await open({ total: 0, diff_available: false, preview_status: 'refused',
+    device_diff: {}, refusal_text: 'inexpressible-on-ned: catalog message' });
+  expect(body.textContent).toContain('inexpressible-on-ned');
+  expect(body.textContent).not.toContain('Nothing pending.');
+});

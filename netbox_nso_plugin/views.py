@@ -227,7 +227,7 @@ class DeviceNSOTabView(generic.ObjectView):
         connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
-        from .summary import category_summaries
+        from .summary import category_summaries, execution_summaries
         from .template_content import _STATUS_BADGE
 
         device = instance
@@ -309,6 +309,7 @@ class DeviceNSOTabView(generic.ObjectView):
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
+            "execution_summaries": execution_summaries(mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
@@ -623,11 +624,11 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
         )
 
 
-_PENDING_KINDS = {"pending", "apply_failed"}
+_PENDING_KINDS = {"pending", "apply_failed", "unavailable"}
 
 # Worst-first ordering of per-cell state kinds, for rolling an interface's cells up
 # into the single row-level state the grid sorts and quick-filters on.
-_KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
+_KIND_SEVERITY = ("apply_failed", "unavailable", "drift", "pending", "deploying", "unknown", "in_sync")
 
 # Each category maps to the independent push scopes shown on its banner.
 _CATEGORY_PUSH_SCOPES = {
@@ -759,8 +760,8 @@ def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) ->
     (interface_row_state), the rest go through display_state. Returns the SET of kinds
     across all of the interface's cells so the view can bucket it as drift/pending/in_sync.
     """
-    from .status_machine import OWNED_STATES
-    from .summary import display_state, interface_row_state
+    from .refusal_display import row_state
+    from .summary import interface_row_state
 
     kinds: set[str] = set()
     for attr in ("enabled", "description"):
@@ -769,9 +770,9 @@ def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) ->
             kinds.add(interface_row_state(st, iface)[0])
     for st in (mtu_states.get(iface.id), sw_states.get(iface.id)):
         if st is not None:
-            kinds.add(display_state(st.status, st.status in OWNED_STATES)[0])
+            kinds.add(row_state(st)[0])
     for st in ip_states.get(iface.id, []):
-        kinds.add(display_state(st.status, st.status in OWNED_STATES)[0])
+        kinds.add(row_state(st)[0])
     return kinds
 
 
@@ -1299,6 +1300,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
         from django.db.models import Q
 
+        from .refusal_display import UNAVAILABLE, project_rows, row_projection
         from .status_machine import OWNED_STATES
         from .template_content import _STATUS_BADGE
 
@@ -1330,8 +1332,16 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # Server-side state quick-filter — applied HERE (the one renderer for every paged
         # category) so route_policy / static / redistribution / vlan / svi / subinterface /
         # l2_services all get the drift/pending/in-sync quick-select without per-template work.
-        rows = list(qs)
-        bucketed = [(_paged_row_bucket(r.status, r.status in OWNED_STATES), r) for r in rows]
+        rows = project_rows(qs)
+        bucketed = [
+            (
+                "pending"
+                if row_projection(row)["advisory"] == UNAVAILABLE
+                else _paged_row_bucket(row.status, row.status in OWNED_STATES),
+                row,
+            )
+            for row in rows
+        ]
         state_counts = {"all": len(rows), "drift": 0, "pending": 0, "in_sync": 0}
         for bucket, _row in bucketed:
             state_counts[bucket] += 1
@@ -1393,6 +1403,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSOSwitchportState,
         )
         from .reconcile import reconcile_category
+        from .refusal_display import project_rows
 
         mgmt = getattr(device, "nso_management", None)
 
@@ -1430,6 +1441,15 @@ class NSOCategoryView(LoginRequiredMixin, View):
             ifaces[iface_id] = st.interface
         for iface_id, st in sw_states.items():
             ifaces[iface_id] = st.interface
+
+        project_rows(
+            [
+                *attr_states.values(),
+                *mtu_states.values(),
+                *sw_states.values(),
+                *(row for rows in ip_states.values() for row in rows),
+            ]
+        )
 
         # The drift modal compares the observed switchport against the LIVE native
         # Interface value. Reload the small interface set with both VLAN relations
@@ -1529,6 +1549,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSORoutePolicyState,
             NSOStaticRouteState,
         )
+        from .refusal_display import row_projection
 
         r = "plugins:netbox_nso_plugin:"
 
@@ -1592,6 +1613,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         def lacp_members(state):
             return [
                 {
+                    **row_projection(member),
                     "interface": iface(member),
                     "mode": member.mode or None,
                     "port_priority": member.port_priority,
@@ -1833,11 +1855,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         ctx="static_routes",
                         qs=lambda d: by_device(NSOStaticRouteState, d, "static_route").order_by("nso_prefix"),
                         accept=r + "routing_accept_static_route",
-                        # Static routes are the one family that settles per route with a
-                        # per-route reason, so an owned apply_failed here renders as its
-                        # own red state carrying the message instead of a blue
-                        # "pending apply" chip promising an Apply that already lost.
-                        distinguish_failed=True,
                         fields={
                             "vrf": lambda st: st.nso_vrf or "global",
                             "prefix": lambda st: st.nso_prefix,
@@ -1846,10 +1863,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "permanent": lambda st: st.static_route.permanent if st.static_route else None,
                             "tag": lambda st: st.static_route.tag if st.static_route else None,
                             "route": lambda st: linked(st.static_route),
-                            "error": lambda st: st.last_apply_error or None,
-                            # An `unproven` verdict's reason: the apply landed and nothing
-                            # proves it. Not a status — a qualifier on one.
-                            "advisory": lambda st: st.last_result_advisory or None,
                             "edit_url": lambda st: (
                                 reverse(r + "overlay_field_edit", args=["static_route", st.pk])
                                 if st.static_route_id
@@ -1927,7 +1940,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
         }
 
-    def _grid_section(self, states, accept_route, fields, related=None, distinguish_failed=False):
+    def _grid_section(self, states, accept_route, fields, related=None):
         """Serialize one grid sub-table: its rows plus the quick-filter counts.
 
         kind/label come from summary.display_state — the same helper the server-rendered
@@ -1938,17 +1951,13 @@ class NSOCategoryView(LoginRequiredMixin, View):
         The counts are taken off the SAME kind the pills filter on, so a chip can never
         promise rows its own filter would hide.
         """
-        from .status_machine import OWNED_STATES
-        from .summary import display_state
+        from .refusal_display import project_rows, row_projection, row_state
 
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
-        for st in states:
+        for st in project_rows(states):
             status_rows = [st, *(list(related(st)) if related else [])]
-            displayed = [
-                display_state(row.status, row.status in OWNED_STATES, distinguish_failed=distinguish_failed)
-                for row in status_rows
-            ]
+            displayed = [row_state(row) for row in status_rows]
             kind = _row_state({item[0] for item in displayed})
             label = next(item[1] for item in displayed if item[0] == kind)
             counts["all"] += 1
@@ -1972,6 +1981,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 ),
             }
             row.update({name: fn(st) for name, fn in fields.items()})
+            row.update(row_projection(st))
             rows.append(row)
         return {"rows": rows, "counts": counts}
 
@@ -2007,7 +2017,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 section["accept"],
                 section["fields"],
                 related=section.get("related"),
-                distinguish_failed=section.get("distinguish_failed", False),
             )
             if key == "bgp" and name == "routers":
                 for state, row in zip(states[name], built["rows"], strict=True):
@@ -2086,8 +2095,9 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
 
+        from .refusal_display import row_projection, row_state
         from .status_machine import OWNED_STATES
-        from .summary import _netbox_value_for, display_state, interface_row_state
+        from .summary import _netbox_value_for, interface_row_state
 
         interface_type_id = ContentType.objects.get_for_model(Interface).pk
 
@@ -2099,6 +2109,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "pk": st.pk,
                 "value": st.nso_value,
                 "netbox_value": _netbox_value_for(st.attribute, iface),
+                **row_projection(st),
                 "status": st.status,
                 "kind": kind,
                 "label": label,
@@ -2115,9 +2126,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
             if st is None:
                 return None
             owned = st.status in OWNED_STATES
-            kind, label = display_state(st.status, owned)
+            kind, label = row_state(st)
             cell = {
                 "pk": st.pk,
+                **row_projection(st),
                 "status": st.status,
                 "kind": kind,
                 "label": label,
@@ -2129,7 +2141,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         def ip_cell(st):
             owned = st.status in OWNED_STATES
-            kind, label = display_state(st.status, owned)
+            kind, label = row_state(st)
             native = native_ips.get(st.pk)
             peer = peer_ip_states.get(st.pk)
             if native is None:
@@ -2145,6 +2157,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "address": str(st.address),
                 "vrf": st.vrf,
                 "secondary": st.secondary,
+                **row_projection(st),
                 "status": st.status,
                 "kind": kind,
                 "label": label,
@@ -2227,6 +2240,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
 
         from .models import NSOInterfaceState
+        from .refusal_display import project_rows
         from .summary import interface_row_state
 
         q = (request.GET.get("q") or "").strip()
@@ -2247,10 +2261,10 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # bounded (≤2 attrs × interfaces), so this is cheap on tab load.
         classified = []
         counts = {"all": 0, "drift": 0, "pending": 0}
-        for st in qs:
+        for st in project_rows(qs):
             kind, label, owned = interface_row_state(st, st.interface)
             counts["all"] += 1
-            if kind in ("pending", "deploying", "apply_failed"):
+            if kind in ("pending", "deploying", "apply_failed", "unavailable"):
                 counts["pending"] += 1
             elif kind == "drift":
                 counts["drift"] += 1
@@ -2259,7 +2273,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if state == "drift":
             filtered = [c for c in classified if c[1] == "drift"]
         elif state == "pending":
-            filtered = [c for c in classified if c[1] in ("pending", "deploying", "apply_failed")]
+            filtered = [c for c in classified if c[1] in ("pending", "deploying", "apply_failed", "unavailable")]
         elif state == "in_sync":
             filtered = [c for c in classified if c[1] in ("in_sync", "unknown")]
         else:
@@ -2279,6 +2293,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 netbox_value = "—"
             rows.append(
                 {
+                    **st.refusal_display,
                     "state": st,
                     "iface_name": iface.name,
                     "iface_url": iface.get_absolute_url(),
@@ -3720,7 +3735,9 @@ class NSOJobStatusView(LoginRequiredMixin, View):
         from . import adapter_client as client
 
         try:
-            return JsonResponse(_job_with_outcome_counts(client.get_job(job_id)))
+            from .refusal_display import job_projection
+
+            return JsonResponse(_job_with_outcome_counts(job_projection(client.get_job(job_id))))
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
 
@@ -4041,6 +4058,9 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             apply_state = None
             apply_state_error = public_error_message(exc)
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
+        from .refusal_display import job_projection
+
+        jobs = [job_projection(job) for job in jobs]
         serialized_jobs = jobs
         if generation_ids:
             generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
@@ -6178,7 +6198,7 @@ def _apply_preview_interface_changes(device_pk):
         # 'deploying' (apply pushed, awaiting device confirmation) is counted as pending-apply
         # by the tab badges, so it must appear here too — else the preview total drops to 0 and
         # the confirm modal is silently skipped (openApply's `!d.total` short-circuit).
-        if kind not in ("pending", "apply_failed", "deploying"):
+        if kind not in ("pending", "apply_failed", "deploying", "unavailable"):
             continue
         if st.attribute == "description":
             netbox_val = iface.description or "—"
@@ -6187,7 +6207,13 @@ def _apply_preview_interface_changes(device_pk):
         else:
             netbox_val = "—"
         changes.append(
-            {"interface": iface.name, "attribute": st.attribute, "device": st.nso_value or "—", "netbox": netbox_val}
+            {
+                **st.refusal_display,
+                "interface": iface.name,
+                "attribute": st.attribute,
+                "device": st.nso_value or "—",
+                "netbox": netbox_val,
+            }
         )
     return changes
 
@@ -6315,14 +6341,22 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
             (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or "", "l2_sap"),
         ]
 
+        from .refusal_display import UNAVAILABLE, row_projection
+
         routing_changes = []
         if mgmt is not None:
             for model, label, item_fn, detail_fn, scope in preview_specs:
                 # accepted/apply_failed (owned, differs) AND deploying (apply pushed, not yet
                 # confirmed) are all "pending apply" on the tab — the preview must count the same
                 # set or a device with only deploying rows previews total=0 and skips the modal.
-                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed", "deploying"))
+                rows = model.objects.filter(management=mgmt)
                 for r in rows:
+                    projected = row_projection(r)
+                    if (
+                        r.status not in {"accepted", "apply_failed", "deploying"}
+                        and projected["advisory"] != UNAVAILABLE
+                    ):
+                        continue
                     try:
                         item = item_fn(r)
                     except Exception:
@@ -6338,6 +6372,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                     staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None
                     routing_changes.append(
                         {
+                            **projected,
                             "category": label,
                             "item": item,
                             "detail": detail,
@@ -6375,8 +6410,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 document_digest = preview["document_digest"]
                 preview_status = preview["status"]
                 preview_refusals = preview["refusals"]
+                device_diff = preview["diffs"] if preview_status in {"ready", "refused"} else {}
                 if preview_status == "ready":
-                    device_diff = preview["diffs"]
                     diff_available = True
                     diff_error = None
             except client.AdapterError as exc:
@@ -6398,6 +6433,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         # by an EMPTY diff before the modal may be skipped. Pending rows always require
         # confirmation — an unavailable adapter (device_diff={}) proves nothing, which is
         # why the gate demands diff_available and not merely an empty dict.
+        from .refusal_display import attributed_projection
+
+        preview_projection = attributed_projection(preview_refusals) if preview_refusals else None
         total = len(changes) + len(routing_changes)
         response = JsonResponse(
             {
@@ -6414,6 +6452,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 "document_digest": document_digest,
                 "preview_status": preview_status,
                 "refusals": preview_refusals,
+                "refusal": preview_projection,
+                "refusal_text": preview_projection["text"] if preview_projection else "",
                 "diff_error": diff_error,
             }
         )

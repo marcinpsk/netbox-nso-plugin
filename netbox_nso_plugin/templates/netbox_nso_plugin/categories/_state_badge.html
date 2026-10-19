@@ -5,7 +5,10 @@ State badge from a raw status. Expects `status`. Owned (NetBox is the source of
 truth) is derived from owned statuses and shown as a shield.
 changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
 {% endcomment %}
-{% if status == "changed" or status == "conflict" %}<span class="badge text-bg-warning text-dark" title="The device's on-box content differs from what NetBox holds, and NetBox does not own this object — review the diff and Accept to take ownership, or update NetBox to match.">drift</span>
+{% with display=state.refusal_display %}
+{% if display.refusal and not display.refusal.valid %}<span class="badge text-bg-danger">invalid refusal evidence</span>
+{% elif display.advisory %}<span class="badge text-bg-warning text-dark">previous {{ status }}</span>
+{% elif status == "changed" or status == "conflict" %}<span class="badge text-bg-warning text-dark" title="The device's on-box content differs from what NetBox holds, and NetBox does not own this object — review the diff and Accept to take ownership, or update NetBox to match.">drift</span>
 {% elif status == "drifted" or status == "accepted" %}<span class="badge text-bg-info" title="NetBox owns this object (Accepted) but it has not yet been applied to / confirmed on the device. Run Apply to push NetBox's version to the device.">pending apply</span>
 {% elif status == "apply_failed" %}<span class="badge text-bg-danger" title="The last apply to the device failed — NetBox still owns the intent. See the apply error and retry.">apply failed</span>
 {% elif status == "deploying" %}<span class="badge text-bg-primary" title="An apply is in progress — NetBox is pushing its version to the device.">deploying</span>
@@ -14,3 +17,7 @@ changed/conflict = not-owned drift; drifted/accepted = owned -> pending apply.
 {% else %}<span class="badge text-bg-info">{{ status }}</span>{% endif %}
 {% if status == "in_sync" or status == "accepted" or status == "drifted" or status == "deploying" or status == "apply_failed" %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
 {% if residue %}<span class="badge text-bg-warning text-dark ms-1" title="A retraction (adapter job #{{ residue_job }}) reported success but this key survived on the device — it re-imported here as an unowned mirror, not new device config. Clean up on-device via a gated commit, or Accept to adopt it as intent.">removal residue</span>{% endif %}
+
+{% if display.refusal_text %}<small class="text-danger ms-1">{{ display.refusal_text }}</small>{% elif display.error %}<small class="text-danger ms-1">{{ display.error }}</small>{% endif %}
+{% if display.advisory %}<small class="text-warning ms-1{% if display.execution_disposition == 'unavailable' %} nso-execution-unavailable{% endif %}">{{ display.advisory }}</small>{% endif %}
+{% endwith %}

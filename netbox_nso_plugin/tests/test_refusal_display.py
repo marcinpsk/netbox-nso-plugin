@@ -1,0 +1,792 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba
+"""Catalog refusal presentation through real settlement, HTTP views and templates."""
+
+import copy
+
+from dcim.models import Interface
+from django.db import transaction
+from django.urls import reverse
+
+from netbox_nso_plugin.models import NSOInterfaceState
+
+from . import test_refusal_settlement_families as families
+from . import test_refusal_settlement_runtime as runtime
+from ._adapter_http import make_apply_preview, make_response
+from ._outbox_case import without_commit_drain
+from ._ownership_case import acquire_overlay
+from .test_durable_bgp_capture import BGPCaptureCase
+
+
+class TestRefusalDisplay(BGPCaptureCase):
+    prepare = runtime.TestRefusalSettlementRuntime.prepare
+    terminal = runtime.TestRefusalSettlementRuntime.terminal
+    serve_terminal_evidence = runtime.TestRefusalSettlementRuntime.serve_terminal_evidence
+    _serve_bgp_observation = runtime.TestRefusalSettlementRuntime._serve_bgp_observation
+    apply_owners = families.TestRefusalSettlementFamilies.apply_owners
+    evidence = families.TestRefusalSettlementFamilies.evidence
+    settle = families.TestRefusalSettlementFamilies.settle
+
+    def category(self, key, **params):
+        response = self.client.get(
+            reverse("plugins:netbox_nso_plugin:device_nso_category", args=(self.device.pk, key)), params
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        return response
+
+    def preview(self, payload=None):
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/actions/apply-diff"):
+                return make_response(200, payload or make_apply_preview(device_id=1558))
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:device_apply_preview", args=(self.device.pk,)))
+        self.assertEqual(response.status_code, 200, response.content)
+        return response
+
+    def refused_bgp(self, refused=1):
+        from datetime import datetime
+
+        from ._outbox_case import mirror_update
+        from .test_read_gate import _INC_A
+
+        mirror_update(
+            self.management,
+            adapter_incarnation=_INC_A[0],
+            adapter_incarnation_born=datetime.fromisoformat(_INC_A[1]),
+            adapter_source_epoch=1,
+            source_epoch_aware=True,
+        )
+        with without_commit_drain():
+            self.management.manage_routing = True
+            self.management.save(update_fields=("manage_routing",))
+        self.prepare()
+        generation = self.terminal(refused=refused)
+        self.settle(generation)
+        self._serve_bgp_observation(generation)
+        self.category("bgp", refresh=1)
+        return generation["refusals"][0]
+
+    def interface_execution(self, *, unavailable=False, matching=False, prior_status="accepted", disposition=None):
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_interfaces = True
+            self.management.manage_description = True
+            self.management.save(update_fields=("manage_interfaces", "manage_description"))
+            iface = Interface.objects.create(
+                device=self.device, name="Ethernet1", type="1000base-t", description="placeholder desired"
+            )
+            row = acquire_overlay(
+                NSOInterfaceState,
+                interface=iface,
+                attribute="description",
+                status="accepted",
+                nso_value="placeholder desired" if matching else "placeholder observed",
+            )
+        self.apply_owners([row], prior_status=prior_status)
+        disposition = disposition or ("unavailable" if unavailable else "refused")
+        generation = self.evidence(
+            refused=row if disposition == "refused" else None,
+            dispositions={"interface.description": disposition},
+        )
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
+
+        for section in generation["sections"]:
+            for counter in SECTION_COUNTER_KEYS[section]:
+                generation["carrier_job_result"].setdefault(
+                    counter, dict.fromkeys(("in_sync", "apply_failed", "not_applied", "unavailable"), 0)
+                )
+        self.settle(generation)
+        from netbox_nso_plugin.lifecycle_fence import read_refresh
+        from netbox_nso_plugin.template_content import _upsert_interface_states
+
+        with read_refresh():
+            _upsert_interface_states(
+                self.device,
+                [
+                    {
+                        "name": iface.name,
+                        "attrs": {
+                            "description": {
+                                "status": "in_sync",
+                                "nso_value": "placeholder desired" if matching else "placeholder observed",
+                                "last_apply_error": {},
+                            }
+                        },
+                    }
+                ],
+            )
+        row.refresh_from_db()
+        return iface, row, generation
+
+    def test_device_tab_shows_refusal_reason_and_message(self):
+        cause = self.refused_bgp()
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f"{cause['reason']}: {cause['message']}")
+
+    def test_interface_badge_shows_catalog_reason(self):
+        iface, row, generation = self.interface_execution()
+        cause = generation["refusals"][0]
+        response = self.client.get(iface.get_absolute_url())
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f"{cause['reason']}: {cause['message']}")
+
+    def test_interface_views_keep_ordinary_json_error_without_message(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.template_content import _upsert_interface_states
+
+        error = {"code": "placeholder_failure", "detail": "<placeholder-error> & detail"}
+        with without_commit_drain():
+            iface = Interface.objects.create(device=self.device, name="Ethernet1", type="1000base-t")
+        interfaces = [
+            {
+                "name": iface.name,
+                "attrs": {
+                    "description": {
+                        "status": "apply_failed",
+                        "nso_value": "placeholder observed",
+                        "last_apply_error": error,
+                    }
+                },
+            }
+        ]
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/interfaces"):
+                return make_response(200, interfaces)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        with without_commit_drain():
+            _upsert_interface_states(self.device, adapter_client.get_interfaces(1558))
+        row = NSOInterfaceState.objects.get(interface=iface, attribute="description")
+        self.assertEqual(row.last_apply_error, error)
+        for url in (row.get_absolute_url(), iface.get_absolute_url()):
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertContains(response, "placeholder_failure")
+                self.assertContains(response, "&lt;placeholder-error&gt; &amp; detail")
+                self.assertNotContains(response, "<placeholder-error>")
+        cell = self.category("interface", format="json").json()["rows"][0]["description"]
+        self.assertIsNone(cell["refusal"])
+        self.assertIn("placeholder_failure", cell["error"])
+
+    def test_peer_refusal_restores_router_and_sibling_history(self):
+        cause = self.refused_bgp()
+        payload = self.category("bgp", format="json").json()
+        peer = next(row for row in payload["peers"]["rows"] if row["pk"] == self.owners[1].pk)
+        self.assertEqual(peer["state"], "apply_failed")
+        self.assertEqual(peer.get("refusal_text"), f"{cause['reason']}: {cause['message']}")
+        self.assertEqual(peer["refusal"]["causes"][0]["message_id"], cause["message_id"])
+        for section, owner in (("routers", self.owners[0]), ("peers", self.owners[2])):
+            restored = next(row for row in payload[section]["rows"] if row["pk"] == owner.pk)
+            self.assertEqual(restored["status"], self.prior[(owner._meta.label_lower, owner.pk)][0])
+            self.assertIsNone(restored["refusal"])
+            self.assertEqual(restored["error"], self.prior[(owner._meta.label_lower, owner.pk)][2])
+        self.assertContains(self.category("bgp"), cause["reason"])
+
+    def test_unavailable_execution_keeps_prior_state_with_advisory(self):
+        self.prepare()
+        generation = self.terminal(refused=None, disposition="unavailable")
+        self.settle(generation)
+        payload = self.category("bgp", format="json").json()
+        for section in ("routers", "peers"):
+            for row in payload[section]["rows"]:
+                self.assertIn("unavailable", row.get("advisory") or "")
+                self.assertIsNone(row["refusal"])
+                self.assertTrue(row["label"].startswith("previous "))
+        self.assertContains(self.category("bgp"), "unavailable")
+
+    def test_preview_refusal_keeps_diffs_and_identity_fields(self):
+        cause = self.refused_bgp()
+        preview = make_apply_preview(
+            device_id=1558, status="refused", refusals=[cause], diffs={"device_intent": "placeholder diff"}
+        )
+        result = self.preview(preview).json()
+        self.assertEqual(result["device_diff"], preview["diffs"])
+        self.assertEqual(result["generation_id"], preview["generation_id"])
+        self.assertEqual(result["document_digest"], preview["document_digest"])
+        self.assertEqual(result["refusal_text"], f"{cause['reason']}: {cause['message']}")
+        self.assertFalse(result["diff_available"])
+        self.assertFalse(result["nothing_pending"])
+        for field in ("changes", "routing_changes", "total", "refusals"):
+            self.assertIn(field, result)
+
+    def test_document_refusal_summary_requires_no_commit_proof(self):
+        from netbox_nso_plugin.refusal_display import document_projection
+
+        self.prepare()
+        generation = self.terminal()
+        projection = document_projection(generation["carrier_job_result"])
+        self.assertIn("nothing committed", projection["summary"])
+        for phase, acknowledged in (
+            ("pre_commit_dry_run", True),
+            ("post_commit_verification", False),
+            ("commit", None),
+        ):
+            result = copy.deepcopy(generation["carrier_job_result"])
+            result["commit_acknowledged"] = acknowledged
+            result["refusals"][0]["sender_phase"] = phase
+            self.assertNotIn("nothing committed", document_projection(result)["summary"])
+
+    def test_refusal_secret_canary_is_absent_from_ui_logs_and_errors(self):
+        iface, row, generation = self.interface_execution()
+        canary = "placeholder-forged-secret-canary"
+        forged = copy.deepcopy(row.last_apply_error)
+        forged["refusals"][0]["message"] = canary
+        from ._outbox_case import mirror_update
+
+        mirror_update(row, last_apply_error=forged)
+        import logging
+
+        with self.assertLogs("netbox_nso_plugin", level="DEBUG") as captured:
+            logging.getLogger("netbox_nso_plugin").debug("Inspect refusal projection")
+            responses = [
+                self.client.get(iface.get_absolute_url()),
+                self.category("interface"),
+                self.category("interface", format="json"),
+                self.category("interfaces"),
+            ]
+        self.assertNotIn(canary, "\n".join(captured.output))
+        for response in responses:
+            self.assertNotIn(canary, response.content.decode())
+        self.assertContains(responses[0], "invalid refusal evidence")
+
+    def test_forged_catalog_message_is_rejected(self):
+        iface, row, generation = self.interface_execution()
+        canary = "placeholder-forged-secret-canary"
+        from netbox_nso_plugin import adapter_client
+
+        from ._outbox_case import mirror_update
+
+        mirror_update(row, last_apply_error={})
+        forged = copy.deepcopy(generation["row_outcomes"][0]["refusals"][0])
+        forged["message"] = canary
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/interfaces"):
+                return make_response(
+                    200,
+                    [
+                        {
+                            "name": iface.name,
+                            "attrs": {
+                                "description": {
+                                    "nso_value": "placeholder",
+                                    "status": "apply_failed",
+                                    "last_apply_error": {"refusals": [forged]},
+                                }
+                            },
+                        }
+                    ],
+                )
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        with self.assertRaises(adapter_client.AdapterError) as raised:
+            adapter_client.get_interfaces(1558)
+        self.assertNotIn(canary, str(raised.exception))
+        self.assertEqual(raised.exception.code, "invalid_response")
+
+    def rest_client(self):
+        from rest_framework.test import APIClient
+        from users.constants import TOKEN_PREFIX
+        from users.models import Token, User
+
+        token = Token.objects.create(user=User.objects.get(username="placeholder-bgp-operator"))
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}")
+        return api
+
+    def test_interface_rest_rejects_forged_stored_refusal(self):
+        from ._outbox_case import mirror_update
+
+        iface, row, generation = self.interface_execution()
+        api = self.rest_client()
+        detail = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,))
+        listing = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list")
+        cause = generation["row_outcomes"][0]["refusals"][0]
+        valid = api.get(detail)
+        self.assertEqual(valid.status_code, 200, valid.content)
+        self.assertEqual(valid.json()["last_apply_error"]["refusals"][0]["message"], cause["message"])
+        stored = copy.deepcopy(row.last_apply_error)
+        for field in ("message", "message_id", "reason", "field"):
+            with self.subTest(field=field):
+                forged = copy.deepcopy(stored)
+                forged["refusals"][0][field] = "placeholder-forged-secret-canary"
+                forged["message"] = "placeholder-forged-secret-canary"
+                mirror_update(row, last_apply_error=forged)
+                for url in (detail, listing):
+                    response = api.get(url)
+                    self.assertEqual(response.status_code, 200, response.content)
+                    self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
+                    self.assertContains(response, "invalid refusal evidence")
+
+    def test_management_rest_rejects_forged_cached_refusal(self):
+        from ._outbox_case import mirror_update
+
+        iface, row, generation = self.interface_execution()
+        forged = copy.deepcopy(row.last_apply_error)
+        forged["refusals"][0]["message"] = "placeholder-forged-secret-canary"
+        mirror_update(
+            self.management,
+            state_snapshot={
+                "interfaces": [
+                    {
+                        "name": iface.name,
+                        "attrs": {"description": {"status": "apply_failed", "last_apply_error": forged}},
+                    }
+                ]
+            },
+        )
+        response = self.rest_client().get(
+            reverse("plugins-api:netbox_nso_plugin-api:nsodevicemanagement-detail", args=(self.management.pk,))
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
+        self.assertContains(response, "invalid refusal evidence")
+
+    def test_router_rest_projects_catalog_from_ledger(self):
+        from ._outbox_case import mirror_update
+
+        cause = self.refused_bgp(refused=0)
+        router = self.owners[0]
+        mirror_update(router, last_apply_error="placeholder-forged-secret-canary")
+        api = self.rest_client()
+        for name, args in (("nsobgprouterstate-detail", (router.pk,)), ("nsobgprouterstate-list", ())):
+            response = api.get(reverse(f"plugins-api:netbox_nso_plugin-api:{name}", args=args))
+            self.assertEqual(response.status_code, 200, response.content)
+            self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
+            self.assertContains(response, f"{cause['reason']}: {cause['message']}")
+
+    def test_interface_object_views_qualify_restored_in_sync(self):
+        iface, row, generation = self.interface_execution(unavailable=True, prior_status="in_sync")
+        self.assertEqual(row.status, "in_sync")
+        for url in (row.get_absolute_url(), iface.get_absolute_url()):
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertContains(response, "previous in_sync")
+                self.assertContains(response, "Execution unavailable; showing previous state.")
+                self.assertContains(response, f"placeholder prior nsointerfacestate {row.pk}")
+
+    def test_route_policy_object_view_qualifies_restored_in_sync(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_routing = True
+            self.management.manage_route_policy = True
+            self.management.save(update_fields=("manage_routing", "manage_route_policy"))
+            reconcile_route_policy(
+                self.device,
+                {
+                    "prefix_lists": [
+                        {
+                            "name": "placeholder-policy",
+                            "entries": [{"seq": 5, "action": "permit", "prefix": "198.18.0.0/15"}],
+                        }
+                    ],
+                    "community_lists": [],
+                    "as_paths": [],
+                    "route_maps": [],
+                },
+            )
+            row = NSORoutePolicyState.objects.get(management=self.management)
+        self.apply_owners([row], prior_status="in_sync")
+        generation = self.evidence(dispositions={"route-policy.prefix-list": "unavailable"})
+        self.settle(generation)
+        row.refresh_from_db()
+        self.assertEqual(row.status, "in_sync")
+        response = self.client.get(row.assigned_object.get_absolute_url())
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertContains(response, "previous in_sync")
+        self.assertContains(response, "Execution unavailable; showing previous state.")
+        self.assertContains(response, f"placeholder prior nsoroutepolicystate {row.pk}")
+
+    def test_matching_interface_value_does_not_hide_correlated_refusal(self):
+        iface, row, generation = self.interface_execution(matching=True)
+        payload = self.category("interface", format="json").json()
+        cell = payload["rows"][0]["description"]
+        self.assertEqual(cell["kind"], "apply_failed")
+        self.assertTrue(cell["refusal_text"])
+        self.assertContains(self.category("interfaces"), generation["refusals"][0]["reason"])
+
+    def test_matching_interface_value_preserves_restored_ordinary_failure(self):
+        iface, row, generation = self.interface_execution(
+            matching=True, prior_status="apply_failed", disposition="not_applied"
+        )
+        prior_error = f"placeholder prior nsointerfacestate {row.pk}"
+        self.assertEqual(row.status, "apply_failed")
+        payload = self.category("interface", state="pending", format="json").json()
+        self.assertEqual(payload["counts"]["pending"], 1)
+        self.assertEqual(len(payload["rows"]), 1)
+        cell = payload["rows"][0]["description"]
+        self.assertEqual(cell["kind"], "apply_failed")
+        self.assertIsNone(cell["refusal"])
+        self.assertEqual(cell["error"], prior_error)
+        response = self.category("interfaces", state="pending")
+        self.assertContains(response, iface.name)
+        self.assertContains(response, prior_error)
+        change = self.preview().json()["changes"][0]
+        self.assertEqual(change["error"], prior_error)
+        self.assertContains(self.client.get(row.get_absolute_url()), prior_error)
+
+    def test_correlated_refusal_remains_in_pending_filter_and_preview(self):
+        iface, row, generation = self.interface_execution(matching=True)
+        self.assertContains(self.category("interfaces", state="pending"), iface.name)
+        payload = self.category("interface", state="pending", format="json").json()
+        self.assertEqual(payload["counts"]["pending"], 1)
+        self.assertEqual(len(payload["rows"]), 1)
+        self.assertEqual(
+            self.preview().json()["changes"][0]["refusal_text"],
+            f"{generation['refusals'][0]['reason']}: {generation['refusals'][0]['message']}",
+        )
+
+    def test_matching_interface_value_keeps_unavailable_advisory_visible(self):
+        iface, row, generation = self.interface_execution(unavailable=True, matching=True)
+        payload = self.category("interface", state="pending", format="json").json()
+        self.assertEqual(payload["counts"]["pending"], 1)
+        cell = payload["rows"][0]["description"]
+        self.assertEqual(cell["status"], "accepted")
+        self.assertTrue(cell["label"].startswith("previous "))
+        self.assertIn("unavailable", cell["advisory"])
+        self.assertIsNone(cell["refusal"])
+        self.assertContains(self.category("interfaces", state="pending"), "unavailable")
+        self.assertIn("unavailable", self.preview().json()["changes"][0]["advisory"])
+
+    def test_structured_job_summary_ignores_free_form_error(self):
+        self.prepare()
+        generation = self.terminal()
+        canary = "placeholder-forged-secret-canary"
+        job = {
+            "id": 501,
+            "type": "apply",
+            "status": "failed",
+            "result": generation["carrier_job_result"],
+            "row_outcomes": generation["row_outcomes"],
+            "refusals": generation["refusals"],
+            "error": {"message": canary, "detail": {"items": [{"type": "bgp", "error": canary}]}},
+        }
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/jobs/501"):
+                return make_response(200, job)
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:nsojob_status", args=(501,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(canary, response.content.decode())
+        self.assertIn("nothing committed", response.json()["refusal_summary"])
+
+    def test_all_category_grids_project_safe_refusal(self):
+        from netbox_routing.models import ISISInstance, OSPFInstance
+
+        from netbox_nso_plugin import models
+        from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
+
+        from ._settlement_case import _route
+
+        with without_commit_drain(), transaction.atomic():
+            flags = (
+                "manage_routing",
+                "manage_interfaces",
+                "manage_bgp",
+                "manage_isis",
+                "manage_ospf",
+                "manage_static",
+                "manage_route_policy",
+                "manage_redistribution",
+            )
+            for flag in flags:
+                setattr(self.management, flag, True)
+            self.management.save(update_fields=flags)
+            scope = self.scope()
+            router = self.router_owner()
+            peer = self.peer(scope, "198.18.0.2")
+            redistribution = self.redistribution(scope)
+            bundle_iface = Interface.objects.create(device=self.device, name="Port-channel71", type="lag")
+            bundle = acquire_overlay(
+                models.NSOLACPBundleState,
+                management=self.management,
+                interface=bundle_iface,
+                lag_id=71,
+                status="accepted",
+            )
+            iface = Interface.objects.create(device=self.device, name="Ethernet71", type="1000base-t")
+            bfd = acquire_overlay(
+                models.NSOBFDInterfaceState,
+                management=self.management,
+                interface=iface,
+                min_tx=300,
+                min_rx=300,
+                multiplier=3,
+                status="accepted",
+            )
+            isis_native = ISISInstance.objects.create(
+                device=self.device, process_tag="placeholder-process", net="49.0001.0000.0000.0001.00"
+            )
+            isis = acquire_overlay(
+                models.NSOISISInstanceState,
+                management=self.management,
+                isis_instance=isis_native,
+                process_tag=isis_native.process_tag,
+                net=isis_native.net,
+                status="accepted",
+            )
+            ospf_native = OSPFInstance.objects.create(
+                device=self.device, name="placeholder-ospf", process_id="71", router_id="198.18.0.1"
+            )
+            ospf = acquire_overlay(
+                models.NSOOSPFInstanceState,
+                management=self.management,
+                ospf_instance=ospf_native,
+                process_id="71",
+                router_id="198.18.0.1",
+                status="accepted",
+            )
+            route = _route("198.18.71.0/24", "198.18.0.1", devices=[self.device])
+            static = acquire_overlay(
+                models.NSOStaticRouteState,
+                management=self.management,
+                static_route=route,
+                nso_prefix=str(route.prefix),
+                nso_next_hop=str(route.next_hop),
+                status="accepted",
+            )
+            reconcile_route_policy(
+                self.device,
+                {
+                    "prefix_lists": [
+                        {
+                            "name": "placeholder-policy",
+                            "entries": [{"seq": 5, "action": "permit", "prefix": "198.18.0.0/15"}],
+                        }
+                    ],
+                    "community_lists": [],
+                    "as_paths": [],
+                    "route_maps": [],
+                },
+            )
+            policy = models.NSORoutePolicyState.objects.get(management=self.management)
+            from ._ownership_case import save_overlay_fixture
+
+            policy.status = "accepted"
+            save_overlay_fixture(policy, update_fields=("status",))
+        owners = [router, peer, redistribution, bundle, bfd, isis, ospf, static, policy]
+        self.apply_owners(owners)
+        subjects = {
+            item["logical_ref"]["subject"]
+            for snapshot in self.attempt.overlay_snapshots.all()
+            for item in snapshot.contributors["rows"]
+        }
+        generation = self.evidence(dispositions=dict.fromkeys(subjects, "refused"))
+        self.settle(generation)
+        expected = {
+            "bgp": ("peers", peer),
+            "redistribution": (None, redistribution),
+            "lacp": (None, bundle),
+            "bfd": (None, bfd),
+            "isis": ("instances", isis),
+            "ospf": ("instances", ospf),
+            "static": (None, static),
+            "route_policy": (None, policy),
+        }
+        from netbox_nso_plugin.views import NSOCategoryView
+
+        self.assertEqual(set(expected), set(NSOCategoryView._GRID_CATEGORIES))
+        for category, (section, owner) in expected.items():
+            with self.subTest(category=category):
+                payload = self.category(category, format="json").json()
+                rows = payload[section]["rows"] if section else payload["rows"]
+                projected = next(row for row in rows if row["pk"] == owner.pk)
+                self.assertEqual(projected["state"], "apply_failed")
+                self.assertTrue(projected["refusal"]["valid"])
+                self.assertTrue(projected["refusal_text"].startswith("inexpressible-on-ned: "))
+                self.assertContains(self.category(category), "inexpressible-on-ned")
+        counts = self.client.get(
+            reverse("plugins:netbox_nso_plugin:device_nso_category_counts", args=(self.device.pk,))
+        ).json()["categories"]
+        for category in expected:
+            with self.subTest(counts=category):
+                self.assertGreater(counts[category]["pending"], 0)
+
+    def test_router_refusal_preserves_peer_history(self):
+        cause = self.refused_bgp(refused=0)
+        payload = self.category("bgp", format="json").json()
+        router = payload["routers"]["rows"][0]
+        self.assertEqual(router["state"], "apply_failed")
+        self.assertEqual(router["refusal"]["causes"][0]["row"]["subject"], "bgp.router")
+        self.assertEqual(router["refusal_text"], f"{cause['reason']}: {cause['message']}")
+        for peer in payload["peers"]["rows"]:
+            owner = next(row for row in self.owners[1:] if row.pk == peer["pk"])
+            prior = self.prior[(owner._meta.label_lower, owner.pk)]
+            self.assertEqual(peer["status"], prior[0])
+            self.assertEqual(peer["error"], prior[2])
+            self.assertIsNone(peer["refusal"])
+
+    def test_new_acceptance_replaces_correlated_interface_refusal(self):
+        from datetime import timedelta
+
+        from ._outbox_case import content_update
+
+        iface, row, generation = self.interface_execution(matching=True)
+        with without_commit_drain():
+            content_update(row, status="accepted", accepted_at=self.stamp + timedelta(seconds=1))
+        payload = self.category("interface", format="json").json()
+        self.assertEqual(payload["rows"][0]["description"]["kind"], "in_sync")
+        self.assertEqual(payload["counts"]["pending"], 0)
+
+    def restored_structured_error(self, disposition):
+        from uuid import UUID
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
+
+        iface, row, previous = self.interface_execution(matching=True)
+        prior = copy.deepcopy(row.last_apply_error)
+
+        def admission(selected):
+            result = families._promoted(selected)
+            result["job_id"] = 502
+            result["generations"] = [{**result["generations"][0], "generation_id": 82, "job_id": 502, "seq": 5}]
+            return 202, result
+
+        self.adapter.apply_response = admission
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
+        generation = self.evidence(dispositions={"interface.description": disposition})
+        generation["generation_id"] = 82
+        generation["carrier_job_id"] = 502
+        generation["seq"] = 5
+        for outcome in generation["row_outcomes"]:
+            outcome["generation_id"] = 82
+            outcome["carrier"]["generation_id"] = 82
+        for carrier in generation["carrier_job_result"]["settlement_owners"]:
+            carrier["generation_id"] = 82
+        for section in generation["sections"]:
+            for counter in SECTION_COUNTER_KEYS[section]:
+                generation["carrier_job_result"].setdefault(
+                    counter, dict.fromkeys(("in_sync", "apply_failed", "not_applied", "unavailable"), 0)
+                )
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+
+        execution = settle_terminal_generation(
+            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=2
+        )
+        self.assertEqual(execution.consumption_state, "consumed")
+        row.refresh_from_db()
+        self.assertEqual(row.last_apply_error, prior)
+        cell = self.category("interface", format="json").json()["rows"][0]["description"]
+        self.assertIn(previous["refusals"][0]["reason"], cell["error"] or "")
+        return cell
+
+    def test_unavailable_execution_retains_prior_structured_error(self):
+        cell = self.restored_structured_error("unavailable")
+        self.assertIn("unavailable", cell["advisory"])
+        self.assertIsNone(cell["refusal"])
+
+    def test_not_applied_interface_preserves_prior_correlated_refusal(self):
+        cell = self.restored_structured_error("not_applied")
+        self.assertEqual(cell["kind"], "apply_failed")
+        self.assertTrue(cell["refusal"]["valid"])
+
+    def test_restored_text_error_is_projected_from_prior_execution(self):
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+
+        from ._outbox_case import mirror_update
+
+        self.prepare()
+        generation = self.terminal()
+        self.settle(generation)
+        retry = self.terminal(refused=2)
+        retry["carrier_job_id"] = 502
+        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        row = self.owners[1]
+        row.refresh_from_db()
+        mirror_update(row, last_apply_error="placeholder-forged-secret-canary")
+        response = self.category("bgp", format="json")
+        projected = next(item for item in response.json()["peers"]["rows"] if item["pk"] == row.pk)
+        cause = generation["refusals"][0]
+        self.assertEqual(projected["error"], f"{cause['reason']}: {cause['message']}")
+        self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
+
+    def test_unavailable_category_keeps_pending_filter_and_prior_error(self):
+        from uuid import UUID
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        from ._outbox_case import own_vlan
+
+        with without_commit_drain():
+            self.management.manage_interfaces = True
+            self.management.save(update_fields=("manage_interfaces",))
+            row = own_vlan(self.management, 71, "placeholder-vlan")
+        self.bookkeeping(row, status="in_sync")
+        self.adapter.apply_response = lambda selected: (
+            202,
+            {**families._promoted(selected), "generations": families._promoted(selected)["generations"][:1]},
+        )
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
+        generation = self.evidence(dispositions={"vlan.vlan": "unavailable"})
+        self.settle(generation)
+        response = self.category("vlan", state="pending")
+        self.assertContains(response, "Execution unavailable")
+        self.assertContains(response, "previous in_sync")
+        self.assertContains(response, f"placeholder prior {row._meta.model_name} {row.pk}")
+
+    def test_mixed_contributors_keep_device_summary_unavailable(self):
+        from netbox_routing.models import ISISInstance, ISISLevel
+
+        from netbox_nso_plugin.models import NSOISISInstanceState
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_routing = True
+            self.management.manage_isis = True
+            self.management.save(update_fields=("manage_routing", "manage_isis"))
+            native = ISISInstance.objects.create(
+                device=self.device, process_tag="placeholder-process", net="49.0001.0000.0000.0001.00"
+            )
+            ISISLevel.objects.create(instance=native, level=1, disabled=True)
+            row = acquire_overlay(
+                NSOISISInstanceState,
+                management=self.management,
+                isis_instance=native,
+                process_tag=native.process_tag,
+                net=native.net,
+                status="accepted",
+            )
+        self.apply_owners([row])
+        generation = self.evidence(
+            dispositions={"isis.process-config": "in_sync", "isis.process-config.level": "not_applied"}
+        )
+        self.settle(generation)
+        response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+        self.assertContains(response, "Execution unavailable; showing previous state.")
+
+    def test_document_summary_qualifies_unapplied_contributions(self):
+        from netbox_nso_plugin.refusal_display import document_projection
+
+        self.prepare()
+        result = self.terminal(refused=None, disposition="not_applied")["carrier_job_result"]
+        projection = document_projection(result)
+        self.assertIn("unapplied", projection["summary"])
+        self.assertIsNone(projection["refusal"])
+        self.assertNotIn("nothing committed", projection["summary"])

@@ -121,6 +121,9 @@
     function fmtState(cell) {
       var d = cell.getRow().getData();
       var out = badge(d.state, d.label);
+      [d.description, d.enabled, d.mtu, d.switchport].concat(d.ips || []).forEach(function (cell) {
+        if (cell) out += G.evidenceText(cell);
+      });
       if (interfaceUnifiedDiff(d)) {
         out +=
           ' <button type="button" class="btn btn-xs btn-outline-warning nso-if-diff" data-iface-id="' +

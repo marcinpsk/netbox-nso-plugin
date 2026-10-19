@@ -29,19 +29,19 @@
   var activeKind = 'all';
   // Mirror summary.display_state(status, owned) -> kind.
   function kindOf(tr) {
+    if (tr.querySelector('.nso-execution-unavailable')) return 'unavailable';
     var s = tr.getAttribute('data-status') || '';
-    var owned = tr.getAttribute('data-owned') === 'true';
     if (s === 'deploying') return 'deploying';
     if (s === 'imported' || s === 'in_sync') return 'in_sync';
     if (s === 'apply_failed') return 'apply_failed';
-    return owned ? 'pending' : 'drift';  // changed / drifted / conflict / accepted
+    return s === 'accepted' || s === 'drifted' ? 'pending' : 'drift';
   }
   var counts = { all: rows.length, drift: 0, pending: 0, in_sync: 0 };
   rows.forEach(function (tr) {
     var k = kindOf(tr);
     tr.setAttribute('data-kind', k);
     if (k === 'drift') counts.drift++;
-    else if (k === 'pending' || k === 'apply_failed') counts.pending++;
+    else if (k === 'pending' || k === 'apply_failed' || k === 'unavailable') counts.pending++;
     else counts.in_sync++;  // in_sync + deploying
   });
   pills.forEach(function (p) {
@@ -50,7 +50,7 @@
   });
   function inBucket(k) {
     if (activeKind === 'all') return true;
-    if (activeKind === 'pending') return k === 'pending' || k === 'apply_failed';
+    if (activeKind === 'pending') return k === 'pending' || k === 'apply_failed' || k === 'unavailable';
     if (activeKind === 'in_sync') return k === 'in_sync' || k === 'deploying';
     return k === activeKind;
   }

@@ -27,6 +27,12 @@ class _OwnedOverlayModel(NetBoxModel):
         abstract = True
         base_manager_name = "objects"
 
+    @property
+    def refusal_display(self):
+        from .refusal_display import row_projection
+
+        return row_projection(self)
+
     def save(self, *args, **kwargs):
         """Hold the ownership check, write, and release cleanup in one transaction."""
         with transaction.atomic(using=kwargs.get("using") or self._state.db or "default"):

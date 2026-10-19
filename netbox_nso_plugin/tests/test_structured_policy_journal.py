@@ -256,7 +256,7 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         entries = JournalEntry.objects.filter(assigned_object_type=row.content_type, assigned_object_id=row.object_id)
         assert entries.count() == 1
         assert entries.get().kind == "danger"
-        assert cause.message in entries.get().comments
+        assert f"{cause.reason}: {cause.message}" in entries.get().comments
         assert JournalEntry.objects.count() == 2
 
     def test_policy_journal_rolls_back_partial_writes_before_retry(self):

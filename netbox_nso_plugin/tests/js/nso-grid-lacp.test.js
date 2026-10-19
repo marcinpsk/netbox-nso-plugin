@@ -182,3 +182,30 @@ describe("LACP grid", () => {
     expect(edit.dataset).not.toHaveProperty("peVInterface");
   });
 });
+
+it("shows each member's projected refusal beside that member", () => {
+  const text = "inexpressible-on-ned: <placeholder> & catalog text";
+  const row = { bundle: { name: "Port-channel71", url: "/dcim/interfaces/20/" },
+    members: [{ interface: { name: "Ethernet1", url: "/dcim/interfaces/21/" }, refusal_text: text }],
+    observed_members: [] };
+  const table = mount(row);
+  const result = table.config.columns.find((column) => column.field === "_members").formatter(cell(row));
+  expect(result.textContent).toContain(text);
+  expect(result.querySelector("placeholder")).toBeNull();
+});
+
+it("shows a member's restored error and current advisory in separate elements", () => {
+  const error = "inexpressible-on-ned: <placeholder> & prior catalog error";
+  const advisory = "Execution unavailable; showing previous state.";
+  const row = { bundle: { name: "Port-channel71", url: "/dcim/interfaces/20/" },
+    members: [{ interface: { name: "Ethernet1", url: "/dcim/interfaces/21/" }, error, advisory }],
+    observed_members: [] };
+  const table = mount(row);
+  const result = table.config.columns.find((column) => column.field === "_members").formatter(cell(row));
+  expect(result.textContent).toContain(error);
+  expect(result.textContent).toContain(advisory);
+  expect([...result.querySelectorAll("small")].map((item) => item.textContent)).toEqual([error, advisory]);
+  expect(result.querySelector("small.text-danger").textContent).toBe(error);
+  expect(result.querySelector("small.text-warning").textContent).toBe(advisory);
+  expect(result.querySelector("placeholder")).toBeNull();
+});

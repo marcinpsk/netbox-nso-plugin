@@ -108,6 +108,7 @@
       link.title = member.interface.name;
       link.textContent = member.interface.name;
       line.appendChild(link);
+      G.appendEvidence(line, member);
       if (member.mode) line.appendChild(badge(member.mode, "text-bg-light border"));
       if (member.port_priority != null) {
         line.appendChild(badge("pri " + member.port_priority, "text-bg-light border"));

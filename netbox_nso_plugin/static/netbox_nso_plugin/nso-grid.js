@@ -48,15 +48,16 @@
     drift: ["text-bg-warning text-dark", "drift"],
     pending: ["text-bg-info", "pending apply"],
     apply_failed: ["text-bg-danger", "apply failed"],
+    unavailable: ["text-bg-warning text-dark", "previous state"],
     deploying: ["text-bg-primary", "deploying"],
     in_sync: ["text-bg-success", "in sync"],
     unknown: ["text-bg-info", "unknown"],
   };
   // Severity order for the State column's sorter — worst first, so the rows an
   // operator must act on sort to the top.
-  var SEVERITY = ["apply_failed", "drift", "pending", "deploying", "unknown", "in_sync"];
+  var SEVERITY = ["apply_failed", "unavailable", "drift", "pending", "deploying", "unknown", "in_sync"];
   // Statuses that mean "NetBox does not own this yet" — mirrors _accept_cell.html.
-  var PENDING_KINDS = ["pending", "apply_failed"];
+  var PENDING_KINDS = ["pending", "apply_failed", "unavailable"];
   var MUTED = '<span class="text-muted">—</span>';
 
   /* Escape for BOTH text and quoted-attribute contexts.
@@ -80,15 +81,33 @@
     return '<span class="badge ' + b[0] + '">' + esc(label || b[1]) + "</span>";
   }
 
-  /* Value cells stay quiet when in sync (compact) — only trouble gets a badge. */
+  function appendEvidence(parent, data) {
+    [
+      [data.refusal_text || data.error, "text-danger ms-1"],
+      [data.advisory, "text-warning ms-1"],
+    ].forEach(function (item) {
+      if (!item[0]) return;
+      var node = document.createElement("small");
+      node.className = item[1];
+      node.textContent = item[0];
+      parent.appendChild(node);
+    });
+  }
+
+  function evidenceText(data) {
+    var parent = document.createElement("span");
+    appendEvidence(parent, data);
+    return parent.innerHTML;
+  }
+
   function cellBadge(cell) {
     if (!cell) return "";
     if (cell.kind === "in_sync") {
       return cell.status === "in_sync"
-        ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>'
-        : "";
+        ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>' + evidenceText(cell)
+        : evidenceText(cell);
     }
-    return " " + badge(cell.kind, cell.label);
+    return " " + badge(cell.kind, cell.label) + evidenceText(cell);
   }
 
   function acceptBtn(cell) {
@@ -172,7 +191,7 @@
       field: "state",
       formatter: function (cell) {
         var d = cell.getRow().getData();
-        var out = badge(d.state, d.label);
+        var out = badge(d.state, d.label) + evidenceText(d);
         if (d.residue) {
           // Same wording and explanation as _state_badge.html — an operator must not have
           // to learn two names for the same thing depending on which panel they are on.
@@ -441,6 +460,8 @@
     mount: mount,
     badge: badge,
     cellBadge: cellBadge,
+    appendEvidence: appendEvidence,
+    evidenceText: evidenceText,
     acceptBtn: acceptBtn,
     valueFormatter: valueFormatter,
     stateColumn: stateColumn,

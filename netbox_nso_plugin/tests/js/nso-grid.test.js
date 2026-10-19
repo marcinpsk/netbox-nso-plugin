@@ -272,3 +272,36 @@ describe("exports", () => {
     expect(parse(G.MUTED).querySelector(".text-muted").textContent).toBe("—");
   });
 });
+
+describe("catalog refusal projection", () => {
+  it("shows the projected cause as literal text in every state column", () => {
+    const text = "inexpressible-on-ned: <placeholder> & catalog text";
+    const output = G.stateColumn().formatter({ getRow: () => ({ getData: () => ({
+      state: "apply_failed", label: "apply failed", refusal_text: text,
+    }) }) });
+    const node = typeof output === "string" ? parse(output) : output;
+    expect(node.textContent).toContain(text);
+    expect(node.querySelector("placeholder")).toBeNull();
+  });
+
+  it("keeps unavailable evidence visible beside a prior in-sync cell", () => {
+    const text = "Execution unavailable; showing previous state.";
+    const node = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", advisory: text }));
+    expect(node.textContent).toContain(text);
+  });
+
+  it("shows the restored error and current advisory in separate elements", () => {
+    const error = "inexpressible-on-ned: <placeholder> & prior catalog error";
+    const advisory = "Execution unavailable; showing previous state.";
+    const row = { state: "unavailable", kind: "unavailable", status: "apply_failed", error, advisory };
+    for (const html of [G.stateColumn().formatter(fakeCell(row)), G.cellBadge(row)]) {
+      const node = parse(html);
+      expect(node.textContent).toContain(error);
+      expect(node.textContent).toContain(advisory);
+      expect([...node.querySelectorAll("small")].map((item) => item.textContent)).toEqual([error, advisory]);
+      expect(node.querySelector("small.text-danger").textContent).toBe(error);
+      expect(node.querySelector("small.text-warning").textContent).toBe(advisory);
+      expect(node.querySelector("placeholder")).toBeNull();
+    }
+  });
+});
