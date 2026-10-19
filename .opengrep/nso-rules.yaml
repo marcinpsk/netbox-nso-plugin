@@ -744,3 +744,17 @@ rules:
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**"]
+  - id: nso-test-borrows-another-class-method
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Do not call a method of another test class with this test's self. Put the shared helper in a mixin and
+      inherit it. This checks Test*.method(self, ...) calls with or without a module prefix, not a class held in a
+      variable.
+    patterns:
+      - pattern: $CLS.$METHOD(self, ...)
+      - metavariable-regex:
+          metavariable: $CLS
+          regex: ^(?:\w+\.)*Test(?!Case$)[A-Z]\w*$
+    paths:
+      include: ["netbox_nso_plugin/tests/**"]

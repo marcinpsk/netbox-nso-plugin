@@ -2979,3 +2979,17 @@ class CaughtExceptionTextForm:
         except VaultRefError as exc:
             # ok: nso-caught-exception-text-to-operator
             self.add_error("vault_ref", str(exc))
+
+
+class BorrowedSettlementHelperCase(BGPSettlementHelpers, BGPCaptureCase):
+    def test_borrowed_helpers(self):
+        # ruleid: nso-test-borrows-another-class-method
+        TestRefusalSettlementRuntime.prepare(self)
+        # ruleid: nso-test-borrows-another-class-method
+        generation = runtime_case.TestRefusalSettlementRuntime.terminal(self, refused=None)
+        # ok: nso-test-borrows-another-class-method
+        self.serve_terminal_evidence(generation)
+        # ok: nso-test-borrows-another-class-method
+        TestCase.setUp(self)
+        # ok: nso-test-borrows-another-class-method
+        _AdapterWireSession.reset(self.environment.adapter_port)
