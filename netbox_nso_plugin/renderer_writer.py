@@ -1156,10 +1156,19 @@ class RendererWriter:
         from .refusal_registry import OVERLAYS
 
         self._read_preserved = {}
+        overlay_pks = defaultdict(set)
+        for write in plan.write_set:
+            if write.pk is not None and write.model_label in OVERLAYS and write.operation == "save":
+                overlay_pks[write.model_label].add(write.pk)
+        currents = {
+            (label, row.pk): row
+            for label, pks in overlay_pks.items()
+            for row in apps.get_model(label).objects.filter(pk__in=pks).order_by()
+        }
         writes = []
         for write in plan.write_set:
             if write.pk is not None and write.model_label in OVERLAYS and write.operation == "save":
-                current = apps.get_model(write.model_label).objects.filter(pk=write.pk).first()
+                current = currents.get((write.model_label, write.pk))
                 if current is None:
                     raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
                 protected = protected_read_fields(current)

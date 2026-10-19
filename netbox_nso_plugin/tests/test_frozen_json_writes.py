@@ -39,6 +39,24 @@ class FrozenJSONWriteTests(IntentPushResetMixin, TestCase):
         state.refresh_from_db()
         self.assertIsNone(state.last_apply_error)
 
+    def test_writer_loads_every_planned_overlay_save_in_one_query(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.renderer_writer import RendererWriter
+
+        saves = []
+        for index in range(6):
+            interface = Interface.objects.create(device=self.device, name=f"Ethernet{index + 2}", type="1000base-t")
+            state = NSOInterfaceState.objects.create(interface=interface, attribute="description", status="imported")
+            candidate = copy.copy(state)
+            candidate.last_apply_error = {"code": "new"}
+            saves.append(planned_save(candidate, update_fields=("last_apply_error",)))
+        plan = RendererMutationPlan.build(saves=tuple(saves))
+        with CaptureQueriesContext(connection) as queries:
+            RendererWriter(plan, content=False, permit=None)
+        self.assertEqual(len(queries), 1, [query["sql"] for query in queries])
+
     def _nested_value(self):
         return {
             "metadata": {
