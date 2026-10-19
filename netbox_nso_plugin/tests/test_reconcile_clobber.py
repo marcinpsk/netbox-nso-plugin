@@ -235,12 +235,12 @@ class TestTheReconcileCannotOverwriteTheBackfilledStatus(_ClobberBarrierCase):
             "for a generation nothing is carrying"
         )
 
-    def test_a_stale_reconcile_cannot_overwrite_the_backfilled_status_pre_s5(self):
-        """The retired transition is serialized before backfill, so it cannot clobber later state."""
+    def test_a_retired_read_transition_cannot_certify_apply_before_backfill(self):
+        """The retired read transition computes success but cannot certify Apply."""
         self._run_barrier(settles_deploying=True)
 
         assert self.computed == ["in_sync"], self.computed
-        assert self.state.status == "in_sync"
+        assert self.state.status == "accepted"
 
 
 class TestTheMirrorAllowList(SimpleTestCase):

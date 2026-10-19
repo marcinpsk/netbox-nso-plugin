@@ -82,12 +82,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 5cdc33f51a4513fc6e1104ecb994d8d48b4ba2f4
+          ref: db6e3ce81cdb010bfed58abf30d052553e53ccdf
           path: .o3c-adapter
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           cache-dependency-glob: |
             netbox/requirements*.txt
@@ -208,7 +208,7 @@ jobs:
         with:
           python-version: ${{ matrix.environment.python-version }}
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
       - name: Install gate dependencies
         run: uv pip install --system pytest pytest-cov pytest-xdist pytest-split==0.11.0 pyyaml
       - name: Test the shard gate
@@ -250,7 +250,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
         ports:
-          - 55432:5432
+          - 5432/tcp
 
     steps:
       - name: Check out the plugin
@@ -274,12 +274,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: marcinpsk/nso-adapter
-          ref: 615eaa54bd7fd42ad309f73463963ea23cfee61c
+          ref: db6e3ce81cdb010bfed58abf30d052553e53ccdf
           path: refusal-adapter
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -292,7 +292,7 @@ jobs:
 
       - name: Start the adapter with a real PostgreSQL store
         env:
-          ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
+          ADAPTER_DATABASE_URL: postgresql+asyncpg://adapter:adapter@127.0.0.1:${{ job.services['adapter-postgres'].ports['5432'] }}/adapter
           ADAPTER_TOKEN: contract-adapter-token
           NETBOX_TOKEN: contract-netbox-token
         # The instance entry is a name the store validates onboarding against, nothing more:
@@ -300,7 +300,7 @@ jobs:
         # request ever leaves for it. Without it the store-side contract checks cannot create
         # the throwaway devices they push intent to.
         run: |
-          cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<'EOF'
+          cat > "${RUNNER_TEMP}/adapter-contract.yaml" <<EOF
           secrets:
             provider: local
           nso_instances:
@@ -314,7 +314,7 @@ jobs:
           api:
             adapter_token_ref: CONTRACT_ADAPTER_TOKEN
           diagnostic_key_ref: CONTRACT_DIAGNOSTIC_KEY
-          database_url: postgresql+asyncpg://adapter:adapter@127.0.0.1:55432/adapter
+          database_url: ${ADAPTER_DATABASE_URL}
           log_level: WARNING
           log_format: json
           scheduler:

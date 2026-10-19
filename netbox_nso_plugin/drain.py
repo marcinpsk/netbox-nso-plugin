@@ -1170,7 +1170,6 @@ def settle(claim: Claim, response) -> str:
     """Record the outcome of an acknowledged send, under a compare-and-set on the sequence."""
     _refuse_in_transaction("outcome")
     from .durable_capture import CaptureEpochChanged, acknowledge_claim_capture
-    from .models import NSOIntentOutboxEntry
 
     with transaction.atomic():
         state = _lock_state(claim.device_id, claim.scope)
@@ -1205,52 +1204,63 @@ def settle(claim: Claim, response) -> str:
                 claim.device_id,
                 claim.scope,
             )
-        if claim.mark is False and claim.mark_any and claim.marking_mode == delivery.MARKING_QUERY_FLAG:
-            # The fold downgraded a marked contributor, which is the query-flag AND. A
-            # per-object scope delivers the deletion itself, so its AND has no wire effect.
-            # It is recorded because the success path pops the transient error entry.
-            state.degraded_deletions = [
-                *state.degraded_deletions,
-                {
-                    "route_ids": sorted(ack.acknowledged),
-                    # Each deletion holds a LINEAGE, and every reader of the record wants the
-                    # triples themselves: a list of lists renders as no route at all.
-                    "triples": _lineages(claim.deletions, ack.acknowledged),
-                    "at": now.isoformat(),
-                    "reason": LEGACY_MARK_DOWNGRADED,
-                    "device": claim.device_id,
-                },
-            ]
-        state.degraded_deletions = [*state.degraded_deletions, *_degradations(state, claim, response, now)]
-        if len(state.degraded_deletions) >= DEGRADED_ALERT_COUNT:
-            logger.warning(
-                "%s/%s holds %s unacknowledged degraded deletions; run nso_acknowledge_degraded_deletions",
-                claim.device_id,
-                claim.scope,
-                len(state.degraded_deletions),
-            )
-        if claim.mode == delivery.MODE_BACKFILL_ONLY and state.fence_withheld_since is not None:
-            # The one thing that lifts the withholding: the fence is open, so the deletion
-            # the key is holding can be re-claimed at a NEW sequence and executed.
-            logger.info("the fence opened for %s/%s; ordinary sends resume", claim.device_id, claim.scope)
-            state.fence_withheld_since = None
-        retired = NSOIntentOutboxEntry.objects.filter(
-            device_id=claim.device_id, scope=claim.scope, consumed_by_push_seq=claim.push_seq
-        )
-        _retire(retired, list(retired.values_list("pk", flat=True)))
-        state.revoked_ids = [int(route_id) for route_id in state.revoked_ids if int(route_id) not in ack.acknowledged]
-        state.lineage_carry = {
-            route_id: triple
-            for route_id, triple in (state.lineage_carry or {}).items()
-            if int(route_id) not in ack.acknowledged
-        }
-        _clear_claim(state)
-        state.attempts = 0
-        state.last_success_identity = claim.identity
-        state.last_success_at = now
-        state.save()
-        _stamp_last_acked(claim)
+        _commit_acknowledged_claim(state, claim, response, ack, now)
     return SUCCEEDED
+
+
+def _commit_acknowledged_claim(state, claim, response, ack, now):
+    """Commit successful claim bookkeeping under the caller's existing state lock."""
+    from .models import NSOIntentOutboxEntry
+
+    if not connection.in_atomic_block:
+        raise RuntimeError("acknowledged claim bookkeeping requires a transaction")
+    if state.push_seq != claim.push_seq or state.device_id != claim.device_id or state.scope != claim.scope:
+        raise ProtocolViolation("acknowledged claim differs from the locked outbox state")
+    if claim.mark is False and claim.mark_any and claim.marking_mode == delivery.MARKING_QUERY_FLAG:
+        # The fold downgraded a marked contributor, which is the query-flag AND. A
+        # per-object scope delivers the deletion itself, so its AND has no wire effect.
+        # It is recorded because the success path pops the transient error entry.
+        state.degraded_deletions = [
+            *state.degraded_deletions,
+            {
+                "route_ids": sorted(ack.acknowledged),
+                # Each deletion holds a LINEAGE, and every reader of the record wants the
+                # triples themselves: a list of lists renders as no route at all.
+                "triples": _lineages(claim.deletions, ack.acknowledged),
+                "at": now.isoformat(),
+                "reason": LEGACY_MARK_DOWNGRADED,
+                "device": claim.device_id,
+            },
+        ]
+    state.degraded_deletions = [*state.degraded_deletions, *_degradations(state, claim, response, now)]
+    if len(state.degraded_deletions) >= DEGRADED_ALERT_COUNT:
+        logger.warning(
+            "%s/%s holds %s unacknowledged degraded deletions; run nso_acknowledge_degraded_deletions",
+            claim.device_id,
+            claim.scope,
+            len(state.degraded_deletions),
+        )
+    if claim.mode == delivery.MODE_BACKFILL_ONLY and state.fence_withheld_since is not None:
+        # The one thing that lifts the withholding: the fence is open, so the deletion
+        # the key is holding can be re-claimed at a NEW sequence and executed.
+        logger.info("the fence opened for %s/%s; ordinary sends resume", claim.device_id, claim.scope)
+        state.fence_withheld_since = None
+    retired = NSOIntentOutboxEntry.objects.filter(
+        device_id=claim.device_id, scope=claim.scope, consumed_by_push_seq=claim.push_seq
+    )
+    _retire(retired, list(retired.values_list("pk", flat=True)))
+    state.revoked_ids = [int(route_id) for route_id in state.revoked_ids if int(route_id) not in ack.acknowledged]
+    state.lineage_carry = {
+        route_id: triple
+        for route_id, triple in (state.lineage_carry or {}).items()
+        if int(route_id) not in ack.acknowledged
+    }
+    _clear_claim(state)
+    state.attempts = 0
+    state.last_success_identity = claim.identity
+    state.last_success_at = now
+    state.save()
+    _stamp_last_acked(claim)
 
 
 def _stamp_last_acked(claim: Claim) -> None:

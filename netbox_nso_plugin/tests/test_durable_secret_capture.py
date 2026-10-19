@@ -184,6 +184,15 @@ class TestDurableSecretCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         self.assertEqual(row.last_apply_error, snapshot.prior_last_apply_error)
 
     def test_snapshot_redacts_nested_json_error_values(self):
+        from netbox_nso_plugin.apply_state import (
+            _enter_level,
+            lock_device_intent_transaction,
+            lock_intent_revisions,
+            lock_order_scope,
+        )
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.selection_manifest import lock_manifest_rows
+
         secret = 'placeholder"\\json-secret'
         escaped = json.dumps(secret, ensure_ascii=False)[1:-1]
         with without_commit_drain(), transaction.atomic():
@@ -202,12 +211,22 @@ class TestDurableSecretCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 "detail": [escaped, {"repeated": f"{secret} and {secret}", "count": 2, "retry": False}, None],
             },
         )
-        with transaction.atomic():
+        with transaction.atomic(), lock_order_scope():
+            lock_device_intent_transaction(self.device.pk)
+            _enter_level(5, self.management.pk)
+            management = NSODeviceManagement.objects.select_for_update(of=("self",)).get(pk=self.management.pk)
+            revisions = lock_intent_revisions(self.device.pk, ("interface",))
+            row = lock_manifest_rows(management, ("interface",))[row._meta.label_lower, row.pk]
             attempt = NSOApplyAttempt.objects.create(
-                management=self.management, adapter_device_id=self.management.adapter_device_id
+                management=management, adapter_device_id=management.adapter_device_id
             )
             snapshot = durable_capture._snapshot(
-                attempt, selection, selection.contributor_manifest[0], row, {}, secrets=("json-secret", secret, escaped)
+                attempt,
+                selection,
+                selection.contributor_manifest[0],
+                row,
+                revisions,
+                secrets=("json-secret", secret, escaped),
             )
         error = {
             "message": "Prior error contains [redacted]",

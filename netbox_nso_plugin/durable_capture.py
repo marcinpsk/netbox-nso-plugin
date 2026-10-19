@@ -2,11 +2,12 @@
 # Copyright (C) 2026 Marcin Zieba
 """Capture emitted ownership and restore exact local Apply bookkeeping."""
 
+import contextlib
 import copy
 import dataclasses
 import json
 
-from django.db import connection, transaction
+from django.db import connection
 from django.utils import timezone
 
 from . import delivery
@@ -15,8 +16,6 @@ from .models import (
     NSOApplyAttempt,
     NSOApplyOverlaySnapshot,
     NSODeviceManagement,
-    NSOFamilyReadState,
-    NSOOverlaySettlementFence,
 )
 from .refusal_registry import OVERLAYS, RegistryError
 
@@ -85,27 +84,18 @@ def _secret_values(value):
 
 
 def _watermark(management, spec):
-    return {
-        row.family: {
-            "attempt_id": row.applied_attempt_id,
-            "incarnation": row.applied_incarnation,
-            "source_epoch": row.applied_source_epoch,
-            "payload_revision": row.applied_payload_revision,
-            "publication_sequence": row.applied_publication_sequence,
-        }
-        for row in NSOFamilyReadState.objects.filter(management=management, family__in=spec.read_families)
-    }
+    from .lifecycle_fence import applied_watermark
+
+    return applied_watermark(management, spec)
 
 
-def _fence_revision(management, epoch, row):
-    return (
-        NSOOverlaySettlementFence.objects.filter(
-            management=management, mapping_epoch=epoch, model_label=row._meta.label_lower, overlay_pk=row.pk
-        )
-        .values_list("bookkeeping_revision", flat=True)
-        .first()
-        or 0
-    )
+def _fence_revisions(management, epoch, row):
+    from .lifecycle_fence import fence_for
+
+    fence = fence_for(row)
+    if fence is None or fence.management_id != management.pk or fence.mapping_epoch != epoch:
+        raise RegistryError("snapshot owner has no current mapping fence")
+    return fence.bookkeeping_revision, fence.owner_revision
 
 
 def _static_fences(row):
@@ -145,8 +135,14 @@ def _snapshot(attempt, selection, owner, row, revisions, *, promote=False, at=No
     error = json.dumps(row.last_apply_error, ensure_ascii=False)
     secrets = set(secrets) | _secret_values(canonical_fragment(row))
     if any(secret in error for secret in secrets):
+        from .lifecycle_fence import locked_owner_bookkeeping
+
         redacted = _redact_error(row.last_apply_error, sorted(secrets, key=len, reverse=True))
-        with suppress_intent_push(), mirror_refresh(row, ("last_apply_error",)) as target:
+        with (
+            locked_owner_bookkeeping(row),
+            suppress_intent_push(),
+            mirror_refresh(row, ("last_apply_error",)) as target,
+        ):
             if target is None:
                 raise RegistryError("captured overlay disappeared before error redaction")
             target.last_apply_error = redacted
@@ -163,6 +159,7 @@ def _snapshot(attempt, selection, owner, row, revisions, *, promote=False, at=No
     epoch = selection.mapping_epoch
     streams = {item["stream"] for item in owner["contributors"]}
     scopes = {scope for scope, entry in delivery.delivery_keys().items() if entry.section in streams}
+    bookkeeping_revision, owner_revision = _fence_revisions(attempt.management, epoch, row)
     return NSOApplyOverlaySnapshot.objects.create(
         attempt=attempt,
         selection=selection,
@@ -175,7 +172,8 @@ def _snapshot(attempt, selection, owner, row, revisions, *, promote=False, at=No
         scope_revisions={scope: revision for scope, revision in revisions.items() if scope in scopes},
         content_digest=owner["content_digest"],
         observation_watermark=_watermark(attempt.management, spec),
-        expected_fence_revision=_fence_revision(attempt.management, epoch, row),
+        expected_fence_revision=bookkeeping_revision,
+        expected_owner_revision=owner_revision,
         contributors={"rows": copy.deepcopy(owner["contributors"])},
         static_route_fences=_static_fences(row),
     )
@@ -231,7 +229,8 @@ def _capture(management, rendered, revision, *, push_seq=None, deletions=(), mar
     secrets = _secret_values(wire)
     for owner in selection.contributor_manifest:
         key = (owner["model_label"], owner["overlay_pk"])
-        _snapshot(attempt, selection, owner, rows[key], {scope: revision}, secrets=secrets)
+        row = rows[key]
+        _snapshot(attempt, selection, owner, row, {scope: revision}, secrets=secrets)
     return selection
 
 
@@ -274,6 +273,7 @@ def _validate_snapshot_membership(selection):
             "rows": owner["contributors"]
         }:
             raise RegistryError("selection snapshot provenance changed")
+    return snapshots
 
 
 def validate_claim_capture(management, scope, push_seq, payload, revision, deletions, marking_mode, *, rendered=None):
@@ -379,47 +379,64 @@ def capture_manual(
         _snapshot(attempt, selection, owner, row, attempt.scope_revisions, promote=promote, at=at)
 
 
-def _locked_attempt(attempt_id):
-    from .apply_state import _enter_level, lock_device_intent_transaction
+def attempt_footprint(attempt_id):
+    """Return all frozen owners and native dependencies needed for attempt bookkeeping."""
+    from .intent_state import MutationFootprint, SourceRow, footprint_for_instance
 
-    attempt = NSOApplyAttempt.objects.select_related("management").get(pk=attempt_id)
-    device_id = attempt.management.device_id
-    lock_device_intent_transaction(device_id)
-    _enter_level(5, attempt.management_id)
-    management = NSODeviceManagement.objects.select_for_update(of=("self",)).get(pk=attempt.management_id)
-    if management.device_id != device_id:
-        raise RegistryError("attempt mapping changed while acquiring its locks")
-    attempt.management = management
-    return attempt, management
+    before = NSOApplyAttempt.objects.select_related("management").get(pk=attempt_id)
+    snapshots = list(before.overlay_snapshots.order_by("model_label", "overlay_pk"))
+    footprints = [
+        MutationFootprint(device_ids=(before.management.device_id,)),
+        MutationFootprint.for_keys(
+            ((before.management.device_id, scope) for scope in before.scope_revisions),
+            overlay_rows=(SourceRow(item.model_label, item.overlay_pk) for item in snapshots),
+        ),
+    ]
+    for item in snapshots:
+        row = OVERLAYS[item.model_label].model.objects.filter(pk=item.overlay_pk).first()
+        if row is not None:
+            footprints.append(footprint_for_instance(row))
+    return MutationFootprint.merge(*footprints)
 
 
-def _snapshot_rows(management, snapshots):
-    from .apply_state import _enter_level
-    from .intent_state import OVERLAY_MODEL_RANKS
+@contextlib.contextmanager
+def _snapshot_transaction(attempt_id):
+    """Acquire native dependencies and owner fences before snapshot bookkeeping."""
+    from .intent_state import mirror_transaction
+    from .lifecycle_fence import authoritative_bookkeeping
+    from .models import NSOIntentRevision
 
-    rows = {}
-    for rank, label in enumerate(OVERLAY_MODEL_RANKS):
-        wanted = {item.overlay_pk for item in snapshots if item.model_label == label}
-        if not wanted:
-            continue
-        spec = OVERLAYS[label]
-        for pk in sorted(wanted):
-            _enter_level(8, (rank, pk))
-        targets = (
-            spec.model.objects.select_for_update(of=("self",))
-            .filter(pk__in=wanted, **{spec.device_lookup: management.device_id})
-            .order_by("pk")
+    before = NSOApplyAttempt.objects.select_related("management").get(pk=attempt_id)
+    with authoritative_bookkeeping(), mirror_transaction(attempt_footprint(attempt_id)):
+        attempt = NSOApplyAttempt.objects.select_for_update().get(pk=attempt_id)
+        management = NSODeviceManagement.objects.select_for_update().get(pk=attempt.management_id)
+        if management.device_id != before.management.device_id:
+            raise RegistryError("attempt mapping changed while acquiring its locks")
+        attempt.management = management
+        snapshots = list(attempt.overlay_snapshots.order_by("model_label", "overlay_pk"))
+        rows = {}
+        for item in snapshots:
+            spec = OVERLAYS[item.model_label]
+            row = spec.model.objects.filter(pk=item.overlay_pk, **{spec.device_lookup: management.device_id}).first()
+            if row is not None:
+                rows[(item.model_label, item.overlay_pk)] = row
+        revisions = dict(
+            NSOIntentRevision.objects.filter(
+                device_id=management.device_id,
+                scope__in=attempt.scope_revisions,
+            ).values_list("scope", "revision")
         )
-        rows.update(((label, row.pk), row) for row in targets)
-    return rows
+        yield attempt, management, snapshots, rows, revisions
 
 
-def _matches(snapshot, row, management, revisions, prefix, *, check_watermark=True):
+def _matches(snapshot, row, management, revisions, prefix, *, check_watermark=True, check_revisions=True):
     from .selection_manifest import current_content_digest
 
     if row is None or snapshot.mapping_epoch != mapping_epoch(management):
         return False
-    if any(revisions.get(scope) != revision for scope, revision in snapshot.scope_revisions.items()):
+    if check_revisions and any(
+        revisions.get(scope) != revision for scope, revision in snapshot.scope_revisions.items()
+    ):
         return False
     return (
         all(getattr(row, field) == getattr(snapshot, f"{prefix}_{field}") for field in _BOOKKEEPING)
@@ -429,16 +446,19 @@ def _matches(snapshot, row, management, revisions, prefix, *, check_watermark=Tr
             not check_watermark
             or _watermark(management, OVERLAYS[snapshot.model_label]) == snapshot.observation_watermark
         )
-        and _fence_revision(management, snapshot.mapping_epoch, row) == snapshot.expected_fence_revision
+        and snapshot.expected_owner_revision is not None
+        and _fence_revisions(management, snapshot.mapping_epoch, row)
+        == (snapshot.expected_fence_revision, snapshot.expected_owner_revision)
         and _static_fences(row) == snapshot.static_route_fences
     )
 
 
 def _write_bookkeeping(row, snapshot, prefix):
     from .intent_state import mirror_refresh
+    from .lifecycle_fence import authoritative_bookkeeping
     from .signals import suppress_intent_push
 
-    with suppress_intent_push(), mirror_refresh(row, _BOOKKEEPING) as target:
+    with authoritative_bookkeeping(), suppress_intent_push(), mirror_refresh(row, _BOOKKEEPING) as target:
         if target is None:
             raise RegistryError("captured overlay disappeared before bookkeeping")
         for field in _BOOKKEEPING:
@@ -447,12 +467,12 @@ def _write_bookkeeping(row, snapshot, prefix):
 
 
 def promote_snapshots(attempt):
-    from .apply_state import IntentChangedDuringPreparation, lock_intent_revisions, lock_order_scope
+    from .apply_state import IntentChangedDuringPreparation
+    from .lifecycle_fence import advance_fence
 
     if connection.in_atomic_block:
         raise RuntimeError("manual snapshots must commit before promotion")
-    with transaction.atomic(), lock_order_scope():
-        locked, management = _locked_attempt(attempt.pk)
+    with _snapshot_transaction(attempt.pk) as (locked, management, snapshots, rows, revisions):
         if locked.trigger_kind != "manual" or locked.adapter_apply_attempt_id is not None:
             raise IntentChangedDuringPreparation
         if (
@@ -460,7 +480,6 @@ def promote_snapshots(attempt):
             or locked.source_epoch != management.adapter_source_epoch
         ):
             raise IntentChangedDuringPreparation
-        revisions = lock_intent_revisions(management.device_id, locked.scope_revisions)
         if revisions != locked.scope_revisions or management.source_rekey_pending:
             raise IntentChangedDuringPreparation
         epoch = mapping_epoch(management)
@@ -479,8 +498,6 @@ def promote_snapshots(attempt):
                 **{selector_field: selector},
             ).exists():
                 raise IntentChangedDuringPreparation
-        snapshots = list(locked.overlay_snapshots.order_by("model_label", "overlay_pk"))
-        rows = _snapshot_rows(management, snapshots)
         if any(
             not _matches(item, rows.get((item.model_label, item.overlay_pk)), management, revisions, "prior")
             for item in snapshots
@@ -488,22 +505,21 @@ def promote_snapshots(attempt):
             raise IntentChangedDuringPreparation
         for item in snapshots:
             if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
-                _write_bookkeeping(rows[(item.model_label, item.overlay_pk)], item, "expected")
+                target = rows[(item.model_label, item.overlay_pk)]
+                _write_bookkeeping(target, item, "expected")
+                item.expected_fence_revision = advance_fence(target, current_attempt=locked).bookkeeping_revision
+                item.save(update_fields=("expected_fence_revision",))
         locked.adapter_apply_attempt_id = locked.pk
         locked.save(update_fields=("adapter_apply_attempt_id",))
         attempt.adapter_apply_attempt_id = locked.pk
 
 
 def restore_attempt(attempt_id, keep_streams=()):
-    from .apply_state import lock_intent_revisions, lock_order_scope
+    from .lifecycle_fence import advance_fence
 
-    with transaction.atomic(), lock_order_scope():
-        attempt, management = _locked_attempt(attempt_id)
+    with _snapshot_transaction(attempt_id) as (attempt, management, snapshots, rows, revisions):
         if attempt.trigger_kind != "manual" or attempt.adapter_apply_attempt_id != attempt.pk:
             raise RegistryError("restoration requires a promoted manual attempt")
-        revisions = lock_intent_revisions(management.device_id, attempt.scope_revisions)
-        snapshots = list(attempt.overlay_snapshots.order_by("model_label", "overlay_pk"))
-        rows = _snapshot_rows(management, snapshots)
         for item in snapshots:
             if item.settlement_disposition != "unresolved":
                 continue
@@ -513,9 +529,10 @@ def restore_attempt(attempt_id, keep_streams=()):
             if any(contributor["stream"] in keep_streams for contributor in contributors):
                 continue
             row = rows.get((item.model_label, item.overlay_pk))
-            if _matches(item, row, management, revisions, "expected", check_watermark=False):
+            if _matches(item, row, management, revisions, "expected", check_watermark=False, check_revisions=False):
                 if any(getattr(item, f"prior_{field}") != getattr(item, f"expected_{field}") for field in _BOOKKEEPING):
                     _write_bookkeeping(row, item, "prior")
+                    advance_fence(row, current_attempt=attempt)
                 item.settlement_disposition = "not_applied"
             else:
                 item.settlement_disposition = "superseded"

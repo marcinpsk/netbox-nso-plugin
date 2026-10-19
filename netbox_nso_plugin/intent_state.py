@@ -522,9 +522,9 @@ class _Permit:
     mirror_update_fields: frozenset[str] | None = None
     detect_reconcile_content: bool = False
     settles_deploying: bool = True
-    initial_deploying_rows: tuple[SourceRow, ...] = ()
-    deferred_repend_rows: tuple[SourceRow, ...] = ()
     deleted_rows: set[SourceRow] = field(default_factory=set)
+    owner_before: dict = field(default_factory=dict)
+    owner_fences: dict = field(default_factory=dict)
 
 
 _REGISTRY: dict[str, RendererInputSpec] = {}
@@ -2177,19 +2177,13 @@ def _lock_rows(rows: tuple[SourceRow, ...], *, level: int, ranks: tuple[str, ...
     if unknown:
         raise IntentMutationProtocolError(f"renderer-input model ranks are missing {sorted(unknown)!r}")
 
-    def sort_key(candidate):
-        return (
-            rank_by_label[candidate.model_label],
-            candidate.pk is None,
-            repr(candidate.pk),
-        )
-
-    for row in sorted(rows, key=sort_key):
-        if row.pk is None:
-            continue
-        _enter_level(level, sort_key(row))
-        model = apps.get_model(row.model_label)
-        list(model.objects.select_for_update(of=("self",)).filter(pk=row.pk).order_by("pk"))
+    for label in sorted({row.model_label for row in rows}, key=rank_by_label.__getitem__):
+        pks = sorted({row.pk for row in rows if row.model_label == label and row.pk is not None})
+        for pk in pks:
+            _enter_level(level, (rank_by_label[label], False, pk))
+        if pks:
+            model = apps.get_model(label)
+            list(model.objects.select_for_update(of=("self",)).filter(pk__in=pks).order_by("pk"))
 
 
 def _revalidate_sources(footprint: MutationFootprint) -> None:
@@ -2226,100 +2220,9 @@ def _refuse_unacquired_keys(keys, footprint: MutationFootprint, what: str) -> fr
 
 @dataclass(frozen=True)
 class _Acquired:
-    """What one acquisition advanced, and the promoted rows a deferred re-pend still owes."""
+    """Record the delivery revisions advanced by one complete acquisition."""
 
     bumped: frozenset[tuple[int, str]] = frozenset()
-    deploying_rows: tuple[SourceRow, ...] = ()
-
-
-def _deploying_scope_rows(footprint: MutationFootprint) -> tuple[SourceRow, ...]:
-    """Discover candidate Apply-in-flight rows after their revision locks are held."""
-    from .apply_state import deploying_models
-
-    models_by_scope = deploying_models()
-    rows = []
-    for device_id, scope in footprint.revision_keys:
-        for model in models_by_scope.get(scope, ()):
-            rows.extend(
-                SourceRow(model._meta.label_lower, pk)
-                for pk in model.objects.filter(
-                    management__device_id=device_id,
-                    status="deploying",
-                )
-                .order_by("pk")
-                .values_list("pk", flat=True)
-            )
-    return tuple(rows)
-
-
-def _still_deploying_rows(rows: tuple[SourceRow, ...]) -> tuple[SourceRow, ...]:
-    """Keep candidates whose locked row version is still deploying."""
-    current = set()
-    labels = {row.model_label for row in rows}
-    for label in OVERLAY_MODEL_RANKS:
-        if label not in labels:
-            continue
-        pks = {row.pk for row in rows if row.model_label == label and row.pk is not None}
-        current.update(
-            SourceRow(label, pk)
-            for pk in apps.get_model(label).objects.filter(pk__in=pks, status="deploying").values_list("pk", flat=True)
-        )
-    return tuple(row for row in rows if row in current)
-
-
-def _bump_and_lock_deploying(
-    footprint: MutationFootprint,
-    *,
-    bump_keys: frozenset[tuple[int, str]] | None,
-    bump_owned_plan_rows: bool,
-) -> tuple[frozenset[tuple[int, str]], tuple[SourceRow, ...]]:
-    """Lock the promoted scope, then advance the revisions its locked content changes."""
-    from .outbox import bump_intent_revision
-
-    if bump_keys is not None:
-        _refuse_unacquired_keys(bump_keys, footprint, "the requested revision bump")
-    deploying_rows = _deploying_scope_rows(footprint)
-    locked_overlay_rows = tuple(set(footprint.overlay_rows) | set(deploying_rows))
-    _lock_rows(locked_overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
-    if bump_owned_plan_rows:
-        # Ownership is read from the locked rows, never predicted before the locks.
-        bump_keys = _refuse_unacquired_keys(
-            _owned_removal_keys(footprint), footprint, "the plan's owned overlay removal"
-        )
-    bumped = tuple(key for key in footprint.revision_keys if bump_keys is None or key in bump_keys)
-    for device_id, scope in bumped:
-        bump_intent_revision(device_id, scope)
-    if set(bumped) != set(footprint.revision_keys):
-        changed_rows = set(_deploying_scope_rows(replace(footprint, revision_keys=bumped)))
-        deploying_rows = tuple(row for row in deploying_rows if row in changed_rows)
-    return frozenset(bumped), _still_deploying_rows(deploying_rows)
-
-
-def _repend_locked_rows(rows: tuple[SourceRow, ...]) -> None:
-    """Force rows captured as deploying back to pending Apply state."""
-    from .signals import suppress_intent_push
-
-    permit = _ACTIVE_PERMIT.get()
-    consumed = permit.deleted_rows if permit is not None else frozenset()
-    with suppress_intent_push():
-        for row_ref in rows:
-            if row_ref.pk is None:
-                continue
-            row = apps.get_model(row_ref.model_label).objects.filter(pk=row_ref.pk).first()
-            if row is None:
-                # Only a delete this very transaction performed may consume a row from the
-                # initially deploying set; anything else vanished behind the locks that hold it.
-                if row_ref not in consumed:
-                    raise IntentMutationProtocolError(
-                        f"{row_ref.model_label} row {row_ref.pk!r} vanished before its repend"
-                    )
-                continue
-            row.status = "accepted"
-            update_fields = ["status"]
-            if hasattr(row, "apply_attempt_id"):
-                row.apply_attempt_id = None
-                update_fields.append("apply_attempt_id")
-            row.save(update_fields=update_fields)
 
 
 def _acquire(
@@ -2328,9 +2231,6 @@ def _acquire(
     bump_keys: frozenset[tuple[int, str]] | None = None,
     bump_owned_plan_rows: bool = False,
     join_deployment_gate: bool = True,
-    settles_deploying: bool = True,
-    defer_repend: bool = False,
-    capture_deploying: bool = False,
 ) -> _Acquired:
     from .apply_state import (
         _enter_level,
@@ -2355,20 +2255,8 @@ def _acquire(
     )
     for management_id in management_ids:
         _enter_level(5, (0, management_id))
-    management_rows = list(
+    managements = list(
         NSODeviceManagement.objects.select_for_update(of=("self",)).filter(pk__in=management_ids).order_by("pk")
-    )
-    read_state_keys = list(
-        NSOFamilyReadState.objects.filter(management__in=management_rows)
-        .order_by("management_id", "family")
-        .values_list("management_id", "family")
-    )
-    for management_id, family in read_state_keys:
-        _enter_level(5, (1, management_id, family))
-    list(
-        NSOFamilyReadState.objects.select_for_update(of=("self",))
-        .filter(management_id__in=management_ids)
-        .order_by("management_id", "family")
     )
     _lock_rows(footprint.source_rows, level=6, ranks=SOURCE_MODEL_RANKS)
     _revalidate_sources(footprint)
@@ -2377,21 +2265,33 @@ def _acquire(
         scopes_by_device.setdefault(device_id, []).append(scope)
     for device_id, scopes in sorted(scopes_by_device.items()):
         lock_intent_revisions(device_id, scopes)
-    if bump_owned_plan_rows or bump_keys is None or bump_keys:
-        bumped, deploying_rows = _bump_and_lock_deploying(
-            footprint,
-            bump_keys=bump_keys,
-            bump_owned_plan_rows=bump_owned_plan_rows,
+    from .lifecycle_fence import capture_locked_owners, lock_owner_fences, owner_rows
+
+    footprint = replace(footprint, overlay_rows=owner_rows(footprint))
+    fences = lock_owner_fences(footprint.overlay_rows, managements=managements)
+
+    _lock_rows(footprint.overlay_rows, level=8, ranks=OVERLAY_MODEL_RANKS)
+    if bump_keys is not None:
+        _refuse_unacquired_keys(bump_keys, footprint, "the requested revision bump")
+    if bump_owned_plan_rows:
+        bump_keys = _refuse_unacquired_keys(
+            _owned_removal_keys(footprint), footprint, "the plan's owned overlay removal"
         )
-        if not bumped or not settles_deploying:
-            return _Acquired(bumped)
-        if defer_repend:
-            return _Acquired(bumped, deploying_rows)
-        _repend_locked_rows(deploying_rows)
-        return _Acquired(bumped)
-    deploying_rows = _deploying_scope_rows(footprint) if capture_deploying else ()
-    _lock_rows(tuple(set(footprint.overlay_rows) | set(deploying_rows)), level=8, ranks=OVERLAY_MODEL_RANKS)
-    return _Acquired(frozenset(), _still_deploying_rows(deploying_rows))
+    from .outbox import bump_intent_revision
+
+    bumped = frozenset(key for key in footprint.revision_keys if bump_keys is None or key in bump_keys)
+    for device_id, scope in sorted(bumped):
+        bump_intent_revision(device_id, scope)
+    # Applied family identity follows the complete owner/overlay footprint.
+    list(
+        NSOFamilyReadState.objects.select_for_update(of=("self",))
+        .filter(management_id__in=management_ids)
+        .order_by("management_id", "family")
+    )
+    permit = _ACTIVE_PERMIT.get()
+    if permit is not None:
+        permit.owner_before.update(capture_locked_owners(fences))
+    return _Acquired(bumped)
 
 
 def _upgrade_detected_reconcile(
@@ -2417,11 +2317,6 @@ def _upgrade_detected_reconcile(
     for device_id, scope in revision_keys:
         bump_intent_revision(device_id, scope)
     permit.bumped.update(revision_keys)
-    deferred_repend_rows = permit.initial_deploying_rows
-    if set(revision_keys) != set(permit.footprint.revision_keys):
-        selected_rows = set(_deploying_scope_rows(replace(permit.footprint, revision_keys=revision_keys)))
-        deferred_repend_rows = tuple(row for row in deferred_repend_rows if row in selected_rows)
-    permit.deferred_repend_rows = deferred_repend_rows
     permit.dml_kind = "content"
     permit.bump_keys = None
     permit.detect_reconcile_content = False
@@ -2446,8 +2341,6 @@ def _join_active_permit(
 def _intent_transaction(
     footprint: MutationFootprint,
     *,
-    defer_repend: bool = False,
-    repend_after: bool = False,
     settles_deploying: bool = True,
     bump_keys=None,
 ):
@@ -2469,13 +2362,12 @@ def _intent_transaction(
             acquired = _acquire(
                 footprint,
                 bump_keys=None if bump_keys is None else frozenset(bump_keys),
-                settles_deploying=settles_deploying,
-                defer_repend=defer_repend or repend_after,
             )
             permit.bumped.update(acquired.bumped)
             yield permit
-            if (defer_repend or repend_after) and permit.settles_deploying and acquired.deploying_rows:
-                _repend_locked_rows(acquired.deploying_rows)
+            from .lifecycle_fence import finish_locked_owners
+
+            finish_locked_owners(permit.owner_before, repend=permit.settles_deploying, deleted_rows=permit.deleted_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
 
@@ -2518,14 +2410,11 @@ def mirror_transaction(
         )
         token = _ACTIVE_PERMIT.set(permit)
         try:
-            permit.initial_deploying_rows = _acquire(
-                footprint,
-                bump_keys=frozenset(),
-                capture_deploying=detect_content_changes,
-            ).deploying_rows
+            _acquire(footprint, bump_keys=frozenset())
             yield permit
-            if permit.settles_deploying and permit.deferred_repend_rows:
-                _repend_locked_rows(permit.deferred_repend_rows)
+            from .lifecycle_fence import finish_locked_owners
+
+            finish_locked_owners(permit.owner_before, repend=permit.settles_deploying, deleted_rows=permit.deleted_rows)
         finally:
             _ACTIVE_PERMIT.reset(token)
 
@@ -2536,7 +2425,6 @@ def reconcile_transaction(plan: ReconcileMutationPlan):
     if plan.changes_content:
         mutation = _intent_transaction(
             plan.footprint,
-            defer_repend=True,
             settles_deploying=plan.settles_deploying,
         )
     else:
@@ -2575,6 +2463,8 @@ def offline_mutation():
 @contextlib.contextmanager
 def mirror_refresh(instance, update_fields):
     """Permit one per-instance lifecycle save only when its fragment stays equal."""
+    from .refusal_registry import OVERLAYS
+
     spec = _REGISTRY.get(instance._meta.label_lower)
     if spec is None:
         yield
@@ -2584,7 +2474,28 @@ def mirror_refresh(instance, update_fields):
         raise IntentMutationProtocolError("mirror_refresh requires declared lifecycle-only update_fields")
     if not transaction.get_connection().in_atomic_block:
         raise IntentMutationProtocolError("mirror_refresh requires transaction.atomic()")
+    active = _ACTIVE_PERMIT.get()
+    if (
+        active is not None
+        and active.dml_kind == "locked_bookkeeping"
+        and SourceRow(instance._meta.label_lower, instance.pk) not in active.footprint.overlay_rows
+    ):
+        raise IntentMutationProtocolError("locked bookkeeping permit does not cover this owner")
+    if active is None and instance._meta.label_lower in OVERLAYS:
+        with (
+            mirror_transaction(footprint_for_instance(instance, spec)),
+            mirror_refresh(instance, update_fields) as locked,
+        ):
+            yield locked
+        return
     locked = type(instance).objects.select_for_update(of=("self",)).filter(pk=instance.pk).first()
+    from .lifecycle_fence import protected_read_fields
+
+    preserved = (
+        {name: getattr(locked, name) for name in protected_read_fields(locked) if hasattr(locked, name)}
+        if locked is not None
+        else {}
+    )
     before = ABSENT if locked is None else canonical_fragment(locked, spec)
     permit = _Permit(
         footprint=MutationFootprint(),
@@ -2598,6 +2509,13 @@ def mirror_refresh(instance, update_fields):
     token = _ACTIVE_PERMIT.set(permit)
     try:
         yield locked
+        if locked is not None and preserved:
+            current = type(locked).objects.get(pk=locked.pk)
+            changed = {name for name, value in preserved.items() if getattr(current, name) != value}
+            if changed:
+                for name in changed:
+                    setattr(locked, name, preserved[name])
+                locked.save(update_fields=changed)
         after = ABSENT if locked is None else canonical_fragment(locked, spec)
         if after != before:
             raise IntentMutationProtocolError("mirror_refresh changed a canonical renderer fragment")
@@ -2642,11 +2560,12 @@ def mirror_reconciler(function):
 
     @functools.wraps(function)
     def wrapped(*args, **kwargs):
+        from .lifecycle_fence import read_refresh
         from .signals import suppress_intent_push
 
         token = _RECONCILER_ACTIVE.set(_RECONCILER_ACTIVE.get() + 1)
         try:
-            with transaction.atomic(), suppress_intent_push():
+            with transaction.atomic(), suppress_intent_push(), read_refresh():
                 return function(*args, **kwargs)
         finally:
             _RECONCILER_ACTIVE.reset(token)
@@ -2672,6 +2591,9 @@ def _validate_explicit_write(sender, instance, update_fields=None, **kwargs):
     from .renderer_writer import active_renderer_writer, require_planned_signal_write
 
     writer = active_renderer_writer()
+    permit = _ACTIVE_PERMIT.get()
+    if sender._meta.label_lower == "netbox_nso_plugin.nsodevicemanagement" and permit is not None:
+        permit.owner_fences.clear()
     if sender._meta.label_lower in OVERLAY_MODEL_RANKS:
         from .models import NSOOwnershipAcquisition
         from .status_machine import is_owned
@@ -2747,8 +2669,11 @@ def _lock_management_delete(instance, origin) -> None:
     elif not active.footprint.covers(footprint):
         raise IntentMutationProtocolError("the active mutation footprint does not cover the management deletion")
 
+    from .models import NSOOverlaySettlementFence
     from .ownership_planner import detach_device_manifests, retire_device_manifests
 
+    # Acquisition can create fences after Django freezes the deletion collector.
+    NSOOverlaySettlementFence.objects.filter(management_id=instance.pk).delete()
     transition = retire_device_manifests if _delete_origin_label(origin) == "dcim.device" else detach_device_manifests
     transition(instance.device_id)
 

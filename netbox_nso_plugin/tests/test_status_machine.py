@@ -320,11 +320,9 @@ class TestOnApplyResult(SimpleTestCase):
         for s in (sm.ACCEPTED, sm.IN_SYNC, sm.IMPORTED, sm.CHANGED):
             self.assertEqual(sm.on_apply_result(s, ok=False), s)
 
-    def test_apply_failed_recovers_on_reconcile(self):
-        # Not stuck: the device catching up → in_sync; still differing → re-pend accepted.
-        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, matches=True), sm.IN_SYNC)
-        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, matches=False), sm.ACCEPTED)
-        # Absent from payload (pending retry) → preserved, not drifted.
+    def test_apply_failed_requires_a_correlated_result_or_successor_acceptance(self):
+        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, matches=True), sm.APPLY_FAILED)
+        self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, matches=False), sm.APPLY_FAILED)
         self.assertEqual(sm.on_reconcile(sm.APPLY_FAILED, present=False), sm.APPLY_FAILED)
 
     def test_apply_failed_retryable_via_accept(self):

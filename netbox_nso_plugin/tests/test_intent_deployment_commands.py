@@ -1253,10 +1253,13 @@ class TestIntentRestoreProtectsTheRouteIdentityNamespace(
             advance_static_route_pk(41)
 
     def test_a_missing_route_id_maximum_fails_fast_instead_of_defaulting(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
         self.adapter.include_global_max_route_id = False
 
-        with self.assertRaisesRegex(CommandError, "global_max_route_id"):
+        with self.assertRaisesRegex(CommandError, "Adapter returned invalid intent receipts"):
             self._restore()
+        self.assertTrue(is_quiesced(), "a malformed receipt document resumed the deployment gate")
 
     def test_ordinary_big_auto_field_operation_does_not_advance_to_an_adapter_watermark(self):
         from netbox_routing.models import StaticRoute

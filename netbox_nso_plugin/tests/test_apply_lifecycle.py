@@ -204,7 +204,7 @@ class TestIntentRevisionWrites(TestCase):
         ):
             self.assertEqual(bump_intent_revision(self.device.pk, "vlan"), before + 1)
 
-    def test_enqueue_bumps_the_scope_revision_and_repends_deploying_rows(self):
+    def test_enqueue_bumps_the_scope_revision_and_preserves_unchanged_owners(self):
         from netbox_nso_plugin import outbox
         from netbox_nso_plugin.intent_state import footprint_for_instance, intent_transaction
         from netbox_nso_plugin.models import NSOIntentRevision, NSOLoggingLevelState
@@ -215,10 +215,11 @@ class TestIntentRevisionWrites(TestCase):
             console_severity="WARNING",
             status="accepted",
         )
+        attempt_id = uuid4()
         mirror_update(
             row,
             status="deploying",
-            apply_attempt_id=uuid4(),
+            apply_attempt_id=attempt_id,
         )
         revision, _created = NSOIntentRevision.objects.get_or_create(device=self.device, scope="logging")
         before = revision.revision
@@ -229,8 +230,7 @@ class TestIntentRevisionWrites(TestCase):
         revision = NSOIntentRevision.objects.get(device=self.device, scope="logging")
         self.assertEqual(revision.revision, before + 1)
         row.refresh_from_db()
-        self.assertEqual(row.status, "accepted")
-        self.assertIsNone(row.apply_attempt_id)
+        self.assertEqual((row.status, row.apply_attempt_id), ("deploying", attempt_id))
 
     def test_a_foreign_logging_host_edit_repends_on_the_next_audit(self):
         from netbox_nso_plugin.models import NSOLoggingHostState, NSOLoggingLevelState
