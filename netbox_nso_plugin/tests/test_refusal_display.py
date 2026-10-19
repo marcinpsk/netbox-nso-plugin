@@ -10,43 +10,16 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import NSOInterfaceState
 
-from . import test_refusal_settlement_families as families
-from . import test_refusal_settlement_runtime as runtime
 from ._adapter_http import make_apply_preview, make_response
+from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._refusal_display import RefusalDisplayHelpers
+from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
-class TestRefusalDisplay(BGPCaptureCase):
-    prepare = runtime.TestRefusalSettlementRuntime.prepare
-    terminal = runtime.TestRefusalSettlementRuntime.terminal
-    serve_terminal_evidence = runtime.TestRefusalSettlementRuntime.serve_terminal_evidence
-    _serve_bgp_observation = runtime.TestRefusalSettlementRuntime._serve_bgp_observation
-    apply_owners = families.TestRefusalSettlementFamilies.apply_owners
-    evidence = families.TestRefusalSettlementFamilies.evidence
-    settle = families.TestRefusalSettlementFamilies.settle
-
-    def category(self, key, **params):
-        response = self.client.get(
-            reverse("plugins:netbox_nso_plugin:device_nso_category", args=(self.device.pk, key)), params
-        )
-        self.assertEqual(response.status_code, 200, response.content)
-        return response
-
-    def preview(self, payload=None):
-        original = self.adapter._handle
-
-        def handle(method, url, **kwargs):
-            if method == "GET" and url.endswith("/actions/apply-diff"):
-                return make_response(200, payload or make_apply_preview(device_id=1558))
-            return original(method, url, **kwargs)
-
-        self.adapter._handle = handle
-        response = self.client.get(reverse("plugins:netbox_nso_plugin:device_apply_preview", args=(self.device.pk,)))
-        self.assertEqual(response.status_code, 200, response.content)
-        return response
-
+class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCaptureCase):
     def refused_bgp(self, refused=1):
         from datetime import datetime
 
@@ -594,16 +567,6 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.assertNotIn(canary, str(raised.exception))
         self.assertEqual(raised.exception.code, "invalid_response")
 
-    def rest_client(self):
-        from rest_framework.test import APIClient
-        from users.constants import TOKEN_PREFIX
-        from users.models import Token, User
-
-        token = Token.objects.create(user=User.objects.get(username="placeholder-bgp-operator"))
-        api = APIClient()
-        api.credentials(HTTP_AUTHORIZATION=f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}")
-        return api
-
     def test_interface_rest_rejects_forged_stored_refusal(self):
         from ._outbox_case import mirror_update
 
@@ -978,7 +941,7 @@ class TestRefusalDisplay(BGPCaptureCase):
         prior = copy.deepcopy(row.last_apply_error)
 
         def admission(selected):
-            result = families._promoted(selected)
+            result = _promoted(selected)
             result["job_id"] = 502
             result["generations"] = [{**result["generations"][0], "generation_id": 82, "job_id": 502, "seq": 5}]
             return 202, result
@@ -1069,7 +1032,7 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.bookkeeping(row, status="in_sync")
         self.adapter.apply_response = lambda selected: (
             202,
-            {**families._promoted(selected), "generations": families._promoted(selected)["generations"][:1]},
+            {**_promoted(selected), "generations": _promoted(selected)["generations"][:1]},
         )
         response = self.client.post(
             reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),

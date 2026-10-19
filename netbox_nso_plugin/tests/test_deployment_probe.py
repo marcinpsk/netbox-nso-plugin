@@ -18,20 +18,17 @@ from users.models import Token, User
 from netbox_nso_plugin import deployment
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution, NSOIntentDeploymentControl
 
-from . import test_refusal_settlement_runtime as runtime
+from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import make_managed
 from ._settlement_adapter import FakeAdapter, LoopbackOnlySession
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
-class DeploymentCase(BGPCaptureCase):
-    prepare = runtime.TestRefusalSettlementRuntime.prepare
-    prepare_automatic = runtime.TestRefusalSettlementRuntime.prepare_automatic
-
+class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
     def terminal(self, *args, **kwargs):
         from django.utils import timezone
 
-        generation = runtime.TestRefusalSettlementRuntime.terminal(self, *args, **kwargs)
+        generation = super().terminal(*args, **kwargs)
         generation["updated_at"] = timezone.now().isoformat()
         return generation
 
@@ -115,7 +112,7 @@ class DeploymentCase(BGPCaptureCase):
         self.header = {"HTTP_AUTHORIZATION": f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}"}
 
     def serve_terminal_evidence(self, *args, **kwargs):
-        runtime.TestRefusalSettlementRuntime.serve_terminal_evidence(self, *args, **kwargs)
+        super().serve_terminal_evidence(*args, **kwargs)
         self.server.evidence_incarnation = self.socket_adapter.store.incarnation
 
     def _prepare_bgp_observation_capture(self):
@@ -139,7 +136,7 @@ class DeploymentCase(BGPCaptureCase):
     def _serve_bgp_observation(self, *args, **kwargs):
         from ._adapter_http import make_response
 
-        runtime.TestRefusalSettlementRuntime._serve_bgp_observation(self, *args, **kwargs)
+        super()._serve_bgp_observation(*args, **kwargs)
         original = self.adapter._handle
 
         def read(method, url, **options):

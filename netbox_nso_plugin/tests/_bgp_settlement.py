@@ -336,3 +336,107 @@ class BGPSettlementHelpers:
             "refusals": attributed,
             "updated_at": self.stamp.isoformat(),
         }
+
+    def _serve_bgp_observation(self, generation=None, *, drift_peer=None):
+        from ._adapter_http import make_response
+        from ._routing_observation_case import routing_observation
+        from ._scope_observation_case import entry
+        from .test_read_gate import _rs
+
+        self.serve_terminal_evidence(self.terminal() if generation is None else generation)
+        self.server.evidence_incarnation = self.management.adapter_incarnation
+        original = self.adapter._handle
+        observation = routing_observation(
+            "bgp",
+            document={
+                "routers": [
+                    entry(
+                        asn="64512",
+                        router_id="198.18.0.1",
+                        scope=[
+                            entry(
+                                vrf="",
+                                address_family=[entry(afi="ipv4-unicast")],
+                                peer_group=[],
+                                peer=[
+                                    entry(
+                                        peer_address=row.peer_address_str,
+                                        remote_as="64513",
+                                        enabled=row.pk != getattr(drift_peer, "pk", None),
+                                        password_present=True,
+                                        peer_address_family=[entry(afi="ipv4-unicast", enabled=True)],
+                                    )
+                                    for row in self.owners[1:]
+                                ],
+                            )
+                        ],
+                    )
+                ],
+                "present": ["routers"],
+                "unprojectable": [],
+            },
+        )
+        peers = [
+            {
+                "peer_address": row.peer_address_str,
+                "remote_as": "64513",
+                "enabled": row.pk != getattr(drift_peer, "pk", None),
+                "password": "placeholder-secret-canary",
+                "address_families": [{"af": "ipv4-unicast", "enabled": True}],
+            }
+            for row in self.owners[1:]
+        ]
+        document = {
+            "routers": [
+                {
+                    "asn": "64512",
+                    "router_id": "198.18.0.1",
+                    "scopes": [{"vrf": "", "address_families": ["ipv4-unicast"], "peers": peers, "peer_groups": []}],
+                }
+            ],
+            "read_state": _rs(),
+            "observation": observation,
+        }
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/bgp-config"):
+                return make_response(200, document)
+            if method == "GET" and url.endswith("/bfd"):
+                return make_response(200, {"interfaces": []})
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+
+    def apply_owners(self, owners, *, prior_status="accepted", prior_error=None):
+        self.owners = owners
+        self.prior = {}
+        for row in owners:
+            self.bookkeeping(row, status=prior_status)
+            if prior_error is not None:
+                from ._outbox_case import mirror_update
+
+                mirror_update(row, last_apply_error=prior_error)
+            row.refresh_from_db()
+            self.prior[(row._meta.label_lower, row.pk)] = (
+                row.status,
+                row.last_apply_at,
+                copy.deepcopy(row.last_apply_error),
+                row.apply_attempt_id,
+            )
+        self.adapter.apply_response = lambda selected: (
+            202,
+            {**_promoted(selected), "generations": _promoted(selected)["generations"][:1]},
+        )
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
+
+    def settle(self, generation):
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+
+        return settle_terminal_generation(
+            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=1
+        )

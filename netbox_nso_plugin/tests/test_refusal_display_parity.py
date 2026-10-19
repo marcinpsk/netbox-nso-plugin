@@ -20,11 +20,11 @@ from netbox_nso_plugin.refusal_display import UNAVAILABLE
 from netbox_nso_plugin.refusal_registry import OVERLAYS, SECTION_COUNTER_KEYS, document_section_for_stream
 from netbox_nso_plugin.vlan_reconciler import _device_vlan_group
 
-from . import test_refusal_display as display
-from . import test_refusal_settlement_families as families
 from ._adapter_http import make_apply_preview, make_response
+from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import mirror_update, without_commit_drain
 from ._ownership_case import acquire_overlay
+from ._refusal_display import RefusalDisplayHelpers
 from ._settlement_case import _route
 from .test_durable_bgp_capture import BGPCaptureCase
 
@@ -98,12 +98,7 @@ class OwnerHTML(HTMLParser):
             self.script = None
 
 
-class TestOwnerDisplayParity(BGPCaptureCase):
-    category = display.TestRefusalDisplay.category
-    preview = display.TestRefusalDisplay.preview
-    rest_client = display.TestRefusalDisplay.rest_client
-    evidence = families.TestRefusalSettlementFamilies.evidence
-
+class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCaptureCase):
     def owners(self):
         """Create one real owner of every registered model through the acquisition writer."""
         with without_commit_drain(), transaction.atomic():
