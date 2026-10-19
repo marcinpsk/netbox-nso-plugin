@@ -64,6 +64,31 @@ class TestOwnerLifecycleFence(_CascadeFlushMixin, IntentPushResetMixin, Transact
             )
         self.assertEqual(counts, [(1, 1, 1), (1, 1, 1)])
 
+    def test_owner_rows_reads_each_overlay_model_once_for_any_device_count(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import MutationFootprint, SourceRow
+        from netbox_nso_plugin.lifecycle_fence import owner_rows
+
+        from ._outbox_case import own_vlan
+
+        managements = [self.management]
+        owners = [own_vlan(self.management, 100, "rows-0")]
+        counts = []
+        for size in (1, 4):
+            while len(managements) < size:
+                _device, management = make_managed(
+                    f"owner-rows-{len(managements)}", 1767 + len(managements), index=len(managements) + 1
+                )
+                managements.append(management)
+                owners.append(own_vlan(management, 100 + len(managements), f"rows-{len(managements)}"))
+            footprint = MutationFootprint.for_keys((management.device_id, "vlan") for management in managements)
+            with CaptureQueriesContext(connection) as queries:
+                rows = owner_rows(footprint)
+            self.assertEqual(set(rows), {SourceRow(row._meta.label_lower, row.pk) for row in owners})
+            counts.append(sum(f'FROM "{owners[0]._meta.db_table}"' in query["sql"] for query in queries))
+        self.assertEqual(counts, [1, 1])
+
     def bgp_owners(self):
         asn = ASN.objects.create(asn=64512, rir=RIR.objects.create(name="Private", slug="private"))
         router = BGPRouter.objects.create(

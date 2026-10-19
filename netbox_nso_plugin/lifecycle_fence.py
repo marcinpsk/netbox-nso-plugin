@@ -26,12 +26,10 @@ def owner_rows(footprint):
 
     rows = set(footprint.overlay_rows)
     for label, spec in OVERLAYS.items():
-        for device_id, scope in footprint.revision_keys:
-            if scope in spec.delivery_keys:
-                rows.update(
-                    SourceRow(label, pk)
-                    for pk in spec.model.objects.filter(**{spec.device_lookup: device_id}).values_list("pk", flat=True)
-                )
+        device_ids = {device_id for device_id, scope in footprint.revision_keys if scope in spec.delivery_keys}
+        if device_ids:
+            lookup = {f"{spec.device_lookup}__in": device_ids}
+            rows.update(SourceRow(label, pk) for pk in spec.model.objects.filter(**lookup).values_list("pk", flat=True))
     return tuple(rows)
 
 
