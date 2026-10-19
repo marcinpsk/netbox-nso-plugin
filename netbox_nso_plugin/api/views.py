@@ -333,6 +333,22 @@ class SyncCompleteView(APIView):
         device_id = body.get("netbox_device_id")
         adapter_device_id = body.get("adapter_device_id")
 
+        if any(
+            value is not None and (type(value) is not int or value <= 0) for value in (device_id, adapter_device_id)
+        ):
+            return Response(
+                {"detail": "device identities must be positive integers"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if (
+            device_id is not None
+            and adapter_device_id is not None
+            and not NSODeviceManagement.objects.filter(
+                device_id=device_id,
+                adapter_device_id=adapter_device_id,
+            ).exists()
+        ):
+            return Response({"detail": "device identities do not match"}, status=status.HTTP_400_BAD_REQUEST)
+
         if device_id is None and adapter_device_id is None:
             return Response(
                 {"detail": "netbox_device_id or adapter_device_id is required"},
@@ -348,7 +364,18 @@ class SyncCompleteView(APIView):
                 )
             device_id = mgmt.device_id
 
-        enqueue_device_reconcile(int(device_id))
+        from ..deployment import DeploymentQuiesced, is_quiesced, operation
+        from ..deployment_probe import ProbeBlocked, enqueue_probe
+        from ..models import NSOApplyAttempt
+
+        try:
+            if is_quiesced():
+                enqueue_probe(int(device_id))
+            else:
+                with operation("sync-complete callback"):
+                    enqueue_device_reconcile(int(device_id))
+        except (ProbeBlocked, DeploymentQuiesced, NSOApplyAttempt.DoesNotExist) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response({"queued": True, "netbox_device_id": int(device_id)}, status=status.HTTP_202_ACCEPTED)
 
 

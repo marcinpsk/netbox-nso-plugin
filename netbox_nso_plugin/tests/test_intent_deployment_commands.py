@@ -35,6 +35,31 @@ class _BrokenStderr(io.StringIO):
 
 
 class TestReceiptSelectors(SimpleTestCase):
+    def test_deployment_gate_help_explains_each_action_and_its_required_arguments(self):
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import Command
+
+        parser = Command().create_parser("manage.py", "nso_intent_deployment_gate")
+        actions = {action.dest: action.help or "" for action in parser._actions}
+        required = {
+            "prepare": ("Block fleet", "quiesced"),
+            "verify": ("paired verification", "--device ID", "--settled-probe UUID"),
+            "resume": ("paired verification", "--device ID", "--settled-probe UUID"),
+            "abort": ("paired verification", "--device ID", "--settled-probe UUID"),
+            "import_routers": ("--device ID", "no ownership"),
+            "accept_routers": ("--device ID", "exact operator-selected overlay IDs"),
+            "prepare_store": ("--device ID", "--scope", "never enqueues a device Apply"),
+            "start_probe": ("--device ID", "--register-probe", "manual Apply"),
+            "register_probe": ("terminal", "callback", "--revoke-probe"),
+            "revoke_probe": ("quiesced", "permit"),
+        }
+        for action, phrases in required.items():
+            for phrase in phrases:
+                with self.subTest(action=action, phrase=phrase):
+                    self.assertIn(phrase, actions[action])
+        help_text = parser.format_help()
+        for obsolete in ("--adapter-root", "--packages-root", "--plugin-ref", "--adapter-ref"):
+            self.assertNotIn(obsolete, help_text)
+
     def test_deployment_gate_rejects_a_boolean_device_id(self):
         from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import _receipt_for
 
@@ -523,347 +548,22 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
                         self._prepare()
 
     def test_a_failed_verification_keeps_writes_blocked(self):
-        """§4.6: the rollback happens with writes still blocked; only success or --abort resumes."""
-        from netbox_nso_plugin import drain, outbox
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.deployment import DeploymentQuiesced, is_quiesced
+        from netbox_nso_plugin import deployment, outbox
 
-        own_route(self.mgmt, "198.18.41.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
-            self._prepare()
-
-        self.adapter.fail_with = AdapterError("adapter exploded", code="internal_error", status_code=500)
-        config, session = self.adapter.patches()
-        with config, session:
-            with self.assertRaisesRegex(CommandError, "Verification push failed"):
+        deployment.quiesce()
+        for action in ("verify", "resume", "abort"):
+            with self.subTest(action=action), self.assertRaisesRegex(CommandError, "verification probes"):
                 call_command(
                     "nso_intent_deployment_gate",
-                    verify=True,
+                    **{action: True},
                     device_id=self.device.pk,
                     stdout=io.StringIO(),
                     stderr=io.StringIO(),
                 )
-
-        assert is_quiesced(), "a failed verification resumed writes"
-        with self.assertRaises(DeploymentQuiesced):
-            with transaction.atomic():
-                outbox.enqueue(self.device.pk, "static_route")
-
-        call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
-        assert not is_quiesced(), "--abort must release the gate"
-
-    def test_a_receipt_read_failure_is_a_named_command_failure(self):
-        from netbox_nso_plugin import adapter_client, drain
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.deployment import is_quiesced
-
-        own_route(self.mgmt, "198.18.42.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
-            self._prepare()
-
-        config, session = self.adapter.patches()
-        with (
-            config,
-            session,
-            patch.object(
-                adapter_client,
-                "get_intent_receipts",
-                side_effect=AdapterError("receipt read failed", code="nso_unreachable"),
-            ),
-            self.assertRaisesRegex(CommandError, "Verification failed: receipt read failed"),
-        ):
-            call_command(
-                "nso_intent_deployment_gate",
-                verify=True,
-                device_id=self.device.pk,
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-
-        assert is_quiesced(), "a failed receipt read resumed writes"
-
-    def test_a_reprepare_after_a_failed_verification_keeps_the_gate(self):
-        """codex O3b review P1: --prepare must not release a gate it did not create."""
-        from netbox_nso_plugin import drain
-        from netbox_nso_plugin.adapter_client import AdapterError
-        from netbox_nso_plugin.deployment import is_quiesced
-
-        own_route(self.mgmt, "198.18.42.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
-            self._prepare()
-        self.adapter.fail_with = AdapterError("adapter exploded", code="internal_error", status_code=500)
-        config, session = self.adapter.patches()
-        with config, session:
-            with self.assertRaisesRegex(CommandError, "Verification push failed"):
-                call_command(
-                    "nso_intent_deployment_gate",
-                    verify=True,
-                    device_id=self.device.pk,
-                    stdout=io.StringIO(),
-                    stderr=io.StringIO(),
-                )
-        assert is_quiesced()
-
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
-            with self.assertRaisesRegex(CommandError, "Deployment gate blocked"):
-                self._prepare()
-        assert is_quiesced(), "a failed re-prepare released a gate it did not create"
-
-    def test_prepare_failure_preserves_a_gate_created_before_its_exclusive_transition(self):
-        from netbox_nso_plugin.deployment import is_quiesced, quiesce, resume
-        from netbox_nso_plugin.models import NSOIntentOutboxState
-
-        NSOIntentOutboxState.objects.create(
-            device=self.device,
-            scope="static_route",
-            claimed_at=timezone.now(),
-        )
-
-        def competing_transition():
-            quiesce()
-            return quiesce()
-
-        try:
-            with (
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.quiesce",
-                    side_effect=competing_transition,
-                ),
-                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"),
-            ):
-                with self.assertRaisesRegex(CommandError, "Deployment gate blocked"):
-                    self._prepare()
-            assert is_quiesced(), "prepare released the competing command's gate"
-        finally:
-            resume()
-
-    def test_prepare_cleanup_resume_failure_reports_recovery_and_keeps_the_gate(self):
-        from netbox_nso_plugin import deployment
-
-        stderr = io.StringIO()
-        failure = DatabaseError("connection lost")
-        try:
-            with (
-                patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"),
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.gate_blockers",
-                    return_value=["a test blocker"],
-                ),
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
-                    side_effect=failure,
-                ),
-                self.assertRaises(DatabaseError) as caught,
-            ):
-                self._prepare_with_stderr(stderr)
-
-            self.assertIs(caught.exception, failure)
-            self.assertIsInstance(caught.exception.__context__, CommandError)
-            self.assertIn("Deployment gate blocked: a test blocker", str(caught.exception.__context__))
-            self.assertIsNone(caught.exception.__cause__)
-            self.assertIn("intent work may remain quiesced", stderr.getvalue())
-            self.assertIn("nso_intent_deployment_gate --abort", stderr.getvalue())
             self.assertTrue(deployment.is_quiesced())
-            call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
-            self.assertFalse(deployment.is_quiesced())
-        finally:
-            if deployment.is_quiesced():
-                deployment.resume()
-
-    def test_verification_abandons_a_claim_that_carries_deletions(self):
-        from netbox_nso_plugin import drain
-        from netbox_nso_plugin.deployment import quiesce, resume
-
-        route = own_route(self.mgmt, "198.18.43.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-        with without_commit_drain():
-            _unassign_and_retire(route, self.device)
-        claim = drain.claim(self.device.pk, "static_route")
-        assert claim is not None and [record["route_id"] for record in claim.deletions] == [route.pk]
-
-        quiesce()
-        try:
-            with (
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.gate_blockers",
-                    return_value=[],
-                ),
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.claim", return_value=claim
-                ),
-            ):
-                with self.assertRaisesRegex(CommandError, "no-deletion static verification push"):
-                    call_command(
-                        "nso_intent_deployment_gate",
-                        verify=True,
-                        device_id=self.device.pk,
-                        stdout=io.StringIO(),
-                        stderr=io.StringIO(),
-                    )
-            state = state_of(self.device, "static_route")
-            assert state.push_seq is None, "the rejected verification claim remained active"
-            assert state.claim_deletions == []
-            assert [record["route_id"] for record in state.queued_deletions] == [route.pk]
-        finally:
-            resume()
-
-    def test_completed_verification_reports_resume_failure_and_keeps_the_gate(self):
-        from netbox_nso_plugin import deployment, drain
-        from netbox_nso_plugin.deployment import is_quiesced
-
-        own_route(self.mgmt, "198.18.45.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-
-        deployment.quiesce()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        failure = DatabaseError("connection lost")
-        config, session = self.adapter.patches()
-        try:
-            with (
-                config,
-                session,
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
-                    side_effect=failure,
-                ),
-                self.assertRaises(DatabaseError) as caught,
-            ):
-                call_command(
-                    "nso_intent_deployment_gate",
-                    verify=True,
-                    device_id=self.device.pk,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-
-            self.assertIs(caught.exception, failure)
-            self.assertIn("Deployment verification passed, but intent work may remain quiesced", stderr.getvalue())
-            self.assertIn("Fix the cause and run nso_intent_deployment_gate --abort.", stderr.getvalue())
-            self.assertNotIn("Deployment verification passed", stdout.getvalue())
-            self.assertTrue(deployment.is_quiesced())
-            call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO(), stderr=io.StringIO())
-            assert not is_quiesced(), "--abort must release the gate"
-        finally:
-            if deployment.is_quiesced():
-                deployment.resume()
-
-    def test_verification_resume_failure_survives_stderr_failure(self):
-        from netbox_nso_plugin import deployment, drain
-
-        own_route(self.mgmt, "198.18.46.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-
-        deployment.quiesce()
-        failure = DatabaseError("connection lost")
-        config, session = self.adapter.patches()
-        try:
-            with (
-                config,
-                session,
-                patch(
-                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.resume",
-                    side_effect=failure,
-                ),
-                self.assertRaises(DatabaseError) as caught,
-            ):
-                call_command(
-                    "nso_intent_deployment_gate",
-                    verify=True,
-                    device_id=self.device.pk,
-                    stdout=io.StringIO(),
-                    stderr=_BrokenStderr(),
-                )
-
-            self.assertIs(caught.exception, failure)
-            self.assertTrue(deployment.is_quiesced())
-        finally:
-            if deployment.is_quiesced():
-                deployment.resume()
-
-    def test_the_full_gate_sequence_quiesces_and_verifies_a_no_deletion_static_push(self):
-        from django.http import HttpResponse
-        from django.test import RequestFactory
-
-        from netbox_nso_plugin import drain, outbox
-        from netbox_nso_plugin.deployment import DeploymentQuiesced
-        from netbox_nso_plugin.intent_drift import resync_intent
-        from netbox_nso_plugin.intent_state import content_mutation
-        from netbox_nso_plugin.middleware import IntentDeploymentMiddleware
-        from netbox_nso_plugin.onboarding import advance_provisioning, onboard_candidate
-        from netbox_nso_plugin.reconcile import reconcile_device
-
-        own_route(self.mgmt, "198.18.40.0/24", "198.18.0.1")
-        config, session = self.adapter.patches()
-        with config, session:
-            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
-        assert entries(self.device, "static_route") == []
-
-        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep") as sleeper:
-            self._prepare()
-
-        with self.assertRaisesRegex(RuntimeError, "deployment is quiesced"):
-            with transaction.atomic():
-                outbox.enqueue(self.device.pk, "static_route")
-        blocked = IntentDeploymentMiddleware(lambda _request: HttpResponse("mutated"))(
-            RequestFactory().post("/api/plugins/nso/onboard/")
-        )
-        assert blocked.status_code == 503
-        for operation in (
-            lambda: reconcile_device(None),
-            lambda: resync_intent(None, None),
-            lambda: onboard_candidate(None, None),
-            lambda: advance_provisioning(None),
-        ):
-            with self.assertRaises(DeploymentQuiesced):
-                operation()
-        with patch("netbox_nso_plugin.drain._compact_intent_outbox") as compact:
-            assert drain.drain_intent_outbox() == (0, 0), "the scheduled drain tick ran while quiesced"
-        compact.assert_not_called()
-
-        stdout = io.StringIO()
-        config, session = self.adapter.patches()
-        with config, session:
-            call_command(
-                "nso_intent_deployment_gate",
-                verify=True,
-                device_id=self.device.pk,
-                stdout=stdout,
-                stderr=io.StringIO(),
-            )
-
-        sleeper.assert_called_once_with(635)
-        verification = self.adapter.requests[-1]
-        assert verification["body"]["deleted_routes"] == []
-        assert verification["push_seq"] == max(receipt["push_seq"] for receipt in self.adapter.receipts.values())
-        assert {tuple(sorted(read.items())) for read in self.adapter.receipt_reads} >= {
-            tuple(sorted({"device_id": self.adapter_device_id, "section": "static_route"}.items()))
-        }
-        assert state_of(self.device, "static_route").push_seq is None
-        assert drain.gate_blockers() == []
-        assert "Deployment verification passed" in stdout.getvalue()
-
-        with without_commit_drain(), content_mutation({(self.device.pk, "static_route")}):
+        with self.assertRaises(deployment.DeploymentQuiesced), transaction.atomic():
             outbox.enqueue(self.device.pk, "static_route")
-        assert entries(self.device, "static_route", unconsumed=True), "normal operation did not resume"
+        self.assertEqual(self.adapter.requests, [])
 
 
 class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):

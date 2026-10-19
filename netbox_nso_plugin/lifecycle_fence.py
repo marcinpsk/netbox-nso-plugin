@@ -16,7 +16,18 @@ from django.db import transaction
 
 BOOKKEEPING_FIELDS = frozenset({"status", "accepted_at", "last_apply_at", "last_apply_error", "apply_attempt_id"})
 _UNSET = object()
+_OWNER_LIMIT = contextvars.ContextVar("nso_bounded_owner_footprint", default=None)
 _AUTHORITATIVE_BOOKKEEPING = contextvars.ContextVar("nso_authoritative_bookkeeping", default=False)
+
+
+@contextlib.contextmanager
+def bounded_owners(owners):
+    """Restrict one revalidated probe transaction to its captured owner identities."""
+    token = _OWNER_LIMIT.set(frozenset(owners))
+    try:
+        yield
+    finally:
+        _OWNER_LIMIT.reset(token)
 
 
 def owner_rows(footprint):
@@ -25,6 +36,9 @@ def owner_rows(footprint):
     from .refusal_registry import OVERLAYS
 
     rows = set(footprint.overlay_rows)
+    limit = _OWNER_LIMIT.get()
+    if limit is not None:
+        return tuple(ref for ref in rows if (ref.model_label, ref.pk) in limit)
     for label, spec in OVERLAYS.items():
         device_ids = {device_id for device_id, scope in footprint.revision_keys if scope in spec.delivery_keys}
         if device_ids:
@@ -71,6 +85,9 @@ def fence_for(row, *, lock=False):
 
     permit = _ACTIVE_PERMIT.get()
     ref = SourceRow(row._meta.label_lower, row.pk)
+    limit = _OWNER_LIMIT.get()
+    if limit is not None and (ref.model_label, ref.pk) not in limit:
+        raise RuntimeError("A probe cannot write an unselected owner fence")
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("owner fence requires transaction.atomic()")
     cached = permit.owner_fences.get(ref) if permit is not None else None

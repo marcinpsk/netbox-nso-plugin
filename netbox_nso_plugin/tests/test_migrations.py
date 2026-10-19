@@ -96,6 +96,7 @@ class TestMigrationGraph(SimpleTestCase):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         leaves = sorted(name for app, name in loader.graph.leaf_nodes() if app == APP)
 
+        assert leaves == ["0036_deployment_probe"]
         assert len(leaves) == 1, f"{APP} has conflicting leaf migrations: {leaves}"
         state = loader.project_state([(APP, leaves[0])])
         for name in (
@@ -106,6 +107,8 @@ class TestMigrationGraph(SimpleTestCase):
             "nsobgprouterstate",
         ):
             assert (APP, name) in state.models, f"missing refusal ledger model: {name}"
+        assert "verification_attempt" in state.models[APP, "nsointentdeploymentcontrol"].fields
+        assert "nso_attempt_prune" in {index.name for index in state.models[APP, "nsoapplyattempt"].options["indexes"]}
 
 
 class TestMigrationsMatchTheModels(TestCase):
@@ -460,3 +463,37 @@ class TestOwnershipIdentityMigration(_CascadeFlushMixin, TransactionTestCase):
         from netbox_nso_plugin.models import NSOOwnershipManifest
 
         self.assertFalse(NSOOwnershipManifest.objects.exists())
+
+
+class TestDeploymentProbeSchema(_CascadeFlushMixin, TransactionTestCase):
+    def test_probe_gate_schema_preserves_quiesced_state(self):
+        from django.db.migrations.executor import MigrationExecutor
+        from django.db.models import PROTECT
+        from django.utils import timezone
+
+        from ._outbox_case import make_managed
+
+        _device, management = make_managed("probe-schema", 1767)
+        executor = MigrationExecutor(connection)
+        leaves = executor.loader.graph.leaf_nodes(APP)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(leaves))
+        parent = (APP, "0035_owner_revision")
+        executor.migrate([parent])
+        old = executor.loader.project_state([parent]).apps
+        stamp = timezone.now()
+        old.get_model(APP, "NSOIntentDeploymentControl").objects.create(pk=1, quiesced_at=stamp)
+        attempt = old.get_model(APP, "NSOApplyAttempt").objects.create(management_id=management.pk)
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaves)
+        current = executor.loader.project_state(leaves).apps
+        Control = current.get_model(APP, "NSOIntentDeploymentControl")
+        control = Control.objects.get(pk=1)
+        self.assertEqual(control.quiesced_at, stamp)
+        self.assertIsNone(control.verification_attempt_id)
+        self.assertTrue(current.get_model(APP, "NSOApplyAttempt").objects.filter(pk=attempt.pk).exists())
+        self.assertIs(Control._meta.get_field("verification_attempt").remote_field.on_delete, PROTECT)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Control.objects.filter(pk=1).update(quiesced_at=None, verification_attempt_id=attempt.pk)
+        self.assertIn(
+            "nso_attempt_prune", {index.name for index in current.get_model(APP, "NSOApplyAttempt")._meta.indexes}
+        )

@@ -22,6 +22,8 @@ class IntentDeploymentMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
+        if request.path_info == "/api/plugins/nso/sync-complete/":
+            return self.get_response(request)
         if request.method in _SAFE_METHODS:
             return self.get_response(request)
         try:

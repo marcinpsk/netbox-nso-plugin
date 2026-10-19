@@ -208,7 +208,7 @@ class BGPSettlementHelpers:
                             "generation_id": generation["generation_id"],
                             "seq": generation["seq"],
                             "status": generation["status"],
-                            "job_id": generation["carrier_job_id"],
+                            "job_id": None if pruned else generation["carrier_job_id"],
                             "mode": "networked",
                             "settlement_cohort": 9,
                             "digest": "a" * 64,

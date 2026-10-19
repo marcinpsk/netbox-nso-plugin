@@ -176,6 +176,7 @@ def _gated(
     epoch,
     ctx_key: str | None = None,
     pre_body=None,
+    publish_applied=True,
 ):
     """Gate ONE family document (D9): record the disposition, run *body* iff admitted.
 
@@ -207,6 +208,7 @@ def _gated(
             epoch=epoch,
             pre_body=pre_body,
             observation=payload.get("observation") if isinstance(payload, dict) else None,
+            publish_applied=publish_applied,
         )
     except ReconcileScopeError as exc:
         from .read_gate import (

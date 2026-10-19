@@ -3211,7 +3211,12 @@ class NSOApplyAttempt(models.Model):
                 name="nso_attempt_adapter_request",
             ),
         ]
-        indexes = [models.Index(fields=["management", "-created_at"], name="nso_apply_attempt_device")]
+        indexes = [
+            models.Index(fields=["management", "-created_at"], name="nso_apply_attempt_device"),
+            models.Index(
+                fields=["completed_at", "id"], condition=models.Q(lifecycle="terminal"), name="nso_attempt_prune"
+            ),
+        ]
         ordering = ["-created_at"]
         verbose_name = "NSO Apply Attempt"
         verbose_name_plural = "NSO Apply Attempts"
@@ -3383,7 +3388,20 @@ class NSOIntentDeploymentControl(models.Model):
 
     id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
     quiesced_at = models.DateTimeField(null=True, blank=True)
+    verification_attempt = models.ForeignKey(
+        to="NSOApplyAttempt",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="deployment_verifications",
+    )
 
     class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(verification_attempt__isnull=True) | models.Q(quiesced_at__isnull=False),
+                name="nso_probe_requires_quiescence",
+            ),
+        ]
         verbose_name = "NSO Intent Deployment Control"
         verbose_name_plural = "NSO Intent Deployment Control"

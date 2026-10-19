@@ -876,24 +876,12 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
     )
     for generation in generations:
         identity = generation["generation_id"], generation["job_id"]
-        if generation["status"] in {"pending", "running"} or identity in present:
+        if not terminal_carrier_requires_certificate(generation) or identity in present:
             continue
-        # An abandoned generation that never had a carrier job has no execution to settle.
-        if generation["status"] == "abandoned" and generation["job_id"] is None:
+        projection = consumed_generation_certificate(management, incarnation, generation)
+        if projection is not None:
+            bound.automatic_generations.append(projection)
             continue
-        cached = (
-            _cursor_epoch_executions(management, incarnation)
-            .filter(
-                generation_id=generation["generation_id"],
-                carrier_job_id=generation["job_id"],
-            )
-            .first()
-        )
-        if cached is not None:
-            projection = _execution_projection(cached)
-            if all(projection[key] == generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
-                bound.automatic_generations.append(projection)
-                continue
         _record_invariant(
             management,
             {"generation_id": generation["generation_id"], "carrier_job_id": generation["job_id"]},
@@ -902,6 +890,38 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
             "missing_generation_evidence",
         )
         raise EvidenceInvariantError("missing_generation_evidence")
+
+
+def terminal_carrier_requires_certificate(generation):
+    """Require terminal evidence because a nullable job FK cannot prove that no carrier ran."""
+    return generation["status"] not in {"pending", "running"}
+
+
+def consumed_generation_certificate(management, incarnation, generation):
+    """Validate the retained certificate required by recovery and deployment readiness."""
+    certificates = generation_certificates(management, incarnation, generation)
+    if generation["job_id"] is not None:
+        certificates = certificates.filter(carrier_job_id=generation["job_id"])
+    candidates = list(certificates[:2])
+    if len(candidates) != 1:
+        return None
+    cached = candidates[0]
+    if (
+        cached.invariant_code
+        or cached.consumed_at is None
+        or not _positive_int(cached.settle_seq)
+        or not _positive_int(cached.carrier_job_id)
+    ):
+        return None
+    projection = _execution_projection(cached)
+    if all(projection[key] == generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
+        return projection
+    return None
+
+
+def generation_certificates(management, incarnation, generation):
+    """Keep all consumed carriers that recovery can request for a listed generation."""
+    return _consumed_executions(management, incarnation).filter(generation_id=generation["generation_id"])
 
 
 def _cursor_epoch_executions(management, incarnation):

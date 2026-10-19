@@ -167,3 +167,35 @@ class RefreshDeviceSyncCacheJob(JobRunner):
             settle_failed,
             time.monotonic() - settle_started,
         )
+
+
+@system_job(interval=JobIntervalChoices.INTERVAL_DAILY)
+class PruneApplyLedgerJob(JobRunner):
+    """Prune one bounded batch of expired Apply history each day."""
+
+    class Meta:
+        name = "Prune NSO Apply ledger"
+
+    def run(self, *args, **kwargs):
+        """Use the same eligibility and deletion path as the maintenance command."""
+        from core.models import Job
+
+        from .apply_retention import prune_apply_ledger
+
+        previous = (
+            Job.objects.filter(name=self.name, data__has_key="apply_ledger_cursor")
+            .exclude(
+                pk=self.job.pk,
+            )
+            .order_by("-created")
+            .first()
+        )
+        cursor = previous.data["apply_ledger_cursor"] if previous is not None else None
+        try:
+            result = prune_apply_ledger(execute=True, cursor=cursor)
+            self.job.data = {**(self.job.data or {}), "apply_ledger_cursor": result.next_cursor}
+            self.job.save(update_fields=("data",))
+            return result
+        except DeploymentQuiesced:
+            logger.info("PruneApplyLedgerJob: paused for an intent deployment")
+            return None

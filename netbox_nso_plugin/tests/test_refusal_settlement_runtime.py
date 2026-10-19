@@ -738,9 +738,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.serve_terminal_evidence(self.terminal(), head=False, pruned=True)
         with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
             settle_device_apply_attempts(self.management)
-        execution = NSOApplyExecution.objects.get()
-        self.assertEqual(execution.consumption_state, "unconsumed")
-        self.assertEqual(execution.invariant_code, "missing_generation_evidence")
+        self.assertFalse(NSOApplyExecution.objects.exists())
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(
@@ -850,16 +848,16 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             "updated_at": self.stamp.isoformat(),
         }
 
-    def test_carrierless_abandoned_generation_does_not_stall_settlement(self):
-        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+    def test_abandoned_generation_without_carrier_authority_stalls_settlement(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
 
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal(), earlier_generations=[self._carrierless_generation("abandoned")])
-        settle_device_apply_attempts(self.management)
-        execution = NSOApplyExecution.objects.get()
-        self.assertEqual((execution.consumption_state, execution.invariant_code), ("consumed", ""))
+        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+            settle_device_apply_attempts(self.management)
+        self.assertFalse(NSOApplyExecution.objects.exists())
         self.owners[1].refresh_from_db()
-        self.assertEqual(self.owners[1].status, "apply_failed")
+        self.assertEqual(self.owners[1].status, self.prior[(self.owners[1]._meta.label_lower, self.owners[1].pk)][0])
 
     def test_carrierless_failed_generation_still_stalls_before_consumption(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts

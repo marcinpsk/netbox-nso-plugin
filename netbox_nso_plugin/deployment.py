@@ -143,6 +143,8 @@ def _set_active(active: bool) -> bool:
                     defaults={"quiesced_at": timezone.now()},
                 )
                 return created
+            if NSOIntentDeploymentControl.objects.filter(pk=1, verification_attempt__isnull=False).exists():
+                raise DeploymentQuiesced("Revoke verification probe authority before resume")
             NSOIntentDeploymentControl.objects.filter(pk=1).delete()
             return False
     finally:
