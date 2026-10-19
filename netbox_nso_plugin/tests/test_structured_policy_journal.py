@@ -13,6 +13,9 @@ from netbox_nso_plugin.refusal_registry import owner_spec
 from netbox_nso_plugin.selection_manifest import current_content_digest
 
 from ._ownership_case import save_overlay_fixture
+
+# Module scope: a lazy import would subclass the conftest's blocked Session.
+from ._settlement_adapter import FakeAdapter, LoopbackOnlySession
 from .test_route_policy_panel_journal import _RoutePolicyFixture
 
 
@@ -421,3 +424,53 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         execution = NSOApplyExecution.objects.get()
         assert execution.consumption_state == "unconsumed"
         assert execution.invariant_code
+
+    def test_run_device_reconcile_journals_the_route_policy_carrier(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.delivery import canonical_fingerprint
+        from netbox_nso_plugin.models import AdapterConnection
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        management, row, prior, result, generation, cause = self.policy_terminal()
+        adapter = FakeAdapter()
+        self.addCleanup(adapter.stop)
+        for target, value in (
+            ("netbox_nso_plugin.adapter_client.requests.Session", LoopbackOnlySession),
+            ("netbox_nso_plugin.reconcile.reconcile_device", lambda *args, **kwargs: {}),
+        ):
+            patcher = patch(target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        adapter_client.reset_session()
+        self.addCleanup(adapter_client.reset_session)
+        AdapterConnection.objects.all().delete()
+        AdapterConnection.objects.create(url=adapter.url, enabled=True, timeout_seconds=10)
+        adapter_client.reset_config_cache()
+        self.addCleanup(adapter_client.reset_config_cache)
+        adapter.store.add_device(nso_instance="rpj-inst", nso_device_name="rpj-dev", device_id=777)
+        job = adapter.store.terminal_job(777, status="succeeded", extra=result)
+        adapter.store.add_generation(
+            777,
+            generation_id=17,
+            seq=9,
+            status="failed",
+            job_id=job["id"],
+            mode="networked",
+            settlement_cohort=9,
+            digest="a" * 64,
+            stream_revisions={"route_policy": 7},
+            source_push_seq={"route_policy": 41},
+        )
+
+        run_device_reconcile(self.device.pk)
+
+        object_entry = JournalEntry.objects.get(assigned_object_type=row.content_type, assigned_object_id=row.object_id)
+        assert object_entry.kind == "danger"
+        assert f"adapter job #{job['id']}." in object_entry.comments
+        execution = NSOApplyExecution.objects.get(carrier_job_id=job["id"], consumption_state="consumed")
+        management.refresh_from_db()
+        assert management.last_journaled_apply_job == canonical_fingerprint(
+            (management.pk, execution.mapping_epoch, adapter.store.incarnation, 17, job["id"])
+        )
