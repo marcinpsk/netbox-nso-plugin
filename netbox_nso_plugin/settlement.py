@@ -83,13 +83,11 @@ def sweep_static_route_settlements() -> tuple[int, int]:
 
     This independent clock can recover when the adapter cannot deliver callbacks.
     Query candidates after link repair so each poll uses the current mapping.
-    Include every registered delivery scope and sent selections awaiting binding.
+    Include every registered delivery scope and every sent selection that cadence or retry can still execute.
     Keep each device's failure separate so one outage does not stop the sweep.
     """
     from . import status_machine as sm
-    from .apply_settlement import EvidenceInvariantError
     from .apply_state import deploying_models
-    from .deployment import DeploymentQuiesced
     from .models import NSODeviceManagement
 
     candidate_pks = set(
@@ -119,12 +117,7 @@ def sweep_static_route_settlements() -> tuple[int, int]:
     for pk in candidates:
         try:
             settle_static_routes(pk)
-        except (
-            adapter_client.AdapterError,
-            EvidenceInvariantError,
-            DeploymentQuiesced,
-            NSODeviceManagement.DoesNotExist,
-        ):
+        except Exception:  # noqa: BLE001 one device's failure must not stop the fleet sweep
             logger.exception("static-route settlement sweep failed for management row %s", pk)
             failed += 1
             continue

@@ -116,6 +116,46 @@ class TestTheScheduledTickIsAnIndependentClock(_CarrierCase):
             "pass is hostage to its last"
         )
 
+    def test_an_unexpected_settlement_error_does_not_abort_the_sweep(self):
+        """A defect on one device is logged and counted; later devices still settle."""
+        from netbox_nso_plugin import settlement
+
+        devices = {}
+        for tag, adapter_id in (("unexpected", 14), ("healthy", 15)):
+            device = _make_device(tag)
+            mgmt = _make_mgmt(device, tag, adapter_id, adapter=self.adapter)
+            self.adapter.store.add_device(
+                nso_instance=f"se-{tag}-inst",
+                nso_device_name=f"nso-se-{tag}",
+                netbox_device_id=device.pk,
+                device_id=adapter_id,
+            )
+            devices[tag] = (device, mgmt)
+        _own(
+            _route("10.44.0.0/16", "10.44.0.1", devices=[devices["unexpected"][0]]),
+            devices["unexpected"][1],
+            generation=207,
+        )
+        healthy_state = _own(
+            _route("10.46.0.0/16", "10.46.0.1", devices=[devices["healthy"][0]]), devices["healthy"][1], generation=205
+        )
+        enqueue(devices["healthy"][0], "static_route")
+        real = settlement.settle_static_routes
+
+        def settle(pk):
+            if pk == devices["unexpected"][1].pk:
+                raise RuntimeError("unexpected settlement defect")
+            return real(pk)
+
+        with (
+            patch.object(settlement, "settle_static_routes", side_effect=settle),
+            self.assertLogs("netbox_nso_plugin.settlement", "ERROR"),
+        ):
+            self._tick()
+
+        healthy_state.refresh_from_db()
+        assert healthy_state.status == "in_sync", "one device's unexpected error aborted the sweep"
+
 
 class TestTheSameTickSettlesARepairedDevice(_SettlementCase):
     """S5.6b — a mapping repaired in this tick is settled on its NEW id, in this tick.
