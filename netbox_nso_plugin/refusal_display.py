@@ -182,7 +182,10 @@ def _previous_refusal(row):
 
 def row_projection(row):
     """Keep restored history separate from the current execution's refusal."""
+    from .refusal_registry import OVERLAYS
+
     error = getattr(row, "last_apply_error", None)
+    historical_refusal = None
     projection = {"refusal": None, "refusal_text": "", "advisory": "", "error": None}
     if isinstance(error, dict) and "refusals" in error:
         projection["refusal"] = safe_projection(error["refusals"])
@@ -196,6 +199,7 @@ def row_projection(row):
             projection["refusal"] = _snapshot_refusal(snapshot, [execution])
         elif snapshot.settlement_disposition == "unavailable":
             if projection["refusal"] is not None:
+                historical_refusal = projection["refusal"]
                 projection["error"] = projection["refusal"]["text"]
             projection["refusal"] = None
             projection["advisory"] = UNAVAILABLE
@@ -206,6 +210,16 @@ def row_projection(row):
         projection["error"] = (error.get("message") or str(error)) if isinstance(error, dict) else error
     if not projection["advisory"]:
         projection["advisory"] = getattr(row, "last_result_advisory", "") or ""
+    spec = OVERLAYS.get(row._meta.label_lower) if hasattr(row, "_meta") else None
+    if spec is not None and spec.error_type == "JSONField":
+        error_refusal = projection["refusal"] if projection["refusal"] is not None else historical_refusal
+        projection["error_value"] = (
+            {"refusals": error_refusal["causes"], "message": error_refusal["text"]}
+            if error_refusal is not None
+            else copy.deepcopy(error)
+        )
+    else:
+        projection["error_value"] = projection["error"] if projection["error"] is not None else error
     return projection
 
 

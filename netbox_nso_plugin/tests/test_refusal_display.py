@@ -175,6 +175,11 @@ class TestRefusalDisplay(BGPCaptureCase):
         cell = self.category("interface", format="json").json()["rows"][0]["description"]
         self.assertIsNone(cell["refusal"])
         self.assertIn("placeholder_failure", cell["error"])
+        response = self.rest_client().get(
+            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,))
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["last_apply_error"], error)
 
     def test_peer_refusal_restores_router_and_sibling_history(self):
         cause = self.refused_bgp()
@@ -216,6 +221,109 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.assertFalse(result["nothing_pending"])
         for field in ("changes", "routing_changes", "total", "refusals"):
             self.assertIn(field, result)
+
+    def test_preview_unavailable_lacp_member_prevents_nothing_pending(self):
+        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+
+        with without_commit_drain(), transaction.atomic():
+            interface = Interface.objects.create(device=self.device, name="Port-channel71", type="lag")
+            bundle = acquire_overlay(
+                NSOLACPBundleState, management=self.management, interface=interface, lag_id=71, status="accepted"
+            )
+            member_iface = Interface.objects.create(
+                device=self.device, name="Ethernet71", type="1000base-t", lag=interface
+            )
+            member = acquire_overlay(
+                NSOLACPMemberState, management=self.management, interface=member_iface, status="accepted"
+            )
+        self.apply_owners([bundle, member], prior_status="in_sync")
+        self.settle(self.evidence(dispositions={"lag.bundle.member": "unavailable"}))
+        rows = self.category("lacp", format="json").json()["rows"]
+        self.assertIn("unavailable", rows[0]["members"][0]["advisory"])
+        result = self.preview(make_apply_preview(device_id=1558, diffs={})).json()
+        self.assertTrue(result["diff_available"])
+        self.assertFalse(result["nothing_pending"])
+        self.assertEqual(result["total"], 1)
+        change = result["routing_changes"][0]
+        self.assertEqual(change["item"], member_iface.name)
+        self.assertEqual(change["status"], "in_sync")
+        self.assertIn("unavailable", change["advisory"])
+        self.assertIsNone(change["refusal"])
+        self.assertEqual(change["error"], self.prior[(member._meta.label_lower, member.pk)][2])
+
+    def test_preview_includes_independent_ip_mtu_member_and_flex_algo_refusals(self):
+        from ipam.models import IPAddress
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin import models
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS, document_section_for_stream
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_routing = True
+            self.management.manage_isis = True
+            self.management.manage_interfaces = True
+            self.management.save(update_fields=("manage_routing", "manage_isis", "manage_interfaces"))
+            iface = Interface.objects.create(device=self.device, name="Ethernet71", type="1000base-t", mtu=9000)
+            IPAddress.objects.create(address="198.18.0.1/24", assigned_object=iface)
+            ip = acquire_overlay(
+                models.NSOInterfaceIPState, interface=iface, address="198.18.0.1/24", status="accepted"
+            )
+            mtu = acquire_overlay(
+                models.NSOInterfaceMtuState,
+                management=self.management,
+                interface=iface,
+                l2_mtu=9000,
+                status="accepted",
+            )
+            bundle_iface = Interface.objects.create(device=self.device, name="Port-channel71", type="lag")
+            bundle = acquire_overlay(
+                models.NSOLACPBundleState,
+                management=self.management,
+                interface=bundle_iface,
+                lag_id=71,
+                status="accepted",
+            )
+            iface.lag = bundle_iface
+            iface.save(update_fields=("lag",))
+            member = acquire_overlay(
+                models.NSOLACPMemberState, management=self.management, interface=iface, status="accepted"
+            )
+            instance = ISISInstance.objects.create(
+                device=self.device, process_tag="placeholder-process", net="49.0001.0000.0000.0001.00"
+            )
+            native = ISISFlexAlgo.objects.create(instance=instance, algo_id=130)
+            flex_algo = acquire_overlay(
+                models.NSOISISFlexAlgoState,
+                management=self.management,
+                isis_flex_algo=native,
+                process_tag=instance.process_tag,
+                algo_id=130,
+                status="accepted",
+            )
+        self.apply_owners([ip, mtu, bundle, member, flex_algo], prior_status="in_sync")
+        generation = self.evidence(
+            dispositions=dict.fromkeys(
+                ("interface.ipv4-address", "mtu.interface", "lag.bundle.member", "isis.process-config.flex-algo"),
+                "refused",
+            )
+        )
+        generation["sections"] = sorted({document_section_for_stream(stream) for stream in generation["sections"]})
+        for section in generation["sections"]:
+            for counter in SECTION_COUNTER_KEYS[section]:
+                generation["carrier_job_result"].setdefault(
+                    counter, dict.fromkeys(("in_sync", "apply_failed", "not_applied", "unavailable"), 0)
+                )
+        self.settle(generation)
+        result = self.preview(make_apply_preview(device_id=1558, diffs={})).json()
+        expected = {"Interface IP", "Interface MTU", "LACP member", "IS-IS Flex-Algo"}
+        self.assertEqual({change["category"] for change in result["routing_changes"]}, expected)
+        self.assertEqual(result["total"], 4)
+        self.assertFalse(result["nothing_pending"])
+        for change in result["routing_changes"]:
+            with self.subTest(category=change["category"]):
+                self.assertTrue(change["refusal"]["valid"])
+                self.assertTrue(change["refusal_text"].startswith("inexpressible-on-ned: "))
+                self.assertEqual(change["error"], change["refusal_text"])
 
     def test_document_refusal_summary_requires_no_commit_proof(self):
         from netbox_nso_plugin.refusal_display import document_projection
@@ -327,6 +435,29 @@ class TestRefusalDisplay(BGPCaptureCase):
                     self.assertEqual(response.status_code, 200, response.content)
                     self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
                     self.assertContains(response, "invalid refusal evidence")
+
+    def test_interface_rest_projects_correlated_refusal_over_replaced_json_error(self):
+        from ._outbox_case import mirror_update
+
+        iface, row, generation = self.interface_execution()
+        api = self.rest_client()
+        detail = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,))
+        listing = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list")
+        cause = generation["row_outcomes"][0]["refusals"][0]
+        for error in ({"message": "placeholder-secret-canary"}, {}):
+            with self.subTest(error=error):
+                mirror_update(row, last_apply_error=error)
+                for url in (detail, listing):
+                    with self.subTest(url=url):
+                        response = api.get(url)
+                        self.assertEqual(response.status_code, 200, response.content)
+                        self.assertNotIn("placeholder-secret-canary", response.content.decode())
+                        data = response.json()
+                        projected = data["results"][0] if url == listing else data
+                        self.assertEqual(projected["last_apply_error"]["refusals"], [cause])
+                        self.assertEqual(
+                            projected["last_apply_error"]["message"], f"{cause['reason']}: {cause['message']}"
+                        )
 
     def test_management_rest_rejects_forged_cached_refusal(self):
         from ._outbox_case import mirror_update
@@ -691,6 +822,15 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.assertEqual(row.last_apply_error, prior)
         cell = self.category("interface", format="json").json()["rows"][0]["description"]
         self.assertIn(previous["refusals"][0]["reason"], cell["error"] or "")
+        response = self.rest_client().get(
+            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,))
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        cause = prior["refusals"][0]
+        self.assertEqual(
+            response.json()["last_apply_error"],
+            {"refusals": prior["refusals"], "message": f"{cause['reason']}: {cause['message']}"},
+        )
         return cell
 
     def test_unavailable_execution_retains_prior_structured_error(self):

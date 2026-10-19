@@ -6218,6 +6218,143 @@ def _apply_preview_interface_changes(device_pk):
     return changes
 
 
+def _apply_preview_owner_changes(device_pk):
+    """List every settled owner outside the interface attribute panel."""
+
+    def _iface(r):
+        try:
+            return r.interface.name
+        except Exception:
+            return "—"
+
+    def _vlan_item(r):
+        return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
+
+    bgp_observations = {}
+
+    # Formatters affect presentation only; the settlement registry selects every owner.
+    preview_formatters = {
+        "nsovlanstate": ("VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else ""),
+        "nsoswitchportstate": ("Switchport", _iface, lambda r: r.mode or ""),
+        "nsosvistate": (
+            "SVI / IRB",
+            _iface,
+            lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
+        ),
+        "nsosubinterfacestate": ("Subinterface", _iface, lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else ""),
+        "nsobfdinterfacestate": (
+            "BFD",
+            _iface,
+            lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
+        ),
+        "nsolacpbundlestate": ("LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else ""),
+        "nsostaticroutestate": (
+            "Static route",
+            lambda r: r.nso_prefix or "",
+            lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
+        ),
+        "nsoisisinterfacestate": ("IS-IS interface", _iface, _isis_iface_detail),
+        "nsoisisinstancestate": ("IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or ""),
+        "nsoospfinterfacestate": ("OSPF interface", _iface, _ospf_iface_detail),
+        "nsoospfinstancestate": ("OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
+        "nsobgprouterstate": (
+            "BGP router",
+            lambda r: f"AS {r.asn_str}",
+            lambda r: str(r.bgp_router.router_id or "") if r.bgp_router_id else "",
+        ),
+        "nsobgppeerstate": (
+            "BGP peer",
+            lambda r: r.peer_address_str or "",
+            lambda r: _bgp_peer_preview_detail(r, bgp_observations),
+        ),
+        "nsoroutepolicystate": ("Route policy", lambda r: r.object_name or "", lambda r: r.family or ""),
+        "nsoredistributionstate": (
+            "Redistribution",
+            lambda r: f"{r.source_protocol} → {r.dest_protocol}",
+            lambda r: r.route_map or "",
+        ),
+        "nsosnmpcommunitystate": ("SNMP community", lambda r: "community", lambda r: r.access or ""),
+        "nsosnmpv3userstate": ("SNMP v3 user", lambda r: r.username or "user", lambda r: ""),
+        "nsosnmphoststate": (
+            "SNMP host",
+            lambda r: r.address or "",
+            lambda r: f"v{r.version}" if r.version else "",
+        ),
+        "nsosnmpsysteminfostate": ("SNMP system", lambda r: "system-info", lambda r: ""),
+        "nsologginghoststate": ("Logging host", lambda r: r.address or "", lambda r: r.severity or ""),
+        "nsologginglevelstate": (
+            "Logging levels",
+            lambda r: "local-levels",
+            lambda r: ", ".join(f"{f.split('_')[0]}={v}" for f, v in r.set_severities().items()),
+        ),
+        "nsol2sapstate": ("L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or ""),
+        "nsointerfaceipstate": ("Interface IP", _iface, lambda r: _join_props([r.address, r.vrf])),
+        "nsointerfacemtustate": (
+            "Interface MTU",
+            _iface,
+            lambda r: _join_props(
+                [f"{key} {getattr(r, key)}" for key in ("l2_mtu", "ip_mtu", "mpls_mtu") if getattr(r, key) is not None]
+            ),
+        ),
+        "nsolacpmemberstate": (
+            "LACP member",
+            _iface,
+            lambda r: _join_props([r.mode, f"priority {r.port_priority}" if r.port_priority is not None else ""]),
+        ),
+        "nsoisisflexalgostate": (
+            "IS-IS Flex-Algo",
+            lambda r: f"{r.process_tag} / {r.algo_id}",
+            lambda r: r.metric_type or "",
+        ),
+    }
+
+    from .delivery import delivery_keys
+    from .refusal_display import UNAVAILABLE, project_rows, row_projection
+    from .refusal_registry import OVERLAYS
+
+    routing_changes = []
+    for spec in OVERLAYS.values():
+        model = spec.model
+        if model is NSOInterfaceState:
+            continue
+        label, item_fn, detail_fn = preview_formatters.get(
+            model._meta.model_name,
+            (str(model._meta.verbose_name), lambda r: f"row {r.pk}", lambda r: ""),
+        )
+        # Include pending owners and unresolved executions in the confirmation count.
+        rows = model.objects.filter(**{spec.device_lookup: device_pk})
+        for r in project_rows(rows):
+            projected = row_projection(r)
+            if r.status not in {"accepted", "apply_failed", "deploying"} and projected["advisory"] != UNAVAILABLE:
+                continue
+            try:
+                item = item_fn(r)
+            except Exception:
+                item = "—"
+            try:
+                detail = detail_fn(r)
+            except Exception:
+                detail = ""
+            key = r.dest_protocol if len(spec.delivery_keys) > 1 else spec.delivery_keys[0]
+            scope_val = key if delivery_keys()[key].in_protocol else None
+            # Show the age of staged intent and whether it has ever been applied.
+            accepted_at = getattr(r, "accepted_at", None)
+            staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None
+            routing_changes.append(
+                {
+                    **projected,
+                    "category": label,
+                    "item": item,
+                    "detail": detail,
+                    "status": r.status,
+                    "scope": scope_val,
+                    "staged_days": staged_days,
+                    "never_applied": getattr(r, "last_apply_at", None) is None,
+                }
+            )
+    return routing_changes
+
+
 class NSOApplyPreviewView(LoginRequiredMixin, View):
     """JSON preview of what 'Apply Intent' would push to the device.
 
@@ -6235,153 +6372,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
 
         changes = _apply_preview_interface_changes(device_pk)
 
-        # Every other category is an NSO*State overlay committed by this same single
-        # Apply. Itemise each pending row (category + item + detail) so the operator
-        # sees exactly what will be pushed — not just a count.
-        from .models import NSOLACPBundleState, NSOSwitchportState
-
-        def _iface(r):
-            try:
-                return r.interface.name
-            except Exception:
-                return "—"
-
-        def _vlan_item(r):
-            return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
-
-        bgp_observations = {}
-
-        # (Model, category label, item fn, detail fn) — all read defensively.
-        # The fifth element names the intent scope that receives the row's push.
-        # None marks a push outside the mirrored scopes. Redistribution uses its
-        # destination protocol's scope. The dry-run preview covers the whole device,
-        # so its delta cannot identify a separate change for each row or scope.
-        preview_specs = [
-            (NSOVLANState, "VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else "", "vlan"),
-            (NSOSwitchportState, "Switchport", _iface, lambda r: r.mode or "", None),
-            (
-                NSOSVIState,
-                "SVI / IRB",
-                _iface,
-                lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
-                "svi",
-            ),
-            (
-                NSOSubinterfaceState,
-                "Subinterface",
-                _iface,
-                lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else "",
-                "subinterface",
-            ),
-            (
-                NSOBFDInterfaceState,
-                "BFD",
-                _iface,
-                lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
-                "bfd",
-            ),
-            (NSOLACPBundleState, "LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else "", None),
-            (
-                NSOStaticRouteState,
-                "Static route",
-                lambda r: r.nso_prefix or "",
-                lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
-                "static_route",
-            ),
-            (NSOISISInterfaceState, "IS-IS interface", _iface, _isis_iface_detail, "isis"),
-            (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or "", "isis"),
-            (NSOOSPFInterfaceState, "OSPF interface", _iface, _ospf_iface_detail, "ospf"),
-            (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or "", "ospf"),
-            (
-                NSOBGPRouterState,
-                "BGP router",
-                lambda r: f"AS {r.asn_str}",
-                lambda r: str(r.bgp_router.router_id or "") if r.bgp_router_id else "",
-                "bgp",
-            ),
-            (
-                NSOBGPPeerState,
-                "BGP peer",
-                lambda r: r.peer_address_str or "",
-                lambda r: _bgp_peer_preview_detail(r, bgp_observations),
-                "bgp",
-            ),
-            (
-                NSORoutePolicyState,
-                "Route policy",
-                lambda r: r.object_name or "",
-                lambda r: r.family or "",
-                "route_policy",
-            ),
-            (
-                NSORedistributionState,
-                "Redistribution",
-                lambda r: f"{r.source_protocol} → {r.dest_protocol}",
-                lambda r: r.route_map or "",
-                lambda r: r.dest_protocol or None,
-            ),
-            (NSOSnmpCommunityState, "SNMP community", lambda r: "community", lambda r: r.access or "", "snmp"),
-            (NSOSnmpV3UserState, "SNMP v3 user", lambda r: r.username or "user", lambda r: "", "snmp"),
-            (
-                NSOSnmpHostState,
-                "SNMP host",
-                lambda r: r.address or "",
-                lambda r: f"v{r.version}" if r.version else "",
-                "snmp",
-            ),
-            (NSOSnmpSystemInfoState, "SNMP system", lambda r: "system-info", lambda r: "", "snmp"),
-            (NSOLoggingHostState, "Logging host", lambda r: r.address or "", lambda r: r.severity or "", "logging"),
-            (
-                NSOLoggingLevelState,
-                "Logging levels",
-                lambda r: "local-levels",
-                lambda r: ", ".join(f"{f.split('_')[0]}={v}" for f, v in r.set_severities().items()),
-                "logging",
-            ),
-            (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or "", "l2_sap"),
-        ]
-
-        from .refusal_display import UNAVAILABLE, row_projection
-
-        routing_changes = []
-        if mgmt is not None:
-            for model, label, item_fn, detail_fn, scope in preview_specs:
-                # accepted/apply_failed (owned, differs) AND deploying (apply pushed, not yet
-                # confirmed) are all "pending apply" on the tab — the preview must count the same
-                # set or a device with only deploying rows previews total=0 and skips the modal.
-                rows = model.objects.filter(management=mgmt)
-                for r in rows:
-                    projected = row_projection(r)
-                    if (
-                        r.status not in {"accepted", "apply_failed", "deploying"}
-                        and projected["advisory"] != UNAVAILABLE
-                    ):
-                        continue
-                    try:
-                        item = item_fn(r)
-                    except Exception:
-                        item = "—"
-                    try:
-                        detail = detail_fn(r)
-                    except Exception:
-                        detail = ""
-                    scope_val = scope(r) if callable(scope) else scope
-                    # Staleness: a row accepted long ago and never applied is staged-and-
-                    # forgotten (example-comm sat silently for a month) — surface it.
-                    accepted_at = getattr(r, "accepted_at", None)
-                    staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None
-                    routing_changes.append(
-                        {
-                            **projected,
-                            "category": label,
-                            "item": item,
-                            "detail": detail,
-                            "status": r.status,
-                            "scope": scope_val,
-                            "staged_days": staged_days,
-                            "never_applied": getattr(r, "last_apply_at", None) is None,
-                        }
-                    )
+        routing_changes = _apply_preview_owner_changes(device_pk)
 
         # Right panel: the diff the Apply would push (NSO dry-run, no commit).
         # outformat=cli → NSO's NED-uniform +/- tree diff (rendered via diff2html);

@@ -1,6 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
 rules:
+  - id: nso-row-error-projection-bypass
+    languages: [python]
+    severity: ERROR
+    message: Read overlay errors through refusal_display.row_projection so correlated ledger evidence takes precedence.
+    pattern-either:
+      - pattern: $ROW.last_apply_error
+      - pattern: getattr($ROW, "last_apply_error", ...)
+    paths:
+      include:
+        - "netbox_nso_plugin/**/serializers.py"
+        - "netbox_nso_plugin/**/serializers/**/*.py"
+        - "netbox_nso_plugin/**/views.py"
+        - "netbox_nso_plugin/**/views/**/*.py"
+        - "netbox_nso_plugin/**/templatetags/**/*.py"
+      exclude: ["**/tests/**"]
   - id: nso-route-policy-name-folding
     languages: [python]
     severity: ERROR

@@ -18,16 +18,11 @@ class RefusalDisplaySerializerMixin:
     """Project overlay errors at every REST serialization boundary."""
 
     def to_representation(self, instance):
-        from ..refusal_display import row_projection, stored_error_projection
+        from ..refusal_display import row_projection
 
         data = super().to_representation(instance)
         if "last_apply_error" in data:
-            error = instance.last_apply_error
-            data["last_apply_error"] = (
-                stored_error_projection(error)
-                if isinstance(error, dict)
-                else row_projection(instance)["error"] or error
-            )
+            data["last_apply_error"] = row_projection(instance)["error_value"]
         return data
 
 
