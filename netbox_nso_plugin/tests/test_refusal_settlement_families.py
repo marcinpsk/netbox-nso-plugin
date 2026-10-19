@@ -18,15 +18,15 @@ from netbox_nso_plugin.models import (
     NSOLACPMemberState,
     NSOSwitchportState,
 )
-from netbox_nso_plugin.refusal_registry import OVERLAYS
 
+from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import without_commit_drain
 from ._ownership_case import acquire_overlay, save_overlay_fixture
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
-class TestRefusalSettlementFamilies(BGPCaptureCase):
+class TestRefusalSettlementFamilies(BGPSettlementHelpers, BGPCaptureCase):
     def apply_owners(self, owners):
         self.owners = owners
         self.prior = {}
@@ -49,92 +49,6 @@ class TestRefusalSettlementFamilies(BGPCaptureCase):
         )
         self.assertEqual(response.status_code, 200, response.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
-
-    def evidence(self, refused=None, dispositions=None):
-        import json
-        from pathlib import Path
-
-        catalog = json.loads((Path(__file__).parent / "fixtures/refusal_settlement.json").read_text(encoding="utf-8"))[
-            "bgp"
-        ]["refusal"]
-        outcomes, attributed, revisions, sources = [], [], {}, {}
-        for snapshot in self.attempt.overlay_snapshots.all():
-            for contributor in snapshot.contributors["rows"]:
-                stream = contributor["stream"]
-                selector = contributor["source_selector"]
-                source = selector.get("source_push_seq")
-                revision = selector.get("selection_revision", 7)
-                revisions[stream], sources[stream] = revision, source
-                ref, parent = contributor["logical_ref"], contributor["carrier_ref"]
-                carrier = {
-                    "stream": stream,
-                    "row": {key: parent[key] for key in ("subject", "key")},
-                    "source_push_seq": source,
-                    "frozen_revision": revision,
-                    "accepted_at": self.stamp.isoformat(),
-                    "generation_id": 81,
-                    "settlement_cohort": 9,
-                }
-                identity = {key: value for key, value in carrier.items() if key not in {"row", "accepted_at"}}
-                identity.update(
-                    row={key: ref[key] for key in ("subject", "key")},
-                    acceptance_identity=self.stamp.isoformat(),
-                    carrier=carrier,
-                )
-                failed = refused is not None and (snapshot.model_label, snapshot.overlay_pk) == (
-                    refused._meta.label_lower,
-                    refused.pk,
-                )
-                disposition = (dispositions or {}).get(ref["subject"], "refused" if failed else "not_applied")
-                causes = []
-                if disposition == "refused":
-                    cause = {**catalog, "family": ref["family"], "row": identity["row"]}
-                    causes.append(cause)
-                    attributed.append(
-                        {
-                            **cause,
-                            "logical_rows": [copy.deepcopy(identity)],
-                            "provenance": "current",
-                            "sender_phase": "commit",
-                        }
-                    )
-                outcomes.append({**identity, "disposition": disposition, "refusals": causes})
-        priority = {"in_sync": 0, "not_applied": 1, "unavailable": 2, "refused": 3}
-        carriers = {}
-        for outcome in outcomes:
-            carrier = outcome["carrier"]
-            key = (carrier["stream"], carrier["row"]["subject"], carrier["row"]["key"])
-            existing = carriers.get(key)
-            if existing is None or priority[outcome["disposition"]] > priority[existing["disposition"]]:
-                carriers[key] = {**carrier, "disposition": outcome["disposition"]}
-        counts = {}
-        for carrier in carriers.values():
-            spec = next(spec for spec in OVERLAYS.values() if carrier["row"]["subject"] in spec.subjects)
-            key = spec.counter_keys[0] if len(spec.counter_keys) == 1 else f"{carrier['stream']}_count_by_outcome"
-            count = counts.setdefault(key, dict.fromkeys(("in_sync", "apply_failed", "not_applied", "unavailable"), 0))
-            count["apply_failed" if carrier["disposition"] == "refused" else carrier["disposition"]] += 1
-        result = {
-            **counts,
-            "row_outcomes": outcomes,
-            "refusals": attributed,
-            "settlement_owners": list(carriers.values()),
-            "commit_acknowledged": not attributed,
-        }
-        return {
-            "generation_id": 81,
-            "seq": 4,
-            "status": "failed" if attributed else "settled",
-            "sections": sorted(revisions),
-            "stream_revisions": revisions,
-            "source_push_seq": sources,
-            "carrier_job_id": 501,
-            "carrier_job_status": "succeeded",
-            "carrier_job_result": result,
-            "carrier_job_error": None,
-            "row_outcomes": outcomes,
-            "refusals": attributed,
-            "updated_at": self.stamp.isoformat(),
-        }
 
     def settle(self, generation):
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation

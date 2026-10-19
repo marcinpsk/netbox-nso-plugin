@@ -10,124 +10,12 @@ from django.urls import reverse
 
 from netbox_nso_plugin.models import NSOApplyAttempt, NSOApplyExecution
 
+from ._bgp_settlement import BGPSettlementHelpers
 from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
-class TestRefusalSettlementRuntime(BGPCaptureCase):
-    def prepare(self, *, redistribution=False, mode="networked"):
-        def admission(selected):
-            response = _promoted(selected)
-            response["generations"] = response["generations"][:1]
-            response["generations"][0]["mode"] = mode
-            return 202, response
-
-        self.adapter.apply_response = admission
-        scope = self.scope()
-        self.owners = [
-            self.router_owner(),
-            self.peer(scope, "198.18.0.2"),
-            self.peer(scope, "198.18.0.3", status="in_sync"),
-        ]
-        if redistribution:
-            self.owners.append(self.redistribution(scope))
-        self.prior = {
-            (row._meta.label_lower, row.pk): (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id)
-            for row in self.owners
-        }
-        answer = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
-        self.assertEqual(answer.status_code, 200, answer.content)
-        self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
-
-    def terminal(self, refused=1, *, disposition=None):
-        import json
-        from pathlib import Path
-
-        cause = json.loads((Path(__file__).parent / "fixtures/refusal_settlement.json").read_text(encoding="utf-8"))[
-            "bgp"
-        ]["refusal"]
-        snapshots = list(self.attempt.overlay_snapshots.order_by("model_label", "overlay_pk"))
-        selected = self.attempt.selected
-
-        def identity(ref, accepted_key="acceptance_identity"):
-            return {
-                "stream": "bgp",
-                "row": {"subject": ref["subject"], "key": ref["key"]},
-                "source_push_seq": selected["bgp"],
-                "frozen_revision": 7,
-                accepted_key: self.stamp.isoformat(),
-                "generation_id": 81,
-                "settlement_cohort": 9,
-            }
-
-        owner = self.owners[refused] if refused is not None else None
-        outcomes = []
-        for snapshot in snapshots:
-            ref = snapshot.contributors["rows"][0]["logical_ref"]
-            failed = owner is not None and (snapshot.model_label, snapshot.overlay_pk) == (
-                owner._meta.label_lower,
-                owner.pk,
-            )
-            outcome_cause = {**cause, "row": {"subject": ref["subject"], "key": ref["key"]}}
-            outcomes.append(
-                {
-                    **identity(ref),
-                    "carrier": identity(snapshot.contributors["rows"][0]["carrier_ref"], "accepted_at"),
-                    "disposition": disposition or ("refused" if failed else "not_applied" if owner else "in_sync"),
-                    "refusals": [outcome_cause] if failed else [],
-                }
-            )
-        failed = next((row for row in outcomes if row["disposition"] == "refused"), None)
-        causes = (
-            []
-            if failed is None
-            else [
-                {
-                    **failed["refusals"][0],
-                    "logical_rows": [
-                        {key: value for key, value in failed.items() if key not in {"disposition", "refusals"}}
-                    ],
-                    "provenance": "current",
-                    "sender_phase": "pre_commit_dry_run",
-                }
-            ]
-        )
-        counter = dict.fromkeys(("in_sync", "apply_failed", "not_applied", "unavailable"), 0)
-        carriers = {}
-        priority = {"in_sync": 0, "not_applied": 1, "unavailable": 2, "refused": 3}
-        for outcome in outcomes:
-            key = json.dumps(outcome["carrier"], sort_keys=True)
-            previous = carriers.get(key)
-            if previous is None or priority[outcome["disposition"]] > priority[previous["disposition"]]:
-                carriers[key] = {**outcome["carrier"], "disposition": outcome["disposition"]}
-        for carrier in carriers.values():
-            counter["apply_failed" if carrier["disposition"] == "refused" else carrier["disposition"]] += 1
-        result = {
-            "row_outcomes": outcomes,
-            "refusals": causes,
-            "settlement_owners": list(carriers.values()),
-            "bgp_count_by_outcome": counter,
-            "commit_acknowledged": owner is None,
-        }
-        return {
-            "generation_id": 81,
-            "seq": 4,
-            "status": "failed" if owner else "settled",
-            "sections": ["bgp"],
-            "stream_revisions": {"bgp": 7},
-            "source_push_seq": {"bgp": selected["bgp"]},
-            "carrier_job_id": 501,
-            "carrier_job_status": "succeeded",
-            "carrier_job_result": result,
-            "carrier_job_error": None,
-            "updated_at": (self.stamp + timedelta(days=1)).isoformat(),
-            "row_outcomes": outcomes,
-            "refusals": causes,
-        }
-
+class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
     def settle(self, generation):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
 
@@ -273,24 +161,6 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
             {"unavailable"},
         )
 
-    def prepare_automatic(self):
-        from netbox_nso_plugin import drain
-
-        scope = self.scope()
-        self.owners = [
-            self.router_owner(),
-            self.peer(scope, "198.18.0.2"),
-            self.peer(scope, "198.18.0.3", status="in_sync"),
-        ]
-        self.prior = {
-            (row._meta.label_lower, row.pk): (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id)
-            for row in self.owners
-        }
-        drain.drain_intent_outbox()
-        self.attempt = NSOApplyAttempt.objects.get(
-            trigger_kind="push", overlay_snapshots__model_label=self.owners[0]._meta.label_lower
-        )
-
     def test_cadence_settles_without_manual_uuid(self):
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
@@ -353,112 +223,6 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(row.status, "in_sync")
-
-    def serve_terminal_evidence(
-        self,
-        generation,
-        *,
-        epoch_change=False,
-        manual=False,
-        head=True,
-        pruned=False,
-        settle_seq=1,
-        earlier_generations=(),
-    ):
-        from ._adapter_http import make_response
-        from .test_durable_bgp_capture import _CaptureHandler
-
-        class EvidenceHandler(_CaptureHandler):
-            def end_headers(handler):
-                handler.send_header("X-Store-Incarnation", handler.server.evidence_incarnation)
-                super().end_headers()
-
-        self.server.RequestHandlerClass = EvidenceHandler
-        self.server.evidence_incarnation = "placeholder-store"
-        from netbox_nso_plugin import adapter_client
-
-        adapter_client.reset_session()
-        original = self.adapter._handle
-        self.evidence_requests = []
-        feed_requests = 0
-
-        def handle(method, url, **kwargs):
-            nonlocal feed_requests
-            self.evidence_requests.append((method, url))
-            if method == "GET" and url.endswith("/jobs"):
-                feed_requests += 1
-                if epoch_change and feed_requests > 1:
-                    self.server.evidence_incarnation = "placeholder-reset-store"
-                job = {
-                    "id": generation["carrier_job_id"],
-                    "type": "apply",
-                    "device_id": self.management.adapter_device_id,
-                    "status": generation["carrier_job_status"],
-                    "result": generation["carrier_job_result"],
-                    "row_outcomes": generation["row_outcomes"],
-                    "refusals": generation["refusals"],
-                    "error": None,
-                    "context": None,
-                    "created_at": self.stamp.isoformat(),
-                    "updated_at": generation["updated_at"],
-                    "started_at": self.stamp.isoformat(),
-                    "heartbeat_at": None,
-                    "settle_seq": settle_seq,
-                }
-                after = int(kwargs["params"]["after_settle_seq"])
-                return make_response(200, [] if pruned or job["settle_seq"] <= after else [job])
-            if method == "GET" and url.endswith("/generations"):
-                return make_response(
-                    200,
-                    [
-                        *earlier_generations,
-                        {
-                            "generation_id": generation["generation_id"],
-                            "seq": generation["seq"],
-                            "status": generation["status"],
-                            "job_id": generation["carrier_job_id"],
-                            "mode": "networked",
-                            "settlement_cohort": 9,
-                            "digest": "a" * 64,
-                            "stream_revisions": generation["stream_revisions"],
-                            "source_push_seq": generation["source_push_seq"],
-                            "created_at": self.stamp.isoformat(),
-                            "updated_at": generation["updated_at"],
-                        },
-                    ],
-                )
-            if method == "POST" and url.endswith("/deployment-evidence"):
-                head = {key: value for key, value in generation.items() if key != "stream_revisions"}
-                head.update(
-                    mode="networked", settlement_cohort=9, apply_attempt_id=None, created_at=self.stamp.isoformat()
-                )
-                return make_response(
-                    200,
-                    {
-                        "device_id": self.management.adapter_device_id,
-                        "head": head if head_enabled else None,
-                        "blocked": generation["status"] == "failed",
-                        "write_work_pending": False,
-                        "held_jobs": [],
-                        "pending_generations": 0,
-                        "attempts": [
-                            {
-                                "apply_attempt_id": str(self.attempt.pk),
-                                "admission_state": "admitted",
-                                "http_status": 202,
-                                "response": self.attempt.response,
-                                "generations": [generation],
-                            }
-                        ]
-                        if manual and str(self.attempt.pk) in kwargs["json"]["apply_attempt_ids"]
-                        else [],
-                        "unknown_apply_attempt_ids": [],
-                    },
-                )
-            return original(method, url, **kwargs)
-
-        head_enabled = head
-        self.adapter._handle = handle
 
     def test_cadence_http_feed_settles_without_manual_uuid(self):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
@@ -1188,7 +952,6 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
 
         from ._outbox_case import own_vlan
         from .test_apply_settlement import _payload
-        from .test_refusal_settlement_families import TestRefusalSettlementFamilies
 
         self.prepare()
         manual = self.attempt
@@ -1200,7 +963,7 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
             overlay_snapshots__model_label=vlan._meta.label_lower,
             overlay_snapshots__overlay_pk=vlan.pk,
         )
-        second = TestRefusalSettlementFamilies.evidence(self, dispositions={"vlan.vlan": "in_sync"})
+        second = self.evidence(dispositions={"vlan.vlan": "in_sync"})
         second.update(generation_id=82, seq=5)
         for identity in second["row_outcomes"] + second["carrier_job_result"]["settlement_owners"]:
             identity["generation_id"] = 82

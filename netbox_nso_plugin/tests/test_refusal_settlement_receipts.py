@@ -5,10 +5,10 @@
 from netbox_nso_plugin.models import NSOApplyExecution
 
 from . import test_durable_bgp_capture as bgp_case
-from . import test_refusal_settlement_runtime as runtime_case
+from ._bgp_settlement import BGPSettlementHelpers
 
 
-class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
+class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
     def test_corrected_automatic_receipt_retains_the_original_manual_attempt(self):
         import copy
 
@@ -18,11 +18,10 @@ class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
 
         from ._adapter_http import make_response
         from ._outbox_case import own_vlan
-        from .test_refusal_settlement_families import TestRefusalSettlementFamilies
 
-        runtime_case.TestRefusalSettlementRuntime.prepare(self)
+        self.prepare()
         manual = self.attempt
-        bgp = runtime_case.TestRefusalSettlementRuntime.terminal(self)
+        bgp = self.terminal()
         vlan = own_vlan(self.management, 79, "lost-receipt-manual-sibling")
         self.adapter.drop_response_once = True
         drain.drain_intent_outbox()
@@ -33,14 +32,14 @@ class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
         )
         selection = self.attempt.overlay_snapshots.get().selection
         self.assertIsNone(selection.acknowledged_at)
-        automatic = TestRefusalSettlementFamilies.evidence(self, dispositions={"vlan.vlan": "in_sync"})
+        automatic = self.evidence(dispositions={"vlan.vlan": "in_sync"})
         automatic.update(generation_id=82, seq=5, carrier_job_id=502)
         for identity in automatic["row_outcomes"] + automatic["carrier_job_result"]["settlement_owners"]:
             identity["generation_id"] = 82
             if "carrier" in identity:
                 identity["carrier"]["generation_id"] = 82
         self.attempt = manual
-        runtime_case.TestRefusalSettlementRuntime.serve_terminal_evidence(self, bgp, manual=True)
+        self.serve_terminal_evidence(bgp, manual=True)
         original = self.adapter._handle
         base_job = original("GET", self.server.adapter_url + "/api/v1/jobs", params={"after_settle_seq": 0}).json()[0]
         invalid_receipt = True
@@ -141,12 +140,12 @@ class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
         from ._adapter_http import make_response
 
         self.adapter.drop_response_once = True
-        runtime_case.TestRefusalSettlementRuntime.prepare_automatic(self)
+        self.prepare_automatic()
         self.selection = self.attempt.overlay_snapshots.first().selection
         self.assertIsNone(self.selection.acknowledged_at)
         self.assertEqual(len(self.adapter.capture_reads), 1)
-        generation = runtime_case.TestRefusalSettlementRuntime.terminal(self)
-        runtime_case.TestRefusalSettlementRuntime.serve_terminal_evidence(self, generation, epoch_change=epoch_change)
+        generation = self.terminal()
+        self.serve_terminal_evidence(generation, epoch_change=epoch_change)
         original = self.adapter._handle
         stored = next(receipt for url, receipt in self.adapter.receipts.items() if url.endswith("/bgp-intent"))
         self.receipt = {
@@ -269,7 +268,6 @@ class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
 
         from ._outbox_case import partition, without_commit_drain
         from ._static_route_case import _own, _route
-        from .test_refusal_settlement_families import TestRefusalSettlementFamilies
 
         with without_commit_drain():
             self.management.manage_static = True
@@ -299,7 +297,7 @@ class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
         )
         row.refresh_from_db()
         self.assertIsNone(row.expected_generation)
-        generation = TestRefusalSettlementFamilies.evidence(self, dispositions={"static-route.route": "in_sync"})
+        generation = self.evidence(dispositions={"static-route.route": "in_sync"})
         generation["carrier_job_result"]["static_route_results"] = [
             {
                 "route_id": native.pk,
@@ -308,7 +306,7 @@ class TestLostPublicationReceipt(bgp_case.BGPCaptureCase):
                 "outcome": "in_sync",
             }
         ]
-        runtime_case.TestRefusalSettlementRuntime.serve_terminal_evidence(self, generation)
+        self.serve_terminal_evidence(generation)
         settle_device_apply_attempts(self.management)
         row.refresh_from_db()
         self.assertEqual(row.status, "in_sync")

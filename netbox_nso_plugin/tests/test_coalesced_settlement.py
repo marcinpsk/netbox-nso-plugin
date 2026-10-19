@@ -6,6 +6,7 @@ import copy
 
 import pytest
 
+from ._bgp_settlement import BGPSettlementHelpers
 from .test_durable_bgp_capture import BGPCaptureCase
 from .test_refusal_contract import generation
 from .test_refusal_result import refused_bgp_result
@@ -69,7 +70,7 @@ def test_coalesced_carrier_rejects_changed_secondary_authority():
         validate_carrier_generations(generations)
 
 
-class TestCoalescedOwnerSettlement(BGPCaptureCase):
+class TestCoalescedOwnerSettlement(BGPSettlementHelpers, BGPCaptureCase):
     def prepare_carrier(self):
         from uuid import UUID
 
@@ -79,7 +80,6 @@ class TestCoalescedOwnerSettlement(BGPCaptureCase):
 
         from ._outbox_case import own_vlan
         from .test_apply_selector import _promoted
-        from .test_refusal_settlement_families import TestRefusalSettlementFamilies
 
         self.owners = [self.router_owner(), own_vlan(self.management, 71, "coalesced")]
         for row in self.owners:
@@ -105,9 +105,7 @@ class TestCoalescedOwnerSettlement(BGPCaptureCase):
         )
         self.assertEqual(response.status_code, 200, response.content)
         self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
-        first = TestRefusalSettlementFamilies.evidence(
-            self, dispositions={"bgp.router": "in_sync", "vlan.vlan": "in_sync"}
-        )
+        first = self.evidence(dispositions={"bgp.router": "in_sync", "vlan.vlan": "in_sync"})
         result = first["carrier_job_result"]
         for identity in result["row_outcomes"] + result["settlement_owners"]:
             if identity["stream"] != "bgp":
@@ -159,12 +157,11 @@ class TestCoalescedOwnerSettlement(BGPCaptureCase):
         from netbox_nso_plugin.settlement import settle_static_routes
 
         from ._adapter_http import make_response
-        from .test_refusal_settlement_runtime import TestRefusalSettlementRuntime
 
         generations = self.prepare_carrier()
         self.settle_carrier(generations, settle_seq=None)
         self.assertEqual(list(NSOApplyExecution.objects.values_list("settle_seq", flat=True)), [None, None])
-        TestRefusalSettlementRuntime.serve_terminal_evidence(self, generations[0])
+        self.serve_terminal_evidence(generations[0])
         original = self.adapter._handle
 
         def complete_metadata(method, url, **kwargs):

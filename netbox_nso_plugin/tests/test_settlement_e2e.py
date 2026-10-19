@@ -46,6 +46,7 @@ import json
 import requests
 from django.test import LiveServerTestCase
 
+from ._bgp_settlement import BGPSettlementHelpers
 from ._settlement_adapter import FakeAdapter, SettlementStore
 from ._settlement_case import _AdapterDoubleMixin, _CarrierMixin, _make_device, _make_mgmt
 from ._static_route_case import _assign_and_accept, _edit_owned_route
@@ -443,7 +444,7 @@ class TestTheIdentityEditSettlesEndToEnd(
         return NSODeviceManagement.objects.get(pk=self.mgmt.pk)
 
 
-class TestRefusalCallbackEndToEnd(BGPCaptureCase, LiveServerTestCase):
+class TestRefusalCallbackEndToEnd(BGPSettlementHelpers, BGPCaptureCase, LiveServerTestCase):
     """Deliver catalog refusal over both HTTP sockets and run the real RQ carrier."""
 
     host = "127.0.0.1"
@@ -513,11 +514,9 @@ class TestRefusalCallbackEndToEnd(BGPCaptureCase, LiveServerTestCase):
     def test_child_refusal_restores_unnamed_peer_after_callback_restart(self):
         from django.db import connections
 
-        from .test_refusal_settlement_runtime import TestRefusalSettlementRuntime
-
-        TestRefusalSettlementRuntime.prepare(self)
-        generation = TestRefusalSettlementRuntime.terminal(self)
-        TestRefusalSettlementRuntime.serve_terminal_evidence(self, generation)
+        self.prepare()
+        generation = self.terminal()
+        self.serve_terminal_evidence(generation)
         # Preserve the exact manual UUID returned by the adapter's accepted response.
         original = self.adapter._handle
 
