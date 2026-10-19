@@ -850,6 +850,9 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         identity = generation["generation_id"], generation["job_id"]
         if generation["status"] in {"pending", "running"} or identity in present:
             continue
+        # An abandoned generation that never had a carrier job has no execution to settle.
+        if generation["status"] == "abandoned" and generation["job_id"] is None:
+            continue
         cached = (
             _consumed_executions(management, incarnation)
             .filter(

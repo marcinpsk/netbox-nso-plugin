@@ -355,7 +355,15 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
             self.assertEqual(row.status, "in_sync")
 
     def serve_terminal_evidence(
-        self, generation, *, epoch_change=False, manual=False, head=True, pruned=False, settle_seq=1
+        self,
+        generation,
+        *,
+        epoch_change=False,
+        manual=False,
+        head=True,
+        pruned=False,
+        settle_seq=1,
+        earlier_generations=(),
     ):
         from ._adapter_http import make_response
         from .test_durable_bgp_capture import _CaptureHandler
@@ -403,6 +411,7 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
                 return make_response(
                     200,
                     [
+                        *earlier_generations,
                         {
                             "generation_id": generation["generation_id"],
                             "seq": generation["seq"],
@@ -415,7 +424,7 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
                             "source_push_seq": generation["source_push_seq"],
                             "created_at": self.stamp.isoformat(),
                             "updated_at": generation["updated_at"],
-                        }
+                        },
                     ],
                 )
             if method == "POST" and url.endswith("/deployment-evidence"):
@@ -974,6 +983,42 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
                 (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id),
                 self.prior[(row._meta.label_lower, row.pk)],
             )
+
+    def _carrierless_generation(self, status):
+        return {
+            "generation_id": 80,
+            "seq": 3,
+            "status": status,
+            "job_id": None,
+            "mode": "detach",
+            "settlement_cohort": None,
+            "digest": "b" * 64,
+            "stream_revisions": {"bgp": 6},
+            "source_push_seq": {"bgp": None},
+            "created_at": self.stamp.isoformat(),
+            "updated_at": self.stamp.isoformat(),
+        }
+
+    def test_carrierless_abandoned_generation_does_not_stall_settlement(self):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal(), earlier_generations=[self._carrierless_generation("abandoned")])
+        settle_device_apply_attempts(self.management)
+        execution = NSOApplyExecution.objects.get()
+        self.assertEqual((execution.consumption_state, execution.invariant_code), ("consumed", ""))
+        self.owners[1].refresh_from_db()
+        self.assertEqual(self.owners[1].status, "apply_failed")
+
+    def test_carrierless_failed_generation_still_stalls_before_consumption(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal(), earlier_generations=[self._carrierless_generation("failed")])
+        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+            settle_device_apply_attempts(self.management)
+        self.owners[1].refresh_from_db()
+        self.assertEqual(self.owners[1].status, self.prior[(self.owners[1]._meta.label_lower, self.owners[1].pk)][0])
 
     def test_automatic_split_streams_reconstruct_the_document_sections(self):
         from netbox_nso_plugin.apply_settlement import _generation_from_carrier
