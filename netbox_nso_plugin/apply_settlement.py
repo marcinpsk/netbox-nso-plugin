@@ -898,7 +898,7 @@ def terminal_carrier_requires_certificate(generation):
 
 
 def consumed_generation_certificate(management, incarnation, generation):
-    """Validate the retained certificate required by recovery and deployment readiness."""
+    """Validate local and remote carrier evidence for recovery and deployment readiness."""
     certificates = generation_certificates(management, incarnation, generation)
     if generation["job_id"] is not None:
         certificates = certificates.filter(carrier_job_id=generation["job_id"])
@@ -914,9 +914,42 @@ def consumed_generation_certificate(management, incarnation, generation):
     ):
         return None
     projection = _execution_projection(cached)
-    if all(projection[key] == generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
-        return projection
-    return None
+    if any(projection[key] != generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
+        return None
+    if generation["job_id"] is None and not _retained_carrier_matches(management, incarnation, generation, cached):
+        return None
+    return projection
+
+
+def _retained_carrier_matches(management, incarnation, generation, execution):
+    """Require remote carrier identity after the adapter deletes a job."""
+    from . import adapter_client as client
+    from .outcome_settlement import immutable_execution_projection
+
+    attempt = execution.attempt
+    attempt_ids = (
+        (attempt.pk,) if attempt.trigger_kind == "manual" and attempt.adapter_apply_attempt_id == attempt.pk else ()
+    )
+    evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+    _page, final_incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=0, limit=1)
+    if incarnation != final_incarnation:
+        raise EvidenceInvariantError("evidence_epoch_changed")
+    _reject_unrequested_attempts(evidence, attempt_ids)
+    if evidence.get("device_id") != management.adapter_device_id:
+        raise EvidenceInvariantError("admission_mapping_changed")
+    retained = [
+        row
+        for raw in evidence["attempts"]
+        for row in _validate_attempt(raw, attempt, incarnation)["generations"]
+        if row["generation_id"] == generation["generation_id"]
+    ]
+    head = evidence["head"]
+    if head is not None and head["generation_id"] == generation["generation_id"]:
+        if head["seq"] != generation["seq"]:
+            return False
+        retained.append(_validate_generation(_generation_from_carrier(generation, head)))
+    projection = immutable_execution_projection(_execution_projection(execution))
+    return bool(retained) and all(immutable_execution_projection(row) == projection for row in retained)
 
 
 def generation_certificates(management, incarnation, generation):

@@ -178,7 +178,7 @@ def check_active_streams():
             if terminal_carrier_requires_certificate(generation):
                 _require(
                     consumed_generation_certificate(management, incarnation, generation) is not None,
-                    "A terminal remote carrier has no verified consumed execution evidence",
+                    "missing_generation_evidence: A terminal remote carrier has no verified consumed execution evidence",
                 )
             for stream, revision in generation["stream_revisions"].items():
                 source = generation["source_push_seq"][stream]

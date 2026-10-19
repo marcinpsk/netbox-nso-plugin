@@ -350,7 +350,7 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
             {
                 ("drain.py", "_claim_or_wait", "_claim_after_audit"),
                 ("drain.py", "claim", "_claim_after_audit"),
-                ("management/commands/nso_intent_deployment_gate.py", "Command._verify", "drain.claim"),
+                ("management/commands/nso_intent_deployment_gate.py", "Command._store_preparation", "drain.claim"),
             },
         )
 
@@ -367,6 +367,10 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
             found,
             {
                 ("delivery.py", "deliver", "render"),
+                # Readiness proves current ownership and content against captured selections.
+                ("deployment_checks.py", "check_active_streams", "delivery.render"),
+                # Probe admission checks the prepared selection digest before promotion.
+                ("deployment_probe.py", "start_probe", "delivery.render"),
                 ("drain.py", "_form", "delivery.render"),
                 ("drain.py", "_form_backfill", "delivery.render"),
                 ("drain.py", "_form_store_only", "delivery.render"),

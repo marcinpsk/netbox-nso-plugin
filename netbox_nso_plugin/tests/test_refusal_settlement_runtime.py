@@ -908,15 +908,16 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 self.assertEqual(reconstructed["sections"], [section])
                 self.assertEqual(validate_generation(reconstructed), reconstructed)
 
-    def test_pruned_nonhead_generation_reuses_its_consumed_certificate(self):
-        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+    def test_pruned_nonhead_generation_without_remote_carrier_blocks_recovery(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         self.prepare_automatic()
         generation = self.terminal()
         original = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
         self.serve_terminal_evidence(generation, head=False, pruned=True)
-        settle_device_apply_attempts(self.management)
+        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+            load_deployment_evidence(self.management)
         self.assertEqual(NSOApplyExecution.objects.count(), 1)
         original.refresh_from_db()
         self.assertEqual(original.consumption_state, "consumed")
