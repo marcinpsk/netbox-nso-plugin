@@ -136,14 +136,10 @@ def _result(route_id, generation, *, outcome="in_sync", fingerprint=FINGERPRINT,
 def _evidence_generation(generation_id, selected, settled_scopes=()):
     from netbox_nso_plugin import delivery
     from netbox_nso_plugin.refusal_contract import COUNT_KEYS
-    from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
+    from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS, document_section_for_stream
 
     settled = bool(settled_scopes)
-    sections_by_stream = {
-        entry.section: delivery.delivery_keys()[{"ip": "interface", "isis_flex_algo": "isis"}.get(scope, scope)].section
-        for scope, entry in delivery.delivery_keys().items()
-    }
-    sections = sorted({sections_by_stream[stream] for stream in selected})
+    sections = sorted({document_section_for_stream(stream) for stream in selected})
     result = (
         None
         if not settled
