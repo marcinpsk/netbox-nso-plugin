@@ -357,6 +357,7 @@ jobs:
           NSO_LIVE_ADAPTER_TEST: "1"
           NSO_LIVE_ADAPTER_URL: http://127.0.0.1:18000
           NSO_LIVE_ADAPTER_TOKEN: contract-adapter-token
+          LIVE_ADAPTER_OPENAPI_SNAPSHOT: ${{ github.workspace }}/nso-adapter/tests/api/openapi_snapshot.json
           REFUSAL_SETTLEMENT_FIXTURE: ${{ github.workspace }}/refusal-adapter/tests/fixtures/refusal_settlement.json
         run: >-
           uv run -- pytest
