@@ -56,9 +56,11 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
     if management.adapter_device_id is not None:
         try:
             evidence = settle_device_apply_attempts(management)
-        except EvidenceInvariantError:
+        except EvidenceInvariantError as exc:
             logger.warning("Settlement evidence remains unresolved for management %s", pk)
-            return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
+            # A backlog too long to bind still drains page by page; _settle_job stays fail-closed.
+            if str(exc) != "settlement_feed_not_bounded":
+                return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
     with transaction.atomic():
         row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
         result = _consume_locked(row)

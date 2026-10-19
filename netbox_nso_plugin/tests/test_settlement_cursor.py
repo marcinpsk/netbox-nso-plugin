@@ -412,6 +412,28 @@ class TestUnresolvedExecution(_SettlementCase):
         assert consume_static_route_settlements(mgmt).consumed == 1
         assert self._cursor(mgmt).settle_cursor_seq == 2
 
+    def test_backlog_beyond_the_evidence_bound_still_drains_one_page(self):
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, consume_static_route_settlements
+
+        device = _make_device("backlog")
+        mgmt = _make_mgmt(device, "backlog", 81, adapter=self.adapter)
+        for _ in range(10_001):
+            self.adapter.store.terminal_job(81, job_type="sync")
+        result = consume_static_route_settlements(mgmt)
+        assert (result.stalled, result.consumed, result.cursor) == (False, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE)
+        assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
+
+    def test_backlog_beyond_the_evidence_bound_still_stalls_on_an_unresolved_apply(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        mgmt, _sr = self._unresolvable("backlogapply", 82)
+        for _ in range(10_000):
+            self.adapter.store.terminal_job(82, job_type="sync")
+        result = consume_static_route_settlements(mgmt)
+        assert (result.stalled, result.consumed) == (True, 0)
+        row = self._cursor(mgmt)
+        assert (row.settle_cursor_seq, row.settle_stall_seq) == (0, 1)
+
 
 class TestMalformedFeedPreservesCursor(_SettlementCase):
     """An invalid feed page cannot certify or discard any ordered execution."""
