@@ -30,6 +30,15 @@ def raw_overlay_error(row):
     error = data["last_apply_error"]
 
 
+class AliasedOverlayErrorSerializer(RefusalDisplaySerializerMixin, serializers.ModelSerializer):
+    # ruleid: nso-row-error-projection-bypass
+    error = serializers.JSONField(source="last_apply_error", read_only=True)
+    # ruleid: nso-row-error-projection-bypass
+    error_text = serializers.CharField(read_only=True, source="last_apply_error")
+    # ok: nso-row-error-projection-bypass
+    projected_error = serializers.JSONField(source="refusal_display.error_value", read_only=True)
+
+
 def vlan_identity_from_name(candidate, native, interface):
     # ruleid: nso-vlan-identity-from-interface-name
     candidate.dot1q_vlan = int(native.name.rsplit(".", 1)[-1])

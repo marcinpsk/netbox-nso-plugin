@@ -3,6 +3,8 @@
 
 # Local review checks
 
+Dotted `last_apply_error` source aliases are covered by `test_refusal_display_parity.py`, not by `nso-row-error-projection-bypass`.
+
 Run these checks before a commit:
 
 ```sh

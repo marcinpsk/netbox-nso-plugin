@@ -11,11 +11,7 @@
  * There is deliberately NO client-side kind derivation here. A cell's kind decides its
  * badge, whether it offers Accept, and which quick-filter pill counts it, so a second
  * implementation that drifts from the server's would show the operator a row that its
- * own filter then hides. The server already owns this (summary.display_state /
- * interface_row_state — and note those two disagree about apply_failed on purpose), so
- * the payload ships `kind` per cell and `state` per row, and we only render them.
- * _table_filter.html still carries its own copy for the server-rendered tables that
- * have not become grids yet; a panel drops it when it does.
+ * own filter then hides. The payload carries the common owner projection.
  *
  * Row contract (what a panel's payload rows look like):
  *   { state: "<kind>", ...cells }
@@ -57,7 +53,6 @@
   // operator must act on sort to the top.
   var SEVERITY = ["apply_failed", "unavailable", "drift", "pending", "deploying", "unknown", "in_sync"];
   // Statuses that mean "NetBox does not own this yet" — mirrors _accept_cell.html.
-  var PENDING_KINDS = ["pending", "apply_failed", "unavailable"];
   var MUTED = '<span class="text-muted">—</span>';
 
   /* Escape for BOTH text and quoted-attribute contexts.
@@ -103,7 +98,7 @@
   function cellBadge(cell) {
     if (!cell) return "";
     if (cell.kind === "in_sync") {
-      return cell.status === "in_sync"
+      return cell.owned
         ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>' + evidenceText(cell)
         : evidenceText(cell);
     }
@@ -425,14 +420,14 @@
         });
         var s = pill.dataset.state;
         if (s === "all") table.clearFilter(true);
-        else if (s === "drift") table.setFilter("state", "=", "drift");
+        else if (s === "drift") table.setFilter("bucket", "=", "drift");
         else if (s === "pending")
           table.setFilter(function (d) {
-            return PENDING_KINDS.indexOf(d.state) !== -1;
+            return d.bucket === "pending";
           });
         else
           table.setFilter(function (d) {
-            return d.state !== "drift" && PENDING_KINDS.indexOf(d.state) === -1;
+            return d.bucket === "in_sync";
           });
         return;
       }

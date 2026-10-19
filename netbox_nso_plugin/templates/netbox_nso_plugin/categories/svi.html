@@ -19,7 +19,7 @@
         </thead>
         <tbody>
           {% for s in svi_states %}
-          <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+          <tr data-kind="{{ s.refusal_display.state }}" data-bucket="{{ s.refusal_display.bucket }}">
             <td class="text-nowrap">
               <a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a>
               <div class="text-muted small">

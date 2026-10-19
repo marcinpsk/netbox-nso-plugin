@@ -73,23 +73,26 @@
               {% with s=compliance.by_status %}
                 <tr><th colspan="2" class="text-muted small fw-normal border-0 pb-0">Status by managed attribute</th></tr>
                 {% if s.in_sync    %}<tr><th>In Sync</th>    <td><span class="badge text-bg-success">{{ s.in_sync }}</span></td></tr>{% endif %}
-                {% if s.imported   %}<tr><th>Imported</th>   <td><span class="badge text-bg-success">{{ s.imported }}</span></td></tr>{% endif %}
-                {% if s.changed    %}<tr><th>Changed</th>    <td><span class="badge text-bg-warning text-dark">{{ s.changed }}</span></td></tr>{% endif %}
-                {% if s.drifted    %}<tr><th>Drifted</th>    <td><span class="badge text-bg-warning text-dark">{{ s.drifted }}</span></td></tr>{% endif %}
-                {% if s.accepted   %}<tr><th>Accepted</th>   <td><span class="badge text-bg-info">{{ s.accepted }}</span></td></tr>{% endif %}
+                {% if s.drift      %}<tr><th>Drift</th>      <td><span class="badge text-bg-warning text-dark">{{ s.drift }}</span></td></tr>{% endif %}
+                {% if s.pending    %}<tr><th>Pending Apply</th><td><span class="badge text-bg-info">{{ s.pending }}</span></td></tr>{% endif %}
                 {% if s.deploying  %}<tr><th>Deploying</th>  <td><span class="badge text-bg-primary">{{ s.deploying }}</span></td></tr>{% endif %}
                 {% if s.apply_failed %}<tr><th>Apply Failed</th><td><span class="badge text-bg-danger">{{ s.apply_failed }}</span></td></tr>{% endif %}
-                {% if s.error      %}<tr><th>Error</th>      <td><span class="badge text-bg-danger">{{ s.error }}</span></td></tr>{% endif %}
+                {% if s.unavailable %}<tr><th>Unavailable</th><td><span class="badge text-bg-warning text-dark">{{ s.unavailable }}</span></td></tr>{% endif %}
                 {% if s.unknown    %}<tr><th>Unknown</th>    <td><span class="badge text-bg-info">{{ s.unknown }}</span></td></tr>{% endif %}
               {% endwith %}
               {% if compliance.last_checked_at %}
-                <tr><th>Last Checked</th><td>{{ compliance.last_checked_at }}</td></tr>
+                <tr><th>Adapter Last Checked</th><td>{{ compliance.last_checked_at }}</td></tr>
               {% endif %}
             </table>
           </div>
         </div>
       </div>
     {% endif %}
+    {% for execution in execution_summaries %}
+      <div class="col-12">
+        <div class="alert alert-warning">{{ execution.summary }}</div>
+      </div>
+    {% endfor %}
     {% if adapter_error %}
       <div class="col-12">
         <div class="alert alert-warning">

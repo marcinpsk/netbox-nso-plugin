@@ -14,7 +14,7 @@
       </thead>
       <tbody>
         {% for ip in interface_ips %}
-        <tr data-status="{{ ip.status }}" data-owned="{{ ip.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ ip.refusal_display.state }}" data-bucket="{{ ip.refusal_display.bucket }}">
           <td><a href="{{ ip.interface.get_absolute_url }}">{{ ip.interface.name }}</a></td>
           <td><code>{{ ip.address }}</code></td>
           <td>{{ ip.family }}</td>

@@ -13,7 +13,7 @@
           <tr><th>Console</th><th>Monitor</th><th>Module</th><th>Status / Synced</th><th></th></tr>
         </thead>
         <tbody>
-          <tr data-status="{{ ll.status }}" data-owned="{{ ll.accepted_at|yesno:'true,false' }}">
+          <tr data-kind="{{ ll.refusal_display.state }}" data-bucket="{{ ll.refusal_display.bucket }}">
             {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='logging_levels' pk=ll.pk as levels_edit_url %}
             <td>
               <a href="#" class="nso-popedit" title="Edit the console severity; this takes ownership"
@@ -67,7 +67,7 @@
       </thead>
       <tbody>
         {% for h in logging_data.hosts %}
-        <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ h.refusal_display.state }}" data-bucket="{{ h.refusal_display.bucket }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='logging_host' pk=h.pk as host_edit_url %}
           <td>
             <span class="fw-semibold">{{ h.address }}</span>

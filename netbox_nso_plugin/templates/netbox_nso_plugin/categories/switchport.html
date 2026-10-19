@@ -12,7 +12,7 @@
       <thead><tr><th>Interface</th><th>Mode</th><th>Untagged</th><th>Tagged</th><th>Status</th><th></th></tr></thead>
       <tbody>
         {% for s in switchport_states %}
-        <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ s.refusal_display.state }}" data-bucket="{{ s.refusal_display.bucket }}">
           <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
           <td>{% if s.mode %}<span class="badge text-bg-light">{{ s.mode }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
           <td>{% if s.untagged_vlan %}{{ s.untagged_vlan.vid }}{% else %}<span class="text-muted">—</span>{% endif %}</td>

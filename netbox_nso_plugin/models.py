@@ -33,6 +33,10 @@ class _OwnedOverlayModel(NetBoxModel):
 
         return row_projection(self)
 
+    @property
+    def refusal_model(self):
+        return self._meta.model_name
+
     def save(self, *args, **kwargs):
         """Hold the ownership check, write, and release cleanup in one transaction."""
         with transaction.atomic(using=kwargs.get("using") or self._state.db or "default"):
@@ -924,7 +928,7 @@ class NSOInterfaceState(_OwnedOverlayModel):
         verbose_name_plural = "NSO Interface States"
 
     def __str__(self):
-        return f"{self.interface} / {self.attribute} [{self.status}]"
+        return f"{self.interface} / {self.attribute}"
 
     def get_absolute_url(self):
         """Return the absolute URL for this object."""
@@ -1043,7 +1047,7 @@ class NSOInterfaceIPState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
 
     def __str__(self):
         vrf_label = f" [{self.vrf}]" if self.vrf else ""
-        return f"{self.interface} / {self.address}{vrf_label} [{self.status}]"
+        return f"{self.interface} / {self.address}{vrf_label}"
 
 
 # ─── SNMP state overlays ─────────────────────────────────────────────────
@@ -1149,7 +1153,7 @@ class NSOSnmpCommunityState(_OwnedOverlayModel):
         verbose_name_plural = "NSO SNMP Community States"
 
     def __str__(self):
-        return f"{self.management} / community:{self.community_hash} [{self.status}]"
+        return f"{self.management} / community:{self.community_hash}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -1229,7 +1233,7 @@ class NSOSnmpV3UserState(_OwnedOverlayModel):
         verbose_name_plural = "NSO SNMP V3 User States"
 
     def __str__(self):
-        return f"{self.management} / v3:{self.username} [{self.status}]"
+        return f"{self.management} / v3:{self.username}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -1288,7 +1292,7 @@ class NSOSnmpHostState(_OwnedOverlayModel):
         verbose_name_plural = "NSO SNMP Host States"
 
     def __str__(self):
-        return f"{self.management} / host:{self.address} [{self.status}]"
+        return f"{self.management} / host:{self.address}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -1326,7 +1330,7 @@ class NSOSnmpSystemInfoState(_OwnedOverlayModel):
         verbose_name_plural = "NSO SNMP System Info States"
 
     def __str__(self):
-        return f"{self.management} / system-info [{self.status}]"
+        return f"{self.management} / system-info"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -1368,7 +1372,7 @@ class NSOLoggingHostState(_OwnedOverlayModel):
         verbose_name_plural = "NSO Logging Host States"
 
     def __str__(self):
-        return f"{self.management} / syslog:{self.address} [{self.status}]"
+        return f"{self.management} / syslog:{self.address}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -1439,7 +1443,7 @@ class NSOLoggingLevelState(_OwnedOverlayModel):
         verbose_name_plural = "NSO Logging Level States"
 
     def __str__(self):
-        return f"{self.management} / local-levels [{self.status}]"
+        return f"{self.management} / local-levels"
 
     def set_severities(self) -> dict:
         """Return the managed (non-blank) severities as ``{field_name: OC value}``."""
@@ -1539,7 +1543,7 @@ class NSOStaticRouteState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO Static Route States"
 
     def __str__(self):
-        return f"{self.management} / {self.nso_prefix} [{self.status}]"
+        return f"{self.management} / {self.nso_prefix}"
 
 
 _L2_SAP_STATUS_CHOICES = [
@@ -1618,7 +1622,7 @@ class NSOL2SapState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO L2 SAP States"
 
     def __str__(self):
-        return f"{self.management} / {self.service_name}:{self.sap_id} [{self.status}]"
+        return f"{self.management} / {self.service_name}:{self.sap_id}"
 
 
 _ISIS_STATUS_CHOICES = [
@@ -1698,7 +1702,7 @@ class NSOISISInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO IS-IS Interface States"
 
     def __str__(self):
-        return f"{self.management} / {self.interface} ({self.af}) [{self.status}]"
+        return f"{self.management} / {self.interface} ({self.af})"
 
 
 class NSOISISInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -1760,7 +1764,7 @@ class NSOISISInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO IS-IS Instance States"
 
     def __str__(self):
-        return f"{self.management} / isis {self.process_tag} [{self.status}]"
+        return f"{self.management} / isis {self.process_tag}"
 
 
 class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -1809,7 +1813,7 @@ class NSOISISFlexAlgoState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO IS-IS Flex-Algo States"
 
     def __str__(self):
-        return f"{self.management} / flex-algo {self.algo_id} [{self.status}]"
+        return f"{self.management} / flex-algo {self.algo_id}"
 
 
 _BGP_STATUS_CHOICES = [
@@ -1867,7 +1871,7 @@ class NSOBGPRouterState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         self.router_id = content["router_id"] or ""
 
     def __str__(self):
-        return f"{self.management} / ASN:{self.asn_str} [{self.status}]"
+        return f"{self.management} / ASN:{self.asn_str}"
 
 
 class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -1923,7 +1927,7 @@ class NSOBGPPeerState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
 
     def __str__(self):
         vrf_part = f" vrf:{self.vrf_name}" if self.vrf_name else ""
-        return f"{self.management} / ASN:{self.asn_str}{vrf_part} peer:{self.peer_address_str} [{self.status}]"
+        return f"{self.management} / ASN:{self.asn_str}{vrf_part} peer:{self.peer_address_str}"
 
 
 class NSOBGPPeerTemplateState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -1974,7 +1978,7 @@ class NSOBGPPeerTemplateState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO BGP Peer Template States"
 
     def __str__(self):
-        return f"{self.management} / peer-group:{self.template_name} [{self.status}]"
+        return f"{self.management} / peer-group:{self.template_name}"
 
 
 _ROUTE_POLICY_STATUS_CHOICES = [
@@ -2094,7 +2098,7 @@ class NSORoutePolicyState(SharedObjectStateMixin, _NSODeviceTabURLMixin, _OwnedO
         verbose_name_plural = "NSO Route Policy States"
 
     def __str__(self):
-        return f"{self.management} / {self.family}:{self.object_name} [{self.status}]"
+        return f"{self.management} / {self.family}:{self.object_name}"
 
     def clean(self):
         """Reject a generic target that does not belong to the selected policy family."""
@@ -2223,7 +2227,7 @@ class NSOOSPFInstanceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO OSPF Instance States"
 
     def __str__(self):
-        return f"{self.management} / ospf {self.process_id} [{self.status}]"
+        return f"{self.management} / ospf {self.process_id}"
 
 
 class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -2268,7 +2272,7 @@ class NSOOSPFInterfaceState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO OSPF Interface States"
 
     def __str__(self):
-        return f"{self.management} / {self.interface} ospf [{self.status}]"
+        return f"{self.management} / {self.interface} ospf"
 
 
 _REDISTRIBUTION_STATUS_CHOICES = [
@@ -2346,7 +2350,7 @@ class NSORedistributionState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         src = self.source_protocol
         if self.source_ref:
             src += f" {self.source_ref}"
-        return f"{self.management} / {self.dest_protocol} ← {src} [{self.status}]"
+        return f"{self.management} / {self.dest_protocol} ← {src}"
 
 
 _LACP_STATUS_CHOICES = [
@@ -2410,7 +2414,7 @@ class NSOLACPBundleState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO LACP Bundle States"
 
     def __str__(self):
-        return f"{self.management} / {self.interface} [{self.status}]"
+        return f"{self.management} / {self.interface}"
 
 
 class NSOLACPMemberState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -2448,7 +2452,7 @@ class NSOLACPMemberState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO LACP Member States"
 
     def __str__(self):
-        return f"{self.management} / {self.interface} [{self.status}]"
+        return f"{self.management} / {self.interface}"
 
 
 _VLAN_STATUS_CHOICES = [
@@ -2511,7 +2515,7 @@ class NSOVLANState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO VLAN States"
 
     def __str__(self):
-        return f"{self.management} / VLAN {self.vlan} [{self.status}]"
+        return f"{self.management} / VLAN {self.vlan}"
 
 
 class NSOSwitchportState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
@@ -2563,7 +2567,7 @@ class NSOSwitchportState(_NSODeviceTabURLMixin, _OwnedOverlayModel):
         verbose_name_plural = "NSO Switchport States"
 
     def __str__(self):
-        return f"{self.management} / {self.interface} [{self.status}]"
+        return f"{self.management} / {self.interface}"
 
 
 class NSOSVIState(_OwnedOverlayModel):
@@ -2610,7 +2614,7 @@ class NSOSVIState(_OwnedOverlayModel):
         verbose_name_plural = "NSO SVI States"
 
     def __str__(self):
-        return f"{self.management} / svi:{self.interface} [{self.status}]"
+        return f"{self.management} / svi:{self.interface}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -2675,7 +2679,7 @@ class NSOSubinterfaceState(_OwnedOverlayModel):
         verbose_name_plural = "NSO Subinterface States"
 
     def __str__(self):
-        return f"{self.management} / subif:{self.interface} [{self.status}]"
+        return f"{self.management} / subif:{self.interface}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""
@@ -2740,7 +2744,7 @@ class NSOInterfaceMtuState(_OwnedOverlayModel):
         verbose_name_plural = "NSO Interface MTU States"
 
     def __str__(self):
-        return f"{self.management} / mtu:{self.interface} [{self.status}]"
+        return f"{self.management} / mtu:{self.interface}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay has no standalone detail view)."""
@@ -2793,7 +2797,7 @@ class NSOBFDInterfaceState(_OwnedOverlayModel):
         verbose_name_plural = "NSO BFD States"
 
     def __str__(self):
-        return f"{self.management} / bfd:{self.interface} [{self.status}]"
+        return f"{self.management} / bfd:{self.interface}"
 
     def get_absolute_url(self):
         """Return the device NSO tab URL (the overlay's detail; used by edit redirects)."""

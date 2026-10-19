@@ -4,47 +4,6 @@
 
 from __future__ import annotations
 
-from .status_machine import OWNED_STATES
-
-# The display state is TWO independent dimensions:
-#   sync     — does the device match NetBox?  match (imported/in_sync) vs differ
-#   owned    — is NetBox the source of truth?  owned == status in OWNED_STATES
-#              (accepted/deploying/in_sync/apply_failed). This is the canonical
-#              ownership test (status_machine.is_owned) and exactly what Apply pushes —
-#              NOT ``accepted_at``, which is a one-shot timestamp never cleared on
-#              un-own, so a row reverted/drifted back to ``imported`` keeps a stale
-#              accepted_at and would otherwise read as owned forever.
-# Combined into the operator-facing buckets:
-#   in sync       = device matches NetBox (whether owned or not)
-#   drift         = device differs AND NetBox does NOT own it (device changed out-of-band)
-#   pending apply = device differs AND NetBox owns it (Apply will push NetBox's value)
-_MATCH_STATUSES = ("imported", "in_sync")
-_DIFFER_STATUSES = ("changed", "conflict", "accepted", "apply_failed")
-
-
-def display_state(status: str, owned: bool, *, distinguish_failed: bool = False):
-    """Return (kind, label) for a row from its sync *status* and *owned* flag.
-
-    kind ∈ in_sync | drift | pending | apply_failed | deploying | unknown — drives badge
-    colour.
-
-    ``distinguish_failed`` splits an OWNED ``apply_failed`` out of the "pending apply"
-    bucket. It is off by default because folding it in is what every other family still
-    does, and flipping it fleet-wide would change nine panels at once; a caller opts in
-    for a family that can also show WHY the apply failed, so the operator gets a red chip
-    and the message together rather than a blue chip promising an Apply that already ran
-    and lost. Not owned means the device changed out of band, which is drift either way.
-    """
-    if status == "deploying":
-        return ("deploying", "deploying")
-    if status in _MATCH_STATUSES:
-        return ("in_sync", "in sync")
-    if distinguish_failed and owned and status == "apply_failed":
-        return ("apply_failed", "apply failed")
-    if status in _DIFFER_STATUSES:
-        return ("pending", "pending apply") if owned else ("drift", "drift")
-    return ("unknown", status or "unknown")
-
 
 def matches_device_value(attribute, netbox_value, nso_value):
     """Return True if a NetBox attribute value equals the device (NSO) value.
@@ -83,56 +42,16 @@ def _netbox_value_for(attribute, iface):
 
 
 def interface_row_state(st, iface):
-    """Return (kind, label, owned) for one interface-attr row — value-aware.
+    """Read the common owner projection with the current interface values."""
+    from .refusal_display import row_projection
 
-    For description/enabled we compare the *actual* NetBox value against the device
-    value rather than trusting the adapter-reported status: the adapter only learns a
-    NetBox value once it writes it back, so a value set directly in NetBox shows as
-    ``unknown``/``imported`` and would hide in the "in sync" remainder. When the
-    values match it is in sync; when they differ it is pending apply (owned) or drift
-    (not owned). In-flight ("deploying") and non-comparable attributes fall back to
-    the status-driven :func:`display_state`.
-    """
-    from .refusal_display import row_projection, row_state
-
-    owned = st.status in OWNED_STATES
-    projection = row_projection(st)
-    invalid = projection["refusal"] is not None and not projection["refusal"]["valid"]
-    retained_failure = st.status == "apply_failed" and projection["execution_disposition"] == "not_applied"
-    if invalid or retained_failure or projection["execution_disposition"] in {"refused", "unavailable"}:
-        kind, label = row_state(st)
-        return kind, label, owned
-    if st.status == "deploying" or st.attribute not in _COMPARABLE_IFACE_ATTRS:
-        kind, label = display_state(st.status, owned)
-        return (kind, label, owned)
-    matches = matches_device_value(st.attribute, _netbox_value_for(st.attribute, iface), st.nso_value)
-    if matches:
-        return ("in_sync", "in sync", owned)
-    # Values differ. Surface a failed apply distinctly so the operator knows the last
-    # push errored, instead of it hiding as an ordinary "pending apply".
-    if st.status == "apply_failed":
-        return ("apply_failed", "apply failed", owned)
-    return ("pending", "pending apply", owned) if owned else ("drift", "drift", owned)
+    projected = row_projection(st, iface)
+    return projected["state"], projected["label"], projected["owned"]
 
 
 def interface_status_breakdown(qs) -> dict:
-    """Value-aware {total, drift, pending} for interface-attr states.
-
-    Mirrors :func:`_status_breakdown` but classifies each row through
-    :func:`interface_row_state` (real NetBox vs device value) so a value set
-    directly in NetBox is bucketed correctly instead of vanishing into "in sync".
-    """
-    from .refusal_display import project_rows
-
-    out = {"total": 0, "drift": 0, "pending": 0}
-    for st in project_rows(qs.select_related("interface")):
-        out["total"] += 1
-        kind, _label, _owned = interface_row_state(st, st.interface)
-        if kind in ("pending", "deploying", "apply_failed", "unavailable"):
-            out["pending"] += 1
-        elif kind == "drift":
-            out["drift"] += 1
-    return out
+    """Count interface owners through the common projection."""
+    return _status_breakdown(qs.select_related("interface"))
 
 
 # Each category: key -> (label, mdi-icon, scope-flag on NSODeviceManagement).
@@ -169,26 +88,15 @@ _NON_ROUTING_FLAGS = {"manage_interfaces", "manage_snmp", "manage_logging", "man
 
 
 def _status_breakdown(qs) -> dict:
-    """Return owned-aware {total, drift, pending} buckets for a state queryset.
-
-    Owned = ``status in OWNED_STATES`` (the canonical test — what Apply pushes), NOT
-    ``accepted_at`` (a stale, never-cleared timestamp). A differing status is therefore
-    *intrinsically* owned-or-not: accepted/apply_failed are owned → pending apply;
-    changed/conflict are unowned → drift. match (imported/in_sync) → in sync (the
-    implicit remainder). A row left at ``unknown`` (or any unrecognized status) is an
-    *anomaly* — reconcilers always set a concrete status — so it is surfaced under drift
-    (needs attention) rather than hidden in the in-sync remainder.
-    """
-    from .refusal_display import project_rows, row_state
+    """Count the same owner buckets used by REST, grids and Apply preview."""
+    from .refusal_display import project_rows, row_projection
 
     out = {"total": 0, "drift": 0, "pending": 0}
     for row in project_rows(qs):
-        kind, _label = row_state(row)
+        projected = row_projection(row)
         out["total"] += 1
-        if kind in {"pending", "deploying", "apply_failed", "unavailable"}:
-            out["pending"] += 1
-        elif kind != "in_sync":
-            out["drift"] += 1
+        if projected["bucket"] in out:
+            out[projected["bucket"]] += 1
     return out
 
 
@@ -200,8 +108,6 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
         NSOBGPPeerTemplateState,
         NSOBGPRouterState,
         NSOInterfaceState,
-        NSOISISInstanceState,
-        NSOISISInterfaceState,
         NSOOSPFInstanceState,
         NSOOSPFInterfaceState,
         NSORedistributionState,
@@ -235,13 +141,16 @@ def _category_counts(key: str, device, mgmt) -> dict:  # noqa: C901
     if key == "bfd":
         return _status_breakdown(NSOBFDInterfaceState.objects.filter(management=mgmt))
     if key == "isis":
-        # interfaces + instances combined for the headline; expand shows both.
-        ifaces = _status_breakdown(NSOISISInterfaceState.objects.filter(interface__device_id=dev_id))
-        procs = _status_breakdown(NSOISISInstanceState.objects.filter(management=mgmt))
-        for bucket, total in procs.items():
-            ifaces[bucket] += total
-        ifaces["processes"] = procs["total"]
-        return ifaces
+        from .refusal_registry import document_owner_specs
+
+        out = {"total": 0, "drift": 0, "pending": 0}
+        for spec in document_owner_specs(key):
+            counts = _status_breakdown(spec.model.objects.filter(**{spec.device_lookup: dev_id}))
+            for bucket in ("total", "drift", "pending"):
+                out[bucket] += counts[bucket]
+            if spec.model._meta.model_name == "nsoisisinstancestate":
+                out["processes"] = counts["total"]
+        return out
     if key == "ospf":
         ifaces = _status_breakdown(NSOOSPFInterfaceState.objects.filter(interface__device_id=dev_id))
         insts = _status_breakdown(NSOOSPFInstanceState.objects.filter(management=mgmt))

@@ -266,7 +266,21 @@
 
   function mount(root, section) {
     var payloadEl = document.getElementById("nso-isis-data");
-    if (!root || !payloadEl || !G || ["instances", "interfaces"].includes(section) === false) return;
+    if (!root || !payloadEl || !G || ["instances", "interfaces", "flex_algos"].includes(section) === false) return;
+    var columns = {
+      instances: instanceColumns,
+      interfaces: interfaceColumns,
+      flex_algos: function () {
+        return [
+          { title: "Process", field: "_process", formatter: "plaintext", minWidth: 125 },
+          { title: "Algorithm", field: "algo_id", formatter: "plaintext", minWidth: 100 },
+          { title: "Metric", field: "metric_type", formatter: "plaintext", minWidth: 100 },
+          { title: "Priority", field: "priority", formatter: "plaintext", minWidth: 100 },
+          G.stateColumn({ minWidth: 100 }),
+          G.lastSyncColumn({ minWidth: 110 }),
+        ];
+      },
+    };
     return G.mount(root, {
       key: "isis_" + section,
       payload: JSON.parse(payloadEl.textContent),
@@ -275,7 +289,7 @@
       },
       jsonUrl: root.dataset.jsonUrl,
       maxHeight: false,
-      placeholder: section === "instances" ? "No IS-IS instances." : "No IS-IS interfaces.",
+      placeholder: "No IS-IS " + { instances: "instances", interfaces: "interfaces", flex_algos: "Flex-Algos" }[section] + ".",
       flatten: function (rows) {
         return rows.map(function (row) {
           row._process = row.process_tag || "default";
@@ -285,7 +299,7 @@
           return row;
         });
       },
-      columns: section === "instances" ? instanceColumns() : interfaceColumns(),
+      columns: columns[section](),
     });
   }
 

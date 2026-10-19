@@ -17,7 +17,7 @@
         </thead>
         <tbody>
           {% for sap in l2_sap_states %}
-          <tr data-status="{{ sap.status }}" data-owned="{{ sap.accepted_at|yesno:'true,false' }}">
+          <tr data-kind="{{ sap.refusal_display.state }}" data-bucket="{{ sap.refusal_display.bucket }}">
             <td>
               <span class="fw-semibold">{{ sap.service_name }}</span>
               <div class="small">

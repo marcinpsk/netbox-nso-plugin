@@ -2134,11 +2134,11 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
         from django.contrib.contenttypes.models import ContentType
 
         from .models import NSORoutePolicyState
-        from .status_machine import OWNED_STATES
+        from .refusal_display import project_rows, row_projection
 
         obj = self.context["object"]
         ct = ContentType.objects.get_for_model(obj)
-        states = list(
+        states = project_rows(
             NSORoutePolicyState.objects.filter(content_type=ct, object_id=obj.pk).select_related(
                 "management", "management__device"
             )
@@ -2149,7 +2149,7 @@ class RoutePolicyNSODevices(PluginTemplateExtension):
         # (accepted / deploying / in_sync / apply_failed). Brownfield/un-owned overlays
         # (imported / changed / conflict) are NOT auto-pushed — they surface via reconcile.
         # Surfacing the owned set lets the operator see exactly which boxes an edit touches.
-        propagation_devices = [s.management.device for s in states if s.status in OWNED_STATES]
+        propagation_devices = [s.management.device for s in states if row_projection(s)["owned"]]
         return self.render(
             "netbox_nso_plugin/route_policy_nso_devices.html",
             extra_context={"nso_states": states, "propagation_devices": propagation_devices},

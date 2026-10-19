@@ -1,10 +1,7 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
 {# Reusable state-pill + name filter for a category table, mirroring the Interfaces tab. #}
-{# Rows are already rendered, so filtering is client-side and instant. Each <tr> must #}
-{# carry data-status and data-owned; the kind (drift / pending / in_sync) is derived #}
-{# here exactly like summary.display_state. Params: fid = id of the wrapper holding the #}
-{# <table>; placeholder = search-box placeholder (optional). #}
+{# Rows carry the server's projected kind and bucket. #}
 <div class="d-flex align-items-center gap-2 mb-2 flex-wrap">
   {% if not text_only %}<div class="btn-group btn-group-sm" role="group" aria-label="State filter">
     <button type="button" class="btn btn-outline-secondary active" data-kind-filter="{{ fid }}" data-kind="all">All <span class="badge text-bg-light ms-1" data-kind-count>0</span></button>
@@ -27,38 +24,20 @@
   var search = document.querySelector('[data-text-filter="{{ fid }}"]');
   var counter = document.querySelector('[data-list-filter-count="{{ fid }}"]');
   var activeKind = 'all';
-  // Mirror summary.display_state(status, owned) -> kind.
-  function kindOf(tr) {
-    if (tr.querySelector('.nso-execution-unavailable')) return 'unavailable';
-    var s = tr.getAttribute('data-status') || '';
-    if (s === 'deploying') return 'deploying';
-    if (s === 'imported' || s === 'in_sync') return 'in_sync';
-    if (s === 'apply_failed') return 'apply_failed';
-    return s === 'accepted' || s === 'drifted' ? 'pending' : 'drift';
-  }
   var counts = { all: rows.length, drift: 0, pending: 0, in_sync: 0 };
   rows.forEach(function (tr) {
-    var k = kindOf(tr);
-    tr.setAttribute('data-kind', k);
-    if (k === 'drift') counts.drift++;
-    else if (k === 'pending' || k === 'apply_failed' || k === 'unavailable') counts.pending++;
-    else counts.in_sync++;  // in_sync + deploying
+    var bucket = tr.getAttribute('data-bucket');
+    if (Object.prototype.hasOwnProperty.call(counts, bucket)) counts[bucket]++;
   });
   pills.forEach(function (p) {
     var badge = p.querySelector('[data-kind-count]');
     if (badge) badge.textContent = counts[p.getAttribute('data-kind')] != null ? counts[p.getAttribute('data-kind')] : 0;
   });
-  function inBucket(k) {
-    if (activeKind === 'all') return true;
-    if (activeKind === 'pending') return k === 'pending' || k === 'apply_failed' || k === 'unavailable';
-    if (activeKind === 'in_sync') return k === 'in_sync' || k === 'deploying';
-    return k === activeKind;
-  }
   function apply() {
     var q = (search && search.value || '').trim().toLowerCase();
     var shown = 0;
     rows.forEach(function (tr) {
-      var ok = inBucket(tr.getAttribute('data-kind')) && (!q || tr.textContent.toLowerCase().indexOf(q) !== -1);
+      var ok = (activeKind === 'all' || tr.getAttribute('data-bucket') === activeKind) && (!q || tr.textContent.toLowerCase().indexOf(q) !== -1);
       tr.style.display = ok ? '' : 'none';
       if (ok) shown++;
     });

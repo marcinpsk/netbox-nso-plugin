@@ -9,6 +9,8 @@ from . import refusal_contract, refusal_protocol
 INVALID = "invalid refusal evidence"
 UNAVAILABLE = "Execution unavailable; showing previous state."
 UNAPPLIED = "Execution includes unapplied contributions. Review the row states."
+PENDING_STATES = frozenset({"pending", "deploying", "apply_failed", "unavailable"})
+_STATE_SEVERITY = ("apply_failed", "unavailable", "drift", "pending", "deploying", "unknown", "in_sync")
 _CAUSE_FIELDS = refusal_contract._CAUSE_ORDER
 
 
@@ -56,9 +58,11 @@ def stored_error_projection(error):
 
 
 def snapshot_projection(snapshot):
-    """Validate cached interface errors before exposing a management snapshot."""
+    """Label adapter evidence and validate cached errors before exposing a snapshot."""
     projected = copy.deepcopy(snapshot)
     if isinstance(projected, dict):
+        if projected:
+            projected["source"] = "adapter-reported"
         for interface in projected.get("interfaces") or []:
             for attr in (interface.get("attrs") or {}).values():
                 if "last_apply_error" in attr:
@@ -180,8 +184,8 @@ def _previous_refusal(row):
     return _snapshot_refusal(snapshot, snapshot.executions.filter(consumption_state="consumed"))
 
 
-def row_projection(row):
-    """Keep restored history separate from the current execution's refusal."""
+def row_projection(row, interface=None):
+    """Decide owner state, pending membership and safe execution evidence together."""
     from .refusal_registry import OVERLAYS
 
     error = getattr(row, "last_apply_error", None)
@@ -191,6 +195,7 @@ def row_projection(row):
         projection["refusal"] = safe_projection(error["refusals"])
     current = _current_snapshot(row)
     projection["execution_disposition"] = current[0].settlement_disposition if current else None
+    projection["advisory"] = UNAVAILABLE if projection["execution_disposition"] == "unavailable" else ""
     if isinstance(error, str) and error and projection["execution_disposition"] != "refused":
         projection["refusal"] = _previous_refusal(row)
     if current is not None and (projection["refusal"] is None or projection["refusal"]["valid"]):
@@ -202,7 +207,6 @@ def row_projection(row):
                 historical_refusal = projection["refusal"]
                 projection["error"] = projection["refusal"]["text"]
             projection["refusal"] = None
-            projection["advisory"] = UNAVAILABLE
     if projection["refusal"] is not None:
         projection["refusal_text"] = projection["refusal"]["text"]
         projection["error"] = projection["refusal_text"]
@@ -220,23 +224,76 @@ def row_projection(row):
         )
     else:
         projection["error_value"] = projection["error"] if projection["error"] is not None else error
+    kind, label, owned = _row_classification(row, projection, interface)
+    pending = kind in PENDING_STATES
+    projection.update(
+        state=kind,
+        kind=kind,
+        label=label,
+        owned=owned,
+        pending=pending,
+        bucket="pending" if pending else "in_sync" if kind == "in_sync" else "drift",
+    )
     return projection
 
 
-def row_state(row):
-    """Show qualified prior state when the latest execution is unavailable."""
-    from .status_machine import OWNED_STATES
-    from .summary import display_state
+def _stored_state(status, owned):
+    """Classify lifecycle status before current execution and value evidence."""
+    if status == "deploying":
+        return "deploying", "deploying"
+    if status in {"imported", "in_sync"}:
+        return "in_sync", "in sync"
+    if owned and status == "apply_failed":
+        return "apply_failed", "apply failed"
+    if status in {"changed", "conflict", "accepted", "apply_failed"}:
+        return ("pending", "pending apply") if owned else ("drift", "drift")
+    return "unknown", status or "unknown"
 
-    projected = row_projection(row)
+
+def _row_classification(row, projected, interface):
+    """Give current execution evidence precedence over stored status and value equality."""
+    from .status_machine import OWNED_STATES
+    from .summary import _COMPARABLE_IFACE_ATTRS, _netbox_value_for, matches_device_value
+
     owned = row.status in OWNED_STATES
     if projected["refusal"] is not None and not projected["refusal"]["valid"]:
-        return "apply_failed", INVALID
+        return "apply_failed", INVALID, owned
     if projected["execution_disposition"] == "refused":
-        return "apply_failed", "apply failed"
+        return "apply_failed", "apply failed", owned
     if projected["advisory"] == UNAVAILABLE:
-        return "unavailable", "previous " + display_state(row.status, owned, distinguish_failed=True)[1]
-    return display_state(row.status, owned, distinguish_failed=True)
+        return "unavailable", "previous " + _stored_state(row.status, owned)[1], owned
+    if interface is None and hasattr(row, "attribute"):
+        interface = getattr(row, "interface", None)
+    retained_failure = row.status == "apply_failed" and (
+        projected["execution_disposition"] == "not_applied" or (projected["error"] and projected["refusal"] is None)
+    )
+    if (
+        interface is not None
+        and row.status != "deploying"
+        and not retained_failure
+        and row.attribute in _COMPARABLE_IFACE_ATTRS
+    ):
+        if matches_device_value(row.attribute, _netbox_value_for(row.attribute, interface), row.nso_value):
+            return "in_sync", "in sync", owned
+        if row.status == "apply_failed":
+            return "apply_failed", "apply failed", owned
+        return ("pending", "pending apply", owned) if owned else ("drift", "drift", owned)
+    kind, label = _stored_state(row.status, owned)
+    return kind, label, owned
+
+
+def row_state(row):
+    """Read the common owner classification."""
+    projected = row_projection(row)
+    return projected["state"], projected["label"]
+
+
+def group_projection(projections):
+    """Use one projected owner's state and bucket for a grouped grid row."""
+    selected = min(projections, key=lambda item: _STATE_SEVERITY.index(item["state"]), default=None)
+    if selected is None:
+        return {"state": "in_sync", "kind": "in_sync", "label": "in sync", "pending": False, "bucket": "in_sync"}
+    return {key: selected[key] for key in ("state", "kind", "label", "pending", "bucket")}
 
 
 def document_projection(result):
@@ -284,28 +341,31 @@ def job_projection(job):
 
 
 def device_execution_summaries(management):
-    """Read only executions still named by a current owner fence."""
-    from .durable_capture import mapping_epoch
-    from .models import NSOApplyExecution
+    """Summarize only executions named by current projected owners."""
+    from .refusal_registry import OVERLAYS
 
     if management is None:
         return []
-    executions = (
-        NSOApplyExecution.objects.filter(
-            settlement_fences__management=management,
-            settlement_fences__mapping_epoch=mapping_epoch(management),
-            settlement_fences__current_attempt__isnull=False,
-            consumption_state="consumed",
+    fences = list(management.settlement_fences.filter(current_attempt__isnull=False, last_execution__isnull=False))
+    rows = []
+    for label in {fence.model_label for fence in fences}:
+        rows.extend(
+            OVERLAYS[label].model.objects.filter(pk__in=[f.overlay_pk for f in fences if f.model_label == label])
         )
-        .distinct()
-        .order_by("-terminal_at")
-    )
+    executions = {}
+    for row in project_rows(rows):
+        current = _current_snapshot(row)
+        if current is not None:
+            execution = current[1]
+            unavailable = row_projection(row)["advisory"] == UNAVAILABLE
+            previous = executions.get(execution.pk)
+            executions[execution.pk] = (execution, unavailable or bool(previous and previous[1]))
     summaries = []
-    for execution in executions:
+    for execution, unavailable in sorted(executions.values(), key=lambda item: item[0].terminal_at, reverse=True):
         stored = execution.terminal_projection
         result = stored.get("carrier_job_result") if isinstance(stored, dict) else None
         projected = document_projection(result)
-        if execution.overlay_snapshots.filter(settlement_disposition="unavailable").exists():
+        if unavailable:
             summary = projected["summary"]
             projected["summary"] = UNAVAILABLE + (" " + summary if summary and summary != UNAVAILABLE else "")
         if projected["summary"]:

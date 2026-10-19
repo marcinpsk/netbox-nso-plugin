@@ -18,6 +18,7 @@ router.register("link-roles", views.NSOLinkRoleViewSet)
 router.register("link-role-assignments", views.NSOLinkRoleAssignmentViewSet)
 
 urlpatterns = [
+    path("owner-state/<str:model>/<int:pk>/", views.OwnerStateView.as_view(), name="owner-state-detail"),
     path("sync-complete/", views.SyncCompleteView.as_view(), name="sync_complete"),
     path("provision-complete/", views.ProvisionCompleteView.as_view(), name="provision_complete"),
     path("onboarding-candidates/", views.OnboardingCandidatesView.as_view(), name="onboarding_candidates"),

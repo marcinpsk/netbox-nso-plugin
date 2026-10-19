@@ -8,6 +8,7 @@ rules:
     pattern-either:
       - pattern: $ROW.last_apply_error
       - pattern: getattr($ROW, "last_apply_error", ...)
+      - pattern: $FIELD(..., source="last_apply_error", ...)
     paths:
       include:
         - "netbox_nso_plugin/**/serializers.py"

@@ -42,7 +42,7 @@ class TestNSOL2SapStateModel(TestCase):
         row.refresh_from_db()
         self.assertEqual((row.service_type, row.outer_tag, row.inner_tag), ("vpls", 701, None))
         self.assertIsNone(row.l2vpn)
-        self.assertEqual(str(row), f"{self.mgmt} / 701:1/1/c31/3:701 [imported]")
+        self.assertEqual(str(row), f"{self.mgmt} / 701:1/1/c31/3:701")
 
     def test_unique_per_service_and_sap(self):
         NSOL2SapState.objects.create(

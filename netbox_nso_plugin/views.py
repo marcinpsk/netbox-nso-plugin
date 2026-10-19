@@ -624,12 +624,6 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
         )
 
 
-_PENDING_KINDS = {"pending", "apply_failed", "unavailable"}
-
-# Worst-first ordering of per-cell state kinds, for rolling an interface's cells up
-# into the single row-level state the grid sorts and quick-filters on.
-_KIND_SEVERITY = ("apply_failed", "unavailable", "drift", "pending", "deploying", "unknown", "in_sync")
-
 # Each category maps to the independent push scopes shown on its banner.
 _CATEGORY_PUSH_SCOPES = {
     "bgp": ("bgp",),
@@ -740,40 +734,39 @@ def _scope_push_error(entry):
     return result
 
 
-def _row_state(kinds) -> str:
-    """Collapse one interface's cell kinds to the single worst-first row state.
+def _isis_grid_sections(sections):
+    """Include every registered IS-IS owner in the category grid."""
+    from .refusal_registry import document_owner_specs
 
-    THE row state: the grid sorts on it and every quick-filter pill matches on it, so the
-    chip counts must be derived from this same value. Counting by set-membership instead
-    (``"drift" in kinds``) double-classified an interface with both a drifted cell and an
-    apply_failed cell: it collapses to ``apply_failed``, so the Drift filter (state == drift)
-    hid it — while the Drift chip still counted it. The chip promised a row the filter would
-    not show.
-    """
-    return next((k for k in _KIND_SEVERITY if k in kinds), "in_sync")
+    result = {}
+    for owner in document_owner_specs("isis"):
+        section = sections[owner.model._meta.model_name]
+        result[section["name"]] = {
+            **section,
+            "qs": lambda device, owner=owner, section=section: (
+                owner.model.objects.filter(**{owner.device_lookup: device.pk})
+                .select_related(*section["select_related"])
+                .order_by(*section["ordering"])
+            ),
+        }
+    return result
 
 
-def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) -> set[str]:
-    """Aggregate the per-attribute state kinds for one interface (matrix view).
+def _merged_iface_projection(iface, attr_states, mtu_states, sw_states, ip_states):
+    """Roll up common owner projections across one interface's cells."""
+    from .refusal_display import group_projection, row_projection
 
-    Each attribute cell classifies independently: enabled/description are value-aware
-    (interface_row_state), the rest go through display_state. Returns the SET of kinds
-    across all of the interface's cells so the view can bucket it as drift/pending/in_sync.
-    """
-    from .refusal_display import row_state
-    from .summary import interface_row_state
-
-    kinds: set[str] = set()
-    for attr in ("enabled", "description"):
-        st = attr_states.get((iface.id, attr))
-        if st is not None:
-            kinds.add(interface_row_state(st, iface)[0])
-    for st in (mtu_states.get(iface.id), sw_states.get(iface.id)):
-        if st is not None:
-            kinds.add(row_state(st)[0])
-    for st in ip_states.get(iface.id, []):
-        kinds.add(row_state(st)[0])
-    return kinds
+    projections = [
+        row_projection(st, iface)
+        for attribute in ("enabled", "description")
+        if (st := attr_states.get((iface.id, attribute))) is not None
+    ]
+    projections.extend(
+        row_projection(st)
+        for st in (mtu_states.get(iface.id), sw_states.get(iface.id), *ip_states.get(iface.id, []))
+        if st is not None
+    )
+    return group_projection(projections)
 
 
 def _matching_peer_ip_state(state, candidates):
@@ -905,36 +898,6 @@ def _native_ip_by_state(ip_states):
         if linked is not None:
             resolved[state.pk] = linked
     return resolved
-
-
-def _paged_row_bucket(status: str, owned: bool) -> str:
-    """Bucket one paged-overlay row into the drift / pending / in_sync quick-filter group.
-
-    Mirrors ``summary.display_state`` + the ``_table_filter.html`` ``kindOf`` JS so the
-    server-side paged filter and the client-side non-paged filter agree exactly.
-    """
-    if status in ("imported", "in_sync", "deploying"):
-        return "in_sync"
-    if status == "apply_failed":
-        return "pending"
-    return "pending" if owned else "drift"  # changed / conflict / accepted
-
-
-def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
-    """Filter the interface list to those matching the quick-select *state* bucket."""
-    if state == "drift":
-        return [i for i in ordered if "drift" in kinds_by_iface[i.id]]
-    if state == "pending":
-        return [i for i in ordered if kinds_by_iface[i.id] & _PENDING_KINDS]
-    if state == "in_sync":
-        return [
-            i
-            for i in ordered
-            if kinds_by_iface[i.id]
-            and "drift" not in kinds_by_iface[i.id]
-            and not (kinds_by_iface[i.id] & _PENDING_KINDS)
-        ]
-    return ordered  # "all" (or unknown) → no filter
 
 
 def _difference_value(scope, value):
@@ -1300,8 +1263,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
         from django.db.models import Q
 
-        from .refusal_display import UNAVAILABLE, project_rows, row_projection
-        from .status_machine import OWNED_STATES
+        from .refusal_display import project_rows, row_projection
         from .template_content import _STATUS_BADGE
 
         spec = self._paged_category_specs().get(key)
@@ -1333,15 +1295,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # category) so route_policy / static / redistribution / vlan / svi / subinterface /
         # l2_services all get the drift/pending/in-sync quick-select without per-template work.
         rows = project_rows(qs)
-        bucketed = [
-            (
-                "pending"
-                if row_projection(row)["advisory"] == UNAVAILABLE
-                else _paged_row_bucket(row.status, row.status in OWNED_STATES),
-                row,
-            )
-            for row in rows
-        ]
+        bucketed = [(row_projection(row)["bucket"], row) for row in rows]
         state_counts = {"all": len(rows), "drift": 0, "pending": 0, "in_sync": 0}
         for bucket, _row in bucketed:
             state_counts[bucket] += 1
@@ -1463,16 +1417,14 @@ class NSOCategoryView(LoginRequiredMixin, View):
         links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states)
         native_ips = _native_ip_by_state(ip_states)
 
-        # Per-interface aggregate state for the grid's row-level rollup and the
-        # drift/pending quick-filter counts.
-        kinds_by_iface = {i.id: _merged_iface_kinds(i, attr_states, mtu_states, sw_states, ip_states) for i in ordered}
-        # Counted off the COLLAPSED row state — the exact value each quick-filter pill matches
-        # on — so a chip can never promise rows its own filter hides (see _row_state).
+        projections_by_iface = {
+            iface.id: _merged_iface_projection(iface, attr_states, mtu_states, sw_states, ip_states)
+            for iface in ordered
+        }
         counts = {"all": len(ordered), "drift": 0, "pending": 0}
-        for ks in kinds_by_iface.values():
-            state = _row_state(ks)
-            counts["drift"] += 1 if state == "drift" else 0
-            counts["pending"] += 1 if state in _PENDING_KINDS else 0
+        for projected in projections_by_iface.values():
+            if projected["bucket"] in counts:
+                counts[projected["bucket"]] += 1
 
         # The client-side grid sorts, filters and quick-filters in the browser, so the
         # payload always carries every row — no server state filter, no pagination.
@@ -1480,7 +1432,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # the same payload via json_script so first paint needs no second request.
         payload = self._interface_merged_payload(
             ordered,
-            kinds_by_iface,
+            projections_by_iface,
             counts,
             attr_states,
             mtu_states,
@@ -1540,8 +1492,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSOBFDInterfaceState,
             NSOBGPPeerState,
             NSOBGPPeerTemplateState,
-            NSOISISInstanceState,
-            NSOISISInterfaceState,
             NSOLACPBundleState,
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
@@ -1614,6 +1564,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
             return [
                 {
                     **row_projection(member),
+                    "model": member._meta.model_name,
+                    "pk": member.pk,
                     "interface": iface(member),
                     "mode": member.mode or None,
                     "port_priority": member.port_priority,
@@ -1621,6 +1573,74 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 }
                 for member in lacp_member_states(state)
             ]
+
+        isis_sections = {
+            "nsoisisinterfacestate": dict(
+                name="interfaces",
+                select_related=("interface",),
+                ordering=("interface__name", "af"),
+                ctx="isis_interfaces",
+                accept=r + "routing_accept_isis_interface",
+                fields={
+                    "iface": iface,
+                    "af": lambda st: st.af,
+                    "process_tag": lambda st: st.process_tag or "default",
+                    "circuit_type": lambda st: st.circuit_type or None,
+                    "network_type": lambda st: st.network_type or None,
+                    "metric": lambda st: st.metric,
+                    "passive": lambda st: st.passive,
+                    "bfd_enabled": lambda st: st.bfd_enabled,
+                    "frr_enabled": lambda st: st.frr_enabled,
+                    "frr_protection": lambda st: st.frr_protection or None,
+                    "hello_auth": lambda st: (
+                        (st.hello_auth_type or "on") if (st.hello_auth_present or st.hello_auth_type) else None
+                    ),
+                    "edit_url": lambda st: (
+                        reverse(r + "overlay_field_edit", args=["isis_interface", st.pk])
+                        if st.isis_interface_id
+                        else None
+                    ),
+                },
+            ),
+            "nsoisisinstancestate": dict(
+                name="instances",
+                select_related=("isis_instance",),
+                ordering=("process_tag",),
+                ctx="isis_processes",
+                accept=r + "routing_accept_isis_instance",
+                fields={
+                    "process_tag": lambda st: st.process_tag or "default",
+                    "instance": lambda st: linked(st.isis_instance),
+                    "net": lambda st: st.net or None,
+                    "is_type": lambda st: st.is_type or None,
+                    "metric_style": lambda st: st.metric_style or None,
+                    "overload_bit": lambda st: st.overload_bit,
+                    "fast_reroute": lambda st: st.fast_reroute or None,
+                    "microloop_avoidance": lambda st: st.microloop_avoidance,
+                    "area_auth": lambda st: f"{st.area_auth_type or '—'}{' ✓' if st.area_auth_present else ''}",
+                    "domain_auth": lambda st: f"{st.domain_auth_type or '—'}{' ✓' if st.domain_auth_present else ''}",
+                    "edit_url": lambda st: (
+                        reverse(r + "overlay_field_edit", args=["isis_instance", st.pk])
+                        if st.isis_instance_id
+                        else None
+                    ),
+                },
+            ),
+            "nsoisisflexalgostate": dict(
+                name="flex_algos",
+                select_related=("isis_flex_algo",),
+                ordering=("process_tag", "algo_id"),
+                ctx="isis_flex_algos",
+                accept=None,
+                fields={
+                    "process_tag": lambda st: st.process_tag or "default",
+                    "algo_id": lambda st: st.algo_id,
+                    "metric_type": lambda st: st.metric_type or None,
+                    "priority": lambda st: st.priority,
+                },
+            ),
+        }
+        isis_owner_sections = _isis_grid_sections(isis_sections)
 
         return {
             "lacp": {
@@ -1705,57 +1725,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
             "isis": {
                 "reconcile_on_expand": True,
-                "sections": {
-                    "interfaces": dict(
-                        ctx="isis_interfaces",
-                        qs=lambda d: by_device(NSOISISInterfaceState, d, "interface").order_by("interface__name", "af"),
-                        accept=r + "routing_accept_isis_interface",
-                        fields={
-                            "iface": iface,
-                            "af": lambda st: st.af,
-                            "process_tag": lambda st: st.process_tag or "default",
-                            "circuit_type": lambda st: st.circuit_type or None,
-                            "network_type": lambda st: st.network_type or None,
-                            "metric": lambda st: st.metric,
-                            "passive": lambda st: st.passive,
-                            "bfd_enabled": lambda st: st.bfd_enabled,
-                            "frr_enabled": lambda st: st.frr_enabled,
-                            "frr_protection": lambda st: st.frr_protection or None,
-                            "hello_auth": lambda st: (
-                                (st.hello_auth_type or "on") if (st.hello_auth_present or st.hello_auth_type) else None
-                            ),
-                            "edit_url": lambda st: (
-                                reverse(r + "overlay_field_edit", args=["isis_interface", st.pk])
-                                if st.isis_interface_id
-                                else None
-                            ),
-                        },
-                    ),
-                    "instances": dict(
-                        ctx="isis_processes",
-                        qs=lambda d: by_device(NSOISISInstanceState, d, "isis_instance").order_by("process_tag"),
-                        accept=r + "routing_accept_isis_instance",
-                        fields={
-                            "process_tag": lambda st: st.process_tag or "default",
-                            "instance": lambda st: linked(st.isis_instance),
-                            "net": lambda st: st.net or None,
-                            "is_type": lambda st: st.is_type or None,
-                            "metric_style": lambda st: st.metric_style or None,
-                            "overload_bit": lambda st: st.overload_bit,
-                            "fast_reroute": lambda st: st.fast_reroute or None,
-                            "microloop_avoidance": lambda st: st.microloop_avoidance,
-                            "area_auth": lambda st: f"{st.area_auth_type or '—'}{' ✓' if st.area_auth_present else ''}",
-                            "domain_auth": lambda st: (
-                                f"{st.domain_auth_type or '—'}{' ✓' if st.domain_auth_present else ''}"
-                            ),
-                            "edit_url": lambda st: (
-                                reverse(r + "overlay_field_edit", args=["isis_instance", st.pk])
-                                if st.isis_instance_id
-                                else None
-                            ),
-                        },
-                    ),
-                },
+                "sections": isis_owner_sections,
             },
             "bgp": {
                 "reconcile_on_expand": True,
@@ -1941,47 +1911,34 @@ class NSOCategoryView(LoginRequiredMixin, View):
         }
 
     def _grid_section(self, states, accept_route, fields, related=None):
-        """Serialize one grid sub-table: its rows plus the quick-filter counts.
-
-        kind/label come from summary.display_state — the same helper the server-rendered
-        tables used — so badges, quick-filter buckets and Accept visibility keep their
-        established meaning, and the client never re-derives them (a second, drifting
-        implementation would show a row that its own filter then hides).
-
-        The counts are taken off the SAME kind the pills filter on, so a chip can never
-        promise rows its own filter would hide.
-        """
-        from .refusal_display import project_rows, row_projection, row_state
+        """Serialize projected owners and count the same buckets the grid filters."""
+        from .refusal_display import group_projection, project_rows, row_projection
 
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
         for st in project_rows(states):
             status_rows = [st, *(list(related(st)) if related else [])]
-            displayed = [row_state(row) for row in status_rows]
-            kind = _row_state({item[0] for item in displayed})
-            label = next(item[1] for item in displayed if item[0] == kind)
+            projections = [row_projection(row) for row in status_rows]
+            grouped = group_projection(projections)
             counts["all"] += 1
-            if kind == "drift":
-                counts["drift"] += 1
-            elif kind in _PENDING_KINDS:
-                counts["pending"] += 1
+            if grouped["bucket"] in counts:
+                counts[grouped["bucket"]] += 1
             row = {
                 "pk": st.pk,
+                "model": st._meta.model_name,
+                **projections[0],
                 "status": st.status,
-                "state": kind,
-                "kind": kind,
-                "label": label,
+                **grouped,
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
                 "accept_url": (
                     reverse(accept_route, args=[st.pk])
-                    if any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
+                    if accept_route and any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
                     else None
                 ),
             }
             row.update({name: fn(st) for name, fn in fields.items()})
-            row.update(row_projection(st))
             rows.append(row)
         return {"rows": rows, "counts": counts}
 
@@ -2075,7 +2032,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
     def _interface_merged_payload(
         self,
         ordered,
-        kinds_by_iface,
+        projections_by_iface,
         counts,
         attr_states,
         mtu_states,
@@ -2086,34 +2043,25 @@ class NSOCategoryView(LoginRequiredMixin, View):
         native_ips,
         adapter_error,
     ):
-        """Build the merged per-interface matrix payload for the Tabulator grid.
-
-        Cell classification reuses the exact helpers the old server-rendered table
-        used (interface_row_state / display_state), so grid badges, quick-filter
-        buckets and Accept visibility keep the established semantics.
-        """
+        """Build the interface matrix from the common owner projections."""
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
 
-        from .refusal_display import row_projection, row_state
-        from .status_machine import OWNED_STATES
-        from .summary import _netbox_value_for, interface_row_state
+        from .refusal_display import row_projection
+        from .summary import _netbox_value_for
 
         interface_type_id = ContentType.objects.get_for_model(Interface).pk
 
         def attr_cell(st, iface):
             if st is None:
                 return None
-            kind, label, owned = interface_row_state(st, iface)
             return {
                 "pk": st.pk,
+                "model": st._meta.model_name,
                 "value": st.nso_value,
                 "netbox_value": _netbox_value_for(st.attribute, iface),
                 **row_projection(st),
                 "status": st.status,
-                "kind": kind,
-                "label": label,
-                "owned": owned,
                 "accept_url": (
                     reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept", args=[st.pk])
                     if st.status in self._ACCEPTABLE_STATUSES
@@ -2125,23 +2073,17 @@ class NSOCategoryView(LoginRequiredMixin, View):
         def plain_cell(st, accept_route, extra):
             if st is None:
                 return None
-            owned = st.status in OWNED_STATES
-            kind, label = row_state(st)
             cell = {
                 "pk": st.pk,
+                "model": st._meta.model_name,
                 **row_projection(st),
                 "status": st.status,
-                "kind": kind,
-                "label": label,
-                "owned": owned,
                 "accept_url": (reverse(accept_route, args=[st.pk]) if st.status in self._ACCEPTABLE_STATUSES else None),
             }
             cell.update(extra)
             return cell
 
         def ip_cell(st):
-            owned = st.status in OWNED_STATES
-            kind, label = row_state(st)
             native = native_ips.get(st.pk)
             peer = peer_ip_states.get(st.pk)
             if native is None:
@@ -2154,14 +2096,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 assignment = "another object"
             return {
                 "pk": st.pk,
+                "model": st._meta.model_name,
                 "address": str(st.address),
                 "vrf": st.vrf,
                 "secondary": st.secondary,
                 **row_projection(st),
                 "status": st.status,
-                "kind": kind,
-                "label": label,
-                "owned": owned,
                 "url": native.get_absolute_url() if native is not None else None,
                 # A changed IP row is retained only when the latest device snapshot
                 # stopped reporting it; conflict/imported rows are still present.
@@ -2193,7 +2133,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
         for iface in ordered:
             mtu = mtu_states.get(iface.id)
             sw = sw_states.get(iface.id)
-            kinds = kinds_by_iface[iface.id]
             rows.append(
                 {
                     "iface": {"id": iface.id, "name": iface.name, "url": iface.get_absolute_url()},
@@ -2224,7 +2163,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         if sw
                         else {},
                     ),
-                    "state": _row_state(kinds),
+                    **projections_by_iface[iface.id],
                 }
             )
         return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
@@ -2240,8 +2179,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
 
         from .models import NSOInterfaceState
-        from .refusal_display import project_rows
-        from .summary import interface_row_state
+        from .refusal_display import project_rows, row_projection
 
         q = (request.GET.get("q") or "").strip()
         state = request.GET.get("state") or "all"
@@ -2259,31 +2197,20 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # NetBox. Filtering/counts therefore happen in Python over the classified rows
         # so the chips, totals and badges always agree. The per-device row count is
         # bounded (≤2 attrs × interfaces), so this is cheap on tab load.
-        classified = []
-        counts = {"all": 0, "drift": 0, "pending": 0}
-        for st in project_rows(qs):
-            kind, label, owned = interface_row_state(st, st.interface)
-            counts["all"] += 1
-            if kind in ("pending", "deploying", "apply_failed", "unavailable"):
-                counts["pending"] += 1
-            elif kind == "drift":
-                counts["drift"] += 1
-            classified.append((st, kind, label, owned))
-
-        if state == "drift":
-            filtered = [c for c in classified if c[1] == "drift"]
-        elif state == "pending":
-            filtered = [c for c in classified if c[1] in ("pending", "deploying", "apply_failed", "unavailable")]
-        elif state == "in_sync":
-            filtered = [c for c in classified if c[1] in ("in_sync", "unknown")]
-        else:
-            filtered = classified
+        classified = [(st, row_projection(st)) for st in project_rows(qs)]
+        counts = {"all": len(classified), "drift": 0, "pending": 0}
+        for _row, projected in classified:
+            if projected["bucket"] in counts:
+                counts[projected["bucket"]] += 1
+        filtered = [
+            item for item in classified if state not in {"drift", "pending", "in_sync"} or item[1]["bucket"] == state
+        ]
 
         paginator = Paginator(filtered, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
 
         rows = []
-        for st, kind, label, owned in page.object_list:
+        for st, projected in page.object_list:
             iface = st.interface
             if st.attribute == "description":
                 netbox_value = iface.description or "—"
@@ -2293,7 +2220,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 netbox_value = "—"
             rows.append(
                 {
-                    **st.refusal_display,
+                    **projected,
                     "state": st,
                     "iface_name": iface.name,
                     "iface_url": iface.get_absolute_url(),
@@ -2301,9 +2228,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                     "attribute": st.attribute,
                     "netbox_value": netbox_value,
                     "device_value": st.nso_value or "—",
-                    "label": label,
-                    "kind": kind,
-                    "owned": owned,
                 }
             )
 
@@ -2870,7 +2794,10 @@ class NSODeviceManagementView(generic.ObjectView):
 
     def get_extra_context(self, request, instance):
         """Inject live adapter data, falling back to cached snapshot on error."""
+        from collections import Counter
+
         from . import adapter_client as client
+        from .refusal_display import device_execution_summaries, project_rows, row_projection
 
         interfaces = None
         compliance = None
@@ -2889,9 +2816,18 @@ class NSODeviceManagementView(generic.ObjectView):
                 interfaces = snapshot.get("interfaces")
                 compliance = snapshot.get("compliance")
 
+        rows = project_rows(
+            NSOInterfaceState.objects.filter(interface__device=instance.device).select_related("interface")
+        )
+        compliance = {
+            "managed_interfaces": len({row.interface_id for row in rows}),
+            "by_status": dict(Counter(row_projection(row)["state"] for row in rows)),
+            "last_checked_at": (compliance or {}).get("last_checked_at"),
+        }
         return {
             "interfaces": interfaces,
             "compliance": compliance,
+            "execution_summaries": device_execution_summaries(instance),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
         }
@@ -4167,24 +4103,22 @@ class NSODeviceReconcileView(NSOActionPermissionMixin, View):
 
 
 class NSOInterfaceStateListView(generic.ObjectListView):
-    """Cross-device interface-attribute *drift dashboard*.
-
-    Not a dump of every overlay row — it shows only attributes that need attention
-    (drift / pending apply / apply-failed) across all devices, with the device
-    column, so an operator can triage from one place. In-sync/imported rows are
-    excluded (the per-device NSO tab is the full value-aware surface). Status-based
-    filter: the adapter status lags a value typed straight into NetBox, so click
-    through to the device tab for the value-aware truth.
-    """
+    """Show interface owners whose projected state needs attention across devices."""
 
     template_name = "netbox_nso_plugin/links_object_list.html"
-    queryset = NSOInterfaceState.objects.exclude(status__in=("imported", "in_sync")).select_related(
-        "interface", "interface__device"
-    )
+    queryset = NSOInterfaceState.objects.select_related("interface", "interface__device")
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
     # Sync-managed: no add/import/edit — just export + bulk-delete (cleanup).
     actions = (BulkExport, BulkDelete)
+
+    def get_queryset(self, request):
+        """Select attention rows with the same projection as the table."""
+        from .refusal_display import project_rows, row_projection
+
+        queryset = super().get_queryset(request)
+        pks = [row.pk for row in project_rows(queryset) if row_projection(row)["state"] != "in_sync"]
+        return queryset.filter(pk__in=pks)
 
 
 class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
@@ -6174,31 +6108,19 @@ def _isis_iface_detail(r):
 
 
 def _apply_preview_interface_changes(device_pk):
-    """Interface attributes Apply would actually push: OWNED status + value differs from device.
-
-    Apply pushes only intent in an OWNED status (accepted / deploying / in_sync / apply_failed) —
-    that's what the intent-push mirrors to the adapter and what the NSO dry-run reflects. Keying
-    the preview off ``accepted_at`` instead over-reported: an attribute that drifted back to
-    ``imported`` (un-owned) keeps a stale ``accepted_at`` from a past acceptance, so it was listed
-    as "what we push" even though Apply never pushes it and the dry-run shows no change. Filter by
-    owned status so the left panel agrees with the dry-run and the real Apply.
-    """
-    from .status_machine import OWNED_STATES
-    from .summary import interface_row_state
+    """Select pending interface owners through the common projection."""
+    from .refusal_display import project_rows, row_projection
 
     changes = []
-    owned = (
-        NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=OWNED_STATES)
+    owners = (
+        NSOInterfaceState.objects.filter(interface__device_id=device_pk)
         .select_related("interface")
         .order_by("interface__name", "attribute")
     )
-    for st in owned:
+    for st in project_rows(owners):
         iface = st.interface
-        kind, _label, _owned = interface_row_state(st, iface)
-        # 'deploying' (apply pushed, awaiting device confirmation) is counted as pending-apply
-        # by the tab badges, so it must appear here too — else the preview total drops to 0 and
-        # the confirm modal is silently skipped (openApply's `!d.total` short-circuit).
-        if kind not in ("pending", "apply_failed", "deploying", "unavailable"):
+        projected = row_projection(st)
+        if not projected["pending"]:
             continue
         if st.attribute == "description":
             netbox_val = iface.description or "—"
@@ -6208,7 +6130,10 @@ def _apply_preview_interface_changes(device_pk):
             netbox_val = "—"
         changes.append(
             {
-                **st.refusal_display,
+                **projected,
+                "model": st._meta.model_name,
+                "pk": st.pk,
+                "status": st.status,
                 "interface": iface.name,
                 "attribute": st.attribute,
                 "device": st.nso_value or "—",
@@ -6309,7 +6234,7 @@ def _apply_preview_owner_changes(device_pk):
     }
 
     from .delivery import delivery_keys
-    from .refusal_display import UNAVAILABLE, project_rows, row_projection
+    from .refusal_display import project_rows, row_projection
     from .refusal_registry import OVERLAYS
 
     routing_changes = []
@@ -6325,7 +6250,7 @@ def _apply_preview_owner_changes(device_pk):
         rows = model.objects.filter(**{spec.device_lookup: device_pk})
         for r in project_rows(rows):
             projected = row_projection(r)
-            if r.status not in {"accepted", "apply_failed", "deploying"} and projected["advisory"] != UNAVAILABLE:
+            if not projected["pending"]:
                 continue
             try:
                 item = item_fn(r)
@@ -6343,6 +6268,8 @@ def _apply_preview_owner_changes(device_pk):
             routing_changes.append(
                 {
                     **projected,
+                    "model": r._meta.model_name,
+                    "pk": r.pk,
                     "category": label,
                     "item": item,
                     "detail": detail,
@@ -7377,13 +7304,14 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
     template_name = "netbox_nso_plugin/route_policy_classify_bulk.html"
 
     def _divergent_rows(self, mgmt):
-        return (
-            NSORoutePolicyState.objects.filter(
-                management=mgmt, status__in=("conflict", "changed"), is_materialized=False
-            )
+        from .refusal_display import project_rows, row_projection
+
+        rows = (
+            NSORoutePolicyState.objects.filter(management=mgmt, is_materialized=False)
             .select_related("management__device")
             .order_by("family", "object_name")
         )
+        return [row for row in project_rows(rows) if row_projection(row)["state"] == "drift"]
 
     def get(self, request, device_pk):  # noqa: D102
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)

@@ -16,7 +16,7 @@
   <div class="table-responsive mb-3">
   <table class="table table-sm table-hover mb-0">
     <thead><tr><th>Location / Contact</th><th>Status / Synced</th><th></th></tr></thead>
-    <tbody><tr data-status="{{ snmp_data.system_info.status }}" data-owned="{{ snmp_data.system_info.accepted_at|yesno:'true,false' }}">
+    <tbody><tr data-kind="{{ snmp_data.system_info.refusal_display.state }}" data-bucket="{{ snmp_data.system_info.refusal_display.bucket }}">
       <td>
         <a href="#" class="nso-popedit" title="Edit location and contact; this takes ownership"
            data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="SNMP system information"
@@ -47,7 +47,7 @@
       </thead>
       <tbody>
         {% for c in snmp_data.communities %}
-        <tr data-status="{{ c.status }}" data-owned="{{ c.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ c.refusal_display.state }}" data-bucket="{{ c.refusal_display.bucket }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_community' pk=c.pk as community_edit_url %}
           <td>
             <code>{{ c.community_hash }}</code>
@@ -114,7 +114,7 @@
       </thead>
       <tbody>
         {% for u in snmp_data.v3_users %}
-        <tr data-status="{{ u.status }}" data-owned="{{ u.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ u.refusal_display.state }}" data-bucket="{{ u.refusal_display.bucket }}">
           <td>
             <span class="fw-semibold">{{ u.username }}</span>
             <div class="small">
@@ -167,7 +167,7 @@
       </thead>
       <tbody>
         {% for h in snmp_data.hosts %}
-        <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ h.refusal_display.state }}" data-bucket="{{ h.refusal_display.bucket }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_host' pk=h.pk as host_edit_url %}
           <td>
             <span class="fw-semibold">{{ h.address }}</span>

@@ -70,7 +70,9 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.category("bgp", refresh=1)
         return generation["refusals"][0]
 
-    def interface_execution(self, *, unavailable=False, matching=False, prior_status="accepted", disposition=None):
+    def interface_execution(
+        self, *, unavailable=False, matching=False, prior_status="accepted", disposition=None, prior_error=None
+    ):
         with without_commit_drain(), transaction.atomic():
             self.management.manage_interfaces = True
             self.management.manage_description = True
@@ -85,7 +87,7 @@ class TestRefusalDisplay(BGPCaptureCase):
                 status="accepted",
                 nso_value="placeholder desired" if matching else "placeholder observed",
             )
-        self.apply_owners([row], prior_status=prior_status)
+        self.apply_owners([row], prior_status=prior_status, prior_error=prior_error)
         disposition = disposition or ("unavailable" if unavailable else "refused")
         generation = self.evidence(
             refused=row if disposition == "refused" else None,
@@ -207,6 +209,94 @@ class TestRefusalDisplay(BGPCaptureCase):
                 self.assertTrue(row["label"].startswith("previous "))
         self.assertContains(self.category("bgp"), "unavailable")
 
+    def test_rest_exposes_unavailable_settlement_on_prior_in_sync_owner(self):
+        _iface, row, _generation = self.interface_execution(unavailable=True, prior_status="in_sync", prior_error={})
+        response = self.rest_client().get(
+            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,))
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()
+        self.assertEqual(data["status"], "in_sync")
+        self.assertEqual(data["last_apply_error"], {})
+        self.assertEqual(data.get("state"), "unavailable")
+        self.assertEqual(data.get("execution_disposition"), "unavailable")
+        self.assertIn("unavailable", data.get("advisory", ""))
+
+    def test_invalid_retained_evidence_keeps_current_unavailable_advisory(self):
+        from ._outbox_case import mirror_update
+
+        _iface, row, _generation = self.interface_execution(unavailable=True, prior_status="in_sync", prior_error={})
+        mirror_update(row, last_apply_error={"refusals": [{"message": "placeholder-secret-canary"}]})
+        response = self.rest_client().get(
+            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,))
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("placeholder-secret-canary", response.content.decode())
+        data = response.json()
+        self.assertEqual(data["state"], "apply_failed")
+        self.assertEqual(data["refusal_text"], "invalid refusal evidence")
+        self.assertEqual(data["execution_disposition"], "unavailable")
+        self.assertIn("unavailable", data["advisory"])
+
+    def test_preview_includes_invalid_evidence_on_in_sync_ip_owner(self):
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._outbox_case import mirror_update
+
+        with without_commit_drain():
+            iface = Interface.objects.create(device=self.device, name="Ethernet71", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceIPState, interface=iface, address="198.18.0.1/24", status="accepted")
+        mirror_update(row, status="in_sync", last_apply_error={"refusals": [{"message": "placeholder-canary"}]})
+        grid = self.category("interface", format="json").json()
+        self.assertEqual(grid["rows"][0]["ips"][0]["kind"], "apply_failed")
+        result = self.preview(make_apply_preview(device_id=1558, diffs={})).json()
+        self.assertFalse(result["nothing_pending"])
+        self.assertEqual(result["total"], 1)
+
+    def test_mixed_interface_grid_filters_the_same_bucket_it_counts(self):
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        with without_commit_drain():
+            self.management.manage_interfaces = True
+            self.management.manage_description = True
+            self.management.save(update_fields=("manage_interfaces", "manage_description"))
+            iface = Interface.objects.create(
+                device=self.device, name="Ethernet71", type="1000base-t", description="placeholder desired"
+            )
+            acquire_overlay(
+                NSOInterfaceState,
+                interface=iface,
+                attribute="description",
+                status="accepted",
+                nso_value="placeholder observed",
+            )
+            NSOInterfaceIPState.objects.create(interface=iface, address="198.18.0.1/24", status="changed")
+        payload = self.category("interface", format="json").json()
+        self.assertEqual(payload["counts"]["drift"], 1)
+        self.assertEqual(payload["rows"][0]["state"], "drift")
+        self.assertEqual(payload["rows"][0]["bucket"], "drift")
+        self.assertFalse(payload["rows"][0]["pending"])
+
+    def test_registry_owner_rest_requires_view_permission_and_refuses_writes(self):
+        from django.test import override_settings
+        from rest_framework.test import APIClient
+        from users.constants import TOKEN_PREFIX
+        from users.models import Token, User
+
+        with without_commit_drain():
+            iface = Interface.objects.create(device=self.device, name="Ethernet71", type="1000base-t")
+            row = NSOInterfaceState.objects.create(interface=iface, attribute="description", status="imported")
+        url = reverse("plugins-api:netbox_nso_plugin-api:owner-state-detail", args=(row._meta.model_name, row.pk))
+        api = self.rest_client()
+        self.assertEqual(api.get(url).status_code, 200)
+        self.assertEqual(api.post(url, {}).status_code, 405)
+        self.assertEqual(APIClient().get(url).status_code, 403)
+        user = User.objects.create_user(username="placeholder-unprivileged-operator")
+        token = Token.objects.create(user=user)
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}")
+        with override_settings(EXEMPT_VIEW_PERMISSIONS=[]):
+            self.assertEqual(api.get(url).status_code, 404)
+
     def test_preview_refusal_keeps_diffs_and_identity_fields(self):
         cause = self.refused_bgp()
         preview = make_apply_preview(
@@ -324,6 +414,108 @@ class TestRefusalDisplay(BGPCaptureCase):
                 self.assertTrue(change["refusal"]["valid"])
                 self.assertTrue(change["refusal_text"].startswith("inexpressible-on-ned: "))
                 self.assertEqual(change["error"], change["refusal_text"])
+
+    def flex_algo_execution(self, disposition):
+        from netbox_routing.models import ISISFlexAlgo, ISISInstance
+
+        from netbox_nso_plugin import models
+
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_routing = True
+            self.management.manage_isis = True
+            self.management.save(update_fields=("manage_routing", "manage_isis"))
+            native = ISISInstance.objects.create(
+                device=self.device, process_tag="placeholder-process", net="49.0001.0000.0000.0001.00"
+            )
+            instance = acquire_overlay(
+                models.NSOISISInstanceState,
+                management=self.management,
+                isis_instance=native,
+                process_tag=native.process_tag,
+                net=native.net,
+                status="accepted",
+            )
+            iface = Interface.objects.create(device=self.device, name="Ethernet71", type="1000base-t")
+            interface = acquire_overlay(
+                models.NSOISISInterfaceState,
+                management=self.management,
+                interface=iface,
+                process_tag=native.process_tag,
+                af="ipv4",
+                status="accepted",
+            )
+            algo = ISISFlexAlgo.objects.create(instance=native, algo_id=130)
+            flex_algo = acquire_overlay(
+                models.NSOISISFlexAlgoState,
+                management=self.management,
+                isis_flex_algo=algo,
+                process_tag=native.process_tag,
+                algo_id=130,
+                status="accepted",
+            )
+        self.apply_owners([instance, interface, flex_algo], prior_status="in_sync")
+        generation = self.evidence(
+            dispositions={
+                "isis.process-config": "in_sync",
+                "isis.interface-config": "in_sync",
+                "isis.process-config.flex-algo": disposition,
+            }
+        )
+        from netbox_nso_plugin.refusal_registry import document_section_for_stream
+
+        generation["sections"] = sorted({document_section_for_stream(stream) for stream in generation["sections"]})
+        self.settle(generation)
+        return flex_algo
+
+    def assert_flex_algo_pending_display(self, disposition):
+        from netbox_nso_plugin.refusal_display import UNAVAILABLE
+
+        owner = self.flex_algo_execution(disposition)
+        with self.subTest(surface="category counts"):
+            counts = self.client.get(
+                reverse("plugins:netbox_nso_plugin:device_nso_category_counts", args=(self.device.pk,))
+            ).json()["categories"]["isis"]
+            self.assertEqual(counts["pending"], 1)
+            self.assertEqual(counts["total"], 3)
+            self.assertEqual(counts["drift"], 0)
+        with self.subTest(surface="device tab"):
+            response = self.client.get(reverse("dcim:device_nso", args=(self.device.pk,)))
+            self.assertEqual(response.status_code, 200)
+            category = next(cat for cat in response.context["nso_categories"] if cat["key"] == "isis")
+            self.assertEqual(category["counts"]["pending"], 1)
+        with self.subTest(surface="category grid"):
+            payload = self.category("isis", format="json").json()
+            self.assertIn("flex_algos", payload)
+            rows = payload["flex_algos"]["rows"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["pk"], owner.pk)
+            self.assertEqual(rows[0]["algo_id"], 130)
+            self.assertEqual(payload["flex_algos"]["counts"], {"all": 1, "drift": 0, "pending": 1})
+            for sibling in ("instances", "interfaces"):
+                self.assertEqual(payload[sibling]["rows"][0]["state"], "in_sync")
+                self.assertEqual(payload[sibling]["counts"]["pending"], 0)
+            if disposition == "refused":
+                self.assertEqual(rows[0]["state"], "apply_failed")
+                self.assertTrue(rows[0]["refusal"]["valid"])
+                self.assertTrue(rows[0]["refusal_text"].startswith("inexpressible-on-ned: "))
+            else:
+                self.assertEqual(rows[0]["state"], "unavailable")
+                self.assertIsNone(rows[0]["refusal"])
+                self.assertEqual(rows[0]["advisory"], UNAVAILABLE)
+                self.assertEqual(rows[0]["status"], "in_sync")
+        with self.subTest(surface="category HTML"):
+            self.assertContains(self.category("isis"), 'class="nso-grid nso-isis-flex"')
+        with self.subTest(surface="preview"):
+            preview = self.preview(make_apply_preview(device_id=1558, diffs={})).json()
+            self.assertEqual(preview["total"], 1)
+            self.assertEqual(preview["routing_changes"][0]["category"], "IS-IS Flex-Algo")
+            self.assertFalse(preview["nothing_pending"])
+
+    def test_refused_flex_algo_is_pending_beside_in_sync_isis_siblings(self):
+        self.assert_flex_algo_pending_display("refused")
+
+    def test_unavailable_flex_algo_is_pending_beside_in_sync_isis_siblings(self):
+        self.assert_flex_algo_pending_display("unavailable")
 
     def test_document_refusal_summary_requires_no_commit_proof(self):
         from netbox_nso_plugin.refusal_display import document_projection
@@ -503,7 +695,7 @@ class TestRefusalDisplay(BGPCaptureCase):
             with self.subTest(url=url):
                 response = self.client.get(url)
                 self.assertEqual(response.status_code, 200, response.content)
-                self.assertContains(response, "previous in_sync")
+                self.assertContains(response, "previous in sync")
                 self.assertContains(response, "Execution unavailable; showing previous state.")
                 self.assertContains(response, f"placeholder prior nsointerfacestate {row.pk}")
 
@@ -537,7 +729,7 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.assertEqual(row.status, "in_sync")
         response = self.client.get(row.assigned_object.get_absolute_url())
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertContains(response, "previous in_sync")
+        self.assertContains(response, "previous in sync")
         self.assertContains(response, "Execution unavailable; showing previous state.")
         self.assertContains(response, f"placeholder prior nsoroutepolicystate {row.pk}")
 
@@ -889,7 +1081,7 @@ class TestRefusalDisplay(BGPCaptureCase):
         self.settle(generation)
         response = self.category("vlan", state="pending")
         self.assertContains(response, "Execution unavailable")
-        self.assertContains(response, "previous in_sync")
+        self.assertContains(response, "previous in sync")
         self.assertContains(response, f"placeholder prior {row._meta.model_name} {row.pk}")
 
     def test_mixed_contributors_keep_device_summary_unavailable(self):

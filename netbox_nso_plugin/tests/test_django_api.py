@@ -253,16 +253,22 @@ class NSOInterfaceStateAPITest(APITestCase):
         self.assertEqual(response.data["attribute"], "description")
 
     def test_status_filter_applies(self):
-        """?status= must actually filter — the viewset now declares filterset_class. Before, an
-        unrecognized filter param was silently ignored and every row was returned."""
+        """Filter the projected membership returned with each owner row."""
         other = acquire_overlay(
-            NSOInterfaceState, interface=self.state.interface, attribute="enabled", status="accepted", nso_value="true"
+            NSOInterfaceState, interface=self.state.interface, attribute="enabled", status="accepted", nso_value="false"
         )
-        response = self.client.get(f"{self._get_list_url()}?status=accepted", **self.header)
+        response = self.client.get(f"{self._get_list_url()}?status=pending", **self.header)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         ids = {row["id"] for row in response.data["results"]}
         self.assertIn(other.pk, ids)
-        self.assertNotIn(self.state.pk, ids)  # the 'changed' row is filtered out
+        self.assertNotIn(self.state.pk, ids)
+        self.assertTrue(all(row["state"] == "pending" and row["pending"] for row in response.data["results"]))
+        for projected_state in ("drift", "in_sync"):
+            response = self.client.get(f"{self._get_list_url()}?status={projected_state}", **self.header)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            ids = {row["id"] for row in response.data["results"]}
+            self.assertNotIn(other.pk, ids)
+            self.assertEqual(self.state.pk in ids, projected_state == "drift")
 
     def test_accepting_through_the_api_is_refused(self):
         """Refuse REST ownership and enqueue no delivery."""

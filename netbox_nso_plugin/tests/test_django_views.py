@@ -3516,13 +3516,10 @@ class TestDeviceNSOTabView(ViewTestBase):
         from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOInterfaceState
 
         iface = Interface.objects.create(device=self.device, name="Gi0/9", type="other", description="nb")
-        # cell 1 → apply_failed. Only the value-aware attribute cells can produce that kind
-        # (interface_row_state); display_state folds apply_failed into "pending".
+        # A failed owner takes precedence over drift in the grouped projection.
         acquire_overlay(
             NSOInterfaceState, interface=iface, attribute="description", status="apply_failed", nso_value="device-side"
         )
-        # cell 2 → drift (unowned differ). apply_failed outranks drift in _KIND_SEVERITY,
-        # so the ROW collapses to apply_failed while the raw kind set still holds "drift".
         NSOInterfaceMtuState.objects.create(management=self.mgmt, interface=iface, l2_mtu=9216, status="changed")
 
         url = reverse(
@@ -3534,8 +3531,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertEqual(row["state"], "apply_failed", "the worst cell wins the row state")
 
         # What each pill would actually show, by the grid's own filter predicates.
-        shown_drift = [r for r in data["rows"] if r["state"] == "drift"]
-        shown_pending = [r for r in data["rows"] if r["state"] in ("pending", "apply_failed")]
+        shown_drift = [r for r in data["rows"] if r["bucket"] == "drift"]
+        shown_pending = [r for r in data["rows"] if r["bucket"] == "pending"]
         self.assertEqual(data["counts"]["drift"], len(shown_drift))
         self.assertEqual(data["counts"]["pending"], len(shown_pending))
         self.assertNotIn(row, shown_drift)
@@ -4280,41 +4277,6 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         content_bulk_update(self.iface_state, status="changed")
-
-
-class TestMergedInterfaceStateFilter(TestCase):
-    """Unit tests for the matrix-view state quick-filter bucketing (pure function)."""
-
-    class _I:
-        def __init__(self, iface_id):
-            self.id = iface_id
-
-    def test_buckets_drift_pending_in_sync(self):
-        from netbox_nso_plugin.views import _filter_ifaces_by_state
-
-        a, b, c = self._I(1), self._I(2), self._I(3)
-        ordered = [a, b, c]
-        kinds = {1: {"drift"}, 2: {"pending"}, 3: {"in_sync"}}
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "drift"), [a])
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "pending"), [b])
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "in_sync"), [c])
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "all"), [a, b, c])
-
-    def test_apply_failed_counts_as_pending_not_in_sync(self):
-        from netbox_nso_plugin.views import _filter_ifaces_by_state
-
-        x = self._I(1)
-        self.assertEqual(_filter_ifaces_by_state([x], {1: {"apply_failed"}}, "pending"), [x])
-        self.assertEqual(_filter_ifaces_by_state([x], {1: {"apply_failed"}}, "in_sync"), [])
-
-    def test_mixed_interface_appears_in_both_drift_and_pending(self):
-        from netbox_nso_plugin.views import _filter_ifaces_by_state
-
-        x = self._I(1)
-        kinds = {1: {"drift", "pending"}}
-        self.assertEqual(_filter_ifaces_by_state([x], kinds, "drift"), [x])
-        self.assertEqual(_filter_ifaces_by_state([x], kinds, "pending"), [x])
-        self.assertEqual(_filter_ifaces_by_state([x], kinds, "in_sync"), [])  # not clean → excluded
 
 
 class TestInterfaceMatrixStateChips(ViewTestBase):
@@ -7022,7 +6984,7 @@ class TestPagedCategoryQuickSelect(ViewTestBase):
 
 class TestCategoryQuickSelectStructure(SimpleTestCase):
     """Fast structural backstop (no DB): any category template that renders per-row
-    status (data-status) must also pull in a quick-select provider, so a new/edited
+    projected state (data-bucket) must also pull in a quick-select provider, so a new/edited
     category template can't omit it.
     """
 
@@ -7043,7 +7005,7 @@ class TestCategoryQuickSelectStructure(SimpleTestCase):
             if path.name.startswith("_"):  # shared partials are not standalone categories
                 continue
             text = path.read_text(encoding="utf-8")
-            if "data-status=" not in text:
+            if "data-bucket=" not in text:
                 continue  # no status table → nothing to filter
             if not any(marker in text for marker in self._FILTER_MARKERS):
                 offenders.append(path.name)

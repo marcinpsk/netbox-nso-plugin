@@ -15,7 +15,7 @@
       </thead>
       <tbody>
         {% for s in interface_mtu_states %}
-        <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ s.refusal_display.state }}" data-bucket="{{ s.refusal_display.bucket }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='interface_mtu' pk=s.pk as mtu_edit_url %}
           <td><a href="{{ s.interface.get_absolute_url }}">{{ s.interface.name }}</a></td>
           <td>

@@ -55,6 +55,30 @@ class NSOBGPRouterStateViewSet(NetBoxModelViewSet):
         return _visible_bgp_router_states(self.request.user)
 
 
+class OwnerStateView(APIView):
+    """Read a registered owner's projected state through its model serializer."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, model, pk):
+        from django.shortcuts import get_object_or_404
+
+        from ..refusal_registry import OVERLAYS
+        from . import serializers
+
+        spec = OVERLAYS.get(f"netbox_nso_plugin.{model}")
+        if spec is None:
+            return Response({"detail": "Unknown owner model."}, status=status.HTTP_404_NOT_FOUND)
+        queryset = spec.model.objects.restrict(request.user, "view")
+        if spec.model is NSOBGPRouterState:
+            from ..views import _visible_bgp_router_states
+
+            queryset = _visible_bgp_router_states(request.user)
+        owner = get_object_or_404(queryset, pk=pk)
+        serializer = getattr(serializers, spec.model.__name__ + "Serializer")
+        return Response(serializer(owner, context={"request": request}).data)
+
+
 class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):
     """REST API for database-managed derived-intent templates."""
 

@@ -181,19 +181,22 @@ describe("quick-filter pills", () => {
       root.querySelector('[data-state="' + state + '"]').dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     click("drift");
-    expect(table.filter).toEqual({ a: "state", b: "=", c: "drift" });
+    expect(table.filter).toEqual({ a: "bucket", b: "=", c: "drift" });
     expect(root.querySelector('[data-state="drift"]').classList.contains("active")).toBe(true);
     expect(root.querySelector('[data-state="all"]').classList.contains("active")).toBe(false);
 
     click("pending");
-    expect(table.filter.a({ state: "pending" })).toBe(true);
-    expect(table.filter.a({ state: "apply_failed" })).toBe(true);
-    expect(table.filter.a({ state: "drift" })).toBe(false);
+    expect(table.filter.a({ state: "pending", bucket: "pending" })).toBe(true);
+    expect(table.filter.a({ state: "deploying", bucket: "pending" })).toBe(true);
+    expect(table.filter.a({ state: "unavailable", bucket: "pending" })).toBe(true);
+    expect(table.filter.a({ state: "in_sync", bucket: "pending" })).toBe(true);
+    expect(table.filter.a({ state: "apply_failed", bucket: "pending" })).toBe(true);
+    expect(table.filter.a({ state: "drift", bucket: "drift" })).toBe(false);
 
     click("ok");
-    expect(table.filter.a({ state: "in_sync" })).toBe(true);
-    expect(table.filter.a({ state: "drift" })).toBe(false);
-    expect(table.filter.a({ state: "apply_failed" })).toBe(false);
+    expect(table.filter.a({ state: "in_sync", bucket: "in_sync" })).toBe(true);
+    expect(table.filter.a({ state: "drift", bucket: "drift" })).toBe(false);
+    expect(table.filter.a({ state: "apply_failed", bucket: "pending" })).toBe(false);
 
     click("all");
     expect(table.filter).toBeNull();

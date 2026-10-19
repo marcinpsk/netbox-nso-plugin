@@ -112,11 +112,11 @@ class TestNSOInterfaceStateFilterSet(TestCase):
         )
 
     def test_filterset_by_status(self):
-        """status filter works."""
+        """The status filter selects projected drift."""
         from netbox_nso_plugin.filters import NSOInterfaceStateFilterSet
         from netbox_nso_plugin.models import NSOInterfaceState
 
-        fs = NSOInterfaceStateFilterSet(data={"status": ["changed"]}, queryset=NSOInterfaceState.objects.all())
+        fs = NSOInterfaceStateFilterSet(data={"status": ["drift"]}, queryset=NSOInterfaceState.objects.all())
         self.assertTrue(fs.is_valid())
         self.assertEqual(fs.qs.count(), 1)
 

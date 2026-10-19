@@ -90,7 +90,7 @@ class TestAppliedToDevicesPanel(_RoutePolicyFixture):
         self._reconcile()
         cl = CommunityList.objects.get(name="CLJ")
         ct = ContentType.objects.get_for_model(cl)
-        # Operator owns it → status accepted (so the panel shows a non-import badge).
+        # Accepted ownership projects to pending apply in the common badge.
         state = NSORoutePolicyState.objects.get(content_type=ct, object_id=cl.pk)
 
         state.status = "accepted"
@@ -100,7 +100,9 @@ class TestAppliedToDevicesPanel(_RoutePolicyFixture):
         html = render_to_string("netbox_nso_plugin/route_policy_nso_devices.html", {"nso_states": states})
         self.assertIn("Applied to Devices", html)
         self.assertIn("rpj-router", html)
-        self.assertIn("Accepted", html)  # get_status_display
+        self.assertIn("pending apply", html)
+        self.assertIn('data-state="pending"', html)
+        self.assertIn('data-pending="true"', html)
 
     def test_panel_empty_when_no_states(self):
         """No managing device → the panel renders nothing."""

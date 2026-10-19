@@ -719,7 +719,7 @@
           }
         });
       });
-      if (outcomes.length) { msg += '  (' + outcomes.join(', ') + ')'; }
+      if (outcomes.length) { msg += '  (Adapter-reported: ' + outcomes.join(', ') + ')'; }
       return msg;
     }
 
@@ -937,7 +937,7 @@
               : 'Accepted ' + c.staged_days + ' days ago and still not in sync — the last apply never converged or the change was re-staged.';
             stale = ' <span class="badge text-bg-warning text-dark" title="' + staleTitle + '">' + staleLabel + '</span>';
           }
-          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span>' + stale + refusalNotice(c) + '</td></tr>';
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.label) + '</span>' + stale + refusalNotice(c) + '</td></tr>';
         });
         h += '</tbody></table></div>';
       }

@@ -130,13 +130,13 @@ describe("cellBadge", () => {
   });
 
   it("in-sync-and-owned renders the quiet check icon, not a badge", () => {
-    const host = parse(G.cellBadge({ kind: "in_sync", status: "in_sync" }));
+    const host = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", owned: true }));
     expect(host.querySelector(".mdi-check-circle")).not.toBeNull();
     expect(host.querySelector(".badge")).toBeNull();
   });
 
   it("in-sync but not-owned renders nothing at all", () => {
-    expect(G.cellBadge({ kind: "in_sync", status: "pending" })).toBe("");
+    expect(G.cellBadge({ kind: "in_sync", status: "pending", owned: false })).toBe("");
   });
 
   it("any other kind renders its badge", () => {
@@ -175,7 +175,7 @@ describe("valueFormatter", () => {
   });
 
   it("escapes the device-supplied value", () => {
-    const row = { desc: { value: 'up"link <1>', kind: "in_sync", status: "in_sync" } };
+    const row = { desc: { value: 'up"link <1>', kind: "in_sync", status: "in_sync", owned: true } };
     const host = parse(G.valueFormatter("desc")(fakeCell(row)));
     expect(host.textContent).toContain('up"link <1>');
     // The only element is the in-sync check icon — `<1>` stayed text, not markup.
@@ -184,7 +184,7 @@ describe("valueFormatter", () => {
   });
 
   it("a custom render gets the cell and the whole row, and its output is used as the body", () => {
-    const row = { peer: { value: "x", kind: "in_sync", status: "in_sync" }, extra: 7 };
+    const row = { peer: { value: "x", kind: "in_sync", status: "in_sync", owned: true }, extra: 7 };
     const seen = [];
     const out = G.valueFormatter("peer", (c, r) => {
       seen.push([c, r]);
@@ -286,7 +286,7 @@ describe("catalog refusal projection", () => {
 
   it("keeps unavailable evidence visible beside a prior in-sync cell", () => {
     const text = "Execution unavailable; showing previous state.";
-    const node = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", advisory: text }));
+    const node = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", owned: true, advisory: text }));
     expect(node.textContent).toContain(text);
   });
 

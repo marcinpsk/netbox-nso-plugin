@@ -27,11 +27,15 @@ from .test_durable_bgp_capture import BGPCaptureCase
 
 
 class TestRefusalSettlementFamilies(BGPSettlementHelpers, BGPCaptureCase):
-    def apply_owners(self, owners, *, prior_status="accepted"):
+    def apply_owners(self, owners, *, prior_status="accepted", prior_error=None):
         self.owners = owners
         self.prior = {}
         for row in owners:
             self.bookkeeping(row, status=prior_status)
+            if prior_error is not None:
+                from ._outbox_case import mirror_update
+
+                mirror_update(row, last_apply_error=prior_error)
             row.refresh_from_db()
             self.prior[(row._meta.label_lower, row.pk)] = (
                 row.status,

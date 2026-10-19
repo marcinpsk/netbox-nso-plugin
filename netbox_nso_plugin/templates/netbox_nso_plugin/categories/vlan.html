@@ -20,7 +20,7 @@
         <thead><tr><th>VLAN</th><th>Name</th><th>Status</th><th>Last Synced</th><th></th></tr></thead>
         <tbody>
           {% for s in vlan_states %}
-          <tr data-status="{{ s.status }}" data-owned="{{ s.accepted_at|yesno:'true,false' }}">
+          <tr data-kind="{{ s.refusal_display.state }}" data-bucket="{{ s.refusal_display.bucket }}">
             <td class="text-nowrap">
               <a href="{{ s.vlan.get_absolute_url }}">VID {{ s.vlan.vid }}</a>
               {% if s.vlan.group %}<div class="text-muted small" title="VLAN group">{{ s.vlan.group }}</div>{% endif %}

@@ -34,6 +34,7 @@ function mount(section, row) {
   payload.textContent = JSON.stringify({
     instances: { rows: section === "instances" ? [row] : [], counts: { all: 1 } },
     interfaces: { rows: section === "interfaces" ? [row] : [], counts: { all: 1 } },
+    flex_algos: { rows: section === "flex_algos" ? [row] : [], counts: { all: 1, pending: 1 } },
   });
   document.body.append(root, payload);
   window.NSOGridIsis.mount(root, section);
@@ -50,11 +51,34 @@ beforeEach(() => {
   document.body.innerHTML = "";
   delete window.__nsoGrid_isis_instances;
   delete window.__nsoGrid_isis_interfaces;
+  delete window.__nsoGrid_isis_flex_algos;
 });
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("IS-IS grid", () => {
+  it("shows a Flex-Algo owner and its pending execution state", () => {
+    const row = {
+      process_tag: "placeholder-process",
+      algo_id: 130,
+      metric_type: "igp",
+      priority: 128,
+      state: "unavailable",
+      label: "Execution unavailable; previous in_sync",
+      advisory: "Execution unavailable; showing previous state.",
+    };
+    const table = mount("flex_algos", row);
+
+    expect(table).toBeDefined();
+    expect(table.config.data).toHaveLength(1);
+    expect(table.config.data[0].algo_id).toBe(130);
+    expect(table.config.columns.map((column) => column.field)).toEqual([
+      "_process", "algo_id", "metric_type", "priority", "state", "last_sync",
+    ]);
+    const state = table.config.columns.find((column) => column.field === "state").formatter(cell(row));
+    expect(state).toContain("unavailable");
+  });
+
   it("compacts an interface into binding and one safe config editor", () => {
     const row = {
       iface: { name: "Ethernet1", url: "/dcim/interfaces/1/" },
