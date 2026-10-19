@@ -354,7 +354,9 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
             row.refresh_from_db()
             self.assertEqual(row.status, "in_sync")
 
-    def serve_terminal_evidence(self, generation, *, epoch_change=False, manual=False, head=True, pruned=False):
+    def serve_terminal_evidence(
+        self, generation, *, epoch_change=False, manual=False, head=True, pruned=False, settle_seq=1
+    ):
         from ._adapter_http import make_response
         from .test_durable_bgp_capture import _CaptureHandler
 
@@ -393,7 +395,7 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
                     "updated_at": generation["updated_at"],
                     "started_at": self.stamp.isoformat(),
                     "heartbeat_at": None,
-                    "settle_seq": 1,
+                    "settle_seq": settle_seq,
                 }
                 after = int(kwargs["params"]["after_settle_seq"])
                 return make_response(200, [] if pruned or job["settle_seq"] <= after else [job])
@@ -460,6 +462,28 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
         self.assertEqual(self.owners[1].status, "apply_failed")
         self.assertEqual(self.adapter.apply_requests, [])
         self.assertEqual(NSOApplyExecution.objects.get().settle_seq, 1)
+
+    def test_sweep_settles_a_retry_of_an_already_bound_selection(self):
+        from netbox_nso_plugin.models import NSOAcceptedSelection
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.settlement import sweep_static_route_settlements
+
+        self.prepare_automatic()
+        settle_terminal_generation(self.management, self.terminal(refused=None), "placeholder-store", settle_seq=1)
+        for row in self.owners:
+            row.refresh_from_db()
+            self.assertEqual(row.status, "in_sync")
+        selection = NSOAcceptedSelection.objects.get(management=self.management, stream="bgp")
+        self.assertEqual((selection.publication_state, selection.binding_state), ("sent", "bound"))
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        self.serve_terminal_evidence(retry, settle_seq=2)
+
+        self.assertEqual(sweep_static_route_settlements(), (1, 0))
+
+        self.owners[1].refresh_from_db()
+        self.assertEqual(self.owners[1].status, "apply_failed")
+        self.assertEqual(NSOApplyExecution.objects.get(carrier_job_id=502).consumption_state, "consumed")
 
     def test_malformed_feed_identity_cannot_settle_or_advance_the_cursor(self):
         from netbox_nso_plugin.adapter_client import AdapterError
