@@ -639,8 +639,8 @@ class TestSymmetricOwnershipExecutor(TestCase):
                 for query in captured.captured_queries
                 if query["sql"].lstrip().upper().startswith("SELECT") and f'FROM "{table}"' in query["sql"]
             ]
-            # Batched owner-fence capture validates the prior and final contributions.
-            self.assertLessEqual(len(selects), 3 * rows + 5)
+            # A fixed batched owner-fence cost plus two SELECTs per planned row.
+            self.assertEqual(len(selects), 2 * rows + 6)
             return len(captured.captured_queries)
 
         measure(1)
