@@ -294,15 +294,19 @@ def validate_terminal_generation(
 ):
     """Prove complete ownership without binding selections or writing overlays."""
     try:
-        refusal_contract.validate_generation(generation)
-        _require(isinstance(store_incarnation, str) and 0 < len(store_incarnation) <= 64, "missing_store_incarnation")
-        if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
-            return None
-        return _join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
+        return _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
     except (refusal_contract.ContractError, EvidenceInvariantError) as exc:
         code = "execution_order_unproven" if str(exc) == "execution_order_unproven" else "invalid_terminal_batch"
         _record_invariant(management, generation, store_incarnation, attempt, code)
         raise EvidenceInvariantError(code) from exc
+
+
+def _validated_join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries):
+    refusal_contract.validate_generation(generation)
+    _require(isinstance(store_incarnation, str) and 0 < len(store_incarnation) <= 64, "missing_store_incarnation")
+    if generation["status"] in {"pending", "running"} or generation["row_outcomes"] is None:
+        return None
+    return _join(management, generation, store_incarnation, attempt, authorities, receipt_recoveries)
 
 
 def _attempt_for(attempts, generation):
@@ -359,13 +363,14 @@ def settle_terminal_generations(
         keys = set()
         for generation in generations:
             identity = generation["generation_id"], generation["carrier_job_id"]
-            joined = validate_terminal_generation(
+            # The batch handler below records the invariant for every generation.
+            joined = _validated_join(
                 management,
                 generation,
                 store_incarnation,
-                attempt=attempts.get(identity),
-                authorities=authorities[generation["carrier_job_id"]],
-                receipt_recoveries=receipt_recoveries,
+                attempts.get(identity),
+                authorities[generation["carrier_job_id"]],
+                receipt_recoveries,
             )
             if joined is not None:
                 grouped.update(joined[-1])

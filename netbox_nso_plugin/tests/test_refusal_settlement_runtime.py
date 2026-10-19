@@ -1621,6 +1621,26 @@ class TestRefusalSettlementRuntime(BGPCaptureCase):
                 self.prior[row._meta.label_lower, row.pk],
             )
 
+    def test_rejected_generation_records_its_invariant_once(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+
+        self.prepare_automatic()
+        self.attempt.overlay_snapshots.update(expected_owner_revision=None)
+        table = NSOApplyExecution._meta.db_table
+        with CaptureQueriesContext(connection) as queries, self.assertRaises(EvidenceInvariantError):
+            settle_terminal_generation(self.management, self.terminal(), "placeholder-store", settle_seq=1)
+        writes = [
+            query["sql"].split(None, 1)[0].upper()
+            for query in queries
+            if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE")) and f'"{table}"' in query["sql"]
+        ]
+        self.assertEqual(writes, ["INSERT"])
+        self.assertTrue(NSOApplyExecution.objects.get().invariant_code)
+
     def test_new_selection_records_initial_zero_owner_revision(self):
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
