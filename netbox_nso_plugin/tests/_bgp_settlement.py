@@ -220,15 +220,15 @@ class BGPSettlementHelpers:
                     ],
                 )
             if method == "POST" and url.endswith("/deployment-evidence"):
-                head = {key: value for key, value in generation.items() if key != "stream_revisions"}
-                head.update(
+                head_row = {key: value for key, value in generation.items() if key != "stream_revisions"}
+                head_row.update(
                     mode="networked", settlement_cohort=9, apply_attempt_id=None, created_at=self.stamp.isoformat()
                 )
                 return make_response(
                     200,
                     {
                         "device_id": self.management.adapter_device_id,
-                        "head": head if head_enabled else None,
+                        "head": head_row if head else None,
                         "blocked": generation["status"] == "failed",
                         "write_work_pending": False,
                         "held_jobs": [],
@@ -249,7 +249,6 @@ class BGPSettlementHelpers:
                 )
             return original(method, url, **kwargs)
 
-        head_enabled = head
         self.adapter._handle = handle
 
     def evidence(self, refused=None, dispositions=None):

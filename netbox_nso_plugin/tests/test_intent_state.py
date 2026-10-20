@@ -636,7 +636,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(revision.revision, before + 1)
         self.assertEqual(other_revision.revision, other_before)
 
-    def test_detected_partial_bump_repends_only_the_selected_scope(self):
+    def test_detected_partial_bump_bumps_only_the_selected_scope_and_preserves_deploying_rows(self):
         from netbox_nso_plugin.intent_state import _upgrade_detected_reconcile
 
         other_device, other_management = make_managed("intent-other", 1624, index=2)

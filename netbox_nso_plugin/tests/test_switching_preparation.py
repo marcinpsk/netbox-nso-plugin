@@ -89,10 +89,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
 
         from django.utils import timezone
 
-        from netbox_nso_plugin import delivery
         from netbox_nso_plugin.models import NSOApplyAttempt
         from netbox_nso_plugin.refusal_protocol import PREFIX, RowRef, refusal, render_refusals
-        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS, _document_section
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS, document_section_for_stream
 
         from .test_apply_settlement import _payload
 
@@ -106,13 +105,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             generation_id = prepared["generation_id"]
             job_id = 500 + index
             revision = prepared["stream_revisions"]
-            sections = sorted(
-                {
-                    _document_section(scope)
-                    for scope, entry in delivery.delivery_keys().items()
-                    if entry.section in revision
-                }
-            )
+            sections = sorted({document_section_for_stream(stream) for stream in revision})
             outcomes, causes = [], []
             carriers = {}
             counts = {
@@ -167,8 +160,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                             carrier_row["disposition"] = "refused"
                 for carrier in carriers.values():
                     outcome = "apply_failed" if carrier["disposition"] == "refused" else carrier["disposition"]
-                    (counter_key,) = SECTION_COUNTER_KEYS[carrier["stream"]]
-                    counts[counter_key][outcome] += 1
+                    counts[f"{carrier['stream']}_count_by_outcome"][outcome] += 1
                 result = {
                     **counts,
                     "row_outcomes": outcomes,

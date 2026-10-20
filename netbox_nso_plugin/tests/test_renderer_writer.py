@@ -1118,7 +1118,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertFalse(plan.changes_content)
         self.assertEqual(plan.write_set[0].selected_pks, (lower.pk, higher.pk))
 
-    def test_content_save_bumps_repends_enqueues_and_finalizes_fingerprint(self):
+    def test_content_save_bumps_preserves_deploying_enqueues_and_finalizes_fingerprint(self):
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
