@@ -986,7 +986,7 @@ class TestO3CJoinedPinUvVersion(SimpleTestCase):
         (steps,) = [
             job["steps"]
             for job in jobs
-            if any(step.get("with", {}).get("path") == _ADAPTER_ROOT.name for step in job["steps"])
+            if any(step.get("with", {}).get("path") == ".o3c-adapter" for step in job["steps"])
         ]
         (setup_uv,) = [step for step in steps if step.get("uses", "").startswith("astral-sh/setup-uv@")]
         version = str(setup_uv.get("with", {}).get("version", ""))
