@@ -35,6 +35,10 @@ class AliasedOverlayErrorSerializer(RefusalDisplaySerializerMixin, serializers.M
     error = serializers.JSONField(source="last_apply_error", read_only=True)
     # ruleid: nso-row-error-projection-bypass
     error_text = serializers.CharField(read_only=True, source="last_apply_error")
+    # ruleid: nso-row-error-projection-bypass
+    owner_error = serializers.CharField(source="owner.last_apply_error", read_only=True)
+    # ok: nso-row-error-projection-bypass
+    owner_error_time = serializers.DateTimeField(source="owner.last_apply_error_at", read_only=True)
     # ok: nso-row-error-projection-bypass
     projected_error = serializers.JSONField(source="refusal_display.error_value", read_only=True)
 

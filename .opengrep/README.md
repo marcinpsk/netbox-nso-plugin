@@ -3,7 +3,7 @@
 
 # Local review checks
 
-Dotted `last_apply_error` source aliases are covered by `test_refusal_display_parity.py`, not by `nso-row-error-projection-bypass`.
+`nso-row-error-projection-bypass` also matches a literal serializer `source` whose last component is `last_apply_error`, such as `owner.last_apply_error`. A source held in a variable is covered by `test_refusal_display_parity.py`.
 
 Run these checks before a commit:
 
