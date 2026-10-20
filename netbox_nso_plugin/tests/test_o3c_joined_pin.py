@@ -978,6 +978,23 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
 
 
 @tag("o3c")
+class TestO3CJoinedPinUvVersion(SimpleTestCase):
+    def test_the_joined_pin_job_pins_a_uv_that_accepts_system_certs(self):
+        import yaml
+
+        jobs = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))["jobs"].values()
+        (steps,) = [
+            job["steps"]
+            for job in jobs
+            if any(step.get("with", {}).get("path") == _ADAPTER_ROOT.name for step in job["steps"])
+        ]
+        (setup_uv,) = [step for step in steps if step.get("uses", "").startswith("astral-sh/setup-uv@")]
+        version = str(setup_uv.get("with", {}).get("version", ""))
+        assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"setup-uv must pin an exact uv version, got {version!r}"
+        # uv rejects --system-certs before 0.11.0.
+        assert tuple(int(part) for part in version.split(".")) >= (0, 11, 0)
+
+
 class TestO3CEnvironmentFailFast(SimpleTestCase):
     """Prove a failed preflight tears down without hanging the suite."""
 
