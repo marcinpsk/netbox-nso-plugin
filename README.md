@@ -96,8 +96,11 @@ See `.devcontainer/` for the Docker-based development environment.
 
 Keep plugin operations and adapter Apply, removal, cadence, sweeper, and reclaimer
 admissions stopped throughout the cutover. The plugin gate does not stop the adapter.
-Run `nso_intent_deployment_gate --prepare` before installing the paired code and migration.
-A failed maintenance or verification action leaves the plugin quiesced.
+Run `nso_intent_deployment_gate --prepare --paired-activation` before installing the paired code
+and migration. The gate keeps this mark until paired verification releases it. A later
+`--prepare` without the flag does not remove it.
+A failed preparation, maintenance, or verification action leaves the plugin quiesced.
+The maintenance and probe actions below require a paired-activation gate.
 
 Use `--import-routers --device ID` to import one validated BGP observation and print
 router overlay IDs, router IDs, and complete scope and address-family membership.
@@ -139,7 +142,12 @@ installed migration leaf, pending migrations, preview shape, settlement evidence
 held work, and retained selection and execution provenance before resuming the plugin.
 CI proves shared fixture byte equality and codec/corpus equality with the package
 generator at pinned refs. Record those results and exact deploy refs in the step E hand-off.
-`--resume` and `--abort` use the same checks. Neither bypasses failed verification.
+On a paired-activation gate, `--resume` and `--abort` use the same checks. Neither bypasses
+failed verification.
+A gate prepared without `--paired-activation`, or created by `nso_intent_restore` or
+`nso_renderer_baseline_cutover`, does not use paired verification. Plain `--abort` releases it,
+and `--verify --device ID` sends one no-deletion static push before resume. A failed plain
+`--prepare` releases only a gate that the same invocation created.
 Resume the paired adapter admissions only after both components pass their cutover gates.
 Local HTTP-double tests do not establish live NSO acceptance.
 

@@ -108,6 +108,7 @@ class TestMigrationGraph(SimpleTestCase):
         ):
             assert (APP, name) in state.models, f"missing refusal ledger model: {name}"
         assert "verification_attempt" in state.models[APP, "nsointentdeploymentcontrol"].fields
+        assert "paired_activation" in state.models[APP, "nsointentdeploymentcontrol"].fields
         assert "nso_attempt_prune" in {index.name for index in state.models[APP, "nsoapplyattempt"].options["indexes"]}
 
 
@@ -490,10 +491,15 @@ class TestDeploymentProbeSchema(_CascadeFlushMixin, TransactionTestCase):
         control = Control.objects.get(pk=1)
         self.assertEqual(control.quiesced_at, stamp)
         self.assertIsNone(control.verification_attempt_id)
+        self.assertFalse(control.paired_activation)
         self.assertTrue(current.get_model(APP, "NSOApplyAttempt").objects.filter(pk=attempt.pk).exists())
         self.assertIs(Control._meta.get_field("verification_attempt").remote_field.on_delete, PROTECT)
         with self.assertRaises(IntegrityError), transaction.atomic():
-            Control.objects.filter(pk=1).update(quiesced_at=None, verification_attempt_id=attempt.pk)
+            Control.objects.filter(pk=1).update(verification_attempt_id=attempt.pk)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Control.objects.filter(pk=1).update(
+                quiesced_at=None, paired_activation=True, verification_attempt_id=attempt.pk
+            )
         self.assertIn(
             "nso_attempt_prune", {index.name for index in current.get_model(APP, "NSOApplyAttempt")._meta.indexes}
         )

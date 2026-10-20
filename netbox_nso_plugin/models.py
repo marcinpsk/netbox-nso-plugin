@@ -3388,6 +3388,8 @@ class NSOIntentDeploymentControl(models.Model):
 
     id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
     quiesced_at = models.DateTimeField(null=True, blank=True)
+    # Set by --prepare --paired-activation and never cleared while the gate exists.
+    paired_activation = models.BooleanField(default=False)
     verification_attempt = models.ForeignKey(
         to="NSOApplyAttempt",
         on_delete=models.PROTECT,
@@ -3401,6 +3403,10 @@ class NSOIntentDeploymentControl(models.Model):
             models.CheckConstraint(
                 condition=models.Q(verification_attempt__isnull=True) | models.Q(quiesced_at__isnull=False),
                 name="nso_probe_requires_quiescence",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(verification_attempt__isnull=True) | models.Q(paired_activation=True),
+                name="nso_probe_requires_paired_activation",
             ),
         ]
         verbose_name = "NSO Intent Deployment Control"

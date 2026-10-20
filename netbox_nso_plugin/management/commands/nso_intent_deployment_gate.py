@@ -14,7 +14,14 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import adapter_client, delivery, drain
-from netbox_nso_plugin.deployment import gate_bypass, quiesce, resume
+from netbox_nso_plugin.deployment import (
+    DeploymentQuiesced,
+    gate_bypass,
+    is_paired_activation,
+    is_quiesced,
+    quiesce,
+    resume,
+)
 
 _sleep = time.sleep
 
@@ -85,51 +92,90 @@ class Command(BaseCommand):
         actions.add_argument(
             "--prepare",
             action="store_true",
-            help="Block fleet Apply, accept, drains, callbacks, settlement, and reconciliation. A failed step leaves work quiesced.",
+            help=(
+                "Block fleet Apply, accept, drains, callbacks, settlement, and reconciliation. "
+                "With --paired-activation, a failed step leaves work quiesced. Without it, a failed step "
+                "releases only a gate this invocation created."
+            ),
         )
         actions.add_argument(
             "--verify",
             action="store_true",
-            help="Run paired verification and resume. Require --device ID and --settled-probe UUID for success, peer refusal, and router refusal. Failure leaves work quiesced.",
+            help=(
+                "Verify and resume. On a paired-activation gate, run paired verification: require --device ID and "
+                "--settled-probe UUID for success, peer refusal, and router refusal. On another gate, send one "
+                "no-deletion static push to --device ID. Failure leaves work quiesced."
+            ),
         )
         actions.add_argument(
             "--resume",
             action="store_true",
-            help="Run paired verification before resume. Require --device ID and three --settled-probe UUID arguments. Failure leaves work quiesced.",
+            help=(
+                "Run paired verification before resume. Require a paired-activation gate, --device ID, and three "
+                "--settled-probe UUID arguments. Failure leaves work quiesced."
+            ),
         )
         actions.add_argument(
             "--abort",
             action="store_true",
-            help="Run paired verification before abort releases the gate. Require --device ID and three --settled-probe UUID arguments. Failure leaves work quiesced.",
+            help=(
+                "Release the gate. A paired-activation gate first requires paired verification with --device ID "
+                "and three --settled-probe UUID arguments. Release any other gate directly. "
+                "Failure leaves work quiesced."
+            ),
         )
         actions.add_argument(
             "--import-routers",
             action="store_true",
-            help="Import BGP routers with --device ID. Grant no ownership. Keep work quiesced.",
+            help="Import BGP routers with --device ID. Grant no ownership. Require a paired-activation gate. Keep work quiesced.",
         )
         actions.add_argument(
             "--accept-routers",
             nargs="+",
             type=int,
             metavar="ID",
-            help="Accept the exact operator-selected overlay IDs with --device ID. Keep work quiesced.",
+            help=(
+                "Accept the exact operator-selected overlay IDs with --device ID. "
+                "Require a paired-activation gate. Keep work quiesced."
+            ),
         )
         actions.add_argument(
             "--prepare-store",
             action="store_true",
-            help="Prepare intent with --device ID and --scope. This action never enqueues a device Apply. Keep work quiesced.",
+            help=(
+                "Prepare intent with --device ID and --scope. This action never enqueues a device Apply. "
+                "Require a paired-activation gate. Keep work quiesced."
+            ),
         )
         actions.add_argument(
             "--start-probe",
             metavar="ATTEMPT_UUID",
-            help="With --device ID, capture a fresh probe UUID and permit before one manual Apply. Use --register-probe when terminal. Keep work quiesced.",
+            help=(
+                "With --device ID, capture a fresh probe UUID and permit before one manual Apply. "
+                "Use --register-probe when terminal. Require a paired-activation gate. Keep work quiesced."
+            ),
         )
         actions.add_argument(
             "--register-probe",
             metavar="ATTEMPT_UUID",
-            help="Bind the terminal execution before the callback and bounded RQ worker. Use --revoke-probe to cancel its permit. Keep work quiesced.",
+            help=(
+                "Bind the terminal execution before the callback and bounded RQ worker. Use --revoke-probe to "
+                "cancel its permit. Require a paired-activation gate. Keep work quiesced."
+            ),
         )
-        actions.add_argument("--revoke-probe", action="store_true", help="Revoke the probe permit. Keep work quiesced.")
+        actions.add_argument(
+            "--revoke-probe",
+            action="store_true",
+            help="Revoke the probe permit. Require a paired-activation gate. Keep work quiesced.",
+        )
+        parser.add_argument(
+            "--paired-activation",
+            action="store_true",
+            help=(
+                "With --prepare, mark the gate for paired code activation. A later --prepare never downgrades "
+                "the mark, and only paired verification releases the gate."
+            ),
+        )
         parser.add_argument("--device", type=int, dest="device_id", metavar="ID")
         parser.add_argument("--scope", choices=tuple(delivery.delivery_keys()))
         parser.add_argument("--settled-probe", action="append", default=[])
@@ -139,9 +185,19 @@ class Command(BaseCommand):
         from netbox_nso_plugin.deployment_probe import ProbeBlocked, locked_gate, register_probe, start_probe
         from netbox_nso_plugin.refusal_contract import ContractError
 
+        if options["paired_activation"] and not options["prepare"]:
+            raise CommandError("--paired-activation requires --prepare")
         try:
             if options["prepare"]:
-                self._prepare()
+                self._prepare(paired=options["paired_activation"])
+            elif options["abort"]:
+                if is_paired_activation():
+                    self._verify_paired(options)
+                else:
+                    resume()
+                    self.stdout.write(self.style.SUCCESS("Deployment gate aborted; normal intent operation resumed"))
+            elif options["verify"] and not is_paired_activation():
+                self._verify_static(options["device_id"])
             elif options["start_probe"]:
                 if options["device_id"] is None:
                     raise CommandError("--start-probe requires --device ID")
@@ -160,8 +216,9 @@ class Command(BaseCommand):
             elif options["import_routers"] or options["accept_routers"] or options["prepare_store"]:
                 self._maintenance(options)
             else:
-                self._verify(options)
+                self._verify_paired(options)
         except (
+            DeploymentQuiesced,
             ProbeBlocked,
             EvidenceInvariantError,
             ContractError,
@@ -172,14 +229,31 @@ class Command(BaseCommand):
         ) as exc:
             raise CommandError(str(exc)) from exc
 
-    def _prepare(self):
-        quiesce()
-        wait = _old_client_wait()
-        self.stdout.write(f"Intent work is quiesced; waiting {wait} seconds for old clients and the lease")
-        _sleep(wait)
-        blockers = drain.gate_blockers()
-        if blockers:
-            raise CommandError("Deployment gate blocked: " + "; ".join(blockers))
+    def _prepare(self, *, paired):
+        created = quiesce(paired_activation=paired)
+        # A paired gate stays quiesced on failure; another gate is released only by the invocation that created it.
+        release = created and not is_paired_activation()
+        try:
+            wait = _old_client_wait()
+            self.stdout.write(f"Intent work is quiesced; waiting {wait} seconds for old clients and the lease")
+            _sleep(wait)
+            blockers = drain.gate_blockers()
+            if blockers:
+                raise CommandError("Deployment gate blocked: " + "; ".join(blockers))
+        except BaseException:
+            if release:
+                try:
+                    resume()
+                except BaseException:
+                    with suppress(Exception):  # best effort: the resume() failure must propagate
+                        self.stderr.write(
+                            self.style.ERROR(
+                                "Deployment gate preparation failed and intent work may remain quiesced. "
+                                "Fix the cause and run nso_intent_deployment_gate --abort."
+                            )
+                        )
+                    raise
+            raise
         self.stdout.write(self.style.SUCCESS("Deployment gate prepared; keep both components quiesced"))
 
     def _maintenance(self, options):
@@ -313,7 +387,83 @@ class Command(BaseCommand):
                 raise
             raise CommandError(f"Store preparation failed: {exc}") from exc
 
-    def _verify(self, options):
+    def _verify_static(self, device_id):
+        from netbox_nso_plugin.models import NSODeviceManagement
+
+        if device_id is None:
+            raise CommandError("--verify requires --device ID")
+        if not is_quiesced():
+            raise CommandError("The deployment gate is not prepared")
+        # A failure leaves the gate quiesced; only a passed verification or an explicit --abort resumes.
+        blockers = drain.gate_blockers()
+        if blockers:
+            raise CommandError("Deployment gate changed before verification: " + "; ".join(blockers))
+        mgmt = NSODeviceManagement.objects.filter(device_id=device_id, adapter_device_id__isnull=False).first()
+        if mgmt is None:
+            raise CommandError(f"No linked NSO-managed device exists for id {device_id}")
+        with gate_bypass():
+            claim = drain.claim(device_id, "static_route", force=True)
+            if claim is None:
+                raise CommandError("Could not form the no-deletion static verification push")
+            if claim.deletions:
+                drain.abandon(claim)
+                raise CommandError("Could not form the no-deletion static verification push")
+            try:
+                response = drain.send_claim(claim)
+            except Exception as exc:
+                if getattr(exc, "status_code", None) in {409, 422}:
+                    drain.abandon(claim)
+                else:
+                    drain.record_failure(claim, exc)
+                raise CommandError(f"Verification push failed: {exc}") from exc
+            try:
+                section = delivery.delivery_keys()[claim.scope].section
+                document = adapter_client.get_intent_receipts(device_id=mgmt.adapter_device_id, section=section)
+                receipt = _verification_receipt(
+                    claim,
+                    _receipt_for(document, adapter_device_id=mgmt.adapter_device_id, section=section),
+                )
+                acknowledgement = drain.acknowledgement(claim, response)
+                if not acknowledgement.exact:
+                    raise drain.ProtocolViolation(acknowledgement.reason)
+                if drain.resolve_restored_claim(device_id, claim.scope, receipt) != drain.RESTORE_SETTLED:
+                    raise CommandError("Verification receipt did not settle its exact push")
+            except Exception as exc:
+                if self._active_verification_claim(device_id, claim.push_seq):
+                    drain.record_failure(claim, exc)
+                if isinstance(exc, CommandError):
+                    raise
+                raise CommandError(f"Verification failed: {exc}") from exc
+        blockers = drain.gate_blockers()
+        if blockers:
+            raise CommandError("New work appeared during verification: " + "; ".join(blockers))
+        self._resume_after_static_verification()
+
+    def _resume_after_static_verification(self):
+        try:
+            resume()
+        except BaseException:
+            with suppress(Exception):  # best effort: the resume() failure must propagate
+                self.stderr.write(
+                    self.style.ERROR(
+                        "Deployment verification passed, but intent work may remain quiesced. "
+                        "Fix the cause and run nso_intent_deployment_gate --abort."
+                    )
+                )
+            raise
+        self.stdout.write(self.style.SUCCESS("Deployment verification passed; normal intent operation resumed"))
+
+    @staticmethod
+    def _active_verification_claim(device_id, push_seq):
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        return NSOIntentOutboxState.objects.filter(
+            device_id=device_id,
+            scope="static_route",
+            push_seq=push_seq,
+        ).exists()
+
+    def _verify_paired(self, options):
         from netbox_nso_plugin.deployment_checks import check_active_streams, check_contracts, check_settled_probes
         from netbox_nso_plugin.deployment_probe import locked_gate
 
@@ -327,7 +477,7 @@ class Command(BaseCommand):
             if blockers:
                 raise CommandError("Deployment gate changed before resume: " + "; ".join(blockers))
             try:
-                resume()
+                resume(paired_verified=True)
             except BaseException:
                 with suppress(Exception):
                     self.stderr.write(

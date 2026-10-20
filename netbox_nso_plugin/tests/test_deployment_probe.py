@@ -168,7 +168,7 @@ class DeploymentCase(BGPSettlementHelpers, BGPCaptureCase):
             for carrier in generation["carrier_job_result"]["settlement_owners"]:
                 carrier["generation_id"] = 80
             settle_terminal_generation(self.management, generation, self.socket_adapter.store.incarnation, settle_seq=1)
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
 
         def admission(selected):
@@ -258,7 +258,7 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertEqual(execution.consumption_state, "superseded")
 
     def test_deployment_verify_requires_cutover_contract_and_settlement_probe(self):
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         with self.assertRaisesRegex(CommandError, "contract|artifact|probe"):
             self.command(verify=True, device_id=self.device.pk)
         self.assertTrue(deployment.is_quiesced())
@@ -419,7 +419,7 @@ class TestDeploymentProbe(DeploymentCase):
         self._prepare_bgp_observation_capture()
         self._serve_bgp_observation()
         self.unown_router()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         result = json.loads(self.command(import_routers=True, device_id=self.device.pk))
         self.owners[0].refresh_from_db()
         self.assertIsNone(self.owners[0].accepted_at)
@@ -432,7 +432,7 @@ class TestDeploymentProbe(DeploymentCase):
         self._prepare_bgp_observation_capture()
         self._serve_bgp_observation()
         self.unown_router()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         with self.assertRaises(CommandError):
             self.command(accept_routers=[self.owners[0].pk, 999999], device_id=self.device.pk)
         self.owners[0].refresh_from_db()
@@ -445,7 +445,7 @@ class TestDeploymentProbe(DeploymentCase):
 
     def test_quiesced_router_preparation_emits_no_apply_and_keeps_gate_closed(self):
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         puts = len(self.adapter.capture_reads)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
         self.assertEqual(len(self.adapter.capture_reads), puts + 1)
@@ -460,7 +460,7 @@ class TestDeploymentProbe(DeploymentCase):
 
     def test_failed_router_preparation_stays_quiesced(self):
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         from ._adapter_http import make_response
 
         original = self.adapter._handle
@@ -551,14 +551,14 @@ class TestDeploymentProbe(DeploymentCase):
             return original(method, url, **kwargs)
 
         self.adapter._handle = inventory
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         with transaction.atomic(), self.assertRaisesRegex(ProbeBlocked, "captured|selection|preparation|provenance"):
             check_active_streams()
         self.assertTrue(deployment.is_quiesced())
 
     def test_quiesced_probe_start_registers_before_remote_admission(self):
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
         attempt_id = uuid4()
         observed = []
@@ -914,7 +914,7 @@ class TestDeploymentProbe(DeploymentCase):
     def test_a_reprepare_after_a_failed_verification_keeps_the_gate(self):
         from netbox_nso_plugin.models import NSOIntentOutboxState
 
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         with self.assertRaises(CommandError):
             self.command(verify=True, device_id=self.device.pk)
         NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", revoked_ids=[11])
@@ -960,7 +960,7 @@ class TestDeploymentProbe(DeploymentCase):
         from .test_apply_selector import _promoted
 
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
         self.adapter.apply_response = lambda selected: (
             409,
@@ -997,7 +997,7 @@ class TestDeploymentProbe(DeploymentCase):
         from netbox_nso_plugin import adapter_client
 
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
         self.adapter.apply_response = lambda selected: (
             503,
@@ -1042,7 +1042,7 @@ class TestDeploymentProbe(DeploymentCase):
         from .test_apply_selector import _promoted
 
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
         selection = NSOAcceptedSelection.objects.filter(management=self.management, stream="bgp").latest("pk")
         state = NSOIntentOutboxState.objects.get(device=self.device, scope="bgp")
@@ -1083,7 +1083,7 @@ class TestDeploymentProbe(DeploymentCase):
         from .test_apply_selector import _promoted
 
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
 
         def contradictory(selected):
@@ -1107,7 +1107,7 @@ class TestDeploymentProbe(DeploymentCase):
 
     def test_valid_no_op_probe_closes_without_replaying_apply(self):
         self._prepare_bgp_observation_capture()
-        deployment.quiesce()
+        deployment.quiesce(paired_activation=True)
         self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
 
         def skipped(selected):

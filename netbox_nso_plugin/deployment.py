@@ -40,6 +40,13 @@ def is_quiesced() -> bool:
     return NSOIntentDeploymentControl.objects.filter(pk=1).exists()
 
 
+def is_paired_activation() -> bool:
+    """Return whether the active gate guards a paired code activation."""
+    from .models import NSOIntentDeploymentControl
+
+    return NSOIntentDeploymentControl.objects.filter(pk=1, paired_activation=True).exists()
+
+
 def _refuse(label: str) -> None:
     raise DeploymentQuiesced(f"{label} is blocked because the intent deployment is quiesced")
 
@@ -118,7 +125,7 @@ def guarded(label: str):
     return _decorate
 
 
-def _set_active(active: bool) -> bool:
+def _set_active(active: bool, *, paired_activation: bool = False, paired_verified: bool = False) -> bool:
     """Change the switch and return whether activation created it."""
     from .models import NSOIntentDeploymentControl
 
@@ -138,14 +145,19 @@ def _set_active(active: bool) -> bool:
             raise
         with transaction.atomic():
             if active:
-                _control, created = NSOIntentDeploymentControl.objects.update_or_create(
-                    pk=1,
-                    defaults={"quiesced_at": timezone.now()},
-                )
+                defaults = {"quiesced_at": timezone.now()}
+                if paired_activation:
+                    defaults["paired_activation"] = True
+                _control, created = NSOIntentDeploymentControl.objects.update_or_create(pk=1, defaults=defaults)
                 return created
-            if NSOIntentDeploymentControl.objects.filter(pk=1, verification_attempt__isnull=False).exists():
+            control = NSOIntentDeploymentControl.objects.select_for_update().filter(pk=1).first()
+            if control is None:
+                return False
+            if control.verification_attempt_id is not None:
                 raise DeploymentQuiesced("Revoke verification probe authority before resume")
-            NSOIntentDeploymentControl.objects.filter(pk=1).delete()
+            if control.paired_activation and not paired_verified:
+                raise DeploymentQuiesced("A paired-activation gate resumes only after paired verification")
+            control.delete()
             return False
     finally:
         if acquired:
@@ -153,14 +165,14 @@ def _set_active(active: bool) -> bool:
                 cursor.execute("SELECT pg_advisory_unlock(%s)", [_LOCK_KEY])
 
 
-def quiesce() -> bool:
-    """Block new operations and return whether this call activated the gate."""
-    return _set_active(True)
+def quiesce(*, paired_activation: bool = False) -> bool:
+    """Block new operations and return whether this call activated the gate; the paired mark is never removed."""
+    return _set_active(True, paired_activation=paired_activation)
 
 
-def resume() -> None:
-    """Restore normal intent operation."""
-    _set_active(False)
+def resume(*, paired_verified: bool = False) -> None:
+    """Restore normal intent operation; a paired-activation gate needs ``paired_verified``."""
+    _set_active(False, paired_verified=paired_verified)
 
 
 @contextlib.contextmanager

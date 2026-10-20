@@ -38,6 +38,10 @@ def locked_gate():
         _require(cursor.fetchone()[0], "A deployment operation is still running")
         control = NSOIntentDeploymentControl.objects.select_for_update().filter(pk=1).first()
         _require(control is not None and control.quiesced_at is not None, "The deployment gate must stay quiesced")
+        _require(
+            control.paired_activation,
+            "This action requires a paired-activation gate; run nso_intent_deployment_gate --prepare --paired-activation",
+        )
         yield control
 
 
