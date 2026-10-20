@@ -51,7 +51,7 @@ FORCED_CLAIM_SITE = ("drain.py", "_claim_or_wait", "_claim_after_audit")
 DEPLOYMENT_PREPARATION_SITES = {
     ("nso_intent_deployment_gate.py", "_store_preparation", "drain.claim"): 1,
     ("nso_intent_deployment_gate.py", "_store_preparation", "prepare"): 1,
-    ("nso_intent_deployment_gate.py", "_verify_static", "drain.claim"): 1,
+    ("nso_intent_deployment_gate.py", "_static_push", "drain.claim"): 1,
 }
 
 

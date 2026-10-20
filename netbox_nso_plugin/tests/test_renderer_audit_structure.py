@@ -351,7 +351,7 @@ class TestRendererCaptureSitesAreAuditFronted(SimpleTestCase):
                 ("drain.py", "_claim_or_wait", "_claim_after_audit"),
                 ("drain.py", "claim", "_claim_after_audit"),
                 ("management/commands/nso_intent_deployment_gate.py", "Command._store_preparation", "drain.claim"),
-                ("management/commands/nso_intent_deployment_gate.py", "Command._verify_static", "drain.claim"),
+                ("management/commands/nso_intent_deployment_gate.py", "Command._static_push", "drain.claim"),
             },
         )
 

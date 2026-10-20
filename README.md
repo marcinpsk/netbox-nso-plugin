@@ -96,10 +96,18 @@ See `.devcontainer/` for the Docker-based development environment.
 
 Keep plugin operations and adapter Apply, removal, cadence, sweeper, and reclaimer
 admissions stopped throughout the cutover. The plugin gate does not stop the adapter.
-Run `nso_intent_deployment_gate --prepare --paired-activation` before installing the paired code
-and migration. The gate keeps this mark until paired verification releases it. A later
-`--prepare` without the flag does not remove it.
-A failed preparation, maintenance, or verification action leaves the plugin quiesced.
+The code that installs the paired cutover also adds `--paired-activation` and its migration.
+Use this order:
+
+1. On the old plugin code, run `nso_intent_deployment_gate --prepare`. Keep the adapter
+   admissions stopped.
+2. Install the paired plugin code and run its migrations. The gate stays in place.
+3. Run `nso_intent_deployment_gate --prepare --paired-activation`. This marks the retained
+   gate for paired activation. The gate keeps its original `quiesced_at`.
+
+The gate keeps the paired mark until paired verification releases it. A later `--prepare`
+without the flag does not remove it.
+A failed paired preparation, maintenance, or verification action leaves the plugin quiesced.
 The maintenance and probe actions below require a paired-activation gate.
 
 Use `--import-routers --device ID` to import one validated BGP observation and print

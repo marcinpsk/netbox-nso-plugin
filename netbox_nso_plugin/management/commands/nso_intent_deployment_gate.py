@@ -16,10 +16,12 @@ from django.core.management.base import BaseCommand, CommandError
 from netbox_nso_plugin import adapter_client, delivery, drain
 from netbox_nso_plugin.deployment import (
     DeploymentQuiesced,
+    DeploymentTransitionTimeout,
+    exclusive_transition,
     gate_bypass,
     is_paired_activation,
-    is_quiesced,
     quiesce,
+    report_replaced_gate,
     resume,
 )
 
@@ -219,6 +221,7 @@ class Command(BaseCommand):
                 self._verify_paired(options)
         except (
             DeploymentQuiesced,
+            DeploymentTransitionTimeout,
             ProbeBlocked,
             EvidenceInvariantError,
             ContractError,
@@ -230,9 +233,9 @@ class Command(BaseCommand):
             raise CommandError(str(exc)) from exc
 
     def _prepare(self, *, paired):
-        created = quiesce(paired_activation=paired)
-        # A paired gate stays quiesced on failure; another gate is released only by the invocation that created it.
-        release = created and not is_paired_activation()
+        created_at = quiesce(paired_activation=paired)
+        # A paired gate stays quiesced on failure; an ordinary gate is released only by the invocation that created it.
+        release = created_at is not None and not paired
         try:
             wait = _old_client_wait()
             self.stdout.write(f"Intent work is quiesced; waiting {wait} seconds for old clients and the lease")
@@ -243,7 +246,7 @@ class Command(BaseCommand):
         except BaseException:
             if release:
                 try:
-                    resume()
+                    resume(created_at=created_at)
                 except BaseException:
                     with suppress(Exception):  # best effort: the resume() failure must propagate
                         self.stderr.write(
@@ -253,6 +256,8 @@ class Command(BaseCommand):
                             )
                         )
                     raise
+                with suppress(Exception):  # best effort: the preparation failure must propagate
+                    report_replaced_gate(self.stderr)
             raise
         self.stdout.write(self.style.SUCCESS("Deployment gate prepared; keep both components quiesced"))
 
@@ -388,56 +393,64 @@ class Command(BaseCommand):
             raise CommandError(f"Store preparation failed: {exc}") from exc
 
     def _verify_static(self, device_id):
-        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.models import NSODeviceManagement, NSOIntentDeploymentControl
 
         if device_id is None:
             raise CommandError("--verify requires --device ID")
-        if not is_quiesced():
-            raise CommandError("The deployment gate is not prepared")
-        # A failure leaves the gate quiesced; only a passed verification or an explicit --abort resumes.
-        blockers = drain.gate_blockers()
-        if blockers:
-            raise CommandError("Deployment gate changed before verification: " + "; ".join(blockers))
-        mgmt = NSODeviceManagement.objects.filter(device_id=device_id, adapter_device_id__isnull=False).first()
-        if mgmt is None:
-            raise CommandError(f"No linked NSO-managed device exists for id {device_id}")
-        with gate_bypass():
-            claim = drain.claim(device_id, "static_route", force=True)
-            if claim is None:
-                raise CommandError("Could not form the no-deletion static verification push")
-            if claim.deletions:
+        # Hold the switch lock from the purpose recheck through resume, so no paired upgrade interleaves.
+        with exclusive_transition():
+            control = NSOIntentDeploymentControl.objects.filter(pk=1).first()
+            if control is None:
+                raise CommandError("The deployment gate is not prepared")
+            if control.paired_activation:
+                raise CommandError("The deployment gate became a paired-activation gate; run its paired verification")
+            # A failure leaves the gate quiesced; only a passed verification or an explicit --abort resumes.
+            blockers = drain.gate_blockers()
+            if blockers:
+                raise CommandError("Deployment gate changed before verification: " + "; ".join(blockers))
+            mgmt = NSODeviceManagement.objects.filter(device_id=device_id, adapter_device_id__isnull=False).first()
+            if mgmt is None:
+                raise CommandError(f"No linked NSO-managed device exists for id {device_id}")
+            with gate_bypass():
+                self._static_push(device_id, mgmt)
+            blockers = drain.gate_blockers()
+            if blockers:
+                raise CommandError("New work appeared during verification: " + "; ".join(blockers))
+            self._resume_after_static_verification()
+
+    def _static_push(self, device_id, mgmt):
+        claim = drain.claim(device_id, "static_route", force=True)
+        if claim is None:
+            raise CommandError("Could not form the no-deletion static verification push")
+        if claim.deletions:
+            drain.abandon(claim)
+            raise CommandError("Could not form the no-deletion static verification push")
+        try:
+            response = drain.send_claim(claim)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) in {409, 422}:
                 drain.abandon(claim)
-                raise CommandError("Could not form the no-deletion static verification push")
-            try:
-                response = drain.send_claim(claim)
-            except Exception as exc:
-                if getattr(exc, "status_code", None) in {409, 422}:
-                    drain.abandon(claim)
-                else:
-                    drain.record_failure(claim, exc)
-                raise CommandError(f"Verification push failed: {exc}") from exc
-            try:
-                section = delivery.delivery_keys()[claim.scope].section
-                document = adapter_client.get_intent_receipts(device_id=mgmt.adapter_device_id, section=section)
-                receipt = _verification_receipt(
-                    claim,
-                    _receipt_for(document, adapter_device_id=mgmt.adapter_device_id, section=section),
-                )
-                acknowledgement = drain.acknowledgement(claim, response)
-                if not acknowledgement.exact:
-                    raise drain.ProtocolViolation(acknowledgement.reason)
-                if drain.resolve_restored_claim(device_id, claim.scope, receipt) != drain.RESTORE_SETTLED:
-                    raise CommandError("Verification receipt did not settle its exact push")
-            except Exception as exc:
-                if self._active_verification_claim(device_id, claim.push_seq):
-                    drain.record_failure(claim, exc)
-                if isinstance(exc, CommandError):
-                    raise
-                raise CommandError(f"Verification failed: {exc}") from exc
-        blockers = drain.gate_blockers()
-        if blockers:
-            raise CommandError("New work appeared during verification: " + "; ".join(blockers))
-        self._resume_after_static_verification()
+            else:
+                drain.record_failure(claim, exc)
+            raise CommandError(f"Verification push failed: {exc}") from exc
+        try:
+            section = delivery.delivery_keys()[claim.scope].section
+            document = adapter_client.get_intent_receipts(device_id=mgmt.adapter_device_id, section=section)
+            receipt = _verification_receipt(
+                claim,
+                _receipt_for(document, adapter_device_id=mgmt.adapter_device_id, section=section),
+            )
+            acknowledgement = drain.acknowledgement(claim, response)
+            if not acknowledgement.exact:
+                raise drain.ProtocolViolation(acknowledgement.reason)
+            if drain.resolve_restored_claim(device_id, claim.scope, receipt) != drain.RESTORE_SETTLED:
+                raise CommandError("Verification receipt did not settle its exact push")
+        except Exception as exc:
+            if self._active_verification_claim(device_id, claim.push_seq):
+                drain.record_failure(claim, exc)
+            if isinstance(exc, CommandError):
+                raise
+            raise CommandError(f"Verification failed: {exc}") from exc
 
     def _resume_after_static_verification(self):
         try:
