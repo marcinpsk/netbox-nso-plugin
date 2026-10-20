@@ -1134,6 +1134,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         deploying = own_vlan(management, 1628, "writer-content-peer")
         mirror_update(deploying, status="deploying", apply_attempt_id=uuid4())
+        deploying_attempt_id = deploying.apply_attempt_id
         NSOIntentOutboxEntry.objects.filter(device=device, scope="vlan").delete()
         revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope="vlan")
         before = revision.revision
@@ -1154,7 +1155,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         assert target.status == "accepted"
         assert deploying.status == "deploying"
-        assert deploying.apply_attempt_id is not None
+        assert deploying.apply_attempt_id == deploying_attempt_id
         assert revision.revision == before + 1
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == expected
