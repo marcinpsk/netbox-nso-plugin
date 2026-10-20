@@ -986,15 +986,18 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
                 _missing_generation_evidence(management, incarnation, row)
             if immutable_execution_projection(cached) != immutable_execution_projection(row):
                 raise EvidenceInvariantError("consumed_execution_changed")
-    for generation in generations:
+    pending = [
+        generation
+        for generation in generations
+        if terminal_carrier_requires_certificate(generation)
+        and (generation["generation_id"], generation["carrier_job_id"]) not in present
+    ]
+    certificates = generation_certificate_candidates(management, incarnation, pending)
+    for generation in pending:
         identity = generation["generation_id"], generation["carrier_job_id"]
-        if not terminal_carrier_requires_certificate(generation):
-            continue
         if generation["carrier_job_id"] is None:
             _missing_generation_evidence(management, incarnation, generation)
-        if identity in present:
-            continue
-        projection = consumed_generation_certificate(management, incarnation, generation)
+        projection = certified_projection(generation, certificates.get(identity, ()))
         if projection is None:
             _missing_generation_evidence(management, incarnation, generation)
         bound.automatic_generations.append(projection)
@@ -1005,16 +1008,22 @@ def terminal_carrier_requires_certificate(generation):
     return generation["status"] not in {"pending", "running"}
 
 
-def consumed_generation_certificate(management, incarnation, generation):
+def generation_certificate_candidates(management, incarnation, generations):
+    """Load the consumed certificates of every listed current carrier in one query."""
+    carriers = [generation for generation in generations if generation["carrier_job_id"] is not None]
+    candidates = {}
+    if not carriers:
+        return candidates
+    for cached in generation_certificates(management, incarnation, *carriers).filter(
+        carrier_job_id__in={generation["carrier_job_id"] for generation in carriers}
+    ):
+        candidates.setdefault((cached.generation_id, cached.carrier_job_id), []).append(cached)
+    return candidates
+
+
+def certified_projection(generation, candidates):
     """Require one ordered consumed certificate for the listing's current carrier."""
-    if generation["carrier_job_id"] is None:
-        return None
-    candidates = list(
-        generation_certificates(management, incarnation, generation).filter(
-            carrier_job_id=generation["carrier_job_id"],
-        )[:2]
-    )
-    if len(candidates) != 1:
+    if generation["carrier_job_id"] is None or len(candidates) != 1:
         return None
     cached = candidates[0]
     if cached.invariant_code or cached.consumed_at is None or not _positive_int(cached.settle_seq):

@@ -313,6 +313,34 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         NSOApplyExecution.objects.filter(pk=execution.pk).update(generation_id=103)
         self.assertTrue(_historical_certificate_required(attempt, self.management, remote))
 
+    def test_terminal_metadata_certifies_every_listed_carrier_in_one_query(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.apply_settlement import _BoundEvidence, _require_terminal_metadata
+
+        listing = []
+        for _index in range(3):
+            _attempt, execution = self.history()
+            listing.append(
+                {
+                    **{key: execution.terminal_projection[key] for key in ("generation_id", "seq", "status")},
+                    **{key: execution.terminal_projection[key] for key in ("stream_revisions", "source_push_seq")},
+                    "carrier_job_id": execution.carrier_job_id,
+                    "carrier_job_status": "succeeded",
+                }
+            )
+        bound = _BoundEvidence(attempts=[])
+        bound.automatic_generations = []
+        self.management.refresh_from_db()
+        with CaptureQueriesContext(connection) as queries:
+            _require_terminal_metadata(bound, listing, self.management, self.adapter.store.incarnation)
+        reads = [query for query in queries if NSOApplyExecution._meta.db_table in query["sql"]]
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(
+            [row["carrier_job_id"] for row in bound.automatic_generations], [row["carrier_job_id"] for row in listing]
+        )
+
     def test_unconsumed_malformed_and_cursor_gap_history_stays(self):
         for change in (
             {"consumption_state": "unconsumed"},
