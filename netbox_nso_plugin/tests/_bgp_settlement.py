@@ -165,6 +165,7 @@ class BGPSettlementHelpers:
         pruned=False,
         settle_seq=1,
         earlier_generations=(),
+        listed_carrier=None,
     ):
         from ._adapter_http import make_response
         from .test_durable_bgp_capture import _CaptureHandler
@@ -220,6 +221,7 @@ class BGPSettlementHelpers:
                             "job_id": None if pruned else generation["carrier_job_id"],
                             "carrier_job_id": generation["carrier_job_id"],
                             "carrier_job_status": generation["carrier_job_status"],
+                            **(listed_carrier or {}),
                             "mode": "networked",
                             "settlement_cohort": 9,
                             "digest": "a" * 64,

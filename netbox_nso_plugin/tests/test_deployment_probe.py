@@ -524,6 +524,17 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertIsNone(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id)
         self.assertTrue(deployment.is_quiesced())
 
+    def test_probe_registration_rejects_a_carrier_the_listing_does_not_retain(self):
+        self.probe()
+        generation = self.terminal()
+        retry = generation["carrier_job_id"] + 1
+        self.serve_terminal_evidence(generation, manual=True, listed_carrier={"job_id": retry, "carrier_job_id": retry})
+        with self.assertRaisesRegex(CommandError, "retained listing carrier"):
+            self.command(register_probe=str(self.attempt.pk))
+        self.assertIsNone(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id)
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+        self.assertTrue(deployment.is_quiesced())
+
     def test_quiesced_read_does_not_publish_a_full_family_observation(self):
         self.probe()
         from netbox_nso_plugin.models import NSOFamilyObservation

@@ -205,6 +205,12 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         _response_generation_ids(attempt.response) == {generation["generation_id"]},
         "Probe generation differs from its admitted execution",
     )
+    listed = next(row for row in listing if row["generation_id"] == generation["generation_id"])
+    _require(
+        listed["carrier_job_id"] == generation["carrier_job_id"]
+        and listed["carrier_job_status"] == generation["carrier_job_status"],
+        "Probe carrier differs from the retained listing carrier",
+    )
     _require(generation["source_push_seq"] == attempt.selected, "Probe frozen selection changed")
     link = attempt.response["generations"][0]
     _require(
