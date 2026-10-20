@@ -9,6 +9,7 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
 from django.db.models.functions import Now
 from django.urls import reverse
+from django.utils.functional import cached_property
 from netbox.models import NetBoxModel
 
 from .outbox import CONTRIBUTION_KIND_CHOICES, CONTRIBUTION_KIND_ORDINARY
@@ -27,7 +28,7 @@ class _OwnedOverlayModel(NetBoxModel):
         abstract = True
         base_manager_name = "objects"
 
-    @property
+    @cached_property
     def refusal_display(self):
         from .refusal_display import row_projection
 

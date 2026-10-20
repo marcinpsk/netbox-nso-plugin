@@ -111,7 +111,7 @@ def _snapshot_for_fence(row, fence):
 
 
 def project_rows(rows):
-    """Load current execution links once for a display collection."""
+    """Load current execution links and previous refusals once for a display collection."""
     from .models import NSOOverlaySettlementFence
     from .refusal_registry import OVERLAYS
 
@@ -142,7 +142,40 @@ def project_rows(rows):
                 current = _snapshot_for_fence(row, fence)
                 if current is not None:
                     row._refusal_current = current
+    _load_previous_refusals(owners)
     return rows
+
+
+def _load_previous_refusals(owners):
+    from django.db.models import Prefetch
+
+    from .models import NSOApplyExecution, NSOApplyOverlaySnapshot
+
+    keyed = {
+        (row.apply_attempt_id, label, pk): row
+        for (label, pk), row in owners.items()
+        if getattr(row, "apply_attempt_id", None) is not None
+    }
+    for row in keyed.values():
+        row._refusal_previous = None
+    if not keyed:
+        return
+    snapshots = NSOApplyOverlaySnapshot.objects.filter(
+        attempt_id__in={attempt_id for attempt_id, _label, _pk in keyed},
+        model_label__in={label for _attempt_id, label, _pk in keyed},
+        overlay_pk__in={pk for _attempt_id, _label, pk in keyed},
+        settlement_disposition="refused",
+    ).prefetch_related(
+        Prefetch(
+            "executions",
+            queryset=NSOApplyExecution.objects.filter(consumption_state="consumed"),
+            to_attr="consumed_executions",
+        )
+    )
+    for snapshot in snapshots:
+        row = keyed.get((snapshot.attempt_id, snapshot.model_label, snapshot.overlay_pk))
+        if row is not None:
+            row._refusal_previous = (snapshot, snapshot.consumed_executions)
 
 
 def _snapshot_refusal(snapshot, executions):
@@ -173,6 +206,8 @@ def _previous_refusal(row):
 
     if not hasattr(row, "_meta") or getattr(row, "apply_attempt_id", None) is None:
         return None
+    if hasattr(row, "_refusal_previous"):
+        return None if row._refusal_previous is None else _snapshot_refusal(*row._refusal_previous)
     snapshot = NSOApplyOverlaySnapshot.objects.filter(
         attempt_id=row.apply_attempt_id,
         model_label=row._meta.label_lower,

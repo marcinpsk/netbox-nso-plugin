@@ -1103,6 +1103,69 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertEqual(projected["error"], f"{cause['reason']}: {cause['message']}")
         self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
 
+    def test_project_rows_batches_the_previous_refusal_lookup(self):
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.refusal_display import project_rows, row_projection
+
+        from ._outbox_case import mirror_update
+
+        self.prepare()
+        generation = self.terminal()
+        self.settle(generation)
+        retry = self.terminal(refused=2)
+        retry["carrier_job_id"] = 502
+        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        row = self.owners[1]
+        mirror_update(row, last_apply_error="placeholder ordinary failure")
+        (row,) = project_rows([type(row).objects.get(pk=row.pk)])
+        with self.assertNumQueries(0):
+            projected = row_projection(row)
+        cause = generation["refusals"][0]
+        self.assertEqual(projected["error"], f"{cause['reason']}: {cause['message']}")
+
+    def test_refusal_display_is_computed_once_per_row(self):
+        _iface, row, generation = self.interface_execution()
+        row = NSOInterfaceState.objects.get(pk=row.pk)
+        first = row.refusal_display
+        with self.assertNumQueries(0):
+            self.assertIs(row.refusal_display, first)
+        cause = generation["refusals"][0]
+        self.assertEqual(first["refusal_text"], f"{cause['reason']}: {cause['message']}")
+
+    def test_interface_rest_list_loads_current_evidence_once_per_page(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.lifecycle_fence import read_refresh
+        from netbox_nso_plugin.models import NSOOverlaySettlementFence
+        from netbox_nso_plugin.template_content import _upsert_interface_states
+
+        with without_commit_drain():
+            interfaces = [
+                Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t")
+                for index in range(1, 4)
+            ]
+        with read_refresh():
+            _upsert_interface_states(
+                self.device,
+                [
+                    {
+                        "name": iface.name,
+                        "attrs": {
+                            "description": {"status": "in_sync", "nso_value": "placeholder", "last_apply_error": {}}
+                        },
+                    }
+                    for iface in interfaces
+                ],
+            )
+        api = self.rest_client()
+        table = NSOOverlaySettlementFence._meta.db_table
+        with CaptureQueriesContext(connection) as queries:
+            response = api.get(reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list"))
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["count"], 3)
+        self.assertEqual(sum(f'"{table}"' in query["sql"] for query in queries.captured_queries), 1)
+
     def test_unavailable_category_keeps_pending_filter_and_prior_error(self):
         from uuid import UUID
 

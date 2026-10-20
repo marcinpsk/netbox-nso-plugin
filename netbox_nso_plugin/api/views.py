@@ -42,7 +42,17 @@ def _request_body(request):
     return body if isinstance(body, dict) else None
 
 
-class NSOBGPRouterStateViewSet(NetBoxModelViewSet):
+class _ProjectedPageMixin:
+    """Load the refusal evidence of one list page in batched queries."""
+
+    def paginate_queryset(self, queryset):
+        from ..refusal_display import project_rows
+
+        page = super().paginate_queryset(queryset)
+        return None if page is None else project_rows(page)
+
+
+class NSOBGPRouterStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
     """Expose router observations and lifecycle through the overlay API."""
 
     queryset = NSOBGPRouterState.objects.select_related("management", "bgp_router")
@@ -111,7 +121,7 @@ class NSODeviceManagementViewSet(NetBoxModelViewSet):
     filterset_class = NSODeviceManagementFilterSet
 
 
-class NSOInterfaceStateViewSet(NetBoxModelViewSet):
+class NSOInterfaceStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
     """REST API for NSOInterfaceState — per-interface intent status overlay.
 
     The adapter's scope reconciler also reads this to mirror intent (decision L).
