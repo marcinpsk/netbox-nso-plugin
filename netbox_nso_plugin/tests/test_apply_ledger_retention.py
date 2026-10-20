@@ -49,11 +49,12 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
             boundary.start()
             self.addCleanup(boundary.stop)
 
-    def history(self, days=31):
+    def history(self, days=31, management=None):
+        management = management or self.management
         stamp = timezone.now() - timedelta(days=days)
         attempt = NSOApplyAttempt.objects.create(
-            management=self.management,
-            adapter_device_id=1767,
+            management=management,
+            adapter_device_id=management.adapter_device_id,
             trigger_kind="cadence",
             selected={"bgp": 41},
             lifecycle="terminal",
@@ -83,9 +84,9 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         }
         execution = NSOApplyExecution.objects.create(
             attempt=attempt,
-            management=self.management,
-            mapping_epoch=mapping_epoch(self.management),
-            adapter_device_id=1767,
+            management=management,
+            mapping_epoch=mapping_epoch(management),
+            adapter_device_id=management.adapter_device_id,
             store_incarnation=self.adapter.store.incarnation,
             generation_id=identity,
             generation_seq=1,
@@ -98,8 +99,10 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
             consumption_state="consumed",
             consumed_at=stamp,
         )
-        NSODeviceManagement.objects.filter(pk=self.management.pk).update(
-            settle_cursor_device_id=1767, settle_cursor_incarnation=execution.store_incarnation, settle_cursor_seq=2
+        NSODeviceManagement.objects.filter(pk=management.pk).update(
+            settle_cursor_device_id=management.adapter_device_id,
+            settle_cursor_incarnation=execution.store_incarnation,
+            settle_cursor_seq=2,
         )
         return attempt, execution
 
@@ -219,6 +222,54 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
         self.assertIn(PruneApplyLedgerJob, registry["system_jobs"])
         self.assertEqual(registry["system_jobs"][PruneApplyLedgerJob]["interval"], JobIntervalChoices.INTERVAL_DAILY)
+
+    def test_daily_job_drains_more_than_one_batch(self):
+        from core.models import Job
+
+        from netbox_nso_plugin.apply_retention import DEFAULT_BATCH_SIZE
+        from netbox_nso_plugin.jobs import PruneApplyLedgerJob
+
+        for _index in range(DEFAULT_BATCH_SIZE + 1):
+            self.history()
+        job = Job.objects.create(name=PruneApplyLedgerJob.name, job_id=uuid4())
+        PruneApplyLedgerJob(job).run()
+        self.assertFalse(NSOApplyAttempt.objects.exists())
+        self.assertIsNone(job.data["apply_ledger_cursor"])
+
+    def test_daily_job_keeps_the_cursor_when_its_time_budget_ends(self):
+        from core.models import Job
+
+        from netbox_nso_plugin import jobs
+        from netbox_nso_plugin.apply_retention import DEFAULT_BATCH_SIZE
+
+        for _index in range(DEFAULT_BATCH_SIZE + 1):
+            self.history()
+        job = Job.objects.create(name=jobs.PruneApplyLedgerJob.name, job_id=uuid4())
+        with patch.object(jobs, "PRUNE_TIME_BUDGET_SECONDS", 0):
+            jobs.PruneApplyLedgerJob(job).run()
+        self.assertEqual(NSOApplyAttempt.objects.count(), 1)
+        self.assertIsNotNone(job.data["apply_ledger_cursor"])
+
+    def test_adapter_outage_on_one_device_retains_only_that_device(self):
+        _device, other = make_managed("ledger-retention-other", 1768, index=2)
+        other.refresh_from_db()
+        self.adapter.store.add_device(nso_instance="placeholder", nso_device_name="placeholder-2", device_id=1768)
+        unreachable, _execution = self.history(days=32, management=other)
+        removable, _execution = self.history()
+        self.adapter.store.feed_error_devices.add(1768)
+        output = StringIO()
+        call_command("nso_prune_apply_ledger", execute=True, stdout=output)
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=unreachable.pk).exists())
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
+        self.assertIn("deleted=1", output.getvalue())
+
+    def test_remote_generations_are_read_once_per_device(self):
+        for _index in range(3):
+            self.history()
+        self.adapter.store.feed_requests.clear()
+        self.prune(execute=True)
+        self.assertFalse(NSOApplyAttempt.objects.exists())
+        self.assertEqual(len(self.adapter.store.feed_requests), 2)
 
     def test_unconsumed_malformed_and_cursor_gap_history_stays(self):
         for change in (

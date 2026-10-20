@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Marcin Zieba
 """Bounded retention of terminal Apply history with no remaining authority."""
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -10,11 +11,13 @@ from django.db import transaction
 from django.db.models import ProtectedError, Q, RestrictedError
 from django.utils import timezone
 
-from . import refusal_contract
+from . import adapter_client, refusal_contract
 from .deployment import guarded
 from .durable_capture import mapping_epoch
 from .models import NSOAcceptedSelection, NSOApplyAttempt, NSODeviceManagement, NSOIntentOutboxState
 from .refusal_registry import OVERLAYS
+
+logger = logging.getLogger(__name__)
 
 RETENTION_DAYS = 30
 DEFAULT_BATCH_SIZE = 100
@@ -116,20 +119,40 @@ def _eligible(attempt, management):
     return not NSOIntentOutboxState.objects.filter(device_id=management.device_id, push_seq__isnull=False).exists()
 
 
-def _historical_certificate_required(attempt, management):
-    from . import adapter_client
+@dataclass(frozen=True)
+class _RemoteGenerations:
+    adapter_device_id: int
+    store_incarnation: str
+    generations: list
+
+
+def _remote_generations(management_id):
+    """Read one stable generation listing per device, without a row lock; None retains its history."""
+    device_id = NSODeviceManagement.objects.filter(pk=management_id).values_list("adapter_device_id", flat=True).first()
+    if device_id is None:
+        return None
+    try:
+        _page, incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
+        generations = adapter_client.list_device_generations(device_id)
+        _page, final_incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
+    except adapter_client.AdapterError:
+        logger.warning(
+            "Apply ledger retention keeps history for management %s: the adapter is unavailable", management_id
+        )
+        return None
+    if incarnation != final_incarnation:
+        return None
+    return _RemoteGenerations(device_id, incarnation, generations)
+
+
+def _historical_certificate_required(attempt, management, remote):
     from .apply_settlement import generation_certificates
 
-    _page, incarnation = adapter_client.get_settlement_feed(management.adapter_device_id, after_settle_seq=0, limit=1)
-    generations = adapter_client.list_device_generations(management.adapter_device_id)
-    _page, final_incarnation = adapter_client.get_settlement_feed(
-        management.adapter_device_id, after_settle_seq=0, limit=1
-    )
-    if incarnation != final_incarnation or attempt.executions.exclude(store_incarnation=incarnation).exists():
+    if attempt.executions.exclude(store_incarnation=remote.store_incarnation).exists():
         return True
     return any(
-        generation_certificates(management, incarnation, generation).filter(attempt=attempt).exists()
-        for generation in generations
+        generation_certificates(management, remote.store_incarnation, generation).filter(attempt=attempt).exists()
+        for generation in remote.generations
     )
 
 
@@ -154,9 +177,17 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
         )[:batch_size]
     )
     eligible = deleted = 0
+    remote_by_management = {}
     for attempt_id, management_id, _completed_at in candidates:
+        if management_id not in remote_by_management:
+            remote_by_management[management_id] = _remote_generations(management_id)
+        remote = remote_by_management[management_id]
+        if remote is None:
+            continue
         with transaction.atomic():
             management = NSODeviceManagement.objects.select_for_update().get(pk=management_id)
+            if management.adapter_device_id != remote.adapter_device_id:
+                continue
             attempt = (
                 NSOApplyAttempt.objects.select_for_update()
                 .filter(
@@ -168,7 +199,7 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
             )
             if attempt is None or not _eligible(attempt, management):
                 continue
-            if _historical_certificate_required(attempt, management):
+            if _historical_certificate_required(attempt, management, remote):
                 continue
             eligible += 1
             if not execute:
