@@ -207,6 +207,11 @@ describe("stateColumn", () => {
     expect(sorted).toEqual(["apply_failed", "drift", "pending", "in_sync"]);
   });
 
+  it("offers every projected state in its header filter", () => {
+    const values = G.stateColumn().headerFilterParams.values;
+    expect(Object.keys(values).filter((key) => key !== "").sort()).toEqual([...G.SEVERITY].sort());
+  });
+
   it("merges extra column options over the defaults", () => {
     const col = G.stateColumn({ minWidth: 200, field: "other" });
     expect(col.minWidth).toBe(200);
