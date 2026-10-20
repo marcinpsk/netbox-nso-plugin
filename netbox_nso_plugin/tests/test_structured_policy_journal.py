@@ -186,6 +186,30 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
             == 2
         )
 
+    def test_policy_journal_binds_the_store_to_the_settlement_cursor(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        # A store rebuild: the feed cursor moved to the new store, the read gate still holds the old one.
+        NSODeviceManagement.objects.filter(pk=self._make_mgmt().pk).update(
+            settle_cursor_incarnation="placeholder-policy-store", adapter_incarnation="placeholder-old-store"
+        )
+        management, row, execution, job = self.execution()
+        _journal_route_policy_apply(management, job)
+        assert (
+            JournalEntry.objects.filter(assigned_object_type=row.content_type, assigned_object_id=row.object_id).count()
+            == 1
+        )
+
+    def test_policy_journal_skips_evidence_from_a_store_the_cursor_left(self):
+        from netbox_nso_plugin.models import NSODeviceManagement
+        from netbox_nso_plugin.reconcile import _journal_route_policy_apply
+
+        management, row, execution, job = self.execution()
+        NSODeviceManagement.objects.filter(pk=management.pk).update(settle_cursor_incarnation="placeholder-next-store")
+        _journal_route_policy_apply(management, job)
+        assert not JournalEntry.objects.exists()
+
     def test_policy_journal_rejects_wrong_execution_identity_or_result(self):
         from netbox_nso_plugin.reconcile import _journal_route_policy_apply
 

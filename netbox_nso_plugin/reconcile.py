@@ -1293,7 +1293,8 @@ def _journal_route_policy_apply(mgmt, job: dict | None) -> None:
         current = type(mgmt).objects.get(pk=mgmt.pk)
         if mapping_epoch(current) != identity["mapping_epoch"]:
             return
-        store = current.reset_pending_incarnation or current.adapter_incarnation
+        # The feed cursor, not the read gate, bound this evidence to its store.
+        store = current.settle_cursor_incarnation
         if store and store != identity["store_incarnation"]:
             return
         execution = NSOApplyExecution.objects.filter(**identity).first()
