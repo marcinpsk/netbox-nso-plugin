@@ -1405,7 +1405,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
         return {"device_id": device_id, "skipped": "device_gone"}
 
     # Settle and journal one coherent execution snapshot before publishing observations.
-    from .apply_settlement import EvidenceInvariantError, latest_route_policy_carrier
+    from .apply_settlement import EvidenceInvariantError, route_policy_carriers
     from .durable_capture import mapping_epoch
 
     try:
@@ -1421,7 +1421,8 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
                     and mgmt.adapter_device_id == outcome.adapter_device_id
                     and mapping_epoch(mgmt) == outcome.mapping_epoch
                 ):
-                    _journal_route_policy_apply(mgmt, latest_route_policy_carrier(outcome.deployment_evidence))
+                    for carrier in route_policy_carriers(outcome.deployment_evidence):
+                        _journal_route_policy_apply(mgmt, carrier)
     except (AdapterError, EvidenceInvariantError, DeploymentQuiesced, NSODeviceManagement.DoesNotExist) as exc:
         logger.warning("nso reconcile: apply-failure settle skipped for device %s: %s", device_id, exc)
 

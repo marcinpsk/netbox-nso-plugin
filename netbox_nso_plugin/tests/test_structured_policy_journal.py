@@ -449,15 +449,12 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         assert execution.consumption_state == "unconsumed"
         assert execution.invariant_code
 
-    def test_run_device_reconcile_journals_the_route_policy_carrier(self):
+    def policy_adapter(self):
         from unittest.mock import patch
 
         from netbox_nso_plugin import adapter_client
-        from netbox_nso_plugin.delivery import canonical_fingerprint
         from netbox_nso_plugin.models import AdapterConnection
-        from netbox_nso_plugin.reconcile import run_device_reconcile
 
-        management, row, prior, result, generation, cause = self.policy_terminal()
         adapter = FakeAdapter()
         self.addCleanup(adapter.stop)
         for target, value in (
@@ -474,19 +471,31 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         adapter_client.reset_config_cache()
         self.addCleanup(adapter_client.reset_config_cache)
         adapter.store.add_device(nso_instance="rpj-inst", nso_device_name="rpj-dev", device_id=777)
+        return adapter
+
+    def policy_carrier(self, adapter, result, *, generation_id=17, seq=9):
         job = adapter.store.terminal_job(777, status="succeeded", extra=result)
         adapter.store.add_generation(
             777,
-            generation_id=17,
-            seq=9,
+            generation_id=generation_id,
+            seq=seq,
             status="failed",
             job_id=job["id"],
             mode="networked",
-            settlement_cohort=9,
+            settlement_cohort=seq,
             digest="a" * 64,
             stream_revisions={"route_policy": 7},
             source_push_seq={"route_policy": 41},
         )
+        return job
+
+    def test_run_device_reconcile_journals_the_route_policy_carrier(self):
+        from netbox_nso_plugin.delivery import canonical_fingerprint
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        management, row, prior, result, generation, cause = self.policy_terminal()
+        adapter = self.policy_adapter()
+        job = self.policy_carrier(adapter, result)
 
         run_device_reconcile(self.device.pk)
 
@@ -498,3 +507,30 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
         assert management.last_journaled_apply_job == canonical_fingerprint(
             (management.pk, execution.mapping_epoch, adapter.store.incarnation, 17, job["id"])
         )
+
+    def test_run_device_reconcile_journals_every_carrier_of_one_feed_page(self):
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        management, row, prior, result, generation, cause = self.policy_terminal()
+        adapter = self.policy_adapter()
+        retry = copy.deepcopy(result)
+        for item in (*retry["row_outcomes"], *retry["settlement_owners"], *retry["refusals"][0]["logical_rows"]):
+            item["generation_id"] = 18
+            item["settlement_cohort"] = 10
+            if "carrier" in item:
+                item["carrier"].update(generation_id=18, settlement_cohort=10)
+        first = self.policy_carrier(adapter, result)
+        second = self.policy_carrier(adapter, retry, generation_id=18, seq=10)
+
+        run_device_reconcile(self.device.pk)
+
+        consumed = NSOApplyExecution.objects.filter(consumption_state="consumed")
+        assert set(consumed.values_list("carrier_job_id", flat=True)) == {first["id"], second["id"]}
+        comments = list(
+            JournalEntry.objects.filter(
+                assigned_object_type=row.content_type, assigned_object_id=row.object_id
+            ).values_list("comments", flat=True)
+        )
+        assert len(comments) == 2
+        for job in (first, second):
+            assert any(f"adapter job #{job['id']}." in text for text in comments), job["id"]

@@ -693,12 +693,12 @@ def settle_device_apply_attempts(management):
     return evidence
 
 
-def latest_route_policy_carrier(deployment_evidence, *, attempt_ids=None):
-    """Return one exact validated carrier without inferring order from job IDs."""
+def route_policy_carriers(deployment_evidence, *, attempt_ids=None):
+    """Return every exact validated carrier in settlement order, never ordered by job IDs."""
     candidates = []
     allowed = None if attempt_ids is None else set(attempt_ids)
     if not isinstance(deployment_evidence, dict):
-        return None
+        return []
     for attempt in deployment_evidence["attempts"]:
         if allowed is not None and UUID(str(attempt["apply_attempt_id"])) not in allowed:
             continue
@@ -716,21 +716,21 @@ def latest_route_policy_carrier(deployment_evidence, *, attempt_ids=None):
             ):
                 candidates.append(generation)
     candidates = list({(row["generation_id"], row["carrier_job_id"]): row for row in candidates}.values())
-    if not candidates:
-        return None
     sequences = getattr(deployment_evidence, "settlement_sequences", {})
     if len(candidates) > 1 and any(row["carrier_job_id"] not in sequences for row in candidates):
-        return None
-    generation = max(candidates, key=lambda row: sequences.get(row["carrier_job_id"], 0))
-    return {
-        "id": generation["carrier_job_id"],
-        "store_incarnation": getattr(deployment_evidence, "store_incarnation", None),
-        "generation_id": generation["generation_id"],
-        "status": generation["carrier_job_status"],
-        "result": generation["carrier_job_result"],
-        "error": generation["carrier_job_error"],
-        "updated_at": generation["updated_at"],
-    }
+        return []
+    return [
+        {
+            "id": generation["carrier_job_id"],
+            "store_incarnation": getattr(deployment_evidence, "store_incarnation", None),
+            "generation_id": generation["generation_id"],
+            "status": generation["carrier_job_status"],
+            "result": generation["carrier_job_result"],
+            "error": generation["carrier_job_error"],
+            "updated_at": generation["updated_at"],
+        }
+        for generation in sorted(candidates, key=lambda row: sequences.get(row["carrier_job_id"], 0))
+    ]
 
 
 class _BoundEvidence(dict):
