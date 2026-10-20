@@ -2993,3 +2993,48 @@ class BorrowedSettlementHelperCase(BGPSettlementHelpers, BGPCaptureCase):
         TestCase.setUp(self)
         # ok: nso-test-borrows-another-class-method
         _AdapterWireSession.reset(self.environment.adapter_port)
+
+
+def per_row_mirror_refresh(rows, footprint):
+    for row in rows:
+        # ruleid: nso-per-row-mirror-refresh-loop
+        with mirror_refresh(row, {"unsupported_members"}) as locked:
+            locked.save(update_fields=["unsupported_members"])
+    with transaction.atomic(), suppress_intent_push():
+        for row, members in rows:
+            if members:
+                # ruleid: nso-per-row-mirror-refresh-loop
+                with mirror_refresh(row, {"unsupported_members"}) as locked:
+                    locked.save(update_fields=["unsupported_members"])
+    with transaction.atomic(), suppress_intent_push(), mirror_rows_transaction(rows):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    with mirror_rows_transaction(rows):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    with mirror_transaction(footprint):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    for row in rows:
+        # ruleid: nso-per-row-mirror-refresh-loop
+        with intent_state.mirror_refresh(row, {"unsupported_members"}) as locked:
+            locked.save(update_fields=["unsupported_members"])
+    with intent_state.mirror_rows_transaction(rows):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with intent_state.mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    with transaction.atomic(), intent_state.mirror_transaction(footprint):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    # ok: nso-per-row-mirror-refresh-loop
+    with mirror_refresh(rows[0], {"unsupported_members"}) as locked:
+        locked.save(update_fields=["unsupported_members"])

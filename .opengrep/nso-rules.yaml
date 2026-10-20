@@ -758,3 +758,44 @@ rules:
           regex: ^(?:\w+\.)*Test(?!Case$)[A-Z]\w*$
     paths:
       include: ["netbox_nso_plugin/tests/**"]
+  - id: nso-per-row-mirror-refresh-loop
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Batch per-row mirror_refresh saves under one mirror_rows_transaction(rows). An overlay footprint expands to
+      every sibling owner on the device, so one acquisition per row repeats the owner locks and projections. This
+      checks mirror_refresh calls inside a for loop, not loops in comprehensions or in a caller of a helper.
+    patterns:
+      - pattern-either:
+          - pattern: mirror_refresh(...)
+          - pattern: $MODULE.mirror_refresh(...)
+      - pattern-inside: |
+          for $ROW in $ROWS:
+              ...
+      - pattern-not-inside: |
+          with mirror_rows_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with ..., mirror_rows_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with $MODULE.mirror_rows_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with ..., $MODULE.mirror_rows_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with mirror_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with ..., mirror_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with $MODULE.mirror_transaction(...):
+              ...
+      - pattern-not-inside: |
+          with ..., $MODULE.mirror_transaction(...):
+              ...
+    paths:
+      include: ["netbox_nso_plugin/**/*.py"]
+      exclude: ["**/tests/**"]
