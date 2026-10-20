@@ -293,6 +293,13 @@ describe("catalog refusal projection", () => {
     expect(evidence.classList.contains("text-break")).toBe(true);
   });
 
+  it("labels a restored prior error as history beside an in-sync cell", () => {
+    const error = "placeholder prior restored error";
+    const node = parse(G.cellBadge({ kind: "in_sync", owned: true, error, error_history: true }));
+    expect(node.textContent).toContain("Previous error: " + error);
+    expect(node.querySelector(".text-danger")).toBeNull();
+  });
+
   it("keeps unavailable evidence visible beside a prior in-sync cell", () => {
     const text = "Execution unavailable; showing previous state.";
     const node = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", owned: true, advisory: text }));
@@ -309,7 +316,7 @@ describe("catalog refusal projection", () => {
       expect(node.textContent).toContain(advisory);
       expect([...node.querySelectorAll("small")].map((item) => item.textContent)).toEqual([error, advisory]);
       expect(node.querySelector("small.text-danger").textContent).toBe(error);
-      expect(node.querySelector("small.text-warning").textContent).toBe(advisory);
+      expect(node.querySelector("small.text-warning-emphasis").textContent).toBe(advisory);
       expect(node.querySelector("placeholder")).toBeNull();
     }
   });

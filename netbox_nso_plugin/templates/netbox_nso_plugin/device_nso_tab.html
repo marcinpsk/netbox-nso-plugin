@@ -905,7 +905,7 @@
 
     function renderIntentPanel(d) {
       if (!d.total && d.preview_status === 'refused') {
-        return '<p class="text-warning mb-0">Preview refused. Review the catalog cause.</p>';
+        return '<p class="text-warning-emphasis mb-0">Preview refused. Review the catalog cause.</p>';
       }
       if (!d.total) {
         // #107: no itemised rows, yet the dry-run shows a transaction — typically the
@@ -935,7 +935,7 @@
             var staleTitle = c.never_applied
               ? 'Accepted ' + c.staged_days + ' days ago and never applied — this intent has been waiting in staging ever since.'
               : 'Accepted ' + c.staged_days + ' days ago and still not in sync — the last apply never converged or the change was re-staged.';
-            stale = ' <span class="badge text-bg-warning text-dark" title="' + staleTitle + '">' + staleLabel + '</span>';
+            stale = ' <span class="badge text-bg-warning text-dark text-wrap" title="' + staleTitle + '">' + staleLabel + '</span>';
           }
           h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.label) + '</span>' + stale + refusalNotice(c) + '</td></tr>';
         });
@@ -990,7 +990,7 @@
       var keys = Object.keys(diff);
       if (!keys.length) {
         if (!d.diff_available) {
-          return '<p class="text-warning mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
+          return '<p class="text-warning-emphasis mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
         }
         return '<p class="text-muted mb-0">No device change for this generation.</p>';
       }
@@ -1045,7 +1045,7 @@
     }
 
     function refusalNotice(d) {
-      return [[d.refusal_text || d.error, 'text-danger'], [d.advisory, 'text-warning']].map(function (item) {
+      return [[d.refusal_text || d.error, 'text-danger'], [d.advisory, 'text-warning-emphasis']].map(function (item) {
         if (!item[0]) return '';
         var notice = document.createElement('p');
         notice.className = item[1] + ' text-break';

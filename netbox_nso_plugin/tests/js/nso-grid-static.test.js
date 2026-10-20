@@ -156,6 +156,73 @@ describe("static route grid", () => {
     expect(badgeClass).not.toContain("text-bg-danger");
   });
 
+  it("labels a restored prior error as history without a failed badge", () => {
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "in_sync",
+      error: "placeholder prior restored error",
+      error_history: true,
+      advisory: null,
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+
+    expect(result.textContent).toContain("Previous error: placeholder prior restored error");
+    expect(result.querySelector(".text-bg-danger")).toBeNull();
+    expect(result.querySelector(".text-danger")).toBeNull();
+  });
+
+  it("wraps a long result message instead of clipping it", () => {
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "pending",
+      error: null,
+      advisory: "verification disabled — nothing proves this route landed on the device after the last apply",
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+    const message = result.querySelector(".small");
+
+    expect(message.classList.contains("text-truncate")).toBe(false);
+    expect(message.classList.contains("text-wrap")).toBe(true);
+  });
+
+  it("shows the advisory once, in the result column", () => {
+    const advisory = "verification disabled — nothing proves this route landed";
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "pending",
+      label: "pending apply",
+      error: null,
+      advisory,
+    };
+    const table = mount(row);
+    const columns = table.config.columns;
+    const result = columns.find((column) => column.field === "_result").formatter(cell(row));
+    const stateOutput = columns.find((column) => column.field === "state").formatter(cell(row));
+    const state = document.createElement("div");
+    state.innerHTML = typeof stateOutput === "string" ? stateOutput : stateOutput.outerHTML;
+
+    expect(result.textContent).toContain(advisory);
+    expect(result.querySelector(".text-warning-emphasis").textContent).toBe(advisory);
+    expect(state.textContent).not.toContain(advisory);
+  });
+
   it("leaves the result column empty for a route with no verdict to report", () => {
     const row = {
       vrf: "global",

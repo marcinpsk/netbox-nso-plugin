@@ -77,9 +77,11 @@
   }
 
   function appendEvidence(parent, data) {
+    var history = data.error_history && data.error;
     [
-      [data.refusal_text || data.error, "d-block text-wrap text-break text-danger"],
-      [data.advisory, "d-block text-wrap text-break text-warning"],
+      [history ? "Previous error: " + data.error : "", "d-block text-wrap text-break text-body-secondary"],
+      [history ? "" : data.refusal_text || data.error, "d-block text-wrap text-break text-danger"],
+      [data.advisory, "d-block text-wrap text-break text-warning-emphasis"],
     ].forEach(function (item) {
       if (!item[0]) return;
       var node = document.createElement("small");
@@ -181,12 +183,14 @@
    * differently — or quietly forget the residue badge, which is the whole point of
    * being able to attribute a re-imported husk instead of reading it as new config. */
   function stateColumn(extra) {
+    // A panel that shows evidence in its own column passes evidence: false.
+    var evidence = !extra || extra.evidence !== false;
     var col = {
       title: "State",
       field: "state",
       formatter: function (cell) {
         var d = cell.getRow().getData();
-        var out = badge(d.state, d.label) + evidenceText(d);
+        var out = badge(d.state, d.label) + (evidence ? evidenceText(d) : "");
         if (d.residue) {
           // Same wording and explanation as _state_badge.html — an operator must not have
           // to learn two names for the same thing depending on which panel they are on.
@@ -215,7 +219,9 @@
         },
       },
     };
-    return Object.assign(col, extra || {});
+    col = Object.assign(col, extra || {});
+    delete col.evidence;
+    return col;
   }
 
   /* Muted "device: <value>" annotation for a cell whose INTENT lives in NetBox

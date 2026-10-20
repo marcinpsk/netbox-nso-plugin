@@ -78,17 +78,22 @@
   function fmtResult(cell) {
     var row = cell.getRow().getData();
     var wrap = document.createElement("div");
-    var text = row.error || row.advisory;
+    var failure = row.error_history ? "" : row.error;
+    var history = row.error_history && row.error ? "Previous error: " + row.error : "";
+    var text = failure || row.advisory || history;
     if (!text) {
       wrap.innerHTML = G.MUTED;
       return wrap;
     }
-    wrap.appendChild(
-      row.error ? badge("apply failed", "text-bg-danger") : badge("unproven", "text-bg-warning text-dark"),
-    );
+    if (failure || row.advisory) {
+      wrap.appendChild(
+        failure ? badge("apply failed", "text-bg-danger") : badge("unproven", "text-bg-warning text-dark"),
+      );
+    }
     var msg = document.createElement("div");
-    msg.className = "small text-truncate " + (row.error ? "text-danger" : "text-muted");
-    msg.title = text;
+    msg.className =
+      "small text-wrap text-break " +
+      (failure ? "text-danger" : row.advisory ? "text-warning-emphasis" : "text-body-secondary");
     msg.textContent = text;
     wrap.appendChild(msg);
     return wrap;
@@ -134,7 +139,7 @@
         },
         { title: "Policy", field: "_policy", formatter: fmtPolicy, widthGrow: 1.5, minWidth: 190 },
         { title: "Result", field: "_result", formatter: fmtResult, widthGrow: 1.2, minWidth: 150 },
-        G.stateColumn({ widthGrow: 0.6, minWidth: 85 }),
+        G.stateColumn({ widthGrow: 0.6, minWidth: 85, evidence: false }),
         G.lastSyncColumn({ widthGrow: 0.7, minWidth: 95 }),
         G.acceptColumn({ widthGrow: 0.3, minWidth: 45 }),
       ],

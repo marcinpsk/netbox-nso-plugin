@@ -455,3 +455,14 @@ describe("refusal evidence in the interface grid", () => {
     expect(col("_network").formatter(fakeCell(data)).textContent).toContain(text);
   });
 });
+
+describe("MTU cell", () => {
+  it("lets the value and its failed badge wrap inside the cell", () => {
+    const mtu = { pk: 7, l2: 9192, ip: null, mpls: null, status: "apply_failed", kind: "apply_failed", label: "apply failed" };
+    const data = row({ mtu, state: "apply_failed" });
+    const { col } = mountRows([data]);
+    const node = col("mtu").formatter(fakeCell(data));
+    expect(node.classList.contains("text-wrap")).toBe(true);
+    expect(node.querySelector(".badge").textContent).toBe("apply failed");
+  });
+});

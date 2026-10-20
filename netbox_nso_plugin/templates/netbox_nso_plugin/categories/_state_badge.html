@@ -12,7 +12,7 @@
 {% else %}<span class="badge text-bg-info">{{ display.label }}</span>{% endif %}
 {% if display.owned %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
 {% if residue %}<span class="badge text-bg-warning text-dark ms-1" title="A removal left this key on the device{% if state.residue_job_id %} (adapter job #{{ state.residue_job_id }}){% endif %}. Review the device or accept the row.">removal residue</span>{% endif %}
-{% if hide_error %}{% elif display.refusal_text %}<small class="text-danger ms-1">{{ display.refusal_text }}</small>{% elif display.error %}<small class="text-danger ms-1">{{ display.error }}</small>{% endif %}
-{% if display.advisory %}<small class="text-warning ms-1{% if display.execution_disposition == 'unavailable' %} nso-execution-unavailable{% endif %}">{{ display.advisory }}</small>{% endif %}
+{% if hide_error %}{% elif display.error_history %}<small class="text-body-secondary ms-1">Previous error: {{ display.error }}</small>{% elif display.refusal_text %}<small class="text-danger ms-1">{{ display.refusal_text }}</small>{% elif display.error %}<small class="text-danger ms-1">{{ display.error }}</small>{% endif %}
+{% if display.advisory %}<small class="text-warning-emphasis ms-1{% if display.execution_disposition == 'unavailable' %} nso-execution-unavailable{% endif %}">{{ display.advisory }}</small>{% endif %}
 </span>
 {% endwith %}

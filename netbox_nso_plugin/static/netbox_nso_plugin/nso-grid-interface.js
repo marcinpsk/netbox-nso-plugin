@@ -225,6 +225,7 @@
       // The value itself is a popedit anchor (three-field popover) — DOM-built so the
       // data attributes are safely escaped whatever the values contain.
       var wrap = document.createElement("span");
+      wrap.className = "text-wrap";
       var a = document.createElement("a");
       a.href = "#";
       a.className = "nso-popedit font-monospace text-nowrap";

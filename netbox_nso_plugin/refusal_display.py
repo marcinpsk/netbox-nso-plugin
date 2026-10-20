@@ -190,7 +190,7 @@ def row_projection(row, interface=None):
 
     error = getattr(row, "last_apply_error", None)
     historical_refusal = None
-    projection = {"refusal": None, "refusal_text": "", "advisory": "", "error": None}
+    projection = {"refusal": None, "refusal_text": "", "advisory": "", "error": None, "error_history": False}
     if isinstance(error, dict) and "refusals" in error:
         projection["refusal"] = safe_projection(error["refusals"])
     current = _current_snapshot(row)
@@ -226,8 +226,11 @@ def row_projection(row, interface=None):
         projection["error_value"] = projection["error"] if projection["error"] is not None else error
     kind, label, owned = _row_classification(row, projection, interface)
     if kind == "in_sync":
-        # A row shown in sync carries no failure text from an earlier acceptance.
-        projection.update(refusal=None, refusal_text="", error=None)
+        # A current not_applied restoration keeps its prior error as history; older failure text is not shown.
+        restored = projection["execution_disposition"] == "not_applied" and projection["error"] is not None
+        projection.update(refusal=None, refusal_text="", error_history=restored)
+        if not restored:
+            projection["error"] = None
     pending = kind in PENDING_STATES
     projection.update(
         state=kind,
@@ -267,9 +270,9 @@ def _row_classification(row, projected, interface):
         return "unavailable", "previous " + _stored_state(row.status, owned)[1], owned
     if interface is None and hasattr(row, "attribute"):
         interface = getattr(row, "interface", None)
-    # A failure recorded for this acceptance, refusal or ordinary error, outranks value equality.
+    # A current restoration or an ordinary error outranks value equality; an uncorrelated refusal does not.
     retained_failure = row.status == "apply_failed" and (
-        projected["execution_disposition"] == "not_applied" or bool(projected["error"])
+        projected["execution_disposition"] == "not_applied" or (projected["error"] and projected["refusal"] is None)
     )
     if (
         interface is not None

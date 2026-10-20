@@ -206,6 +206,6 @@ it("shows a member's restored error and current advisory in separate elements", 
   expect(result.textContent).toContain(advisory);
   expect([...result.querySelectorAll("small")].map((item) => item.textContent)).toEqual([error, advisory]);
   expect(result.querySelector("small.text-danger").textContent).toBe(error);
-  expect(result.querySelector("small.text-warning").textContent).toBe(advisory);
+  expect(result.querySelector("small.text-warning-emphasis").textContent).toBe(advisory);
   expect(result.querySelector("placeholder")).toBeNull();
 });

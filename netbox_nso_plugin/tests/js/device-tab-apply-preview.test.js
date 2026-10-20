@@ -100,3 +100,13 @@ it('wraps a long unbroken refusal token inside the preview table', async () => {
   const notice = [...body.querySelectorAll('td p')].find(node => node.textContent === text);
   expect(notice.classList.contains('text-break')).toBe(true);
 });
+
+it('lets the staged badge wrap and uses a readable advisory color in the preview table', async () => {
+  const body = await open({ total: 1, diff_available: true, device_diff: {},
+    routing_changes: [{ category: 'BGP', item: 'example', scope: 'bgp', staged_days: 19, never_applied: true,
+      advisory: 'Execution unavailable; showing previous state.' }] });
+  const staged = [...body.querySelectorAll('td .badge')].find(node => node.textContent.startsWith('staged 19d'));
+  expect(staged.classList.contains('text-wrap')).toBe(true);
+  const advisory = [...body.querySelectorAll('td p')].find(node => node.textContent.startsWith('Execution unavailable'));
+  expect(advisory.classList.contains('text-warning-emphasis')).toBe(true);
+});
