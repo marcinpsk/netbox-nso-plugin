@@ -8688,15 +8688,16 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
     attempt's admission and the evidence that later settles it, which is what this pin needs.
     """
 
-    def __init__(self, apply_response, evidence=None):
+    def __init__(self, apply_response, evidence=None, *, generations=()):
         super().__init__()
         self.apply_response = apply_response
         self.evidence = evidence
+        self.generations = list(generations)
         self.apply_requests: list[dict] = []
 
     def _handle(self, method, url, **kwargs):
         if method == "GET" and url.endswith(("/jobs", "/generations")):
-            response = make_response(200, [])
+            response = make_response(200, self.generations if url.endswith("/generations") else [])
             response.headers["X-Store-Incarnation"] = "placeholder-store"
             return response
         if url.endswith("/deployment-evidence"):
@@ -8822,7 +8823,15 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
             replayed.append(True)
             return 202, admitted["response"]
 
-        recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown)
+        from ._adapter_http import make_generation_listing
+
+        listing = make_generation_listing(
+            **admitted["response"]["generations"][0],
+            status=terminal["status"],
+            carrier_job_id=terminal["carrier_job_id"],
+            carrier_job_status=terminal["carrier_job_status"],
+        )
+        recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown, generations=[listing])
         config, session = recovery.patches()
         with config, session:
             settle_device_apply_attempts(self.mgmt)

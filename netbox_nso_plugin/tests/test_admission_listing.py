@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Marcin Zieba
+"""Reconcile all held admission links before using or persisting them."""
+
+import copy
+from uuid import uuid4
+
+from django.core.management.base import CommandError
+
+from netbox_nso_plugin import deployment
+from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+from netbox_nso_plugin.models import NSOAcceptedSelection, NSOApplyAttempt, NSOApplyExecution
+
+from ._adapter_http import make_response
+from .test_apply_selector import _promoted
+from .test_deployment_probe import DeploymentCase
+
+
+class TestAdmissionListing(DeploymentCase):
+    def prepare(self):
+        self._prepare_bgp_observation_capture()
+        deployment.quiesce(paired_activation=True)
+        self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
+        self.adapter.apply_response = lambda selected: (
+            202,
+            {
+                **_promoted(selected),
+                "generations": _promoted(selected)["generations"][:1],
+            },
+        )
+        attempt_id = uuid4()
+        self.command(start_probe=str(attempt_id), device_id=self.device.pk)
+        self.attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+
+    def assert_admission_links_reconciled(self, kind):
+        self.prepare()
+        response = copy.deepcopy(self.attempt.response)
+        generation = self.terminal()
+        self.serve_terminal_evidence(generation, manual=kind == "known")
+        original = self.adapter._handle
+        changed = None
+
+        def handle(method, url, **kwargs):
+            answer = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = answer.json()
+                if kind == "known":
+                    document["attempts"][0]["response"] = changed
+                if kind == "replayed":
+                    document["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+                return make_response(200, document)
+            return answer
+
+        self.adapter._handle = handle
+        self.adapter.apply_response = lambda selected: (202, changed)
+        for key, value in (
+            ("seq", 5),
+            ("digest", "b" * 64),
+            ("mode", "detach"),
+            ("generation_id", 999),
+            ("stream_revisions", {"bgp": 8}),
+            ("source_push_seq", {"bgp": 999}),
+        ):
+            with self.subTest(kind=kind, key=key):
+                changed = copy.deepcopy(response)
+                changed["generations"][0][key] = value
+                NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(
+                    response=changed if kind == "retained" else None,
+                    http_status=202 if kind == "retained" else None,
+                )
+                before_attempts = list(NSOApplyAttempt.objects.order_by("pk").values())
+                before_selections = list(NSOAcceptedSelection.objects.order_by("pk").values())
+                before_snapshots = list(self.attempt.overlay_snapshots.order_by("pk").values())
+                with self.assertRaises(EvidenceInvariantError):
+                    load_deployment_evidence(self.management)
+                self.assertEqual(list(NSOApplyAttempt.objects.order_by("pk").values()), before_attempts)
+                self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before_selections)
+                self.assertEqual(list(self.attempt.overlay_snapshots.order_by("pk").values()), before_snapshots)
+                self.assertFalse(NSOApplyExecution.objects.exists())
+                self.management.refresh_from_db()
+                self.assertIsNone(self.management.settle_cursor_seq)
+
+    def test_known_admission_links_match_the_listing_before_persistence(self):
+        self.assert_admission_links_reconciled("known")
+
+    def test_replayed_admission_links_match_the_listing_before_persistence(self):
+        self.assert_admission_links_reconciled("replayed")
+
+    def test_retained_full_promotion_links_match_the_listing_before_use(self):
+        self.assert_admission_links_reconciled("retained")
+
+    def test_head_retained_admission_is_checked_without_a_requested_attempt(self):
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal())
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = response.json()
+                document["head"]["apply_attempt_id"] = str(self.attempt.pk)
+                return make_response(200, document)
+            return response
+
+        self.adapter._handle = handle
+        response = copy.deepcopy(self.attempt.response)
+        response["generations"][0]["digest"] = "b" * 64
+        NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=response)
+        before = list(NSOAcceptedSelection.objects.order_by("pk").values())
+        with self.assertRaisesRegex(EvidenceInvariantError, "admission_generation_mismatch"):
+            load_deployment_evidence(self.management, attempt_ids=())
+        self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+
+    def test_retry_carrier_does_not_change_immutable_admission_links(self):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+
+        self.prepare()
+        generation = self.terminal()
+        generation["carrier_job_id"] = 502
+        self.serve_terminal_evidence(generation, manual=True)
+        with deployment.gate_bypass():
+            settle_device_apply_attempts(self.management)
+        self.assertEqual(self.attempt.response["generations"][0]["job_id"], 501)
+        self.assertEqual(NSOApplyExecution.objects.get().carrier_job_id, 502)
+
+
+class TestProbeAdmissionListing(DeploymentCase):
+    def prepare_probe(self, *, carrier_job_id=501):
+        self._prepare_bgp_observation_capture()
+        deployment.quiesce(paired_activation=True)
+        self.command(prepare_store=True, device_id=self.device.pk, scope="bgp")
+        self.adapter.apply_response = lambda selected: (
+            202,
+            {
+                **_promoted(selected),
+                "generations": _promoted(selected)["generations"][:1],
+            },
+        )
+        attempt_id = uuid4()
+        self.command(start_probe=str(attempt_id), device_id=self.device.pk)
+        self.attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
+        generation = self.terminal()
+        generation["carrier_job_id"] = carrier_job_id
+        self.serve_terminal_evidence(generation, manual=True)
+
+    def test_probe_links_match_the_listing_before_binding(self):
+        self.prepare_probe()
+        attempt_id = self.attempt.pk
+        original = self.adapter._handle
+        change = {}
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                rows = response.json()
+                rows[0].update(change)
+                return make_response(200, rows)
+            return response
+
+        self.adapter._handle = handle
+        before_selections = list(NSOAcceptedSelection.objects.order_by("pk").values())
+        for change in ({"seq": 5}, {"digest": "b" * 64}, {"mode": "detach"}):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(CommandError, "admission_generation_mismatch"):
+                    self.command(register_probe=str(attempt_id))
+                self.assertFalse(NSOApplyExecution.objects.exists())
+                self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before_selections)
+
+    def test_probe_retry_keeps_the_original_admission_job_link(self):
+        self.prepare_probe(carrier_job_id=502)
+        self.command(register_probe=str(self.attempt.pk))
+        self.assertEqual(self.attempt.response["generations"][0]["job_id"], 501)
+        self.assertEqual(NSOApplyExecution.objects.get().carrier_job_id, 502)

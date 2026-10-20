@@ -115,3 +115,23 @@ def patch_matching_control_state(test_case):
     for patcher in patchers:
         patcher.start()
         test_case.addCleanup(patcher.stop)
+
+
+def make_generation_listing(*, generation_id=81, seq=4, **values):
+    """Return one complete adapter generation listing row."""
+    return {
+        "generation_id": generation_id,
+        "seq": seq,
+        "status": "settled",
+        "job_id": 501,
+        "carrier_job_id": 501,
+        "carrier_job_status": "succeeded",
+        "mode": "networked",
+        "settlement_cohort": 9,
+        "digest": "a" * 64,
+        "stream_revisions": {"bgp": 7},
+        "source_push_seq": {"bgp": 1},
+        "created_at": "2026-10-20T10:00:00+00:00",
+        "updated_at": "2026-10-20T10:01:00+00:00",
+        **values,
+    }

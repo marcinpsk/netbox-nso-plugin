@@ -36,6 +36,14 @@ def test_generation_dispositions_match_the_committed_adapter_openapi_enum():
     openapi_statuses = set(openapi["components"]["schemas"]["GenerationStatus"]["enum"])
 
     assert set(GENERATION_DISPOSITIONS) == openapi_statuses
+    from netbox_nso_plugin.adapter_client import GENERATION_LISTING_FIELDS
+    from netbox_nso_plugin.tests._settlement_adapter import GENERATION_RESPONSE_FIELDS
+
+    listing = openapi["components"]["schemas"]["DeviceGenerationOut"]
+    assert set(listing["required"]) == GENERATION_LISTING_FIELDS == GENERATION_RESPONSE_FIELDS
+    assert set(listing["properties"]) == GENERATION_LISTING_FIELDS
+    head = openapi["components"]["schemas"]["DeploymentEvidenceHeadOut"]
+    assert "stream_revisions" in head["required"]
 
 
 def test_generation_wire_keys_match_the_live_adapter_contract():

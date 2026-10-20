@@ -227,35 +227,48 @@ class TestDeploymentProbe(DeploymentCase):
 
         from django.utils import timezone
 
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_generation_listing
 
         self._prepare_bgp_observation_capture()
-        late = self.terminal()
-        newest = self.terminal(refused=None)
+        late = self.terminal(refused=None)
+        newest = self.terminal()
         newest.update(generation_id=82, seq=5, carrier_job_id=502)
         for outcome in newest["row_outcomes"]:
             outcome["generation_id"] = outcome["carrier"]["generation_id"] = 82
         for carrier in newest["carrier_job_result"]["settlement_owners"]:
             carrier["generation_id"] = 82
+        for cause in newest["refusals"]:
+            for logical in cause["logical_rows"]:
+                logical["generation_id"] = logical["carrier"]["generation_id"] = 82
         incarnation = self.socket_adapter.store.incarnation
-        settle_terminal_generation(self.management, newest, incarnation, settle_seq=2)
         execution = settle_terminal_generation(self.management, late, incarnation, settle_seq=1)
-        self.assertEqual(execution.consumption_state, "superseded")
-        self.assertFalse(execution.overlay_snapshots.exists())
         NSOApplyAttempt.objects.filter(pk=execution.attempt_id).update(completed_at=timezone.now() - timedelta(days=31))
         NSODeviceManagement.objects.filter(pk=self.management.pk).update(
             settle_cursor_device_id=self.management.adapter_device_id,
             settle_cursor_incarnation=incarnation,
-            settle_cursor_seq=3,
+            settle_cursor_seq=1,
         )
-        self.serve_terminal_evidence(late, head=False, pruned=True)
+        historical = make_generation_listing(
+            job_id=None,
+            source_push_seq=late["source_push_seq"],
+            updated_at=late["updated_at"],
+        )
+        self.serve_terminal_evidence(newest, settle_seq=2, earlier_generations=[historical])
         call_command("nso_prune_apply_ledger", execute=True, stdout=StringIO())
-        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
-            load_deployment_evidence(self.management)
+        self.evidence_requests.clear()
+        result = settle_static_routes(self.management)
+        self.assertFalse(result.stalled)
+        self.assertEqual((result.consumed, result.cursor), (1, 2))
+        self.assertEqual(sum(url.endswith("/deployment-evidence") for _method, url in self.evidence_requests), 1)
         execution.refresh_from_db()
-        self.assertEqual(execution.consumption_state, "superseded")
+        self.assertEqual((execution.consumption_state, execution.settle_seq), ("consumed", 1))
+        self.assertEqual(NSOApplyExecution.objects.get(generation_id=82).consumption_state, "consumed")
+        self.owners[1].refresh_from_db()
+        self.assertEqual(self.owners[1].status, "apply_failed")
 
     def test_deployment_verify_requires_cutover_contract_and_settlement_probe(self):
         deployment.quiesce(paired_activation=True)
@@ -705,7 +718,14 @@ class TestDeploymentProbe(DeploymentCase):
             response = original(method, url, **kwargs)
             if method == "GET" and url.endswith("/generations"):
                 generations = response.json()
-                historical = {**generations[0], "generation_id": 79, "seq": 2, "job_id": 499, "status": "failed"}
+                historical = {
+                    **generations[0],
+                    "generation_id": 79,
+                    "seq": 2,
+                    "job_id": 499,
+                    "carrier_job_id": 499,
+                    "status": "failed",
+                }
                 return make_response(200, [historical, *generations])
             return response
 
@@ -763,6 +783,8 @@ class TestDeploymentProbe(DeploymentCase):
                     },
                     "status": retained["status"],
                     "job_id": None,
+                    "carrier_job_id": retained["carrier_job_id"],
+                    "carrier_job_status": retained["carrier_job_status"],
                 }
                 return make_response(200, [historical, *document])
             if method == "POST" and url.endswith("/deployment-evidence"):
@@ -812,16 +834,17 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertEqual(self.management.settle_cursor_seq, cursor)
         self.assertFalse(NSOApplyExecution.objects.filter(carrier_job_id=1502, consumed_at__isnull=False).exists())
 
-    def test_verify_rejects_pruned_generation_without_remote_carrier_identity(self):
+    def test_verify_accepts_pruned_generation_from_listing_carrier_identity(self):
         attempts = self.paired_probes()
         execution = NSOApplyExecution.objects.get(generation_id=80)
         self.assertNotEqual(execution.attempt.trigger_kind, "manual")
         self.serve_pruned_historical_carrier(execution, execution.terminal_projection)
-        with self.assertRaisesRegex(CommandError, "missing_generation_evidence"):
-            self.command(verify=True, device_id=self.device.pk, settled_probe=[str(pk) for pk in attempts])
-        self.assertTrue(deployment.is_quiesced())
+        self.command(verify=True, device_id=self.device.pk, settled_probe=[str(pk) for pk in attempts])
+        self.assertFalse(deployment.is_quiesced())
 
-    def test_verify_rejects_changed_terminal_identity_after_job_deletion(self):
+    def test_held_evidence_rejects_changed_terminal_identity_after_job_deletion(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+
         attempts = self.paired_probes()
         execution = NSOApplyExecution.objects.get(attempt_id=attempts[1])
         retained = {
@@ -830,11 +853,11 @@ class TestDeploymentProbe(DeploymentCase):
             "carrier_job_error": {"message": "Placeholder changed error"},
         }
         self.serve_pruned_historical_carrier(execution, retained)
-        with self.assertRaisesRegex(CommandError, "missing_generation_evidence"):
-            self.command(verify=True, device_id=self.device.pk, settled_probe=[str(pk) for pk in attempts])
+        with self.assertRaisesRegex(EvidenceInvariantError, "consumed_execution_changed"):
+            load_deployment_evidence(self.management, attempt_ids=(execution.attempt_id,))
         self.assertTrue(deployment.is_quiesced())
 
-    def test_verify_rejects_ambiguous_pruned_generation_carriers(self):
+    def test_verify_accepts_exact_pruned_carrier_among_historical_certificates(self):
         attempts = self.paired_probes()
         execution = NSOApplyExecution.objects.get(generation_id=80)
         self.serve_terminal_evidence(execution.terminal_projection, head=False, pruned=True)
@@ -843,9 +866,8 @@ class TestDeploymentProbe(DeploymentCase):
         retry["carrier_job_id"] += 1000
         retry["terminal_projection"] = {**retry["terminal_projection"], "carrier_job_id": retry["carrier_job_id"]}
         NSOApplyExecution.objects.create(**retry)
-        with self.assertRaisesRegex(CommandError, "terminal.*consumed|historical.*evidence"):
-            self.command(verify=True, device_id=self.device.pk, settled_probe=[str(pk) for pk in attempts])
-        self.assertTrue(deployment.is_quiesced())
+        self.command(verify=True, device_id=self.device.pk, settled_probe=[str(pk) for pk in attempts])
+        self.assertFalse(deployment.is_quiesced())
 
     def assert_historical_probe_rejected(self, field):
         from datetime import timedelta
@@ -1164,7 +1186,7 @@ class TestDeploymentProbe(DeploymentCase):
         generation = self.terminal()
         generation["carrier_job_id"] = 502
         self.serve_terminal_evidence(generation, manual=True)
-        with self.assertRaisesRegex(CommandError, "carrier|admi|generation"):
+        with self.assertRaisesRegex(CommandError, "carrier|admi|generation|execution"):
             self.command(register_probe=str(self.attempt.pk))
         self.assertIsNone(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id)
         self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")

@@ -738,7 +738,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.serve_terminal_evidence(self.terminal(), head=False, pruned=True)
         with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
             settle_device_apply_attempts(self.management)
-        self.assertFalse(NSOApplyExecution.objects.exists())
+        self.assertEqual(NSOApplyExecution.objects.get().invariant_code, "missing_generation_evidence")
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(
@@ -839,6 +839,8 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             "seq": 3,
             "status": status,
             "job_id": None,
+            "carrier_job_id": None,
+            "carrier_job_status": None,
             "mode": "detach",
             "settlement_cohort": None,
             "digest": "b" * 64,
@@ -908,16 +910,16 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 self.assertEqual(reconstructed["sections"], [section])
                 self.assertEqual(validate_generation(reconstructed), reconstructed)
 
-    def test_pruned_nonhead_generation_without_remote_carrier_blocks_recovery(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
+    def test_pruned_nonhead_generation_recovers_from_ordered_certificate(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         self.prepare_automatic()
         generation = self.terminal()
         original = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
         self.serve_terminal_evidence(generation, head=False, pruned=True)
-        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
-            load_deployment_evidence(self.management)
+        evidence = load_deployment_evidence(self.management)
+        self.assertEqual(evidence.settlement_sequences, {501: 1})
         self.assertEqual(NSOApplyExecution.objects.count(), 1)
         original.refresh_from_db()
         self.assertEqual(original.consumption_state, "consumed")
@@ -1063,7 +1065,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             generation.update(
                 carrier_job_result=copy.deepcopy(result), row_outcomes=copy.deepcopy(result["row_outcomes"])
             )
-        head = {key: value for key, value in first.items() if key != "stream_revisions"}
+        head = dict(first)
         head.update(
             apply_attempt_id=str(manual.pk), mode="networked", settlement_cohort=9, created_at=self.stamp.isoformat()
         )
@@ -1074,6 +1076,8 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                     for key in ("generation_id", "seq", "status", "stream_revisions", "source_push_seq", "updated_at")
                 },
                 "job_id": 501,
+                "carrier_job_id": 501,
+                "carrier_job_status": generation["carrier_job_status"],
                 "mode": "networked",
                 "settlement_cohort": 9,
                 "digest": "a" * 64,
@@ -1370,6 +1374,21 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             if "carrier" in identity:
                 identity["carrier"]["generation_id"] = 80
         self.serve_terminal_evidence(generation)
+        from ._adapter_http import make_generation_listing, make_response
+
+        original = self.adapter._handle
+        link = self.attempt.response["generations"][0]
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "GET" and url.endswith("/generations"):
+                pending = make_generation_listing(
+                    **link, status="pending", carrier_job_id=None, carrier_job_status=None
+                )
+                return make_response(200, [*response.json(), pending])
+            return response
+
+        self.adapter._handle = handle
         settle_device_apply_attempts(self.management)
         for row in self.owners:
             row.refresh_from_db()

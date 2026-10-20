@@ -14,13 +14,22 @@ from netbox_nso_plugin.refusal_registry import OVERLAYS
 from .test_apply_selector import _promoted
 
 
+def promoted_streams(selected, streams, *, mode="networked"):
+    """Promote only the fixture's populated streams and skip its empty preparations."""
+    response = _promoted(selected)
+    response["generations"] = response["generations"][:1]
+    link = response["generations"][0]
+    link["mode"] = mode
+    for key in ("stream_revisions", "source_push_seq"):
+        link[key] = {stream: value for stream, value in link[key].items() if stream in streams}
+    response["skipped"] = {stream: "no_receipt" for stream in selected if stream not in streams}
+    return response
+
+
 class BGPSettlementHelpers:
     def prepare(self, *, redistribution=False, mode="networked"):
         def admission(selected):
-            response = _promoted(selected)
-            response["generations"] = response["generations"][:1]
-            response["generations"][0]["mode"] = mode
-            return 202, response
+            return 202, promoted_streams(selected, {"bgp"}, mode=mode)
 
         self.adapter.apply_response = admission
         scope = self.scope()
@@ -209,6 +218,8 @@ class BGPSettlementHelpers:
                             "seq": generation["seq"],
                             "status": generation["status"],
                             "job_id": None if pruned else generation["carrier_job_id"],
+                            "carrier_job_id": generation["carrier_job_id"],
+                            "carrier_job_status": generation["carrier_job_status"],
                             "mode": "networked",
                             "settlement_cohort": 9,
                             "digest": "a" * 64,
@@ -220,7 +231,7 @@ class BGPSettlementHelpers:
                     ],
                 )
             if method == "POST" and url.endswith("/deployment-evidence"):
-                head_row = {key: value for key, value in generation.items() if key != "stream_revisions"}
+                head_row = dict(generation)
                 head_row.update(
                     mode="networked", settlement_cohort=9, apply_attempt_id=None, created_at=self.stamp.isoformat()
                 )
@@ -423,10 +434,12 @@ class BGPSettlementHelpers:
                 copy.deepcopy(row.last_apply_error),
                 row.apply_attempt_id,
             )
-        self.adapter.apply_response = lambda selected: (
-            202,
-            {**_promoted(selected), "generations": _promoted(selected)["generations"][:1]},
-        )
+        from netbox_nso_plugin.delivery import delivery_keys
+
+        streams = {
+            delivery_keys()[key].section for row in owners for key in OVERLAYS[row._meta.label_lower].delivery_keys
+        }
+        self.adapter.apply_response = lambda selected: (202, promoted_streams(selected, streams))
         response = self.client.post(
             reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
             HTTP_X_REQUESTED_WITH="XMLHttpRequest",

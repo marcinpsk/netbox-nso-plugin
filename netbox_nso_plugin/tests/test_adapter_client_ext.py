@@ -1190,20 +1190,22 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     def test_device_generations_reads_every_ascending_page(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT, list_device_generations
 
+        from ._adapter_http import make_generation_listing
+
         # A page of exactly the limit is what makes the reader ask for another; the short one stops it.
         last_full_seq = _GENERATION_PAGE_LIMIT
         first_page = [
-            {"generation_id": seq, "seq": seq, "status": "pending", "settlement_cohort": None}
+            make_generation_listing(generation_id=seq, seq=seq, status="pending", settlement_cohort=None)
             for seq in range(1, last_full_seq + 1)
         ]
         final_page = [
-            {
-                "generation_id": last_full_seq + 1,
-                "seq": last_full_seq + 1,
-                "job_id": None,
-                "status": "pending",
-                "settlement_cohort": None,
-            }
+            make_generation_listing(
+                generation_id=last_full_seq + 1,
+                seq=last_full_seq + 1,
+                job_id=None,
+                status="pending",
+                settlement_cohort=None,
+            )
         ]
         session = make_session()
         session.request.side_effect = [
@@ -1233,6 +1235,8 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
             list_device_generations,
         )
 
+        from ._adapter_http import make_generation_listing
+
         self.assertLessEqual(_GENERATION_PAGE_MAX, 20)
 
         page_number = 0
@@ -1246,12 +1250,7 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
             return make_response(
                 200,
                 [
-                    {
-                        "generation_id": seq,
-                        "seq": seq,
-                        "status": "pending",
-                        "settlement_cohort": None,
-                    }
+                    make_generation_listing(generation_id=seq, seq=seq, status="pending", settlement_cohort=None)
                     for seq in range(first_seq, first_seq + _GENERATION_PAGE_LIMIT)
                 ],
             )

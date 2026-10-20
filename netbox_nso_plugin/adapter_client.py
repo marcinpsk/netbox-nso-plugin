@@ -16,6 +16,7 @@ import time
 import weakref
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
 
 import requests
 from django.conf import settings
@@ -1318,6 +1319,83 @@ def list_jobs(adapter_device_id):
     return _validated_jobs(_request("GET", "/api/v1/jobs", params={"device_id": adapter_device_id}), "jobs listing")
 
 
+GENERATION_LISTING_FIELDS = frozenset(
+    {
+        "generation_id",
+        "seq",
+        "status",
+        "job_id",
+        "carrier_job_id",
+        "carrier_job_status",
+        "mode",
+        "settlement_cohort",
+        "digest",
+        "stream_revisions",
+        "source_push_seq",
+        "created_at",
+        "updated_at",
+    }
+)
+
+
+def _positive_generation_int(value):
+    return type(value) is int and value > 0
+
+
+def _aware_generation_timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).utcoffset() is not None
+    except ValueError:
+        return False
+
+
+def _generation_provenance(mapping, *, nullable=False):
+    return isinstance(mapping, dict) and all(
+        isinstance(key, str) and (_positive_generation_int(value) or nullable and value is None)
+        for key, value in mapping.items()
+    )
+
+
+def _validated_generation_listing(row):
+    from .refusal_contract import GENERATION_STATUSES
+
+    valid = isinstance(row, dict) and set(row) == GENERATION_LISTING_FIELDS
+    if valid:
+        valid = (
+            all(_positive_generation_int(row[key]) for key in ("generation_id", "seq"))
+            and all(
+                row[key] is None or _positive_generation_int(row[key])
+                for key in ("job_id", "carrier_job_id", "settlement_cohort")
+            )
+            and isinstance(row["status"], str)
+            and row["status"] in GENERATION_STATUSES
+            and isinstance(row["mode"], str)
+            and row["mode"] in {"networked", "detach"}
+            and isinstance(row["digest"], str)
+            and _generation_provenance(row["stream_revisions"])
+            and _generation_provenance(row["source_push_seq"], nullable=True)
+            and row["stream_revisions"].keys() <= row["source_push_seq"].keys()
+            and all(_aware_generation_timestamp(row[key]) for key in ("created_at", "updated_at"))
+            and (row["carrier_job_id"] is None) == (row["carrier_job_status"] is None)
+            and (
+                row["carrier_job_status"] is None
+                or isinstance(row["carrier_job_status"], str)
+                and row["carrier_job_status"] in {"queued", "running", "succeeded", "failed"}
+            )
+            and (
+                row["status"] in {"pending", "running"}
+                or row["carrier_job_id"] is None
+                or row["job_id"] is None
+                or row["carrier_job_id"] == row["job_id"]
+            )
+        )
+    if not valid:
+        raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
+    return row
+
+
 def list_device_generations(adapter_device_id, *, since_seq=None):
     """GET a bounded set of ascending generation pages after ``since_seq``."""
     if since_seq is not None and (type(since_seq) is not int or since_seq < 0):
@@ -1333,24 +1411,9 @@ def list_device_generations(adapter_device_id, *, since_seq=None):
         if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
             raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
         for row in page:
-            generation_id = row.get("generation_id")
-            seq = row.get("seq")
-            job_id = row.get("job_id")
-            status = row.get("status")
-            settlement_cohort = row.get("settlement_cohort")
-            if (
-                "settlement_cohort" not in row
-                or type(generation_id) is not int
-                or generation_id <= 0
-                or generation_id in generation_ids
-                or type(seq) is not int
-                or seq <= 0
-                or (job_id is not None and (type(job_id) is not int or job_id <= 0))
-                or not isinstance(status, str)
-                or not status
-                or (last_seq is not None and seq <= last_seq)
-                or (settlement_cohort is not None and (type(settlement_cohort) is not int or settlement_cohort <= 0))
-            ):
+            _validated_generation_listing(row)
+            generation_id, seq = row["generation_id"], row["seq"]
+            if generation_id in generation_ids or last_seq is not None and seq <= last_seq:
                 raise AdapterError("Adapter returned a malformed generations listing.", code="invalid_response")
             generation_ids.add(generation_id)
             last_seq = seq

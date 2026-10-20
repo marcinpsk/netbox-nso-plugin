@@ -81,6 +81,8 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
                             )
                         },
                         "job_id": automatic["carrier_job_id"],
+                        "carrier_job_id": automatic["carrier_job_id"],
+                        "carrier_job_status": automatic["carrier_job_status"],
                     }
                 )
                 return make_response(200, generations)
@@ -317,7 +319,8 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         )
 
     def test_malformed_generation_sources_fail_as_safe_evidence_invariants(self):
-        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+        from netbox_nso_plugin.adapter_client import AdapterError
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
         from ._adapter_http import make_response
 
@@ -340,8 +343,9 @@ class TestLostPublicationReceipt(BGPSettlementHelpers, bgp_case.BGPCaptureCase):
         self.adapter._handle = malformed
         for invalid in (missing, None, [], {"bgp": True}):
             with self.subTest(source=repr(invalid)):
-                with self.assertRaises(EvidenceInvariantError):
+                with self.assertRaises(AdapterError) as raised:
                     settle_device_apply_attempts(self.management)
+                self.assertEqual(raised.exception.code, "invalid_response")
                 self.selection.refresh_from_db()
                 self.assertIsNone(self.selection.acknowledged_at)
                 self.assertFalse(NSOApplyExecution.objects.filter(consumption_state="consumed").exists())
