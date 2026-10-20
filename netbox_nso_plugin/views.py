@@ -6261,7 +6261,9 @@ def _apply_preview_owner_changes(device_pk):
             except Exception:
                 detail = ""
             key = r.dest_protocol if len(spec.delivery_keys) > 1 else spec.delivery_keys[0]
-            scope_val = key if delivery_keys()[key].in_protocol else None
+            # A read can store a destination protocol that has no delivery key.
+            entry = delivery_keys().get(key)
+            scope_val = key if entry is not None and entry.in_protocol else None
             # Show the age of staged intent and whether it has ever been applied.
             accepted_at = getattr(r, "accepted_at", None)
             staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None

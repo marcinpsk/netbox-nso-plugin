@@ -2694,6 +2694,25 @@ class TestNSOApplyPreviewView(ViewTestBase):
         self.assertEqual(data["total"], 1)
         self.assertFalse(data["nothing_pending"])
 
+    def test_unregistered_redistribution_protocol_keeps_the_preview_open(self):
+        """The reconciler stores any reported destination protocol; the preview must not crash on it."""
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="")
+        row = acquire_overlay(
+            NSORedistributionState,
+            management=self.mgmt,
+            dest_protocol="rip",
+            dest_ref="1",
+            source_protocol="static",
+            status="accepted",
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        [change] = [item for item in json.loads(response.content)["routing_changes"] if item["pk"] == row.pk]
+        self.assertIsNone(change["scope"])
+
 
 class TestRoutingStateAcceptView(ViewTestBase):
     """Per-row routing accepts (RoutingStateAcceptMixin families)."""
