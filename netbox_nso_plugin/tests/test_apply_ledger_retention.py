@@ -297,6 +297,8 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
                 seq=seq,
                 status="settled",
                 job_id=None,
+                carrier_job_id=1000 + seq,
+                carrier_job_status="succeeded",
                 mode="detach",
                 settlement_cohort=None,
                 digest="a" * 64,
