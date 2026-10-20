@@ -47,9 +47,11 @@ FORCED_PUSH_SITES = {
 #: named here so the exclusion cannot quietly widen to a module that is one.
 FORCED_CLAIM_SITE = ("drain.py", "_claim_or_wait", "_claim_after_audit")
 # Store preparation uses audited captures under bounded maintenance without a device Apply.
+# A non-paired gate's verification forms one no-deletion claim and verifies its exact receipt.
 DEPLOYMENT_PREPARATION_SITES = {
     ("nso_intent_deployment_gate.py", "_store_preparation", "drain.claim"): 1,
     ("nso_intent_deployment_gate.py", "_store_preparation", "prepare"): 1,
+    ("nso_intent_deployment_gate.py", "_verify_static", "drain.claim"): 1,
 }
 
 

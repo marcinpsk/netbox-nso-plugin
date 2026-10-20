@@ -145,10 +145,12 @@ def _set_active(active: bool, *, paired_activation: bool = False, paired_verifie
             raise
         with transaction.atomic():
             if active:
-                defaults = {"quiesced_at": timezone.now()}
+                _control, created = NSOIntentDeploymentControl.objects.update_or_create(
+                    pk=1,
+                    defaults={"quiesced_at": timezone.now()},
+                )
                 if paired_activation:
-                    defaults["paired_activation"] = True
-                _control, created = NSOIntentDeploymentControl.objects.update_or_create(pk=1, defaults=defaults)
+                    NSOIntentDeploymentControl.objects.filter(pk=1).update(paired_activation=True)
                 return created
             control = NSOIntentDeploymentControl.objects.select_for_update().filter(pk=1).first()
             if control is None:
