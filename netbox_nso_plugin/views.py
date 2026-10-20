@@ -3720,20 +3720,24 @@ class NSOJobStatusView(LoginRequiredMixin, View):
         from . import adapter_client as client
 
         try:
-            job = client.get_job(job_id)
-            result = job.get("result")
-            counts = (
-                [
-                    {"scope": key.removesuffix("_count_by_outcome"), **value}
-                    for key, value in sorted(result.items())
-                    if key.endswith("_count_by_outcome")
-                ]
-                if isinstance(result, dict)
-                else []
-            )
-            return JsonResponse({**job, "outcome_counts": counts})
+            return JsonResponse(_job_with_outcome_counts(client.get_job(job_id)))
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
+
+
+def _job_with_outcome_counts(job):
+    """Add the per-scope outcome counts that the tab's Apply failure message reads."""
+    result = job.get("result")
+    counts = (
+        [
+            {"scope": key.removesuffix("_count_by_outcome"), **value}
+            for key, value in sorted(result.items())
+            if key.endswith("_count_by_outcome")
+        ]
+        if isinstance(result, dict)
+        else []
+    )
+    return {**job, "outcome_counts": counts}
 
 
 def _removal_job_scope(job):
@@ -4050,7 +4054,7 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
                 "onboarded": True,
                 "running": running,
                 "last": last,
-                "jobs": serialized_jobs,
+                "jobs": [_job_with_outcome_counts(job) for job in serialized_jobs],
                 "generations": generations,
                 "apply_state": apply_state,
                 "apply_state_error": apply_state_error,
