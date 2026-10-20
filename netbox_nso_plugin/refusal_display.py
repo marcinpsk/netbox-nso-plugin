@@ -147,35 +147,45 @@ def project_rows(rows):
 
 
 def _load_previous_refusals(owners):
-    from django.db.models import Prefetch
-
     from .models import NSOApplyExecution, NSOApplyOverlaySnapshot
 
+    # Only a text error reads the previous refusal; see row_projection.
     keyed = {
         (row.apply_attempt_id, label, pk): row
         for (label, pk), row in owners.items()
         if getattr(row, "apply_attempt_id", None) is not None
+        and isinstance(row.last_apply_error, str)
+        and row.last_apply_error
     }
     for row in keyed.values():
         row._refusal_previous = None
     if not keyed:
         return
-    snapshots = NSOApplyOverlaySnapshot.objects.filter(
-        attempt_id__in={attempt_id for attempt_id, _label, _pk in keyed},
-        model_label__in={label for _attempt_id, label, _pk in keyed},
-        overlay_pk__in={pk for _attempt_id, _label, pk in keyed},
-        settlement_disposition="refused",
-    ).prefetch_related(
-        Prefetch(
-            "executions",
-            queryset=NSOApplyExecution.objects.filter(consumption_state="consumed"),
-            to_attr="consumed_executions",
+    snapshots = {
+        snapshot.pk: snapshot
+        for snapshot in NSOApplyOverlaySnapshot.objects.filter(
+            attempt_id__in={attempt_id for attempt_id, _label, _pk in keyed},
+            model_label__in={label for _attempt_id, label, _pk in keyed},
+            overlay_pk__in={pk for _attempt_id, _label, pk in keyed},
+            settlement_disposition="refused",
+        ).only("attempt_id", "model_label", "overlay_pk", "contributors")
+        if (snapshot.attempt_id, snapshot.model_label, snapshot.overlay_pk) in keyed
+    }
+    links = list(
+        NSOApplyOverlaySnapshot.executions.through.objects.filter(nsoapplyoverlaysnapshot_id__in=snapshots).values_list(
+            "nsoapplyoverlaysnapshot_id", "nsoapplyexecution_id"
         )
     )
-    for snapshot in snapshots:
-        row = keyed.get((snapshot.attempt_id, snapshot.model_label, snapshot.overlay_pk))
-        if row is not None:
-            row._refusal_previous = (snapshot, snapshot.consumed_executions)
+    executions = NSOApplyExecution.objects.filter(
+        pk__in={execution_id for _snapshot_id, execution_id in links}, consumption_state="consumed"
+    ).in_bulk()
+    consumed = {snapshot_id: [] for snapshot_id in snapshots}
+    for snapshot_id, execution_id in links:
+        if execution_id in executions:
+            consumed[snapshot_id].append(executions[execution_id])
+    for snapshot in snapshots.values():
+        row = keyed[(snapshot.attempt_id, snapshot.model_label, snapshot.overlay_pk)]
+        row._refusal_previous = (snapshot, consumed[snapshot.pk])
 
 
 def _snapshot_refusal(snapshot, executions):

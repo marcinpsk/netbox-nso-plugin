@@ -1123,6 +1123,50 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         cause = generation["refusals"][0]
         self.assertEqual(projected["error"], f"{cause['reason']}: {cause['message']}")
 
+    def test_project_rows_shares_previous_refusal_executions(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOApplyOverlaySnapshot
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.refusal_display import project_rows
+
+        from ._outbox_case import mirror_update
+
+        self.prepare()
+        self.settle(self.terminal())
+        retry = self.terminal(refused=2)
+        retry["carrier_job_id"] = 502
+        settle_terminal_generation(self.management, retry, "placeholder-store", attempt=self.attempt, settle_seq=2)
+        refused, other = self.owners[1], self.owners[2]
+        snapshot = NSOApplyOverlaySnapshot.objects.get(
+            attempt=self.attempt, overlay_pk=refused.pk, settlement_disposition="refused"
+        )
+        executions = list(snapshot.executions.all())
+        other.refresh_from_db()
+        NSOApplyOverlaySnapshot.objects.filter(attempt_id=other.apply_attempt_id, overlay_pk=other.pk).delete()
+        snapshot.pk = None
+        snapshot.attempt_id = other.apply_attempt_id
+        snapshot.overlay_pk = other.pk
+        snapshot.model_label = other._meta.label_lower
+        snapshot.save()
+        snapshot.executions.set(executions)
+        for row in (refused, other):
+            mirror_update(row, last_apply_error="placeholder ordinary failure")
+        rows = project_rows([type(row).objects.get(pk=row.pk) for row in (refused, other)])
+        first, second = ({execution.pk: execution for execution in row._refusal_previous[1]} for row in rows)
+        self.assertTrue(first)
+        self.assertEqual(first.keys(), second.keys())
+        for pk, execution in first.items():
+            self.assertIs(second[pk], execution)
+        for row in (refused, other):
+            mirror_update(row, last_apply_error="")
+        table = NSOApplyOverlaySnapshot._meta.db_table
+        with CaptureQueriesContext(connection) as queries:
+            project_rows([type(row).objects.get(pk=row.pk) for row in (refused, other)])
+        refused_lookup = f'"{table}"."settlement_disposition" = \'refused\''
+        self.assertFalse(any(refused_lookup in query["sql"] for query in queries.captured_queries))
+
     def test_refusal_display_is_computed_once_per_row(self):
         _iface, row, generation = self.interface_execution()
         row = NSOInterfaceState.objects.get(pk=row.pk)
