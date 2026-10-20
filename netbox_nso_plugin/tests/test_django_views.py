@@ -739,6 +739,14 @@ class TestNSOInterfaceStateListView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
 
+    def test_lists_a_stored_in_sync_row_whose_netbox_value_drifted(self):
+        """A raw in_sync row with no settlement fence still needs attention when the values differ."""
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="device desc")
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(self.iface_state.pk, [row.pk for row in response.context["table"].data])
+
 
 class TestInterfacesPageNoAttrsHint(ViewTestBase):
     """The interfaces page must explain an empty tab caused by no attrs in scope.
