@@ -2107,9 +2107,10 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
     """
     from django.db import transaction
 
-    from .intent_state import mirror_refresh
+    from .intent_state import mirror_refresh, mirror_rows_transaction
     from .models import NSOStaticRouteState
 
+    expected = {}
     for echo in echoes:
         if not isinstance(echo, dict):
             continue
@@ -2118,13 +2119,20 @@ def _record_static_route_expectations(device_id, generations: dict, echoes) -> N
             continue
         if generation is None or generations.get(route_id) != generation:
             continue  # never pushed by us at this generation — not an expectation we may record
-        with transaction.atomic(), suppress_intent_push():
-            rows = NSOStaticRouteState.objects.filter(
-                management__device_id=device_id,
-                static_route_id=route_id,
-                intent_generation=generation,
-            )
+        expected[route_id] = (generation, fingerprint)
+    if not expected:
+        return
+    with transaction.atomic(), suppress_intent_push():
+        rows = [
+            row
+            for row in NSOStaticRouteState.objects.filter(management__device_id=device_id, static_route_id__in=expected)
+            if row.intent_generation == expected[row.static_route_id][0]
+        ]
+        if not rows:
+            return
+        with mirror_rows_transaction(rows):
             for row in rows:
+                generation, fingerprint = expected[row.static_route_id]
                 fields = {"expected_generation", "expected_fingerprint"}
                 with mirror_refresh(row, fields) as locked:
                     if locked is None or locked.intent_generation != generation:
@@ -3022,18 +3030,23 @@ def _store_unsupported_members(owned_rows, resp) -> None:
         return  # push skipped-unchanged or failed — keep whatever we last recorded
     from django.db import transaction
 
-    from .intent_state import mirror_refresh
+    from .intent_state import mirror_refresh, mirror_rows_transaction
 
     unsupported = resp.get("unsupported_members") or {}
-    with transaction.atomic(), suppress_intent_push():
-        for row in owned_rows:
-            members = unsupported.get(row.object_name, []) if row.family == "community_list" else []
-            if list(row.unsupported_members or []) != list(members):
-                with mirror_refresh(row, {"unsupported_members"}) as locked:
-                    if locked is None:
-                        continue
-                    locked.unsupported_members = members
-                    locked.save(update_fields=["unsupported_members"])
+    changed = []
+    for row in owned_rows:
+        members = unsupported.get(row.object_name, []) if row.family == "community_list" else []
+        if list(row.unsupported_members or []) != list(members):
+            changed.append((row, members))
+    if not changed:
+        return
+    with transaction.atomic(), suppress_intent_push(), mirror_rows_transaction([row for row, _ in changed]):
+        for row, members in changed:
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                if locked is None:
+                    continue
+                locked.unsupported_members = members
+                locked.save(update_fields=["unsupported_members"])
 
 
 def _build_community_list_entries(obj):

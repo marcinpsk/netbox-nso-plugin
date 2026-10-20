@@ -2460,6 +2460,11 @@ def offline_mutation():
         _ACTIVE_PERMIT.reset(token)
 
 
+def mirror_rows_transaction(rows):
+    """Acquire one read-side footprint for a batch of per-row ``mirror_refresh`` saves."""
+    return mirror_transaction(MutationFootprint.merge(*(footprint_for_instance(row) for row in rows)))
+
+
 @contextlib.contextmanager
 def mirror_refresh(instance, update_fields):
     """Permit one per-instance lifecycle save only when its fragment stays equal."""

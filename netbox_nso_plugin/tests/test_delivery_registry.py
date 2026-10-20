@@ -278,6 +278,33 @@ class TestDeliverySuccessHooks(IntentPushResetMixin, TestCase):
         row.refresh_from_db()
         assert row.unsupported_members == ["large:1:2:3"]
 
+    def test_route_policy_unsupported_members_batch_uses_one_acquisition(self):
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.signals import _store_unsupported_members
+
+        _device, mgmt = _fixture("rp-batch", 7306)
+        with patch("netbox_nso_plugin.adapter_client.put_route_policy_intent"):
+            rows = [
+                acquire_overlay(
+                    NSORoutePolicyState,
+                    management=mgmt,
+                    family="community_list",
+                    object_name=f"dr-cl-batch-{index}",
+                    status="accepted",
+                )
+                for index in range(3)
+            ]
+        response = {"unsupported_members": {row.object_name: [f"large:1:2:{i}"] for i, row in enumerate(rows)}}
+
+        with patch.object(intent_state, "_acquire", wraps=intent_state._acquire) as acquire:
+            _store_unsupported_members(rows, response)
+
+        assert acquire.call_count == 1
+        for i, row in enumerate(rows):
+            row.refresh_from_db()
+            assert row.unsupported_members == [f"large:1:2:{i}"]
+
     def test_render_builders_do_not_claim_to_return_adapter_responses(self):
         from netbox_nso_plugin import signals
 

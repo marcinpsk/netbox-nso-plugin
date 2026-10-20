@@ -436,6 +436,33 @@ class TestOwnerLifecycleFence(_CascadeFlushMixin, IntentPushResetMixin, Transact
             ],
         )
 
+    def test_static_echo_batch_records_every_route_in_one_acquisition(self):
+        from unittest.mock import patch
+
+        from netbox_nso_plugin import intent_state
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.signals import _record_static_route_expectations
+
+        from ._outbox_case import own_route
+
+        for index in range(3):
+            own_route(self.management, f"198.18.17.{index * 16}/28", f"198.18.17.{index * 16 + 1}")
+        states = list(NSOStaticRouteState.objects.filter(management=self.management))
+        self.assertEqual(len(states), 3)
+        echoes = [
+            {"route_id": state.static_route_id, "generation": state.intent_generation, "fingerprint": f"{i}" * 64}
+            for i, state in enumerate(states)
+        ]
+        with patch.object(intent_state, "_acquire", wraps=intent_state._acquire) as acquire:
+            _record_static_route_expectations(
+                self.device.pk, {state.static_route_id: state.intent_generation for state in states}, echoes
+            )
+        self.assertEqual(acquire.call_count, 1)
+        for i, state in enumerate(states):
+            state.refresh_from_db()
+            self.assertEqual(state.expected_generation, state.intent_generation)
+            self.assertEqual(state.expected_fingerprint, f"{i}" * 64)
+
     def test_static_echo_first_commits_before_successor_generation(self):
         from netbox_nso_plugin.apply_state import lock_device_intent_transaction
 
