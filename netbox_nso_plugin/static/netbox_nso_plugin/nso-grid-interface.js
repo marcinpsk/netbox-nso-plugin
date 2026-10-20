@@ -120,7 +120,7 @@
 
     function fmtState(cell) {
       var d = cell.getRow().getData();
-      var out = badge(d.state, d.label);
+      var out = '<span class="text-wrap">' + badge(d.state, d.label);
       if (interfaceUnifiedDiff(d)) {
         out +=
           ' <button type="button" class="btn btn-xs btn-outline-warning nso-if-diff" data-iface-id="' +
@@ -129,7 +129,7 @@
           esc(d.iface.name) +
           '"><span class="mdi mdi-not-equal-variant" aria-hidden="true"></span></button>';
       }
-      return out;
+      return out + "</span>";
     }
 
     function renderDiff() {
@@ -250,8 +250,9 @@
       ips.forEach(function (ip, index) {
         if (index) wrap.appendChild(document.createElement("br"));
         var line = document.createElement("span");
-        line.className = "text-nowrap nso-if-ip";
+        line.className = "nso-if-ip";
         var code = document.createElement("code");
+        code.className = "text-nowrap";
         code.textContent = ip.address;
         if (ip.url) {
           var detail = document.createElement("a");
@@ -315,6 +316,7 @@
       if (!hasIps && !hasSwitchport) return MUTED;
 
       var wrap = document.createElement("span");
+      wrap.className = "text-wrap text-break";
       if (hasIps) wrap.appendChild(fmtIps(cell));
       if (hasIps && hasSwitchport) wrap.appendChild(document.createElement("br"));
       if (hasSwitchport) {

@@ -177,6 +177,50 @@ describe("static route grid", () => {
     expect(result.querySelector(".text-danger")).toBeNull();
   });
 
+  it("shows a current advisory next to a restored prior error", () => {
+    const advisory = "placeholder unavailable advisory";
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "pending",
+      error: "placeholder prior restored error",
+      error_history: true,
+      advisory,
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+
+    expect(result.textContent).toContain("Previous error: placeholder prior restored error");
+    expect(result.querySelector(".text-warning-emphasis").textContent).toBe(advisory);
+    expect(result.querySelector(".text-danger")).toBeNull();
+  });
+
+  it("shows a current failure and a current advisory together", () => {
+    const advisory = "placeholder unavailable advisory";
+    const row = {
+      vrf: "global",
+      prefix: "203.0.113.0/24",
+      next_hop: "192.0.2.2",
+      metric: 1,
+      route: null,
+      edit_url: null,
+      state: "apply_failed",
+      error: "placeholder current failure",
+      error_history: false,
+      advisory,
+    };
+    const table = mount(row);
+    const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
+
+    expect(result.querySelector(".text-bg-danger")).not.toBeNull();
+    expect(result.querySelector(".text-danger").textContent).toBe("placeholder current failure");
+    expect(result.querySelector(".text-warning-emphasis").textContent).toBe(advisory);
+  });
+
   it("wraps a long result message instead of clipping it", () => {
     const row = {
       vrf: "global",
@@ -191,7 +235,7 @@ describe("static route grid", () => {
     };
     const table = mount(row);
     const result = table.config.columns.find((column) => column.field === "_result").formatter(cell(row));
-    const message = result.querySelector(".small");
+    const message = result.querySelector("small");
 
     expect(message.classList.contains("text-truncate")).toBe(false);
     expect(message.classList.contains("text-wrap")).toBe(true);

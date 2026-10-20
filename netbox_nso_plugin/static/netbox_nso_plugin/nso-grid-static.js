@@ -79,9 +79,7 @@
     var row = cell.getRow().getData();
     var wrap = document.createElement("div");
     var failure = row.error_history ? "" : row.error;
-    var history = row.error_history && row.error ? "Previous error: " + row.error : "";
-    var text = failure || row.advisory || history;
-    if (!text) {
+    if (!row.error && !row.advisory) {
       wrap.innerHTML = G.MUTED;
       return wrap;
     }
@@ -90,12 +88,7 @@
         failure ? badge("apply failed", "text-bg-danger") : badge("unproven", "text-bg-warning text-dark"),
       );
     }
-    var msg = document.createElement("div");
-    msg.className =
-      "small text-wrap text-break " +
-      (failure ? "text-danger" : row.advisory ? "text-warning-emphasis" : "text-body-secondary");
-    msg.textContent = text;
-    wrap.appendChild(msg);
+    G.appendEvidence(wrap, row);
     return wrap;
   }
 
@@ -139,7 +132,7 @@
         },
         { title: "Policy", field: "_policy", formatter: fmtPolicy, widthGrow: 1.5, minWidth: 190 },
         { title: "Result", field: "_result", formatter: fmtResult, widthGrow: 1.2, minWidth: 150 },
-        G.stateColumn({ widthGrow: 0.6, minWidth: 85, evidence: false }),
+        G.stateColumn({ widthGrow: 0.6, minWidth: 100, evidence: false }),
         G.lastSyncColumn({ widthGrow: 0.7, minWidth: 95 }),
         G.acceptColumn({ widthGrow: 0.3, minWidth: 45 }),
       ],
