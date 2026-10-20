@@ -432,3 +432,26 @@ describe("NSOGrid.deviceNote", () => {
     expect(host.querySelector(".nso-dev-note").textContent).toBe("device: —");
   });
 });
+
+describe("refusal evidence in the interface grid", () => {
+  const text = "ownership-conflict: placeholder catalog text that is longer than the state column";
+
+  it("shows an attribute's evidence once, in its own cell", () => {
+    const description = Object.assign({}, PENDING_DESC, { kind: "apply_failed", label: "apply failed", refusal_text: text });
+    const data = row({ description, state: "apply_failed" });
+    const { col } = mountRows([data]);
+    const cells = [col("_desc"), col("state")].map((column) => {
+      const output = column.formatter(fakeCell(data));
+      return typeof output === "string" ? parse(output) : output;
+    });
+    const occurrences = cells.map((node) => node.textContent.split(text).length - 1);
+    expect(occurrences).toEqual([1, 0]);
+  });
+
+  it("shows an IP owner's evidence beside that IP", () => {
+    const ip = { pk: 31, address: "198.18.30.0/31", status: "apply_failed", kind: "apply_failed", label: "apply failed", refusal_text: text };
+    const data = row({ ips: [ip], state: "apply_failed" });
+    const { col } = mountRows([data]);
+    expect(col("_network").formatter(fakeCell(data)).textContent).toContain(text);
+  });
+});

@@ -121,9 +121,6 @@
     function fmtState(cell) {
       var d = cell.getRow().getData();
       var out = badge(d.state, d.label);
-      [d.description, d.enabled, d.mtu, d.switchport].concat(d.ips || []).forEach(function (cell) {
-        if (cell) out += G.evidenceText(cell);
-      });
       if (interfaceUnifiedDiff(d)) {
         out +=
           ' <button type="button" class="btn btn-xs btn-outline-warning nso-if-diff" data-iface-id="' +
@@ -269,7 +266,8 @@
         status.innerHTML =
           (ip.secondary ? ' <span class="badge text-bg-light">sec</span>' : "") +
           (ip.kind !== "in_sync" ? " " + badge(ip.kind, ip.label) : "") +
-          acceptBtn(ip);
+          acceptBtn(ip) +
+          G.evidenceText(ip);
         line.appendChild(status);
 
         if (ip.edit_url) {

@@ -1,6 +1,6 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Render the common owner projection. #}
+{# Render the common owner projection; hide_error leaves the error to a separate field. #}
 {% with display=state.refusal_display %}
 <span class="nso-owner-state" data-model="{{ state.refusal_model }}" data-pk="{{ state.pk }}" data-state="{{ display.state }}" data-pending="{{ display.pending|yesno:'true,false' }}" data-advisory="{{ display.advisory }}">
 {% if display.state == "apply_failed" %}<span class="badge text-bg-danger">{{ display.label }}</span>
@@ -12,7 +12,7 @@
 {% else %}<span class="badge text-bg-info">{{ display.label }}</span>{% endif %}
 {% if display.owned %}<span class="mdi mdi-shield-check text-success ms-1" title="NetBox is the source of truth (owned)"></span>{% endif %}
 {% if residue %}<span class="badge text-bg-warning text-dark ms-1" title="A removal left this key on the device{% if state.residue_job_id %} (adapter job #{{ state.residue_job_id }}){% endif %}. Review the device or accept the row.">removal residue</span>{% endif %}
-{% if display.refusal_text %}<small class="text-danger ms-1">{{ display.refusal_text }}</small>{% elif display.error %}<small class="text-danger ms-1">{{ display.error }}</small>{% endif %}
+{% if hide_error %}{% elif display.refusal_text %}<small class="text-danger ms-1">{{ display.refusal_text }}</small>{% elif display.error %}<small class="text-danger ms-1">{{ display.error }}</small>{% endif %}
 {% if display.advisory %}<small class="text-warning ms-1{% if display.execution_disposition == 'unavailable' %} nso-execution-unavailable{% endif %}">{{ display.advisory }}</small>{% endif %}
 </span>
 {% endwith %}

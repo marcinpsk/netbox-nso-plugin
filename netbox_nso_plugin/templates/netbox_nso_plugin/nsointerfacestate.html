@@ -31,7 +31,7 @@
             <tr>
               <th scope="row">Status</th>
               <td>
-                {% include "netbox_nso_plugin/categories/_state_badge.html" with state=object status=object.status %}
+                {% include "netbox_nso_plugin/categories/_state_badge.html" with state=object status=object.status hide_error=True %}
               </td>
             </tr>
             <tr>

@@ -284,6 +284,15 @@ describe("catalog refusal projection", () => {
     expect(node.querySelector("placeholder")).toBeNull();
   });
 
+  it("lets long evidence wrap inside its cell", () => {
+    const text = "ownership-conflict: placeholder catalog text that is longer than the state column";
+    const node = parse(G.cellBadge({ kind: "apply_failed", label: "apply failed", refusal_text: text }));
+    const evidence = node.querySelector("small.text-danger");
+    expect(evidence.classList.contains("d-block")).toBe(true);
+    expect(evidence.classList.contains("text-wrap")).toBe(true);
+    expect(evidence.classList.contains("text-break")).toBe(true);
+  });
+
   it("keeps unavailable evidence visible beside a prior in-sync cell", () => {
     const text = "Execution unavailable; showing previous state.";
     const node = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", owned: true, advisory: text }));

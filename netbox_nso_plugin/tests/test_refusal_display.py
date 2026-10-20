@@ -6,6 +6,7 @@ import copy
 
 from dcim.models import Interface
 from django.db import transaction
+from django.test import SimpleTestCase
 from django.urls import reverse
 
 from netbox_nso_plugin.models import NSOInterfaceState
@@ -165,9 +166,11 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertEqual(peer["refusal"]["causes"][0]["message_id"], cause["message_id"])
         for section, owner in (("routers", self.owners[0]), ("peers", self.owners[2])):
             restored = next(row for row in payload[section]["rows"] if row["pk"] == owner.pk)
-            self.assertEqual(restored["status"], self.prior[(owner._meta.label_lower, owner.pk)][0])
+            prior = self.prior[(owner._meta.label_lower, owner.pk)]
+            self.assertEqual(restored["status"], prior[0])
             self.assertIsNone(restored["refusal"])
-            self.assertEqual(restored["error"], self.prior[(owner._meta.label_lower, owner.pk)][2])
+            # A sibling restored to in sync shows no stale prior error text.
+            self.assertEqual(restored["error"], None if restored["state"] == "in_sync" else prior[2])
         self.assertContains(self.category("bgp"), cause["reason"])
 
     def test_unavailable_execution_keeps_prior_state_with_advisory(self):
@@ -704,6 +707,77 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertTrue(cell["refusal_text"])
         self.assertContains(self.category("interfaces"), generation["refusals"][0]["reason"])
 
+    def test_matching_value_keeps_a_stored_refusal_without_its_current_fence(self):
+        from ._outbox_case import mirror_update
+
+        iface, row, generation = self.interface_execution(matching=True)
+        self.assertEqual(row.status, "apply_failed")
+        self.assertTrue(row.last_apply_error["refusals"])
+        # A store rekey invalidates the fence; the stored refusal still belongs to this acceptance.
+        mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
+        cause = generation["refusals"][0]
+        text = f"{cause['reason']}: {cause['message']}"
+        payload = self.category("interface", format="json").json()
+        cell = payload["rows"][0]["description"]
+        self.assertEqual((cell["kind"], cell["label"], cell["refusal_text"]), ("apply_failed", "apply failed", text))
+        self.assertEqual(payload["rows"][0]["state"], "apply_failed")
+        pending = self.category("interface", state="pending", format="json").json()
+        self.assertEqual(pending["counts"]["pending"], 1)
+        self.assertEqual(len(pending["rows"]), 1)
+        self.assertEqual(self.preview().json()["changes"][0]["refusal_text"], text)
+        api = self.rest_client()
+        detail = api.get(reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", args=(row.pk,)))
+        self.assertEqual(detail.json()["state"], "apply_failed")
+        listing = api.get(
+            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list"), {"status": "apply_failed"}
+        )
+        self.assertEqual([item["id"] for item in listing.json()["results"]], [row.pk])
+        badge = self.client.get(iface.get_absolute_url()).content.decode()
+        self.assertIn(">apply failed<", badge)
+        self.assertNotIn(">in sync<", badge)
+
+    def test_in_sync_rows_render_no_refusal_or_error_text(self):
+        from datetime import timedelta
+
+        from ._outbox_case import content_update
+
+        iface, row, generation = self.interface_execution(matching=True)
+        cause = generation["refusals"][0]
+        with without_commit_drain():
+            content_update(row, status="accepted", accepted_at=self.stamp + timedelta(seconds=1))
+        row.refresh_from_db()
+        self.assertTrue(row.last_apply_error["refusals"])
+        cell = self.category("interface", format="json").json()["rows"][0]["description"]
+        self.assertEqual(cell["kind"], "in_sync")
+        self.assertEqual((cell["refusal"], cell["refusal_text"], cell["error"]), (None, "", None))
+        for response in (self.client.get(iface.get_absolute_url()), self.client.get(row.get_absolute_url())):
+            with self.subTest(url=response.request["PATH_INFO"]):
+                self.assertNotContains(response, cause["message"])
+        self.assertNotContains(self.category("interfaces"), cause["message"])
+
+    def test_interface_state_detail_shows_refusal_text_once(self):
+        iface, row, generation = self.interface_execution()
+        cause = generation["refusals"][0]
+        page = self.client.get(row.get_absolute_url()).content.decode()
+        self.assertEqual(page.count(cause["message"]), 1)
+
+    def test_invalid_evidence_badge_does_not_repeat_its_evidence_text(self):
+        from ._outbox_case import mirror_update
+
+        iface, row, generation = self.interface_execution()
+        mirror_update(row, last_apply_error={"refusals": [{"message": "placeholder-forged-secret-canary"}]})
+        payload = self.category("interface", format="json").json()
+        cell = payload["rows"][0]["description"]
+        self.assertEqual(
+            (cell["kind"], cell["label"], cell["refusal_text"]),
+            ("apply_failed", "apply failed", "invalid refusal evidence"),
+        )
+        for url in (reverse("plugins:netbox_nso_plugin:nsointerfacestate_list"), row.get_absolute_url()):
+            with self.subTest(url=url):
+                page = self.client.get(url).content.decode()
+                self.assertEqual(page.count("invalid refusal evidence"), 1)
+                self.assertNotIn("placeholder-forged-secret-canary", page)
+
     def test_matching_interface_value_preserves_restored_ordinary_failure(self):
         iface, row, generation = self.interface_execution(
             matching=True, prior_status="apply_failed", disposition="not_applied"
@@ -916,7 +990,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
             owner = next(row for row in self.owners[1:] if row.pk == peer["pk"])
             prior = self.prior[(owner._meta.label_lower, owner.pk)]
             self.assertEqual(peer["status"], prior[0])
-            self.assertEqual(peer["error"], prior[2])
+            self.assertEqual(peer["error"], None if peer["state"] == "in_sync" else prior[2])
             self.assertIsNone(peer["refusal"])
 
     def test_new_acceptance_replaces_correlated_interface_refusal(self):
@@ -1085,3 +1159,22 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertIn("unapplied", projection["summary"])
         self.assertIsNone(projection["refusal"])
         self.assertNotIn("nothing committed", projection["summary"])
+
+
+class TestRefusalCauseFormatting(SimpleTestCase):
+    def test_distinct_causes_are_separated_visibly(self):
+        import json
+        from pathlib import Path
+
+        from netbox_nso_plugin import refusal_protocol
+        from netbox_nso_plugin.refusal_display import format_causes
+
+        base = json.loads((Path(__file__).parent / "fixtures/refusal_settlement.json").read_text(encoding="utf-8"))[
+            "bgp"
+        ]["refusal"]
+        causes = []
+        for message_id in ("write-site-conflict", "parent-absent"):
+            entry = refusal_protocol.MESSAGES[message_id]
+            causes.append({**base, "message_id": message_id, "reason": entry.reason, "message": entry.text})
+        phrases = sorted(f"{cause['reason']}: {cause['message']}" for cause in causes)
+        self.assertEqual(format_causes(causes), " | ".join(phrases))

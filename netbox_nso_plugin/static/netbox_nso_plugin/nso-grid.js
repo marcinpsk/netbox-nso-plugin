@@ -78,8 +78,8 @@
 
   function appendEvidence(parent, data) {
     [
-      [data.refusal_text || data.error, "text-danger ms-1"],
-      [data.advisory, "text-warning ms-1"],
+      [data.refusal_text || data.error, "d-block text-wrap text-break text-danger"],
+      [data.advisory, "d-block text-wrap text-break text-warning"],
     ].forEach(function (item) {
       if (!item[0]) return;
       var node = document.createElement("small");

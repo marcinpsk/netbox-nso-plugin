@@ -92,3 +92,11 @@ it('does not call an empty refused preview nothing pending', async () => {
   expect(body.textContent).toContain('inexpressible-on-ned');
   expect(body.textContent).not.toContain('Nothing pending.');
 });
+
+it('wraps a long unbroken refusal token inside the preview table', async () => {
+  const text = 'inexpressible-on-ned: ' + 'x'.repeat(200);
+  const body = await open({ total: 1, diff_available: true, device_diff: {},
+    routing_changes: [{ category: 'BGP', item: 'example', scope: 'bgp', staged_days: null, refusal_text: text }] });
+  const notice = [...body.querySelectorAll('td p')].find(node => node.textContent === text);
+  expect(notice.classList.contains('text-break')).toBe(true);
+});

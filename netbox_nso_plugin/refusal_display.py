@@ -27,8 +27,8 @@ def catalog_causes(causes):
 
 
 def format_causes(causes):
-    """Return one catalog phrase per distinct reason and message."""
-    return " ".join(sorted({f"{cause['reason']}: {cause['message']}" for cause in catalog_causes(causes)}))
+    """Return one catalog phrase per distinct reason and message, separated visibly."""
+    return " | ".join(sorted({f"{cause['reason']}: {cause['message']}" for cause in catalog_causes(causes)}))
 
 
 def safe_projection(causes):
@@ -225,6 +225,9 @@ def row_projection(row, interface=None):
     else:
         projection["error_value"] = projection["error"] if projection["error"] is not None else error
     kind, label, owned = _row_classification(row, projection, interface)
+    if kind == "in_sync":
+        # A row shown in sync carries no failure text from an earlier acceptance.
+        projection.update(refusal=None, refusal_text="", error=None)
     pending = kind in PENDING_STATES
     projection.update(
         state=kind,
@@ -257,15 +260,16 @@ def _row_classification(row, projected, interface):
 
     owned = row.status in OWNED_STATES
     if projected["refusal"] is not None and not projected["refusal"]["valid"]:
-        return "apply_failed", INVALID, owned
+        return "apply_failed", "apply failed", owned
     if projected["execution_disposition"] == "refused":
         return "apply_failed", "apply failed", owned
     if projected["advisory"] == UNAVAILABLE:
         return "unavailable", "previous " + _stored_state(row.status, owned)[1], owned
     if interface is None and hasattr(row, "attribute"):
         interface = getattr(row, "interface", None)
+    # A failure recorded for this acceptance, refusal or ordinary error, outranks value equality.
     retained_failure = row.status == "apply_failed" and (
-        projected["execution_disposition"] == "not_applied" or (projected["error"] and projected["refusal"] is None)
+        projected["execution_disposition"] == "not_applied" or bool(projected["error"])
     )
     if (
         interface is not None

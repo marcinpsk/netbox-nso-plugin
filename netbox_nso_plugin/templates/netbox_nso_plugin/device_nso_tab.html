@@ -1048,7 +1048,7 @@
       return [[d.refusal_text || d.error, 'text-danger'], [d.advisory, 'text-warning']].map(function (item) {
         if (!item[0]) return '';
         var notice = document.createElement('p');
-        notice.className = item[1];
+        notice.className = item[1] + ' text-break';
         notice.textContent = item[0];
         return notice.outerHTML;
       }).join('');
