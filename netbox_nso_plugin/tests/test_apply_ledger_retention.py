@@ -271,6 +271,34 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertFalse(NSOApplyAttempt.objects.exists())
         self.assertEqual(len(self.adapter.store.feed_requests), 2)
 
+    def test_certificate_check_reads_every_listed_generation_in_one_query(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.apply_retention import _historical_certificate_required, _remote_generations
+
+        attempt, execution = self.history()
+        for seq in range(1, 6):
+            self.adapter.store.add_generation(
+                1767,
+                generation_id=100 + seq,
+                seq=seq,
+                status="settled",
+                job_id=None,
+                mode="detach",
+                settlement_cohort=None,
+                digest="a" * 64,
+                stream_revisions={"bgp": 7},
+                source_push_seq={"bgp": 41},
+            )
+        remote = _remote_generations(self.management.pk)
+        self.management.refresh_from_db()
+        with CaptureQueriesContext(connection) as unlisted:
+            self.assertFalse(_historical_certificate_required(attempt, self.management, remote))
+        self.assertEqual(len(unlisted), 2)
+        NSOApplyExecution.objects.filter(pk=execution.pk).update(generation_id=103)
+        self.assertTrue(_historical_certificate_required(attempt, self.management, remote))
+
     def test_unconsumed_malformed_and_cursor_gap_history_stays(self):
         for change in (
             {"consumption_state": "unconsumed"},

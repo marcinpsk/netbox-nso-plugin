@@ -150,9 +150,10 @@ def _historical_certificate_required(attempt, management, remote):
 
     if attempt.executions.exclude(store_incarnation=remote.store_incarnation).exists():
         return True
-    return any(
-        generation_certificates(management, remote.store_incarnation, generation).filter(attempt=attempt).exists()
-        for generation in remote.generations
+    return (
+        generation_certificates(management, remote.store_incarnation, *remote.generations)
+        .filter(attempt=attempt)
+        .exists()
     )
 
 

@@ -952,9 +952,11 @@ def _retained_carrier_matches(management, incarnation, generation, execution):
     return bool(retained) and all(immutable_execution_projection(row) == projection for row in retained)
 
 
-def generation_certificates(management, incarnation, generation):
-    """Keep all consumed carriers that recovery can request for a listed generation."""
-    return _consumed_executions(management, incarnation).filter(generation_id=generation["generation_id"])
+def generation_certificates(management, incarnation, *generations):
+    """Keep all consumed carriers that recovery can request for the listed generations."""
+    return _consumed_executions(management, incarnation).filter(
+        generation_id__in=[generation["generation_id"] for generation in generations]
+    )
 
 
 def _cursor_epoch_executions(management, incarnation):
