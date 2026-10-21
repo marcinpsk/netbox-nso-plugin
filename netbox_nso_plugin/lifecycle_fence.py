@@ -545,14 +545,15 @@ def publish_observation(footprint, family, identity):
     if identity["payload_revision"] is None:
         return
 
+    # Resolve under the lock again: the read body can create sibling owners.
+    pks_by_label = {}
     for ref in owner_rows(footprint):
         spec = OVERLAYS.get(ref.model_label)
-        if ref.pk is None or spec is None or family not in spec.read_families:
-            continue
-        row = spec.model.objects.filter(pk=ref.pk).first()
-        if row is None:
-            continue
-        fence = fence_for(row)
-        if fence.observation_watermark.get(family) == identity:
-            continue
-        advance_fence(row, observation_watermark={**fence.observation_watermark, family: identity})
+        if ref.pk is not None and spec is not None and family in spec.read_families:
+            pks_by_label.setdefault(ref.model_label, set()).add(ref.pk)
+    for label, pks in sorted(pks_by_label.items()):
+        for row in OVERLAYS[label].model.objects.filter(pk__in=pks).order_by("pk"):
+            fence = fence_for(row)
+            if fence.observation_watermark.get(family) == identity:
+                continue
+            advance_fence(row, observation_watermark={**fence.observation_watermark, family: identity})

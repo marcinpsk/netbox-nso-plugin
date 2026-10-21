@@ -86,6 +86,34 @@ class TestOwnerLifecycleFence(LifecycleFenceHelpers, _CascadeFlushMixin, IntentP
             counts.append(sum(f'FROM "{owners[0]._meta.db_table}"' in query["sql"] for query in queries))
         self.assertEqual(counts, [1, 1])
 
+    def test_publish_observation_loads_each_overlay_model_once_for_any_owner_count(self):
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.intent_state import MutationFootprint, mirror_transaction
+        from netbox_nso_plugin.lifecycle_fence import fence_for, publish_observation
+
+        from ._outbox_case import own_vlan
+
+        owners = []
+        counts = []
+        for size in (1, 4):
+            while len(owners) < size:
+                owners.append(own_vlan(self.management, 100 + len(owners), f"publish-{len(owners)}"))
+            identity = {
+                "incarnation": "placeholder-store",
+                "source_epoch": 1,
+                "payload_revision": size,
+                "digest": "a" * 64,
+            }
+            footprint = MutationFootprint.for_keys(((self.device.pk, "vlan"),))
+            with without_commit_drain(), mirror_transaction(footprint):
+                with CaptureQueriesContext(connection) as queries:
+                    publish_observation(footprint, "vlan", identity)
+                watermarks = [fence_for(row).observation_watermark.get("vlan") for row in owners]
+            self.assertEqual(watermarks, [identity] * size)
+            counts.append(sum(f'FROM "{owners[0]._meta.db_table}"' in query["sql"] for query in queries))
+        self.assertEqual(counts, [2, 2])
+
     def test_peer_scalar_successor_does_not_repend_router_and_sibling(self):
         parent, (first, second) = self.bgp_owners()
         attempt = parent.apply_attempt_id
