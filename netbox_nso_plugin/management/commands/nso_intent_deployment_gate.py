@@ -511,10 +511,13 @@ class Command(BaseCommand):
 
 def router_inventory(management):
     """Return router identity and full scope membership without ownership inference."""
-    from netbox_nso_plugin.bgp_router_content import qualified_router, router_content
+    from netbox_nso_plugin.bgp_router_content import BGPIntentError, qualified_router, router_content
     from netbox_nso_plugin.models import NSOBGPRouterState
 
-    return [
-        {"id": row.pk, "content": router_content(qualified_router(row))}
-        for row in NSOBGPRouterState.objects.filter(management=management).order_by("pk")
-    ]
+    inventory = []
+    for row in NSOBGPRouterState.objects.filter(management=management).order_by("pk"):
+        try:
+            inventory.append({"id": row.pk, "content": router_content(qualified_router(row))})
+        except BGPIntentError as exc:
+            inventory.append({"id": row.pk, "error": exc.public_message})
+    return inventory

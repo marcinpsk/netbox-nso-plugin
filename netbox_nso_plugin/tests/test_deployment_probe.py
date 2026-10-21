@@ -443,6 +443,25 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertIsNotNone(self.owners[0].accepted_at)
         self.assertTrue(deployment.is_quiesced())
 
+    def test_router_inventory_reports_an_unqualified_overlay_per_row(self):
+        from netbox_nso_plugin.models import NSOBGPRouterState
+
+        self._prepare_bgp_observation_capture()
+        self._serve_bgp_observation()
+        self.unown_router()
+        unlinked = NSOBGPRouterState.objects.create(management=self.management, asn_str="65010", status="imported")
+        deployment.quiesce(paired_activation=True)
+        result = json.loads(self.command(accept_routers=[self.owners[0].pk], device_id=self.device.pk))
+        self.owners[0].refresh_from_db()
+        self.assertEqual(self.owners[0].status, "accepted")
+        by_id = {entry["id"]: entry for entry in result}
+        self.assertIn("scopes", by_id[self.owners[0].pk]["content"])
+        self.assertEqual(
+            by_id[unlinked.pk],
+            {"id": unlinked.pk, "error": "Import and accept a linked BGP router before sending BGP intent."},
+        )
+        self.assertTrue(deployment.is_quiesced())
+
     def test_quiesced_router_preparation_emits_no_apply_and_keeps_gate_closed(self):
         self._prepare_bgp_observation_capture()
         deployment.quiesce(paired_activation=True)
