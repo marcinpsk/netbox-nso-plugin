@@ -587,6 +587,15 @@ class TestJobBoundaryValidation(unittest.TestCase):
 
         self._refuses(self._session(content=b""), lambda: get_job(7))
 
+    def test_a_count_map_without_structured_evidence_is_refused(self):
+        """Every adapter producer of a count map also emits the structured evidence fields."""
+        from netbox_nso_plugin.adapter_client import get_job, list_jobs
+
+        counts = {"vlan_count_by_outcome": {"in_sync": 1, "apply_failed": 0, "not_applied": 0, "unavailable": 0}}
+        job = {**_JOB_OUT, "result": counts}
+        self._refuses(self._session(job), lambda: get_job(7))
+        self._refuses(self._session([job]), lambda: list_jobs(10))
+
     def test_list_jobs_refuses_a_listing_that_is_not_a_list_of_jobs(self):
         from netbox_nso_plugin.adapter_client import list_jobs
 
