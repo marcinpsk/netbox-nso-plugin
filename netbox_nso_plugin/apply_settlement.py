@@ -926,7 +926,7 @@ def _drop_earlier_epoch_history(bound, management, incarnation):
 
 def _historical_certificate(management, incarnation, generation_id, carrier_id):
     candidates = list(
-        _consumed_executions(management, incarnation).filter(
+        _cursor_epoch_executions(management, incarnation).filter(
             generation_id=generation_id,
             carrier_job_id=carrier_id,
         )[:2]
