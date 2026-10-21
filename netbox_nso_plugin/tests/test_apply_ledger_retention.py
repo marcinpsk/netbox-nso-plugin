@@ -204,6 +204,18 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.prune(execute=True)
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=old.pk).exists())
 
+    def test_quiesced_gate_reports_a_command_error_and_deletes_nothing(self):
+        from django.core.management.base import CommandError
+
+        from netbox_nso_plugin import deployment
+
+        attempt, _execution = self.history()
+        deployment.quiesce()
+        self.addCleanup(deployment.resume)
+        with self.assertRaisesRegex(CommandError, "Apply ledger retention"):
+            self.prune(execute=True)
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
     def test_prune_dry_run_deletes_nothing(self):
         attempt, _execution = self.history()
         self.prune()

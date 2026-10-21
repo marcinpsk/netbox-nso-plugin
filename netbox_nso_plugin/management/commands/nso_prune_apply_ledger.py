@@ -5,6 +5,7 @@
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin.apply_retention import DEFAULT_BATCH_SIZE, prune_apply_ledger
+from netbox_nso_plugin.deployment import DeploymentQuiesced
 
 
 class Command(BaseCommand):
@@ -20,7 +21,7 @@ class Command(BaseCommand):
             result = prune_apply_ledger(
                 execute=options["execute"], batch_size=options["batch_size"], cursor=options["after"]
             )
-        except ValueError as exc:
+        except (ValueError, DeploymentQuiesced) as exc:
             raise CommandError(str(exc)) from exc
         self.stdout.write(
             f"examined={result.examined} eligible={result.eligible} deleted={result.deleted} "
