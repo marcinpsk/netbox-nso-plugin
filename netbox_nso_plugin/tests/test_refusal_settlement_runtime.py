@@ -748,6 +748,57 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 self.prior[(row._meta.label_lower, row.pk)],
             )
 
+    def test_consumed_generation_behind_the_cursor_survives_a_source_epoch_change(self):
+        self._assert_consumed_history_survives_a_source_epoch_change(head=False)
+
+    def test_consumed_head_generation_survives_a_source_epoch_change(self):
+        self._assert_consumed_history_survives_a_source_epoch_change(head=True)
+
+    def test_changed_head_history_after_a_source_epoch_change_is_refused(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal(), head=True)
+        settle_device_apply_attempts(self.management)
+        consumed = NSOApplyExecution.objects.get()
+        NSOApplyExecution.objects.filter(pk=consumed.pk).update(
+            terminal_projection={**consumed.terminal_projection, "seq": 5}, generation_seq=5
+        )
+        mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
+        self.management.refresh_from_db()
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "consumed_execution_changed"):
+            settle_device_apply_attempts(self.management)
+
+    def _assert_consumed_history_survives_a_source_epoch_change(self, *, head):
+        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        self.serve_terminal_evidence(self.terminal(), head=head)
+        settle_device_apply_attempts(self.management)
+        consumed = NSOApplyExecution.objects.get()
+        self.assertEqual(consumed.consumption_state, "consumed")
+        self.owners[1].refresh_from_db()
+        settled = (self.owners[1].status, self.owners[1].last_apply_error)
+        mirror_update(
+            self.management,
+            settle_cursor_seq=1,
+            settle_cursor_incarnation="placeholder-store",
+            settle_cursor_device_id=self.management.adapter_device_id,
+            adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1,
+        )
+        self.management.refresh_from_db()
+
+        settle_device_apply_attempts(self.management)
+
+        self.assertEqual(list(NSOApplyExecution.objects.values_list("pk", flat=True)), [consumed.pk])
+        self.owners[1].refresh_from_db()
+        self.assertEqual((self.owners[1].status, self.owners[1].last_apply_error), settled)
+
     def _carrierless_generation(self, status):
         return {
             "generation_id": 80,

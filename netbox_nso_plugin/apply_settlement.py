@@ -772,6 +772,7 @@ def _bound_evidence(evidence, jobs, generations, incarnation, *, management):
                 )
             )
     _require_terminal_metadata(bound, generations, management, incarnation)
+    _drop_earlier_epoch_history(bound, management, incarnation)
     return bound
 
 
@@ -833,6 +834,33 @@ def _authoritative_carrier_generation(generation, generation_id, carrier, manage
     raise EvidenceInvariantError("missing_generation_evidence")
 
 
+def _drop_earlier_epoch_history(bound, management, incarnation):
+    """Drop generations consumed only under an earlier mapping epoch: the cursor already passed them."""
+    from .durable_capture import mapping_epoch
+    from .outcome_settlement import immutable_execution_projection
+
+    carrier_ids = {generation["carrier_job_id"] for generation in bound.automatic_generations}
+    epoch = mapping_epoch(management)
+    current, earlier = set(), {}
+    for execution in _cursor_epoch_executions(management, incarnation).filter(carrier_job_id__in=carrier_ids):
+        identity = execution.generation_id, execution.carrier_job_id
+        if execution.mapping_epoch == epoch:
+            current.add(identity)
+        else:
+            earlier[identity] = execution
+    kept = []
+    for generation in bound.automatic_generations:
+        identity = generation["generation_id"], generation["carrier_job_id"]
+        execution = earlier.get(identity)
+        if execution is None or identity in current:
+            kept.append(generation)
+        elif immutable_execution_projection(_validate_generation(generation)) != immutable_execution_projection(
+            _execution_projection(execution)
+        ):
+            raise EvidenceInvariantError("consumed_execution_changed")
+    bound.automatic_generations = kept
+
+
 def _require_terminal_metadata(bound, generations, management, incarnation):
     """Block historical carrier gaps before a later execution can consume its cursor."""
     from .outcome_settlement import _record_invariant
@@ -854,7 +882,7 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         if generation["status"] == "abandoned" and generation["job_id"] is None:
             continue
         cached = (
-            _consumed_executions(management, incarnation)
+            _cursor_epoch_executions(management, incarnation)
             .filter(
                 generation_id=generation["generation_id"],
                 carrier_job_id=generation["job_id"],
@@ -876,17 +904,22 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         raise EvidenceInvariantError("missing_generation_evidence")
 
 
-def _consumed_executions(management, incarnation):
-    from .durable_capture import mapping_epoch
+def _cursor_epoch_executions(management, incarnation):
+    """Return consumed certificates under the settlement cursor's epoch: store incarnation and adapter device."""
     from .models import NSOApplyExecution
 
     return NSOApplyExecution.objects.filter(
         management=management,
-        mapping_epoch=mapping_epoch(management),
         adapter_device_id=management.adapter_device_id,
         store_incarnation=incarnation,
         consumption_state__in=("consumed", "superseded"),
     )
+
+
+def _consumed_executions(management, incarnation):
+    from .durable_capture import mapping_epoch
+
+    return _cursor_epoch_executions(management, incarnation).filter(mapping_epoch=mapping_epoch(management))
 
 
 def _execution_projection(execution):
