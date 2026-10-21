@@ -317,7 +317,7 @@ def settle_apply_attempts(
     for attempt_id, evidence in validated.items():
         local = local_attempts[attempt_id]
         keep = _admission_keep_streams(local, evidence["response"], rejected=evidence["admission_state"] == "rejected")
-        for link in evidence["response"].get("generations", []):
+        for link in evidence["response"].get("generations") or ():
             generation_modes[link["generation_id"]] = link["mode"]
         if keep is not None:
             restorations.append((attempt_id, keep))

@@ -867,6 +867,36 @@ class TestAttemptSettlement(TestCase):
                 row.refresh_from_db()
                 self.assertEqual(row.status, "deploying")
 
+    def test_a_rejected_admission_with_null_generations_settles_as_empty(self):
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt_id = uuid4()
+        row = self._vlan_row(1637, attempt_id)
+        rejection = {"error": {"code": "apply_unexecutable", "message": "Rejected.", "detail": {}}, "generations": None}
+        NSOApplyAttempt.objects.create(
+            id=attempt_id,
+            adapter_apply_attempt_id=attempt_id,
+            management=self.management,
+            adapter_device_id=self.adapter_device_id,
+            selected={"vlan": 303},
+            scope_revisions={"vlan": 1},
+            http_status=409,
+            response=rejection,
+        )
+        evidence = {
+            "apply_attempt_id": str(attempt_id),
+            "admission_state": "rejected",
+            "http_status": 409,
+            "response": rejection,
+            "generations": [],
+        }
+
+        settle_apply_attempts(self.management, _payload(self.adapter_device_id, [evidence]))
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, "deploying")
+
     def test_settled_generation_rejects_a_failed_carrier_snapshot(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_apply_attempts
 
