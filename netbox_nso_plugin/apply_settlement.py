@@ -953,8 +953,8 @@ def _retained_carrier_matches(management, incarnation, generation, execution):
 
 
 def generation_certificates(management, incarnation, *generations):
-    """Keep all consumed carriers that recovery can request for the listed generations."""
-    return _consumed_executions(management, incarnation).filter(
+    """Keep all consumed carriers that recovery can request for the listed generations, in any mapping epoch."""
+    return _cursor_epoch_executions(management, incarnation).filter(
         generation_id__in=[generation["generation_id"] for generation in generations]
     )
 
