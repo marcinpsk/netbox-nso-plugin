@@ -259,8 +259,7 @@ def static_route_success_proven(snapshot, generation) -> bool:
 
 def _settle_job(row, job, incarnation) -> bool:
     """Advance only after the exact remote execution has a durable local disposition."""
-    from .durable_capture import mapping_epoch
-    from .models import NSOApplyExecution
+    from .apply_settlement import _cursor_epoch_executions
     from .outcome_settlement import _bind_consumed_sequences
 
     if job.get("type") not in {"apply", "removal"}:
@@ -268,13 +267,8 @@ def _settle_job(row, job, incarnation) -> bool:
     result = job.get("result")
     if not isinstance(result, dict) or "row_outcomes" not in result:
         return False
-    executions = NSOApplyExecution.objects.filter(
-        management=row,
-        mapping_epoch=mapping_epoch(row),
-        store_incarnation=incarnation,
-        carrier_job_id=job["id"],
-        consumption_state__in=("consumed", "superseded"),
-    )
+    # A certificate from an earlier mapping epoch is still this cursor's history.
+    executions = _cursor_epoch_executions(row, incarnation).filter(carrier_job_id=job["id"])
     matching = [
         execution
         for execution in executions

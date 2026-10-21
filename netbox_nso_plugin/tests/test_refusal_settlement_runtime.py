@@ -774,6 +774,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
 
     def _assert_consumed_history_survives_a_source_epoch_change(self, *, head):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+        from netbox_nso_plugin.settlement import settle_static_routes
 
         from ._outbox_case import mirror_update
 
@@ -784,17 +785,12 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.assertEqual(consumed.consumption_state, "consumed")
         self.owners[1].refresh_from_db()
         settled = (self.owners[1].status, self.owners[1].last_apply_error)
-        mirror_update(
-            self.management,
-            settle_cursor_seq=1,
-            settle_cursor_incarnation="placeholder-store",
-            settle_cursor_device_id=self.management.adapter_device_id,
-            adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1,
-        )
-        self.management.refresh_from_db()
+        mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
 
-        settle_device_apply_attempts(self.management)
+        ahead = settle_static_routes(self.management.pk)
+        behind = settle_static_routes(self.management.pk)
 
+        self.assertEqual((ahead.stalled, ahead.cursor, behind.stalled, behind.cursor), (False, 1, False, 1))
         self.assertEqual(list(NSOApplyExecution.objects.values_list("pk", flat=True)), [consumed.pk])
         self.owners[1].refresh_from_db()
         self.assertEqual((self.owners[1].status, self.owners[1].last_apply_error), settled)
