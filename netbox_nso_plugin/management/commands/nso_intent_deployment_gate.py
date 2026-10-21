@@ -366,9 +366,12 @@ class Command(BaseCommand):
                 raise CommandError("Direct store preparation was not acknowledged")
             return {"selection_revision": answer["selection_revision"]}
         claim = drain.claim(management.device_id, scope, mode=delivery.MODE_STORE_ONLY, force=True)
-        if claim is None or claim.mode != delivery.MODE_STORE_ONLY or claim.deletions:
+        if claim is None:
             raise CommandError("Could not form an exact store-only preparation")
         try:
+            # Only a takeover replay differs; it may be sent already, so release it and never abandon it.
+            if claim.mode != delivery.MODE_STORE_ONLY or claim.deletions:
+                raise CommandError("Could not form an exact store-only preparation")
             answer = drain.send_claim(claim)
             acknowledgement = drain.acknowledgement(claim, answer)
             if not acknowledgement.exact:

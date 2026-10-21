@@ -747,6 +747,30 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         finally:
             resume()
 
+    def test_store_preparation_releases_a_rejected_replay_and_keeps_its_authority(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import Command
+
+        route = own_route(self.mgmt, "198.18.46.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+        with without_commit_drain():
+            _unassign_and_retire(route, self.device)
+        claim = drain.claim(self.device.pk, "static_route")
+        assert claim is not None and [record["route_id"] for record in claim.deletions] == [route.pk]
+        state = state_of(self.device, "static_route")
+        state.claimed_at = None
+        state.save(update_fields=["claimed_at"])
+
+        with self.assertRaisesRegex(CommandError, "exact store-only preparation"):
+            Command._store_preparation(self.mgmt, "static_route")
+
+        state = state_of(self.device, "static_route")
+        assert state.claimed_at is None, "the rejected replay kept its lease"
+        assert state.push_seq == claim.push_seq, "a possibly sent replay was abandoned"
+        assert [record["route_id"] for record in state.claim_deletions] == [route.pk]
+
     def test_completed_verification_reports_resume_failure_and_keeps_the_gate(self):
         from netbox_nso_plugin import deployment, drain
         from netbox_nso_plugin.deployment import is_quiesced
