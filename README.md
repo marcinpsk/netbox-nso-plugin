@@ -149,7 +149,8 @@ with the complete router and two-peer membership. Runtime verification checks th
 installed migration leaf, pending migrations, preview shape, settlement evidence,
 held work, and retained selection and execution provenance before resuming the plugin.
 CI proves shared fixture byte equality and codec/corpus equality with the package
-generator at pinned refs. Record those results and exact deploy refs in the step E hand-off.
+generator at pinned refs. Record those results and the exact deploy refs in the cutover
+hand-off record.
 On a paired-activation gate, `--resume` and `--abort` use the same checks. Neither bypasses
 failed verification.
 A gate prepared without `--paired-activation`, or created by `nso_intent_restore` or
