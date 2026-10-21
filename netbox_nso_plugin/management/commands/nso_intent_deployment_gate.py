@@ -200,14 +200,14 @@ class Command(BaseCommand):
                     self.stdout.write(self.style.SUCCESS("Deployment gate aborted; normal intent operation resumed"))
             elif options["verify"] and not is_paired_activation():
                 self._verify_static(options["device_id"])
-            elif options["start_probe"]:
+            elif options["start_probe"] is not None:
                 if options["device_id"] is None:
                     raise CommandError("--start-probe requires --device ID")
                 attempt_id = start_probe(options["start_probe"], options["device_id"])
                 self.stdout.write(
                     f"Probe {attempt_id} registered before admission; bind it with --register-probe when terminal"
                 )
-            elif options["register_probe"]:
+            elif options["register_probe"] is not None:
                 register_probe(options["register_probe"])
                 self.stdout.write("Verification probe authority registered; normal work stays quiesced")
             elif options["revoke_probe"]:
@@ -217,8 +217,10 @@ class Command(BaseCommand):
                 self.stdout.write("Verification probe authority revoked; normal work stays quiesced")
             elif options["import_routers"] or options["accept_routers"] or options["prepare_store"]:
                 self._maintenance(options)
-            else:
+            elif options["verify"] or options["resume"]:
                 self._verify_paired(options)
+            else:
+                raise CommandError("Unsupported deployment gate action")
         except (
             DeploymentQuiesced,
             DeploymentTransitionTimeout,

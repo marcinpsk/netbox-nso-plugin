@@ -669,6 +669,13 @@ class TestDeploymentProbe(DeploymentCase):
             NSOApplyExecution.objects.filter(attempt_id__in=attempts, consumption_state="consumed").count(), 3
         )
 
+    def test_an_empty_probe_value_never_runs_paired_verification(self):
+        settled = [str(pk) for pk in self.paired_probes()]
+        for action in ("start_probe", "register_probe"):
+            with self.subTest(action=action), self.assertRaisesRegex(CommandError, "UUID"):
+                self.command(**{action: ""}, device_id=self.device.pk, settled_probe=settled)
+            self.assertTrue(deployment.is_quiesced())
+
     def test_verify_rejects_terminal_remote_generation_without_consumed_execution(self):
         from ._adapter_http import make_response
 
