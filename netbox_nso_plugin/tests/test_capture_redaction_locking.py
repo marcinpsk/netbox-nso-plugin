@@ -10,15 +10,12 @@ from unittest.mock import patch
 from django.db import close_old_connections, connection, transaction
 from django.test import TransactionTestCase
 
-from . import test_lifecycle_fence as lifecycle_cases
+from ._lifecycle_fence import LifecycleFenceHelpers
 from ._outbox_case import content_update, make_managed, mirror_update, without_commit_drain
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
-class TestCaptureRedactionLocking(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
-    bgp_owners = lifecycle_cases.TestOwnerLifecycleFence.bgp_owners
-    _wait_for_blocking = lifecycle_cases.TestOwnerLifecycleFence._wait_for_blocking
-
+class TestCaptureRedactionLocking(LifecycleFenceHelpers, _CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
         self.device, self.management = make_managed("capture-redaction", 1768)

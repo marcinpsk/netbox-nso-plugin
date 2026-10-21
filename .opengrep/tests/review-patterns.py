@@ -2995,6 +2995,27 @@ class BorrowedSettlementHelperCase(BGPSettlementHelpers, BGPCaptureCase):
         _AdapterWireSession.reset(self.environment.adapter_port)
 
 
+class AssignedSettlementHelperCase(BGPSettlementHelpers, BGPCaptureCase):
+    # ruleid: nso-test-borrows-another-class-method
+    prepare = TestRefusalSettlementRuntime.prepare
+    # ruleid: nso-test-borrows-another-class-method
+    terminal = runtime_case.TestRefusalSettlementRuntime.terminal
+    # ok: nso-test-borrows-another-class-method
+    helper = BGPSettlementHelpers.prepare
+    # ok: nso-test-borrows-another-class-method
+    setup = TestCase.setUp
+
+    def local_reference(self):
+        # ok: nso-test-borrows-another-class-method
+        helper = runtime_case.TestRefusalSettlementRuntime.terminal
+        # ok: nso-test-borrows-another-class-method
+        return super().terminal()
+
+
+# ok: nso-test-borrows-another-class-method
+terminal_reference = runtime_case.TestRefusalSettlementRuntime.terminal
+
+
 def per_row_mirror_refresh(rows, footprint):
     for row in rows:
         # ruleid: nso-per-row-mirror-refresh-loop

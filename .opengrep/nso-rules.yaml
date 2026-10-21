@@ -748,11 +748,20 @@ rules:
     languages: [python]
     severity: ERROR
     message: >-
-      Do not call a method of another test class with this test's self. Put the shared helper in a mixin and
-      inherit it. This checks Test*.method(self, ...) calls with or without a module prefix, not a class held in a
-      variable.
+      Put shared test helpers in a mixin and inherit it. This checks Test*.method(self, ...) calls and
+      class-body method assignments with or without a module prefix. It does not resolve class aliases or
+      computed attributes, and it excludes TestCase.
     patterns:
-      - pattern: $CLS.$METHOD(self, ...)
+      - pattern-either:
+          - pattern: $CLS.$METHOD(self, ...)
+          - patterns:
+              - pattern-inside: |
+                  class $CASE(...):
+                      ...
+              - pattern-not-inside: |
+                  def $FUNC(...):
+                      ...
+              - pattern: $NAME = $CLS.$METHOD
       - metavariable-regex:
           metavariable: $CLS
           regex: ^(?:\w+\.)*Test(?!Case$)[A-Z]\w*$

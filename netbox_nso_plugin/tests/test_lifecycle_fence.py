@@ -6,27 +6,24 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from datetime import timedelta
 from threading import Event
-from time import monotonic, sleep
-from uuid import uuid4
 
-from dcim.models import Device, Interface
+from dcim.models import Interface
 from django.apps import apps
-from django.contrib.contenttypes.models import ContentType
 from django.db import close_old_connections, connection, transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
-from ipam.models import ASN, RIR, IPAddress
-from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPRouter, BGPScope
+from netbox_routing.models import BGPAddressFamily, BGPPeer, BGPScope
 
-from netbox_nso_plugin.models import NSOBGPPeerState, NSOBGPRouterState, NSOInterfaceState
+from netbox_nso_plugin.models import NSOInterfaceState
 from netbox_nso_plugin.template_content import _upsert_interface_states
 
+from ._lifecycle_fence import LifecycleFenceHelpers
 from ._outbox_case import content_update, make_managed, mirror_update, without_commit_drain
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin, _CascadeFlushMixin
 
 
-class TestOwnerLifecycleFence(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+class TestOwnerLifecycleFence(LifecycleFenceHelpers, _CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
     def setUp(self):
         super().setUp()
         self.device, self.management = make_managed("owner-fence", 1767)
@@ -88,41 +85,6 @@ class TestOwnerLifecycleFence(_CascadeFlushMixin, IntentPushResetMixin, Transact
             self.assertEqual(set(rows), {SourceRow(row._meta.label_lower, row.pk) for row in owners})
             counts.append(sum(f'FROM "{owners[0]._meta.db_table}"' in query["sql"] for query in queries))
         self.assertEqual(counts, [1, 1])
-
-    def bgp_owners(self):
-        asn = ASN.objects.create(asn=64512, rir=RIR.objects.create(name="Private", slug="private"))
-        router = BGPRouter.objects.create(
-            assigned_object_type=ContentType.objects.get_for_model(Device),
-            assigned_object_id=self.device.pk,
-            asn=asn,
-            name="placeholder-router",
-            router_id="198.18.0.1",
-        )
-        scope = BGPScope.objects.create(router=router)
-        BGPAddressFamily.objects.create(scope=scope, address_family="ipv4-unicast")
-        parent = acquire_overlay(
-            NSOBGPRouterState, management=self.management, bgp_router=router, asn_str="64512", status="accepted"
-        )
-        peers = []
-        for address in ("198.18.0.2", "198.18.0.3"):
-            native = BGPPeer.objects.create(
-                scope=scope, peer=IPAddress.objects.create(address=address + "/32"), name=None
-            )
-            peers.append(
-                acquire_overlay(
-                    NSOBGPPeerState,
-                    management=self.management,
-                    bgp_peer=native,
-                    asn_str="64512",
-                    vrf_name="",
-                    peer_address_str=address,
-                    status="accepted",
-                )
-            )
-        attempt_id = uuid4()
-        for row in (parent, *peers):
-            mirror_update(row, status="deploying", apply_attempt_id=attempt_id)
-        return parent, peers
 
     def test_peer_scalar_successor_does_not_repend_router_and_sibling(self):
         parent, (first, second) = self.bgp_owners()
@@ -587,21 +549,6 @@ class TestOwnerLifecycleFence(_CascadeFlushMixin, IntentPushResetMixin, Transact
             a.result(timeout=60)
             b.result(timeout=60)
         self.assertEqual(len(set(backends)), 2)
-
-    def _wait_for_blocking(self, backends, pending):
-        deadline = monotonic() + 15
-        while True:
-            if pending.done():
-                pending.result()
-                self.fail("second writer completed without waiting for the first writer's PostgreSQL lock")
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT %s = ANY(pg_blocking_pids(%s))", [backends[0], backends[1]])
-                blocked = cursor.fetchone()[0]
-            if blocked:
-                return
-            if monotonic() >= deadline:
-                self.fail("second writer never waited for the first writer's PostgreSQL lock")
-            sleep(0.01)
 
     def test_certified_success_allows_drift_only_from_a_new_payload(self):
         from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
