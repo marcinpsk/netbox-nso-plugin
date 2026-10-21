@@ -738,7 +738,9 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.serve_terminal_evidence(self.terminal(), head=False, pruned=True)
         with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
             settle_device_apply_attempts(self.management)
-        self.assertEqual(NSOApplyExecution.objects.get().invariant_code, "missing_generation_evidence")
+        execution = NSOApplyExecution.objects.get()
+        self.assertEqual(execution.invariant_code, "missing_generation_evidence")
+        self.assertEqual(execution.consumption_state, "unconsumed")
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(
