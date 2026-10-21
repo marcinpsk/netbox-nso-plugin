@@ -9,9 +9,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIGEST = "f5be2d320d5d558b2d076533d37a7a5f0bf52dcffb2b8788c8eb3d54fcfe43f2"
-MODULE_DIGEST = "865a1c9d2363024922c7843af06599e322de74012248cebbfd20d9e4b9670418"
-CORPUS_DIGEST = "be5d7dd729131ce67370372687dad2ff32e82b320f9152acb843b857981c4a90"
-SOURCE_DIGEST = "996dd1e8d0bb232b735ce59b632934c145490b966d6557e173c9bd39e10d8a5d"
+MODULE_DIGEST = "df1eb78f34c7532ce326fc8f71e2175fb9edf8ace92afe6a7a1b97eb135bd08b"
+CORPUS_DIGEST = "cff8689f693b72f9ac409f9a804a634bc11ff2cf63bec7eb0539d25e821931a7"
+SOURCE_DIGEST = "d504e5caeed7e1e970a3fe66df727169bb3309d93337ec8f24f7318dcd083ed1"
 
 
 def generation():
@@ -76,6 +76,25 @@ def test_refusal_protocol_corpus_row_identities():
         path = tuple((name, tuple(keys)) for name, keys in case["natural_path"])
         assert canonical_identity(case["family"], case["subject"], path) == case["canonical"]
         assert row_ref(case["family"], case["subject"], path).key == case["key"]
+
+
+def test_refusal_protocol_corpus_messages_parse_and_validate():
+    from netbox_nso_plugin.refusal_contract import validate_refusals
+    from netbox_nso_plugin.refusal_protocol import RefusalProtocolError, claims_refusal, parse_refusals, render_refusals
+
+    corpus = json.loads((ROOT / "refusal_protocol_corpus.json").read_bytes())
+    for case in corpus["valid"]:
+        parsed = parse_refusals(case["message"])
+        assert render_refusals(parsed) == case["message"], case["name"]
+        attributed = [
+            {**record, "logical_rows": [], "provenance": "current", "sender_phase": "commit"}
+            for record in case["refusals"]
+        ]
+        assert validate_refusals(attributed) == attributed, case["name"]
+    for case in corpus["invalid"]:
+        assert claims_refusal(case["message"]) is case["claims"], case["name"]
+        with pytest.raises(RefusalProtocolError):
+            parse_refusals(case["message"])
 
 
 def test_cutover_generation_accepts_pinned_adapter_shape():

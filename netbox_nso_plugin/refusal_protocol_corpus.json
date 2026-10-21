@@ -527,6 +527,870 @@
           }
         }
       ]
+    },
+    {
+      "name": "catalog-field-no-home",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"field-no-home\",\"message\":\"This NED has no setting for this field; the intent cannot land without it.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "field-no-home",
+          "message": "This NED has no setting for this field; the intent cannot land without it.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-field-not-implemented",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"field-not-implemented\",\"message\":\"This NED can hold this field, but the service has no verified write path for it yet.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "field-not-implemented",
+          "message": "This NED can hold this field, but the service has no verified write path for it yet.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-value-no-form",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"ospf\",\"row\":{\"subject\":\"ospf\",\"key\":\"2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"value-no-form\",\"message\":\"This NED has no form for this value of the field.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "ospf",
+          "row": {
+            "subject": "ospf",
+            "key": "2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "value-no-form",
+          "message": "This NED has no form for this value of the field.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-bfd.junos-non-ae",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bfd\",\"row\":{\"subject\":\"bfd\",\"key\":\"dca668c7846a5b783d23b3c55b1da4601b94700eda6f75a9b369ddd0fcce7e64\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"bfd.junos-non-ae\",\"message\":\"Junos sets BFD on an interface only as micro-BFD on an aggregated Ethernet bundle. This interface is not a bundle, so the BFD writer has no setting for it.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bfd",
+          "row": {
+            "subject": "bfd",
+            "key": "dca668c7846a5b783d23b3c55b1da4601b94700eda6f75a9b369ddd0fcce7e64"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "bfd.junos-non-ae",
+          "message": "Junos sets BFD on an interface only as micro-BFD on an aggregated Ethernet bundle. This interface is not a bundle, so the BFD writer has no setting for it.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-bfd.micro-bfd-unsupported",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bfd\",\"row\":{\"subject\":\"bfd\",\"key\":\"dca668c7846a5b783d23b3c55b1da4601b94700eda6f75a9b369ddd0fcce7e64\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"bfd.micro-bfd-unsupported\",\"message\":\"The BFD writer for this NED has no micro-BFD setting, so it cannot run BFD on each bundle member.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bfd",
+          "row": {
+            "subject": "bfd",
+            "key": "dca668c7846a5b783d23b3c55b1da4601b94700eda6f75a9b369ddd0fcce7e64"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "bfd.micro-bfd-unsupported",
+          "message": "The BFD writer for this NED has no micro-BFD setting, so it cannot run BFD on each bundle member.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-bfd.xr-single-interval",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bfd\",\"row\":{\"subject\":\"bfd\",\"key\":\"dca668c7846a5b783d23b3c55b1da4601b94700eda6f75a9b369ddd0fcce7e64\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"bfd.xr-single-interval\",\"message\":\"IOS-XR has one BFD minimum interval for transmit and receive. State the transmit interval only and leave the receive interval unset.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bfd",
+          "row": {
+            "subject": "bfd",
+            "key": "dca668c7846a5b783d23b3c55b1da4601b94700eda6f75a9b369ddd0fcce7e64"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "bfd.xr-single-interval",
+          "message": "IOS-XR has one BFD minimum interval for transmit and receive. State the transmit interval only and leave the receive interval unset.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-bgp.peer-group-deactivated",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp\",\"key\":\"7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a\"},\"field\":null,\"reason\":\"ownership-conflict\",\"message_id\":\"bgp.peer-group-deactivated\",\"message\":\"The peer group of this peer is deactivated on the device. Enabling the peer needs the whole group activated, which changes the other peers of the group.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bgp",
+          "row": {
+            "subject": "bgp",
+            "key": "7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a"
+          },
+          "field": null,
+          "reason": "ownership-conflict",
+          "message_id": "bgp.peer-group-deactivated",
+          "message": "The peer group of this peer is deactivated on the device. Enabling the peer needs the whole group activated, which changes the other peers of the group.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-bgp.redistribution-not-implemented",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"bgp\",\"row\":{\"subject\":\"bgp\",\"key\":\"7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"bgp.redistribution-not-implemented\",\"message\":\"The BGP writer for this NED has no verified write path for this redistribution setting yet.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "bgp",
+          "row": {
+            "subject": "bgp",
+            "key": "7cb8cfd0bd1f45d057c78029fed897ab07285e3853ce9beb63f612efdf326a4a"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "bgp.redistribution-not-implemented",
+          "message": "The BGP writer for this NED has no verified write path for this redistribution setting yet.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.arcos-frr-per-interface",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.arcos-frr-per-interface\",\"message\":\"ArcOS sets IS-IS fast reroute per interface. State it on the interface rows, not on the process.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "isis.arcos-frr-per-interface",
+          "message": "ArcOS sets IS-IS fast reroute per interface. State it on the interface rows, not on the process.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.auth-incomplete",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.auth-incomplete\",\"message\":\"The intent states an IS-IS authentication type without its key. The service cannot write the authentication without the key.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "isis.auth-incomplete",
+          "message": "The intent states an IS-IS authentication type without its key. The service cannot write the authentication without the key.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.frr-protection-without-enable",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"isis.frr-protection-without-enable\",\"message\":\"The intent states a fast-reroute protection kind on an IS-IS interface that does not enable fast reroute.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "isis.frr-protection-without-enable",
+          "message": "The intent states a fast-reroute protection kind on an IS-IS interface that does not enable fast reroute.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.interface-absent",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"isis.interface-absent\",\"message\":\"The IS-IS interface does not exist on the device. The IS-IS writer cannot create the native interface.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "isis.interface-absent",
+          "message": "The IS-IS interface does not exist on the device. The IS-IS writer cannot create the native interface.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.junos-bfd-group-provided",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"ownership-conflict\",\"message_id\":\"isis.junos-bfd-group-provided\",\"message\":\"A Junos configuration group provides BFD on this IS-IS interface. Junos cannot disable group configuration on one interface, and the service does not own the group.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "ownership-conflict",
+          "message_id": "isis.junos-bfd-group-provided",
+          "message": "A Junos configuration group provides BFD on this IS-IS interface. Junos cannot disable group configuration on one interface, and the service does not own the group.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.junos-frr-needs-protection",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.junos-frr-needs-protection\",\"message\":\"Junos enables IS-IS fast reroute on an interface only with a protection kind. State the protection kind.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "isis.junos-frr-needs-protection",
+          "message": "Junos enables IS-IS fast reroute on an interface only with a protection kind. State the protection kind.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.junos-interface-level-disabled",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"ownership-conflict\",\"message_id\":\"isis.junos-interface-level-disabled\",\"message\":\"The device disables an IS-IS level on this Junos interface that the intended circuit type uses. The service does not remove that setting.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "ownership-conflict",
+          "message_id": "isis.junos-interface-level-disabled",
+          "message": "The device disables an IS-IS level on this Junos interface that the intended circuit type uses. The service does not remove that setting.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.junos-net-needs-loopback",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.junos-net-needs-loopback\",\"message\":\"Junos holds the IS-IS NET on the loopback interface. Add the loopback interface row to the IS-IS intent.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "isis.junos-net-needs-loopback",
+          "message": "Junos holds the IS-IS NET on the loopback interface. Add the loopback interface row to the IS-IS intent.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.metric-needs-circuit-type",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"isis.metric-needs-circuit-type\",\"message\":\"ArcOS sets the IS-IS interface metric per level. State the circuit type, so that the metric has a level.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "isis.metric-needs-circuit-type",
+          "message": "ArcOS sets the IS-IS interface metric per level. State the circuit type, so that the metric has a level.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.process-absent",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"isis.process-absent\",\"message\":\"The IS-IS process of this interface row does not exist on the device and is not declared in the intent.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "isis.process-absent",
+          "message": "The IS-IS process of this interface row does not exist on the device and is not declared in the intent.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.use-level-fields",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.use-level-fields\",\"message\":\"This NED sets this IS-IS process value per level. State it with the per-level fields.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "isis.use-level-fields",
+          "message": "This NED sets this IS-IS process value per level. State it with the per-level fields.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.xr-process-tag-required",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"isis.xr-process-tag-required\",\"message\":\"IOS-XR names every IS-IS process by its tag, and this row has no process tag.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "isis.xr-process-tag-required",
+          "message": "IOS-XR names every IS-IS process by its tag, and this row has no process tag.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-lag.arcos-lacp-entry-unowned",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca\"},\"field\":null,\"reason\":\"ownership-conflict\",\"message_id\":\"lag.arcos-lacp-entry-unowned\",\"message\":\"The device holds an LACP entry for this bundle that the service does not own. A static bundle cannot land while that entry exists, and the service does not remove it.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca"
+          },
+          "field": null,
+          "reason": "ownership-conflict",
+          "message_id": "lag.arcos-lacp-entry-unowned",
+          "message": "The device holds an LACP entry for this bundle that the service does not own. A static bundle cannot land while that entry exists, and the service does not remove it.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-lag.arcos-passive-lands-active",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca\"},\"field\":null,\"reason\":\"would-weaken-intent\",\"message_id\":\"lag.arcos-passive-lands-active\",\"message\":\"ArcOS has no LACP mode setting, so a passive member would run in active mode.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca"
+          },
+          "field": null,
+          "reason": "would-weaken-intent",
+          "message_id": "lag.arcos-passive-lands-active",
+          "message": "ArcOS has no LACP mode setting, so a passive member would run in active mode.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-lag.lacp-param-on-static-bundle",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"lag.lacp-param-on-static-bundle\",\"message\":\"The intent states an LACP parameter on a bundle that does not run LACP.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "lag.lacp-param-on-static-bundle",
+          "message": "The intent states an LACP parameter on a bundle that does not run LACP.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-lag.timer-needs-members",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"lag\",\"row\":{\"subject\":\"lag\",\"key\":\"414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"lag.timer-needs-members\",\"message\":\"This NED sets the LACP timer on each member port, and the bundle has no member rows to carry it.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "lag",
+          "row": {
+            "subject": "lag",
+            "key": "414529a3b0effefc0de3e4f1d692332090b014698d9997d9aa9444e9fa93b8ca"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "lag.timer-needs-members",
+          "message": "This NED sets the LACP timer on each member port, and the bundle has no member rows to carry it.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.ios-severity-conflict",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"logging.ios-severity-conflict\",\"message\":\"IOS has one global logging trap severity, and another logging row of the intent states a different severity.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "logging.ios-severity-conflict",
+          "message": "IOS has one global logging trap severity, and another logging row of the intent states a different severity.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.ios-source-dependency-missing",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"logging.ios-source-dependency-missing\",\"message\":\"This IOS logging source row depends on another source-interface row of this transaction that was not created or released. Writing it now would take over a row that still holds its name.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "logging.ios-source-dependency-missing",
+          "message": "This IOS logging source row depends on another source-interface row of this transaction that was not created or released. Writing it now would take over a row that still holds its name.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.ios-source-needs-interface",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"logging.ios-source-needs-interface\",\"message\":\"IOS sets the logging source by interface, not by address. State a source interface.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "logging.ios-source-needs-interface",
+          "message": "IOS sets the logging source by interface, not by address. State a source interface.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.ios-transport-needs-port",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"logging.ios-transport-needs-port\",\"message\":\"IOS writes the logging transport together with its port. State the port.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "logging.ios-transport-needs-port",
+          "message": "IOS writes the logging transport together with its port. State the port.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.junos-source-needs-address",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"logging.junos-source-needs-address\",\"message\":\"Junos sets the syslog source by address only. State a source address.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "logging.junos-source-needs-address",
+          "message": "Junos sets the syslog source by address only. State a source address.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.timos-target-tls",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"ownership-conflict\",\"message_id\":\"logging.timos-target-tls\",\"message\":\"The device holds this SR OS logging target with a TLS profile. A plain target at this address would change a target that the service does not own.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "ownership-conflict",
+          "message_id": "logging.timos-target-tls",
+          "message": "The device holds this SR OS logging target with a TLS profile. A plain target at this address would change a target that the service does not own.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-logging.xr-global-source-conflict",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"logging\",\"row\":{\"subject\":\"logging\",\"key\":\"1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"logging.xr-global-source-conflict\",\"message\":\"IOS-XR has one global logging source, and another logging row of the intent states a different source.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "logging",
+          "row": {
+            "subject": "logging",
+            "key": "1c79472b4bf7b12cef9dd681c317ece0067063cedc895da8f80fb3333b7ddf65"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "logging.xr-global-source-conflict",
+          "message": "IOS-XR has one global logging source, and another logging row of the intent states a different source.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-mtu.junos-family-mtu-needs-unit",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"mtu\",\"row\":{\"subject\":\"mtu\",\"key\":\"174ef567df0c39781bdd83590937fcd6d4cc05117a7e212a033824a4b304eff9\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"mtu.junos-family-mtu-needs-unit\",\"message\":\"Junos sets the IP and MPLS MTU on a logical unit, not on the physical interface.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "mtu",
+          "row": {
+            "subject": "mtu",
+            "key": "174ef567df0c39781bdd83590937fcd6d4cc05117a7e212a033824a4b304eff9"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "mtu.junos-family-mtu-needs-unit",
+          "message": "Junos sets the IP and MPLS MTU on a logical unit, not on the physical interface.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-mtu.junos-l2-mtu-needs-physical",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"mtu\",\"row\":{\"subject\":\"mtu\",\"key\":\"174ef567df0c39781bdd83590937fcd6d4cc05117a7e212a033824a4b304eff9\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"mtu.junos-l2-mtu-needs-physical\",\"message\":\"Junos sets the layer-2 MTU on the physical interface, not on a logical unit.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "mtu",
+          "row": {
+            "subject": "mtu",
+            "key": "174ef567df0c39781bdd83590937fcd6d4cc05117a7e212a033824a4b304eff9"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "mtu.junos-l2-mtu-needs-physical",
+          "message": "Junos sets the layer-2 MTU on the physical interface, not on a logical unit.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-mtu.value-out-of-range",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"mtu\",\"row\":{\"subject\":\"mtu\",\"key\":\"174ef567df0c39781bdd83590937fcd6d4cc05117a7e212a033824a4b304eff9\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"mtu.value-out-of-range\",\"message\":\"The MTU value is outside the range that the service writes to a device.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "mtu",
+          "row": {
+            "subject": "mtu",
+            "key": "174ef567df0c39781bdd83590937fcd6d4cc05117a7e212a033824a4b304eff9"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "mtu.value-out-of-range",
+          "message": "The MTU value is outside the range that the service writes to a device.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-ospf.auth-type-unknown",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"ospf\",\"row\":{\"subject\":\"ospf\",\"key\":\"2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"ospf.auth-type-unknown\",\"message\":\"The OSPF authentication type is not a type that the service knows.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "ospf",
+          "row": {
+            "subject": "ospf",
+            "key": "2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "ospf.auth-type-unknown",
+          "message": "The OSPF authentication type is not a type that the service knows.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-route-policy.ios-as-path-name-numeric",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy\",\"key\":\"682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"route-policy.ios-as-path-name-numeric\",\"message\":\"IOS names AS-path access lists by a number from 1 to 500, and this AS-path list name is not such a number.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy",
+            "key": "682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "route-policy.ios-as-path-name-numeric",
+          "message": "IOS names AS-path access lists by a number from 1 to 500, and this AS-path list name is not such a number.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-route-policy.ios-bgp-asn-absent",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy\",\"key\":\"682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08\"},\"field\":null,\"reason\":\"target-not-found\",\"message_id\":\"route-policy.ios-bgp-asn-absent\",\"message\":\"An IOS source-protocol match on BGP needs the BGP AS number of the device, and the device has no BGP process.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy",
+            "key": "682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08"
+          },
+          "field": null,
+          "reason": "target-not-found",
+          "message_id": "route-policy.ios-bgp-asn-absent",
+          "message": "An IOS source-protocol match on BGP needs the BGP AS number of the device, and the device has no BGP process.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-route-policy.ios-community-member-no-home",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy\",\"key\":\"682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"route-policy.ios-community-member-no-home\",\"message\":\"This community member has no place in the IOS community list type of this list.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy",
+            "key": "682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "route-policy.ios-community-member-no-home",
+          "message": "This community member has no place in the IOS community list type of this list.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-route-policy.ios-source-protocol-bgp-mixed",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy\",\"key\":\"682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"route-policy.ios-source-protocol-bgp-mixed\",\"message\":\"IOS cannot match BGP together with other source protocols in one route-map entry.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy",
+            "key": "682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "route-policy.ios-source-protocol-bgp-mixed",
+          "message": "IOS cannot match BGP together with other source protocols in one route-map entry.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-route-policy.junos-mixed-range-unsupported",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy\",\"key\":\"682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"route-policy.junos-mixed-range-unsupported\",\"message\":\"The Junos writer has no exact form for a prefix list whose entries mix range forms.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy",
+            "key": "682bb9a0614d52089eaaf27956196ef09f18b9680fc0d4e336bcce7f6b5b4b08"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "route-policy.junos-mixed-range-unsupported",
+          "message": "The Junos writer has no exact form for a prefix list whose entries mix range forms.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-snmp.arcos-community-rw",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"snmp\",\"row\":{\"subject\":\"snmp\",\"key\":\"05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517\"},\"field\":null,\"reason\":\"would-weaken-intent\",\"message_id\":\"snmp.arcos-community-rw\",\"message\":\"ArcOS SNMP communities are read-only, so a read-write community would land as read-only.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "snmp",
+          "row": {
+            "subject": "snmp",
+            "key": "05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517"
+          },
+          "field": null,
+          "reason": "would-weaken-intent",
+          "message_id": "snmp.arcos-community-rw",
+          "message": "ArcOS SNMP communities are read-only, so a read-write community would land as read-only.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-snmp.junos-v3-receiver-unsupported",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"snmp\",\"row\":{\"subject\":\"snmp\",\"key\":\"05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"snmp.junos-v3-receiver-unsupported\",\"message\":\"The Junos SNMP writer has no form for an SNMPv3 notification receiver.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "snmp",
+          "row": {
+            "subject": "snmp",
+            "key": "05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "snmp.junos-v3-receiver-unsupported",
+          "message": "The Junos SNMP writer has no form for an SNMPv3 notification receiver.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-snmp.timos-v3-user-read-only",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"snmp\",\"row\":{\"subject\":\"snmp\",\"key\":\"05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"snmp.timos-v3-user-read-only\",\"message\":\"The SR OS SNMP writer has no write path for SNMPv3 users; the service only reads them.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "snmp",
+          "row": {
+            "subject": "snmp",
+            "key": "05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "snmp.timos-v3-user-read-only",
+          "message": "The SR OS SNMP writer has no write path for SNMPv3 users; the service only reads them.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-snmp.xr-host-binding-missing",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"snmp\",\"row\":{\"subject\":\"snmp\",\"key\":\"05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"snmp.xr-host-binding-missing\",\"message\":\"IOS-XR keys an SNMP host by its community or user, and this host row states neither.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "snmp",
+          "row": {
+            "subject": "snmp",
+            "key": "05ac80099ab18d1b59f5eb5f2b7e5e6a16eed23522bcc7f97927f6e2e2843517"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "snmp.xr-host-binding-missing",
+          "message": "IOS-XR keys an SNMP host by its community or user, and this host row states neither.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.interface-name-invalid",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"isis.interface-name-invalid\",\"message\":\"The IS-IS interface name must contain an interface type followed by its number.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "isis.interface-name-invalid",
+          "message": "The IS-IS interface name must contain an interface type followed by its number.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-isis.interface-type-no-home",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"isis\",\"row\":{\"subject\":\"isis\",\"key\":\"f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"isis.interface-type-no-home\",\"message\":\"The IS-IS writer for this NED has no native interface list for this interface type.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "isis",
+          "row": {
+            "subject": "isis",
+            "key": "f4e90de27d967c9124272a47e328b3664604694e0ad1d2de09b87da1a3f3f362"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "isis.interface-type-no-home",
+          "message": "The IS-IS writer for this NED has no native interface list for this interface type.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-ospf.interface-name-invalid",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"ospf\",\"row\":{\"subject\":\"ospf\",\"key\":\"2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a\"},\"field\":null,\"reason\":\"invalid-value\",\"message_id\":\"ospf.interface-name-invalid\",\"message\":\"The OSPF interface name must contain an interface type followed by its number.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "ospf",
+          "row": {
+            "subject": "ospf",
+            "key": "2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a"
+          },
+          "field": null,
+          "reason": "invalid-value",
+          "message_id": "ospf.interface-name-invalid",
+          "message": "The OSPF interface name must contain an interface type followed by its number.",
+          "related": null
+        }
+      ]
+    },
+    {
+      "name": "catalog-ospf.interface-type-no-home",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"ospf\",\"row\":{\"subject\":\"ospf\",\"key\":\"2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a\"},\"field\":null,\"reason\":\"inexpressible-on-ned\",\"message_id\":\"ospf.interface-type-no-home\",\"message\":\"The OSPF writer for this NED has no native interface list for this interface type.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "ospf",
+          "row": {
+            "subject": "ospf",
+            "key": "2490ca7478b578212676959351e0c9d62a1975bf1e30a5e7114b7f0f16f20b2a"
+          },
+          "field": null,
+          "reason": "inexpressible-on-ned",
+          "message_id": "ospf.interface-type-no-home",
+          "message": "The OSPF writer for this NED has no native interface list for this interface type.",
+          "related": null
+        }
+      ]
     }
   ],
   "invalid": [
