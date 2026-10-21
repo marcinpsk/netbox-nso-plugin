@@ -640,6 +640,51 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertNotIn("placeholder-forged-secret-canary", response.content.decode())
         self.assertContains(response, "invalid refusal evidence")
 
+    def test_management_rest_drops_malformed_cached_snapshot_shapes(self):
+        from ._outbox_case import mirror_update
+
+        iface, row, generation = self.interface_execution()
+        canary = "placeholder-forged-secret-canary"
+        forged = copy.deepcopy(row.last_apply_error)
+        forged["refusals"][0]["message"] = canary
+        error = {"status": "apply_failed", "last_apply_error": forged}
+        valid = {"name": iface.name}
+        api = self.rest_client()
+        detail = reverse("plugins-api:netbox_nso_plugin-api:nsodevicemanagement-detail", args=(self.management.pk,))
+        listing = reverse("plugins-api:netbox_nso_plugin-api:nsodevicemanagement-list")
+        for interfaces, expected in (
+            ({"placeholder-0": {"attrs": {"description": error}}}, []),
+            ([canary, valid], [valid]),
+            ([{"name": "placeholder-0", "attrs": [error]}, valid], [valid]),
+            ([{"name": "placeholder-0", "attrs": {"description": error, "enabled": canary}}, valid], [valid]),
+        ):
+            mirror_update(self.management, state_snapshot={"interfaces": interfaces})
+            for url in (detail, listing):
+                with self.subTest(interfaces=interfaces, url=url):
+                    response = api.get(url)
+                    self.assertEqual(response.status_code, 200, response.content)
+                    self.assertNotIn(canary, response.content.decode())
+                    data = response.json()
+                    projected = data["results"][0] if url == listing else data
+                    self.assertEqual(
+                        projected["state_snapshot"], {"interfaces": expected, "source": "adapter-reported"}
+                    )
+
+    def test_interface_read_rejects_non_mapping_attrs(self):
+        from netbox_nso_plugin import adapter_client
+
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            if method == "GET" and url.endswith("/interfaces"):
+                return make_response(200, [{"name": "placeholder-0", "attrs": ["description"]}])
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = handle
+        with self.assertRaises(adapter_client.AdapterError) as raised:
+            adapter_client.get_interfaces(1558)
+        self.assertEqual(raised.exception.code, "invalid_response")
+
     def test_router_rest_projects_catalog_from_ledger(self):
         from ._outbox_case import mirror_update
 

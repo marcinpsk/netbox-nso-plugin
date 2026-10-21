@@ -63,11 +63,25 @@ def snapshot_projection(snapshot):
     if isinstance(projected, dict):
         if projected:
             projected["source"] = "adapter-reported"
-        for interface in projected.get("interfaces") or []:
-            for attr in (interface.get("attrs") or {}).values():
-                if "last_apply_error" in attr:
-                    attr["last_apply_error"] = stored_error_projection(attr["last_apply_error"])
+        interfaces = projected.get("interfaces")
+        if isinstance(interfaces, list):
+            projected["interfaces"] = [interface for interface in interfaces if _project_snapshot_interface(interface)]
+        elif interfaces is not None:
+            projected["interfaces"] = []
     return projected
+
+
+def _project_snapshot_interface(interface):
+    """Project one cached interface in place; reject a shape that cannot carry validated errors."""
+    if not isinstance(interface, dict):
+        return False
+    attrs = interface.get("attrs") or {}
+    if not isinstance(attrs, dict) or not all(isinstance(attr, dict) for attr in attrs.values()):
+        return False
+    for attr in attrs.values():
+        if "last_apply_error" in attr:
+            attr["last_apply_error"] = stored_error_projection(attr["last_apply_error"])
+    return True
 
 
 def _current_snapshot(row):
@@ -432,7 +446,10 @@ def validate_interface_errors(interfaces):
     for interface in interfaces:
         if not isinstance(interface, dict):
             raise refusal_contract.ContractError("invalid interface evidence")
-        for attr in (interface.get("attrs") or {}).values():
+        attrs = interface.get("attrs") or {}
+        if not isinstance(attrs, dict):
+            raise refusal_contract.ContractError("invalid interface evidence")
+        for attr in attrs.values():
             if not isinstance(attr, dict):
                 raise refusal_contract.ContractError("invalid interface evidence")
             error = attr.get("last_apply_error")
