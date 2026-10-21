@@ -754,6 +754,46 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
     def test_consumed_head_generation_survives_a_source_epoch_change(self):
         self._assert_consumed_history_survives_a_source_epoch_change(head=True)
 
+    def test_a_consumed_retry_and_its_original_carrier_survive_a_source_epoch_change(self):
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._adapter_http import make_response
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        original = self.terminal(refused=None)
+        retry = self.terminal()
+        retry["carrier_job_id"] = 502
+        settle_terminal_generation(self.management, original, "placeholder-store", settle_seq=1)
+        settle_terminal_generation(self.management, retry, "placeholder-store", settle_seq=2)
+        mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
+        self.serve_terminal_evidence(retry, head=False, settle_seq=2)
+        serve = self.adapter._handle
+
+        def with_original_job(method, url, **kwargs):
+            response = serve(method, url, **kwargs)
+            if method == "GET" and url.endswith("/jobs") and int(kwargs["params"]["after_settle_seq"]) < 1:
+                job = {
+                    **response.json()[0],
+                    "id": 501,
+                    "status": original["carrier_job_status"],
+                    "result": original["carrier_job_result"],
+                    "row_outcomes": original["row_outcomes"],
+                    "refusals": original["refusals"],
+                    "settle_seq": 1,
+                }
+                response = make_response(200, [job, *response.json()])
+            return response
+
+        self.adapter._handle = with_original_job
+
+        ahead = settle_static_routes(self.management.pk)
+        behind = settle_static_routes(self.management.pk)
+
+        self.assertEqual((ahead.stalled, ahead.cursor, behind.stalled, behind.cursor), (False, 2, False, 2))
+        self.assertEqual(NSOApplyExecution.objects.count(), 2)
+
     def test_changed_head_history_after_a_source_epoch_change_is_refused(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
 

@@ -812,7 +812,7 @@ def _authoritative_carrier_generation(generation, generation_id, carrier, manage
     if generation is not None and generation["job_id"] == carrier["carrier_job_id"]:
         return _generation_from_carrier(generation, carrier)
     cached = (
-        _consumed_executions(management, incarnation)
+        _cursor_epoch_executions(management, incarnation)
         .filter(
             generation_id=generation_id,
             carrier_job_id=carrier["carrier_job_id"],
