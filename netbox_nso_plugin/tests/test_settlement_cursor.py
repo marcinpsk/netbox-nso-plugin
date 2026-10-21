@@ -434,6 +434,29 @@ class TestUnresolvedExecution(_SettlementCase):
         row = self._cursor(mgmt)
         assert (row.settle_cursor_seq, row.settle_stall_seq) == (0, 1)
 
+    def test_backlog_beyond_the_evidence_bound_stalls_on_a_malformed_consumer_page(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        device = _make_device("backlogmalformed")
+        mgmt = _make_mgmt(device, "backlogmalformed", 83, adapter=self.adapter)
+        for _ in range(10_001):
+            self.adapter.store.terminal_job(83, job_type="sync")
+        store = self.adapter.store
+        serve = store.feed
+        heads = []
+
+        def feed(device_id, after, limit):
+            heads.append(after == 0)
+            if heads.count(True) == 2:
+                store.unsequenced_job(83, job_type="sync")
+            return serve(device_id, after, limit)
+
+        store.feed = feed
+        result = consume_static_route_settlements(mgmt)
+        assert (result.stalled, result.drained, result.consumed) == (True, False, 0)
+        row = self._cursor(mgmt)
+        assert (row.settle_cursor_seq, row.settle_stall_seq, row.settle_stall_attempts) == (None, None, 0)
+
 
 class TestMalformedFeedPreservesCursor(_SettlementCase):
     """An invalid feed page cannot certify or discard any ordered execution."""

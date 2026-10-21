@@ -61,18 +61,24 @@ def consume_static_route_settlements(mgmt) -> ConsumeResult:
             # A backlog too long to bind still drains page by page; _settle_job stays fail-closed.
             if str(exc) != "settlement_feed_not_bounded":
                 return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
-    with transaction.atomic():
-        row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
-        result = _consume_locked(row)
-        row.refresh_from_db()
-        if (
-            evidence is not None
-            and mapping_epoch(row) == epoch
-            and result.adapter_device_id == evidence["device_id"]
-            and row.settle_cursor_incarnation == evidence.store_incarnation
-        ):
-            return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
-        return result
+    try:
+        with transaction.atomic():
+            row = NSODeviceManagement.objects.select_for_update().get(pk=pk)
+            result = _consume_locked(row)
+            row.refresh_from_db()
+            if (
+                evidence is not None
+                and mapping_epoch(row) == epoch
+                and result.adapter_device_id == evidence["device_id"]
+                and row.settle_cursor_incarnation == evidence.store_incarnation
+            ):
+                return replace(result, deployment_evidence=evidence, mapping_epoch=epoch)
+            return result
+    except EvidenceInvariantError as exc:
+        # The rolled-back page stalls like an invariant from the evidence read above.
+        logger.warning("Settlement feed remains unresolved for management %s: %s", pk, exc)
+        management.refresh_from_db()
+        return ConsumeResult(management.adapter_device_id, 0, True, False, management.settle_cursor_seq, False)
 
 
 def settle_static_routes(mgmt) -> ConsumeResult:
