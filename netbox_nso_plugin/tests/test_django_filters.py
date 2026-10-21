@@ -120,6 +120,34 @@ class TestNSOInterfaceStateFilterSet(TestCase):
         self.assertTrue(fs.is_valid())
         self.assertEqual(fs.qs.count(), 1)
 
+    def test_filterset_by_state_reads_interfaces_in_one_query(self):
+        """The state projection does not load the interface of each row separately."""
+        from dcim.models import Interface
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.filters import NSOInterfaceStateFilterSet
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        def queries():
+            with CaptureQueriesContext(connection) as captured:
+                fs = NSOInterfaceStateFilterSet(data={"state": ["drift"]}, queryset=NSOInterfaceState.objects.all())
+                self.assertTrue(fs.is_valid())
+                count = fs.qs.count()
+            return count, len(captured)
+
+        one_row = queries()
+        for index in range(3):
+            iface = Interface.objects.create(
+                device=self.state.interface.device, name=f"Loopback{index + 1}", type="virtual"
+            )
+            NSOInterfaceState.objects.create(
+                interface=iface, attribute="description", status="changed", nso_value="desc"
+            )
+        four_rows = queries()
+        self.assertEqual((one_row[0], four_rows[0]), (1, 4))
+        self.assertEqual(four_rows[1], one_row[1])
+
     def test_filterset_by_status(self):
         """The status filter selects the stored status, not the projected state."""
         from netbox_nso_plugin.filters import NSOInterfaceStateFilterSet

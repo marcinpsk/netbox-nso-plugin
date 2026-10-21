@@ -86,7 +86,11 @@ class NSOInterfaceStateFilterSet(NetBoxModelFilterSet):
         """Filter displayed state after current execution and value projection."""
         from .refusal_display import project_rows, row_projection
 
-        pks = [row.pk for row in project_rows(queryset) if row_projection(row)["state"] in values]
+        pks = [
+            row.pk
+            for row in project_rows(queryset.select_related("interface"))
+            if row_projection(row)["state"] in values
+        ]
         return queryset.filter(pk__in=pks)
 
     class Meta:
