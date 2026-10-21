@@ -387,7 +387,7 @@ class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCap
         self.assert_legacy_interface_parity(expected_state, advisory)
         for route, args, params in (
             ("plugins:netbox_nso_plugin:nsointerfacestate_list", (), {}),
-            ("plugins:netbox_nso_plugin:nsointerfacestate_list", (), {"status": expected_state}),
+            ("plugins:netbox_nso_plugin:nsointerfacestate_list", (), {"state": expected_state}),
             ("plugins:netbox_nso_plugin:nsointerfacestate", (interface_owner.pk,), {}),
             ("dcim:interface", (interface_owner.interface_id,), {}),
         ):
@@ -494,10 +494,10 @@ class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCap
                         else "refused",
                     )
                     if row is interface_owner and name.endswith("-list"):
-                        filtered = api.get(reverse(name), {"status": expected_state})
+                        filtered = api.get(reverse(name), {"state": expected_state})
                         self.assertEqual(filtered.status_code, 200, filtered.content)
                         self.assertIn(row.pk, [item["id"] for item in filtered.json()["results"]])
-                        excluded = api.get(reverse(name), {"status": "in_sync"})
+                        excluded = api.get(reverse(name), {"state": "in_sync"})
                         self.assertEqual(excluded.status_code, 200, excluded.content)
                         self.assertNotIn(row.pk, [item["id"] for item in excluded.json()["results"]])
 

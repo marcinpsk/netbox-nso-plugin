@@ -111,14 +111,27 @@ class TestNSOInterfaceStateFilterSet(TestCase):
             interface=iface, attribute="description", status="changed", nso_value="desc"
         )
 
-    def test_filterset_by_status(self):
-        """The status filter selects projected drift."""
+    def test_filterset_by_state(self):
+        """The state filter selects projected drift."""
         from netbox_nso_plugin.filters import NSOInterfaceStateFilterSet
         from netbox_nso_plugin.models import NSOInterfaceState
 
-        fs = NSOInterfaceStateFilterSet(data={"status": ["drift"]}, queryset=NSOInterfaceState.objects.all())
+        fs = NSOInterfaceStateFilterSet(data={"state": ["drift"]}, queryset=NSOInterfaceState.objects.all())
         self.assertTrue(fs.is_valid())
         self.assertEqual(fs.qs.count(), 1)
+
+    def test_filterset_by_status(self):
+        """The status filter selects the stored status, not the projected state."""
+        from netbox_nso_plugin.filters import NSOInterfaceStateFilterSet
+        from netbox_nso_plugin.models import NSOInterfaceState
+
+        for stored, count in (("changed", 1), ("in_sync", 0)):
+            fs = NSOInterfaceStateFilterSet(data={"status": [stored]}, queryset=NSOInterfaceState.objects.all())
+            self.assertTrue(fs.is_valid())
+            self.assertEqual(fs.qs.count(), count)
+        self.assertFalse(
+            NSOInterfaceStateFilterSet(data={"status": ["drift"]}, queryset=NSOInterfaceState.objects.all()).is_valid()
+        )
 
     def test_filterset_by_attribute(self):
         """attribute filter works."""

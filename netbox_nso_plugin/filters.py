@@ -64,6 +64,9 @@ class NSOInterfaceStateFilterSet(NetBoxModelFilterSet):
     """FilterSet for NSOInterfaceState."""
 
     status = django_filters.MultipleChoiceFilter(
+        choices=NSOInterfaceState.STATUS_CHOICES,
+    )
+    state = django_filters.MultipleChoiceFilter(
         choices=[
             ("unknown", "Unknown"),
             ("drift", "Drift"),
@@ -73,13 +76,13 @@ class NSOInterfaceStateFilterSet(NetBoxModelFilterSet):
             ("apply_failed", "Apply failed"),
             ("unavailable", "Unavailable"),
         ],
-        method="filter_status",
+        method="filter_state",
     )
     attribute = django_filters.MultipleChoiceFilter(
         choices=NSOInterfaceState.ATTRIBUTE_CHOICES,
     )
 
-    def filter_status(self, queryset, name, values):
+    def filter_state(self, queryset, name, values):
         """Filter displayed state after current execution and value projection."""
         from .refusal_display import project_rows, row_projection
 

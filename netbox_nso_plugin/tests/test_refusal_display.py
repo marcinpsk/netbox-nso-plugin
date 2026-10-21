@@ -727,7 +727,7 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertEqual(detail.json()["state"], "in_sync")
         self.assertEqual(detail.json()["last_apply_error"]["refusals"], stored["refusals"])
         listing = api.get(
-            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list"), {"status": "apply_failed"}
+            reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list"), {"state": "apply_failed"}
         )
         self.assertEqual(listing.json()["results"], [])
         badge = self.client.get(iface.get_absolute_url())
