@@ -616,6 +616,16 @@ class TestOwnerDisplayParity(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCap
                 with self.subTest(model=model._meta.label_lower, field=name):
                     self.assertTrue(serializer.fields[name].read_only)
 
+    def test_no_overlay_serializer_aliases_the_raw_error(self):
+        from netbox_nso_plugin.api import serializers
+
+        # Bound fields resolve every source, a variable-held one included; only the projected key may read the error.
+        for model in [spec.model for spec in OVERLAYS.values()] + [models.NSOBGPPeerTemplateState]:
+            serializer = getattr(serializers, model.__name__ + "Serializer")()
+            for name, field in serializer.fields.items():
+                with self.subTest(model=model._meta.label_lower, field=name):
+                    self.assertFalse(name != "last_apply_error" and field.source_attrs[-1:] == ["last_apply_error"])
+
     def test_unavailable_in_sync(self):
         self.assert_parity("unavailable_in_sync")
 
