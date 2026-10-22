@@ -1806,6 +1806,10 @@ DEPLOYMENT_EVIDENCE_FIELDS = frozenset(
 )
 
 
+#: The adapter's DeploymentEvidenceIn accepts at most this many distinct attempt ids per request.
+DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT = 100
+
+
 def get_deployment_evidence(adapter_device_id, apply_attempt_ids):
     """Return barrier and durable evidence for the named Apply attempts."""
     evidence = _request(

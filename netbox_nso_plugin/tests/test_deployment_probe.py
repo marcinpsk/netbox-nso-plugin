@@ -763,6 +763,27 @@ class TestDeploymentProbe(DeploymentCase):
             check_active_streams()
         self.assertEqual(reads, {"evidence": 2, "feed": 3})
 
+    def test_retained_carrier_evidence_reads_stay_within_the_adapter_attempt_limit(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.deployment_checks import check_active_streams
+
+        attempts = self.paired_probes()
+        executions = list(NSOApplyExecution.objects.filter(attempt_id__in=attempts).order_by("generation_id"))
+        self.assertEqual(len({execution.attempt_id for execution in executions}), 3)
+        self.serve_pruned_historical_carrier(*[(execution, execution.terminal_projection) for execution in executions])
+        original = self.adapter._handle
+        sizes = []
+
+        def recorded(method, url, **kwargs):
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                sizes.append(len(kwargs["json"]["apply_attempt_ids"]))
+            return original(method, url, **kwargs)
+
+        self.adapter._handle = recorded
+        with patch.object(adapter_client, "DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT", 2), transaction.atomic():
+            check_active_streams()
+        self.assertEqual(sorted(size for size in sizes if size), [1, 2])
+
     def test_one_changed_retained_carrier_in_a_batch_is_missing_evidence(self):
         attempts = self.paired_probes()
         executions = list(NSOApplyExecution.objects.filter(attempt_id__in=attempts).order_by("generation_id"))

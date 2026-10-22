@@ -953,18 +953,21 @@ def _unmatched_retained_carriers(management, incarnation, retained):
         and execution.attempt.adapter_apply_attempt_id == execution.attempt.pk
     }
     attempt_ids = tuple(attempts)
-    evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+    limit = client.DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT
+    chunks = [attempt_ids[start : start + limit] for start in range(0, len(attempt_ids), limit)] or [()]
+    responses = [(chunk, client.get_deployment_evidence(management.adapter_device_id, chunk)) for chunk in chunks]
     _page, final_incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=0, limit=1)
     if incarnation != final_incarnation:
         raise EvidenceInvariantError("evidence_epoch_changed")
-    _reject_unrequested_attempts(evidence, attempt_ids)
-    if evidence.get("device_id") != management.adapter_device_id:
-        raise EvidenceInvariantError("admission_mapping_changed")
     rows = {}
-    for raw in evidence["attempts"]:
-        attempt = attempts[UUID(str(raw["apply_attempt_id"]))]
-        rows.setdefault(attempt.pk, []).extend(_validate_attempt(raw, attempt, incarnation)["generations"])
-    head = evidence["head"]
+    for chunk, evidence in responses:
+        _reject_unrequested_attempts(evidence, chunk)
+        if evidence.get("device_id") != management.adapter_device_id:
+            raise EvidenceInvariantError("admission_mapping_changed")
+        for raw in evidence["attempts"]:
+            attempt = attempts[UUID(str(raw["apply_attempt_id"]))]
+            rows.setdefault(attempt.pk, []).extend(_validate_attempt(raw, attempt, incarnation)["generations"])
+    head = responses[-1][1]["head"]
     unmatched = set()
     for identity, (generation, execution) in retained.items():
         matches = [
