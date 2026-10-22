@@ -835,6 +835,68 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.owners[1].refresh_from_db()
         self.assertEqual((self.owners[1].status, self.owners[1].last_apply_error), settled)
 
+    def test_an_automatic_certificate_is_not_consumed_again_under_a_new_mapping_epoch(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+        from netbox_nso_plugin.settlement import settle_static_routes
+
+        from ._outbox_case import mirror_update
+
+        self.prepare_automatic()
+        generation = self.terminal()
+        consumed = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
+        self.management.refresh_from_db()
+
+        # The epoch's selections no longer hold this generation's push sequences.
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+            settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
+        self._assert_one_certificate(generation, consumed)
+
+        self.serve_terminal_evidence(generation, head=False, pruned=True)
+        ahead = settle_static_routes(self.management.pk)
+        self.assertEqual((ahead.stalled, ahead.cursor), (False, 0))
+        self._assert_one_certificate(generation, consumed)
+
+    def test_a_manual_certificate_is_not_consumed_again_under_a_new_mapping_epoch(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError
+        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
+
+        from ._outbox_case import mirror_update
+
+        self.prepare()
+        generation = self.terminal()
+        self.settle(generation)
+        consumed = NSOApplyExecution.objects.get(consumption_state="consumed")
+        mirror_update(self.management, adapter_source_epoch=(self.management.adapter_source_epoch or 0) + 1)
+        self.management.refresh_from_db()
+
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+            self.settle(copy.deepcopy(generation))
+        # The deployment probe consumes through this writer with its manual attempt.
+        with self.assertRaisesRegex(EvidenceInvariantError, "invalid_terminal_batch"):
+            settle_terminal_generation(
+                self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=1
+            )
+        self._assert_one_certificate(generation, consumed)
+
+    def _assert_one_certificate(self, generation, consumed):
+        from netbox_nso_plugin.apply_settlement import generation_certificate_candidates
+
+        identity = generation["generation_id"], generation["carrier_job_id"]
+        candidates = generation_certificate_candidates(self.management, "placeholder-store", [generation])
+        self.assertEqual([row.pk for row in candidates[identity]], [consumed.pk])
+        self.assertEqual(
+            list(
+                NSOApplyExecution.objects.filter(
+                    generation_id=identity[0],
+                    carrier_job_id=identity[1],
+                    consumption_state__in=("consumed", "superseded"),
+                ).values_list("pk", flat=True)
+            ),
+            [consumed.pk],
+        )
+
     def _carrierless_generation(self, status):
         return {
             "generation_id": 80,
