@@ -2,6 +2,141 @@
 
 <!-- version list -->
 
+## v1.11.0 (2026-10-22)
+
+### Bug Fixes
+
+- Address structured settlement review findings
+  ([`4f208d0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4f208d0ef2f54e86b13fa5d9e506b2253e3985fa))
+
+- Recover execution order before retry settlement
+  ([`d67582c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d67582cc67da7d7180b6aeccf97a6e70e45b8fa1))
+
+- **capture**: Restore a rejected manual attempt after an observation-only fence advance
+  ([`c94acaa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c94acaa453629e366f301ebbdbf750fbb85d94e5))
+
+- **ci**: Allocate the live contract database port
+  ([`9e9a764`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9e9a764bde04530d52161981395633b4a64b7fc1))
+
+- **journal**: Journal every route-policy carrier of one feed page
+  ([`2d52db1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/2d52db14a17245f8eaa967e97db531cc41cf8cbb))
+
+- **reconcile**: Check the route-policy journal store against the settlement cursor
+  ([`f369d1b`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f369d1b235b3a95fe51b3f240ca7b7576089c904))
+
+- **settlement**: Advance the cursor over history from an earlier mapping epoch
+  ([`c675686`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c6756862a01ebb10934769b40dc1e8ddf606efe6))
+
+- **settlement**: Drain the feed when its backlog exceeds the evidence bound
+  ([`8f239d0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/8f239d0ba09a1dec514f0f2172207f612758e821))
+
+- **settlement**: Keep consumed history across a source-epoch change
+  ([`36d4ce1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/36d4ce15d7efa8b4c9f3e944d56bd29a5208bba6))
+
+- **settlement**: Keep per-device failure isolation in the sweep
+  ([`d6a0049`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d6a00496e6b217980ce1d9fc2c6971b6f3357d98))
+
+- **settlement**: Read a null admission generation list as empty
+  ([`a5644f7`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a5644f714a979642640674ed7c4cd13a76ea2357))
+
+- **settlement**: Read a replaced carrier's certificate under the cursor epoch
+  ([`b11f814`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b11f814b1bcb534200b478b32196312e4bc346a6))
+
+- **settlement**: Record a rejected batch invariant once per generation
+  ([`6598869`](https://github.com/marcinpsk/netbox-nso-plugin/commit/6598869800d750b5ea3dd68bb51186f5dca4449b))
+
+- **settlement**: Skip abandoned generations that never had a carrier job
+  ([`1f63541`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1f63541558866557e0b6c38225bdd37a3de724d8))
+
+- **settlement**: Stall on an evidence invariant from the feed walk
+  ([`eaf4030`](https://github.com/marcinpsk/netbox-nso-plugin/commit/eaf4030c9323e7515ba3c2d65b217b0a75f84da3))
+
+- **views**: Add outcome counts to the Apply-chain jobs
+  ([`3b60500`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3b605007ec4fb34157bb315256c9065b56729489))
+
+### Chores
+
+- **ci**: Bump astral-sh/setup-uv
+  ([`781e3aa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/781e3aad47a709955fe34748c6409555328a332f))
+
+- **deps**: Bump the js-minor-patch group with 2 updates
+  ([`ae6cfc1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ae6cfc1961f070a864fec027f3d82ab4d82aab26))
+
+- **deps**: Bump the python-minor-patch group with 3 updates
+  ([`45c35a1`](https://github.com/marcinpsk/netbox-nso-plugin/commit/45c35a195c1a68e949d914326534c4bc0abddb80))
+
+- **opengrep**: Flag per-row mirror_refresh loops outside a batch footprint
+  ([`96205b9`](https://github.com/marcinpsk/netbox-nso-plugin/commit/96205b97f1600f2059a9dd499637042916ee8f4c))
+
+- **opengrep**: Refuse a test call that borrows another test class's method
+  ([`a5f51ba`](https://github.com/marcinpsk/netbox-nso-plugin/commit/a5f51ba941315301c2611d6dfc70a1ac042fbe2f))
+
+### Continuous Integration
+
+- Pin the uv version of the joined-pin job
+  ([`9fc5d78`](https://github.com/marcinpsk/netbox-nso-plugin/commit/9fc5d78635ea52fa15f21478776260d36aa6a77e))
+
+- **test**: Record two renamed tests under their current names
+  ([`95c9bae`](https://github.com/marcinpsk/netbox-nso-plugin/commit/95c9baec2dcf076d177884d172fc6626cb032ee4))
+
+### Features
+
+- Settle structured deployment outcomes
+  ([`58f6eae`](https://github.com/marcinpsk/netbox-nso-plugin/commit/58f6eae84f24769feb55cded9111dcdf3ef7cf8e))
+
+### Performance Improvements
+
+- **fence**: Load observation owners with one query per model
+  ([`83cfdfa`](https://github.com/marcinpsk/netbox-nso-plugin/commit/83cfdfadf36a6ea1ab5e88c5a3415c028e3df9df))
+
+- **fence**: Read sibling owners with one query per overlay model
+  ([`1609996`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1609996b9285cf7b3119917048d1f52f069f8b50))
+
+- **signals**: Batch per-row lifecycle saves of one adapter response
+  ([`4cf6af4`](https://github.com/marcinpsk/netbox-nso-plugin/commit/4cf6af431b6db594b4b5d31b566cb048b976785e))
+
+- **writer**: Load planned overlay saves with one query per model
+  ([`c6dcb0f`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c6dcb0f6f8a238f51e2ae82b476989e38b3a4bff))
+
+### Testing
+
+- Align job and locking fixtures with current contracts
+  ([`1765651`](https://github.com/marcinpsk/netbox-nso-plugin/commit/176565180cd08b56d8b965403a3f126a347fd7e6))
+
+- Align test names and fixtures with the shared contracts
+  ([`90f897c`](https://github.com/marcinpsk/netbox-nso-plugin/commit/90f897c6e5d08195a7a01f829b6879ee4eb3e408))
+
+- Share the lifecycle fence helpers through a mixin
+  ([`d34b26d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/d34b26d159898c9ff691e64718deb535c71cb881))
+
+- **ci**: Find the joined-pin job by its workflow checkout path
+  ([`0c0e090`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0c0e0906fa4c80138924fcbfb67ec36d70260861))
+
+- **client**: Refuse a job count map without structured evidence
+  ([`256df2e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/256df2e8900b8e0608edc36849bd1aa9e8a4210b))
+
+- **contract**: Read the generation enum from the live adapter checkout
+  ([`b0d8040`](https://github.com/marcinpsk/netbox-nso-plugin/commit/b0d8040e4535b6d9dd0b48b01cccea26b84ff34b))
+
+- **ownership**: Assert the exact overlay SELECT count per planned row
+  ([`c6f9be5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c6f9be54da4da6d8f1d811c1f43add83a9b71d3f))
+
+- **reconcile**: Journal the route-policy carrier through run_device_reconcile
+  ([`f321586`](https://github.com/marcinpsk/netbox-nso-plugin/commit/f321586df606784bde54860cc91d08a16a8fb0a2))
+
+- **settlement**: Derive fixture sections from the production registry
+  ([`5fca938`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5fca938ee9e47a45b0ea6a556ac8a66ee246a6e6))
+
+- **settlement**: Prove the sweep polls a bound selection
+  ([`0919e2e`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0919e2e08cb408093e561b622f4e6ff20aa00241))
+
+- **settlement**: Share BGP settlement helpers through a mixin
+  ([`db6deef`](https://github.com/marcinpsk/netbox-nso-plugin/commit/db6deef64648fdb072b94a68e280f8e80b222cca))
+
+- **writer**: Assert the preserved apply-attempt id on a content save
+  ([`7ccb3db`](https://github.com/marcinpsk/netbox-nso-plugin/commit/7ccb3db8986efda7c878e026cdd5dd9edf69b096))
+
+
 ## v1.10.0 (2026-10-18)
 
 ### Bug Fixes
