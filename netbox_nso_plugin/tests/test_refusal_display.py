@@ -1168,6 +1168,21 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         cause = generation["refusals"][0]
         self.assertEqual(projected["error"], f"{cause['reason']}: {cause['message']}")
 
+    def test_row_projection_finds_the_current_epoch_fence_beside_a_stale_one(self):
+        from netbox_nso_plugin.models import NSOOverlaySettlementFence
+        from netbox_nso_plugin.refusal_display import project_rows, row_projection
+
+        _iface, row, _generation = self.interface_execution()
+        current = NSOOverlaySettlementFence.objects.get(model_label=row._meta.label_lower, overlay_pk=row.pk)
+        # The stale fence keeps the lower pk, so an unordered first() reaches it first.
+        NSOOverlaySettlementFence.objects.filter(pk=current.pk).update(mapping_epoch="0" * 64)
+        current.pk = None
+        current.save()
+        (batched,) = project_rows([NSOInterfaceState.objects.get(pk=row.pk)])
+        expected = row_projection(batched)
+        self.assertEqual(expected["execution_disposition"], "refused")
+        self.assertEqual(row_projection(NSOInterfaceState.objects.get(pk=row.pk)), expected)
+
     def test_project_rows_shares_previous_refusal_executions(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext

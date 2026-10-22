@@ -747,6 +747,29 @@ class TestNSOInterfaceStateListView(ViewTestBase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(self.iface_state.pk, [row.pk for row in response.context["table"].data])
 
+    def test_badges_add_no_queries_per_rendered_row(self):
+        """The rendered page is projected once, so the state badge issues no per-row lookups."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_list")
+
+        def render(total):
+            for index in range(NSOInterfaceState.objects.count(), total):
+                interface = Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t")
+                NSOInterfaceState.objects.create(
+                    interface=interface, attribute="description", status="changed", nso_value=f"device {index}"
+                )
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get(url, {"per_page": 50})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content.decode().count('data-state="drift"'), total)
+            return len(queries.captured_queries)
+
+        render(2)  # Warm the per-process caches before counting.
+        small = render(2)
+        self.assertEqual(render(6), small)
+
 
 class TestInterfacesPageNoAttrsHint(ViewTestBase):
     """The interfaces page must explain an empty tab caused by no attrs in scope.
@@ -2475,6 +2498,40 @@ class TestNSOApplyPreviewView(ViewTestBase):
                 self.assertEqual(data["refusals"], refusals)
                 self.assertFalse(data["diff_available"])
                 self.assertFalse(data["nothing_pending"])
+
+    def test_owner_rows_add_no_relation_queries_per_pending_row(self):
+        """The preview loads the relations its formatters read with the owner rows."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.models import NSOBFDInterfaceState, NSOVLANState
+
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="")
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        timers = {"min_tx": 300, "min_rx": 300, "multiplier": 3}
+
+        def preview(total):
+            for index in range(NSOVLANState.objects.count(), total):
+                with without_commit_drain(), transaction.atomic():
+                    interface = Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t")
+                    acquire_overlay(
+                        NSOBFDInterfaceState, management=self.mgmt, interface=interface, status="accepted", **timers
+                    )
+                    vlan = VLAN.objects.create(vid=100 + index, name=f"placeholder-vlan-{index}")
+                    acquire_overlay(NSOVLANState, management=self.mgmt, vlan=vlan, status="accepted")
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get(url)
+            self.assertEqual(response.status_code, 200)
+            shown = {(row["category"], row["item"], row["detail"]) for row in response.json()["routing_changes"]}
+            expected = {("BFD", f"Ethernet{index}", "tx 300 / rx 300 x3") for index in range(total)}
+            expected |= {("VLAN", f"VLAN {100 + index}", f"name placeholder-vlan-{index}") for index in range(total)}
+            self.assertEqual(shown, expected)
+            return len(queries.captured_queries)
+
+        preview(2)  # Warm the per-process caches before counting.
+        small = preview(2)
+        self.assertEqual(preview(6), small)
 
     def test_preview_isis_interface_detail_includes_bfd(self):
         """#77 transparency: a tri-state bfd intent MUST appear in 'properties pushed' —

@@ -92,7 +92,8 @@ def _current_snapshot(row):
         return None
     if hasattr(row, "_refusal_current"):
         return row._refusal_current
-    fence = (
+    # Fences at other mapping epochs share the owner key; only the current epoch's fence counts.
+    fences = (
         NSOOverlaySettlementFence.objects.filter(
             model_label=row._meta.label_lower,
             overlay_pk=row.pk,
@@ -102,9 +103,8 @@ def _current_snapshot(row):
         )
         .select_related("management", "last_execution")
         .prefetch_related("last_execution__overlay_snapshots")
-        .first()
     )
-    return _snapshot_for_fence(row, fence) if fence is not None else None
+    return next((current for fence in fences if (current := _snapshot_for_fence(row, fence)) is not None), None)
 
 
 def _snapshot_for_fence(row, fence):

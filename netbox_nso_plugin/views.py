@@ -6240,6 +6240,22 @@ def _apply_preview_owner_changes(device_pk):
             lambda r: r.metric_type or "",
         ),
     }
+    # The relations each formatter above reads, loaded with the owner rows.
+    preview_relations = {
+        "nsovlanstate": ("vlan",),
+        "nsoswitchportstate": ("interface",),
+        "nsosvistate": ("interface", "vlan"),
+        "nsosubinterfacestate": ("interface",),
+        "nsobfdinterfacestate": ("interface",),
+        "nsolacpbundlestate": ("interface",),
+        "nsoisisinterfacestate": ("interface", "isis_interface"),
+        "nsoospfinterfacestate": ("interface",),
+        "nsobgprouterstate": ("bgp_router",),
+        "nsobgppeerstate": ("bgp_peer__remote_as",),
+        "nsointerfaceipstate": ("interface",),
+        "nsointerfacemtustate": ("interface",),
+        "nsolacpmemberstate": ("interface",),
+    }
 
     from .delivery import delivery_keys
     from .refusal_display import project_rows, row_projection
@@ -6255,7 +6271,9 @@ def _apply_preview_owner_changes(device_pk):
             (str(model._meta.verbose_name), lambda r: f"row {r.pk}", lambda r: ""),
         )
         # Include pending owners and unresolved executions in the confirmation count.
-        rows = model.objects.filter(**{spec.device_lookup: device_pk})
+        rows = model.objects.filter(**{spec.device_lookup: device_pk}).select_related(
+            *preview_relations.get(model._meta.model_name, ())
+        )
         for r in project_rows(rows):
             projected = row_projection(r)
             if not projected["pending"]:
