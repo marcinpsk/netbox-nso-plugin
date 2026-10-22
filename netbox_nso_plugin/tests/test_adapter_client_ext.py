@@ -1129,41 +1129,17 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
     def test_device_generations_reject_a_malformed_listing(self, mock_s, _cfg):
         from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
 
+        from ._adapter_http import make_generation_listing
+
         self.addCleanup(reset_session)
-        # The first two fail the shape check; the rest reach the per-row seq guard, which is
-        # what stops a repeated or out-of-order page from looping the cursor forever.
+        # Field values are covered through load_deployment_evidence; this covers page and key shape.
+        missing_mode = make_generation_listing()
+        del missing_mode["mode"]
         for payload in (
             {"generations": []},
             [None],
-            [{"generation_id": 1, "status": "pending", "settlement_cohort": None}],
-            [{"seq": 1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "status": "pending"}],
-            [{"generation_id": 1, "seq": 1, "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "status": None, "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "status": 123, "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "status": "", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "job_id": "501", "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "job_id": 0, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "job_id": -1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "job_id": True, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": "1", "seq": 1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": True, "seq": 1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 0, "seq": 1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": -1, "seq": 1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 0, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": -1, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": True, "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": "1", "status": "pending", "settlement_cohort": None}],
-            [{"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": 0}],
-            [{"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": -1}],
-            [
-                {"generation_id": 2, "seq": 2, "status": "pending", "settlement_cohort": None},
-                {"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": None},
-            ],
-            [
-                {"generation_id": 1, "seq": 1, "status": "pending", "settlement_cohort": 73},
-                {"generation_id": 1, "seq": 2, "status": "pending", "settlement_cohort": 73},
-            ],
+            [missing_mode],
+            [make_generation_listing(extra=1)],
         ):
             with self.subTest(payload=payload):
                 reset_session()
@@ -1171,6 +1147,30 @@ class TestAdapterClientRemainingFunctions(unittest.TestCase):
 
                 with self.assertRaisesRegex(AdapterError, "malformed generations listing") as raised:
                     list_device_generations(5)
+
+                self.assertEqual(raised.exception.code, "invalid_response")
+
+    @patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=_BASE_CFG)
+    @patch("netbox_nso_plugin.adapter_client.requests.Session")
+    def test_device_generations_reject_a_repeated_or_out_of_order_page(self, mock_s, _cfg):
+        from netbox_nso_plugin.adapter_client import AdapterError, list_device_generations, reset_session
+
+        from ._adapter_http import make_generation_listing
+
+        self.addCleanup(reset_session)
+        # Complete rows pass validation, so only the cursor guards can stop these pages.
+        for since_seq, payload in (
+            (None, [make_generation_listing(generation_id=1, seq=1), make_generation_listing(generation_id=1, seq=2)]),
+            (None, [make_generation_listing(generation_id=2, seq=2), make_generation_listing(generation_id=1, seq=1)]),
+            (None, [make_generation_listing(generation_id=1, seq=1), make_generation_listing(generation_id=2, seq=1)]),
+            (3, [make_generation_listing(generation_id=1, seq=3)]),
+        ):
+            with self.subTest(since_seq=since_seq, payload=payload):
+                reset_session()
+                mock_s.return_value = self._make_session(200, payload)
+
+                with self.assertRaisesRegex(AdapterError, "malformed generations listing") as raised:
+                    list_device_generations(5, since_seq=since_seq)
 
                 self.assertEqual(raised.exception.code, "invalid_response")
 
