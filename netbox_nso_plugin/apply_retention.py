@@ -174,8 +174,11 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
     cutoff = timezone.now() - timedelta(days=RETENTION_DAYS)
     query = NSOApplyAttempt.objects.filter(lifecycle="terminal", completed_at__lt=cutoff)
     if cursor is not None:
-        stamp, attempt_id = cursor.split("|", 1)
-        stamp, attempt_id = datetime.fromisoformat(stamp), UUID(attempt_id)
+        try:
+            stamp, attempt_id = cursor.split("|", 1)
+            stamp, attempt_id = datetime.fromisoformat(stamp), UUID(attempt_id)
+        except ValueError as exc:
+            raise ValueError("The retention cursor must be a next_cursor value from a previous run") from exc
         if timezone.is_naive(stamp):
             raise ValueError("The retention cursor must have a timezone")
         query = query.filter(Q(completed_at__gt=stamp) | Q(completed_at=stamp, pk__gt=attempt_id))

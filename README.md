@@ -165,6 +165,7 @@ Terminal Apply history has a 30-day minimum retention period.
 Add `--execute` to delete eligible history. A daily NetBox system job uses the same
 bounded pruning function. The job retains a scan cursor in its job data.
 Use the reported cursor with `--after CURSOR` to continue a command scan.
+A reported `next_cursor=none` has no cursor: omit `--after`.
 Active or repeatable selections, unresolved executions, current badges, fences, and
 referenced prior snapshots retain their evidence.
 Listed adapter generations retain all consumed carrier certificates for historical recovery.

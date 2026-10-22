@@ -23,10 +23,12 @@ class Command(BaseCommand):
             )
         except (ValueError, DeploymentQuiesced) as exc:
             raise CommandError(str(exc)) from exc
-        end = "start" if result.adapter_unavailable else "end"
         self.stdout.write(
             f"examined={result.examined} eligible={result.eligible} deleted={result.deleted} "
-            f"execute={options['execute']} next_cursor={result.next_cursor or end}"
+            f"execute={options['execute']} next_cursor={result.next_cursor or 'none'}"
         )
         if result.adapter_unavailable:
-            raise CommandError("The adapter is unavailable. Run the command again from next_cursor when it answers.")
+            raise CommandError(
+                "The adapter is unavailable. When the adapter answers, run the command again with "
+                "--after set to next_cursor. If next_cursor is none, omit --after."
+            )
