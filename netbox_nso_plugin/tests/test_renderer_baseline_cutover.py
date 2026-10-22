@@ -260,6 +260,22 @@ class TestRendererBaselineCutover(_CascadeFlushMixin, IntentPushResetMixin, Tran
         call_command("nso_intent_deployment_gate", abort=True, stdout=io.StringIO())
         self.assertFalse(is_quiesced())
 
+    def test_a_passing_run_leaves_a_gate_that_replaced_the_one_it_created(self):
+        from netbox_nso_plugin import deployment
+        from netbox_nso_plugin.renderer_audit import RendererAuditResult
+
+        def replace_gate(*_args, **_kwargs):
+            deployment.resume()
+            deployment.quiesce()
+            return RendererAuditResult(("vlan",), ())
+
+        stderr = io.StringIO()
+        with patch("netbox_nso_plugin.renderer_audit.audit_renderer_scopes", side_effect=replace_gate):
+            call_command("nso_renderer_baseline_cutover", stdout=io.StringIO(), stderr=stderr)
+
+        self.assertTrue(deployment.is_quiesced(), "the cutover released another invocation's gate")
+        self.assertIn("another invocation owns the gate", stderr.getvalue())
+
     def test_a_run_started_under_an_existing_gate_leaves_that_gate_standing(self):
         """The operator who quiesced owns the resume; the cutover must not take it from them."""
         from netbox_nso_plugin.deployment import is_quiesced, quiesce

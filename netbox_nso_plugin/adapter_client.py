@@ -793,7 +793,19 @@ def get_intent_receipts(*, device_id: int | None = None, section: str | None = N
 
 def get_interfaces(adapter_device_id):
     """GET /api/v1/devices/{id}/interfaces."""
-    return _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces")
+    interfaces = _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces")
+    _validate_interface_errors(interfaces)
+    return interfaces
+
+
+def _validate_interface_errors(interfaces):
+    from .refusal_contract import ContractError
+    from .refusal_display import validate_interface_errors
+
+    try:
+        validate_interface_errors(interfaces)
+    except (ContractError, TypeError, ValueError, KeyError):
+        raise AdapterError("Adapter returned invalid refusal evidence.", code="invalid_response") from None
 
 
 def get_lag_config(adapter_device_id: int) -> dict:
@@ -961,7 +973,7 @@ def _legacy_interfaces_as_doc(adapter_device_id: int) -> dict:
 
     No read_state key ⇒ the reconcile gate takes the legacy path (D3).
     """
-    interfaces = _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces")
+    interfaces = get_interfaces(adapter_device_id)
     return {"device_id": adapter_device_id, "interfaces": interfaces}
 
 
@@ -977,7 +989,11 @@ def get_interfaces_doc(adapter_device_id: int) -> dict:
     if memo is not None and memo["legacy"] and (time.monotonic() - memo["at"]) < _CACHE_TTL:
         return _legacy_interfaces_as_doc(adapter_device_id)
     try:
-        return _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces-doc")
+        document = _document(
+            _request("GET", f"/api/v1/devices/{adapter_device_id}/interfaces-doc"), "interfaces document"
+        )
+        _validate_interface_errors(document.get("interfaces"))
+        return document
     except AdapterError as exc:
         if exc.code in ("404", "route_not_found"):
             _ifdoc_capability[cfg["url"]] = {"legacy": True, "at": time.monotonic()}
@@ -1788,6 +1804,10 @@ DEPLOYMENT_EVIDENCE_FIELDS = frozenset(
         "unknown_apply_attempt_ids",
     }
 )
+
+
+#: The adapter's DeploymentEvidenceIn accepts at most this many distinct attempt ids per request.
+DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT = 100
 
 
 def get_deployment_evidence(adapter_device_id, apply_attempt_ids):

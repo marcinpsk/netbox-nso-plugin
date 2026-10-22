@@ -176,6 +176,7 @@ def _gated(
     epoch,
     ctx_key: str | None = None,
     pre_body=None,
+    publish_applied=True,
 ):
     """Gate ONE family document (D9): record the disposition, run *body* iff admitted.
 
@@ -207,6 +208,7 @@ def _gated(
             epoch=epoch,
             pre_body=pre_body,
             observation=payload.get("observation") if isinstance(payload, dict) else None,
+            publish_applied=publish_applied,
         )
     except ReconcileScopeError as exc:
         from .read_gate import (
@@ -1356,9 +1358,12 @@ def _journal_route_policy_apply_locked(mgmt, job, execution, row_ids) -> None:
         if not members:
             continue
         failed = snapshot.settlement_disposition == "refused"
-        messages = sorted({cause["message"] for member in members for cause in member["refusals"]}) if failed else []
+        from .refusal_display import format_causes
+
+        causes = [cause for member in members for cause in member["refusals"]]
+        refusal_text = format_causes(causes) if failed else ""
         kind, verb = ("danger", "failed") if failed else ("success", "succeeded")
-        detail = " " + " ".join(messages) if messages else ""
+        detail = " " + refusal_text if refusal_text else ""
         tab = reverse("dcim:device_nso", kwargs={"pk": mgmt.device_id})
         comment = (
             f"NSO apply on **{mgmt.device}**: route-policy **{verb}**, "

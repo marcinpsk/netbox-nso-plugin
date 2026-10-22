@@ -739,6 +739,14 @@ class TestNSOInterfaceStateListView(ViewTestBase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
 
+    def test_lists_a_stored_in_sync_row_whose_netbox_value_drifted(self):
+        """A raw in_sync row with no settlement fence still needs attention when the values differ."""
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="device desc")
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_list")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(self.iface_state.pk, [row.pk for row in response.context["table"].data])
+
 
 class TestInterfacesPageNoAttrsHint(ViewTestBase):
     """The interfaces page must explain an empty tab caused by no attrs in scope.
@@ -2694,6 +2702,25 @@ class TestNSOApplyPreviewView(ViewTestBase):
         self.assertEqual(data["total"], 1)
         self.assertFalse(data["nothing_pending"])
 
+    def test_unregistered_redistribution_protocol_keeps_the_preview_open(self):
+        """The reconciler stores any reported destination protocol; the preview must not crash on it."""
+        from netbox_nso_plugin.models import NSORedistributionState
+
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="")
+        row = acquire_overlay(
+            NSORedistributionState,
+            management=self.mgmt,
+            dest_protocol="rip",
+            dest_ref="1",
+            source_protocol="static",
+            status="accepted",
+        )
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        [change] = [item for item in json.loads(response.content)["routing_changes"] if item["pk"] == row.pk]
+        self.assertIsNone(change["scope"])
+
 
 class TestRoutingStateAcceptView(ViewTestBase):
     """Per-row routing accepts (RoutingStateAcceptMixin families)."""
@@ -3516,13 +3543,10 @@ class TestDeviceNSOTabView(ViewTestBase):
         from netbox_nso_plugin.models import NSOInterfaceMtuState, NSOInterfaceState
 
         iface = Interface.objects.create(device=self.device, name="Gi0/9", type="other", description="nb")
-        # cell 1 → apply_failed. Only the value-aware attribute cells can produce that kind
-        # (interface_row_state); display_state folds apply_failed into "pending".
+        # A failed owner takes precedence over drift in the grouped projection.
         acquire_overlay(
             NSOInterfaceState, interface=iface, attribute="description", status="apply_failed", nso_value="device-side"
         )
-        # cell 2 → drift (unowned differ). apply_failed outranks drift in _KIND_SEVERITY,
-        # so the ROW collapses to apply_failed while the raw kind set still holds "drift".
         NSOInterfaceMtuState.objects.create(management=self.mgmt, interface=iface, l2_mtu=9216, status="changed")
 
         url = reverse(
@@ -3534,8 +3558,8 @@ class TestDeviceNSOTabView(ViewTestBase):
         self.assertEqual(row["state"], "apply_failed", "the worst cell wins the row state")
 
         # What each pill would actually show, by the grid's own filter predicates.
-        shown_drift = [r for r in data["rows"] if r["state"] == "drift"]
-        shown_pending = [r for r in data["rows"] if r["state"] in ("pending", "apply_failed")]
+        shown_drift = [r for r in data["rows"] if r["bucket"] == "drift"]
+        shown_pending = [r for r in data["rows"] if r["bucket"] == "pending"]
         self.assertEqual(data["counts"]["drift"], len(shown_drift))
         self.assertEqual(data["counts"]["pending"], len(shown_pending))
         self.assertNotIn(row, shown_drift)
@@ -4280,41 +4304,6 @@ class TestInterfaceIntentDelivery(ViewTestBase):
         mgmt.adapter_device_id = None
         mgmt.save(update_fields=["adapter_device_id"])
         content_bulk_update(self.iface_state, status="changed")
-
-
-class TestMergedInterfaceStateFilter(TestCase):
-    """Unit tests for the matrix-view state quick-filter bucketing (pure function)."""
-
-    class _I:
-        def __init__(self, iface_id):
-            self.id = iface_id
-
-    def test_buckets_drift_pending_in_sync(self):
-        from netbox_nso_plugin.views import _filter_ifaces_by_state
-
-        a, b, c = self._I(1), self._I(2), self._I(3)
-        ordered = [a, b, c]
-        kinds = {1: {"drift"}, 2: {"pending"}, 3: {"in_sync"}}
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "drift"), [a])
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "pending"), [b])
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "in_sync"), [c])
-        self.assertEqual(_filter_ifaces_by_state(ordered, kinds, "all"), [a, b, c])
-
-    def test_apply_failed_counts_as_pending_not_in_sync(self):
-        from netbox_nso_plugin.views import _filter_ifaces_by_state
-
-        x = self._I(1)
-        self.assertEqual(_filter_ifaces_by_state([x], {1: {"apply_failed"}}, "pending"), [x])
-        self.assertEqual(_filter_ifaces_by_state([x], {1: {"apply_failed"}}, "in_sync"), [])
-
-    def test_mixed_interface_appears_in_both_drift_and_pending(self):
-        from netbox_nso_plugin.views import _filter_ifaces_by_state
-
-        x = self._I(1)
-        kinds = {1: {"drift", "pending"}}
-        self.assertEqual(_filter_ifaces_by_state([x], kinds, "drift"), [x])
-        self.assertEqual(_filter_ifaces_by_state([x], kinds, "pending"), [x])
-        self.assertEqual(_filter_ifaces_by_state([x], kinds, "in_sync"), [])  # not clean → excluded
 
 
 class TestInterfaceMatrixStateChips(ViewTestBase):
@@ -7022,7 +7011,7 @@ class TestPagedCategoryQuickSelect(ViewTestBase):
 
 class TestCategoryQuickSelectStructure(SimpleTestCase):
     """Fast structural backstop (no DB): any category template that renders per-row
-    status (data-status) must also pull in a quick-select provider, so a new/edited
+    projected state (data-bucket) must also pull in a quick-select provider, so a new/edited
     category template can't omit it.
     """
 
@@ -7043,7 +7032,7 @@ class TestCategoryQuickSelectStructure(SimpleTestCase):
             if path.name.startswith("_"):  # shared partials are not standalone categories
                 continue
             text = path.read_text(encoding="utf-8")
-            if "data-status=" not in text:
+            if "data-bucket=" not in text:
                 continue  # no status table → nothing to filter
             if not any(marker in text for marker in self._FILTER_MARKERS):
                 offenders.append(path.name)
@@ -7865,6 +7854,25 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         self.assertIsNone(self.mgmt.adapter_device_id)
         body = self._get("lacp").content.decode()
         self.assertIn("Gi0/11", body)  # the member row, not just the bundle
+
+    def test_lacp_grid_projects_members_without_a_query_per_member(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOLACPMemberState, NSOOverlaySettlementFence
+
+        table = f'"{NSOOverlaySettlementFence._meta.db_table}"'
+
+        def fence_queries():
+            with CaptureQueriesContext(connection) as queries:
+                response = self._get("lacp")
+            self.assertEqual(response.status_code, 200)
+            return sum(table in query["sql"] for query in queries.captured_queries)
+
+        one_member = fence_queries()
+        second = Interface.objects.create(device=self.device, name="Gi0/12", type="1000base-t", lag=self.lag)
+        NSOLACPMemberState.objects.create(management=self.mgmt, interface=second, mode="active", status="imported")
+        self.assertEqual(fence_queries(), one_member)
 
     def test_lacp_grid_rolls_member_drift_into_bundle_state_and_accept_action(self):
         """A nested member is part of the bundle row, so its drift must drive that row."""

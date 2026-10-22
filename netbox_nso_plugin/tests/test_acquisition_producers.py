@@ -50,6 +50,7 @@ PRODUCERS = {
     ("ip_autoassign.py", "_reserve_single"): ("autoassign", 1),
     ("link_role.py", "apply_description_for_role"): ("link_role", 1),
     ("link_role.py", "enable_igp_for_role"): ("link_role", 1),
+    ("management/commands/nso_intent_deployment_gate.py", "Command._accept_routers"): ("accept", 1),
     ("ownership_planner.py", "_seed_reowned_state"): ("manifest_reown", 1),
     ("ownership_planner.py", "_seed_static_route"): ("manifest_reown", 1),
     ("signals.py", "_route_policy_acquisition_plan"): ("enclosing_accept_or_create", 2),
@@ -217,7 +218,7 @@ UNRESOLVED_DISPOSITIONS = {
     ("provision_lifecycle.py", "validate_provision_evidence"): (1, "Validate external job status."),
     ("provision_lifecycle.py", "mark_provision_terminal"): (1, "Write provision lifecycle status, not overlay status."),
     ("signals.py", "_invalidate_source_admissions"): (1, "Family read admission status is not overlay status."),
-    ("read_gate.py", "gated_family_run"): (1, "Observation JSON does not acquire an overlay."),
+    ("read_gate.py", "_publish_applied_observation"): (1, "Observation JSON does not acquire an overlay."),
     ("filters.py", "NSOInterfaceStateFilterSet"): (1, "Declare a status filter; no row write."),
     ("tables.py", "NSOInterfaceStateTable"): (1, "Declare a status column; no row write."),
 }

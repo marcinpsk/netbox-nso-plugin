@@ -130,13 +130,13 @@ describe("cellBadge", () => {
   });
 
   it("in-sync-and-owned renders the quiet check icon, not a badge", () => {
-    const host = parse(G.cellBadge({ kind: "in_sync", status: "in_sync" }));
+    const host = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", owned: true }));
     expect(host.querySelector(".mdi-check-circle")).not.toBeNull();
     expect(host.querySelector(".badge")).toBeNull();
   });
 
   it("in-sync but not-owned renders nothing at all", () => {
-    expect(G.cellBadge({ kind: "in_sync", status: "pending" })).toBe("");
+    expect(G.cellBadge({ kind: "in_sync", status: "pending", owned: false })).toBe("");
   });
 
   it("any other kind renders its badge", () => {
@@ -175,7 +175,7 @@ describe("valueFormatter", () => {
   });
 
   it("escapes the device-supplied value", () => {
-    const row = { desc: { value: 'up"link <1>', kind: "in_sync", status: "in_sync" } };
+    const row = { desc: { value: 'up"link <1>', kind: "in_sync", status: "in_sync", owned: true } };
     const host = parse(G.valueFormatter("desc")(fakeCell(row)));
     expect(host.textContent).toContain('up"link <1>');
     // The only element is the in-sync check icon — `<1>` stayed text, not markup.
@@ -184,7 +184,7 @@ describe("valueFormatter", () => {
   });
 
   it("a custom render gets the cell and the whole row, and its output is used as the body", () => {
-    const row = { peer: { value: "x", kind: "in_sync", status: "in_sync" }, extra: 7 };
+    const row = { peer: { value: "x", kind: "in_sync", status: "in_sync", owned: true }, extra: 7 };
     const seen = [];
     const out = G.valueFormatter("peer", (c, r) => {
       seen.push([c, r]);
@@ -205,6 +205,11 @@ describe("stateColumn", () => {
   it("sorts by severity, worst first", () => {
     const sorted = ["in_sync", "pending", "apply_failed", "drift"].sort(G.stateColumn().sorter);
     expect(sorted).toEqual(["apply_failed", "drift", "pending", "in_sync"]);
+  });
+
+  it("offers every projected state in its header filter", () => {
+    const values = G.stateColumn().headerFilterParams.values;
+    expect(Object.keys(values).filter((key) => key !== "").sort()).toEqual([...G.SEVERITY].sort());
   });
 
   it("merges extra column options over the defaults", () => {
@@ -270,5 +275,54 @@ describe("exports", () => {
 
   it("MUTED is the shared em-dash placeholder", () => {
     expect(parse(G.MUTED).querySelector(".text-muted").textContent).toBe("—");
+  });
+});
+
+describe("catalog refusal projection", () => {
+  it("shows the projected cause as literal text in every state column", () => {
+    const text = "inexpressible-on-ned: <placeholder> & catalog text";
+    const output = G.stateColumn().formatter({ getRow: () => ({ getData: () => ({
+      state: "apply_failed", label: "apply failed", refusal_text: text,
+    }) }) });
+    const node = typeof output === "string" ? parse(output) : output;
+    expect(node.textContent).toContain(text);
+    expect(node.querySelector("placeholder")).toBeNull();
+  });
+
+  it("lets long evidence wrap inside its cell", () => {
+    const text = "ownership-conflict: placeholder catalog text that is longer than the state column";
+    const node = parse(G.cellBadge({ kind: "apply_failed", label: "apply failed", refusal_text: text }));
+    const evidence = node.querySelector("small.text-danger");
+    expect(evidence.classList.contains("d-block")).toBe(true);
+    expect(evidence.classList.contains("text-wrap")).toBe(true);
+    expect(evidence.classList.contains("text-break")).toBe(true);
+  });
+
+  it("labels a restored prior error as history beside an in-sync cell", () => {
+    const error = "placeholder prior restored error";
+    const node = parse(G.cellBadge({ kind: "in_sync", owned: true, error, error_history: true }));
+    expect(node.textContent).toContain("Previous error: " + error);
+    expect(node.querySelector(".text-danger")).toBeNull();
+  });
+
+  it("keeps unavailable evidence visible beside a prior in-sync cell", () => {
+    const text = "Execution unavailable; showing previous state.";
+    const node = parse(G.cellBadge({ kind: "in_sync", status: "in_sync", owned: true, advisory: text }));
+    expect(node.textContent).toContain(text);
+  });
+
+  it("shows the restored error and current advisory in separate elements", () => {
+    const error = "inexpressible-on-ned: <placeholder> & prior catalog error";
+    const advisory = "Execution unavailable; showing previous state.";
+    const row = { state: "unavailable", kind: "unavailable", status: "apply_failed", error, advisory };
+    for (const html of [G.stateColumn().formatter(fakeCell(row)), G.cellBadge(row)]) {
+      const node = parse(html);
+      expect(node.textContent).toContain(error);
+      expect(node.textContent).toContain(advisory);
+      expect([...node.querySelectorAll("small")].map((item) => item.textContent)).toEqual([error, advisory]);
+      expect(node.querySelector("small.text-danger").textContent).toBe(error);
+      expect(node.querySelector("small.text-warning-emphasis").textContent).toBe(advisory);
+      expect(node.querySelector("placeholder")).toBeNull();
+    }
   });
 });

@@ -128,7 +128,10 @@ class NSOInterfaceStateTable(NetBoxTable):
     device = tables.Column(accessor="interface__device", linkify=True, verbose_name="Device")
     interface = tables.Column(linkify=True)
     attribute = tables.Column()
-    status = tables.Column()
+    status = tables.TemplateColumn(
+        template_code='{% include "netbox_nso_plugin/categories/_state_badge.html" with state=record %}',
+        orderable=False,
+    )
     nso_value = tables.Column()
     last_sync_at = columns.DateTimeColumn()
     accepted_at = columns.DateTimeColumn()

@@ -267,4 +267,11 @@ describe("the device tab's Apply generation-chain poller", () => {
 
     expect(refreshed).not.toHaveBeenCalled();
   });
+  it("keeps an unavailable carrier from certifying a settled generation", async () => {
+    const summary = "Execution unavailable; showing previous state.";
+    await runApply({ ...RACED, jobs: [job({ refusal_summary: summary })] });
+    expect(message()).toContain(summary);
+    expect(document.querySelector("#nso-job-status .alert-success")).toBeNull();
+  });
+
 });

@@ -23,10 +23,7 @@ from types import SimpleNamespace
 from django.test import SimpleTestCase, TestCase
 
 from netbox_nso_plugin.summary import (
-    _DIFFER_STATUSES,
-    _MATCH_STATUSES,
     _status_breakdown,
-    display_state,
     interface_row_state,
     interface_status_breakdown,
     matches_device_value,
@@ -56,47 +53,27 @@ class _FakeQS:
         return self._rows
 
 
-class TestDisplayState(SimpleTestCase):
-    """display_state(status, owned) -> (kind, label). Pure status→badge mapping."""
+class TestOwnerProjection(SimpleTestCase):
+    def test_lifecycle_states_share_pending_membership(self):
+        from netbox_nso_plugin.refusal_display import row_projection
 
-    def test_deploying_wins_regardless_of_owned(self):
-        self.assertEqual(display_state("deploying", True), ("deploying", "deploying"))
-        self.assertEqual(display_state("deploying", False), ("deploying", "deploying"))
-
-    def test_match_statuses_are_in_sync_regardless_of_owned(self):
-        for status in _MATCH_STATUSES:  # ("imported", "in_sync")
-            for owned in (True, False):
-                with self.subTest(status=status, owned=owned):
-                    self.assertEqual(display_state(status, owned), ("in_sync", "in sync"))
-
-    def test_differ_statuses_split_on_ownership(self):
-        # ("changed", "drifted", "conflict", "accepted", "apply_failed")
-        for status in _DIFFER_STATUSES:
+        cases = (
+            ("imported", "in_sync", False, False),
+            ("in_sync", "in_sync", False, True),
+            ("changed", "drift", False, False),
+            ("conflict", "drift", False, False),
+            ("accepted", "pending", True, True),
+            ("apply_failed", "apply_failed", True, True),
+            ("deploying", "deploying", True, True),
+            ("unknown", "unknown", False, False),
+            ("", "unknown", False, False),
+        )
+        for status, state, pending, owned in cases:
             with self.subTest(status=status):
-                self.assertEqual(display_state(status, True), ("pending", "pending apply"))
-                self.assertEqual(display_state(status, False), ("drift", "drift"))
-
-    def test_apply_failed_collapses_at_this_layer(self):
-        # display_state itself still collapses apply_failed into the differ buckets; this
-        # is only ever reached for non-comparable / deploying rows (see
-        # interface_row_state), which never carry apply_failed today. The interfaces tab
-        # surfaces "apply failed" distinctly in interface_row_state instead — see
-        # TestInterfaceRowState.test_apply_failed_with_differing_values_is_surfaced.
-        self.assertEqual(display_state("apply_failed", True), ("pending", "pending apply"))
-
-    def test_unknown_and_blank_fall_through_to_unknown_kind(self):
-        self.assertEqual(display_state("unknown", True), ("unknown", "unknown"))
-        self.assertEqual(display_state("", False), ("unknown", "unknown"))
-        # An unrecognized status echoes itself as the label.
-        self.assertEqual(display_state("weird", False), ("unknown", "weird"))
-
-    def test_unknown_is_not_owned_aware(self):
-        # DECISION (kept): an owned row whose status is "unknown" renders "unknown", not
-        # "pending apply" — owned-awareness is meaningless without a value to compare,
-        # and "unknown" honestly means "no info". This branch is also effectively
-        # unreachable for real interface data (comparable attrs go value-aware via
-        # interface_row_state); routing badges use the template, not display_state.
-        self.assertEqual(display_state("unknown", True), ("unknown", "unknown"))
+                projected = row_projection(SimpleNamespace(status=status))
+                self.assertEqual(projected["state"], state)
+                self.assertEqual(projected["pending"], pending)
+                self.assertEqual(projected["owned"], owned)
 
 
 class TestMatchesDeviceValue(SimpleTestCase):
@@ -292,7 +269,7 @@ class TestStatusBreakdown(TestCase):
                 interface=iface,
                 attribute="description",
                 status=status,
-                nso_value="x",
+                nso_value="" if status in {"imported", "in_sync"} else "x",
                 accepted_at=timezone.now() if owned else None,
             )
         return NSOInterfaceState.objects.filter(interface__device=self.device)

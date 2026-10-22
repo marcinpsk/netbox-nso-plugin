@@ -16,7 +16,7 @@
   <div class="table-responsive mb-3">
   <table class="table table-sm table-hover mb-0">
     <thead><tr><th>Location / Contact</th><th>Status / Synced</th><th></th></tr></thead>
-    <tbody><tr data-status="{{ snmp_data.system_info.status }}" data-owned="{{ snmp_data.system_info.accepted_at|yesno:'true,false' }}">
+    <tbody><tr data-kind="{{ snmp_data.system_info.refusal_display.state }}" data-bucket="{{ snmp_data.system_info.refusal_display.bucket }}">
       <td>
         <a href="#" class="nso-popedit" title="Edit location and contact; this takes ownership"
            data-pe-url="{{ sysinfo_edit_url }}" data-pe-title="SNMP system information"
@@ -25,7 +25,7 @@
            data-pe-v-contact="{{ snmp_data.system_info.contact|default:'' }}">{{ snmp_data.system_info.location|default:"no location" }} · {{ snmp_data.system_info.contact|default:"no contact" }}</a>
       </td>
       <td>
-        {% include "netbox_nso_plugin/categories/_state_badge.html" with status=snmp_data.system_info.status %}
+        {% include "netbox_nso_plugin/categories/_state_badge.html" with state=snmp_data.system_info status=snmp_data.system_info.status %}
         <div class="text-muted small text-nowrap">{% if snmp_data.system_info.last_sync_at %}{{ snmp_data.system_info.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
       </td>
       <td class="text-nowrap">
@@ -47,7 +47,7 @@
       </thead>
       <tbody>
         {% for c in snmp_data.communities %}
-        <tr data-status="{{ c.status }}" data-owned="{{ c.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ c.refusal_display.state }}" data-bucket="{{ c.refusal_display.bucket }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_community' pk=c.pk as community_edit_url %}
           <td>
             <code>{{ c.community_hash }}</code>
@@ -80,7 +80,7 @@
             {% endif %}
           </td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with state=c status=c.status residue=c.residue_survivor residue_job=c.residue_job_id %}
             <div class="text-muted small text-nowrap">{% if c.last_sync_at %}{{ c.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
           </td>
           <td>
@@ -114,7 +114,7 @@
       </thead>
       <tbody>
         {% for u in snmp_data.v3_users %}
-        <tr data-status="{{ u.status }}" data-owned="{{ u.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ u.refusal_display.state }}" data-bucket="{{ u.refusal_display.bucket }}">
           <td>
             <span class="fw-semibold">{{ u.username }}</span>
             <div class="small">
@@ -136,7 +136,7 @@
             {% endif %}
           </td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with state=u status=u.status residue=u.residue_survivor residue_job=u.residue_job_id %}
             <div class="text-muted small text-nowrap">{% if u.last_sync_at %}{{ u.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
           </td>
           <td>
@@ -167,7 +167,7 @@
       </thead>
       <tbody>
         {% for h in snmp_data.hosts %}
-        <tr data-status="{{ h.status }}" data-owned="{{ h.accepted_at|yesno:'true,false' }}">
+        <tr data-kind="{{ h.refusal_display.state }}" data-bucket="{{ h.refusal_display.bucket }}">
           {% url 'plugins:netbox_nso_plugin:overlay_field_edit' key='snmp_host' pk=h.pk as host_edit_url %}
           <td>
             <span class="fw-semibold">{{ h.address }}</span>
@@ -184,7 +184,7 @@
                data-pe-o-notify_type='[{"value":"trap","label":"Trap"},{"value":"inform","label":"Inform"}]'>{% if h.notify_type == "inform" or h.notify_type == "informs" %}inform{% else %}trap{% endif %} · {% if h.version == "1" or h.version == "v1" %}v1{% elif h.version == "2" or h.version == "2c" or h.version == "v2c" %}v2c{% else %}v3{% endif %}{% if h.username %} · {{ h.username }}{% endif %}</a>
           </td>
           <td>
-            {% include "netbox_nso_plugin/categories/_state_badge.html" with status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
+            {% include "netbox_nso_plugin/categories/_state_badge.html" with state=h status=h.status residue=h.residue_survivor residue_job=h.residue_job_id %}
             <div class="text-muted small text-nowrap">{% if h.last_sync_at %}{{ h.last_sync_at|date:"Y-m-d H:i" }}{% else %}not synced{% endif %}</div>
           </td>
           <td class="text-nowrap">

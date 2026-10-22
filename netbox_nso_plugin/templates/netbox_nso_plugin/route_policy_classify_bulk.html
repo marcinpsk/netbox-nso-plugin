@@ -38,7 +38,7 @@
                 <td><input type="checkbox" class="form-check-input nso-rp-bulk-cb" name="state" value="{{ rp.pk }}"></td>
                 <td>{{ rp.family|cut:"_"|capfirst }}</td>
                 <td><code>{{ rp.object_name }}</code></td>
-                <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with status=rp.status %}</td>
+                <td>{% include "netbox_nso_plugin/categories/_state_badge.html" with state=rp status=rp.status %}</td>
                 <td>
                   {% if rp.assigned_object %}
                   <a href="{% url 'plugins:netbox_nso_plugin:routing_route_policy_diff' pk=rp.pk %}"

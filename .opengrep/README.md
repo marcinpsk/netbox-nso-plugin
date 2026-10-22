@@ -3,6 +3,8 @@
 
 # Local review checks
 
+`nso-row-error-projection-bypass` also matches a literal serializer `source` whose last component is `last_apply_error`, such as `owner.last_apply_error`. A source held in a variable is covered by `test_refusal_display_parity.py::test_no_overlay_serializer_aliases_the_raw_error`, which checks the bound source of every overlay serializer field.
+
 Run these checks before a commit:
 
 ```sh
@@ -54,6 +56,7 @@ References checked on 2026-09-12:
 
 | Issue class | Mechanical check | Limit |
 | --- | --- | --- |
+| Row error display bypasses correlated settlement evidence | `nso-row-error-projection-bypass` | Direct `.last_apply_error` access and literal `getattr` in serializers, views, and template tags must use `refusal_display.row_projection`. Settlement writers and the projection module are outside this display-only scope. Dynamic attribute names and dictionary reads are not checked. |
 | Policy names folded into another identity | `nso-route-policy-name-folding` | Direct `object_name__iexact`, `Lower` or `Upper` of `object_name`, and canonical or module-qualified policy-model `name__iexact` lookups through any `objects` manager method. Local-variable `casefold()`, aliased models, and dynamic managers need reconcile integration tests. Tests are excluded. |
 | Route-map `vendor_ext["unmapped"]` read without shape validation | `nso-route-map-unmapped-direct-read` | `get()` and subscript reads of the literal `"unmapped"` key outside `signals.route_map_entry_unmapped`. Writes (`setdefault`, subscript assignment) are allowed. A key held in a variable is not checked. Tests are excluded. |
 | Empty fallback used as array validation before joining observed LACP members | `nso-observed-members-join-without-array-check` | JavaScript calls on `(row.observed_members \|\| [])` and `(row.observed_members ?? [])`. The rule accepts `Array.isArray` normalization and joins of other fields. Aliases and direct joins without a fallback are outside this call-shape check. |

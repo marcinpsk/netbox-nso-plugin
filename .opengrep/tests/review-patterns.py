@@ -15,6 +15,34 @@ from netbox_nso_plugin.signals import suppress_intent_push, _schedule_intent_pus
 from netbox_nso_plugin import signals
 
 
+def raw_overlay_error(row):
+    # ruleid: nso-row-error-projection-bypass
+    error = row.last_apply_error
+    # ruleid: nso-row-error-projection-bypass
+    error = getattr(row, "last_apply_error", None)
+    # ruleid: nso-row-error-projection-bypass
+    error = getattr(row, "last_apply_error")
+    # ok: nso-row-error-projection-bypass
+    error = row.refusal_display["error"]
+    # ok: nso-row-error-projection-bypass
+    error = row_projection(row)["error_value"]
+    # ok: nso-row-error-projection-bypass
+    error = data["last_apply_error"]
+
+
+class AliasedOverlayErrorSerializer(RefusalDisplaySerializerMixin, serializers.ModelSerializer):
+    # ruleid: nso-row-error-projection-bypass
+    error = serializers.JSONField(source="last_apply_error", read_only=True)
+    # ruleid: nso-row-error-projection-bypass
+    error_text = serializers.CharField(read_only=True, source="last_apply_error")
+    # ruleid: nso-row-error-projection-bypass
+    owner_error = serializers.CharField(source="owner.last_apply_error", read_only=True)
+    # ok: nso-row-error-projection-bypass
+    owner_error_time = serializers.DateTimeField(source="owner.last_apply_error_at", read_only=True)
+    # ok: nso-row-error-projection-bypass
+    projected_error = serializers.JSONField(source="refusal_display.error_value", read_only=True)
+
+
 def vlan_identity_from_name(candidate, native, interface):
     # ruleid: nso-vlan-identity-from-interface-name
     candidate.dot1q_vlan = int(native.name.rsplit(".", 1)[-1])

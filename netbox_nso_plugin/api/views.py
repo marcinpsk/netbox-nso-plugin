@@ -42,7 +42,17 @@ def _request_body(request):
     return body if isinstance(body, dict) else None
 
 
-class NSOBGPRouterStateViewSet(NetBoxModelViewSet):
+class _ProjectedPageMixin:
+    """Load the refusal evidence of one list page in batched queries."""
+
+    def paginate_queryset(self, queryset):
+        from ..refusal_display import project_rows
+
+        page = super().paginate_queryset(queryset)
+        return None if page is None else project_rows(page)
+
+
+class NSOBGPRouterStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
     """Expose router observations and lifecycle through the overlay API."""
 
     queryset = NSOBGPRouterState.objects.select_related("management", "bgp_router")
@@ -53,6 +63,30 @@ class NSOBGPRouterStateViewSet(NetBoxModelViewSet):
         from ..views import _visible_bgp_router_states
 
         return _visible_bgp_router_states(self.request.user)
+
+
+class OwnerStateView(APIView):
+    """Read a registered owner's projected state through its model serializer."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, model, pk):
+        from django.shortcuts import get_object_or_404
+
+        from ..refusal_registry import OVERLAYS
+        from . import serializers
+
+        spec = OVERLAYS.get(f"netbox_nso_plugin.{model}")
+        if spec is None:
+            return Response({"detail": "Unknown owner model."}, status=status.HTTP_404_NOT_FOUND)
+        queryset = spec.model.objects.restrict(request.user, "view")
+        if spec.model is NSOBGPRouterState:
+            from ..views import _visible_bgp_router_states
+
+            queryset = _visible_bgp_router_states(request.user)
+        owner = get_object_or_404(queryset, pk=pk)
+        serializer = getattr(serializers, spec.model.__name__ + "Serializer")
+        return Response(serializer(owner, context={"request": request}).data)
 
 
 class NSODerivedIntentTemplateViewSet(NetBoxModelViewSet):
@@ -87,7 +121,7 @@ class NSODeviceManagementViewSet(NetBoxModelViewSet):
     filterset_class = NSODeviceManagementFilterSet
 
 
-class NSOInterfaceStateViewSet(NetBoxModelViewSet):
+class NSOInterfaceStateViewSet(_ProjectedPageMixin, NetBoxModelViewSet):
     """REST API for NSOInterfaceState — per-interface intent status overlay.
 
     The adapter's scope reconciler also reads this to mirror intent (decision L).
@@ -309,6 +343,22 @@ class SyncCompleteView(APIView):
         device_id = body.get("netbox_device_id")
         adapter_device_id = body.get("adapter_device_id")
 
+        if any(
+            value is not None and (type(value) is not int or value <= 0) for value in (device_id, adapter_device_id)
+        ):
+            return Response(
+                {"detail": "device identities must be positive integers"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if (
+            device_id is not None
+            and adapter_device_id is not None
+            and not NSODeviceManagement.objects.filter(
+                device_id=device_id,
+                adapter_device_id=adapter_device_id,
+            ).exists()
+        ):
+            return Response({"detail": "device identities do not match"}, status=status.HTTP_400_BAD_REQUEST)
+
         if device_id is None and adapter_device_id is None:
             return Response(
                 {"detail": "netbox_device_id or adapter_device_id is required"},
@@ -324,7 +374,18 @@ class SyncCompleteView(APIView):
                 )
             device_id = mgmt.device_id
 
-        enqueue_device_reconcile(int(device_id))
+        from ..deployment import DeploymentQuiesced, is_quiesced, operation
+        from ..deployment_probe import ProbeBlocked, enqueue_probe
+        from ..models import NSOApplyAttempt
+
+        try:
+            if is_quiesced():
+                enqueue_probe(int(device_id))
+            else:
+                with operation("sync-complete callback"):
+                    enqueue_device_reconcile(int(device_id))
+        except (ProbeBlocked, DeploymentQuiesced, NSOApplyAttempt.DoesNotExist) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response({"queued": True, "netbox_device_id": int(device_id)}, status=status.HTTP_202_ACCEPTED)
 
 

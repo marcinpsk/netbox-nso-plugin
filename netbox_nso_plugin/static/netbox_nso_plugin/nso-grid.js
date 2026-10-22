@@ -11,11 +11,7 @@
  * There is deliberately NO client-side kind derivation here. A cell's kind decides its
  * badge, whether it offers Accept, and which quick-filter pill counts it, so a second
  * implementation that drifts from the server's would show the operator a row that its
- * own filter then hides. The server already owns this (summary.display_state /
- * interface_row_state — and note those two disagree about apply_failed on purpose), so
- * the payload ships `kind` per cell and `state` per row, and we only render them.
- * _table_filter.html still carries its own copy for the server-rendered tables that
- * have not become grids yet; a panel drops it when it does.
+ * own filter then hides. The payload carries the common owner projection.
  *
  * Row contract (what a panel's payload rows look like):
  *   { state: "<kind>", ...cells }
@@ -48,15 +44,15 @@
     drift: ["text-bg-warning text-dark", "drift"],
     pending: ["text-bg-info", "pending apply"],
     apply_failed: ["text-bg-danger", "apply failed"],
+    unavailable: ["text-bg-warning text-dark", "previous state"],
     deploying: ["text-bg-primary", "deploying"],
     in_sync: ["text-bg-success", "in sync"],
     unknown: ["text-bg-info", "unknown"],
   };
   // Severity order for the State column's sorter — worst first, so the rows an
   // operator must act on sort to the top.
-  var SEVERITY = ["apply_failed", "drift", "pending", "deploying", "unknown", "in_sync"];
+  var SEVERITY = ["apply_failed", "unavailable", "drift", "pending", "deploying", "unknown", "in_sync"];
   // Statuses that mean "NetBox does not own this yet" — mirrors _accept_cell.html.
-  var PENDING_KINDS = ["pending", "apply_failed"];
   var MUTED = '<span class="text-muted">—</span>';
 
   /* Escape for BOTH text and quoted-attribute contexts.
@@ -80,15 +76,35 @@
     return '<span class="badge ' + b[0] + '">' + esc(label || b[1]) + "</span>";
   }
 
-  /* Value cells stay quiet when in sync (compact) — only trouble gets a badge. */
+  function appendEvidence(parent, data) {
+    var history = data.error_history && data.error;
+    [
+      [history ? "Previous error: " + data.error : "", "d-block text-wrap text-break text-body-secondary"],
+      [history ? "" : data.refusal_text || data.error, "d-block text-wrap text-break text-danger"],
+      [data.advisory, "d-block text-wrap text-break text-warning-emphasis"],
+    ].forEach(function (item) {
+      if (!item[0]) return;
+      var node = document.createElement("small");
+      node.className = item[1];
+      node.textContent = item[0];
+      parent.appendChild(node);
+    });
+  }
+
+  function evidenceText(data) {
+    var parent = document.createElement("span");
+    appendEvidence(parent, data);
+    return parent.innerHTML;
+  }
+
   function cellBadge(cell) {
     if (!cell) return "";
     if (cell.kind === "in_sync") {
-      return cell.status === "in_sync"
-        ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>'
-        : "";
+      return cell.owned
+        ? ' <span class="mdi mdi-check-circle text-success" title="In sync — NetBox owns this and the device matches."></span>' + evidenceText(cell)
+        : evidenceText(cell);
     }
-    return " " + badge(cell.kind, cell.label);
+    return " " + badge(cell.kind, cell.label) + evidenceText(cell);
   }
 
   function acceptBtn(cell) {
@@ -167,12 +183,14 @@
    * differently — or quietly forget the residue badge, which is the whole point of
    * being able to attribute a re-imported husk instead of reading it as new config. */
   function stateColumn(extra) {
+    // A panel that shows evidence in its own column passes evidence: false.
+    var evidence = !extra || extra.evidence !== false;
     var col = {
       title: "State",
       field: "state",
       formatter: function (cell) {
         var d = cell.getRow().getData();
-        var out = badge(d.state, d.label);
+        var out = badge(d.state, d.label) + (evidence ? evidenceText(d) : "");
         if (d.residue) {
           // Same wording and explanation as _state_badge.html — an operator must not have
           // to learn two names for the same thing depending on which panel they are on.
@@ -196,12 +214,17 @@
           "": "All",
           drift: "Drift",
           pending: "Pending apply",
+          deploying: "Deploying",
           apply_failed: "Apply failed",
+          unavailable: "Unavailable",
+          unknown: "Unknown",
           in_sync: "In sync",
         },
       },
     };
-    return Object.assign(col, extra || {});
+    col = Object.assign(col, extra || {});
+    delete col.evidence;
+    return col;
   }
 
   /* Muted "device: <value>" annotation for a cell whose INTENT lives in NetBox
@@ -406,14 +429,14 @@
         });
         var s = pill.dataset.state;
         if (s === "all") table.clearFilter(true);
-        else if (s === "drift") table.setFilter("state", "=", "drift");
+        else if (s === "drift") table.setFilter("bucket", "=", "drift");
         else if (s === "pending")
           table.setFilter(function (d) {
-            return PENDING_KINDS.indexOf(d.state) !== -1;
+            return d.bucket === "pending";
           });
         else
           table.setFilter(function (d) {
-            return d.state !== "drift" && PENDING_KINDS.indexOf(d.state) === -1;
+            return d.bucket === "in_sync";
           });
         return;
       }
@@ -441,6 +464,8 @@
     mount: mount,
     badge: badge,
     cellBadge: cellBadge,
+    appendEvidence: appendEvidence,
+    evidenceText: evidenceText,
     acceptBtn: acceptBtn,
     valueFormatter: valueFormatter,
     stateColumn: stateColumn,

@@ -9,7 +9,7 @@ import contextlib
 from django.core.management.base import BaseCommand, CommandError
 
 from netbox_nso_plugin import delivery
-from netbox_nso_plugin.deployment import gate_bypass, gate_recovery_guidance, quiesce, resume
+from netbox_nso_plugin.deployment import gate_bypass, gate_recovery_guidance, quiesce, report_replaced_gate, resume
 
 _STABILITY_PASSES = 3
 
@@ -63,7 +63,7 @@ class Command(BaseCommand):
 
         if created_gate:
             try:
-                resume()
+                resume(created_at=created_gate)
             except BaseException:
                 with contextlib.suppress(Exception):  # best effort: the resume() failure must propagate
                     self.stderr.write(
@@ -73,6 +73,8 @@ class Command(BaseCommand):
                         )
                     )
                 raise
+            with contextlib.suppress(Exception):  # best effort: the completed run must report success
+                report_replaced_gate(self.stderr)
         self.stdout.write(
             self.style.SUCCESS(f"Renderer baseline cutover passed: {len(devices)} devices, {repaired} repairs")
         )

@@ -738,9 +738,7 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.serve_terminal_evidence(self.terminal(), head=False, pruned=True)
         with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
             settle_device_apply_attempts(self.management)
-        execution = NSOApplyExecution.objects.get()
-        self.assertEqual(execution.consumption_state, "unconsumed")
-        self.assertEqual(execution.invariant_code, "missing_generation_evidence")
+        self.assertFalse(NSOApplyExecution.objects.exists())
         for row in self.owners:
             row.refresh_from_db()
             self.assertEqual(
@@ -850,16 +848,16 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             "updated_at": self.stamp.isoformat(),
         }
 
-    def test_carrierless_abandoned_generation_does_not_stall_settlement(self):
-        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+    def test_abandoned_generation_without_carrier_authority_stalls_settlement(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
 
         self.prepare_automatic()
         self.serve_terminal_evidence(self.terminal(), earlier_generations=[self._carrierless_generation("abandoned")])
-        settle_device_apply_attempts(self.management)
-        execution = NSOApplyExecution.objects.get()
-        self.assertEqual((execution.consumption_state, execution.invariant_code), ("consumed", ""))
+        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+            settle_device_apply_attempts(self.management)
+        self.assertFalse(NSOApplyExecution.objects.exists())
         self.owners[1].refresh_from_db()
-        self.assertEqual(self.owners[1].status, "apply_failed")
+        self.assertEqual(self.owners[1].status, self.prior[(self.owners[1]._meta.label_lower, self.owners[1].pk)][0])
 
     def test_carrierless_failed_generation_still_stalls_before_consumption(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
@@ -910,15 +908,16 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
                 self.assertEqual(reconstructed["sections"], [section])
                 self.assertEqual(validate_generation(reconstructed), reconstructed)
 
-    def test_pruned_nonhead_generation_reuses_its_consumed_certificate(self):
-        from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
+    def test_pruned_nonhead_generation_without_remote_carrier_blocks_recovery(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, load_deployment_evidence
         from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
 
         self.prepare_automatic()
         generation = self.terminal()
         original = settle_terminal_generation(self.management, generation, "placeholder-store", settle_seq=1)
         self.serve_terminal_evidence(generation, head=False, pruned=True)
-        settle_device_apply_attempts(self.management)
+        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+            load_deployment_evidence(self.management)
         self.assertEqual(NSOApplyExecution.objects.count(), 1)
         original.refresh_from_db()
         self.assertEqual(original.consumption_state, "consumed")
@@ -1097,76 +1096,6 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
             row.refresh_from_db()
             self.assertEqual(row.status, "in_sync")
         self.assertEqual(NSOApplyExecution.objects.filter(consumption_state="consumed").count(), 2)
-
-    def _serve_bgp_observation(self, generation=None, *, drift_peer=None):
-        from ._adapter_http import make_response
-        from ._routing_observation_case import routing_observation
-        from ._scope_observation_case import entry
-        from .test_read_gate import _rs
-
-        self.serve_terminal_evidence(self.terminal() if generation is None else generation)
-        self.server.evidence_incarnation = self.management.adapter_incarnation
-        original = self.adapter._handle
-        observation = routing_observation(
-            "bgp",
-            document={
-                "routers": [
-                    entry(
-                        asn="64512",
-                        router_id="198.18.0.1",
-                        scope=[
-                            entry(
-                                vrf="",
-                                address_family=[entry(afi="ipv4-unicast")],
-                                peer_group=[],
-                                peer=[
-                                    entry(
-                                        peer_address=row.peer_address_str,
-                                        remote_as="64513",
-                                        enabled=row.pk != getattr(drift_peer, "pk", None),
-                                        password_present=True,
-                                        peer_address_family=[entry(afi="ipv4-unicast", enabled=True)],
-                                    )
-                                    for row in self.owners[1:]
-                                ],
-                            )
-                        ],
-                    )
-                ],
-                "present": ["routers"],
-                "unprojectable": [],
-            },
-        )
-        peers = [
-            {
-                "peer_address": row.peer_address_str,
-                "remote_as": "64513",
-                "enabled": row.pk != getattr(drift_peer, "pk", None),
-                "password": "placeholder-secret-canary",
-                "address_families": [{"af": "ipv4-unicast", "enabled": True}],
-            }
-            for row in self.owners[1:]
-        ]
-        document = {
-            "routers": [
-                {
-                    "asn": "64512",
-                    "router_id": "198.18.0.1",
-                    "scopes": [{"vrf": "", "address_families": ["ipv4-unicast"], "peers": peers, "peer_groups": []}],
-                }
-            ],
-            "read_state": _rs(),
-            "observation": observation,
-        }
-
-        def handle(method, url, **kwargs):
-            if method == "GET" and url.endswith("/bgp-config"):
-                return make_response(200, document)
-            if method == "GET" and url.endswith("/bfd"):
-                return make_response(200, {"interfaces": []})
-            return original(method, url, **kwargs)
-
-        self.adapter._handle = handle
 
     def _notify_with_bgp_observation(self):
         from unittest.mock import patch
