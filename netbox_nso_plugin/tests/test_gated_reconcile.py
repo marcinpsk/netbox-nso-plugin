@@ -196,8 +196,8 @@ class TestGatedReconcileBehavior(_L2Base):
         row.refresh_from_db()
         self.assertEqual(row.status, "deploying")
 
-    def test_a_vanished_confirmed_sap_repends_a_deploying_sibling(self):
-        """A vanished confirmed SAP bears content, so every deploying row in the scope is stale."""
+    def test_a_vanished_confirmed_sap_preserves_a_deploying_sibling(self):
+        """A vanished confirmed SAP changes its contribution and preserves an unchanged sibling."""
         from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentRevision
 
         self._reconcile(_l2_payload(("TL", "TL2"), read_state=_rs(attempt_id=1)))
@@ -206,7 +206,6 @@ class TestGatedReconcileBehavior(_L2Base):
         content_update(deploying, status="accepted")
         content_update(confirmed, status="in_sync")
         attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
-        # Marked LAST, and lifecycle-only: a sibling content write re-pends a deploying row.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt.pk)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="l2_sap")
         before = revision.revision
@@ -218,8 +217,7 @@ class TestGatedReconcileBehavior(_L2Base):
         deploying.refresh_from_db()
         confirmed.refresh_from_db()
         revision.refresh_from_db()
-        self.assertEqual(deploying.status, "accepted")
-        self.assertIsNone(deploying.apply_attempt_id)
+        self.assertEqual((deploying.status, deploying.apply_attempt_id), ("deploying", attempt.pk))
         self.assertEqual(confirmed.status, "changed")
         self.assertEqual(revision.revision, before + 1)
 
@@ -1229,7 +1227,7 @@ class TestRealBodyGateSweep(TestCase):
 class TestDefaultPlanContentMutation(TestCase):
     """Exercise an owned-fragment change through a real default-plan body."""
 
-    def test_late_stale_bfd_transition_repends_a_row_settled_earlier_in_the_body(self):
+    def test_late_bfd_drift_preserves_an_unchanged_matching_deploying_row(self):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.reconcile import reconcile_category
 
@@ -1254,7 +1252,8 @@ class TestDefaultPlanContentMutation(TestCase):
             multiplier=3,
             status="in_sync",
         )
-        mirror_update(deploying, status="deploying", apply_attempt_id=uuid.uuid4())
+        attempt = uuid.uuid4()
+        mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
         document = {
             "interfaces": [
                 {
@@ -1274,10 +1273,9 @@ class TestDefaultPlanContentMutation(TestCase):
         confirmed.refresh_from_db()
         self.assertEqual(context["_gate"]["bfd"], "ran")
         self.assertEqual(confirmed.status, "changed")
-        self.assertEqual(deploying.status, "accepted")
-        self.assertIsNone(deploying.apply_attempt_id)
+        self.assertEqual((deploying.status, deploying.apply_attempt_id), ("deploying", attempt))
 
-    def test_stale_bfd_drift_repends_the_complete_scope(self):
+    def test_bfd_drift_preserves_an_unchanged_missing_deploying_row(self):
         from netbox_nso_plugin.models import NSOBFDInterfaceState
         from netbox_nso_plugin.reconcile import reconcile_category
 
@@ -1293,6 +1291,7 @@ class TestDefaultPlanContentMutation(TestCase):
             multiplier=3,
             status="in_sync",
         )
+        attempt = uuid.uuid4()
         deploying = acquire_overlay(
             NSOBFDInterfaceState,
             management=mgmt,
@@ -1301,7 +1300,7 @@ class TestDefaultPlanContentMutation(TestCase):
             min_rx=300,
             multiplier=3,
             status="deploying",
-            apply_attempt_id=uuid.uuid4(),
+            apply_attempt_id=attempt,
         )
         document = {"interfaces": [], "read_state": _rs()}
 
@@ -1312,12 +1311,11 @@ class TestDefaultPlanContentMutation(TestCase):
         deploying.refresh_from_db()
         self.assertEqual(context["_gate"]["bfd"], "ran")
         self.assertEqual(confirmed.status, "changed")
-        self.assertEqual(deploying.status, "accepted")
-        self.assertIsNone(deploying.apply_attempt_id)
+        self.assertEqual((deploying.status, deploying.apply_attempt_id), ("deploying", attempt))
 
 
 class TestStalePlanRace(TestCase):
-    """A competing edit committed after planning is a stale attempt, not a scope fault."""
+    """A read publishes observations while preserving bookkeeping changed after planning."""
 
     def setUp(self):
         self.device, self.mgmt = _make(f"gz{uuid.uuid4().hex[:6]}", manage_interfaces=True)
@@ -1341,11 +1339,13 @@ class TestStalePlanRace(TestCase):
     @staticmethod
     def _planner_that_stales(state):
         """Freeze the real SVI plan, then commit the lifecycle write that stales it."""
+        from netbox_nso_plugin.lifecycle_fence import authoritative_bookkeeping
         from netbox_nso_plugin.svi_reconciler import svi_reconcile_plan
 
         def plan(device, payload):
             frozen = svi_reconcile_plan(device, payload)
-            mirror_update(state, last_apply_error="the device refused the last apply")
+            with authoritative_bookkeeping():
+                mirror_update(state, last_apply_error="the device refused the last apply")
             return frozen
 
         return plan
@@ -1362,15 +1362,16 @@ class TestStalePlanRace(TestCase):
             row.applied_publication_sequence,
         )
 
-    def _assert_skipped_without_fault(self, ctx, state, status_before, markers_before):
-        self.assertEqual(ctx["_gate"]["svi"], "skipped_stale_attempt")
-        self.assertEqual(self._markers(), markers_before)
+    def _assert_published_without_clobber(self, ctx, state, status_before, markers_before):
+        self.assertEqual(ctx["_gate"]["svi"], "ran")
+        self.assertEqual(self._markers()[0], 2)
+        self.assertGreater(self._markers()[0], markers_before[0])
         state.refresh_from_db()
         self.assertEqual(state.status, status_before)
         self.assertNotEqual(state.status, "error")
         self.assertEqual(state.last_apply_error, "the device refused the last apply")
 
-    def test_category_svi_race_skips_without_faulting_the_scope(self):
+    def test_category_svi_race_publishes_without_clobbering_newer_bookkeeping(self):
         from netbox_nso_plugin.reconcile import reconcile_category
 
         state = self._seed()
@@ -1386,12 +1387,13 @@ class TestStalePlanRace(TestCase):
         ):
             ctx = reconcile_category(self.device, self.mgmt, "svi")
 
-        self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
+        self._assert_published_without_clobber(ctx, state, status_before, markers_before)
 
     def _assert_l2_status_race(self, whole_device):
         from contextlib import ExitStack
 
         from netbox_nso_plugin.l2_service_reconciler import l2_service_reconcile_plan
+        from netbox_nso_plugin.lifecycle_fence import authoritative_bookkeeping
         from netbox_nso_plugin.models import NSOFamilyReadState
         from netbox_nso_plugin.reconcile import reconcile_category, reconcile_device
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
@@ -1421,7 +1423,7 @@ class TestStalePlanRace(TestCase):
             mutation = RendererMutationPlan.build(
                 grant=OwnershipGrant("create"), saves=(planned_save(state, update_fields=("status",)),)
             )
-            with renderer_mirror_writes(mutation) as writer:
+            with authoritative_bookkeeping(), renderer_mirror_writes(mutation) as writer:
                 writer.save(state, update_fields=("status",))
             return frozen
 
@@ -1444,8 +1446,9 @@ class TestStalePlanRace(TestCase):
 
             with patch("netbox_nso_plugin.l2_service_reconciler.l2_service_reconcile_plan", side_effect=stale_plan):
                 ctx = refresh()
-            self.assertEqual(ctx["_gate"]["l2_service"], "skipped_stale_attempt")
-            self.assertEqual(markers(), before)
+            self.assertEqual(ctx["_gate"]["l2_service"], "ran")
+            self.assertEqual(markers()[0], 2)
+            self.assertGreater(markers()[0], before[0])
             state.refresh_from_db()
             self.assertEqual(state.status, "changed")
             self.assertEqual(state.last_apply_error, "")
@@ -1455,13 +1458,13 @@ class TestStalePlanRace(TestCase):
             state.refresh_from_db()
             self.assertEqual(state.status, "imported")
 
-    def test_category_l2_status_race_skips_and_replays_publication(self):
+    def test_category_l2_status_race_preserves_newer_bookkeeping_then_replays(self):
         self._assert_l2_status_race(whole_device=False)
 
-    def test_device_l2_status_race_skips_and_replays_publication(self):
+    def test_device_l2_status_race_preserves_newer_bookkeeping_then_replays(self):
         self._assert_l2_status_race(whole_device=True)
 
-    def test_device_svi_race_skips_without_faulting_the_scope(self):
+    def test_device_svi_race_publishes_without_clobbering_newer_bookkeeping(self):
         from contextlib import ExitStack
 
         from netbox_nso_plugin.reconcile import reconcile_device
@@ -1484,7 +1487,7 @@ class TestStalePlanRace(TestCase):
             )
             ctx = reconcile_device(self.device, self.mgmt)
 
-        self._assert_skipped_without_fault(ctx, state, status_before, markers_before)
+        self._assert_published_without_clobber(ctx, state, status_before, markers_before)
 
 
 class TestSwitchportCascadeRace(TestCase):

@@ -1118,7 +1118,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         self.assertFalse(plan.changes_content)
         self.assertEqual(plan.write_set[0].selected_pks, (lower.pk, higher.pk))
 
-    def test_content_save_bumps_repends_enqueues_and_finalizes_fingerprint(self):
+    def test_content_save_bumps_preserves_deploying_enqueues_and_finalizes_fingerprint(self):
         from netbox_nso_plugin import delivery
         from netbox_nso_plugin.renderer_writer import (
             RendererMutationPlan,
@@ -1134,6 +1134,7 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
         )
         deploying = own_vlan(management, 1628, "writer-content-peer")
         mirror_update(deploying, status="deploying", apply_attempt_id=uuid4())
+        deploying_attempt_id = deploying.apply_attempt_id
         NSOIntentOutboxEntry.objects.filter(device=device, scope="vlan").delete()
         revision, _created = NSOIntentRevision.objects.get_or_create(device=device, scope="vlan")
         before = revision.revision
@@ -1153,8 +1154,8 @@ class TestRendererContentWriter(IntentPushResetMixin, TestCase):
             delivery.render("vlan", device.pk, management.adapter_device_id).payload
         )
         assert target.status == "accepted"
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert deploying.status == "deploying"
+        assert deploying.apply_attempt_id == deploying_attempt_id
         assert revision.revision == before + 1
         assert revision.verified_revision == revision.revision
         assert revision.verified_fingerprint == expected

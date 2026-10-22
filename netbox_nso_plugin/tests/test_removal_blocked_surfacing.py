@@ -82,6 +82,11 @@ def _removal_job(job_id, scope, status, updated="2026-07-10T07:00:00Z", context=
     }
 
 
+def _served(jobs):
+    """The device-jobs listing adds each job's per-scope outcome counts."""
+    return [{**job, "outcome_counts": []} for job in jobs]
+
+
 def _device_generations():
     # Copied from ../nso-adapter/docs/api-contract.md, GET devices/{id}/generations,
     # and ../nso-adapter/tests/api/test_device_generations.py, complete emit-null shape.
@@ -208,7 +213,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         """A failed removal with removal_blocked_collateral yields a blocked_removals entry."""
         job = _blocked_job()
         data = self._get_jobs([job])
-        self.assertEqual(data["jobs"], [job])
+        self.assertEqual(data["jobs"], _served([job]))
         self.assertEqual(len(data["blocked_removals"]), 1)
         entry = data["blocked_removals"][0]
         self.assertEqual(entry["scope"], "isis")
@@ -281,7 +286,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
                     data["apply_state_error"],
                     "The NSO adapter returned an invalid response. See the server log.",
                 )
-                self.assertEqual(data["jobs"], jobs)
+                self.assertEqual(data["jobs"], _served(jobs))
                 self.assertEqual(data["running"], running)
                 self.assertEqual(data["last"], blocked)
                 self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
@@ -297,7 +302,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
 
         self.assertIsNone(data["apply_state"])
         self.assertEqual(data["apply_state_error"], "The NSO adapter request failed. See the server log.")
-        self.assertEqual(data["jobs"], jobs)
+        self.assertEqual(data["jobs"], _served(jobs))
         self.assertEqual(data["running"], running)
         self.assertEqual(data["last"], blocked)
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
@@ -324,7 +329,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
             data["apply_state_error"],
             "The NSO adapter returned an invalid response. See the server log.",
         )
-        self.assertEqual(data["jobs"], jobs)
+        self.assertEqual(data["jobs"], _served(jobs))
         self.assertEqual(data["running"], running)
         self.assertEqual(data["last"], blocked)
         self.assertEqual(data["blocked_removals"][0]["job_id"], blocked["id"])
@@ -341,7 +346,26 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         data = self._get_jobs(jobs, generations=generations, generation_ids=(81, 82))
 
         self.assertEqual(data["generations"], generations[:2])
-        self.assertEqual(data["jobs"], [jobs[1]])
+        self.assertEqual(data["jobs"], _served([jobs[1]]))
+
+    def test_apply_chain_jobs_carry_their_outcome_counts(self):
+        from .test_refusal_result import refused_bgp_result
+
+        result = refused_bgp_result()
+        apply_job = {
+            **_removal_job(501, "vlan", "failed"),
+            "type": "apply",
+            "result": result,
+            "row_outcomes": result["row_outcomes"],
+            "refusals": result["refusals"],
+        }
+
+        data = self._get_jobs([apply_job], generations=_device_generations(), generation_ids=(81,))
+
+        self.assertEqual(
+            data["jobs"][0]["outcome_counts"],
+            [{"scope": "bgp", "in_sync": 0, "apply_failed": 1, "not_applied": 0, "unavailable": 0}],
+        )
 
     def test_requested_apply_generation_is_found_beyond_the_first_page(self):
         # One row past a full page, so only a second page can reach it.
@@ -361,7 +385,7 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         data = self._get_jobs(jobs, generations=generations, generation_ids=(wanted,))
 
         self.assertEqual(data["generations"], [generations[-1]])
-        self.assertEqual(data["jobs"], jobs)
+        self.assertEqual(data["jobs"], _served(jobs))
 
     def test_requested_apply_generation_starts_after_the_browser_cursor(self):
         wanted = _GENERATION_PAGE_LIMIT + 1

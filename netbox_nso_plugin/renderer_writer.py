@@ -345,6 +345,9 @@ class RendererMutationPlan:
 
         footprints.extend(additional_footprints)
         lock_footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
+        from .lifecycle_fence import capture_read_tokens
+
+        capture_read_tokens(lock_footprint.overlay_rows)
         return cls(
             write_set=tuple(writes),
             read_set=tuple(reads),
@@ -682,6 +685,8 @@ def _collector_closure(instance, *, effects_only=False):
 
 def _describe_collector(collector, root_identities, *, batch=False, effects_only=False):  # noqa: C901
     """Flatten the collected effects without replacing its dependency graph."""
+    from .models import NSOOverlaySettlementFence
+
     writes = []
     deleted_overlays = []
     footprints = []
@@ -720,6 +725,9 @@ def _describe_collector(collector, root_identities, *, batch=False, effects_only
         changed_keys.update(_changed_keys(before, after, spec, dependency_changed))
 
     for model, rows in collector.data.items():
+        # Acquisition creates fences after planning. Their cascade does not change renderer ownership.
+        if model is NSOOverlaySettlementFence:
+            continue
         for row in sorted(rows, key=lambda instance: instance.pk):
             _append_deleted_overlay(deleted_overlays, row)
             writes.append(
@@ -733,6 +741,8 @@ def _describe_collector(collector, root_identities, *, batch=False, effects_only
             )
             record_change(row, None)
     for queryset in collector.fast_deletes:
+        if queryset.model is NSOOverlaySettlementFence:
+            continue
         for row in queryset.order_by("pk"):
             _append_deleted_overlay(deleted_overlays, row)
             writes.append(
@@ -1142,6 +1152,38 @@ class RendererWriter:
     """Consume one frozen plan through exact ORM operations."""
 
     def __init__(self, plan: RendererMutationPlan, *, content: bool, permit):
+        from .lifecycle_fence import protected_read_fields
+        from .refusal_registry import OVERLAYS
+
+        self._read_preserved = {}
+        overlay_pks = defaultdict(set)
+        for write in plan.write_set:
+            if write.pk is not None and write.model_label in OVERLAYS and write.operation == "save":
+                overlay_pks[write.model_label].add(write.pk)
+        currents = {
+            (label, row.pk): row
+            for label, pks in overlay_pks.items()
+            for row in apps.get_model(label).objects.filter(pk__in=pks).order_by()
+        }
+        writes = []
+        for write in plan.write_set:
+            if write.pk is not None and write.model_label in OVERLAYS and write.operation == "save":
+                current = currents.get((write.model_label, write.pk))
+                if current is None:
+                    raise IntentPlanStaleError(f"{write.model_label} row {write.pk!r} changed after planning")
+                protected = protected_read_fields(current)
+                values = {name: getattr(current, name) for name in protected if hasattr(current, name)}
+                self._read_preserved[(write.model_label, write.pk)] = values
+                frozen = {
+                    name: freeze_field_value(current._meta.get_field(name), value) for name, value in values.items()
+                }
+                write = replace(
+                    write,
+                    values=tuple((name, frozen.get(name, value)) for name, value in write.values),
+                    before_values=tuple((name, frozen.get(name, value)) for name, value in write.before_values),
+                )
+            writes.append(write)
+        plan = replace(plan, write_set=tuple(writes))
         self.plan = plan
         self.content = content
         self.permit = permit
@@ -1303,7 +1345,7 @@ class RendererWriter:
                 write.operation == "save"
                 and write.model_label == instance._meta.label_lower
                 and self._identity_matches(write, instance)
-                and write.update_fields == normalized_fields
+                and self._save_fields_match(write, instance, normalized_fields)
                 and self._fields_match(write.values, instance)
                 and write.force_insert is bool(force_insert)
             ):
@@ -1314,6 +1356,15 @@ class RendererWriter:
                 return index
         raise IntentMutationProtocolError(
             f"save of {instance._meta.label_lower} row {instance.pk!r} is outside the frozen write set"
+        )
+
+    def _save_fields_match(self, write, instance, normalized_fields):
+        preserved = self._read_preserved.get((instance._meta.label_lower, instance.pk), {})
+        return write.update_fields == normalized_fields or (
+            bool(preserved)
+            and write.update_fields is not None
+            and normalized_fields is not None
+            and set(write.update_fields) - preserved.keys() == set(normalized_fields) - preserved.keys()
         )
 
     def _resolve_reference(self, reference):
@@ -1438,6 +1489,8 @@ class RendererWriter:
 
     def save_via(self, instance, save, *, update_fields=None, force_insert=False):
         """Execute one exact planned save through a model-aware callback."""
+        for name, value in self._read_preserved.get((instance._meta.label_lower, instance.pk), {}).items():
+            setattr(instance, name, value)
         index = self._find_save(instance, update_fields, force_insert)
         write = self.plan.write_set[index]
         previous_binding = (
@@ -1731,7 +1784,7 @@ class RendererWriter:
             write.operation == "save"
             and write.model_label == instance._meta.label_lower
             and self._active_instance is instance
-            and write.update_fields == normalized_fields
+            and self._save_fields_match(write, instance, normalized_fields)
             and self._fields_match(write.values, instance)
         )
 
@@ -1889,7 +1942,6 @@ def renderer_writes(plan: RendererMutationPlan, *, grant=None):
     with _intent_transaction(
         plan.lock_footprint,
         bump_keys=plan.content_keys,
-        repend_after=True,
         settles_deploying=plan.settles_deploying,
     ) as permit:
         if plan.validate_after_acquire is not None:

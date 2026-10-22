@@ -45,8 +45,10 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "c5a905fac77477bb17ca96666e20d264f22fab84c04590ca2745868b71c89fea"
-_ADAPTER_ROOT = Path(__file__).resolve().parents[2].parent / ".o3c-adapter"
+_ADAPTER_RUNTIME_DIGEST = "83214a24cf6c94e4d5cc0343d168d43a7c97aa20301806c85c4f3c71f309f766"
+_ADAPTER_ROOT = Path(
+    os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
+)
 _DSN_CREDENTIAL = re.compile(r"(?<=://)[^:/@\s]+:[^@/\s]+(?=@)")
 _DEVICE_INTENT_ROOT = "device-intent:device-intent"
 _DEVICE_INTENT_PATH = f"/restconf/data/{_DEVICE_INTENT_ROOT}"
@@ -523,7 +525,7 @@ class _O3CEnvironment:
             [
                 uv,
                 "run",
-                "--native-tls",
+                "--system-certs",
                 "--frozen",
                 "--",
                 "scripts/docker-entrypoint.sh",
@@ -976,6 +978,23 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
 
 
 @tag("o3c")
+class TestO3CJoinedPinUvVersion(SimpleTestCase):
+    def test_the_joined_pin_job_pins_a_uv_that_accepts_system_certs(self):
+        import yaml
+
+        jobs = yaml.safe_load(_WORKFLOW.read_text(encoding="utf-8"))["jobs"].values()
+        (steps,) = [
+            job["steps"]
+            for job in jobs
+            if any(step.get("with", {}).get("path") == ".o3c-adapter" for step in job["steps"])
+        ]
+        (setup_uv,) = [step for step in steps if step.get("uses", "").startswith("astral-sh/setup-uv@")]
+        version = str(setup_uv.get("with", {}).get("version", ""))
+        assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"setup-uv must pin an exact uv version, got {version!r}"
+        # uv rejects --system-certs before 0.11.0.
+        assert tuple(int(part) for part in version.split(".")) >= (0, 11, 0)
+
+
 class TestO3CEnvironmentFailFast(SimpleTestCase):
     """Prove a failed preflight tears down without hanging the suite."""
 

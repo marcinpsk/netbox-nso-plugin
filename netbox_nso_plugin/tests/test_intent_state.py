@@ -575,22 +575,22 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertIsNone(self.state.apply_attempt_id)
 
     def test_content_mutation_rejects_a_bump_key_outside_its_locked_footprint(self):
-        from netbox_nso_plugin.intent_state import _bump_and_lock_deploying
+        from netbox_nso_plugin.intent_state import _acquire
 
         footprint = MutationFootprint.for_keys({(self.device.pk, "vlan")})
+        before = NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision
 
         with (
-            patch("netbox_nso_plugin.outbox.bump_intent_revision") as bump,
             self.assertRaisesRegex(IntentMutationProtocolError, "outside the active mutation footprint"),
             transaction.atomic(),
         ):
-            _bump_and_lock_deploying(
+            _acquire(
                 footprint,
                 bump_keys=frozenset({(self.device.pk, "bgp")}),
                 bump_owned_plan_rows=False,
             )
 
-        bump.assert_not_called()
+        self.assertEqual(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision, before)
 
     def test_detected_reconcile_can_delete_a_captured_deploying_row(self):
         attempt_id = uuid4()
@@ -636,7 +636,7 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         self.assertEqual(revision.revision, before + 1)
         self.assertEqual(other_revision.revision, other_before)
 
-    def test_detected_partial_bump_repends_only_the_selected_scope(self):
+    def test_detected_partial_bump_bumps_only_the_selected_scope_and_preserves_deploying_rows(self):
         from netbox_nso_plugin.intent_state import _upgrade_detected_reconcile
 
         other_device, other_management = make_managed("intent-other", 1624, index=2)
@@ -667,8 +667,8 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
         other.refresh_from_db()
         selected_revision.refresh_from_db()
         other_revision.refresh_from_db()
-        self.assertEqual(self.state.status, "accepted")
-        self.assertIsNone(self.state.apply_attempt_id)
+        self.assertEqual(self.state.status, "deploying")
+        self.assertEqual(self.state.apply_attempt_id, attempts[0])
         self.assertEqual(other.status, "deploying")
         self.assertEqual(other.apply_attempt_id, attempts[1])
         self.assertEqual(selected_revision.revision, selected_before + 1)
@@ -900,14 +900,15 @@ class TestIntentMutationProtocol(_CascadeFlushMixin, IntentPushResetMixin, Trans
             with offline_mutation():
                 pass
 
-    def test_a_deploying_row_that_vanished_unaccounted_fails_the_repend(self):
-        from netbox_nso_plugin.intent_state import _repend_locked_rows, intent_transaction
+    def test_an_owner_that_vanished_unaccounted_fails_finalization(self):
+        from netbox_nso_plugin.intent_state import intent_transaction
+        from netbox_nso_plugin.lifecycle_fence import finish_locked_owners
 
         vanished = SourceRow(self.state._meta.label_lower, self.state.pk + 1_000_000)
 
         with without_commit_drain(), intent_transaction(MutationFootprint.for_keys({(self.device.pk, "vlan")})):
             with self.assertRaisesRegex(IntentMutationProtocolError, "vanished"):
-                _repend_locked_rows((vanished,))
+                finish_locked_owners({vanished: (None, 0, ())})
 
     def test_a_planned_delete_accounts_for_the_deploying_row_it_consumes(self):
         from uuid import uuid4

@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1502 Appendix S (S4) — the cursor epoch, the durable stall bound, the consumer.
+"""The cursor epoch, durable unresolved evidence, and ordered consumption.
 
 Pins S4.1 through S4.6. Every test drives the consumer over a **real HTTP** adapter double
 on a loopback socket, so the parameters it builds, the header it reads and the errors it
 maps are its own and not a canned return value. S4.3 goes further and drives two real
-``manage.py`` subprocesses against the committed test database, because a durable counter
-and a module global are indistinguishable from inside one process.
+``manage.py`` subprocesses against the committed test database, because durable unresolved evidence must survive a real process restart.
 """
 
 from __future__ import annotations
@@ -20,7 +19,15 @@ import threading
 from django.db import connection, connections
 from django.utils import timezone
 
-from ._settlement_case import FINGERPRINT, _make_device, _make_mgmt, _own, _result, _route, _SettlementCase
+from ._settlement_case import (
+    _execution_result,
+    _make_device,
+    _make_mgmt,
+    _own,
+    _record_execution,
+    _route,
+    _SettlementCase,
+)
 
 
 class TestConsumptionIsOnceAndMonotone(_SettlementCase):
@@ -30,10 +37,10 @@ class TestConsumptionIsOnceAndMonotone(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("once")
-        mgmt = _make_mgmt(device, "once", 10)
+        mgmt = _make_mgmt(device, "once", 10, adapter=self.adapter)
         sr = _route("10.1.0.0/16", "10.1.0.1", devices=[device])
-        _own(sr, mgmt, generation=41)
-        self.adapter.store.terminal_job(10, results=[_result(sr.pk, 41)])
+        _own(sr, mgmt, generation=41, orphan=True)
+        self.adapter.store.terminal_job(10, job_type="sync")
 
         first = consume_static_route_settlements(mgmt)
         assert first.consumed == 1
@@ -52,10 +59,10 @@ class TestConsumptionIsOnceAndMonotone(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("race")
-        mgmt = _make_mgmt(device, "race", 20)
+        mgmt = _make_mgmt(device, "race", 20, adapter=self.adapter)
         sr = _route("10.2.0.0/16", "10.2.0.1", devices=[device])
-        _own(sr, mgmt, generation=42)
-        self.adapter.store.terminal_job(20, results=[_result(sr.pk, 42)])
+        _own(sr, mgmt, generation=42, orphan=True)
+        self.adapter.store.terminal_job(20, job_type="sync")
 
         results, errors = [], []
         start = threading.Barrier(2)
@@ -85,11 +92,11 @@ class TestConsumptionIsOnceAndMonotone(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("fields")
-        mgmt = _make_mgmt(device, "fields", 30)
+        mgmt = _make_mgmt(device, "fields", 30, adapter=self.adapter)
         sr = _route("10.3.0.0/16", "10.3.0.1", devices=[device])
-        _own(sr, mgmt, generation=43)
+        _own(sr, mgmt, generation=43, orphan=True)
         store = self.adapter.store
-        store.terminal_job(30, results=[_result(sr.pk, 43)])
+        store.terminal_job(30, job_type="sync")
         store.requests.clear()
 
         consume_static_route_settlements(mgmt)
@@ -107,10 +114,10 @@ class TestConsumptionIsOnceAndMonotone(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("locked")
-        mgmt = _make_mgmt(device, "locked", 31)
+        mgmt = _make_mgmt(device, "locked", 31, adapter=self.adapter)
         sr = _route("10.31.0.0/16", "10.31.0.1", devices=[device])
-        _own(sr, mgmt, generation=44)
-        self.adapter.store.terminal_job(31, results=[_result(sr.pk, 44)])
+        _own(sr, mgmt, generation=44, orphan=True)
+        self.adapter.store.terminal_job(31, job_type="sync")
 
         # A caller whose in-memory row is stale — exactly what the link repair leaves behind.
         mgmt.adapter_device_id = 999
@@ -131,10 +138,10 @@ class TestCursorEpoch(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("inc")
-        mgmt = _make_mgmt(device, "inc", 40)
+        mgmt = _make_mgmt(device, "inc", 40, adapter=self.adapter)
         sr = _route("10.4.0.0/16", "10.4.0.1", devices=[device])
-        _own(sr, mgmt, generation=44)
-        self.adapter.store.terminal_job(40, results=[_result(sr.pk, 44)])
+        _own(sr, mgmt, generation=44, orphan=True)
+        self.adapter.store.terminal_job(40, job_type="sync")
 
         # A cursor recorded against a store that is gone: everything below it would be
         # skipped forever if the epoch were not compared.
@@ -152,24 +159,24 @@ class TestCursorEpoch(_SettlementCase):
         assert row.settle_cursor_seq == 1
         assert row.settle_cursor_incarnation == self.adapter.store.incarnation
         # The first page was fetched from the dead cursor, so it had to be re-requested.
-        assert [request[1] for request in self.adapter.store.feed_requests] == [100, 0]
+        assert [request[1] for request in self.adapter.store.feed_requests][-2:] == [100, 0]
 
-    def test_a_first_consumption_asks_for_the_page_once(self):
+    def test_a_first_consumption_uses_one_cursor_page_after_epoch_brackets(self):
         """The epoch resets on a cursor that is already 0, so the page just fetched stands."""
         from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, consume_static_route_settlements
 
         device = _make_device("firstpass")
-        mgmt = _make_mgmt(device, "firstpass", 42)
+        mgmt = _make_mgmt(device, "firstpass", 42, adapter=self.adapter)
         sr = _route("10.42.0.0/16", "10.42.0.1", devices=[device])
-        _own(sr, mgmt, generation=52)
-        self.adapter.store.terminal_job(42, results=[_result(sr.pk, 52)])
+        _own(sr, mgmt, generation=52, orphan=True)
+        self.adapter.store.terminal_job(42, job_type="sync")
 
         result = consume_static_route_settlements(mgmt)
 
         assert result.epoch_reset is True
         assert result.consumed == 1
-        assert self.adapter.store.feed_requests == [(42, 0, SETTLE_FEED_PAGE)], (
-            f"the identical page was requested twice: {self.adapter.store.feed_requests}"
+        assert self.adapter.store.feed_requests == [(42, 0, SETTLE_FEED_PAGE), (42, 1, 1), (42, 0, SETTLE_FEED_PAGE)], (
+            f"expected two epoch brackets and one initial cursor page: {self.adapter.store.feed_requests}"
         )
 
     def test_a_recreated_management_row_starts_from_the_beginning(self):
@@ -177,17 +184,17 @@ class TestCursorEpoch(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("recreate")
-        mgmt = _make_mgmt(device, "recreate", 41)
+        mgmt = _make_mgmt(device, "recreate", 41, adapter=self.adapter)
         sr = _route("10.5.0.0/16", "10.5.0.1", devices=[device])
-        _own(sr, mgmt, generation=45)
-        self.adapter.store.terminal_job(41, results=[_result(sr.pk, 45)])
+        _own(sr, mgmt, generation=45, orphan=True)
+        self.adapter.store.terminal_job(41, job_type="sync")
         consume_static_route_settlements(mgmt)
         assert self._cursor(mgmt).settle_cursor_seq == 1
 
         mgmt.delete()
-        fresh = _make_mgmt(device, "recreate", 41)
+        fresh = _make_mgmt(device, "recreate", 41, adapter=self.adapter)
         sr2 = _route("10.5.1.0/24", "10.5.1.1", devices=[device])
-        _own(sr2, fresh, generation=46)
+        _own(sr2, fresh, generation=46, orphan=True)
 
         result = consume_static_route_settlements(fresh)
 
@@ -205,10 +212,10 @@ class TestCursorEpoch(_SettlementCase):
             with self.subTest(arm=arm):
                 store = self.adapter.store
                 device = _make_device(f"remap{arm}")
-                mgmt = _make_mgmt(device, f"remap{arm}", 100)
+                mgmt = _make_mgmt(device, f"remap{arm}", 100, adapter=self.adapter)
                 identity = mgmt.nso_instance.adapter_instance_id
                 sr = _route(f"10.6.{len(arm)}.0/24", "10.6.0.1", devices=[device])
-                _own(sr, mgmt, generation=50 + len(arm))
+                _own(sr, mgmt, generation=50 + len(arm), orphan=True)
 
                 # A cursor already well past this device's history, on adapter device 100.
                 NSODeviceManagement.objects.filter(pk=mgmt.pk).update(
@@ -222,6 +229,7 @@ class TestCursorEpoch(_SettlementCase):
 
                 if arm == "moved":
                     # Our device is present under a different id.
+                    store.devices.pop(100)
                     store.add_device(
                         nso_instance=identity,
                         nso_device_name=mgmt.nso_device_name,
@@ -241,15 +249,15 @@ class TestCursorEpoch(_SettlementCase):
                         netbox_device_id=device.pk,
                     )
                 else:
-                    # Our device is gone: the re-save's not-found scope push re-onboards it.
-                    pass
+                    # The missing device must be onboarded by the link repair.
+                    store.devices.pop(100)
 
                 reconcile_device_links([NSODeviceManagement.objects.get(pk=mgmt.pk)])
 
                 row = NSODeviceManagement.objects.get(pk=mgmt.pk)
                 assert row.adapter_device_id not in (None, 100), f"{arm}: the link was not repaired"
                 new_id = row.adapter_device_id
-                store.terminal_job(new_id, results=[_result(sr.pk, 50 + len(arm))])
+                store.terminal_job(new_id, job_type="sync")
 
                 result = consume_static_route_settlements(mgmt)
 
@@ -267,12 +275,12 @@ class TestCursorEpoch(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("rebuild")
-        mgmt = _make_mgmt(device, "rebuild", 60)
+        mgmt = _make_mgmt(device, "rebuild", 60, adapter=self.adapter)
         sr = _route("10.7.0.0/16", "10.7.0.1", devices=[device])
-        _own(sr, mgmt, generation=47)
+        _own(sr, mgmt, generation=47, orphan=True)
 
         for _ in range(3):
-            self.adapter.store.terminal_job(60, results=[_result(sr.pk, 47)])
+            self.adapter.store.terminal_job(60, job_type="sync")
         first = consume_static_route_settlements(mgmt)
         assert first.cursor == 3
         born = self.adapter.store.incarnation
@@ -286,7 +294,13 @@ class TestCursorEpoch(_SettlementCase):
         rebuilt = self.adapter.rebuild()
         assert rebuilt.incarnation != born
         self._point_at(self.adapter)
-        rebuilt.terminal_job(60, results=[_result(sr.pk, 47)])
+        rebuilt.add_device(
+            nso_instance=mgmt.nso_instance.name,
+            nso_device_name=mgmt.nso_device_name,
+            netbox_device_id=device.pk,
+            device_id=60,
+        )
+        rebuilt.terminal_job(60, job_type="sync")
 
         row = NSODeviceManagement.objects.get(pk=mgmt.pk)
         assert row.adapter_device_id == 60
@@ -301,200 +315,218 @@ class TestCursorEpoch(_SettlementCase):
         assert after.settle_cursor_incarnation == rebuilt.incarnation
 
 
-class TestStallBound(_SettlementCase):
-    """S4.4 / S4.5 / S4.6 — the triple describes one sequence, and the bound is five."""
+class TestUnresolvedExecution(_SettlementCase):
+    """An unresolved ordered execution remains retained until exact consumption."""
 
     def _unresolvable(self, tag, adapter_device_id):
-        """A device whose head settlement cannot be correlated: no expectation, no read-back."""
         device = _make_device(tag)
-        mgmt = _make_mgmt(device, tag, adapter_device_id)
-        sr = _route(f"10.8.{adapter_device_id % 250}.0/24", "10.8.0.1", devices=[device])
-        _own(sr, mgmt, generation=70, expected=False)
-        self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 70)])
-        self.adapter.store.intent_status = 503
+        mgmt = _make_mgmt(device, tag, adapter_device_id, adapter=self.adapter)
+        sr = _route(f"198.18.{adapter_device_id % 250}.0/24", "198.18.0.1", devices=[device])
+        _own(sr, mgmt, generation=70, expected=False, orphan=True)
+        self.adapter.store.terminal_job(adapter_device_id, extra=_execution_result())
         return mgmt, sr
 
-    def test_the_stall_bound_is_exactly_five_attempts(self):
-        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS, consume_static_route_settlements
+    def test_repeated_passes_never_discard_unresolved_execution(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        mgmt, _sr = self._unresolvable("bound", 70)
-
-        for attempt in range(1, SETTLE_STALL_MAX_ATTEMPTS):
+        mgmt, _sr = self._unresolvable("retained", 70)
+        for attempt in range(1, 8):
             result = consume_static_route_settlements(mgmt)
-            assert result.stalled is True
-            assert result.advanced_past_stall is False, f"advanced early, on attempt {attempt}"
+            assert result.stalled
+            assert not result.drained
             row = self._cursor(mgmt)
             assert row.settle_stall_attempts == attempt
-            assert row.settle_cursor_seq == 0, "the cursor moved past an unresolved settlement"
+            assert row.settle_cursor_seq == 0
+            assert row.settle_stall_seq == 1
+        assert len(self.adapter.store.jobs) == 1
 
-        final = consume_static_route_settlements(mgmt)
+    def test_stall_state_describes_exactly_one_sequence(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        assert final.advanced_past_stall is True
+        mgmt, _sr = self._unresolvable("onlyone", 71)
+        consume_static_route_settlements(mgmt)
+        consume_static_route_settlements(mgmt)
+        assert self._cursor(mgmt).settle_stall_attempts == 2
+        _record_execution(mgmt, self.adapter.store, self.adapter.store.jobs[-1])
+        result = consume_static_route_settlements(mgmt)
+        assert result.consumed == 1
         row = self._cursor(mgmt)
         assert row.settle_cursor_seq == 1
         assert row.settle_stall_seq is None
         assert row.settle_stall_attempts == 0
-        assert SETTLE_STALL_MAX_ATTEMPTS == 5
-
-    def test_stall_state_describes_exactly_one_sequence(self):
-        """S4.4 — a stall on N may not mis-bound a later stall on M."""
-        from netbox_nso_plugin.settlement import consume_static_route_settlements
-
-        mgmt, sr = self._unresolvable("onlyone", 71)
-
-        consume_static_route_settlements(mgmt)
-        consume_static_route_settlements(mgmt)
-        assert self._cursor(mgmt).settle_stall_attempts == 2
-
-        # The read-back recovers, so the head resolves and the walk advances past it.
-        self.adapter.store.intent_status = 200
-        self.adapter.store.echo(71, sr.pk, 70, FINGERPRINT)
-        result = consume_static_route_settlements(mgmt)
-
-        assert result.consumed == 1
-        row = self._cursor(mgmt)
-        assert row.settle_cursor_seq == 1
-        assert row.settle_stall_seq is None, "the triple survived an advance"
-        assert row.settle_stall_attempts == 0
         assert row.settle_stall_first_seen_at is None
 
-        # A later head that stalls starts its own count from one, not from three.
-        sr2 = _route("10.9.0.0/16", "10.9.0.1", devices=[mgmt.device])
-        _own(sr2, mgmt, generation=71, expected=False)
-        self.adapter.store.terminal_job(71, results=[_result(sr2.pk, 71)])
-        self.adapter.store.intent_status = 503
-
+        self.adapter.store.terminal_job(71, extra=_execution_result())
         consume_static_route_settlements(mgmt)
-
         row = self._cursor(mgmt)
         assert row.settle_stall_seq == 2
         assert row.settle_stall_attempts == 1
 
-    def test_a_read_back_that_names_nothing_advances_instead_of_stalling(self):
-        """An expectation the store no longer holds can never arrive, so nothing may wait."""
+    def test_empty_readback_does_not_replace_missing_execution_proof(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         mgmt, _sr = self._unresolvable("nothing", 72)
-        # The read-back answers, but the store no longer carries this route at all.
-        self.adapter.store.intent_status = 200
-
         result = consume_static_route_settlements(mgmt)
+        assert result.stalled
+        assert result.consumed == 0
+        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert self.adapter.store.readback_requests == []
 
-        assert result.stalled is False, "an undecidable-forever result was stalled instead of advanced"
-        assert result.consumed == 1
-        row = self._cursor(mgmt)
-        assert row.settle_cursor_seq == 1
-        assert row.settle_stall_seq is None
+    def test_exact_consumed_or_superseded_execution_advances_once(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        for index, state in enumerate(("consumed", "superseded")):
+            with self.subTest(state=state):
+                mgmt, _sr = self._unresolvable(state, 75 + index)
+                _record_execution(mgmt, self.adapter.store, self.adapter.store.jobs[-1], state=state)
+                first = consume_static_route_settlements(mgmt)
+                second = consume_static_route_settlements(mgmt)
+                assert first.consumed == 1
+                assert second.consumed == 0
+                assert first.cursor == second.cursor == 1
+
+    def test_mismatched_consumed_projection_cannot_advance(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        mgmt, _sr = self._unresolvable("wrongprojection", 77)
+        execution = _record_execution(mgmt, self.adapter.store, self.adapter.store.jobs[-1])
+        projection = execution.terminal_projection
+        projection["carrier_job_result"]["commit_acknowledged"] = False
+        execution.terminal_projection = projection
+        execution.save(update_fields=("terminal_projection",))
+        result = consume_static_route_settlements(mgmt)
+        assert result.stalled
+        assert self._cursor(mgmt).settle_cursor_seq == 0
 
     def test_a_queued_sibling_never_blocks_the_cursor(self):
-        """S4.5 (P5.12) — an unsequenced job is invisible and consumed later, at its own seq."""
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("queued")
-        mgmt = _make_mgmt(device, "queued", 80)
-        sr = _route("10.10.0.0/16", "10.10.0.1", devices=[device])
-        _own(sr, mgmt, generation=72)
+        mgmt = _make_mgmt(device, "queued", 80, adapter=self.adapter)
         store = self.adapter.store
-        store.queued_job(80)
-        store.terminal_job(80, results=[_result(sr.pk, 72)])
-
-        first = consume_static_route_settlements(mgmt)
-
-        assert first.consumed == 1, "the queued sibling blocked the terminal job behind it"
+        store.queued_job(80, job_type="sync")
+        store.terminal_job(80, job_type="sync")
+        assert consume_static_route_settlements(mgmt).consumed == 1
         assert self._cursor(mgmt).settle_cursor_seq == 1
-
-        # The queued job terminalizes later and takes the NEXT sequence, above the cursor.
-        store.terminal_job(80, results=[_result(sr.pk, 72)])
-        second = consume_static_route_settlements(mgmt)
-
-        assert second.consumed == 1
+        store.terminal_job(80, job_type="sync")
+        assert consume_static_route_settlements(mgmt).consumed == 1
         assert self._cursor(mgmt).settle_cursor_seq == 2
 
+    def test_backlog_beyond_the_evidence_bound_still_drains_one_page(self):
+        from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE, consume_static_route_settlements
 
-class TestAFeedRowWithNoSequenceIsSkipped(_SettlementCase):
-    """S4.6: a page that breaks the feed contract may not block the sequences behind it.
+        device = _make_device("backlog")
+        mgmt = _make_mgmt(device, "backlog", 81, adapter=self.adapter)
+        for _ in range(10_001):
+            self.adapter.store.terminal_job(81, job_type="sync")
+        result = consume_static_route_settlements(mgmt)
+        assert (result.stalled, result.consumed, result.cursor) == (False, SETTLE_FEED_PAGE, SETTLE_FEED_PAGE)
+        assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
 
-    An unsequenced row carries no position, so it blocks no position: the cursor can never
-    move past it and nothing sits behind it in settlement order. Stalling on it instead costs
-    twice. The entry has no durable identity, so no cursor can exclude it and every pass after
-    the bound starts the count again — the feed then drains one pass in five, forever. And the
-    stall triple it borrows is the one an undecided *sequence* needs: the two reset each
-    other's count on every cycle, so that bound is never reached and the device head-of-line
-    blocks for good, which is the failure the bound exists to prevent.
-
-    Skipping loses nothing. A job that later takes a sequence takes one above this cursor and
-    is consumed then, exactly like the queued sibling the feed never served.
-    """
-
-    def _broken_feed(self, tag, adapter_device_id, *, expected=True):
-        """A device whose feed head is an unsequenced row, with a real settlement behind it."""
-        device = _make_device(tag)
-        mgmt = _make_mgmt(device, tag, adapter_device_id)
-        sr = _route(f"10.12.{adapter_device_id % 250}.0/24", "10.12.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=74, expected=expected)
-        self.adapter.store.unsequenced_job(adapter_device_id, results=[_result(sr.pk, 74)])
-        self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 74)])
-        return mgmt, state
-
-    def test_the_sequenced_job_behind_it_drains_on_the_first_pass(self):
+    def test_backlog_beyond_the_evidence_bound_still_stalls_on_an_unresolved_apply(self):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        mgmt, state = self._broken_feed("nosequence", 91)
-
+        mgmt, _sr = self._unresolvable("backlogapply", 82)
+        for _ in range(10_000):
+            self.adapter.store.terminal_job(82, job_type="sync")
         result = consume_static_route_settlements(mgmt)
-
-        assert result.stalled is False, "an entry that holds no position blocked the feed"
-        assert result.consumed == 1, "the sequenced job behind the broken row never drained"
-        assert result.drained is True, "the backstop's precondition was lost to a positionless row"
+        assert (result.stalled, result.consumed) == (True, 0)
         row = self._cursor(mgmt)
-        assert row.settle_cursor_seq == 1
-        assert row.settle_stall_seq is None, "the bound was spent on a row that carries no sequence"
-        assert row.settle_stall_attempts == 0
-        state.refresh_from_db()
-        assert state.status == "in_sync"
+        assert (row.settle_cursor_seq, row.settle_stall_seq) == (0, 1)
 
-    def test_it_never_starts_a_stall_cycle_however_often_it_is_served(self):
-        """No cursor can exclude a row with no sequence, so every later pass meets it again."""
-        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS, consume_static_route_settlements
+    def test_backlog_beyond_the_evidence_bound_stalls_on_a_malformed_consumer_page(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        mgmt, _state = self._broken_feed("noseqagain", 92)
+        device = _make_device("backlogmalformed")
+        mgmt = _make_mgmt(device, "backlogmalformed", 83, adapter=self.adapter)
+        for _ in range(10_001):
+            self.adapter.store.terminal_job(83, job_type="sync")
+        store = self.adapter.store
+        serve = store.feed
+        heads = []
 
-        for pass_number in range(1, 2 * SETTLE_STALL_MAX_ATTEMPTS + 1):
+        def feed(device_id, after, limit):
+            heads.append(after == 0)
+            if heads.count(True) == 2:
+                store.unsequenced_job(83, job_type="sync")
+            return serve(device_id, after, limit)
+
+        store.feed = feed
+        result = consume_static_route_settlements(mgmt)
+        assert (result.stalled, result.drained, result.consumed) == (True, False, 0)
+        row = self._cursor(mgmt)
+        assert (row.settle_cursor_seq, row.settle_stall_seq, row.settle_stall_attempts) == (None, None, 0)
+
+
+class TestMalformedFeedPreservesCursor(_SettlementCase):
+    """An invalid feed page cannot certify or discard any ordered execution."""
+
+    def _broken_feed(self, tag, adapter_device_id):
+        device = _make_device(tag)
+        mgmt = _make_mgmt(device, tag, adapter_device_id, adapter=self.adapter)
+        broken = self.adapter.store.unsequenced_job(adapter_device_id, job_type="sync")
+        self.adapter.store.terminal_job(adapter_device_id, job_type="sync")
+        return mgmt, broken
+
+    def test_malformed_head_keeps_sequenced_jobs_unconsumed_until_repaired(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        mgmt, _broken = self._broken_feed("nosequence", 91)
+        result = consume_static_route_settlements(mgmt)
+        assert result.stalled
+        assert not result.drained
+        assert result.consumed == 0
+        assert self._cursor(mgmt).settle_cursor_seq is None
+        self.adapter.store.unsequenced_in_feed.clear()
+        result = consume_static_route_settlements(mgmt)
+        assert result.drained
+        assert result.consumed == 1
+        assert self._cursor(mgmt).settle_cursor_seq == 1
+
+    def test_repeated_malformed_pages_never_advance_or_invent_stall_identity(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        mgmt, _broken = self._broken_feed("noseqagain", 92)
+        for _ in range(7):
             result = consume_static_route_settlements(mgmt)
-            assert result.stalled is False, f"the same entry blocked the feed again on pass {pass_number}"
-            assert result.drained is True, f"the backstop's precondition was lost on pass {pass_number}"
-            assert self._cursor(mgmt).settle_stall_attempts == 0
+            assert result.stalled
+            assert not result.drained
+            row = self._cursor(mgmt)
+            assert row.settle_cursor_seq is None
+            assert row.settle_stall_seq is None
+            assert row.settle_stall_attempts == 0
 
-    def test_it_does_not_reset_the_bound_of_an_undecided_sequence(self):
-        """The stall triple keys ONE entry, and a row served on every pass must not be it."""
-        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS, consume_static_route_settlements
+    def test_malformed_page_preserves_existing_unresolved_sequence(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
 
-        mgmt, state = self._broken_feed("noseqbound", 93, expected=False)
-        self.adapter.store.intent_status = 503  # the sequenced job behind it cannot be decided
-
-        results = [consume_static_route_settlements(mgmt) for _ in range(SETTLE_STALL_MAX_ATTEMPTS)]
-
-        assert results[0].stalled is True, "an undecided sequence did not stall at all"
-        assert results[-1].advanced_past_stall is True
-        row = self._cursor(mgmt)
-        assert row.settle_cursor_seq == 1, (
-            "the unsequenced row reset the undecided sequence's count on every cycle, so its "
-            "bound was never reached and the device head-of-line blocked forever"
-        )
-        assert row.settle_stall_seq is None
-        assert row.settle_stall_attempts == 0
-        state.refresh_from_db()
-        assert state.status == "deploying"
+        device = _make_device("noseqexisting")
+        mgmt = _make_mgmt(device, "noseqexisting", 93, adapter=self.adapter)
+        self.adapter.store.terminal_job(93, extra=_execution_result())
+        consume_static_route_settlements(mgmt)
+        consume_static_route_settlements(mgmt)
+        before = self._cursor(mgmt)
+        self.adapter.store.unsequenced_job(93, job_type="sync")
+        for _ in range(7):
+            result = consume_static_route_settlements(mgmt)
+            assert result.stalled
+            after = self._cursor(mgmt)
+            assert after.settle_cursor_seq == before.settle_cursor_seq == 0
+            assert after.settle_stall_seq == before.settle_stall_seq == 1
+            assert after.settle_stall_attempts == before.settle_stall_attempts == 2
+            assert after.settle_stall_first_seen_at == before.settle_stall_first_seen_at
+        self.adapter.store.unsequenced_in_feed.clear()
+        consume_static_route_settlements(mgmt)
+        assert self._cursor(mgmt).settle_stall_attempts == 3
 
 
 class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
-    """A holder of a pre-advance instance may not carry the cursor or the bound backwards.
+    """A holder of a pre-advance instance may not carry the cursor or unresolved evidence backwards.
 
     ``.update()`` protects the consumer's write from being *clobbered on the way out*; it
     does nothing about a full ``save()`` that lands afterwards from an instance loaded
     before it. Several sweeps load a management row, make an adapter call, and only then
     save — the window is real and it is where the row's other durable records already had
-    to be protected. Monotonicity and the five-attempt bound are worth exactly as much as
+    to be protected. Monotonicity and unresolved execution retention are worth exactly as much as
     that protection covers them.
     """
 
@@ -504,10 +536,10 @@ class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device(tag)
-        mgmt = _make_mgmt(device, tag, adapter_device_id)
+        mgmt = _make_mgmt(device, tag, adapter_device_id, adapter=self.adapter)
         sr = _route(f"10.12.{adapter_device_id % 250}.0/24", "10.12.0.1", devices=[device])
-        _own(sr, mgmt, generation=80)
-        self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 80)])
+        _own(sr, mgmt, generation=80, orphan=True)
+        self.adapter.store.terminal_job(adapter_device_id, job_type="sync")
 
         # The holder loads the row BEFORE the consumer runs, exactly as a sweep does.
         stale = NSODeviceManagement.objects.get(pk=mgmt.pk)
@@ -528,16 +560,15 @@ class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
         assert row.settle_cursor_incarnation == incarnation, "a stale full save rewound the epoch"
         assert row.settle_cursor_device_id == 110
 
-    def test_a_stale_full_save_cannot_reset_the_stall_bound(self):
+    def test_a_stale_full_save_cannot_reset_unresolved_execution_tracking(self):
         from netbox_nso_plugin.models import NSODeviceManagement
         from netbox_nso_plugin.settlement import consume_static_route_settlements
 
         device = _make_device("bound2")
-        mgmt = _make_mgmt(device, "bound2", 111)
+        mgmt = _make_mgmt(device, "bound2", 111, adapter=self.adapter)
         sr = _route("10.13.0.0/16", "10.13.0.1", devices=[device])
-        _own(sr, mgmt, generation=81, expected=False)
-        self.adapter.store.terminal_job(111, results=[_result(sr.pk, 81)])
-        self.adapter.store.intent_status = 503
+        _own(sr, mgmt, generation=81, expected=False, orphan=True)
+        self.adapter.store.terminal_job(111, extra=_execution_result())
 
         stale = NSODeviceManagement.objects.get(pk=mgmt.pk)
         for _ in range(3):
@@ -547,7 +578,7 @@ class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
         stale.save()
 
         row = self._cursor(mgmt)
-        assert row.settle_stall_attempts == 3, "a stale full save reset the stall bound"
+        assert row.settle_stall_attempts == 3, "a stale full save reset unresolved execution tracking"
         assert row.settle_stall_seq == 1
         assert row.settle_stall_first_seen_at is not None
 
@@ -558,10 +589,10 @@ class TestStaleFullSaveCannotRewindTheCursor(_SettlementCase):
         from netbox_nso_plugin.sync_cache import reconcile_device_links
 
         device = _make_device("repairsave")
-        mgmt = _make_mgmt(device, "repairsave", 112)
+        mgmt = _make_mgmt(device, "repairsave", 112, adapter=self.adapter)
         sr = _route("10.14.0.0/16", "10.14.0.1", devices=[device])
-        _own(sr, mgmt, generation=82)
-        self.adapter.store.terminal_job(112, results=[_result(sr.pk, 82)])
+        _own(sr, mgmt, generation=82, orphan=True)
+        self.adapter.store.terminal_job(112, job_type="sync")
 
         # The sweep materializes its candidate list first; the adapter has no device 112,
         # so this row is broken and will be re-saved once the snapshot comes back.
@@ -597,7 +628,7 @@ def _manage_py_dir():
 
 
 class TestDurableStallAcrossProcesses(_SettlementCase):
-    """S4.3 (P5.11) — the bound survives a real process boundary, or it is not durable."""
+    """Unresolved evidence survives a real process boundary."""
 
     def _run_consumer(self, device_id: int, passes: int):
         # The child names the test database directly, under the standard settings: the isolated
@@ -623,32 +654,25 @@ class TestDurableStallAcrossProcesses(_SettlementCase):
             timeout=300,
         )
 
-    def test_stall_attempts_survive_a_real_process_restart(self):
-        from netbox_nso_plugin.settlement import SETTLE_STALL_MAX_ATTEMPTS
-
+    def test_unresolved_evidence_survives_repeated_passes_and_real_restart(self):
         device = _make_device("proc")
-        mgmt = _make_mgmt(device, "proc", 90)
-        sr = _route("10.11.0.0/16", "10.11.0.1", devices=[device])
-        _own(sr, mgmt, generation=73, expected=False)
-        self.adapter.store.terminal_job(90, results=[_result(sr.pk, 73)])
-        self.adapter.store.intent_status = 503
-
-        first = self._run_consumer(device.pk, passes=SETTLE_STALL_MAX_ATTEMPTS - 1)
+        mgmt = _make_mgmt(device, "proc", 90, adapter=self.adapter)
+        self.adapter.store.terminal_job(90, extra=_execution_result())
+        first = self._run_consumer(device.pk, passes=6)
         assert first.returncode == 0, first.stderr
+        before = self._cursor(mgmt)
+        assert before.settle_stall_attempts == 6
+        assert before.settle_cursor_seq == 0
+        assert before.settle_stall_seq == 1
 
-        row = self._cursor(mgmt)
-        assert row.settle_stall_attempts == SETTLE_STALL_MAX_ATTEMPTS - 1
-        assert row.settle_cursor_seq == 0, "the cursor advanced before the bound was reached"
-
-        # A second, genuinely separate process. An in-memory counter starts it at zero and
-        # this single pass can never reach the bound.
-        second = self._run_consumer(device.pk, passes=1)
+        second = self._run_consumer(device.pk, passes=2)
         assert second.returncode == 0, second.stderr
-
-        row = self._cursor(mgmt)
-        assert row.settle_cursor_seq == 1, "the bound was not reached, so the attempts did not survive"
-        assert row.settle_stall_seq is None
-        assert row.settle_stall_attempts == 0
+        after = self._cursor(mgmt)
+        assert after.settle_cursor_seq == 0
+        assert after.settle_stall_seq == 1
+        assert after.settle_stall_attempts == 8
+        assert after.settle_stall_first_seen_at == before.settle_stall_first_seen_at
+        assert len(self.adapter.store.jobs) == 1
 
 
 class TestTheConsumeCommandReportsTheFleet(_SettlementCase):
@@ -663,10 +687,10 @@ class TestTheConsumeCommandReportsTheFleet(_SettlementCase):
         for index, adapter_device_id in enumerate((120, 121, 122)):
             tag = f"cmd{index}"
             device = _make_device(tag)
-            mgmt = _make_mgmt(device, tag, adapter_device_id)
+            mgmt = _make_mgmt(device, tag, adapter_device_id, adapter=self.adapter)
             sr = _route(f"10.16.{index}.0/24", f"10.16.{index}.1", devices=[device])
-            _own(sr, mgmt, generation=90 + index)
-            self.adapter.store.terminal_job(adapter_device_id, results=[_result(sr.pk, 90 + index)])
+            _own(sr, mgmt, generation=90 + index, orphan=True)
+            self.adapter.store.terminal_job(adapter_device_id, job_type="sync")
 
         out = StringIO()
         with CaptureQueriesContext(connection) as queries:

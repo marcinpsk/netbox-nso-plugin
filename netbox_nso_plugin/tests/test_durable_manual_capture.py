@@ -56,6 +56,10 @@ class ManualAdmissionAdapter(ReceiptAdapter):
         self.rejected = False
 
     def _handle(self, method, url, **kwargs):
+        if method == "GET" and url.endswith(("/jobs", "/generations")):
+            response = make_response(200, [])
+            response.headers["X-Store-Incarnation"] = "manual-read-store"
+            return response
         if method == "POST" and url.endswith("/actions/apply"):
             body = copy.deepcopy(kwargs["json"])
             self.apply_requests.append(body)
@@ -182,11 +186,10 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
                 observed_payload_revision=index + 110,
             )
             self.read_watermarks[family] = {
-                "attempt_id": index,
                 "incarnation": "manual-read-store",
                 "source_epoch": 3,
                 "payload_revision": index + 10,
-                "publication_sequence": index + 20,
+                "digest": None,
             }
 
     def _apply(self, adapter):
@@ -324,7 +327,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
             from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 
             management = NSODeviceManagement.objects.get(pk=self.management.pk)
-            settle_device_apply_attempts(management, static_route_feed_drained=True)
+            settle_device_apply_attempts(management)
 
         config, session = adapter.patches()
         with config, session:
@@ -334,6 +337,31 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         attempt = NSOApplyAttempt.objects.get(pk=attempt_id)
         self.assertEqual(attempt.http_status, 409)
         self.assertEqual(attempt.response, adapter.rejection())
+        for _, row in self.rows:
+            self._assert_prior_bookkeeping(row)
+
+    def test_rejected_admission_restores_after_its_remote_journal_is_pruned(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence, settle_device_apply_attempts
+
+        adapter = ManualAdmissionAdapter(lambda _body: requests.ConnectionError("Apply admission answer was lost."))
+        response = self._apply(adapter)
+        self.assertEqual(response.status_code, 502)
+        original_request = copy.deepcopy(adapter.apply_requests[0])
+        adapter.answer = lambda _body: (409, adapter.rejection())
+        config, session = adapter.patches()
+        with config, session:
+            load_deployment_evidence(NSODeviceManagement.objects.get(pk=self.management.pk))
+            attempt = NSOApplyAttempt.objects.get(pk=original_request["apply_attempt_id"])
+            self.assertEqual(attempt.http_status, 409)
+            self.assertTrue(attempt.overlay_snapshots.filter(settlement_disposition="unresolved").exists())
+            adapter.rejected = False
+            in_thread(
+                lambda: contextvars.Context().run(
+                    settle_device_apply_attempts,
+                    NSODeviceManagement.objects.get(pk=self.management.pk),
+                )
+            )
+        self.assertEqual(adapter.apply_requests, [original_request, original_request])
         for _, row in self.rows:
             self._assert_prior_bookkeeping(row)
 
@@ -376,7 +404,7 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         self.assertEqual(snapshot.settlement_disposition, "not_applied")
         for family, watermark in snapshot.observation_watermark.items():
             current = NSOFamilyReadState.objects.get(management=self.management, family=family)
-            self.assertNotEqual(current.applied_attempt_id, watermark["attempt_id"])
+            self.assertNotEqual(current.applied_payload_revision, watermark["payload_revision"])
 
     def test_manual_rejection_keeps_newer_bookkeeping_superseded(self):
         def change_bookkeeping(body):
@@ -400,9 +428,45 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
         )
         self.assertEqual(snapshot.settlement_disposition, "superseded")
 
-    def test_settlement_releases_a_superseded_row_of_a_rejected_attempt(self):
-        from netbox_nso_plugin import adapter_client
-        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+    def test_manual_rejection_restores_after_an_observation_advances_the_fence(self):
+        from netbox_nso_plugin.intent_state import footprint_for_instance, mirror_transaction
+        from netbox_nso_plugin.lifecycle_fence import fence_for, publish_observation
+
+        advanced = []
+
+        def publish_read(body):
+            self.mtu.refresh_from_db()
+            self.assertEqual(self.mtu.status, "deploying")
+            footprint = footprint_for_instance(self.mtu)
+            family = sorted(OVERLAYS[self.mtu._meta.label_lower].read_families)[0]
+            identity = {
+                "incarnation": "manual-read-store",
+                "source_epoch": 3,
+                "payload_revision": 1010,
+                "digest": "c" * 64,
+            }
+            with without_commit_drain(), mirror_transaction(footprint):
+                before = fence_for(self.mtu).bookkeeping_revision
+                publish_observation(footprint, family, identity)
+                advanced.append(fence_for(self.mtu).bookkeeping_revision > before)
+
+        adapter = ManualAdmissionAdapter(
+            lambda _body: (409, ManualAdmissionAdapter.rejection()), before_apply=publish_read
+        )
+        response = self._apply(adapter)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(advanced, [True])
+        self._assert_prior_bookkeeping(self.mtu)
+        snapshot = NSOApplyOverlaySnapshot.objects.get(
+            attempt_id=adapter.apply_requests[0]["apply_attempt_id"],
+            model_label=self.mtu._meta.label_lower,
+            overlay_pk=self.mtu.pk,
+        )
+        self.assertEqual(snapshot.settlement_disposition, "not_applied")
+
+    def test_settlement_preserves_superseded_rejected_attempt_bookkeeping(self):
+        from netbox_nso_plugin.apply_settlement import load_deployment_evidence, settle_apply_attempts
 
         def change_bookkeeping(body):
             mirror_update(self.mtu, last_apply_error="Newer Apply error.")
@@ -417,13 +481,13 @@ class TestDurableManualCapture(_CascadeFlushMixin, IntentPushResetMixin, Transac
 
         config, session = adapter.patches()
         with config, session:
-            evidence = adapter_client.get_deployment_evidence(self.management.adapter_device_id, [attempt_id])
-            settle_apply_attempts(self.management, evidence, static_route_feed_drained=True)
+            evidence = load_deployment_evidence(self.management, attempt_ids=(attempt_id,))
+            settle_apply_attempts(self.management, evidence)
 
         self.mtu.refresh_from_db()
         self.assertEqual(
             (self.mtu.status, self.mtu.apply_attempt_id, self.mtu.last_apply_error),
-            ("accepted", None, "Newer Apply error."),
+            ("deploying", attempt_id, "Newer Apply error."),
         )
 
     def test_manual_skipped_stream_restores_only_its_snapshot(self):

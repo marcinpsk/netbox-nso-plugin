@@ -129,6 +129,14 @@ def _document_section(key: str) -> str:
     return delivery_keys()[_SECTION_OWNER.get(key, key)].section
 
 
+def document_section_for_stream(stream: str) -> str:
+    """Resolve an adapter stream through the shared delivery and document registries."""
+    for key, entry in delivery_keys().items():
+        if entry.section == stream:
+            return _document_section(key)
+    raise RegistryError("unknown adapter stream")
+
+
 SECTION_COUNTER_KEYS = MappingProxyType(
     {
         section: tuple(

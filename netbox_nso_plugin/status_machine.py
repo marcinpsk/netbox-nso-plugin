@@ -159,9 +159,6 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(DRIFT, ACCEPTED, CHANGED, True, "owned value no longer on device"),
     Transition(DRIFT, DEPLOYING, CHANGED, True, "vanished mid-apply"),
     Transition(DRIFT, IN_SYNC, CHANGED, True, "synced value disappeared"),
-    # -- automatic: recovery of an apply-failed (owned) row on the next reconcile --
-    Transition(RECONCILE, APPLY_FAILED, IN_SYNC, True, "failed apply: device now matches → recovered"),
-    Transition(RECONCILE, APPLY_FAILED, ACCEPTED, True, "failed apply: still differs → re-pend for retry"),
     # -- automatic: adoption ambiguity (native object exists, not ours) ------
     Transition(CONFLICT_DETECTED, UNKNOWN, CONFLICT, True, "native object exists, not created by us"),
     Transition(CONFLICT_DETECTED, IMPORTED, CONFLICT, True, "native object diverged from ours"),
@@ -201,9 +198,8 @@ TRANSITIONS: tuple[Transition, ...] = (
     Transition(APPLY_ERR, DEPLOYING, APPLY_FAILED, True, "apply worker reported a per-intent failure"),
     # A correlated settlement may settle a row that never passed through ``deploying``:
     # an auto-applied route is pushed and applied without an operator Apply, so it sits
-    # ``accepted`` with a real generation and a real result. Only the settlement consumer
-    # takes these edges (``on_apply_result(settle_accepted=True)``); the coarse per-scope
-    # settle keeps its ``deploying``-only behavior.
+    # ``accepted`` with a real generation and a real result. Structured owner evidence
+    # supplies the authority for these accepted-row settlement transitions.
     Transition(APPLY_OK, ACCEPTED, IN_SYNC, True, "settlement: a correlated result on a never-deploying row"),
     Transition(APPLY_ERR, ACCEPTED, APPLY_FAILED, True, "settlement: a correlated failure on a never-deploying row"),
     # -- automatic: an unexpected exception while reconciling a row ----------
@@ -398,6 +394,8 @@ def on_reconcile(
             return current
         return advance(current, DRIFT, to=CHANGED)
     if is_owned(current):
+        if current == APPLY_FAILED:
+            return current
         if conflict and matches is not None:
             matches = False
         if current == DEPLOYING:
@@ -421,15 +419,14 @@ def on_apply_result(current: str, *, ok: bool, settle_accepted: bool = False) ->
 
     ``ok`` → ``deploying → in_sync`` (the apply committed); not ok → ``deploying →
     apply_failed`` (the apply errored — the row is no longer stuck in 'deploying';
-    ``last_apply_error`` carries the detail, and the next reconcile recovers it to
-    in_sync once the device catches up, or re-pends to accepted to retry). Rows not in
+    ``last_apply_error`` carries the detail until a successor acceptance or a newer
+    certified execution replaces it). Rows not in
     ``deploying`` are returned unchanged (the apply outcome only concerns in-flight rows).
 
     ``settle_accepted`` additionally settles ``accepted``. Pass it only from a
-    **generation-correlated** consumer: an auto-applied row is pushed and applied with no
-    operator Apply, so it never passes through ``deploying`` and would otherwise sit
-    ``accepted`` forever with a real result naming it. The coarse per-scope settle has no
-    such correlation and must keep its ``deploying``-only behavior.
+    structured owner settlement: an auto-applied row is pushed and applied with no
+    operator Apply, so it can remain ``accepted`` until exact terminal evidence names it.
+    The caller must prove that the outcome belongs to this owner and its current intent.
     """
     if current == DEPLOYING or (settle_accepted and current == ACCEPTED):
         return advance(current, APPLY_OK if ok else APPLY_ERR, to=IN_SYNC if ok else APPLY_FAILED)

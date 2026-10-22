@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
-"""#1502 Appendix S (S5) — the production carrier for the settlement consumer.
-
-Pins S5.4, S5.5 and S5.6c. A consumer nothing calls is dead code that looks alive, and
-Appendix S removes the channel that used to settle static routes — so every pin here starts
-at the **adapter's own callback endpoint** and reaches Step 4 through the real queued-carrier
-arbiter, a real async RQ queue and a real worker. None of them calls the consumer,
-``run_device_reconcile`` or the management command, and none of them asserts on the 202:
-queued is not run, and CI starts Redis with no worker.
-"""
+"""Drive durable execution cursor consumption through the real callback and RQ worker."""
 
 from __future__ import annotations
 
@@ -17,7 +9,17 @@ from unittest.mock import patch
 
 from django.db import connections
 
-from ._settlement_case import _CarrierCase, _make_device, _make_mgmt, _own, _result, _route, _stale_clock
+from ._settlement_case import (
+    _CarrierCase,
+    _execution_result,
+    _make_device,
+    _make_mgmt,
+    _own,
+    _record_execution,
+    _result,
+    _route,
+    _stale_clock,
+)
 
 
 def _repair_before_the_lock(mgmt_pk: int, new_id: int):
@@ -54,12 +56,13 @@ def _repair_before_the_lock(mgmt_pk: int, new_id: int):
 class TestTheCarrier(_CarrierCase):
     """S5.4 — the adapter's notification reaches the consumer, through production wiring only."""
 
-    def test_a_settlement_is_consumed_through_the_real_notify_path(self):
+    def test_a_consumed_execution_advances_the_cursor_through_the_real_notify_path(self):
         device = _make_device("carry")
-        mgmt = _make_mgmt(device, "carry", 10)
+        mgmt = _make_mgmt(device, "carry", 10, adapter=self.adapter)
         sr = _route("10.30.0.0/16", "10.30.0.1", devices=[device])
         state = _own(sr, mgmt, generation=101)
-        self.adapter.store.terminal_job(10, results=[_result(sr.pk, 101)])
+        job = self.adapter.store.terminal_job(10, extra=_execution_result())
+        _record_execution(mgmt, self.adapter.store, job)
 
         response = self._notify(device.pk)
         assert response.status_code == 202, response.data
@@ -71,34 +74,50 @@ class TestTheCarrier(_CarrierCase):
         self._drain()
 
         state.refresh_from_db()
-        assert state.status == "in_sync", "nothing in production consumes the settlement feed"
+        assert state.status == "deploying", "cursor consumption cannot independently settle an overlay"
         assert self.adapter.store.feed_requests, "Step 4 never reached the consumer"
         assert self._cursor(mgmt).settle_cursor_seq == 1
 
-
-class TestOrderingAndIsolation(_CarrierCase):
-    """S5.5 — the consumer runs before the backstop, and its failure costs only the backstop."""
-
-    def test_the_consumer_precedes_the_backstop_in_one_invocation(self):
-        """(a) A settlement one page away must not be pre-empted by the row's own age."""
-        device = _make_device("order")
-        mgmt = _make_mgmt(device, "order", 20)
-        sr = _route("10.31.0.0/16", "10.31.0.1", devices=[device])
-        state = _own(sr, mgmt, generation=102)
-        _stale_clock(state)  # well past the grace: the backstop would fire if it ran first
-        self.adapter.store.terminal_job(20, results=[_result(sr.pk, 102)])
+    def test_a_raw_route_success_stalls_without_certifying_an_overlay(self):
+        device = _make_device("raw-carry")
+        mgmt = _make_mgmt(device, "raw-carry", 12, adapter=self.adapter)
+        route = _route("198.18.12.0/24", "198.18.12.1", devices=[device])
+        state = _own(route, mgmt, generation=105)
+        self.adapter.store.terminal_job(12, results=[_result(route.pk, 105)])
 
         self._notify(device.pk)
         self._drain()
 
         state.refresh_from_db()
-        assert state.status == "in_sync", "the backstop judged a row whose settlement was unconsumed"
+        assert state.status == "deploying"
+        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert self._cursor(mgmt).settle_stall_attempts == 1
+
+
+class TestOrderingAndIsolation(_CarrierCase):
+    """Consume known executions while preserving pending intent on feed failure."""
+
+    def test_the_consumer_advances_a_consumed_execution_without_judging_aged_intent(self):
+        device = _make_device("order")
+        mgmt = _make_mgmt(device, "order", 20, adapter=self.adapter)
+        sr = _route("10.31.0.0/16", "10.31.0.1", devices=[device])
+        state = _own(sr, mgmt, generation=102)
+        _stale_clock(state)  # Age alone is not execution evidence.
+        job = self.adapter.store.terminal_job(20, extra=_execution_result())
+        _record_execution(mgmt, self.adapter.store, job)
+
+        self._notify(device.pk)
+        self._drain()
+
+        state.refresh_from_db()
+        assert state.status == "deploying", "the cursor or age clock certified an overlay without its own outcome"
         assert state.last_apply_error == ""
+        assert self._cursor(mgmt).settle_cursor_seq == 1
 
     def test_a_consumer_error_leaves_the_static_row_waiting(self):
         """(b) Fail closed: a static row waits when its exact-result feed fails."""
         device = _make_device("iso")
-        mgmt = _make_mgmt(device, "iso", 21)
+        mgmt = _make_mgmt(device, "iso", 21, adapter=self.adapter)
         sr = _route("10.32.0.0/16", "10.32.0.1", devices=[device])
         state = _own(sr, mgmt, generation=103)
         _stale_clock(state)
@@ -123,12 +142,18 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
     def test_the_consumer_reads_its_device_id_from_the_locked_row(self):
         """The FIRST feed request must carry the id on the row, not the id on the argument."""
         device = _make_device("stale")
-        mgmt = _make_mgmt(device, "stale", 10)
+        mgmt = _make_mgmt(device, "stale", 10, adapter=self.adapter)
         sr = _route("10.33.0.0/16", "10.33.0.1", devices=[device])
         state = _own(sr, mgmt, generation=104)
         # The settlement lives on the REPAIRED device. Device 10 has nothing to serve, so an
         # end-state assertion alone could pass for the wrong reason — hence the outbound one.
-        self.adapter.store.terminal_job(11, results=[_result(sr.pk, 104)])
+        self.adapter.store.add_device(
+            nso_instance=mgmt.nso_instance.name,
+            nso_device_name=mgmt.nso_device_name,
+            netbox_device_id=device.pk,
+            device_id=11,
+        )
+        self.adapter.store.terminal_job(11, job_type="sync")
 
         # Anchored on the consumer's entry point, which is the contract Step 4 calls: Step 4
         # has handed over its `mgmt` object and the consumer has not taken its lock yet.
@@ -142,22 +167,16 @@ class TestTheConsumerReadsTheLockedRow(_CarrierCase):
             f"not the one on the row it locked: {self.adapter.store.feed_requests}"
         )
         state.refresh_from_db()
-        assert state.status == "in_sync"
+        assert state.status == "deploying"
+        assert self._cursor(mgmt).settle_cursor_seq == 1
 
 
 class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
-    """The apply-in-flight probe must be about the adapter device the consumer locked.
-
-    Step 4 reads the job state for the id on its cached row and hands the verdict down to the
-    escalation. A link repair that commits in that window moves the row to another adapter
-    device, and a probe of the OLD one says nothing about an apply in flight on the NEW one.
-    Reusing it fails every deploying static route on a device that is mid-apply, and an
-    apply's own ``in_sync`` cannot lift a row back out of ``apply_failed``.
-    """
+    """Keep mapping repair and activity probes aligned with the locked adapter identity."""
 
     def test_a_probe_read_for_another_device_does_not_fail_routes_mid_apply(self):
         device = _make_device("probe")
-        mgmt = _make_mgmt(device, "probe", 60)
+        mgmt = _make_mgmt(device, "probe", 60, adapter=self.adapter)
         sr = _route("10.38.0.0/16", "10.38.0.1", devices=[device])
         state = _own(sr, mgmt, generation=120)
         _stale_clock(state)
@@ -183,7 +202,7 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
     def test_a_repaired_device_does_not_judge_an_orphan_attempt(self):
         """A repaired link does not make an orphan Apply UUID actionable."""
         device = _make_device("idle")
-        mgmt = _make_mgmt(device, "idle", 62)
+        mgmt = _make_mgmt(device, "idle", 62, adapter=self.adapter)
         # The generation probe must succeed. It 404s for a device the store does not hold, and an
         # unknown result stands the backstop down, which removes this test's premise.
         self.adapter.store.add_device(nso_instance="se-idle-inst", nso_device_name="nso-se-idle", device_id=63)
@@ -200,46 +219,35 @@ class TestTheApplyProbeNamesTheLockedDevice(_CarrierCase):
         assert state.status == "deploying"
 
 
-class TestTheBackstopNeedsADrainedFeed(_CarrierCase):
-    """Codex S5 P1 — a walk that did not reach the end proves nothing about a waiting row.
-
-    The consumer returning normally is not the precondition; reaching the END of the feed
-    is. A stalled walk stopped on a head it could not resolve, and a full page owes another
-    — in both cases the result this row is waiting for may be the sequence the walk never
-    got to, so escalating there is a false red on a healthy device, and on the stalled arm
-    it also short-circuits the durable five-attempt bound that exists to survive exactly
-    that outage.
-    """
+class TestIncompleteFeedPreservesIntent(_CarrierCase):
+    """Keep an unresolved head or unfinished page from certifying pending intent."""
 
     def test_a_stalled_walk_does_not_let_the_backstop_judge(self):
         device = _make_device("stall")
-        mgmt = _make_mgmt(device, "stall", 40)
+        mgmt = _make_mgmt(device, "stall", 40, adapter=self.adapter)
         sr = _route("10.34.0.0/16", "10.34.0.1", devices=[device])
         state = _own(sr, mgmt, generation=110, expected=False)
         _stale_clock(state)
         self.adapter.store.terminal_job(40, results=[_result(sr.pk, 110)])
-        self.adapter.store.intent_status = 503  # the read-back is down: undecided, not decided
 
         self._notify(device.pk)
         self._drain()
 
         state.refresh_from_db()
-        assert state.status == "deploying", (
-            "the first read-back outage failed the row, bypassing the five-attempt stall bound"
-        )
+        assert state.status == "deploying", "an unresolved execution or a read-back outage judged pending intent"
         assert self._cursor(mgmt).settle_stall_attempts == 1
 
     def test_an_unfinished_page_does_not_let_the_backstop_judge(self):
         from netbox_nso_plugin.settlement import SETTLE_FEED_PAGE
 
         device = _make_device("page")
-        mgmt = _make_mgmt(device, "page", 41)
+        mgmt = _make_mgmt(device, "page", 41, adapter=self.adapter)
         sr = _route("10.35.0.0/16", "10.35.0.1", devices=[device])
         state = _own(sr, mgmt, generation=111)
         _stale_clock(state)
         # A full first page of jobs that decide nothing, then THIS row's result behind it.
         for _ in range(SETTLE_FEED_PAGE):
-            self.adapter.store.terminal_job(41, results=[])
+            self.adapter.store.terminal_job(41, job_type="sync")
         self.adapter.store.terminal_job(41, results=[_result(sr.pk, 111)])
 
         self._notify(device.pk)
@@ -250,26 +258,20 @@ class TestTheBackstopNeedsADrainedFeed(_CarrierCase):
         assert self._cursor(mgmt).settle_cursor_seq == SETTLE_FEED_PAGE
 
 
-class TestTheBackstopPushesNoIntent(_CarrierCase):
-    """Codex S5 P1 — escalating is bookkeeping, and bookkeeping may not re-push intent.
-
-    On an RQ worker the push cache is cold and ``suppress_intent_push()`` is not in scope, so
-    a plain ``save()`` here fires the full static-route PUT. With adapter auto-apply that
-    enqueues another apply for the row just declared failed, whose result cannot recover an
-    ``apply_failed`` row — a loop started by the thing meant to end one.
-    """
+class TestCursorConsumptionPushesNoIntent(_CarrierCase):
+    """Keep cursor bookkeeping from publishing another static-route intent."""
 
     def test_an_orphan_attempt_sends_no_static_route_intent(self):
         from netbox_nso_plugin import adapter_client
         from netbox_nso_plugin.signals import reset_intent_push_state
 
         device = _make_device("nopush")
-        mgmt = _make_mgmt(device, "nopush", 42)
+        mgmt = _make_mgmt(device, "nopush", 42, adapter=self.adapter)
         self.adapter.store.add_device(nso_instance="se-nopush-inst", nso_device_name="nso-se-nopush", device_id=42)
         sr = _route("10.36.0.0/16", "10.36.0.1", devices=[device])
         state = _own(sr, mgmt, generation=112, orphan=True)
         _stale_clock(state)
-        # An empty feed: drained, so the backstop may judge, and nothing else can push.
+        # An empty feed carries no outcome that could change this orphan intent.
         # The worker that runs this has never pushed for this device, so its change-detection
         # cache is empty. Building the fixture in-process warms that cache, and the payload
         # is status-free — deploying and apply_failed produce byte-identical intent — so a
@@ -282,7 +284,7 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
         state.refresh_from_db()
         assert state.status == "deploying"
         pushes = self._intent_puts()
-        assert pushes == [], f"escalating re-pushed this device's static-route intent: {pushes}"
+        assert pushes == [], f"cursor processing re-pushed this device's static-route intent: {pushes}"
         # Positive control: the same filter DOES see a push issued through the client the
         # production path uses, so the empty list above is evidence and not a URL template
         # the filter stopped matching.
@@ -298,19 +300,12 @@ class TestTheBackstopPushesNoIntent(_CarrierCase):
         ]
 
 
-class TestAnUnprovenResultIsNotAFailure(_CarrierCase):
-    """Codex S5 P2 — the clock must not overrule a result that DID correlate.
+class TestRawRouteResultsRemainUnconsumed(_CarrierCase):
+    """Require structured execution authority before publishing lifecycle or advisory changes."""
 
-    A route staged well before its Apply carries an old ``generation_started_at``, so the
-    same invocation that records an ``unproven`` advisory and deliberately leaves the row
-    ``deploying`` would then select it by age and call it ``apply_failed``. The advisory
-    already says more than the clock can, and it is cleared whenever the generation
-    advances, so it cannot go stale.
-    """
-
-    def test_an_unproven_advisory_survives_the_stuck_deploying_clock(self):
+    def test_a_raw_route_result_cannot_publish_an_advisory_or_judge_aged_intent(self):
         device = _make_device("unpr")
-        mgmt = _make_mgmt(device, "unpr", 43)
+        mgmt = _make_mgmt(device, "unpr", 43, adapter=self.adapter)
         sr = _route("10.37.0.0/16", "10.37.0.1", devices=[device])
         state = _own(sr, mgmt, generation=113)
         _stale_clock(state)
@@ -330,8 +325,10 @@ class TestAnUnprovenResultIsNotAFailure(_CarrierCase):
         self._drain()
 
         state.refresh_from_db()
-        assert "unproven" in state.last_result_advisory
+        assert state.last_result_advisory == ""
         assert state.status == "deploying", (
-            "the age clock overruled a correlated result that deliberately did not settle"
+            "a raw route result or the age clock judged intent without structured execution evidence"
         )
         assert state.last_apply_error == ""
+        assert self._cursor(mgmt).settle_cursor_seq == 0
+        assert self._cursor(mgmt).settle_stall_attempts == 1

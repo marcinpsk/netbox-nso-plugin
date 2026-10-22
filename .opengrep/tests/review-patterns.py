@@ -2979,3 +2979,83 @@ class CaughtExceptionTextForm:
         except VaultRefError as exc:
             # ok: nso-caught-exception-text-to-operator
             self.add_error("vault_ref", str(exc))
+
+
+class BorrowedSettlementHelperCase(BGPSettlementHelpers, BGPCaptureCase):
+    def test_borrowed_helpers(self):
+        # ruleid: nso-test-borrows-another-class-method
+        TestRefusalSettlementRuntime.prepare(self)
+        # ruleid: nso-test-borrows-another-class-method
+        generation = runtime_case.TestRefusalSettlementRuntime.terminal(self, refused=None)
+        # ok: nso-test-borrows-another-class-method
+        self.serve_terminal_evidence(generation)
+        # ok: nso-test-borrows-another-class-method
+        TestCase.setUp(self)
+        # ok: nso-test-borrows-another-class-method
+        _AdapterWireSession.reset(self.environment.adapter_port)
+
+
+class AssignedSettlementHelperCase(BGPSettlementHelpers, BGPCaptureCase):
+    # ruleid: nso-test-borrows-another-class-method
+    prepare = TestRefusalSettlementRuntime.prepare
+    # ruleid: nso-test-borrows-another-class-method
+    terminal = runtime_case.TestRefusalSettlementRuntime.terminal
+    # ok: nso-test-borrows-another-class-method
+    helper = BGPSettlementHelpers.prepare
+    # ok: nso-test-borrows-another-class-method
+    setup = TestCase.setUp
+
+    def local_reference(self):
+        # ok: nso-test-borrows-another-class-method
+        helper = runtime_case.TestRefusalSettlementRuntime.terminal
+        # ok: nso-test-borrows-another-class-method
+        return super().terminal()
+
+
+# ok: nso-test-borrows-another-class-method
+terminal_reference = runtime_case.TestRefusalSettlementRuntime.terminal
+
+
+def per_row_mirror_refresh(rows, footprint):
+    for row in rows:
+        # ruleid: nso-per-row-mirror-refresh-loop
+        with mirror_refresh(row, {"unsupported_members"}) as locked:
+            locked.save(update_fields=["unsupported_members"])
+    with transaction.atomic(), suppress_intent_push():
+        for row, members in rows:
+            if members:
+                # ruleid: nso-per-row-mirror-refresh-loop
+                with mirror_refresh(row, {"unsupported_members"}) as locked:
+                    locked.save(update_fields=["unsupported_members"])
+    with transaction.atomic(), suppress_intent_push(), mirror_rows_transaction(rows):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    with mirror_rows_transaction(rows):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    with mirror_transaction(footprint):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    for row in rows:
+        # ruleid: nso-per-row-mirror-refresh-loop
+        with intent_state.mirror_refresh(row, {"unsupported_members"}) as locked:
+            locked.save(update_fields=["unsupported_members"])
+    with intent_state.mirror_rows_transaction(rows):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with intent_state.mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    with transaction.atomic(), intent_state.mirror_transaction(footprint):
+        for row in rows:
+            # ok: nso-per-row-mirror-refresh-loop
+            with mirror_refresh(row, {"unsupported_members"}) as locked:
+                locked.save(update_fields=["unsupported_members"])
+    # ok: nso-per-row-mirror-refresh-loop
+    with mirror_refresh(rows[0], {"unsupported_members"}) as locked:
+        locked.save(update_fields=["unsupported_members"])

@@ -95,6 +95,19 @@ class SettlementStore:
         self._next_id = 0
         self._next_device_id = 0
 
+    def deployment_evidence(self, device_id, requested):
+        """An empty store has no durable manual admission or automatic head."""
+        return {
+            "device_id": device_id,
+            "head": None,
+            "blocked": False,
+            "write_work_pending": False,
+            "held_jobs": [],
+            "pending_generations": 0,
+            "attempts": [],
+            "unknown_apply_attempt_ids": requested,
+        }
+
     def add_device(self, *, nso_instance: str, nso_device_name: str, netbox_device_id=None, device_id=None) -> dict:
         """Register an adapter device row, minting an id unless one is forced."""
         if device_id is None:
@@ -126,6 +139,8 @@ class SettlementStore:
             "device_id": device_id,
             "status": status,
             "result": result,
+            "row_outcomes": result.get("row_outcomes") if result is not None else None,
+            "refusals": result.get("refusals") if result is not None else None,
             "error": None,
             "context": None,
             "created_at": "2026-01-01T00:00:00Z",
@@ -206,7 +221,7 @@ class SettlementStore:
             {"route_id": route_id, "generation": generation, "fingerprint": fingerprint}
         )
 
-    def put_static_route_intent(self, device_id: int, routes: list[dict]) -> dict:
+    def put_static_route_intent(self, device_id: int, routes: list[dict], *, source_push_seq=None) -> dict:
         """Accept a static-route intent push and echo nothing.
 
         The settlement suites record their expectations directly, so the default store only
@@ -272,6 +287,12 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         store = self._store
 
+        if parsed.path.endswith("/deployment-evidence"):
+            device_id = self._device_id_from_path(parsed)
+            requested = self._body()["apply_attempt_ids"]
+            self._send(200, store.deployment_evidence(device_id, requested))
+            return
+
         if parsed.path == "/api/v1/devices":
             body = self._body()
             row = store.add_device(
@@ -303,7 +324,18 @@ class _Handler(BaseHTTPRequestHandler):
 
         if parsed.path.endswith("/static-route-intent"):
             device_id = self._device_id_from_path(parsed)
-            self._send(200, store.put_static_route_intent(device_id, body.get("routes") or []))
+            if device_id not in store.devices:
+                self._send(404, {"error": {"code": "not_found", "message": "Device not found"}})
+                return
+            selector = self.headers.get("X-Push-Seq")
+            self._send(
+                200,
+                store.put_static_route_intent(
+                    device_id,
+                    body["routes"],
+                    source_push_seq=int(selector) if selector is not None else None,
+                ),
+            )
             return
 
         self._send(404, {"error": {"code": "not_found", "message": f"unexpected request {self.path}"}})

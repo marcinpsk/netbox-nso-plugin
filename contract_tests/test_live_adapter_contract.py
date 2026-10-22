@@ -31,7 +31,7 @@ def test_generation_dispositions_match_the_committed_adapter_openapi_enum():
     """Pin every adapter generation status to one plugin disposition."""
     from netbox_nso_plugin.apply_settlement import GENERATION_DISPOSITIONS
 
-    snapshot = Path(__file__).resolve().parents[2] / "nso-adapter" / "tests" / "api" / "openapi_snapshot.json"
+    snapshot = Path(os.environ["LIVE_ADAPTER_OPENAPI_SNAPSHOT"]).resolve()
     openapi = json.loads(snapshot.read_text(encoding="utf-8"))
     openapi_statuses = set(openapi["components"]["schemas"]["GenerationStatus"]["enum"])
 

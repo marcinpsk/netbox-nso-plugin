@@ -68,7 +68,7 @@ PRODUCERS = {
     ("views.py", "_save_owned_overlay_only_edit"): ("operator_edit", 2),
     ("views.py", "_save_owned_interface_mtu_edit"): ("operator_edit", 2),
     ("views.py", "_route_map_name_edit_operations"): ("operator_edit", 2),
-    ("views.py", "_save_lacp_edit"): ("operator_edit", 6),
+    ("views.py", "_save_lacp_edit"): ("operator_edit", 5),
     ("views.py", "_save_vlan_name_edit"): ("operator_edit", 2),
     ("views.py", "NSOBulkAcceptView.post"): ("accept", 1),
     ("views.py", "RoutingStateAcceptMixin.post"): ("accept", 2),
@@ -97,9 +97,19 @@ CONTINUATIONS = {
     ("durable_capture.py", "_snapshot"): (3, "Snapshot values do not acquire overlay ownership."),
     ("forms.py", "NSOInterfaceMtuStateForm.save"): (2, "Repends owned rows; unowned edits remain changed."),
     ("intent_drift.py", "_backfill_static_route_generations"): (2, "Repends deploying static routes only."),
-    ("intent_state.py", "_repend_locked_rows"): (1, "Repends previously owned rows under the scope locks."),
+    ("lifecycle_fence.py", "finish_locked_owners"): (
+        1,
+        "Repends only previously owned changed contributions under owner locks.",
+    ),
+    ("outcome_settlement.py", "_settle_owner"): (
+        2,
+        "Correlated logical Apply verdicts preserve existing ownership.",
+    ),
+    ("outcome_settlement.py", "_capture_automatic_snapshots"): (
+        1,
+        "Clones frozen bookkeeping for a proven deleted owner without acquiring ownership.",
+    ),
     ("renderer_audit.py", "_repair_plan"): (3, "Repairs rows selected from owned statuses."),
-    ("settlement.py", "_settle"): (1, "Correlated Apply verdicts preserve existing ownership."),
     ("vlan_reconciler.py", "save_vlan_content"): (1, "Repends only owned attachments after a native edit."),
 }
 

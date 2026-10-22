@@ -28,6 +28,8 @@ def generation():
             "bgp_count_by_outcome": {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0},
             "row_outcomes": [],
             "refusals": [],
+            "settlement_owners": [],
+            "commit_acknowledged": False,
         },
         "carrier_job_error": None,
         "updated_at": "2026-01-02T03:04:05+00:00",
@@ -174,33 +176,17 @@ def test_cutover_generation_rejects_projection_drift():
 def test_cutover_generation_accepts_refused_peer_evidence():
     from netbox_nso_plugin.refusal_contract import validate_generation
 
-    sample = json.loads((ROOT / "tests/fixtures/refusal_settlement.json").read_bytes())["bgp"]
-    outcomes = [
-        {
-            **{key: value for key, value in item.items() if key not in {"outcome", "cause"}},
-            "disposition": item["outcome"],
-            "refusals": [sample["refusal"]] if item["cause"] else [],
-        }
-        for item in sample["expected"]
-    ]
+    from .test_refusal_result import refused_bgp_result
+
+    result = refused_bgp_result()
     raw = generation()
     raw.update(
         status="failed",
         carrier_job_status="failed",
-        row_outcomes=outcomes,
-        refusals=[
-            {
-                **sample["refusal"],
-                "logical_rows": [
-                    {key: value for key, value in outcomes[0].items() if key not in {"disposition", "refusals"}}
-                ],
-                "provenance": "current",
-                "sender_phase": "commit",
-            }
-        ],
+        row_outcomes=result["row_outcomes"],
+        refusals=result["refusals"],
+        carrier_job_result=result,
     )
-    raw["carrier_job_result"].update(row_outcomes=raw["row_outcomes"], refusals=raw["refusals"])
-    raw["carrier_job_result"]["bgp_count_by_outcome"]["apply_failed"] = 1
     assert validate_generation(raw) == raw
 
 
@@ -210,7 +196,12 @@ def test_cutover_generation_requires_promised_count_maps(section):
 
     raw = generation()
     raw["sections"] = [section]
-    raw["carrier_job_result"] = {"row_outcomes": [], "refusals": []}
+    raw["carrier_job_result"] = {
+        "row_outcomes": [],
+        "refusals": [],
+        "settlement_owners": [],
+        "commit_acknowledged": False,
+    }
     with pytest.raises(ContractError, match="count"):
         validate_generation(raw)
 
@@ -229,7 +220,13 @@ def test_split_section_streams_count_under_their_document_section(stream, sectio
     raw = generation()
     counts = raw["carrier_job_result"]["bgp_count_by_outcome"]
     raw.update(sections=[section], stream_revisions={stream: 7}, source_push_seq={stream: 41})
-    raw["carrier_job_result"] = {**{key: dict(counts) for key in counters}, "row_outcomes": [], "refusals": []}
+    raw["carrier_job_result"] = {
+        **{key: dict(counts) for key in counters},
+        "row_outcomes": [],
+        "refusals": [],
+        "settlement_owners": [],
+        "commit_acknowledged": False,
+    }
     assert validate_generation(raw) == raw
     raw["sections"] = [stream]
     with pytest.raises(ContractError, match="invalid counted section"):

@@ -1232,14 +1232,16 @@ class TestNSOJobStatusView(ViewTestBase):
             "ca_cert_path": None,
             "timeout": 30,
         }
-        session = make_session(response=make_response(200, json_data={"job_id": 42, "status": "completed"}))
+        session = make_session(
+            response=make_response(200, json_data={"id": 42, "type": "apply", "status": "succeeded"})
+        )
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[42])
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.content)
-        self.assertEqual(data["job_id"], 42)
+        self.assertEqual(data["id"], 42)
 
     @patch("netbox_nso_plugin.adapter_client._resolve_config")
     @patch("netbox_nso_plugin.adapter_client.requests.Session")
@@ -1913,7 +1915,9 @@ class TestNSORefreshStateRace(_CascadeFlushMixin, IntentPushResetMixin, Transact
             nonlocal read_finished
             management_read = sql.lstrip().upper().startswith("SELECT") and table in sql
             unlocked_read = before_planning and read_finished and management_read and "FOR UPDATE" not in sql
-            acquisition = not before_planning and management_read and "FOR UPDATE" in sql and " IN " in sql
+            acquisition = (
+                not before_planning and read_finished and management_read and "FOR UPDATE" in sql and " IN " in sql
+            )
             if unlocked_read or acquisition:
                 read_finished = False
                 sequence = next(changes, None)
@@ -2281,8 +2285,8 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
         self.assertFalse(self.interface.enabled)
         self.assertEqual(en_state.status, "accepted")
 
-    def test_toggle_back_to_device_value_is_in_sync_not_pending(self):
-        """Flipping enabled off then back on lands on the device value → in_sync, not pending."""
+    def test_toggle_back_to_device_value_requires_new_apply_evidence(self):
+        """An edit and revert stays owned and requires a new execution certificate."""
         self._make_managed()
         self.interface.enabled = True
         self.interface.save(update_fields=["enabled"])
@@ -2297,12 +2301,12 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
                 self.client.post(url, {"value": "false"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
             en_state.refresh_from_db()
             self.assertEqual(en_state.status, "accepted")
-            # Flip back to True — matches the device again → in_sync (nothing to apply).
+            # The old matching observation cannot certify the reverted intent.
             with self.captureOnCommitCallbacks(execute=True):
                 self.client.post(url, {"value": "true"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
 
         en_state.refresh_from_db()
-        self.assertEqual(en_state.status, "in_sync")
+        self.assertEqual(en_state.status, "accepted")
         self.assertIsNotNone(en_state.accepted_at)  # still owned by NetBox
 
     def test_unknown_attribute_rejected(self):
@@ -2318,12 +2322,16 @@ class TestNSOInterfaceEditFieldView(ViewTestBase):
 class TestNSOApplyPreviewView(ViewTestBase):
     """Tests for NSOApplyPreviewView (what Apply would push)."""
 
-    def _get_diff_preview(self, diffs, *, outformat="native", error=None):
+    def _get_diff_preview(self, diffs, *, outformat="native", error=None, status="ready", refusals=None):
         """Use the current generation contract at the external HTTP boundary."""
         from ._adapter_http import make_apply_preview
 
         response_payload = make_apply_preview(
-            self.mgmt.adapter_device_id, diffs=diffs, outformat="cli" if outformat == "cli" else "native"
+            self.mgmt.adapter_device_id,
+            diffs=diffs,
+            outformat="cli" if outformat == "cli" else "native",
+            status=status,
+            refusals=refusals,
         )
         session = make_session(json_data=response_payload)
         if error is not None:
@@ -2444,6 +2452,21 @@ class TestNSOApplyPreviewView(ViewTestBase):
         clean = self._get_diff_preview({})
         self.assertEqual(clean["device_diff"], {})
         self.assertTrue(clean["diff_available"], "a dry-run that ran and found nothing is a real answer")
+
+    def test_nonready_preview_cannot_claim_nothing_pending(self):
+        from .test_refusal_result import refused_bgp_result
+
+        self.mgmt.adapter_device_id = 79
+        self.mgmt.save(update_fields=("adapter_device_id",))
+        content_bulk_update(self.iface_state, status="in_sync", nso_value="")
+        for status in ("refused", "unavailable", "error"):
+            with self.subTest(status=status):
+                refusals = refused_bgp_result()["refusals"] if status == "refused" else []
+                data = self._get_diff_preview({}, status=status, refusals=refusals)
+                self.assertEqual(data["preview_status"], status)
+                self.assertEqual(data["refusals"], refusals)
+                self.assertFalse(data["diff_available"])
+                self.assertFalse(data["nothing_pending"])
 
     def test_preview_isis_interface_detail_includes_bfd(self):
         """#77 transparency: a tri-state bfd intent MUST appear in 'properties pushed' —
@@ -5570,7 +5593,9 @@ class TestOverlayFieldEditView(ViewTestBase):
         bundle.refresh_from_db()
         edited_state.refresh_from_db()
         sibling_state.refresh_from_db()
-        self.assertEqual((bundle.status, edited_state.status, sibling_state.status), ("accepted",) * 3)
+        self.assertEqual(
+            (bundle.status, edited_state.status, sibling_state.status), ("accepted", "accepted", "deploying")
+        )
 
     def _assert_edit_clears_apply_attempt(self, key, rows, data, url=None, expected_code=200):
         from netbox_nso_plugin.models import NSOApplyAttempt
@@ -5784,8 +5809,8 @@ class TestOverlayFieldEditView(ViewTestBase):
         host.refresh_from_db()
         self.assertEqual((host.community_hash, host.status, host.apply_attempt_id), (new_hash, "accepted", None))
 
-    def test_edit_lacp_member_clears_every_deploying_apply_attempt(self):
-        from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
+    def test_edit_lacp_member_preserves_the_sibling_apply_attempt(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOLACPBundleState, NSOLACPMemberState
 
         lag = Interface.objects.create(device=self.device, name="Port-channel13", type="lag")
         edited = Interface.objects.create(device=self.device, name="GigabitEthernet0/13", type="1000base-t", lag=lag)
@@ -5810,7 +5835,20 @@ class TestOverlayFieldEditView(ViewTestBase):
             )
             for interface in (edited, sibling)
         ]
-        self._assert_edit_clears_apply_attempt("lacp_member", [*members, bundle], {"mode": "passive"})
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt, adapter_device_id=self.mgmt.adapter_device_id)
+        for row in [*members, bundle]:
+            mirror_update(row, status="deploying", apply_attempt_id=attempt.pk)
+        sibling_prior = (members[1].last_apply_at, members[1].last_apply_error)
+
+        response = self.client.post(self._url("lacp_member", members[0].pk), {"mode": "passive"})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        for row in (members[0], bundle):
+            row.refresh_from_db()
+            self.assertEqual((row.status, row.apply_attempt_id), ("accepted", None))
+        members[1].refresh_from_db()
+        self.assertEqual((members[1].status, members[1].apply_attempt_id), ("deploying", attempt.pk))
+        self.assertEqual((members[1].last_apply_at, members[1].last_apply_error), sibling_prior)
 
     def test_edit_shared_vlan_name_updates_native_object_and_owns_every_attached_device(self):
         from django.utils import timezone
@@ -8668,6 +8706,10 @@ class _ApplyBoundaryAdapter(ReceiptAdapter):
         self.apply_requests: list[dict] = []
 
     def _handle(self, method, url, **kwargs):
+        if method == "GET" and url.endswith(("/jobs", "/generations")):
+            response = make_response(200, [])
+            response.headers["X-Store-Incarnation"] = "placeholder-store"
+            return response
         if url.endswith("/deployment-evidence"):
             assert self.evidence is not None, "this test arranged no deployment evidence"
             return make_response(200, self.evidence())
@@ -8737,21 +8779,49 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         self.assertEqual(self.mtu_state.status, "deploying")
 
         adapter_device_id = self.mgmt.adapter_device_id
+        from netbox_nso_plugin.refusal_protocol import row_ref
+
+        reference = row_ref("mtu", "mtu.interface", (("interface", (self.mtu_state.interface.name,)),))
+        carrier = {
+            "stream": "interface_mtu",
+            "row": {"subject": reference.subject, "key": reference.key},
+            "source_push_seq": attempt.selected["interface_mtu"],
+            "frozen_revision": attempt.selected["interface_mtu"],
+            "accepted_at": self.mtu_state.accepted_at.isoformat() if self.mtu_state.accepted_at else None,
+            "generation_id": 91,
+            "settlement_cohort": 91,
+        }
+        outcome = {key: value for key, value in carrier.items() if key != "accepted_at"}
+        outcome.update(acceptance_identity=carrier["accepted_at"], carrier=carrier, disposition="in_sync", refusals=[])
         admitted = _attempt(
             attempt.pk,
             adapter_device_id,
             91,
             dict(attempt.selected),
             "settled",
-            result={"interface_mtu_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
+            result={
+                "interface_mtu_count_by_outcome": {"in_sync": 1, "apply_failed": 0, "not_applied": 0, "unavailable": 0},
+                "row_outcomes": [outcome],
+                "refusals": [],
+                "settlement_owners": [{**carrier, "disposition": "in_sync"}],
+                "commit_acknowledged": True,
+            },
         )
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS
+
+        terminal = admitted["generations"][0]
+        for section in terminal["sections"]:
+            for counter in SECTION_COUNTER_KEYS[section]:
+                terminal["carrier_job_result"].setdefault(
+                    counter, {"in_sync": 0, "apply_failed": 0, "not_applied": 0, "unavailable": 0}
+                )
         unknown = _payload(adapter_device_id, [])
         unknown["unknown_apply_attempt_ids"] = [str(attempt.pk)]
         if malformed_replay:
             invalid_replay = _ApplyBoundaryAdapter(lambda: (202, {"outcome": "unrecognized"}), evidence=lambda: unknown)
             config, session = invalid_replay.patches()
             with config, session:
-                settle_device_apply_attempts(self.mgmt, static_route_feed_drained=True)
+                settle_device_apply_attempts(self.mgmt)
             self.assertEqual(len(invalid_replay.apply_requests), 1)
             attempt.refresh_from_db()
             self.assertIsNone(attempt.http_status)
@@ -8766,7 +8836,7 @@ class TestApplyDoesNotStoreAnAmbiguousAdapterFailure(_CascadeFlushMixin, IntentP
         recovery = _ApplyBoundaryAdapter(replay, evidence=lambda: known if replayed else unknown)
         config, session = recovery.patches()
         with config, session:
-            settle_device_apply_attempts(self.mgmt, static_route_feed_drained=True)
+            settle_device_apply_attempts(self.mgmt)
 
         self.assertEqual(len(recovery.apply_requests), 1)
         attempt.refresh_from_db()

@@ -5,7 +5,7 @@
 import os
 import sys
 from contextlib import contextmanager
-from unittest.mock import ANY, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import requests
@@ -113,159 +113,215 @@ def _forced_scopes(adapter, device_id):
     return [scopes[selections[request["push_seq"]]] for request in requests_ if request["push_seq"] in selections]
 
 
+class _CallbackEvidenceAdapter(ReceiptAdapter):
+    """Serve coherent empty execution evidence and one real policy observation."""
+
+    def __init__(self, adapter_device_id, *, evidence_error=None, unknown_attempt_id=None):
+        super().__init__()
+        self.adapter_device_id = adapter_device_id
+        self.evidence_error = evidence_error
+        self.unknown_attempt_id = unknown_attempt_id
+        self.evidence_requests = []
+        self.policy_reads = []
+        self.apply_requests = []
+        self.feed_reads = 0
+        self.on_evidence = None
+        self.on_cursor_feed = None
+
+    def _handle(self, method, url, **kwargs):
+        if method == "GET" and url.endswith("/api/v1/jobs"):
+            self.feed_reads += 1
+            if self.feed_reads == 3 and self.on_cursor_feed is not None:
+                self.on_cursor_feed()
+            if self.evidence_error is not None:
+                raise self.evidence_error
+            response = make_response(200, [])
+            response.headers["X-Store-Incarnation"] = "callback-evidence-store"
+            return response
+        if method == "GET" and url.endswith(f"/devices/{self.adapter_device_id}/generations"):
+            return make_response(200, [])
+        if method == "POST" and url.endswith("/deployment-evidence"):
+            if self.on_evidence is not None:
+                action, self.on_evidence = self.on_evidence, None
+                action()
+            self.evidence_requests.append(kwargs["json"])
+            return make_response(
+                200,
+                {
+                    "device_id": self.adapter_device_id,
+                    "head": None,
+                    "blocked": False,
+                    "write_work_pending": False,
+                    "held_jobs": [],
+                    "pending_generations": 0,
+                    "attempts": [],
+                    "unknown_apply_attempt_ids": []
+                    if self.unknown_attempt_id is None
+                    else [str(self.unknown_attempt_id)],
+                },
+            )
+        if method == "GET" and url.endswith("/route-policy"):
+            self.policy_reads.append(url)
+            return make_response(200, {"prefix_lists": [{"name": "CALLBACK-PREFIX", "afi": "ipv4", "entries": []}]})
+        if method == "POST" and url.endswith("/actions/apply"):
+            self.apply_requests.append(kwargs["json"])
+            raise AssertionError("Unexpected manual Apply replay")
+        return super()._handle(method, url, **kwargs)
+
+
 class TestRunDeviceReconcile(APITestCase):
     """run_device_reconcile is the rqworker entrypoint (off-request)."""
 
-    def test_route_policy_reconcile_does_not_prefetch_deployment_evidence(self):
-        from types import SimpleNamespace
-
-        from netbox_nso_plugin.reconcile import _reconcile_routing
-
-        device = SimpleNamespace(pk=17)
-        mgmt = SimpleNamespace(
-            adapter_device_id=23,
-            manage_routing=True,
-            manage_static=False,
-            manage_isis=False,
-            manage_route_policy=True,
-            manage_ospf=False,
-            manage_bgp=False,
-            manage_redistribution=False,
-        )
-
-        route_policy = {}
-        requested_device_ids = []
-
-        def get_route_policy(device_id):
-            requested_device_ids.append(device_id)
-            return route_policy
-
-        client = SimpleNamespace(get_route_policy=get_route_policy)
-        ctx = {}
-        attempt_ids = (object(),)
-
-        def run_body(_ctx, _mgmt, _family, _payload, body, **_kwargs):
-            return body()
-
-        with (
-            patch("netbox_nso_plugin.apply_settlement.load_deployment_evidence") as load_evidence,
-            patch(
-                "netbox_nso_plugin.apply_settlement.route_policy_deploying_attempt_ids",
-                return_value=attempt_ids,
-            ) as deploying_attempt_ids,
-            patch("netbox_nso_plugin.reconcile._safe_reconcile", return_value=[]) as safe_reconcile,
-            patch("netbox_nso_plugin.reconcile._gated", side_effect=run_body),
-        ):
-            _reconcile_routing(device, mgmt, client, ctx)
-
-        load_evidence.assert_not_called()
-        self.assertEqual(requested_device_ids, [mgmt.adapter_device_id])
-        deploying_attempt_ids.assert_called_once_with(mgmt)
-        safe_reconcile.assert_called_once_with(
-            ctx,
-            "route_policy_states",
-            mgmt,
-            ("NSORoutePolicyState",),
-            ANY,
-            device,
-            route_policy,
-        )
-        self.assertEqual(ctx["_route_policy_attempt_ids"], attempt_ids)
-        self.assertEqual(ctx["_route_policy_adapter_device_id"], mgmt.adapter_device_id)
-
-    def test_route_policy_evidence_programming_error_stops_reconcile(self):
-        from uuid import uuid4
-
-        from netbox_nso_plugin import reconcile
-
-        device = _make_device("rec-evidence-error")
-        instance = NSOInstance.objects.create(
-            name="rec-evidence-error",
-            adapter_instance_id="rec-evidence-error",
-        )
-        NSODeviceManagement.objects.create(
-            device=device,
-            nso_instance=instance,
-            nso_device_name="rec-evidence-error",
-            adapter_device_id=23,
-            manage_route_policy=True,
-        )
-
-        attempt_id = uuid4()
-        reconcile_context = {
-            reconcile._ROUTE_POLICY_ATTEMPT_IDS: (attempt_id,),
-            reconcile._ROUTE_POLICY_ADAPTER_DEVICE_ID: 23,
-        }
-        with (
-            patch.object(reconcile, "reconcile_device", return_value=reconcile_context),
-            patch(
-                "netbox_nso_plugin.apply_settlement.load_deployment_evidence",
-                side_effect=RuntimeError("evidence parser failed"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "evidence parser failed"),
-        ):
-            reconcile.run_device_reconcile(device.pk)
-
-    def test_unrequested_evidence_uuid_does_not_stop_reconcile(self):
-        from uuid import uuid4
-
-        from netbox_nso_plugin import reconcile
-        from netbox_nso_plugin.models import NSOApplyAttempt
-
-        from ._adapter_http import make_session
-        from ._outbox_case import CFG
-
-        device = _make_device("rec-evidence-extra")
-        instance = NSOInstance.objects.create(
-            name="rec-evidence-extra",
-            adapter_instance_id="rec-evidence-extra",
-        )
-        mgmt = NSODeviceManagement.objects.create(
-            device=device,
-            nso_instance=instance,
-            nso_device_name="rec-evidence-extra",
-            adapter_device_id=24,
-            manage_route_policy=True,
-        )
-        requested_id, extra_id = uuid4(), uuid4()
-        for attempt_id in (requested_id, extra_id):
-            NSOApplyAttempt.objects.create(
-                id=attempt_id,
-                adapter_apply_attempt_id=attempt_id,
-                management=mgmt,
-                adapter_device_id=mgmt.adapter_device_id,
-                selected={"route_policy": 1},
-                scope_revisions={"route_policy": 1},
-                http_status=202,
-                response={"device_id": mgmt.adapter_device_id, "outcome": "promoted"},
+    def _managed_policy_device(self, name, adapter_device_id):
+        device = _make_device(name)
+        instance = NSOInstance.objects.create(name=name, adapter_instance_id=name)
+        with without_commit_drain():
+            management = NSODeviceManagement.objects.create(
+                device=device,
+                nso_instance=instance,
+                nso_device_name=name,
+                adapter_device_id=adapter_device_id,
+                manage_routing=True,
+                manage_route_policy=True,
             )
-        evidence = {
-            "device_id": mgmt.adapter_device_id,
-            "head": None,
-            "blocked": False,
-            "write_work_pending": False,
-            "held_jobs": [],
-            "pending_generations": 0,
-            "attempts": [],
-            "unknown_apply_attempt_ids": [str(extra_id)],
-        }
-        reconcile_context = {
-            reconcile._ROUTE_POLICY_ATTEMPT_IDS: (requested_id,),
-            reconcile._ROUTE_POLICY_ADAPTER_DEVICE_ID: mgmt.adapter_device_id,
-        }
+        return device, management
 
-        with (
-            patch.object(reconcile, "reconcile_device", return_value=reconcile_context),
-            patch("netbox_nso_plugin.adapter_client._resolve_config", return_value=CFG),
-            patch("netbox_nso_plugin.adapter_client.requests.Session", return_value=make_session(200, evidence)),
-            patch("netbox_nso_plugin.adapter_client.trigger_apply") as trigger_apply,
-            self.assertLogs("netbox_nso_plugin.reconcile", level="WARNING") as logs,
-        ):
-            result = reconcile.run_device_reconcile(device.pk)
+    def test_route_policy_reconcile_does_not_prefetch_deployment_evidence(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        device, management = self._managed_policy_device("rec-evidence-once", 23)
+        adapter = _CallbackEvidenceAdapter(management.adapter_device_id)
+        config, session = adapter.patches()
+        with config, session:
+            result = run_device_reconcile(device.pk)
 
         self.assertEqual(result, {"device_id": device.pk, "interface_states": 0})
-        trigger_apply.assert_not_called()
-        self.assertTrue(any("route-policy evidence failed" in line for line in logs.output))
+        self.assertEqual(adapter.evidence_requests, [{"apply_attempt_ids": []}])
+        self.assertEqual(len(adapter.policy_reads), 1)
+        self.assertTrue(
+            NSORoutePolicyState.objects.filter(management=management, object_name="CALLBACK-PREFIX").exists()
+        )
+
+    def test_route_policy_evidence_programming_error_stops_reconcile(self):
+        from netbox_nso_plugin.models import NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        device, management = self._managed_policy_device("rec-evidence-error", 23)
+        adapter = _CallbackEvidenceAdapter(
+            management.adapter_device_id, evidence_error=RuntimeError("evidence parser failed")
+        )
+        config, session = adapter.patches()
+        with config, session, self.assertRaisesRegex(RuntimeError, "evidence parser failed"):
+            run_device_reconcile(device.pk)
+
+        self.assertEqual(adapter.policy_reads, [])
+        self.assertFalse(NSORoutePolicyState.objects.filter(management=management).exists())
+
+    def test_mapping_change_during_cursor_walk_does_not_reuse_old_evidence(self):
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        _device, management = self._managed_policy_device("rec-evidence-remap", 23)
+        adapter = _CallbackEvidenceAdapter(management.adapter_device_id)
+        adapter.on_cursor_feed = lambda: NSODeviceManagement.objects.filter(pk=management.pk).update(
+            adapter_source_epoch=(management.adapter_source_epoch or 0) + 1
+        )
+        config, session = adapter.patches()
+        with config, session:
+            result = consume_static_route_settlements(management)
+
+        self.assertEqual(adapter.feed_reads, 3)
+        self.assertIsNone(result.deployment_evidence)
+        self.assertIsNone(result.mapping_epoch)
+
+    def _sent_selection(self, management):
+        from django.utils import timezone
+
+        from netbox_nso_plugin.durable_capture import mapping_epoch
+        from netbox_nso_plugin.models import NSOAcceptedSelection
+
+        return NSOAcceptedSelection.objects.create(
+            management=management,
+            mapping_epoch=mapping_epoch(management),
+            stream="route_policy",
+            source_push_seq=1,
+            plugin_revision=1,
+            request_digest="a" * 64,
+            publication_state="sent",
+            acknowledged_at=timezone.now(),
+        )
+
+    def test_sweeper_fetches_deployment_evidence_once(self):
+        from netbox_nso_plugin.settlement import sweep_static_route_settlements
+
+        _device, management = self._managed_policy_device("rec-evidence-sweep", 23)
+        self._sent_selection(management)
+        adapter = _CallbackEvidenceAdapter(management.adapter_device_id)
+        config, session = adapter.patches()
+        with config, session:
+            result = sweep_static_route_settlements()
+
+        self.assertEqual(result, (1, 0))
+        self.assertEqual(adapter.evidence_requests, [{"apply_attempt_ids": []}])
+
+    def test_unmanage_during_evidence_fetch_skips_callback_reads(self):
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        device, management = self._managed_policy_device("rec-evidence-unmanage", 23)
+        adapter = _CallbackEvidenceAdapter(management.adapter_device_id)
+        adapter.on_evidence = lambda: NSODeviceManagement.objects.filter(pk=management.pk).delete()
+        config, session = adapter.patches()
+        with config, session:
+            result = run_device_reconcile(device.pk)
+
+        self.assertEqual(result, {"device_id": device.pk, "interface_states": 0})
+        self.assertEqual(adapter.policy_reads, [])
+        self.assertFalse(NSODeviceManagement.objects.filter(pk=management.pk).exists())
+
+    def test_unmanage_during_evidence_fetch_does_not_abort_sweeper(self):
+        from netbox_nso_plugin.settlement import sweep_static_route_settlements
+
+        _device, management = self._managed_policy_device("rec-evidence-sweep-unmanage", 23)
+        self._sent_selection(management)
+        adapter = _CallbackEvidenceAdapter(management.adapter_device_id)
+        adapter.on_evidence = lambda: NSODeviceManagement.objects.filter(pk=management.pk).delete()
+        config, session = adapter.patches()
+        with config, session:
+            result = sweep_static_route_settlements()
+
+        self.assertEqual(result, (0, 1))
+        self.assertFalse(NSODeviceManagement.objects.filter(pk=management.pk).exists())
+
+    def test_unrequested_evidence_uuid_does_not_stop_reconcile(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSORoutePolicyState
+        from netbox_nso_plugin.reconcile import run_device_reconcile
+
+        device, management = self._managed_policy_device("rec-evidence-extra", 24)
+        requested_id, extra_id = uuid4(), uuid4()
+        attempt = NSOApplyAttempt.objects.create(
+            id=requested_id,
+            adapter_apply_attempt_id=requested_id,
+            management=management,
+            adapter_device_id=management.adapter_device_id,
+            selected={"route_policy": 1},
+            scope_revisions={"route_policy": 1},
+        )
+        adapter = _CallbackEvidenceAdapter(management.adapter_device_id, unknown_attempt_id=extra_id)
+        config, session = adapter.patches()
+        with config, session, self.assertLogs("netbox_nso_plugin.reconcile", level="WARNING") as logs:
+            result = run_device_reconcile(device.pk)
+
+        self.assertEqual(result, {"device_id": device.pk, "interface_states": 0})
+        self.assertTrue(adapter.evidence_requests)
+        self.assertTrue(all(row == {"apply_attempt_ids": [str(requested_id)]} for row in adapter.evidence_requests))
+        self.assertEqual(adapter.apply_requests, [])
+        self.assertTrue(any("settle skipped" in line for line in logs.output))
+        self.assertEqual(len(adapter.policy_reads), 1)
+        self.assertTrue(
+            NSORoutePolicyState.objects.filter(management=management, object_name="CALLBACK-PREFIX").exists()
+        )
+        attempt.refresh_from_db()
+        self.assertIsNone(attempt.response)
 
     def test_missing_device_is_skipped(self):
         from netbox_nso_plugin.reconcile import run_device_reconcile

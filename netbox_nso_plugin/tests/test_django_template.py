@@ -220,8 +220,8 @@ class TestUpsertInterfaceStates(TestCase):
         state = NSOInterfaceState.objects.get(interface=self.interface, attribute="description")
         self.assertIsNotNone(state.last_apply_error)
 
-    def test_last_apply_at_updated_when_differs(self):
-        """last_apply_at is updated when the adapter provides a new valid timestamp."""
+    def test_observation_does_not_create_a_certified_apply_timestamp(self):
+        """Only terminal execution evidence can certify an owned row's apply time."""
         from netbox_nso_plugin.template_content import _upsert_interface_states
 
         NSOInterfaceState.objects.filter(interface=self.interface, attribute="description").delete()
@@ -249,7 +249,7 @@ class TestUpsertInterfaceStates(TestCase):
             ],
         )
         state = NSOInterfaceState.objects.get(interface=self.interface, attribute="description")
-        self.assertIsNotNone(state.last_apply_at)
+        self.assertIsNone(state.last_apply_at)
 
 
 class TestInterfaceNSOBadge(TestCase):

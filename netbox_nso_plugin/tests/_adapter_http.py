@@ -80,7 +80,16 @@ def make_transport_session(response, *, error=None):
     return session
 
 
-def make_apply_preview(device_id=10, *, diffs=None, generation_id=81, document_digest="a" * 64, outformat="native"):
+def make_apply_preview(
+    device_id=10,
+    *,
+    diffs=None,
+    generation_id=81,
+    document_digest="a" * 64,
+    outformat="native",
+    status="ready",
+    refusals=None,
+):
     """Return the current adapter ApplyDiffOut shape."""
     return {
         "device_id": device_id,
@@ -88,6 +97,8 @@ def make_apply_preview(device_id=10, *, diffs=None, generation_id=81, document_d
         "diffs": {} if diffs is None else diffs,
         "generation_id": generation_id,
         "document_digest": document_digest,
+        "status": status,
+        "refusals": [] if refusals is None else refusals,
     }
 
 

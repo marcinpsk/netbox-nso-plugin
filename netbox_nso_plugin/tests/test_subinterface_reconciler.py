@@ -668,10 +668,8 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
     def test_owned_state_survives_when_interface_drops_from_payload(self):
         """An owned subinterface overlay must NOT be hard-deleted when the device stops reporting it.
 
-        NSOSubinterfaceState is in ``_APPLY_DEPLOYING_SCOPES``; a bulk delete of stale rows
-        destroys ownership. A confirmed row that vanishes surfaces as ``changed``. That
-        rendered-membership change advances the scope revision, so another deploying row is
-        re-pended to ``accepted`` and loses its superseded attempt identity.
+        A confirmed row that vanishes surfaces as ``changed`` and advances the scope revision.
+        An unchanged deploying sibling retains its own Apply attempt.
         """
         from uuid import uuid4
 
@@ -681,7 +679,6 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
         attempt = uuid4()
-        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
         before = revision.revision
@@ -696,8 +693,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert NSOSubinterfaceState.objects.filter(pk=confirmed.pk).exists(), "in_sync overlay deleted"
         deploying.refresh_from_db()
         revision.refresh_from_db()
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
         assert revision.revision == before + 1  # the vanished confirmed subinterface is a content change
 
@@ -729,12 +725,8 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         assert deploying.status == "deploying"
         assert deploying.apply_attempt_id == attempt
 
-    def test_a_vanished_confirmed_sibling_repends_a_deploying_row(self):
-        """A vanished confirmed sibling bears content, so every deploying row in the scope is stale.
-
-        The in-flight row is still reported, carrying the pre-apply dot1q the device still
-        holds, so only the deferred re-pend can move it off ``deploying``.
-        """
+    def test_a_vanished_confirmed_sibling_preserves_a_mismatching_deploying_row(self):
+        """The read changes a confirmed sibling without superseding unchanged pending intent."""
         from uuid import uuid4
 
         from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
@@ -743,7 +735,6 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
         attempt = uuid4()
-        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
         before = revision.revision
@@ -754,17 +745,13 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
         deploying.refresh_from_db()
         revision.refresh_from_db()
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
+        assert deploying.dot1q_vlan == 100
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
         assert revision.revision == before + 1
 
-    def test_a_vanished_confirmed_sibling_repends_a_matching_deploying_row_after_the_read(self):
-        """The deferred re-pend runs after the read's transitions, so a matching entry never settles here.
-
-        The transition fence leaves the in-flight row ``deploying``, then the deferred re-pend
-        at the end of the reconcile transaction moves it to ``accepted`` with no attempt.
-        """
+    def test_a_vanished_confirmed_sibling_preserves_a_matching_deploying_row(self):
+        """A matching read preserves the pending attempt when only its sibling changes."""
         from uuid import uuid4
 
         from netbox_nso_plugin.models import NSOIntentRevision, NSOSubinterfaceState
@@ -773,7 +760,6 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
         deploying = self._state(name="ge-0/0/0.100", dot1q=100, status="accepted")
         confirmed = self._state(name="ge-0/0/0.200", dot1q=200, status="in_sync")
         attempt = uuid4()
-        # Marked LAST, and lifecycle-only: creating a sibling row re-pends a deploying one.
         mirror_update(deploying, status="deploying", apply_attempt_id=attempt)
         revision = NSOIntentRevision.objects.get(device=self.device, scope="subinterface")
         before = revision.revision
@@ -784,8 +770,7 @@ class TestSubinterfaceWritePath(IntentPushResetMixin, TestCase):
 
         deploying.refresh_from_db()
         revision.refresh_from_db()
-        assert deploying.status == "accepted"
-        assert deploying.apply_attempt_id is None
+        assert (deploying.status, deploying.apply_attempt_id) == ("deploying", attempt)
         assert NSOSubinterfaceState.objects.get(pk=confirmed.pk).status == "changed"
         assert revision.revision == before + 1
 

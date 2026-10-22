@@ -72,7 +72,9 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
                 username="switching-apply-admin", password="test-password-1685", email="switching@test.example"
             )
         self.client.force_login(user)
-        adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
+        adapter = _ApplyContractAdapter(
+            lambda selected: (202, {**_promoted(selected), "device_id": self.management.adapter_device_id})
+        )
         adapter.preparation_revisions = self.adapter.preparation_revisions
         url = reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=[self.management.pk, "apply"])
         config, session = adapter.patches()
@@ -81,6 +83,121 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         assert response.status_code == 200, response.content
         assert response.json()["status"] == "ok", response.content
         return adapter
+
+    def _settlement_evidence(self, adapter, status, *, refused_rows=None):
+        import json
+
+        from django.utils import timezone
+
+        from netbox_nso_plugin.models import NSOApplyAttempt
+        from netbox_nso_plugin.refusal_protocol import PREFIX, RowRef, refusal, render_refusals
+        from netbox_nso_plugin.refusal_registry import SECTION_COUNTER_KEYS, document_section_for_stream
+
+        from .test_apply_settlement import _payload
+
+        self.management.refresh_from_db()
+        attempt = NSOApplyAttempt.objects.get(pk=UUID(adapter.apply_requests[0]["apply_attempt_id"]))
+        snapshots = list(attempt.overlay_snapshots.order_by("model_label", "overlay_pk"))
+        refused = None if refused_rows is None else {(row._meta.label_lower, row.pk) for row in refused_rows}
+        generations = []
+        sequences = {}
+        for index, prepared in enumerate(attempt.response["generations"], start=1):
+            generation_id = prepared["generation_id"]
+            job_id = 500 + index
+            revision = prepared["stream_revisions"]
+            sections = sorted({document_section_for_stream(stream) for stream in revision})
+            outcomes, causes = [], []
+            carriers = {}
+            counts = {
+                key: dict.fromkeys(("in_sync", "apply_failed", "not_applied", "unavailable"), 0)
+                for section in sections
+                for key in SECTION_COUNTER_KEYS[section]
+            }
+            if status in {"settled", "failed"}:
+                for snapshot in snapshots:
+                    failed = status == "failed" and (
+                        refused is None or (snapshot.model_label, snapshot.overlay_pk) in refused
+                    )
+                    disposition = "refused" if failed else "not_applied" if status == "failed" else "in_sync"
+                    for contributor in snapshot.contributors["rows"]:
+                        stream = contributor["stream"]
+                        ref, carrier_ref = contributor["logical_ref"], contributor["carrier_ref"]
+                        identity = {
+                            "stream": stream,
+                            "row": {key: ref[key] for key in ("subject", "key")},
+                            "source_push_seq": prepared["source_push_seq"][stream],
+                            "frozen_revision": revision[stream],
+                            "generation_id": generation_id,
+                            "settlement_cohort": 9,
+                        }
+                        carrier = {
+                            **identity,
+                            "row": {key: carrier_ref[key] for key in ("subject", "key")},
+                            "accepted_at": None,
+                        }
+                        identity.update(acceptance_identity=None, carrier=carrier)
+                        records = []
+                        if failed:
+                            message = (
+                                "lag.member-mode-ios"
+                                if ref["subject"] == "lag.bundle.member"
+                                else f"{stream}.ned-unsupported"
+                            )
+                            built = refusal(stream, RowRef(ref["subject"], ref["key"]), message)
+                            records = json.loads(render_refusals([built]).removeprefix(PREFIX))["refusals"]
+                            causes.append(
+                                {
+                                    **records[0],
+                                    "logical_rows": [identity],
+                                    "provenance": "current",
+                                    "sender_phase": "pre_commit_dry_run",
+                                }
+                            )
+                        outcomes.append({**identity, "disposition": disposition, "refusals": records})
+                        key = stream, carrier_ref["subject"], carrier_ref["key"]
+                        carrier_row = carriers.setdefault(key, {**carrier, "disposition": disposition})
+                        if disposition == "refused":
+                            carrier_row["disposition"] = "refused"
+                for carrier in carriers.values():
+                    outcome = "apply_failed" if carrier["disposition"] == "refused" else carrier["disposition"]
+                    counts[f"{carrier['stream']}_count_by_outcome"][outcome] += 1
+                result = {
+                    **counts,
+                    "row_outcomes": outcomes,
+                    "refusals": causes,
+                    "settlement_owners": list(carriers.values()),
+                    "commit_acknowledged": status == "settled",
+                }
+            else:
+                result = None
+            generations.append(
+                {
+                    "generation_id": generation_id,
+                    "seq": prepared["seq"],
+                    "status": status,
+                    "sections": sections,
+                    "stream_revisions": revision,
+                    "source_push_seq": prepared["source_push_seq"],
+                    "carrier_job_id": job_id,
+                    "carrier_job_status": "queued" if status == "pending" else "succeeded",
+                    "carrier_job_result": result,
+                    "carrier_job_error": None,
+                    "updated_at": timezone.now().isoformat(),
+                    "row_outcomes": outcomes if result is not None else None,
+                    "refusals": causes if result is not None else None,
+                }
+            )
+            sequences[job_id] = index
+        item = {
+            "apply_attempt_id": str(attempt.pk),
+            "admission_state": "admitted",
+            "http_status": 202,
+            "response": attempt.response,
+            "generations": generations,
+        }
+        evidence = _payload(self.management.adapter_device_id, [item])
+        evidence.settlement_sequences = sequences
+        return evidence
 
     def _delete_native_root(self, create, name):
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_delete, renderer_writes
@@ -429,8 +546,6 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         from netbox_nso_plugin.models import NSOLACPMemberState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
 
-        from .test_apply_settlement import _attempt, _payload
-
         bundle = self._bundle("Port-channel31")
         switchport = self._switchport("Ethernet31")
         with without_commit_drain():
@@ -461,63 +576,39 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             assert row.status == "deploying"
             assert row.apply_attempt_id == attempt_id
 
-        selected = adapter.apply_requests[0]["selected"]
-        generation = _attempt(
-            attempt_id,
-            self.management.adapter_device_id,
-            81,
-            selected,
-            "settled",
-            result={
-                "lag_count_by_outcome": {"in_sync": 2, "apply_failed": 0},
-                "switchport_count_by_outcome": {"in_sync": 1, "apply_failed": 0},
-            },
-        )
-        # The stored Apply response has two generations. Evidence must name both.
-        second = copy.deepcopy(generation["generations"][0])
-        second["generation_id"] = 82
-        second["seq"] = 82
-        generation["generations"].append(second)
-        generation["response"] = adapter.apply_response(selected)[1]
-        settle_apply_attempts(
-            self.management, _payload(self.management.adapter_device_id, [generation]), static_route_feed_drained=True
-        )
+        evidence = self._settlement_evidence(adapter, "settled")
+        for generation in evidence["attempts"][0]["generations"]:
+            result = generation["carrier_job_result"]
+            assert result["lag_count_by_outcome"] == {
+                "in_sync": 1,
+                "apply_failed": 0,
+                "not_applied": 0,
+                "unavailable": 0,
+            }
+        settle_apply_attempts(self.management, evidence)
         for row in (bundle, member, switchport):
             row.refresh_from_db()
             assert row.status == "in_sync"
 
-    def test_failed_switching_generation_settles_both_streams_as_apply_failed(self):
+    def test_explicit_switching_refusals_settle_both_streams_as_apply_failed(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
-
-        from .test_apply_settlement import _attempt, _payload
 
         bundle = self._bundle("Port-channel33")
         switchport = self._switchport("Ethernet33")
         adapter = self._apply()
         attempt_id = UUID(adapter.apply_requests[0]["apply_attempt_id"])
-        selected = adapter.apply_requests[0]["selected"]
-        evidence = _attempt(attempt_id, self.management.adapter_device_id, 81, selected, "failed")
-        second = copy.deepcopy(evidence["generations"][0])
-        second["generation_id"] = 82
-        second["seq"] = 82
-        evidence["generations"].append(second)
-        evidence["response"] = adapter.apply_response(selected)[1]
-        settle_apply_attempts(
-            self.management, _payload(self.management.adapter_device_id, [evidence]), static_route_feed_drained=True
-        )
+        settle_apply_attempts(self.management, self._settlement_evidence(adapter, "failed"))
         for row in (bundle, switchport):
             row.refresh_from_db()
             assert row.status == "apply_failed"
             assert row.apply_attempt_id == attempt_id
 
-    def test_read_reconcile_keeps_switching_attempt_pending_until_failed_evidence(self):
+    def test_read_reconcile_preserves_pending_rows_until_exact_member_refusal(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
         from netbox_nso_plugin.lacp_reconciler import lacp_reconcile_plan, reconcile_lag_config
         from netbox_nso_plugin.models import NSOLACPMemberState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
         from netbox_nso_plugin.vlan_reconciler import reconcile_switchport, switchport_reconcile_plan
-
-        from .test_apply_settlement import _attempt, _payload
 
         bundle = self._bundle("Port-channel34")
         switchport = self._switchport("Ethernet34")
@@ -534,15 +625,43 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         ) as writer:
             writer.save(member, force_insert=True)
 
+        with without_commit_drain():
+            sibling_interface = Interface.objects.create(
+                device=self.device, name="Ethernet36", type="1000base-t", lag=bundle.interface
+            )
+        sibling = NSOLACPMemberState(management=self.management, interface=sibling_interface, status="accepted")
+        with renderer_writes(
+            RendererMutationPlan.build(
+                grant=OwnershipGrant("create"),
+                saves=(planned_save(sibling, force_insert=True, natural_key=("management", "interface")),),
+            )
+        ) as writer:
+            writer.save(sibling, force_insert=True)
+
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from ._outbox_case import mirror_update
+
+        for index, row in enumerate((bundle, member, sibling, switchport), start=1):
+            mirror_update(
+                row,
+                last_apply_at=timezone.now() - timedelta(days=index),
+                last_apply_error=f"prior switching error {index}",
+            )
+        prior = {
+            (row._meta.label_lower, row.pk): (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id)
+            for row in (bundle, member, sibling, switchport)
+        }
         adapter = self._apply()
         attempt_id = UUID(adapter.apply_requests[0]["apply_attempt_id"])
-        selected = adapter.apply_requests[0]["selected"]
         lag_payload = {
             "bundles": [
                 {
                     "name": bundle.interface.name,
                     "lag_id": bundle.lag_id,
-                    "members": [{"interface_name": interface.name}],
+                    "members": [{"interface_name": interface.name}, {"interface_name": sibling_interface.name}],
                 }
             ]
         }
@@ -550,7 +669,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             "interfaces": [
                 {
                     "interface_name": switchport.interface.name,
-                    "mode": "trunk",
+                    "mode": "trunk-all",
                     "untagged_vlan": None,
                     "tagged_vlans": [],
                 }
@@ -562,45 +681,77 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         def read_and_assert_pending():
             reconcile_lag_config(self.device, lag_payload)
             reconcile_switchport(self.device, switchport_payload)
-            for row in (bundle, member, switchport):
+            for row in (bundle, member, sibling, switchport):
                 row.refresh_from_db()
                 assert row.status == "deploying"
                 assert row.apply_attempt_id == attempt_id
 
-        def evidence(status):
-            item = _attempt(attempt_id, self.management.adapter_device_id, 81, selected, status)
-            second = copy.deepcopy(item["generations"][0])
-            second["generation_id"] = 82
-            second["seq"] = 82
-            item["generations"].append(second)
-            item["response"] = adapter.apply_response(selected)[1]
-            return item
-
         read_and_assert_pending()
-        pending = evidence("pending")
         settle_apply_attempts(
             self.management,
-            _payload(self.management.adapter_device_id, [pending], head=pending["generations"][0]),
-            static_route_feed_drained=True,
+            self._settlement_evidence(adapter, "pending"),
         )
         read_and_assert_pending()
-        failed = evidence("failed")
         settle_apply_attempts(
             self.management,
-            _payload(self.management.adapter_device_id, [failed], head=failed["generations"][0]),
-            static_route_feed_drained=True,
+            self._settlement_evidence(adapter, "failed", refused_rows=(member,)),
         )
-        for row in (bundle, member, switchport):
+        member.refresh_from_db()
+        assert member.status == "apply_failed"
+        assert member.apply_attempt_id == attempt_id
+        assert "inexpressible-on-ned" in member.last_apply_error
+        for row in (bundle, sibling, switchport):
             row.refresh_from_db()
-            assert row.status == "apply_failed"
-            assert row.apply_attempt_id == attempt_id
+            assert (row.status, row.last_apply_at, row.last_apply_error, row.apply_attempt_id) == prior[
+                (row._meta.label_lower, row.pk)
+            ]
+
+    def test_switchport_observation_successor_preserves_bookkeeping_against_old_refusal(self):
+        from netbox_nso_plugin.apply_settlement import settle_apply_attempts
+        from netbox_nso_plugin.models import NSOApplyAttempt
+        from netbox_nso_plugin.vlan_reconciler import reconcile_switchport
+
+        switchport = self._switchport("Ethernet39")
+        adapter = self._apply()
+        attempt_id = UUID(adapter.apply_requests[0]["apply_attempt_id"])
+        reconcile_switchport(
+            self.device,
+            {
+                "interfaces": [
+                    {
+                        "interface_name": switchport.interface.name,
+                        "mode": "trunk",
+                        "untagged_vlan": None,
+                        "tagged_vlans": [],
+                    }
+                ]
+            },
+        )
+        switchport.refresh_from_db()
+        before = (switchport.status, switchport.last_apply_at, switchport.last_apply_error, switchport.apply_attempt_id)
+        assert before[0] == "deploying"
+        assert Interface.objects.get(pk=switchport.interface_id).mode == "tagged-all"
+        settle_apply_attempts(
+            self.management,
+            self._settlement_evidence(adapter, "failed", refused_rows=(switchport,)),
+        )
+        switchport.refresh_from_db()
+        assert (
+            switchport.status,
+            switchport.last_apply_at,
+            switchport.last_apply_error,
+            switchport.apply_attempt_id,
+        ) == before
+        snapshot = NSOApplyAttempt.objects.get(pk=attempt_id).overlay_snapshots.get(
+            model_label=switchport._meta.label_lower,
+            overlay_pk=switchport.pk,
+        )
+        assert snapshot.settlement_disposition == "superseded"
 
     def test_apply_does_not_promote_member_under_unowned_bundle(self):
         from netbox_nso_plugin.apply_settlement import settle_apply_attempts
         from netbox_nso_plugin.models import NSOLACPMemberState
         from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_writes
-
-        from .test_apply_settlement import _attempt, _payload
 
         selected_bundle = self._bundle("Port-channel36")
         excluded_bundle = self._bundle("Port-channel37")
@@ -626,8 +777,6 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
             writer.save(unowned, update_fields=("status",))
 
         adapter = self._apply()
-        selected = adapter.apply_requests[0]["selected"]
-        attempt_id = UUID(adapter.apply_requests[0]["apply_attempt_id"])
         lag_body = next(request["body"] for request in adapter.requests if request["url"].endswith("/lag-config/apply"))
         assert [bundle["name"] for bundle in lag_body["bundles"]] == [selected_bundle.interface.name]
         selected_bundle.refresh_from_db()
@@ -636,22 +785,7 @@ class TestSwitchingRootPreparation(_CascadeFlushMixin, IntentPushResetMixin, Tra
         assert member.status == "accepted"
         assert member.apply_attempt_id is None
 
-        settled = _attempt(
-            attempt_id,
-            self.management.adapter_device_id,
-            81,
-            selected,
-            "settled",
-            result={"lag_count_by_outcome": {"in_sync": 1, "apply_failed": 0}},
-        )
-        settled["response"] = adapter.apply_response(selected)[1]
-        second = copy.deepcopy(settled["generations"][0])
-        second["generation_id"] = 82
-        second["seq"] = 82
-        settled["generations"].append(second)
-        settle_apply_attempts(
-            self.management, _payload(self.management.adapter_device_id, [settled]), static_route_feed_drained=True
-        )
+        settle_apply_attempts(self.management, self._settlement_evidence(adapter, "settled"))
         selected_bundle.refresh_from_db()
         member.refresh_from_db()
         assert selected_bundle.status == "in_sync"

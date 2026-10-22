@@ -79,6 +79,18 @@ def lock_manifest_rows(management, scopes):
     scopes = frozenset(scopes)
     if not scopes <= delivery_keys().keys():
         raise RegistryError("selection contains an unknown delivery scope")
+    from .intent_state import SourceRow
+    from .lifecycle_fence import bind_locked_owner, lock_owner_fences
+
+    refs = [
+        SourceRow(label, pk)
+        for label, spec in OVERLAYS.items()
+        if scopes.intersection(spec.delivery_keys)
+        for pk in spec.model.objects.filter(
+            **{spec.device_lookup: management.device_id}, status__in=OWNED_STATES
+        ).values_list("pk", flat=True)
+    ]
+    fences = lock_owner_fences(refs, managements=(management,))
     locked = {}
     for rank, label in enumerate(OVERLAY_MODEL_RANKS):
         spec = OVERLAYS.get(label)
@@ -99,6 +111,7 @@ def lock_manifest_rows(management, scopes):
         if spec.model._meta.model_name == "nsoredistributionstate":
             queryset = queryset.filter(dest_protocol__in=scopes.intersection({"bgp", "ospf", "isis"}))
         for row in queryset.order_by("pk"):
+            bind_locked_owner(row, fences[SourceRow(label, row.pk)])
             locked[(label, row.pk)] = row
     return locked
 
@@ -285,7 +298,12 @@ def _policy_emissions(payload):
         if subject is None:
             raise RegistryError("selected policy object has an unknown family")
         path = ((subject.removeprefix("route-policy."), (item["name"],)),)
-        yield _Emission(subject, path, (item["family"], item["name"]), item)
+        entries = tuple(
+            (subject + ".entry", (*path, ("entry", (entry["sequence"],))))
+            for entry in item["entries"]
+            if "sequence" in entry
+        )
+        yield _Emission(subject, path, (item["family"], item["name"]), item, emitted_refs=entries)
 
 
 def _ospf_emissions(payload):

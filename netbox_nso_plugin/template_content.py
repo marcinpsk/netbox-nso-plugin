@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def _cas_mirror_update(queryset, **values):
     """Use ``mirror_refresh`` to authorize a save inside a push-suppressing ``mirror_reconciler``."""
-    row = queryset.select_for_update(of=("self",)).first()
+    row = queryset.first()
     if row is None:
         return None
     with locked_mirror_refresh(row, values) as locked:
@@ -182,6 +182,13 @@ def interface_reconcile_plan(device, interfaces: list):
 
 
 def _upsert_interface_states(device, interfaces: list) -> dict:
+    from .lifecycle_fence import read_refresh
+
+    with read_refresh():
+        return _apply_interface_states(device, interfaces)
+
+
+def _apply_interface_states(device, interfaces: list) -> dict:
     """Apply one frozen interface-attribute reconciliation."""
     from .renderer_writer import active_renderer_writer, renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push

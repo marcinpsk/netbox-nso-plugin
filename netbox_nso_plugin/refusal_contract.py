@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba
-"""Pure C-schema validation, installed before the settlement consumer cutover."""
+"""Validate the shared execution contract before settlement or presentation."""
 
 import json
 import re
 from datetime import datetime
 
 from . import refusal_protocol as protocol
-from .refusal_registry import SECTION_COUNTER_KEYS
+from .delivery import delivery_keys
+from .refusal_registry import OVERLAYS, SECTION_COUNTER_KEYS, RegistryError, owner_spec
 
 COUNT_KEYS = frozenset({"in_sync", "apply_failed", "not_applied", "unavailable"})
 GENERATION_FIELDS = frozenset(
@@ -43,6 +44,15 @@ _IDENTITY_FIELDS = frozenset(
 _CARRIER_FIELDS = (_IDENTITY_FIELDS - {"acceptance_identity", "carrier"}) | {"accepted_at"}
 _CAUSE_ORDER = ("family", "row", "field", "reason", "message_id", "message", "related")
 _CAUSE_FIELDS = frozenset(_CAUSE_ORDER)
+_STREAM_FAMILIES = {
+    entry.section: frozenset(
+        protocol.SUBJECTS[subject].family
+        for spec in OVERLAYS.values()
+        if spec.delivery_keys == (scope,)
+        for subject in spec.subjects
+    )
+    for scope, entry in delivery_keys().items()
+}
 
 
 class ContractError(ValueError):
@@ -89,6 +99,10 @@ def _identity(raw, *, carrier=False):
     _shape(raw, _CARRIER_FIELDS if carrier else _IDENTITY_FIELDS)
     _require(isinstance(raw["stream"], str) and bool(raw["stream"]), "invalid stream")
     _row(raw["row"])
+    _require(
+        protocol.SUBJECTS[raw["row"]["subject"]].family in _STREAM_FAMILIES.get(raw["stream"], ()),
+        "invalid logical stream family",
+    )
     for key in ("source_push_seq", "frozen_revision", "generation_id", "settlement_cohort"):
         _require(raw[key] is None or _positive(raw[key]), "invalid contributor identity")
     acceptance = raw["accepted_at" if carrier else "acceptance_identity"]
@@ -132,6 +146,123 @@ def _outcome(raw):
     _require(isinstance(raw["refusals"], list), "invalid row refusals")
     for cause in raw["refusals"]:
         _cause(cause)
+
+
+def _key(raw):
+    return json.dumps(raw, sort_keys=True, separators=(",", ":"))
+
+
+def _logical_identity(raw):
+    return {key: raw[key] for key in _IDENTITY_FIELDS}
+
+
+def _counter_key(outcome):
+    try:
+        spec = owner_spec(outcome["carrier"]["row"]["subject"])
+    except RegistryError:
+        raise ContractError("unknown settlement carrier") from None
+    if len(spec.counter_keys) == 1:
+        return spec.counter_keys[0]
+    counter = f"{outcome['carrier']['stream']}_count_by_outcome"
+    _require(counter in spec.counter_keys, "invalid settlement carrier stream")
+    return counter
+
+
+def _validate_carriers(result, outcomes):
+    carriers = result["settlement_owners"]
+    _require(isinstance(carriers, list), "invalid settlement owners")
+    grouped = {}
+    priority = {"in_sync": 0, "not_applied": 1, "unavailable": 2, "refused": 3}
+    for outcome in outcomes:
+        identity = _key(outcome["carrier"])
+        grouped.setdefault(identity, []).append(outcome)
+    seen = set()
+    expected_counts = {}
+    for carrier in carriers:
+        _shape(carrier, _CARRIER_FIELDS | {"disposition"})
+        public = {key: carrier[key] for key in _CARRIER_FIELDS}
+        _identity(public, carrier=True)
+        identity = _key(public)
+        _require(identity not in seen and identity in grouped, "invalid settlement carrier membership")
+        seen.add(identity)
+        members = grouped[identity]
+        disposition = max((row["disposition"] for row in members), key=priority.__getitem__)
+        _require(carrier["disposition"] == disposition, "settlement carrier disposition mismatch")
+        counter = _counter_key(members[0])
+        counts = expected_counts.setdefault(counter, dict.fromkeys(COUNT_KEYS, 0))
+        counts["apply_failed" if disposition == "refused" else disposition] += 1
+    _require(seen == set(grouped), "missing settlement carrier")
+    counters = {key: value for key, value in result.items() if key.endswith("_count_by_outcome")}
+    _require(set(expected_counts).issubset(counters), "missing carrier outcome count")
+    for key, counts in counters.items():
+        validate_count_map(counts)
+        _require(counts == expected_counts.get(key, dict.fromkeys(COUNT_KEYS, 0)), "carrier outcome count mismatch")
+
+
+def _validate_refusal_links(result, outcomes):
+    logicals = {_key(_logical_identity(row)): row for row in outcomes}
+    linked = {identity: set() for identity in logicals}
+    seen = set()
+    for cause in result["refusals"]:
+        _cause(cause, attributed=True)
+        _require(
+            cause["sender_phase"] != "post_commit_verification" or result["commit_acknowledged"],
+            "verification refusal without commit acknowledgement",
+        )
+        signature = _key(cause)
+        _require(signature not in seen, "duplicate attributed refusal")
+        seen.add(signature)
+        catalog = _key({key: cause[key] for key in _CAUSE_FIELDS})
+        for logical in cause["logical_rows"]:
+            identity = _key(logical)
+            if cause["provenance"] == "current":
+                _require(identity in logicals, "refusal names an unattempted logical row")
+            if identity in linked:
+                linked[identity].add(catalog)
+    for identity, outcome in logicals.items():
+        causes = {_key(cause) for cause in outcome["refusals"]}
+        _require(len(causes) == len(outcome["refusals"]), "duplicate logical refusal")
+        _require(causes.issubset(linked[identity]), "logical refusal lacks attributed evidence")
+        if outcome["disposition"] == "refused":
+            _require(bool(causes), "refused logical row has no catalog cause")
+        else:
+            _require(not causes, "non-refused logical row carries refusal causes")
+
+
+def validate_refusals(raw):
+    """Validate attributed catalog records without interpreting device text."""
+    _require(isinstance(raw, list), "invalid attributed refusals")
+    for cause in raw:
+        _cause(cause, attributed=True)
+    return raw
+
+
+def validate_result(result, *, sections=()) -> dict:
+    """Require complete logical membership, catalog causes, and carrier-derived counts."""
+    _require(isinstance(result, dict) and all(isinstance(key, str) for key in result), "invalid execution result")
+    _require(
+        {"row_outcomes", "refusals", "settlement_owners", "commit_acknowledged"}.issubset(result),
+        "missing structured execution evidence",
+    )
+    _require(type(result["commit_acknowledged"]) is bool, "invalid commit acknowledgement")
+    outcomes = result["row_outcomes"]
+    _require(isinstance(outcomes, list) and isinstance(result["refusals"], list), "invalid execution projections")
+    seen = set()
+    for outcome in outcomes:
+        _outcome(outcome)
+        logical = (outcome["stream"], outcome["row"]["subject"], outcome["row"]["key"])
+        _require(logical not in seen, "duplicate logical outcome")
+        seen.add(logical)
+        _require(
+            not result["commit_acknowledged"] or outcome["disposition"] != "refused",
+            "committed execution cannot claim a rollback refusal",
+        )
+    for section in sections:
+        _require(section in SECTION_COUNTER_KEYS, "invalid counted section")
+        _require(set(SECTION_COUNTER_KEYS[section]).issubset(result), "missing promised outcome count map")
+    _validate_carriers(result, outcomes)
+    _validate_refusal_links(result, outcomes)
+    return result
 
 
 def validate_generation(raw) -> dict:
@@ -185,11 +316,52 @@ def validate_generation(raw) -> dict:
             for record in projection:
                 validator(record)
     if result is not None:
-        for section in raw["sections"]:
-            _require(section in SECTION_COUNTER_KEYS, "invalid counted section")
-            for key in SECTION_COUNTER_KEYS[section]:
-                _require(key in result, "missing promised outcome count map")
-        for key, counts in result.items():
-            if key.endswith("_count_by_outcome"):
-                validate_count_map(counts)
+        validate_result(result, sections=raw["sections"])
+        for outcome in result["row_outcomes"]:
+            if outcome["generation_id"] != raw["generation_id"]:
+                continue
+            stream = outcome["stream"]
+            _require(
+                outcome["frozen_revision"] == raw["stream_revisions"].get(stream)
+                and stream in raw["stream_revisions"]
+                and stream in raw["source_push_seq"]
+                and outcome["source_push_seq"] == raw["source_push_seq"][stream],
+                "logical generation provenance mismatch",
+            )
     return raw
+
+
+def validate_carrier_generations(generations):
+    """Require every logical and carrier identity to have its own generation authority."""
+    groups = {}
+    for generation in generations:
+        validate_generation(generation)
+        if generation["row_outcomes"] is None:
+            continue
+        authorities = groups.setdefault(generation["carrier_job_id"], {})
+        _require(generation["generation_id"] not in authorities, "duplicate generation authority")
+        authorities[generation["generation_id"]] = generation
+    for authorities in groups.values():
+        first = next(iter(authorities.values()))
+        result = first["carrier_job_result"]
+        for authority in authorities.values():
+            _require(
+                all(
+                    authority[key] == first[key]
+                    for key in ("carrier_job_status", "carrier_job_result", "carrier_job_error")
+                ),
+                "coalesced carrier certificate mismatch",
+            )
+        for outcome in result["row_outcomes"]:
+            for identity in (outcome, outcome["carrier"]):
+                authority = authorities.get(identity["generation_id"])
+                _require(authority is not None, "missing generation authority")
+                stream = identity["stream"]
+                _require(
+                    stream in authority["stream_revisions"]
+                    and stream in authority["source_push_seq"]
+                    and identity["frozen_revision"] == authority["stream_revisions"][stream]
+                    and identity["source_push_seq"] == authority["source_push_seq"][stream],
+                    "carrier generation provenance mismatch",
+                )
+    return generations

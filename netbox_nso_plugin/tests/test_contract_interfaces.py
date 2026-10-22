@@ -149,14 +149,14 @@ class TestInterfacesContractConsumer(TestCase):
         # The device value is still tracked for the value-aware display.
         self.assertEqual(row.nso_value, "device-old")
 
-    def test_owned_row_settles_to_in_sync_when_device_matches(self):
-        """Owned-guard settles the row by value: accepted → in_sync once the device catches up."""
+    def test_matching_observation_does_not_certify_pending_owned_intent(self):
+        """Refresh the observed value while terminal execution evidence remains pending."""
         self.iface.description = "operator-desc"
         self.iface.save(update_fields=["description"])
         acquire_overlay(
             NSOInterfaceState, interface=self.iface, attribute="description", status="accepted", nso_value="device-old"
         )
-        # Adapter now reads the operator's value on the device → settle accepted → in_sync.
+        # A matching device value does not certify this pending execution.
         payload = [
             {
                 "name": "GE0/0",
@@ -165,7 +165,10 @@ class TestInterfacesContractConsumer(TestCase):
             }
         ]
         result = _upsert_interface_states(self.device, payload)
-        self.assertEqual(result[("GE0/0", "description")].status, "in_sync")
+        state = result[("GE0/0", "description")]
+        self.assertEqual(state.status, "accepted")
+        self.assertEqual(state.nso_value, "operator-desc")
+        self.assertIsNone(state.last_apply_at)
 
     def test_unowned_row_keeps_reported_drift_without_acquiring(self):
         """Reported drift stays visible on an unowned row."""

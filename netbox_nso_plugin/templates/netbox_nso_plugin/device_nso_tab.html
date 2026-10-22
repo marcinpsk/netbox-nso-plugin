@@ -698,13 +698,15 @@
       var items = (err.detail && err.detail.items) || [];
       var failed = items.map(function (it) { return (it.type || 'item') + ' — ' + (it.error || 'failed'); });
       var msg = failed.length ? failed.join('; ') : (err.message || 'check adapter logs');
-      var ok = [];
-      var res = job.result || {};
-      Object.keys(res).forEach(function (k) {
-        var m = k.match(/^(.+)_count_by_outcome$/);
-        if (m && res[k] && res[k].in_sync) { ok.push(m[1] + ' ×' + res[k].in_sync); }
+      var outcomes = [];
+      (job.outcome_counts || []).forEach(function (counts) {
+        Object.keys(counts).forEach(function (outcome) {
+          if (outcome !== 'scope' && counts[outcome] > 0) {
+            outcomes.push(counts.scope + ' ' + outcome.replaceAll('_', ' ') + ' ×' + counts[outcome]);
+          }
+        });
       });
-      if (ok.length) { msg += '  (applied OK: ' + ok.join(', ') + ')'; }
+      if (outcomes.length) { msg += '  (' + outcomes.join(', ') + ')'; }
       return msg;
     }
 

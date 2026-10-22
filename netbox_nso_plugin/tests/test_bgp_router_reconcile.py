@@ -96,7 +96,7 @@ def test_router_identity_is_asn_across_multiple_vrf_scopes(router_case):
 
 @pytest.mark.parametrize(
     "status, expected",
-    [("accepted", "accepted"), ("deploying", "deploying"), ("in_sync", "accepted"), ("apply_failed", "accepted")],
+    [("accepted", "accepted"), ("deploying", "deploying"), ("in_sync", "accepted"), ("apply_failed", "apply_failed")],
 )
 def test_bgp_router_reconcile_preserves_owned_bookkeeping(router_case, status, expected):
     state, _ = import_router(router_case)
@@ -242,7 +242,7 @@ def test_missing_confirmed_router_repends_and_keeps_owned_peers_deliverable(rout
 
 
 @pytest.mark.parametrize(
-    "status, expected", [("accepted", "accepted"), ("deploying", "deploying"), ("apply_failed", "accepted")]
+    "status, expected", [("accepted", "accepted"), ("deploying", "deploying"), ("apply_failed", "apply_failed")]
 )
 def test_missing_pending_router_preserves_intent(router_case, status, expected):
     from netbox_nso_plugin.bgp_reconciler import _reconcile_bgp_config
