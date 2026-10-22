@@ -712,6 +712,31 @@ class TestDeploymentProbe(DeploymentCase):
             NSOApplyExecution.objects.filter(attempt_id__in=attempts, consumption_state="consumed").count(), 3
         )
 
+    def test_paired_verification_refuses_a_store_that_changed_after_the_generation_listing(self):
+        from netbox_nso_plugin import adapter_client
+
+        attempts = self.paired_probes()
+        list_generations, settlement_feed = adapter_client.list_device_generations, adapter_client.get_settlement_feed
+        listed = []
+
+        def listing(*args, **kwargs):
+            listed.append(args)
+            return list_generations(*args, **kwargs)
+
+        def feed(*args, **kwargs):
+            page, incarnation = settlement_feed(*args, **kwargs)
+            # The adapter restarted on a new store after it served the listing; the final feed read must refuse.
+            return page, "placeholder-replaced-store" if listed else incarnation
+
+        with (
+            patch.object(adapter_client, "list_device_generations", side_effect=listing),
+            patch.object(adapter_client, "get_settlement_feed", side_effect=feed),
+            self.assertRaisesRegex(CommandError, "store changed"),
+        ):
+            self.command(verify=True, device_id=self.device.pk, settled_probe=[str(pk) for pk in attempts])
+        self.assertTrue(listed)
+        self.assertTrue(deployment.is_quiesced())
+
     def test_an_empty_probe_value_never_runs_paired_verification(self):
         settled = [str(pk) for pk in self.paired_probes()]
         for action in ("start_probe", "register_probe"):
