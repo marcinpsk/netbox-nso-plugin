@@ -747,6 +747,29 @@ class TestNSOInterfaceStateListView(ViewTestBase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(self.iface_state.pk, [row.pk for row in response.context["table"].data])
 
+    def test_badges_add_no_queries_per_rendered_row(self):
+        """The rendered page is projected once, so the state badge issues no per-row lookups."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        url = reverse("plugins:netbox_nso_plugin:nsointerfacestate_list")
+
+        def render(total):
+            for index in range(NSOInterfaceState.objects.count(), total):
+                interface = Interface.objects.create(device=self.device, name=f"Ethernet{index}", type="1000base-t")
+                NSOInterfaceState.objects.create(
+                    interface=interface, attribute="description", status="changed", nso_value=f"device {index}"
+                )
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get(url, {"per_page": 50})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content.decode().count('data-state="drift"'), total)
+            return len(queries.captured_queries)
+
+        render(2)  # Warm the per-process caches before counting.
+        small = render(2)
+        self.assertEqual(render(6), small)
+
 
 class TestInterfacesPageNoAttrsHint(ViewTestBase):
     """The interfaces page must explain an empty tab caused by no attrs in scope.

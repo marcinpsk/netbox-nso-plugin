@@ -138,6 +138,14 @@ class NSOInterfaceStateTable(NetBoxTable):
     last_apply_at = columns.DateTimeColumn()
     actions = columns.ActionsColumn(actions=("delete", "changelog"))
 
+    def configure(self, request):
+        """Project the rendered page once, so the state badge reads no execution evidence per row."""
+        from .refusal_display import project_rows
+
+        super().configure(request)
+        rows = self.page.object_list
+        rows.data = project_rows(rows.data)
+
     class Meta(NetBoxTable.Meta):
         model = NSOInterfaceState
         fields = (
