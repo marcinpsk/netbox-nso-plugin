@@ -1391,6 +1391,24 @@
           "related": null
         }
       ]
+    },
+    {
+      "name": "community-list-entry-community-field",
+      "message": "device-intent: refused {\"refusals\":[{\"family\":\"route-policy\",\"row\":{\"subject\":\"route-policy.community-list.entry\",\"key\":\"925525fc9e72e3d4c7c6db8f43e7aa00a3e93c2b753593ef24bd0e9f0565410f\"},\"field\":\"route-policy.community_list.community\",\"reason\":\"inexpressible-on-ned\",\"message_id\":\"route-policy.ios-community-member-no-home\",\"message\":\"This community member has no place in the IOS community list type of this list.\",\"related\":null}]}",
+      "refusals": [
+        {
+          "family": "route-policy",
+          "row": {
+            "subject": "route-policy.community-list.entry",
+            "key": "925525fc9e72e3d4c7c6db8f43e7aa00a3e93c2b753593ef24bd0e9f0565410f"
+          },
+          "field": "route-policy.community_list.community",
+          "reason": "inexpressible-on-ned",
+          "message_id": "route-policy.ios-community-member-no-home",
+          "message": "This community member has no place in the IOS community list type of this list.",
+          "related": null
+        }
+      ]
     }
   ],
   "invalid": [
