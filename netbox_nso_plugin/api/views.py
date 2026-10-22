@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
+import logging
+
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework import status
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -35,6 +37,10 @@ from .serializers import (
     NSOLinkRoleSerializer,
     NSOPlatformNedMappingSerializer,
 )
+
+logger = logging.getLogger(__name__)
+
+_SYNC_DEFERRED = "Device reconcile is deferred while the deployment gate is active"
 
 
 def _request_body(request):
@@ -385,7 +391,8 @@ class SyncCompleteView(APIView):
                 with operation("sync-complete callback"):
                     enqueue_device_reconcile(int(device_id))
         except (ProbeBlocked, DeploymentQuiesced, NSOApplyAttempt.DoesNotExist) as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            logger.info("Deferred the sync-complete callback for device %s: %r", device_id, exc)
+            return Response({"detail": _SYNC_DEFERRED}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response({"queued": True, "netbox_device_id": int(device_id)}, status=status.HTTP_202_ACCEPTED)
 
 

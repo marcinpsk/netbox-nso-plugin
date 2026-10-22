@@ -344,7 +344,9 @@ class TestDeploymentProbe(DeploymentCase):
         self.probe()
         with deployment.gate_bypass():
             other, _management = make_managed("other-probe", 1768)
-        self.assertEqual(self.notify(other.pk).status_code, 503)
+        blocked = self.notify(other.pk)
+        self.assertEqual(blocked.status_code, 503)
+        self.assertEqual(blocked.json(), {"detail": "Device reconcile is deferred while the deployment gate is active"})
         self.assertEqual(self.notify().status_code, 202)
         NSOIntentDeploymentControl.objects.filter(pk=1).update(verification_attempt=None)
         self.work()
