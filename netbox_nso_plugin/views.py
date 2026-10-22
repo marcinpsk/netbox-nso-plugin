@@ -734,6 +734,15 @@ def _scope_push_error(entry):
     return result
 
 
+def _lacp_member_rows(state):
+    """Return one member list per bundle: the grid projects it once, and the members field reads the same rows."""
+    from .lacp_topology import member_states
+
+    if not hasattr(state, "_nso_lacp_members"):
+        state._nso_lacp_members = list(member_states(state))
+    return state._nso_lacp_members
+
+
 def _isis_grid_sections(sections):
     """Include every registered IS-IS owner in the category grid."""
     from .refusal_registry import document_owner_specs
@@ -1555,11 +1564,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 *({"value": value, "label": label} for value, label in options.get(state.dest_protocol, ())),
             ]
 
-        def lacp_member_states(state):
-            from .lacp_topology import member_states
-
-            return list(member_states(state))
-
         def lacp_members(state):
             return [
                 {
@@ -1571,7 +1575,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                     "port_priority": member.port_priority,
                     "edit_url": reverse(r + "overlay_field_edit", args=["lacp_member", member.pk]),
                 }
-                for member in lacp_member_states(state)
+                for member in _lacp_member_rows(state)
             ]
 
         isis_sections = {
@@ -1650,7 +1654,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         ctx="lacp_bundle_states",
                         qs=lambda d: by_device(NSOLACPBundleState, d, "interface").order_by("interface__name"),
                         accept=r + "lacp_accept_bundle",
-                        related=lacp_member_states,
+                        related=_lacp_member_rows,
                         fields={
                             "bundle": iface,
                             "lag_id": lambda st: st.lag_id,
@@ -1916,8 +1920,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
 
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
-        for st in project_rows(states):
-            status_rows = [st, *(list(related(st)) if related else [])]
+        owners = project_rows(states)
+        related_rows = {id(st): list(related(st)) if related else [] for st in owners}
+        project_rows([row for rows_of in related_rows.values() for row in rows_of])
+        for st in owners:
+            status_rows = [st, *related_rows[id(st)]]
             projections = [row_projection(row) for row in status_rows]
             grouped = group_projection(projections)
             counts["all"] += 1

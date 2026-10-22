@@ -7855,6 +7855,25 @@ class TestUnlinkedReconcileOnExpandCategories(ViewTestBase):
         body = self._get("lacp").content.decode()
         self.assertIn("Gi0/11", body)  # the member row, not just the bundle
 
+    def test_lacp_grid_projects_members_without_a_query_per_member(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOLACPMemberState, NSOOverlaySettlementFence
+
+        table = f'"{NSOOverlaySettlementFence._meta.db_table}"'
+
+        def fence_queries():
+            with CaptureQueriesContext(connection) as queries:
+                response = self._get("lacp")
+            self.assertEqual(response.status_code, 200)
+            return sum(table in query["sql"] for query in queries.captured_queries)
+
+        one_member = fence_queries()
+        second = Interface.objects.create(device=self.device, name="Gi0/12", type="1000base-t", lag=self.lag)
+        NSOLACPMemberState.objects.create(management=self.mgmt, interface=second, mode="active", status="imported")
+        self.assertEqual(fence_queries(), one_member)
+
     def test_lacp_grid_rolls_member_drift_into_bundle_state_and_accept_action(self):
         """A nested member is part of the bundle row, so its drift must drive that row."""
         from netbox_nso_plugin.models import NSOLACPBundleState, NSOLACPMemberState
