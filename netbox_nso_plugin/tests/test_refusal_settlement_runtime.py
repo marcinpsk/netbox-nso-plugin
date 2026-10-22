@@ -925,6 +925,18 @@ class TestRefusalSettlementRuntime(BGPSettlementHelpers, BGPCaptureCase):
         self.owners[1].refresh_from_db()
         self.assertEqual(self.owners[1].status, self.prior[(self.owners[1]._meta.label_lower, self.owners[1].pk)][0])
 
+    def test_recovered_generation_with_a_deleted_carrier_stalls_settlement(self):
+        from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
+
+        self.prepare_automatic()
+        # The adapter's restart recovery serves this shape for a running generation whose job row is gone.
+        self.serve_terminal_evidence(
+            self.terminal(), earlier_generations=[self._carrierless_generation("outcome_unknown")]
+        )
+        with self.assertRaisesRegex(EvidenceInvariantError, "missing_generation_evidence"):
+            settle_device_apply_attempts(self.management)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+
     def test_carrierless_failed_generation_still_stalls_before_consumption(self):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError, settle_device_apply_attempts
 

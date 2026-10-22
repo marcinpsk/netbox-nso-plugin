@@ -8,6 +8,7 @@ import copy
 import json
 import time
 from contextlib import suppress
+from uuid import UUID
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
@@ -152,6 +153,7 @@ class Command(BaseCommand):
         actions.add_argument(
             "--start-probe",
             metavar="ATTEMPT_UUID",
+            type=UUID,
             help=(
                 "With --device ID, capture a fresh probe UUID and permit before one manual Apply. "
                 "Use --register-probe when terminal. Require a paired-activation gate. Keep work quiesced."
@@ -160,6 +162,7 @@ class Command(BaseCommand):
         actions.add_argument(
             "--register-probe",
             metavar="ATTEMPT_UUID",
+            type=UUID,
             help=(
                 "Bind the terminal execution before the callback and bounded RQ worker. Use --revoke-probe to "
                 "cancel its permit. Require a paired-activation gate. Keep work quiesced."
@@ -180,7 +183,7 @@ class Command(BaseCommand):
         )
         parser.add_argument("--device", type=int, dest="device_id", metavar="ID")
         parser.add_argument("--scope", choices=tuple(delivery.delivery_keys()))
-        parser.add_argument("--settled-probe", action="append", default=[])
+        parser.add_argument("--settled-probe", action="append", default=[], type=UUID, metavar="ATTEMPT_UUID")
 
     def handle(self, *args, **options):
         from netbox_nso_plugin.apply_settlement import EvidenceInvariantError

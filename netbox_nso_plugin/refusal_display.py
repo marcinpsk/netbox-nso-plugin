@@ -160,6 +160,26 @@ def project_rows(rows):
     return rows
 
 
+def settled_interface_owners(queryset):
+    """Select interface owners that row_projection can only classify in_sync, without projecting them."""
+    from django.db.models import Exists, F, OuterRef, Q
+
+    from .models import NSOInterfaceState, NSOOverlaySettlementFence
+
+    current = NSOOverlaySettlementFence.objects.filter(
+        model_label=NSOInterfaceState._meta.label_lower, overlay_pk=OuterRef("pk"), current_attempt__isnull=False
+    )
+    # Exact stored values imply matches_device_value; any looser match stays a projection candidate.
+    equal = (
+        Q(attribute="description", nso_value=F("interface__description"))
+        | Q(attribute="enabled", nso_value="True", interface__enabled=True)
+        | Q(attribute="enabled", nso_value="False", interface__enabled=False)
+    )
+    return queryset.filter(
+        equal, Q(last_apply_error__isnull=True) | Q(last_apply_error={}), status__in=("imported", "in_sync")
+    ).exclude(Exists(current))
+
+
 def _load_previous_refusals(owners):
     from .models import NSOApplyExecution, NSOApplyOverlaySnapshot
 

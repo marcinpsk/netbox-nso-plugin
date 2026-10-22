@@ -1274,6 +1274,107 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         self.assertEqual(response.json()["count"], 3)
         self.assertEqual(sum(f'"{table}"' in query["sql"] for query in queries.captured_queries), 1)
 
+    def assert_state_lists_project_only_candidates(self, disposition, fenced_state):
+        from unittest import mock
+
+        from netbox_nso_plugin import refusal_display
+
+        from ._outbox_case import mirror_update
+
+        _iface, fenced, _generation = self.interface_execution(matching=True, disposition=disposition)
+        # Only the current fence separates this owner from a settled row.
+        mirror_update(fenced, status="in_sync", last_apply_error=None)
+        desc = "placeholder settled"
+        forged = {"refusals": [{"message": "placeholder-forged"}]}
+        settled_specs = [
+            ("description", "in_sync", desc, None, True),
+            ("description", "imported", desc, {}, True),
+            ("enabled", "in_sync", "True", None, True),
+            ("enabled", "imported", "False", {}, False),
+        ]
+        candidate_specs = [
+            ("description", "in_sync", f" {desc} ", None, True),
+            ("enabled", "in_sync", "true", None, True),
+            ("enabled", "imported", "", None, False),
+            ("description", "imported", "placeholder observed", None, True),
+            ("description", "accepted", "placeholder observed", None, True),
+            ("description", "deploying", desc, None, True),
+            ("description", "apply_failed", "placeholder observed", None, True),
+            ("description", "in_sync", desc, forged, True),
+            ("placeholder-attribute", "unknown", desc, None, True),
+        ]
+        created = []
+        with without_commit_drain(), transaction.atomic():
+            self.management.manage_enabled = True
+            self.management.save(update_fields=("manage_enabled",))
+            for index, (attribute, status, nso_value, error, enabled) in enumerate(settled_specs + candidate_specs):
+                iface = Interface.objects.create(
+                    device=self.device,
+                    name=f"Ethernet{index + 2}",
+                    type="1000base-t",
+                    description=desc,
+                    enabled=enabled,
+                )
+                created.append(
+                    acquire_overlay(
+                        NSOInterfaceState,
+                        interface=iface,
+                        attribute=attribute,
+                        status=status,
+                        nso_value=nso_value,
+                        last_apply_error=error,
+                    ).pk
+                )
+        settled = set(created[: len(settled_specs)])
+        everything = NSOInterfaceState.objects.select_related("interface")
+        expected = {
+            row.pk: refusal_display.row_projection(row)["state"] for row in refusal_display.project_rows(everything)
+        }
+        self.assertEqual(expected[fenced.pk], fenced_state)
+        self.assertEqual({expected[pk] for pk in settled}, {"in_sync"})
+        states = {"unknown", "drift", "pending", "deploying", "in_sync", "apply_failed", fenced_state}
+        self.assertEqual(set(expected.values()), states)
+
+        projected = []
+        real = refusal_display.project_rows
+
+        def recording(rows):
+            rows = list(rows)
+            projected.extend(row.pk for row in rows)
+            return real(rows)
+
+        api = self.rest_client()
+        listing = reverse("plugins:netbox_nso_plugin:nsointerfacestate_list")
+        rest = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-list")
+        attention = states - {"in_sync"}
+        with mock.patch.object(refusal_display, "project_rows", recording):
+            for params in ({}, *({"state": state} for state in attention)):
+                with self.subTest(surface="ui", params=params):
+                    response = self.client.get(listing, {**params, "per_page": 100})
+                    self.assertEqual(response.status_code, 200, response.content)
+                    wanted = {params["state"]} if params else attention
+                    shown = {row.pk for row in response.context["table"].data}
+                    self.assertEqual(shown, {pk for pk, state in expected.items() if state in wanted})
+            for state in attention:
+                with self.subTest(surface="rest", state=state):
+                    response = api.get(rest, {"state": state, "limit": 100})
+                    self.assertEqual(response.status_code, 200, response.content)
+                    shown = {row["id"] for row in response.json()["results"]}
+                    self.assertEqual(shown, {pk for pk, value in expected.items() if value == state})
+        self.assertFalse(settled & set(projected))
+        for values in (["in_sync"], ["in_sync", "drift"]):
+            with self.subTest(surface="rest", state=values):
+                response = api.get(rest, {"state": values, "limit": 100})
+                self.assertEqual(response.status_code, 200, response.content)
+                shown = {row["id"] for row in response.json()["results"]}
+                self.assertEqual(shown, {pk for pk, value in expected.items() if value in values})
+
+    def test_refused_state_lists_project_only_candidates(self):
+        self.assert_state_lists_project_only_candidates("refused", "apply_failed")
+
+    def test_unavailable_state_lists_project_only_candidates(self):
+        self.assert_state_lists_project_only_candidates("unavailable", "unavailable")
+
     def test_unavailable_category_keeps_pending_filter_and_prior_error(self):
         from uuid import UUID
 

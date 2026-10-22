@@ -547,6 +547,50 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertEqual(list(NSOFamilyObservation.objects.values()), before)
         self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "consumed")
 
+    def test_quiesced_read_fences_its_owners_and_a_full_read_converges(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.deployment_probe import read_bgp
+        from netbox_nso_plugin.lifecycle_fence import fence_for
+        from netbox_nso_plugin.models import NSOFamilyReadState
+        from netbox_nso_plugin.refusal_registry import OVERLAYS
+        from netbox_nso_plugin.signals import suppress_intent_push
+
+        def fences():
+            with transaction.atomic():
+                return {
+                    (item.model_label, item.overlay_pk): fence_for(
+                        OVERLAYS[item.model_label].model.objects.get(pk=item.overlay_pk)
+                    )
+                    for item in self.attempt.overlay_snapshots.all()
+                }
+
+        def applied():
+            return NSOFamilyReadState.objects.filter(
+                management=self.management, family="bgp", applied_payload_revision__isnull=False
+            ).values_list("applied_payload_revision", flat=True)
+
+        self.probe(refused=None)
+        before = fences()
+        applied_before = list(applied())
+        self.assertEqual(self.notify().status_code, 202)
+        self.work()
+        revision = adapter_client.get_bgp_config(self.management.adapter_device_id)["read_state"]["payload_revision"]
+        probed = fences()
+        self.assertEqual(list(applied()), applied_before)
+        self.assertNotIn(revision, applied_before)
+        # The bounded read refreshed these owners, so captures older than it must stop matching.
+        for key, fence in probed.items():
+            self.assertEqual(fence.observation_watermark["bgp"]["payload_revision"], revision)
+            self.assertGreater(fence.bookkeeping_revision, before[key].bookkeeping_revision)
+        self.management.refresh_from_db()
+        with deployment.gate_bypass(), suppress_intent_push():
+            read_bgp(self.management)
+        self.assertEqual(list(applied()), [revision])
+        self.assertEqual(
+            {key: (fence.observation_watermark, fence.bookkeeping_revision) for key, fence in fences().items()},
+            {key: (fence.observation_watermark, fence.bookkeeping_revision) for key, fence in probed.items()},
+        )
+
     def test_success_probe_settles_full_membership_without_another_put(self):
         self.probe(refused=None)
         puts = len(self.adapter.capture_reads)
@@ -745,6 +789,15 @@ class TestDeploymentProbe(DeploymentCase):
             with self.subTest(action=action), self.assertRaisesRegex(CommandError, "UUID"):
                 self.command(**{action: ""}, device_id=self.device.pk, settled_probe=settled)
             self.assertTrue(deployment.is_quiesced())
+
+    def test_a_malformed_settled_probe_is_a_named_command_error(self):
+        settled = [str(pk) for pk in self.paired_probes()]
+        args = ["--verify", "--device", str(self.device.pk)]
+        for probe in [*settled, "not-a-uuid"]:
+            args += ["--settled-probe", probe]
+        with self.assertRaisesRegex(CommandError, "--settled-probe: invalid UUID value: 'not-a-uuid'"):
+            call_command("nso_intent_deployment_gate", *args, stdout=StringIO(), stderr=StringIO())
+        self.assertTrue(deployment.is_quiesced())
 
     def test_verify_rejects_terminal_remote_generation_without_consumed_execution(self):
         from ._adapter_http import make_response
@@ -1231,4 +1284,25 @@ class TestDeploymentProbe(DeploymentCase):
         self.assertEqual(
             set(self.attempt.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"unresolved"}
         )
+        self.assertTrue(deployment.is_quiesced())
+
+    def test_changed_probe_owner_footprint_returns_a_blocked_result(self):
+        self.probe()
+        from netbox_nso_plugin import bgp_reconciler
+
+        plan = bgp_reconciler.bgp_reconcile_plan
+
+        def plan_then_change(device, payload, **kwargs):
+            planned = plan(device, payload, **kwargs)
+            payload["routers"][0]["asn"] = "64599"
+            return planned
+
+        self.assertEqual(self.notify().status_code, 202)
+        with patch.object(bgp_reconciler, "bgp_reconcile_plan", plan_then_change):
+            self.work()
+        (job_id,) = self.queue.finished_job_registry.get_job_ids()
+        result = self.queue.fetch_job(job_id).return_value()
+        self.assertEqual(result["blocked"], "BGP probe owner footprint changed")
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+        self.assertIsNone(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id)
         self.assertTrue(deployment.is_quiesced())

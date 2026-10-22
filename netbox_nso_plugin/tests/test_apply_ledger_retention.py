@@ -330,10 +330,21 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
     def test_prune_command_fails_when_the_adapter_is_unreachable(self):
         attempt, _execution = self.history()
         output = StringIO()
-        with self.adapter_down(), self.assertRaisesMessage(CommandError, "The adapter is unavailable"):
+        with self.adapter_down(), self.assertRaisesMessage(CommandError, "If next_cursor is none, omit --after"):
             call_command("nso_prune_apply_ledger", execute=True, stdout=output)
-        self.assertIn("examined=0 eligible=0 deleted=0 execute=True next_cursor=start", output.getvalue())
+        self.assertIn("examined=0 eligible=0 deleted=0 execute=True next_cursor=none", output.getvalue())
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
+    def test_a_finished_scan_reports_no_cursor(self):
+        self.history()
+        output = StringIO()
+        call_command("nso_prune_apply_ledger", stdout=output)
+        self.assertIn("eligible=1 deleted=0 execute=False next_cursor=none", output.getvalue())
+
+    def test_a_malformed_cursor_is_a_named_command_error(self):
+        for cursor in ("none", "start", "end"):
+            with self.subTest(cursor=cursor), self.assertRaisesMessage(CommandError, "next_cursor value"):
+                call_command("nso_prune_apply_ledger", after=cursor, stdout=StringIO())
 
     def test_daily_job_stops_when_the_adapter_is_unreachable(self):
         from core.models import Job

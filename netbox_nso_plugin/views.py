@@ -4121,10 +4121,11 @@ class NSOInterfaceStateListView(generic.ObjectListView):
 
     def get_queryset(self, request):
         """Select attention rows with the same projection as the table."""
-        from .refusal_display import project_rows, row_projection
+        from .refusal_display import project_rows, row_projection, settled_interface_owners
 
         queryset = super().get_queryset(request)
-        pks = [row.pk for row in project_rows(queryset) if row_projection(row)["state"] != "in_sync"]
+        candidates = queryset.exclude(pk__in=settled_interface_owners(queryset).values("pk"))
+        pks = [row.pk for row in project_rows(candidates) if row_projection(row)["state"] != "in_sync"]
         return queryset.filter(pk__in=pks)
 
 
