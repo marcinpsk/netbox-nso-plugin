@@ -7,7 +7,7 @@ from io import StringIO
 from unittest.mock import patch
 from uuid import uuid4
 
-from django.core.management import call_command
+from django.core.management import CommandError, call_command
 from django.test import TransactionTestCase
 from django.utils import timezone
 
@@ -105,6 +105,16 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
             settle_cursor_seq=2,
         )
         return attempt, execution
+
+    def adapter_down(self):
+        """Fail every feed read as an unreachable adapter; a stopped fake still serves kept-alive connections."""
+        from netbox_nso_plugin import adapter_client
+
+        return patch.object(
+            adapter_client,
+            "get_settlement_feed",
+            side_effect=adapter_client.AdapterError("Adapter unreachable.", code="nso_unreachable"),
+        )
 
     def prune(self, **options):
         return call_command("nso_prune_apply_ledger", stdout=StringIO(), **options)
@@ -274,6 +284,75 @@ class TestApplyLedgerRetention(_CascadeFlushMixin, TransactionTestCase):
         self.assertTrue(NSOApplyAttempt.objects.filter(pk=unreachable.pk).exists())
         self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
         self.assertIn("deleted=1", output.getvalue())
+
+    def test_unreachable_adapter_stops_the_batch_at_the_first_device(self):
+        from netbox_nso_plugin import apply_retention
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        kept = [self.history(days=33)[0]]
+        for index, device_id in enumerate((1768, 1769), start=2):
+            _device, management = make_managed(f"ledger-retention-{device_id}", device_id, index=index)
+            management.refresh_from_db()
+            kept.append(self.history(days=32, management=management)[0])
+        with (
+            self.adapter_down(),
+            patch.object(apply_retention, "_remote_generations", wraps=apply_retention._remote_generations) as read,
+        ):
+            result = prune_apply_ledger(execute=True, cursor=None)
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(result.adapter_unavailable)
+        self.assertEqual((result.examined, result.eligible, result.deleted, result.next_cursor), (0, 0, 0, None))
+        self.assertEqual(NSOApplyAttempt.objects.filter(pk__in=[attempt.pk for attempt in kept]).count(), 3)
+
+    def test_unreachable_adapter_resumes_after_the_examined_candidates(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.apply_retention import prune_apply_ledger
+
+        removable, _execution = self.history(days=33)
+        _device, other = make_managed("ledger-retention-1768", 1768, index=2)
+        other.refresh_from_db()
+        self.history(days=32, management=other)
+        real = adapter_client.get_settlement_feed
+
+        def feed(device_id, **kwargs):
+            if device_id == 1768:
+                raise adapter_client.AdapterError("Adapter did not respond.", code="nso_timeout")
+            return real(device_id, **kwargs)
+
+        with patch.object(adapter_client, "get_settlement_feed", side_effect=feed):
+            result = prune_apply_ledger(execute=True, cursor=None)
+        self.assertTrue(result.adapter_unavailable)
+        self.assertEqual((result.examined, result.deleted), (1, 1))
+        self.assertFalse(NSOApplyAttempt.objects.filter(pk=removable.pk).exists())
+        _stamp, attempt_id = result.next_cursor.split("|", 1)
+        self.assertEqual(attempt_id, str(removable.pk))
+
+    def test_prune_command_fails_when_the_adapter_is_unreachable(self):
+        attempt, _execution = self.history()
+        output = StringIO()
+        with self.adapter_down(), self.assertRaisesMessage(CommandError, "The adapter is unavailable"):
+            call_command("nso_prune_apply_ledger", execute=True, stdout=output)
+        self.assertIn("examined=0 eligible=0 deleted=0 execute=True next_cursor=start", output.getvalue())
+        self.assertTrue(NSOApplyAttempt.objects.filter(pk=attempt.pk).exists())
+
+    def test_daily_job_stops_when_the_adapter_is_unreachable(self):
+        from core.models import Job
+
+        from netbox_nso_plugin import apply_retention
+        from netbox_nso_plugin.apply_retention import DEFAULT_BATCH_SIZE
+        from netbox_nso_plugin.jobs import PruneApplyLedgerJob
+
+        for _index in range(DEFAULT_BATCH_SIZE + 1):
+            self.history()
+        job = Job.objects.create(name=PruneApplyLedgerJob.name, job_id=uuid4())
+        with (
+            self.adapter_down(),
+            patch.object(apply_retention, "_remote_generations", wraps=apply_retention._remote_generations) as read,
+        ):
+            PruneApplyLedgerJob(job).run()
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(NSOApplyAttempt.objects.count(), DEFAULT_BATCH_SIZE + 1)
+        self.assertIsNone(job.data["apply_ledger_cursor"])
 
     def test_remote_generations_are_read_once_per_device(self):
         for _index in range(3):

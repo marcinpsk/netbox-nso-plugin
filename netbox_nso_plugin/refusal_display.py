@@ -415,8 +415,13 @@ def device_execution_summaries(management):
     fences = list(management.settlement_fences.filter(current_attempt__isnull=False, last_execution__isnull=False))
     rows = []
     for label in {fence.model_label for fence in fences}:
+        spec = OVERLAYS[label]
+        # Classification reads the owner relation, so load it with the rows.
+        related = spec.device_lookup.rsplit("__", 1)[0]
         rows.extend(
-            OVERLAYS[label].model.objects.filter(pk__in=[f.overlay_pk for f in fences if f.model_label == label])
+            spec.model.objects.filter(pk__in=[f.overlay_pk for f in fences if f.model_label == label]).select_related(
+                related
+            )
         )
     executions = {}
     for row in project_rows(rows):

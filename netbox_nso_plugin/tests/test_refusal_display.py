@@ -1212,6 +1212,25 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         refused_lookup = f'"{table}"."settlement_disposition" = \'refused\''
         self.assertFalse(any(refused_lookup in query["sql"] for query in queries.captured_queries))
 
+    def test_execution_summaries_load_the_interface_with_its_row(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.refusal_display import device_execution_summaries
+
+        # A refused row returns before the value comparison; a not-applied row reads its interface.
+        self.interface_execution(disposition="not_applied")
+        self.management.refresh_from_db()
+        with CaptureQueriesContext(connection) as queries:
+            device_execution_summaries(self.management)
+        self.assertTrue(any("nsointerfacestate" in query["sql"] for query in queries.captured_queries))
+        lazy = [
+            query["sql"]
+            for query in queries.captured_queries
+            if 'FROM "dcim_interface"' in query["sql"] and "nsointerfacestate" not in query["sql"]
+        ]
+        self.assertEqual(lazy, [])
+
     def test_refusal_display_is_computed_once_per_row(self):
         _iface, row, generation = self.interface_execution()
         row = NSOInterfaceState.objects.get(pk=row.pk)

@@ -201,7 +201,7 @@ class PruneApplyLedgerJob(JobRunner):
                 cursor = result.next_cursor
                 self.job.data = {**(self.job.data or {}), "apply_ledger_cursor": cursor}
                 self.job.save(update_fields=("data",))
-                if cursor is None or time.monotonic() >= deadline:
+                if result.adapter_unavailable or cursor is None or time.monotonic() >= deadline:
                     return result
         except DeploymentQuiesced:
             logger.info("PruneApplyLedgerJob: paused for an intent deployment")

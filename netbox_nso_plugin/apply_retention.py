@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 RETENTION_DAYS = 30
 DEFAULT_BATCH_SIZE = 100
+#: Adapter error codes that make every device unreadable, so the batch stops instead of waiting per device.
+ADAPTER_DOWN_CODES = frozenset({"nso_unreachable", "nso_timeout"})
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,11 @@ class PruneResult:
     eligible: int
     deleted: int
     next_cursor: str | None
+    adapter_unavailable: bool = False
+
+
+class _AdapterUnavailable(Exception):
+    """The adapter cannot answer for any device."""
 
 
 def _valid_execution_evidence(execution, attempt):
@@ -135,7 +142,9 @@ def _remote_generations(management_id):
         _page, incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
         generations = adapter_client.list_device_generations(device_id)
         _page, final_incarnation = adapter_client.get_settlement_feed(device_id, after_settle_seq=0, limit=1)
-    except adapter_client.AdapterError:
+    except adapter_client.AdapterError as exc:
+        if exc.code in ADAPTER_DOWN_CODES:
+            raise _AdapterUnavailable from exc
         logger.warning(
             "Apply ledger retention keeps history for management %s: the adapter is unavailable", management_id
         )
@@ -179,9 +188,16 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
     )
     eligible = deleted = 0
     remote_by_management = {}
-    for attempt_id, management_id, _completed_at in candidates:
+    examined = len(candidates)
+    for index, (attempt_id, management_id, _completed_at) in enumerate(candidates):
         if management_id not in remote_by_management:
-            remote_by_management[management_id] = _remote_generations(management_id)
+            try:
+                remote_by_management[management_id] = _remote_generations(management_id)
+            except _AdapterUnavailable:
+                # The shared deployment lock is held: waiting out the timeout per device would block quiesce().
+                logger.warning("Apply ledger retention stops: the adapter is unavailable")
+                examined = index
+                break
         remote = remote_by_management[management_id]
         if remote is None:
             continue
@@ -217,5 +233,9 @@ def prune_apply_ledger(*, execute=False, batch_size=DEFAULT_BATCH_SIZE, cursor=N
                 binding_state="invalidated",
                 overlay_snapshots__isnull=True,
             ).delete()
+    if examined < len(candidates):
+        last = candidates[examined - 1] if examined else None
+        next_cursor = f"{last[2].isoformat()}|{last[0]}" if last is not None else cursor
+        return PruneResult(examined, eligible, deleted, next_cursor, adapter_unavailable=True)
     next_cursor = f"{candidates[-1][2].isoformat()}|{candidates[-1][0]}" if len(candidates) == batch_size else None
     return PruneResult(len(candidates), eligible, deleted, next_cursor)

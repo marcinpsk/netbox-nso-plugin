@@ -3,7 +3,7 @@
 
 # Local review checks
 
-`nso-row-error-projection-bypass` also matches a literal serializer `source` whose last component is `last_apply_error`, such as `owner.last_apply_error`. A source held in a variable is covered by `test_refusal_display_parity.py`.
+`nso-row-error-projection-bypass` also matches a literal serializer `source` whose last component is `last_apply_error`, such as `owner.last_apply_error`. A source held in a variable is covered by `test_refusal_display_parity.py::test_no_overlay_serializer_aliases_the_raw_error`, which checks the bound source of every overlay serializer field.
 
 Run these checks before a commit:
 
