@@ -1490,13 +1490,15 @@ def _bgp_reconcile_operations(device, payload, planned_at, *, allowed_owners=Non
     operations = _BGPGraphPlanner(device, payload, planned_at).build()
     if allowed_owners is None:
         return operations
+    from .deployment_probe import ProbeBlocked
+
     selected = [
         save for save in operations.saves if (save.instance._meta.label_lower, save.instance.pk) in allowed_owners
     ]
     if {(save.instance._meta.label_lower, save.instance.pk) for save in selected} != set(allowed_owners):
-        raise ValueError("BGP probe owner footprint changed")
+        raise ProbeBlocked("BGP probe owner footprint changed")
     if any(save.force_insert or save.reference_fields for save in selected):
-        raise ValueError("BGP probe cannot create or relink an owner")
+        raise ProbeBlocked("BGP probe cannot create or relink an owner")
     operations.saves = selected
     operations.deletes = []
     operations.operations = [

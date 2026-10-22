@@ -87,7 +87,9 @@ def fence_for(row, *, lock=False):
     ref = SourceRow(row._meta.label_lower, row.pk)
     limit = _OWNER_LIMIT.get()
     if limit is not None and (ref.model_label, ref.pk) not in limit:
-        raise RuntimeError("A probe cannot write an unselected owner fence")
+        from .deployment_probe import ProbeBlocked
+
+        raise ProbeBlocked("A probe cannot write an unselected owner fence")
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("owner fence requires transaction.atomic()")
     cached = permit.owner_fences.get(ref) if permit is not None else None

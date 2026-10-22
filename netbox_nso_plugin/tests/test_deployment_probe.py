@@ -1286,3 +1286,24 @@ class TestDeploymentProbe(DeploymentCase):
             set(self.attempt.overlay_snapshots.values_list("settlement_disposition", flat=True)), {"unresolved"}
         )
         self.assertTrue(deployment.is_quiesced())
+
+    def test_changed_probe_owner_footprint_returns_a_blocked_result(self):
+        self.probe()
+        from netbox_nso_plugin import bgp_reconciler
+
+        plan = bgp_reconciler.bgp_reconcile_plan
+
+        def plan_then_change(device, payload, **kwargs):
+            planned = plan(device, payload, **kwargs)
+            payload["routers"][0]["asn"] = "64599"
+            return planned
+
+        self.assertEqual(self.notify().status_code, 202)
+        with patch.object(bgp_reconciler, "bgp_reconcile_plan", plan_then_change):
+            self.work()
+        (job_id,) = self.queue.finished_job_registry.get_job_ids()
+        result = self.queue.fetch_job(job_id).return_value()
+        self.assertEqual(result["blocked"], "BGP probe owner footprint changed")
+        self.assertEqual(NSOApplyExecution.objects.get(attempt=self.attempt).consumption_state, "unconsumed")
+        self.assertIsNone(NSOIntentDeploymentControl.objects.get(pk=1).verification_attempt_id)
+        self.assertTrue(deployment.is_quiesced())
