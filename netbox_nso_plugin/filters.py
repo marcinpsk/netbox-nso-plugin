@@ -84,14 +84,14 @@ class NSOInterfaceStateFilterSet(NetBoxModelFilterSet):
 
     def filter_state(self, queryset, name, values):
         """Filter displayed state after current execution and value projection."""
-        from .refusal_display import project_rows, row_projection
+        from django.db.models import Q
 
-        pks = [
-            row.pk
-            for row in project_rows(queryset.select_related("interface"))
-            if row_projection(row)["state"] in values
-        ]
-        return queryset.filter(pk__in=pks)
+        from .refusal_display import project_rows, row_projection, settled_interface_owners
+
+        settled = settled_interface_owners(queryset).values("pk")
+        candidates = queryset.exclude(pk__in=settled).select_related("interface")
+        matched = Q(pk__in=[row.pk for row in project_rows(candidates) if row_projection(row)["state"] in values])
+        return queryset.filter(matched | Q(pk__in=settled) if "in_sync" in values else matched)
 
     class Meta:
         model = NSOInterfaceState
