@@ -741,6 +741,15 @@ class TestDeploymentProbe(DeploymentCase):
                 self.command(**{action: ""}, device_id=self.device.pk, settled_probe=settled)
             self.assertTrue(deployment.is_quiesced())
 
+    def test_a_malformed_settled_probe_is_a_named_command_error(self):
+        settled = [str(pk) for pk in self.paired_probes()]
+        args = ["--verify", "--device", str(self.device.pk)]
+        for probe in [*settled, "not-a-uuid"]:
+            args += ["--settled-probe", probe]
+        with self.assertRaisesRegex(CommandError, "--settled-probe: invalid UUID value: 'not-a-uuid'"):
+            call_command("nso_intent_deployment_gate", *args, stdout=StringIO(), stderr=StringIO())
+        self.assertTrue(deployment.is_quiesced())
+
     def test_verify_rejects_terminal_remote_generation_without_consumed_execution(self):
         from ._adapter_http import make_response
 
