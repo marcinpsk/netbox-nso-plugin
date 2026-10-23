@@ -678,6 +678,68 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertEqual((excluded.status_code, mismatched.status_code), (404, 400))
         enqueue.assert_not_called()
 
+    def test_an_ip_edit_does_not_clear_an_excluded_inverse_peer(self):
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._ownership_case import save_overlay_fixture
+
+        with without_commit_drain():
+            local = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=self.device_a, name="Ethernet51", type="1000base-t"),
+                address="198.18.50.1/30",
+                auto_assigned=True,
+                status="accepted",
+            )
+            remote = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=self.device_b, name="Ethernet52", type="1000base-t"),
+                address="198.18.50.2/30",
+                auto_assigned=True,
+                peer_state=local,
+                status="accepted",
+            )
+            local.peer_state = remote
+            save_overlay_fixture(local, update_fields=("peer_state",))
+        _grant(self.user, ("change",), NSODeviceManagement, {"pk": self.management_a.pk})
+        _grant(self.user, ("add", "change"), IPAddress)
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": local.pk}),
+            {"address": "198.18.50.5/30"},
+        )
+        self.assertEqual(response.status_code, 404)
+        remote.refresh_from_db()
+        local.refresh_from_db()
+        self.assertEqual((remote.peer_state_id, local.address), (local.pk, "198.18.50.1/30"))
+
+    def test_the_onboarding_dashboard_lists_only_visible_managed_devices(self):
+        from netbox_nso_plugin.models import NSOInstance
+
+        _grant(self.user, ("view",), NSOInstance)
+        _grant(self.user, ("view",), NSODeviceManagement)
+        _grant(self.user, ("view",), Device, {"pk": self.device_a.pk})
+        url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
+        response = self.client.get(url, {"instance": self.management_b.nso_instance.adapter_instance_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["managed"], [])
+
+    def test_generic_routes_keep_the_netbox_model_restriction(self):
+        """Generic overlay CRUD authorizes by the overlay model's own permission (design 2b): constrained is 404."""
+        with without_commit_drain():
+            interface = Interface.objects.create(device=self.device_b, name="Ethernet53", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceState, interface=interface, attribute="description")
+        _grant(self.user, ("view", "delete"), NSOInterfaceState, {"interface__device_id": self.device_a.pk})
+        for url in (
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate", kwargs={"pk": row.pk}),
+            reverse("plugins:netbox_nso_plugin:nsointerfacestate_delete", kwargs={"pk": row.pk}),
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(self.client.get(url).status_code, 404)
+        api = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", kwargs={"pk": row.pk})
+        self.assertEqual(self._api().get(api).status_code, 404)
+
     def test_an_excluded_nso_instance_inventory_is_404(self):
         from netbox_nso_plugin.models import NSOInstance
 

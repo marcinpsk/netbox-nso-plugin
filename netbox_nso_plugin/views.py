@@ -2575,7 +2575,7 @@ class NSOOnboardingDashboardView(AuthorizedView):
             # join the page costs one more query per managed device.
             managed = list(
                 NSODeviceManagement.objects.restrict(request.user, "view")
-                .filter(nso_instance=instance)
+                .filter(nso_instance=instance, device__in=Device.objects.restrict(request.user, "view"))
                 .select_related("device", "nso_instance")
             )
             # Mirror the adapter's current last-sync state onto the rows before rendering.
@@ -6957,6 +6957,14 @@ def _ip_edit_plan_and_operations(updates, planned_at):
     )
 
 
+def _authorize_planned_states(state_operations, user):
+    """Require change on the management of every overlay row a plan writes (a cleared inverse peer included)."""
+    from .request_authorization import overlay_row
+
+    for candidate, _fields in state_operations:
+        overlay_row(type(candidate), candidate.pk, user, "change")
+
+
 class NSOInterfaceIPStateEditView(AuthorizedView):
     """Edit/materialize an interface IP from the merged grid, optionally with its peer.
 
@@ -7014,6 +7022,7 @@ class NSOInterfaceIPStateEditView(AuthorizedView):
 
         try:
             plan, native_operations, state_operations = _ip_edit_plan_and_operations(updates, timezone.now())
+            _authorize_planned_states(state_operations, request.user)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
             with mutation as writer:
                 with suppress_intent_push():
