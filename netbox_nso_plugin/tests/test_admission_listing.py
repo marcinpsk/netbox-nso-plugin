@@ -112,6 +112,27 @@ class TestAdmissionListing(DeploymentCase):
         self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before)
         self.assertFalse(NSOApplyExecution.objects.exists())
 
+    def test_null_evidence_response_is_an_invalid_stored_response_before_persistence(self):
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal(), manual=True)
+        NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None, http_status=None)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = response.json()
+                document["attempts"][0]["response"] = None
+                return make_response(200, document)
+            return response
+
+        self.adapter._handle = handle
+        before = list(NSOAcceptedSelection.objects.order_by("pk").values())
+        with self.assertRaisesRegex(EvidenceInvariantError, "deployment evidence has an invalid stored response"):
+            load_deployment_evidence(self.management)
+        self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before)
+        self.assertFalse(NSOApplyExecution.objects.exists())
+
     def test_held_rejection_with_null_generations_has_no_admission_links(self):
         self.prepare()
         self.serve_terminal_evidence(self.terminal())
