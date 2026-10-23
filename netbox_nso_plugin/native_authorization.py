@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping
@@ -831,25 +832,27 @@ def _guarded_update(original):
 
 
 def _guarded_bulk(bulk):
+    signature = inspect.signature(bulk)
+
     @functools.wraps(bulk)
     def guarded(self, *args, **kwargs):
         scope = _guarded_scope()
         if scope is None or not is_native(self.model):
             return bulk(self, *args, **kwargs)
-        permit = scope.top()
-        if kwargs.get("update_conflicts"):
+        call = signature.bind(self, *args, **kwargs)
+        if call.arguments.get("update_conflicts"):
             # An upsert changes the stored conflict row, which the proposed rows do not name.
             _refuse(f"native upsert of {self.model._meta.label_lower} inside a request")
-        rows = list(args[0] if args else kwargs.get("objs", ()))
-        args, kwargs = ((rows, *args[1:]), kwargs) if args else ((), {**kwargs, "objs": rows})
+        call.arguments["objs"] = rows = list(call.arguments["objs"])
+        permit = scope.top()
         # M2M add writes the owner's own through rows; another owner's rows need their own permit.
         if rows and all(_through_owned(self.model, row, permit) for row in rows):
-            return bulk(self, *args, **kwargs)
-        names = (args[1] if len(args) > 1 else kwargs.get("fields", ())) if bulk.__name__ == "bulk_update" else ()
-        if not _bookkeeping_update(self.model, tuple(names), permit):
+            return bulk(*call.args, **call.kwargs)
+        names = tuple(call.arguments.get("fields", ())) if bulk.__name__ == "bulk_update" else ()
+        if not _bookkeeping_update(self.model, names, permit):
             _refuse(f"native bulk write of {self.model._meta.label_lower} without its writer permit")
         with scope.holding(_Permit("bookkeeping", self.model, tables=_model_tables(self.model))):
-            return bulk(self, *args, **kwargs)
+            return bulk(*call.args, **call.kwargs)
 
     guarded._nso_native_guard = True
     return guarded

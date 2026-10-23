@@ -349,6 +349,29 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
             list(through.objects.filter(interface_id=self.second.pk).values_list("vlan_id", flat=True)), [vlan.pk]
         )
 
+    def test_a_positional_upsert_inside_an_m2m_permit_is_refused(self):
+        """update_conflicts passed by position is still an upsert of another owner's stored row."""
+        from ipam.models import VLAN
+
+        vlan, other = VLAN.objects.create(vid=3006, name="nw-upsert"), VLAN.objects.create(vid=3007, name="nw-upsert-2")
+        through = Interface.tagged_vlans.through
+        edge = through.objects.create(interface_id=self.second.pk, vlan_id=vlan.pk)
+
+        def upsert():
+            with native.active_native_writer().m2m(self.first, "tagged_vlans", origin=None):
+                through.objects.bulk_create(
+                    [through(pk=edge.pk, interface_id=self.first.pk, vlan_id=other.pk)],
+                    None,
+                    False,
+                    True,
+                    ["vlan"],
+                    ["pk"],
+                )
+
+        self.assertRefused(upsert)
+        edge.refresh_from_db()
+        self.assertEqual((edge.interface_id, edge.vlan_id), (self.second.pk, vlan.pk))
+
     def test_a_signal_born_m2m_edge_of_the_same_owner_is_refused(self):
         """A direct through insert is no M2M change of the owner: it needs an M2M permit."""
         from ipam.models import VLAN
