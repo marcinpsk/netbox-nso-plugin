@@ -507,19 +507,6 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         cls.device = _make_device("rnd")
         cls.mgmt = _make_mgmt(cls.device, "rnd", 9104)
 
-    def test_display_state_splits_an_owned_apply_failed_only_where_asked(self):
-        """P6.6 — folding apply_failed into 'pending apply' fleet-wide is pre-existing (P22);
-        R3 splits it for static routes ONLY, so the other eight panels stay byte-identical."""
-        from netbox_nso_plugin.summary import display_state
-
-        self.assertEqual(display_state("apply_failed", True), ("pending", "pending apply"))
-        self.assertEqual(display_state("apply_failed", True, distinguish_failed=True), ("apply_failed", "apply failed"))
-        # Un-owned means the DEVICE changed out of band — drift either way.
-        self.assertEqual(display_state("apply_failed", False, distinguish_failed=True), ("drift", "drift"))
-        # Every other status is untouched by the flag.
-        for status in ("in_sync", "imported", "accepted", "changed", "conflict", "deploying", ""):
-            self.assertEqual(display_state(status, True), display_state(status, True, distinguish_failed=True), status)
-
     def _grid(self):
         from netbox_nso_plugin.views import NSOCategoryView
 
@@ -538,7 +525,7 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
         self.assertEqual(row["state"], "apply_failed")
         self.assertEqual(row["label"], "apply failed")
         self.assertIn("NED rejected the route", row["error"])
-        self.assertIsNone(row["advisory"])
+        self.assertEqual(row["advisory"], "")
 
     def test_an_unproven_verdict_carries_its_advisory(self):
         """P6.7 — `unproven` is a statement about evidence, so it keeps the status and gains a

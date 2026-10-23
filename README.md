@@ -91,3 +91,82 @@ not change operator intent.
 ## Development
 
 See `.devcontainer/` for the Docker-based development environment.
+
+## Paired intent deployment
+
+Keep plugin operations and adapter Apply, removal, cadence, sweeper, and reclaimer
+admissions stopped throughout the cutover. The plugin gate does not stop the adapter.
+The code that installs the paired cutover also adds `--paired-activation` and its migration.
+Use this order:
+
+1. On the old plugin code, run `nso_intent_deployment_gate --prepare`. Keep the adapter
+   admissions stopped.
+2. Install the paired plugin code and run its migrations. The gate stays in place.
+3. Run `nso_intent_deployment_gate --prepare --paired-activation`. This marks the retained
+   gate for paired activation. The gate keeps its original `quiesced_at`.
+
+The gate keeps the paired mark until paired verification releases it. A later `--prepare`
+without the flag does not remove it.
+A failed paired preparation, maintenance, or verification action leaves the plugin quiesced.
+The maintenance and probe actions below require a paired-activation gate.
+
+Use `--import-routers --device ID` to import one validated BGP observation and print
+router overlay IDs, router IDs, and complete scope and address-family membership.
+The inventory contains identities and content. It does not grant ownership.
+Review it, then use `--accept-routers ID [ID ...] --device ID` with the exact selection.
+Only these router overlays receive an explicit accept grant.
+
+Use `--prepare-store --device ID --scope SCOPE` for each active stream, including
+store-only/manual streams and direct switching. This action obtains durable selection
+provenance and a verified receipt or direct preparation. It does not enqueue device Apply.
+Normal callbacks, drains, accepts, and reconciles remain blocked.
+Resolve old-schema work with the old installed code before installing this cutover.
+Do not manufacture historical snapshots or infer router ownership from peers.
+
+For a controlled placeholder validation device, prepare its BGP store selection first.
+Use `--start-probe ATTEMPT_UUID --device ID` with a fresh operator-selected UUID.
+This bounded action captures the current selection and registers its durable permit before
+sending the one explicit manual Apply. It does not re-send device intent.
+Allow only this controlled adapter admission. Keep all other adapter admissions stopped.
+Use the same UUID to recover an interrupted start without creating a second request.
+Preparation and admission require the adapter store to match the imported source identity.
+A definite rejection restores the snapshots and closes the attempt. Use a fresh UUID after
+correcting that rejection.
+Use `--register-probe ATTEMPT_UUID` when its exact terminal generation and carrier are
+available. Registration validates the selection, execution, and full owner footprint.
+A callback received before these bindings exist remains blocked. After registration,
+await the adapter notification or repeat the authenticated sync-complete callback.
+An authenticated sync-complete callback can then enqueue only this attempt.
+The RQ worker rechecks the durable permit and evidence, reads only the captured BGP
+owners, and runs production settlement. Completion or failure revokes the permit.
+A process restart keeps the same durable authority or leaves the gate unresolved.
+Use `--revoke-probe` to revoke a parked permit without resuming work.
+Probe capture, admission, and terminal execution must belong to the current gate interval.
+
+Run `--verify --device ID --settled-probe UUID --settled-probe UUID --settled-probe UUID`.
+The completed probes must cover success, a peer refusal, and a router refusal, each
+with the complete router and two-peer membership. Runtime verification checks the
+installed migration leaf, pending migrations, preview shape, settlement evidence,
+held work, and retained selection and execution provenance before resuming the plugin.
+CI proves shared fixture byte equality and codec/corpus equality with the package
+generator at pinned refs. Record those results and the exact deploy refs in the cutover
+hand-off record.
+On a paired-activation gate, `--resume` and `--abort` use the same checks. Neither bypasses
+failed verification.
+A gate prepared without `--paired-activation`, or created by `nso_intent_restore` or
+`nso_renderer_baseline_cutover`, does not use paired verification. Plain `--abort` releases it,
+and `--verify --device ID` sends one no-deletion static push before resume. A failed plain
+`--prepare` releases only a gate that the same invocation created.
+Resume the paired adapter admissions only after both components pass their cutover gates.
+Local HTTP-double tests do not establish live NSO acceptance.
+
+Terminal Apply history has a 30-day minimum retention period.
+`nso_prune_apply_ledger --batch-size 100` is a dry run.
+Add `--execute` to delete eligible history. A daily NetBox system job uses the same
+bounded pruning function. The job retains a scan cursor in its job data.
+Use the reported cursor with `--after CURSOR` to continue a command scan.
+A reported `next_cursor=none` has no cursor: omit `--after`.
+Active or repeatable selections, unresolved executions, current badges, fences, and
+referenced prior snapshots retain their evidence.
+Listed adapter generations retain all consumed carrier certificates for historical recovery.
+The pruning scan requires a reachable adapter with a stable store identity.

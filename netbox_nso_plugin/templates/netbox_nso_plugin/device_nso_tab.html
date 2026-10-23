@@ -347,6 +347,10 @@
     </div>
   </div>
 
+  {% for projection in execution_summaries %}
+    <div class="alert alert-warning" role="alert">{{ projection.summary }}</div>
+  {% endfor %}
+
   <div id="nso-apply-state-error" class="alert alert-warning mb-3 d-none" role="alert">
     <span class="mdi mdi-alert-outline me-1"></span>
     Apply state is unavailable: <span data-slot="message"></span>
@@ -483,12 +487,19 @@
           + (r.started_at ? ' · started ' + esc(rel(r.started_at)) : ' · queued ' + esc(rel(r.created_at)))
           + '</div>';
       } else if (l) {
-        var ok = l.status === 'succeeded';
-        var html = '<div class="alert ' + (ok ? 'alert-success' : 'alert-danger') + ' mb-0 py-2">'
+        var evidence = l.refusal_summary || '';
+        var ok = l.status === 'succeeded' && !evidence;
+        var html = '<div class="alert ' + (evidence ? 'alert-warning' : (ok ? 'alert-success' : 'alert-danger')) + ' mb-0 py-2">'
           + '<span class="mdi mdi-' + (ok ? 'check-circle-outline' : 'alert-circle-outline') + ' me-1"></span>'
-          + 'Last ' + esc(l.type) + ': <strong>' + esc(l.status) + '</strong> · ' + esc(rel(l.updated_at));
-        if (!ok && l.error) html += '<div class="small mt-1">' + esc(errText(l.error)) + '</div>';
+          + 'Last ' + esc(l.type) + ': <strong>' + esc(evidence ? 'execution evidence' : l.status) + '</strong> · ' + esc(rel(l.updated_at));
+        if (!evidence && !ok && l.error) html += '<div class="small mt-1">' + esc(errText(l.error)) + '</div>';
         box.innerHTML = html + '</div>';
+        if (evidence) {
+          var detail = document.createElement('div');
+          detail.className = 'small mt-1';
+          detail.textContent = evidence;
+          box.firstElementChild.appendChild(detail);
+        }
       } else {
         box.innerHTML = '';
       }
@@ -538,6 +549,7 @@
           var validDiff = diffs && typeof diffs === 'object' && !Array.isArray(diffs)
             && (Object.keys(diffs).length === 0 || (Object.keys(diffs).length === 1
               && typeof diffs.device_intent === 'string'));
+          if (d.refusal_text) { pre.textContent = d.refusal_text; identity.textContent = validIdentity ? 'Current deployment generation ' + d.generation_id : ''; return; }
           if (d.diff_available !== true || !validIdentity || !validDiff) {
             pre.textContent = d.diff_error === 'invalid_response'
               ? 'Preview unavailable: invalid adapter response.' : 'Preview unavailable. Try again.';
@@ -694,6 +706,7 @@
     // stale static route) fails the whole job even when the change you made (e.g. a VLAN
     // rename) succeeded — say so, instead of a cryptic "1 item(s) failed to apply".
     function formatApplyError(job) {
+      if (job.refusal_summary) return job.refusal_summary;
       var err = job.error || {};
       var items = (err.detail && err.detail.items) || [];
       var failed = items.map(function (it) { return (it.type || 'item') + ' — ' + (it.error || 'failed'); });
@@ -706,7 +719,7 @@
           }
         });
       });
-      if (outcomes.length) { msg += '  (' + outcomes.join(', ') + ')'; }
+      if (outcomes.length) { msg += '  (Adapter-reported: ' + outcomes.join(', ') + ')'; }
       return msg;
     }
 
@@ -716,6 +729,7 @@
           var r = await fetch(jobStatusUrl(jobId));
           if (!r.ok) { clearInterval(interval); setStatus('Could not retrieve job status.', 'danger', false); setButtons(false); return; }
           var job = await r.json();
+          if (job.refusal_summary) { clearInterval(interval); setStatus(job.refusal_summary, 'warning', false); setButtons(false); return; }
           if (job.error && job.status !== 'failed') { clearInterval(interval); var jobErr = (job.error && typeof job.error === 'object') ? (job.error.message || JSON.stringify(job.error)) : job.error; setStatus(label + ' error: ' + jobErr, 'danger', false); setButtons(false); return; }
           if (job.status === 'succeeded') {
             clearInterval(interval); setButtons(false);
@@ -806,6 +820,11 @@
             stop(label + ' failed: ' + detail + suffix, 'danger', true);
             return;
           }
+          var advisory = links.find(function (link) { return link.job && link.job.refusal_summary; });
+          if (advisory) {
+            stop(label + ' stopped: ' + advisory.job.refusal_summary, 'warning', true);
+            return;
+          }
           var abandoned = links.find(function (link) { return link.generationStatus === 'abandoned'; });
           if (abandoned) {
             stop(label + ' stopped: generation ' + abandoned.generationId + ' was abandoned.', 'warning', true);
@@ -885,6 +904,9 @@
     }
 
     function renderIntentPanel(d) {
+      if (!d.total && d.preview_status === 'refused') {
+        return '<p class="text-warning-emphasis mb-0">Preview refused. Review the catalog cause.</p>';
+      }
       if (!d.total) {
         // #107: no itemised rows, yet the dry-run shows a transaction — typically the
         // first commit after accepting config that already matched the device (NSO
@@ -898,7 +920,7 @@
       if (d.changes && d.changes.length) {
         h += '<div class="table-responsive"><table class="table table-sm align-middle mb-2"><thead><tr><th>Interface</th><th>Attribute</th><th>Device now</th><th>→ NetBox</th></tr></thead><tbody>';
         d.changes.forEach(function (c) {
-          h += '<tr><td>' + esc(c.interface) + '</td><td><code>' + esc(c.attribute) + '</code></td><td class="text-muted">' + esc(c.device) + '</td><td><strong>' + esc(c.netbox) + '</strong></td></tr>';
+          h += '<tr><td>' + esc(c.interface) + '</td><td><code>' + esc(c.attribute) + '</code></td><td class="text-muted">' + esc(c.device) + '</td><td><strong>' + esc(c.netbox) + '</strong>' + refusalNotice(c) + '</td></tr>';
         });
         h += '</tbody></table></div>';
       }
@@ -913,9 +935,9 @@
             var staleTitle = c.never_applied
               ? 'Accepted ' + c.staged_days + ' days ago and never applied — this intent has been waiting in staging ever since.'
               : 'Accepted ' + c.staged_days + ' days ago and still not in sync — the last apply never converged or the change was re-staged.';
-            stale = ' <span class="badge text-bg-warning text-dark" title="' + staleTitle + '">' + staleLabel + '</span>';
+            stale = ' <span class="badge text-bg-warning text-dark text-wrap" title="' + staleTitle + '">' + staleLabel + '</span>';
           }
-          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.status) + '</span>' + stale + '</td></tr>';
+          h += '<tr><td>' + esc(c.category) + '</td><td>' + esc(c.item) + '</td><td><strong>' + esc(c.detail) + '</strong></td><td><span class="text-muted small">' + esc(c.label) + '</span>' + stale + refusalNotice(c) + '</td></tr>';
         });
         h += '</tbody></table></div>';
       }
@@ -968,7 +990,7 @@
       var keys = Object.keys(diff);
       if (!keys.length) {
         if (!d.diff_available) {
-          return '<p class="text-warning mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
+          return '<p class="text-warning-emphasis mb-0"><span class="mdi mdi-alert-outline me-1"></span>The NSO dry-run could not be run (the adapter or NSO did not answer), so what this Apply would change on the device is <strong>unknown</strong>. Retry before applying.</p>';
         }
         return '<p class="text-muted mb-0">No device change for this generation.</p>';
       }
@@ -1022,12 +1044,22 @@
            + '</div>' + subtree;
     }
 
+    function refusalNotice(d) {
+      return [[d.refusal_text || d.error, 'text-danger'], [d.advisory, 'text-warning-emphasis']].map(function (item) {
+        if (!item[0]) return '';
+        var notice = document.createElement('p');
+        notice.className = item[1] + ' text-break';
+        notice.textContent = item[0];
+        return notice.outerHTML;
+      }).join('');
+    }
+
     function renderPreview(d) {
       // Keyed on THIS payload (not the cli-based skip decision): a non-empty dry-run
       // must render the two-panel layout even with zero itemised rows (#107).
       var hasDiff = d.device_diff && Object.keys(d.device_diff).length;
       if (!d.total && !hasDiff && d.diff_available) { return '<p class="text-muted mb-0">No itemised pending changes. No device change for this generation.</p>'; }
-      return ''
+      return refusalNotice(d)
         + '<div class="row g-3">'
         + '  <div class="col-lg-4"><h6 class="border-bottom pb-1"><span class="mdi mdi-cloud-upload-outline me-1"></span>Intent — what we push</h6>'
         +      renderIntentPanel(d)

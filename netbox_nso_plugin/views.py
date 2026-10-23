@@ -227,7 +227,7 @@ class DeviceNSOTabView(generic.ObjectView):
         connection / last-sync banner and is the only adapter touch here.
         """
         from .adapter_client import AdapterError
-        from .summary import category_summaries
+        from .summary import category_summaries, execution_summaries
         from .template_content import _STATUS_BADGE
 
         device = instance
@@ -309,6 +309,7 @@ class DeviceNSOTabView(generic.ObjectView):
         return {
             "mgmt": mgmt,
             "nso_categories": category_summaries(device, mgmt),
+            "execution_summaries": execution_summaries(mgmt),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
             "intent_drift": intent_drift,
@@ -623,12 +624,6 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
         )
 
 
-_PENDING_KINDS = {"pending", "apply_failed"}
-
-# Worst-first ordering of per-cell state kinds, for rolling an interface's cells up
-# into the single row-level state the grid sorts and quick-filters on.
-_KIND_SEVERITY = ("apply_failed", "drift", "pending", "deploying", "unknown", "in_sync")
-
 # Each category maps to the independent push scopes shown on its banner.
 _CATEGORY_PUSH_SCOPES = {
     "bgp": ("bgp",),
@@ -739,40 +734,48 @@ def _scope_push_error(entry):
     return result
 
 
-def _row_state(kinds) -> str:
-    """Collapse one interface's cell kinds to the single worst-first row state.
+def _lacp_member_rows(state):
+    """Return one member list per bundle: the grid projects it once, and the members field reads the same rows."""
+    from .lacp_topology import member_states
 
-    THE row state: the grid sorts on it and every quick-filter pill matches on it, so the
-    chip counts must be derived from this same value. Counting by set-membership instead
-    (``"drift" in kinds``) double-classified an interface with both a drifted cell and an
-    apply_failed cell: it collapses to ``apply_failed``, so the Drift filter (state == drift)
-    hid it — while the Drift chip still counted it. The chip promised a row the filter would
-    not show.
-    """
-    return next((k for k in _KIND_SEVERITY if k in kinds), "in_sync")
+    if not hasattr(state, "_nso_lacp_members"):
+        state._nso_lacp_members = list(member_states(state))
+    return state._nso_lacp_members
 
 
-def _merged_iface_kinds(iface, attr_states, mtu_states, sw_states, ip_states) -> set[str]:
-    """Aggregate the per-attribute state kinds for one interface (matrix view).
+def _isis_grid_sections(sections):
+    """Include every registered IS-IS owner in the category grid."""
+    from .refusal_registry import document_owner_specs
 
-    Each attribute cell classifies independently: enabled/description are value-aware
-    (interface_row_state), the rest go through display_state. Returns the SET of kinds
-    across all of the interface's cells so the view can bucket it as drift/pending/in_sync.
-    """
-    from .status_machine import OWNED_STATES
-    from .summary import display_state, interface_row_state
+    result = {}
+    for owner in document_owner_specs("isis"):
+        section = sections[owner.model._meta.model_name]
+        result[section["name"]] = {
+            **section,
+            "qs": lambda device, owner=owner, section=section: (
+                owner.model.objects.filter(**{owner.device_lookup: device.pk})
+                .select_related(*section["select_related"])
+                .order_by(*section["ordering"])
+            ),
+        }
+    return result
 
-    kinds: set[str] = set()
-    for attr in ("enabled", "description"):
-        st = attr_states.get((iface.id, attr))
-        if st is not None:
-            kinds.add(interface_row_state(st, iface)[0])
-    for st in (mtu_states.get(iface.id), sw_states.get(iface.id)):
-        if st is not None:
-            kinds.add(display_state(st.status, st.status in OWNED_STATES)[0])
-    for st in ip_states.get(iface.id, []):
-        kinds.add(display_state(st.status, st.status in OWNED_STATES)[0])
-    return kinds
+
+def _merged_iface_projection(iface, attr_states, mtu_states, sw_states, ip_states):
+    """Roll up common owner projections across one interface's cells."""
+    from .refusal_display import group_projection, row_projection
+
+    projections = [
+        row_projection(st, iface)
+        for attribute in ("enabled", "description")
+        if (st := attr_states.get((iface.id, attribute))) is not None
+    ]
+    projections.extend(
+        row_projection(st)
+        for st in (mtu_states.get(iface.id), sw_states.get(iface.id), *ip_states.get(iface.id, []))
+        if st is not None
+    )
+    return group_projection(projections)
 
 
 def _matching_peer_ip_state(state, candidates):
@@ -904,36 +907,6 @@ def _native_ip_by_state(ip_states):
         if linked is not None:
             resolved[state.pk] = linked
     return resolved
-
-
-def _paged_row_bucket(status: str, owned: bool) -> str:
-    """Bucket one paged-overlay row into the drift / pending / in_sync quick-filter group.
-
-    Mirrors ``summary.display_state`` + the ``_table_filter.html`` ``kindOf`` JS so the
-    server-side paged filter and the client-side non-paged filter agree exactly.
-    """
-    if status in ("imported", "in_sync", "deploying"):
-        return "in_sync"
-    if status == "apply_failed":
-        return "pending"
-    return "pending" if owned else "drift"  # changed / conflict / accepted
-
-
-def _filter_ifaces_by_state(ordered, kinds_by_iface, state):
-    """Filter the interface list to those matching the quick-select *state* bucket."""
-    if state == "drift":
-        return [i for i in ordered if "drift" in kinds_by_iface[i.id]]
-    if state == "pending":
-        return [i for i in ordered if kinds_by_iface[i.id] & _PENDING_KINDS]
-    if state == "in_sync":
-        return [
-            i
-            for i in ordered
-            if kinds_by_iface[i.id]
-            and "drift" not in kinds_by_iface[i.id]
-            and not (kinds_by_iface[i.id] & _PENDING_KINDS)
-        ]
-    return ordered  # "all" (or unknown) → no filter
 
 
 def _difference_value(scope, value):
@@ -1299,7 +1272,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
         from django.db.models import Q
 
-        from .status_machine import OWNED_STATES
+        from .refusal_display import project_rows, row_projection
         from .template_content import _STATUS_BADGE
 
         spec = self._paged_category_specs().get(key)
@@ -1330,8 +1303,8 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # Server-side state quick-filter — applied HERE (the one renderer for every paged
         # category) so route_policy / static / redistribution / vlan / svi / subinterface /
         # l2_services all get the drift/pending/in-sync quick-select without per-template work.
-        rows = list(qs)
-        bucketed = [(_paged_row_bucket(r.status, r.status in OWNED_STATES), r) for r in rows]
+        rows = project_rows(qs)
+        bucketed = [(row_projection(row)["bucket"], row) for row in rows]
         state_counts = {"all": len(rows), "drift": 0, "pending": 0, "in_sync": 0}
         for bucket, _row in bucketed:
             state_counts[bucket] += 1
@@ -1393,6 +1366,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSOSwitchportState,
         )
         from .reconcile import reconcile_category
+        from .refusal_display import project_rows
 
         mgmt = getattr(device, "nso_management", None)
 
@@ -1431,6 +1405,15 @@ class NSOCategoryView(LoginRequiredMixin, View):
         for iface_id, st in sw_states.items():
             ifaces[iface_id] = st.interface
 
+        project_rows(
+            [
+                *attr_states.values(),
+                *mtu_states.values(),
+                *sw_states.values(),
+                *(row for rows in ip_states.values() for row in rows),
+            ]
+        )
+
         # The drift modal compares the observed switchport against the LIVE native
         # Interface value. Reload the small interface set with both VLAN relations
         # prefetched so serialising that second side does not become an N+1 query.
@@ -1443,16 +1426,14 @@ class NSOCategoryView(LoginRequiredMixin, View):
         links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states)
         native_ips = _native_ip_by_state(ip_states)
 
-        # Per-interface aggregate state for the grid's row-level rollup and the
-        # drift/pending quick-filter counts.
-        kinds_by_iface = {i.id: _merged_iface_kinds(i, attr_states, mtu_states, sw_states, ip_states) for i in ordered}
-        # Counted off the COLLAPSED row state — the exact value each quick-filter pill matches
-        # on — so a chip can never promise rows its own filter hides (see _row_state).
+        projections_by_iface = {
+            iface.id: _merged_iface_projection(iface, attr_states, mtu_states, sw_states, ip_states)
+            for iface in ordered
+        }
         counts = {"all": len(ordered), "drift": 0, "pending": 0}
-        for ks in kinds_by_iface.values():
-            state = _row_state(ks)
-            counts["drift"] += 1 if state == "drift" else 0
-            counts["pending"] += 1 if state in _PENDING_KINDS else 0
+        for projected in projections_by_iface.values():
+            if projected["bucket"] in counts:
+                counts[projected["bucket"]] += 1
 
         # The client-side grid sorts, filters and quick-filters in the browser, so the
         # payload always carries every row — no server state filter, no pagination.
@@ -1460,7 +1441,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # the same payload via json_script so first paint needs no second request.
         payload = self._interface_merged_payload(
             ordered,
-            kinds_by_iface,
+            projections_by_iface,
             counts,
             attr_states,
             mtu_states,
@@ -1520,8 +1501,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSOBFDInterfaceState,
             NSOBGPPeerState,
             NSOBGPPeerTemplateState,
-            NSOISISInstanceState,
-            NSOISISInterfaceState,
             NSOLACPBundleState,
             NSOOSPFInstanceState,
             NSOOSPFInterfaceState,
@@ -1529,6 +1508,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             NSORoutePolicyState,
             NSOStaticRouteState,
         )
+        from .refusal_display import row_projection
 
         r = "plugins:netbox_nso_plugin:"
 
@@ -1584,21 +1564,87 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 *({"value": value, "label": label} for value, label in options.get(state.dest_protocol, ())),
             ]
 
-        def lacp_member_states(state):
-            from .lacp_topology import member_states
-
-            return list(member_states(state))
-
         def lacp_members(state):
             return [
                 {
+                    **row_projection(member),
+                    "model": member._meta.model_name,
+                    "pk": member.pk,
                     "interface": iface(member),
                     "mode": member.mode or None,
                     "port_priority": member.port_priority,
                     "edit_url": reverse(r + "overlay_field_edit", args=["lacp_member", member.pk]),
                 }
-                for member in lacp_member_states(state)
+                for member in _lacp_member_rows(state)
             ]
+
+        isis_sections = {
+            "nsoisisinterfacestate": dict(
+                name="interfaces",
+                select_related=("interface",),
+                ordering=("interface__name", "af"),
+                ctx="isis_interfaces",
+                accept=r + "routing_accept_isis_interface",
+                fields={
+                    "iface": iface,
+                    "af": lambda st: st.af,
+                    "process_tag": lambda st: st.process_tag or "default",
+                    "circuit_type": lambda st: st.circuit_type or None,
+                    "network_type": lambda st: st.network_type or None,
+                    "metric": lambda st: st.metric,
+                    "passive": lambda st: st.passive,
+                    "bfd_enabled": lambda st: st.bfd_enabled,
+                    "frr_enabled": lambda st: st.frr_enabled,
+                    "frr_protection": lambda st: st.frr_protection or None,
+                    "hello_auth": lambda st: (
+                        (st.hello_auth_type or "on") if (st.hello_auth_present or st.hello_auth_type) else None
+                    ),
+                    "edit_url": lambda st: (
+                        reverse(r + "overlay_field_edit", args=["isis_interface", st.pk])
+                        if st.isis_interface_id
+                        else None
+                    ),
+                },
+            ),
+            "nsoisisinstancestate": dict(
+                name="instances",
+                select_related=("isis_instance",),
+                ordering=("process_tag",),
+                ctx="isis_processes",
+                accept=r + "routing_accept_isis_instance",
+                fields={
+                    "process_tag": lambda st: st.process_tag or "default",
+                    "instance": lambda st: linked(st.isis_instance),
+                    "net": lambda st: st.net or None,
+                    "is_type": lambda st: st.is_type or None,
+                    "metric_style": lambda st: st.metric_style or None,
+                    "overload_bit": lambda st: st.overload_bit,
+                    "fast_reroute": lambda st: st.fast_reroute or None,
+                    "microloop_avoidance": lambda st: st.microloop_avoidance,
+                    "area_auth": lambda st: f"{st.area_auth_type or '—'}{' ✓' if st.area_auth_present else ''}",
+                    "domain_auth": lambda st: f"{st.domain_auth_type or '—'}{' ✓' if st.domain_auth_present else ''}",
+                    "edit_url": lambda st: (
+                        reverse(r + "overlay_field_edit", args=["isis_instance", st.pk])
+                        if st.isis_instance_id
+                        else None
+                    ),
+                },
+            ),
+            "nsoisisflexalgostate": dict(
+                name="flex_algos",
+                select_related=("isis_flex_algo",),
+                ordering=("process_tag", "algo_id"),
+                ctx="isis_flex_algos",
+                accept=None,
+                fields={
+                    "process_tag": lambda st: st.process_tag or "default",
+                    "algo_id": lambda st: st.algo_id,
+                    "metric_type": lambda st: st.metric_type or None,
+                    "priority": lambda st: st.priority,
+                },
+            ),
+        }
+        isis_owner_sections = _isis_grid_sections(isis_sections)
 
         return {
             "lacp": {
@@ -1608,7 +1654,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         ctx="lacp_bundle_states",
                         qs=lambda d: by_device(NSOLACPBundleState, d, "interface").order_by("interface__name"),
                         accept=r + "lacp_accept_bundle",
-                        related=lacp_member_states,
+                        related=_lacp_member_rows,
                         fields={
                             "bundle": iface,
                             "lag_id": lambda st: st.lag_id,
@@ -1683,57 +1729,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
             "isis": {
                 "reconcile_on_expand": True,
-                "sections": {
-                    "interfaces": dict(
-                        ctx="isis_interfaces",
-                        qs=lambda d: by_device(NSOISISInterfaceState, d, "interface").order_by("interface__name", "af"),
-                        accept=r + "routing_accept_isis_interface",
-                        fields={
-                            "iface": iface,
-                            "af": lambda st: st.af,
-                            "process_tag": lambda st: st.process_tag or "default",
-                            "circuit_type": lambda st: st.circuit_type or None,
-                            "network_type": lambda st: st.network_type or None,
-                            "metric": lambda st: st.metric,
-                            "passive": lambda st: st.passive,
-                            "bfd_enabled": lambda st: st.bfd_enabled,
-                            "frr_enabled": lambda st: st.frr_enabled,
-                            "frr_protection": lambda st: st.frr_protection or None,
-                            "hello_auth": lambda st: (
-                                (st.hello_auth_type or "on") if (st.hello_auth_present or st.hello_auth_type) else None
-                            ),
-                            "edit_url": lambda st: (
-                                reverse(r + "overlay_field_edit", args=["isis_interface", st.pk])
-                                if st.isis_interface_id
-                                else None
-                            ),
-                        },
-                    ),
-                    "instances": dict(
-                        ctx="isis_processes",
-                        qs=lambda d: by_device(NSOISISInstanceState, d, "isis_instance").order_by("process_tag"),
-                        accept=r + "routing_accept_isis_instance",
-                        fields={
-                            "process_tag": lambda st: st.process_tag or "default",
-                            "instance": lambda st: linked(st.isis_instance),
-                            "net": lambda st: st.net or None,
-                            "is_type": lambda st: st.is_type or None,
-                            "metric_style": lambda st: st.metric_style or None,
-                            "overload_bit": lambda st: st.overload_bit,
-                            "fast_reroute": lambda st: st.fast_reroute or None,
-                            "microloop_avoidance": lambda st: st.microloop_avoidance,
-                            "area_auth": lambda st: f"{st.area_auth_type or '—'}{' ✓' if st.area_auth_present else ''}",
-                            "domain_auth": lambda st: (
-                                f"{st.domain_auth_type or '—'}{' ✓' if st.domain_auth_present else ''}"
-                            ),
-                            "edit_url": lambda st: (
-                                reverse(r + "overlay_field_edit", args=["isis_instance", st.pk])
-                                if st.isis_instance_id
-                                else None
-                            ),
-                        },
-                    ),
-                },
+                "sections": isis_owner_sections,
             },
             "bgp": {
                 "reconcile_on_expand": True,
@@ -1833,11 +1829,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         ctx="static_routes",
                         qs=lambda d: by_device(NSOStaticRouteState, d, "static_route").order_by("nso_prefix"),
                         accept=r + "routing_accept_static_route",
-                        # Static routes are the one family that settles per route with a
-                        # per-route reason, so an owned apply_failed here renders as its
-                        # own red state carrying the message instead of a blue
-                        # "pending apply" chip promising an Apply that already lost.
-                        distinguish_failed=True,
                         fields={
                             "vrf": lambda st: st.nso_vrf or "global",
                             "prefix": lambda st: st.nso_prefix,
@@ -1846,10 +1837,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                             "permanent": lambda st: st.static_route.permanent if st.static_route else None,
                             "tag": lambda st: st.static_route.tag if st.static_route else None,
                             "route": lambda st: linked(st.static_route),
-                            "error": lambda st: st.last_apply_error or None,
-                            # An `unproven` verdict's reason: the apply landed and nothing
-                            # proves it. Not a status — a qualifier on one.
-                            "advisory": lambda st: st.last_result_advisory or None,
                             "edit_url": lambda st: (
                                 reverse(r + "overlay_field_edit", args=["static_route", st.pk])
                                 if st.static_route_id
@@ -1927,47 +1914,34 @@ class NSOCategoryView(LoginRequiredMixin, View):
             },
         }
 
-    def _grid_section(self, states, accept_route, fields, related=None, distinguish_failed=False):
-        """Serialize one grid sub-table: its rows plus the quick-filter counts.
-
-        kind/label come from summary.display_state — the same helper the server-rendered
-        tables used — so badges, quick-filter buckets and Accept visibility keep their
-        established meaning, and the client never re-derives them (a second, drifting
-        implementation would show a row that its own filter then hides).
-
-        The counts are taken off the SAME kind the pills filter on, so a chip can never
-        promise rows its own filter would hide.
-        """
-        from .status_machine import OWNED_STATES
-        from .summary import display_state
+    def _grid_section(self, states, accept_route, fields, related=None):
+        """Serialize projected owners and count the same buckets the grid filters."""
+        from .refusal_display import group_projection, project_rows, row_projection
 
         rows = []
         counts = {"all": 0, "drift": 0, "pending": 0}
-        for st in states:
-            status_rows = [st, *(list(related(st)) if related else [])]
-            displayed = [
-                display_state(row.status, row.status in OWNED_STATES, distinguish_failed=distinguish_failed)
-                for row in status_rows
-            ]
-            kind = _row_state({item[0] for item in displayed})
-            label = next(item[1] for item in displayed if item[0] == kind)
+        owners = project_rows(states)
+        related_rows = {id(st): list(related(st)) if related else [] for st in owners}
+        project_rows([row for rows_of in related_rows.values() for row in rows_of])
+        for st in owners:
+            status_rows = [st, *related_rows[id(st)]]
+            projections = [row_projection(row) for row in status_rows]
+            grouped = group_projection(projections)
             counts["all"] += 1
-            if kind == "drift":
-                counts["drift"] += 1
-            elif kind in _PENDING_KINDS:
-                counts["pending"] += 1
+            if grouped["bucket"] in counts:
+                counts[grouped["bucket"]] += 1
             row = {
                 "pk": st.pk,
+                "model": st._meta.model_name,
+                **projections[0],
                 "status": st.status,
-                "state": kind,
-                "kind": kind,
-                "label": label,
+                **grouped,
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
                 "accept_url": (
                     reverse(accept_route, args=[st.pk])
-                    if any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
+                    if accept_route and any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
                     else None
                 ),
             }
@@ -2007,7 +1981,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 section["accept"],
                 section["fields"],
                 related=section.get("related"),
-                distinguish_failed=section.get("distinguish_failed", False),
             )
             if key == "bgp" and name == "routers":
                 for state, row in zip(states[name], built["rows"], strict=True):
@@ -2066,7 +2039,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
     def _interface_merged_payload(
         self,
         ordered,
-        kinds_by_iface,
+        projections_by_iface,
         counts,
         attr_states,
         mtu_states,
@@ -2077,32 +2050,25 @@ class NSOCategoryView(LoginRequiredMixin, View):
         native_ips,
         adapter_error,
     ):
-        """Build the merged per-interface matrix payload for the Tabulator grid.
-
-        Cell classification reuses the exact helpers the old server-rendered table
-        used (interface_row_state / display_state), so grid badges, quick-filter
-        buckets and Accept visibility keep the established semantics.
-        """
+        """Build the interface matrix from the common owner projections."""
         from dcim.models import Interface
         from django.contrib.contenttypes.models import ContentType
 
-        from .status_machine import OWNED_STATES
-        from .summary import _netbox_value_for, display_state, interface_row_state
+        from .refusal_display import row_projection
+        from .summary import _netbox_value_for
 
         interface_type_id = ContentType.objects.get_for_model(Interface).pk
 
         def attr_cell(st, iface):
             if st is None:
                 return None
-            kind, label, owned = interface_row_state(st, iface)
             return {
                 "pk": st.pk,
+                "model": st._meta.model_name,
                 "value": st.nso_value,
                 "netbox_value": _netbox_value_for(st.attribute, iface),
+                **row_projection(st),
                 "status": st.status,
-                "kind": kind,
-                "label": label,
-                "owned": owned,
                 "accept_url": (
                     reverse("plugins:netbox_nso_plugin:nsointerfacestate_accept", args=[st.pk])
                     if st.status in self._ACCEPTABLE_STATUSES
@@ -2114,22 +2080,17 @@ class NSOCategoryView(LoginRequiredMixin, View):
         def plain_cell(st, accept_route, extra):
             if st is None:
                 return None
-            owned = st.status in OWNED_STATES
-            kind, label = display_state(st.status, owned)
             cell = {
                 "pk": st.pk,
+                "model": st._meta.model_name,
+                **row_projection(st),
                 "status": st.status,
-                "kind": kind,
-                "label": label,
-                "owned": owned,
                 "accept_url": (reverse(accept_route, args=[st.pk]) if st.status in self._ACCEPTABLE_STATUSES else None),
             }
             cell.update(extra)
             return cell
 
         def ip_cell(st):
-            owned = st.status in OWNED_STATES
-            kind, label = display_state(st.status, owned)
             native = native_ips.get(st.pk)
             peer = peer_ip_states.get(st.pk)
             if native is None:
@@ -2142,13 +2103,12 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 assignment = "another object"
             return {
                 "pk": st.pk,
+                "model": st._meta.model_name,
                 "address": str(st.address),
                 "vrf": st.vrf,
                 "secondary": st.secondary,
+                **row_projection(st),
                 "status": st.status,
-                "kind": kind,
-                "label": label,
-                "owned": owned,
                 "url": native.get_absolute_url() if native is not None else None,
                 # A changed IP row is retained only when the latest device snapshot
                 # stopped reporting it; conflict/imported rows are still present.
@@ -2180,7 +2140,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
         for iface in ordered:
             mtu = mtu_states.get(iface.id)
             sw = sw_states.get(iface.id)
-            kinds = kinds_by_iface[iface.id]
             rows.append(
                 {
                     "iface": {"id": iface.id, "name": iface.name, "url": iface.get_absolute_url()},
@@ -2211,7 +2170,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         if sw
                         else {},
                     ),
-                    "state": _row_state(kinds),
+                    **projections_by_iface[iface.id],
                 }
             )
         return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
@@ -2227,7 +2186,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from django.core.paginator import Paginator
 
         from .models import NSOInterfaceState
-        from .summary import interface_row_state
+        from .refusal_display import project_rows, row_projection
 
         q = (request.GET.get("q") or "").strip()
         state = request.GET.get("state") or "all"
@@ -2245,31 +2204,20 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # NetBox. Filtering/counts therefore happen in Python over the classified rows
         # so the chips, totals and badges always agree. The per-device row count is
         # bounded (≤2 attrs × interfaces), so this is cheap on tab load.
-        classified = []
-        counts = {"all": 0, "drift": 0, "pending": 0}
-        for st in qs:
-            kind, label, owned = interface_row_state(st, st.interface)
-            counts["all"] += 1
-            if kind in ("pending", "deploying", "apply_failed"):
-                counts["pending"] += 1
-            elif kind == "drift":
-                counts["drift"] += 1
-            classified.append((st, kind, label, owned))
-
-        if state == "drift":
-            filtered = [c for c in classified if c[1] == "drift"]
-        elif state == "pending":
-            filtered = [c for c in classified if c[1] in ("pending", "deploying", "apply_failed")]
-        elif state == "in_sync":
-            filtered = [c for c in classified if c[1] in ("in_sync", "unknown")]
-        else:
-            filtered = classified
+        classified = [(st, row_projection(st)) for st in project_rows(qs)]
+        counts = {"all": len(classified), "drift": 0, "pending": 0}
+        for _row, projected in classified:
+            if projected["bucket"] in counts:
+                counts[projected["bucket"]] += 1
+        filtered = [
+            item for item in classified if state not in {"drift", "pending", "in_sync"} or item[1]["bucket"] == state
+        ]
 
         paginator = Paginator(filtered, self._INTERFACES_PER_PAGE)
         page = paginator.get_page(request.GET.get("page") or 1)
 
         rows = []
-        for st, kind, label, owned in page.object_list:
+        for st, projected in page.object_list:
             iface = st.interface
             if st.attribute == "description":
                 netbox_value = iface.description or "—"
@@ -2279,6 +2227,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 netbox_value = "—"
             rows.append(
                 {
+                    **projected,
                     "state": st,
                     "iface_name": iface.name,
                     "iface_url": iface.get_absolute_url(),
@@ -2286,9 +2235,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
                     "attribute": st.attribute,
                     "netbox_value": netbox_value,
                     "device_value": st.nso_value or "—",
-                    "label": label,
-                    "kind": kind,
-                    "owned": owned,
                 }
             )
 
@@ -2855,7 +2801,10 @@ class NSODeviceManagementView(generic.ObjectView):
 
     def get_extra_context(self, request, instance):
         """Inject live adapter data, falling back to cached snapshot on error."""
+        from collections import Counter
+
         from . import adapter_client as client
+        from .refusal_display import device_execution_summaries, project_rows, row_projection
 
         interfaces = None
         compliance = None
@@ -2874,9 +2823,18 @@ class NSODeviceManagementView(generic.ObjectView):
                 interfaces = snapshot.get("interfaces")
                 compliance = snapshot.get("compliance")
 
+        rows = project_rows(
+            NSOInterfaceState.objects.filter(interface__device=instance.device).select_related("interface")
+        )
+        compliance = {
+            "managed_interfaces": len({row.interface_id for row in rows}),
+            "by_status": dict(Counter(row_projection(row)["state"] for row in rows)),
+            "last_checked_at": (compliance or {}).get("last_checked_at"),
+        }
         return {
             "interfaces": interfaces,
             "compliance": compliance,
+            "execution_summaries": device_execution_summaries(instance),
             "adapter_error": adapter_error,
             "adapter_error_code": adapter_error_code,
         }
@@ -3720,7 +3678,9 @@ class NSOJobStatusView(LoginRequiredMixin, View):
         from . import adapter_client as client
 
         try:
-            return JsonResponse(_job_with_outcome_counts(client.get_job(job_id)))
+            from .refusal_display import job_projection
+
+            return JsonResponse(_job_with_outcome_counts(job_projection(client.get_job(job_id))))
         except AdapterError as exc:
             return JsonResponse({"error": public_error_message(exc)}, status=502)
 
@@ -4041,6 +4001,9 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
             apply_state = None
             apply_state_error = public_error_message(exc)
         generations = [row for row in generations if row.get("generation_id") in generation_ids]
+        from .refusal_display import job_projection
+
+        jobs = [job_projection(job) for job in jobs]
         serialized_jobs = jobs
         if generation_ids:
             generation_job_ids = {row.get("job_id") for row in generations if row.get("job_id") is not None}
@@ -4147,24 +4110,23 @@ class NSODeviceReconcileView(NSOActionPermissionMixin, View):
 
 
 class NSOInterfaceStateListView(generic.ObjectListView):
-    """Cross-device interface-attribute *drift dashboard*.
-
-    Not a dump of every overlay row — it shows only attributes that need attention
-    (drift / pending apply / apply-failed) across all devices, with the device
-    column, so an operator can triage from one place. In-sync/imported rows are
-    excluded (the per-device NSO tab is the full value-aware surface). Status-based
-    filter: the adapter status lags a value typed straight into NetBox, so click
-    through to the device tab for the value-aware truth.
-    """
+    """Show interface owners whose projected state needs attention across devices."""
 
     template_name = "netbox_nso_plugin/links_object_list.html"
-    queryset = NSOInterfaceState.objects.exclude(status__in=("imported", "in_sync")).select_related(
-        "interface", "interface__device"
-    )
+    queryset = NSOInterfaceState.objects.select_related("interface", "interface__device")
     table = NSOInterfaceStateTable
     filterset = NSOInterfaceStateFilterSet
     # Sync-managed: no add/import/edit — just export + bulk-delete (cleanup).
     actions = (BulkExport, BulkDelete)
+
+    def get_queryset(self, request):
+        """Select attention rows with the same projection as the table."""
+        from .refusal_display import project_rows, row_projection, settled_interface_owners
+
+        queryset = super().get_queryset(request)
+        candidates = queryset.exclude(pk__in=settled_interface_owners(queryset).values("pk"))
+        pks = [row.pk for row in project_rows(candidates) if row_projection(row)["state"] != "in_sync"]
+        return queryset.filter(pk__in=pks)
 
 
 class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
@@ -6154,31 +6116,19 @@ def _isis_iface_detail(r):
 
 
 def _apply_preview_interface_changes(device_pk):
-    """Interface attributes Apply would actually push: OWNED status + value differs from device.
-
-    Apply pushes only intent in an OWNED status (accepted / deploying / in_sync / apply_failed) —
-    that's what the intent-push mirrors to the adapter and what the NSO dry-run reflects. Keying
-    the preview off ``accepted_at`` instead over-reported: an attribute that drifted back to
-    ``imported`` (un-owned) keeps a stale ``accepted_at`` from a past acceptance, so it was listed
-    as "what we push" even though Apply never pushes it and the dry-run shows no change. Filter by
-    owned status so the left panel agrees with the dry-run and the real Apply.
-    """
-    from .status_machine import OWNED_STATES
-    from .summary import interface_row_state
+    """Select pending interface owners through the common projection."""
+    from .refusal_display import project_rows, row_projection
 
     changes = []
-    owned = (
-        NSOInterfaceState.objects.filter(interface__device_id=device_pk, status__in=OWNED_STATES)
+    owners = (
+        NSOInterfaceState.objects.filter(interface__device_id=device_pk)
         .select_related("interface")
         .order_by("interface__name", "attribute")
     )
-    for st in owned:
+    for st in project_rows(owners):
         iface = st.interface
-        kind, _label, _owned = interface_row_state(st, iface)
-        # 'deploying' (apply pushed, awaiting device confirmation) is counted as pending-apply
-        # by the tab badges, so it must appear here too — else the preview total drops to 0 and
-        # the confirm modal is silently skipped (openApply's `!d.total` short-circuit).
-        if kind not in ("pending", "apply_failed", "deploying"):
+        projected = row_projection(st)
+        if not projected["pending"]:
             continue
         if st.attribute == "description":
             netbox_val = iface.description or "—"
@@ -6187,9 +6137,177 @@ def _apply_preview_interface_changes(device_pk):
         else:
             netbox_val = "—"
         changes.append(
-            {"interface": iface.name, "attribute": st.attribute, "device": st.nso_value or "—", "netbox": netbox_val}
+            {
+                **projected,
+                "model": st._meta.model_name,
+                "pk": st.pk,
+                "status": st.status,
+                "interface": iface.name,
+                "attribute": st.attribute,
+                "device": st.nso_value or "—",
+                "netbox": netbox_val,
+            }
         )
     return changes
+
+
+def _apply_preview_owner_changes(device_pk):
+    """List every settled owner outside the interface attribute panel."""
+
+    def _iface(r):
+        try:
+            return r.interface.name
+        except Exception:
+            return "—"
+
+    def _vlan_item(r):
+        return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
+
+    bgp_observations = {}
+
+    # Formatters affect presentation only; the settlement registry selects every owner.
+    preview_formatters = {
+        "nsovlanstate": ("VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else ""),
+        "nsoswitchportstate": ("Switchport", _iface, lambda r: r.mode or ""),
+        "nsosvistate": (
+            "SVI / IRB",
+            _iface,
+            lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
+        ),
+        "nsosubinterfacestate": ("Subinterface", _iface, lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else ""),
+        "nsobfdinterfacestate": (
+            "BFD",
+            _iface,
+            lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
+        ),
+        "nsolacpbundlestate": ("LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else ""),
+        "nsostaticroutestate": (
+            "Static route",
+            lambda r: r.nso_prefix or "",
+            lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
+        ),
+        "nsoisisinterfacestate": ("IS-IS interface", _iface, _isis_iface_detail),
+        "nsoisisinstancestate": ("IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or ""),
+        "nsoospfinterfacestate": ("OSPF interface", _iface, _ospf_iface_detail),
+        "nsoospfinstancestate": ("OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or ""),
+        "nsobgprouterstate": (
+            "BGP router",
+            lambda r: f"AS {r.asn_str}",
+            lambda r: str(r.bgp_router.router_id or "") if r.bgp_router_id else "",
+        ),
+        "nsobgppeerstate": (
+            "BGP peer",
+            lambda r: r.peer_address_str or "",
+            lambda r: _bgp_peer_preview_detail(r, bgp_observations),
+        ),
+        "nsoroutepolicystate": ("Route policy", lambda r: r.object_name or "", lambda r: r.family or ""),
+        "nsoredistributionstate": (
+            "Redistribution",
+            lambda r: f"{r.source_protocol} → {r.dest_protocol}",
+            lambda r: r.route_map or "",
+        ),
+        "nsosnmpcommunitystate": ("SNMP community", lambda r: "community", lambda r: r.access or ""),
+        "nsosnmpv3userstate": ("SNMP v3 user", lambda r: r.username or "user", lambda r: ""),
+        "nsosnmphoststate": (
+            "SNMP host",
+            lambda r: r.address or "",
+            lambda r: f"v{r.version}" if r.version else "",
+        ),
+        "nsosnmpsysteminfostate": ("SNMP system", lambda r: "system-info", lambda r: ""),
+        "nsologginghoststate": ("Logging host", lambda r: r.address or "", lambda r: r.severity or ""),
+        "nsologginglevelstate": (
+            "Logging levels",
+            lambda r: "local-levels",
+            lambda r: ", ".join(f"{f.split('_')[0]}={v}" for f, v in r.set_severities().items()),
+        ),
+        "nsol2sapstate": ("L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or ""),
+        "nsointerfaceipstate": ("Interface IP", _iface, lambda r: _join_props([r.address, r.vrf])),
+        "nsointerfacemtustate": (
+            "Interface MTU",
+            _iface,
+            lambda r: _join_props(
+                [f"{key} {getattr(r, key)}" for key in ("l2_mtu", "ip_mtu", "mpls_mtu") if getattr(r, key) is not None]
+            ),
+        ),
+        "nsolacpmemberstate": (
+            "LACP member",
+            _iface,
+            lambda r: _join_props([r.mode, f"priority {r.port_priority}" if r.port_priority is not None else ""]),
+        ),
+        "nsoisisflexalgostate": (
+            "IS-IS Flex-Algo",
+            lambda r: f"{r.process_tag} / {r.algo_id}",
+            lambda r: r.metric_type or "",
+        ),
+    }
+    # The relations each formatter above reads, loaded with the owner rows.
+    preview_relations = {
+        "nsovlanstate": ("vlan",),
+        "nsoswitchportstate": ("interface",),
+        "nsosvistate": ("interface", "vlan"),
+        "nsosubinterfacestate": ("interface",),
+        "nsobfdinterfacestate": ("interface",),
+        "nsolacpbundlestate": ("interface",),
+        "nsoisisinterfacestate": ("interface", "isis_interface"),
+        "nsoospfinterfacestate": ("interface",),
+        "nsobgprouterstate": ("bgp_router",),
+        "nsobgppeerstate": ("bgp_peer__remote_as",),
+        "nsointerfaceipstate": ("interface",),
+        "nsointerfacemtustate": ("interface",),
+        "nsolacpmemberstate": ("interface",),
+    }
+
+    from .delivery import delivery_keys
+    from .refusal_display import project_rows, row_projection
+    from .refusal_registry import OVERLAYS
+
+    routing_changes = []
+    for spec in OVERLAYS.values():
+        model = spec.model
+        if model is NSOInterfaceState:
+            continue
+        label, item_fn, detail_fn = preview_formatters.get(
+            model._meta.model_name,
+            (str(model._meta.verbose_name), lambda r: f"row {r.pk}", lambda r: ""),
+        )
+        # Include pending owners and unresolved executions in the confirmation count.
+        rows = model.objects.filter(**{spec.device_lookup: device_pk}).select_related(
+            *preview_relations.get(model._meta.model_name, ())
+        )
+        for r in project_rows(rows):
+            projected = row_projection(r)
+            if not projected["pending"]:
+                continue
+            try:
+                item = item_fn(r)
+            except Exception:
+                item = "—"
+            try:
+                detail = detail_fn(r)
+            except Exception:
+                detail = ""
+            key = r.dest_protocol if len(spec.delivery_keys) > 1 else spec.delivery_keys[0]
+            # A read can store a destination protocol that has no delivery key.
+            entry = delivery_keys().get(key)
+            scope_val = key if entry is not None and entry.in_protocol else None
+            # Show the age of staged intent and whether it has ever been applied.
+            accepted_at = getattr(r, "accepted_at", None)
+            staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None
+            routing_changes.append(
+                {
+                    **projected,
+                    "model": r._meta.model_name,
+                    "pk": r.pk,
+                    "category": label,
+                    "item": item,
+                    "detail": detail,
+                    "status": r.status,
+                    "scope": scope_val,
+                    "staged_days": staged_days,
+                    "never_applied": getattr(r, "last_apply_at", None) is None,
+                }
+            )
+    return routing_changes
 
 
 class NSOApplyPreviewView(LoginRequiredMixin, View):
@@ -6209,144 +6327,7 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
 
         changes = _apply_preview_interface_changes(device_pk)
 
-        # Every other category is an NSO*State overlay committed by this same single
-        # Apply. Itemise each pending row (category + item + detail) so the operator
-        # sees exactly what will be pushed — not just a count.
-        from .models import NSOLACPBundleState, NSOSwitchportState
-
-        def _iface(r):
-            try:
-                return r.interface.name
-            except Exception:
-                return "—"
-
-        def _vlan_item(r):
-            return f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else "VLAN"
-
-        bgp_observations = {}
-
-        # (Model, category label, item fn, detail fn) — all read defensively.
-        # The fifth element names the intent scope that receives the row's push.
-        # None marks a push outside the mirrored scopes. Redistribution uses its
-        # destination protocol's scope. The dry-run preview covers the whole device,
-        # so its delta cannot identify a separate change for each row or scope.
-        preview_specs = [
-            (NSOVLANState, "VLAN", _vlan_item, lambda r: f"name {r.vlan.name}" if r.vlan else "", "vlan"),
-            (NSOSwitchportState, "Switchport", _iface, lambda r: r.mode or "", None),
-            (
-                NSOSVIState,
-                "SVI / IRB",
-                _iface,
-                lambda r: f"VLAN {r.vlan.vid}" if getattr(r, "vlan", None) else (r.vrf or ""),
-                "svi",
-            ),
-            (
-                NSOSubinterfaceState,
-                "Subinterface",
-                _iface,
-                lambda r: f"dot1q {r.dot1q_vlan}" if r.dot1q_vlan else "",
-                "subinterface",
-            ),
-            (
-                NSOBFDInterfaceState,
-                "BFD",
-                _iface,
-                lambda r: f"tx {r.min_tx or '?'} / rx {r.min_rx or '?'} x{r.multiplier or '?'}",
-                "bfd",
-            ),
-            (NSOLACPBundleState, "LACP", _iface, lambda r: f"lag {r.lag_id}" if r.lag_id else "", None),
-            (
-                NSOStaticRouteState,
-                "Static route",
-                lambda r: r.nso_prefix or "",
-                lambda r: f"→ {r.nso_next_hop}" if r.nso_next_hop else "",
-                "static_route",
-            ),
-            (NSOISISInterfaceState, "IS-IS interface", _iface, _isis_iface_detail, "isis"),
-            (NSOISISInstanceState, "IS-IS", lambda r: r.process_tag or "instance", lambda r: r.net or "", "isis"),
-            (NSOOSPFInterfaceState, "OSPF interface", _iface, _ospf_iface_detail, "ospf"),
-            (NSOOSPFInstanceState, "OSPF", lambda r: f"process {r.process_id}", lambda r: r.router_id or "", "ospf"),
-            (
-                NSOBGPRouterState,
-                "BGP router",
-                lambda r: f"AS {r.asn_str}",
-                lambda r: str(r.bgp_router.router_id or "") if r.bgp_router_id else "",
-                "bgp",
-            ),
-            (
-                NSOBGPPeerState,
-                "BGP peer",
-                lambda r: r.peer_address_str or "",
-                lambda r: _bgp_peer_preview_detail(r, bgp_observations),
-                "bgp",
-            ),
-            (
-                NSORoutePolicyState,
-                "Route policy",
-                lambda r: r.object_name or "",
-                lambda r: r.family or "",
-                "route_policy",
-            ),
-            (
-                NSORedistributionState,
-                "Redistribution",
-                lambda r: f"{r.source_protocol} → {r.dest_protocol}",
-                lambda r: r.route_map or "",
-                lambda r: r.dest_protocol or None,
-            ),
-            (NSOSnmpCommunityState, "SNMP community", lambda r: "community", lambda r: r.access or "", "snmp"),
-            (NSOSnmpV3UserState, "SNMP v3 user", lambda r: r.username or "user", lambda r: "", "snmp"),
-            (
-                NSOSnmpHostState,
-                "SNMP host",
-                lambda r: r.address or "",
-                lambda r: f"v{r.version}" if r.version else "",
-                "snmp",
-            ),
-            (NSOSnmpSystemInfoState, "SNMP system", lambda r: "system-info", lambda r: "", "snmp"),
-            (NSOLoggingHostState, "Logging host", lambda r: r.address or "", lambda r: r.severity or "", "logging"),
-            (
-                NSOLoggingLevelState,
-                "Logging levels",
-                lambda r: "local-levels",
-                lambda r: ", ".join(f"{f.split('_')[0]}={v}" for f, v in r.set_severities().items()),
-                "logging",
-            ),
-            (NSOL2SapState, "L2 SAP", lambda r: r.sap_id or "", lambda r: r.service_name or "", "l2_sap"),
-        ]
-
-        routing_changes = []
-        if mgmt is not None:
-            for model, label, item_fn, detail_fn, scope in preview_specs:
-                # accepted/apply_failed (owned, differs) AND deploying (apply pushed, not yet
-                # confirmed) are all "pending apply" on the tab — the preview must count the same
-                # set or a device with only deploying rows previews total=0 and skips the modal.
-                rows = model.objects.filter(management=mgmt, status__in=("accepted", "apply_failed", "deploying"))
-                for r in rows:
-                    try:
-                        item = item_fn(r)
-                    except Exception:
-                        item = "—"
-                    try:
-                        detail = detail_fn(r)
-                    except Exception:
-                        detail = ""
-                    scope_val = scope(r) if callable(scope) else scope
-                    # Staleness: a row accepted long ago and never applied is staged-and-
-                    # forgotten (example-comm sat silently for a month) — surface it.
-                    accepted_at = getattr(r, "accepted_at", None)
-                    staged_days = int((timezone.now() - accepted_at).days) if accepted_at else None
-                    routing_changes.append(
-                        {
-                            "category": label,
-                            "item": item,
-                            "detail": detail,
-                            "status": r.status,
-                            "scope": scope_val,
-                            "staged_days": staged_days,
-                            "never_applied": getattr(r, "last_apply_at", None) is None,
-                        }
-                    )
+        routing_changes = _apply_preview_owner_changes(device_pk)
 
         # Right panel: the diff the Apply would push (NSO dry-run, no commit).
         # outformat=cli → NSO's NED-uniform +/- tree diff (rendered via diff2html);
@@ -6375,8 +6356,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 document_digest = preview["document_digest"]
                 preview_status = preview["status"]
                 preview_refusals = preview["refusals"]
+                device_diff = preview["diffs"] if preview_status in {"ready", "refused"} else {}
                 if preview_status == "ready":
-                    device_diff = preview["diffs"]
                     diff_available = True
                     diff_error = None
             except client.AdapterError as exc:
@@ -6398,6 +6379,9 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
         # by an EMPTY diff before the modal may be skipped. Pending rows always require
         # confirmation — an unavailable adapter (device_diff={}) proves nothing, which is
         # why the gate demands diff_available and not merely an empty dict.
+        from .refusal_display import attributed_projection
+
+        preview_projection = attributed_projection(preview_refusals) if preview_refusals else None
         total = len(changes) + len(routing_changes)
         response = JsonResponse(
             {
@@ -6414,6 +6398,8 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
                 "document_digest": document_digest,
                 "preview_status": preview_status,
                 "refusals": preview_refusals,
+                "refusal": preview_projection,
+                "refusal_text": preview_projection["text"] if preview_projection else "",
                 "diff_error": diff_error,
             }
         )
@@ -7346,13 +7332,14 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
     template_name = "netbox_nso_plugin/route_policy_classify_bulk.html"
 
     def _divergent_rows(self, mgmt):
-        return (
-            NSORoutePolicyState.objects.filter(
-                management=mgmt, status__in=("conflict", "changed"), is_materialized=False
-            )
+        from .refusal_display import project_rows, row_projection
+
+        rows = (
+            NSORoutePolicyState.objects.filter(management=mgmt, is_materialized=False)
             .select_related("management__device")
             .order_by("family", "object_name")
         )
+        return [row for row in project_rows(rows) if row_projection(row)["state"] == "drift"]
 
     def get(self, request, device_pk):  # noqa: D102
         mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)

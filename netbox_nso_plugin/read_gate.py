@@ -932,6 +932,33 @@ def _publication_observation(family, decision, observation):
     return None
 
 
+def _publish_applied_observation(management, row, decision, epoch, snapshot):
+    """Publish the applied identity within the caller's fenced transaction."""
+    if snapshot is not None:
+        from .models import NSOFamilyObservation
+
+        management.refresh_from_db()
+        row.refresh_from_db()
+        if not _locked_publication_matches(management, row, decision, epoch):
+            raise _SupersededPublication
+        NSOFamilyObservation.objects.update_or_create(read_state=row, defaults=snapshot)
+    row.applied_attempt_id = decision.attempt_id
+    row.applied_incarnation = decision.incarnation
+    row.applied_source_epoch = decision.source_epoch
+    row.applied_payload_revision = decision.payload_revision
+    row.applied_publication_sequence = decision.sequence
+    row.save(
+        update_fields=[
+            "applied_attempt_id",
+            "applied_incarnation",
+            "applied_source_epoch",
+            "applied_payload_revision",
+            "applied_publication_sequence",
+            "last_updated",
+        ]
+    )
+
+
 @read_refresh()
 def gated_family_run(
     mgmt,
@@ -942,6 +969,7 @@ def gated_family_run(
     epoch,
     pre_body: Callable[[], Any] | None = None,
     observation: dict | None = None,
+    publish_applied: bool = True,
 ) -> GateResult:
     """ONE family document → ONE gate decision → at most ONE body run (R3-6).
 
@@ -1009,29 +1037,8 @@ def gated_family_run(
             if not _locked_publication_matches(current_management, row, decision, epoch):
                 raise _SupersededPublication
             value = body()
-            if snapshot is not None:
-                from .models import NSOFamilyObservation
-
-                current_management.refresh_from_db()
-                row.refresh_from_db()
-                if not _locked_publication_matches(current_management, row, decision, epoch):
-                    raise _SupersededPublication
-                NSOFamilyObservation.objects.update_or_create(read_state=row, defaults=snapshot)
-            row.applied_attempt_id = decision.attempt_id
-            row.applied_incarnation = decision.incarnation
-            row.applied_source_epoch = decision.source_epoch
-            row.applied_payload_revision = decision.payload_revision
-            row.applied_publication_sequence = decision.sequence
-            row.save(
-                update_fields=[
-                    "applied_attempt_id",
-                    "applied_incarnation",
-                    "applied_source_epoch",
-                    "applied_payload_revision",
-                    "applied_publication_sequence",
-                    "last_updated",
-                ]
-            )
+            if publish_applied:
+                _publish_applied_observation(current_management, row, decision, epoch, snapshot)
             publish_observation(footprint, family, identity)
     except (RendererTargetsChanged, IntentPlanStaleError, _SupersededPublication):
         return GateResult(SKIPPED_STALE_ATTEMPT)

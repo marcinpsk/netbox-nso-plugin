@@ -66,7 +66,7 @@ class _Operations:
         self.operations.append(("delete", instance, None, False, ()))
 
 
-def bgp_reconcile_plan(device, payload):
+def bgp_reconcile_plan(device, payload, *, allowed_owners=None):
     """Freeze every shared, native, child, and overlay BGP write."""
     from django.utils import timezone
 
@@ -80,7 +80,7 @@ def bgp_reconcile_plan(device, payload):
         if error.name not in {"netbox_routing", "netbox_routing.models"}:
             raise
         return RendererMutationPlan.build(planned_at=planned_at)
-    operations = _bgp_reconcile_operations(device, payload, planned_at)
+    operations = _bgp_reconcile_operations(device, payload, planned_at, allowed_owners=allowed_owners)
 
     def validate_after_acquire():
         _validate_bgp_source_resolutions(device.pk, operations.source_interface_resolutions)
@@ -1486,11 +1486,30 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             self.save(state, update_fields=("status",))
 
 
-def _bgp_reconcile_operations(device, payload, planned_at):
-    return _BGPGraphPlanner(device, payload, planned_at).build()
+def _bgp_reconcile_operations(device, payload, planned_at, *, allowed_owners=None):
+    operations = _BGPGraphPlanner(device, payload, planned_at).build()
+    if allowed_owners is None:
+        return operations
+    from .deployment_probe import ProbeBlocked
+
+    selected = [
+        save for save in operations.saves if (save.instance._meta.label_lower, save.instance.pk) in allowed_owners
+    ]
+    if {(save.instance._meta.label_lower, save.instance.pk) for save in selected} != set(allowed_owners):
+        raise ProbeBlocked("BGP probe owner footprint changed")
+    if any(save.force_insert or save.reference_fields for save in selected):
+        raise ProbeBlocked("BGP probe cannot create or relink an owner")
+    operations.saves = selected
+    operations.deletes = []
+    operations.operations = [
+        operation
+        for operation in operations.operations
+        if operation[0] == "save" and (operation[1]._meta.label_lower, operation[1].pk) in allowed_owners
+    ]
+    return operations
 
 
-def _reconcile_bgp_config(device, payload: dict) -> list:
+def _reconcile_bgp_config(device, payload: dict, *, allowed_owners=None) -> list:
     """Reconcile BGP config from adapter payload into NetBox netbox-routing BGP models.
 
     For each router → scope → peer entry reported by the adapter:
@@ -1527,7 +1546,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
         return []
 
     def apply_operations(writer, planned_at):
-        operations = _bgp_reconcile_operations(device, payload, planned_at)
+        operations = _bgp_reconcile_operations(device, payload, planned_at, allowed_owners=allowed_owners)
         for operation, instance, update_fields, force_insert, references in operations.operations:
             if operation == "delete":
                 writer.delete(instance)
@@ -1536,7 +1555,7 @@ def _reconcile_bgp_config(device, payload: dict) -> list:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
     def plan_fn():
-        return bgp_reconcile_plan(device, payload)
+        return bgp_reconcile_plan(device, payload, allowed_owners=allowed_owners)
 
     active = active_renderer_writer()
     if active is not None:

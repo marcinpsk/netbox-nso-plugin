@@ -2,17 +2,12 @@
 # Copyright (C) 2026 Marcin Zieba
 """Settle independent contributors through real renderer capture and HTTP admission."""
 
-import copy
-from uuid import UUID
-
 from dcim.models import Interface
 from django.db import transaction
-from django.urls import reverse
 from ipam.models import VLAN, VLANGroup
 from netbox_routing.models import ISISInstance, ISISLevel
 
 from netbox_nso_plugin.models import (
-    NSOApplyAttempt,
     NSOISISInstanceState,
     NSOLACPBundleState,
     NSOLACPMemberState,
@@ -22,41 +17,10 @@ from netbox_nso_plugin.models import (
 from ._bgp_settlement import BGPSettlementHelpers
 from ._outbox_case import without_commit_drain
 from ._ownership_case import acquire_overlay, save_overlay_fixture
-from .test_apply_selector import _promoted
 from .test_durable_bgp_capture import BGPCaptureCase
 
 
 class TestRefusalSettlementFamilies(BGPSettlementHelpers, BGPCaptureCase):
-    def apply_owners(self, owners):
-        self.owners = owners
-        self.prior = {}
-        for row in owners:
-            self.bookkeeping(row)
-            row.refresh_from_db()
-            self.prior[(row._meta.label_lower, row.pk)] = (
-                row.status,
-                row.last_apply_at,
-                copy.deepcopy(row.last_apply_error),
-                row.apply_attempt_id,
-            )
-        self.adapter.apply_response = lambda selected: (
-            202,
-            {**_promoted(selected), "generations": _promoted(selected)["generations"][:1]},
-        )
-        response = self.client.post(
-            reverse("plugins:netbox_nso_plugin:nsodevicemanagement_action", args=(self.management.pk, "apply")),
-            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
-        )
-        self.assertEqual(response.status_code, 200, response.content)
-        self.attempt = NSOApplyAttempt.objects.get(pk=UUID(self.adapter.manual_reads[-1]["body"]["apply_attempt_id"]))
-
-    def settle(self, generation):
-        from netbox_nso_plugin.outcome_settlement import settle_terminal_generation
-
-        return settle_terminal_generation(
-            self.management, generation, "placeholder-store", attempt=self.attempt, settle_seq=1
-        )
-
     def assert_restored(self, row):
         row.refresh_from_db()
         self.assertEqual(

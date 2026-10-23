@@ -137,6 +137,15 @@ def document_section_for_stream(stream: str) -> str:
     raise RegistryError("unknown adapter stream")
 
 
+def document_owner_specs(section: str) -> tuple[OverlaySpec, ...]:
+    """Select document owners, excluding contributions shared across protocols."""
+    return tuple(
+        spec
+        for spec in OVERLAYS.values()
+        if len(spec.delivery_keys) == 1 and _document_section(spec.delivery_keys[0]) == section
+    )
+
+
 SECTION_COUNTER_KEYS = MappingProxyType(
     {
         section: tuple(

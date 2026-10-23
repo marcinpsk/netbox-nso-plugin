@@ -432,3 +432,61 @@ describe("NSOGrid.deviceNote", () => {
     expect(host.querySelector(".nso-dev-note").textContent).toBe("device: —");
   });
 });
+
+describe("refusal evidence in the interface grid", () => {
+  const text = "ownership-conflict: placeholder catalog text that is longer than the state column";
+
+  it("shows an attribute's evidence once, in its own cell", () => {
+    const description = Object.assign({}, PENDING_DESC, { kind: "apply_failed", label: "apply failed", refusal_text: text });
+    const data = row({ description, state: "apply_failed" });
+    const { col } = mountRows([data]);
+    const cells = [col("_desc"), col("state")].map((column) => {
+      const output = column.formatter(fakeCell(data));
+      return typeof output === "string" ? parse(output) : output;
+    });
+    const occurrences = cells.map((node) => node.textContent.split(text).length - 1);
+    expect(occurrences).toEqual([1, 0]);
+  });
+
+  it("shows an IP owner's evidence beside that IP", () => {
+    const ip = { pk: 31, address: "198.18.30.0/31", status: "apply_failed", kind: "apply_failed", label: "apply failed", refusal_text: text };
+    const data = row({ ips: [ip], state: "apply_failed" });
+    const { col } = mountRows([data]);
+    expect(col("_network").formatter(fakeCell(data)).textContent).toContain(text);
+  });
+});
+
+describe("MTU cell", () => {
+  it("lets the value and its failed badge wrap inside the cell", () => {
+    const mtu = { pk: 7, l2: 9192, ip: null, mpls: null, status: "apply_failed", kind: "apply_failed", label: "apply failed" };
+    const data = row({ mtu, state: "apply_failed" });
+    const { col } = mountRows([data]);
+    const node = col("mtu").formatter(fakeCell(data));
+    expect(node.classList.contains("text-wrap")).toBe(true);
+    expect(node.querySelector(".badge").textContent).toBe("apply failed");
+  });
+});
+
+describe("narrow cells", () => {
+  it("lets the network cell wrap a long tagged VLAN list and its badge", () => {
+    const switchport = { pk: 9, mode: "trunk", untagged: 1, tagged: [100, 200, 300, 400], kind: "apply_failed", label: "apply failed" };
+    const ip = { pk: 31, address: "198.18.30.0/31", status: "apply_failed", kind: "apply_failed", label: "apply failed" };
+    const data = row({ ips: [ip], switchport, state: "apply_failed" });
+    const { col } = mountRows([data]);
+    const node = col("_network").formatter(fakeCell(data));
+    expect(node.classList.contains("text-wrap")).toBe(true);
+    expect(node.querySelector(".text-nowrap:not(code)")).toBeNull();
+    expect(node.querySelector("code").classList.contains("text-nowrap")).toBe(true);
+  });
+
+  it("lets the compare button wrap below the state badge", () => {
+    const enabled = { value: "false", netbox_value: true, status: "accepted", kind: "pending", label: "pending apply" };
+    const data = row({ enabled, state: "pending" });
+    const { col } = mountRows([data]);
+    const state = parse(col("state").formatter(fakeCell(data)));
+    const wrapper = state.querySelector(".text-wrap");
+    expect(wrapper).not.toBeNull();
+    expect(wrapper.querySelector(".badge")).not.toBeNull();
+    expect(wrapper.querySelector(".nso-if-diff")).not.toBeNull();
+  });
+});

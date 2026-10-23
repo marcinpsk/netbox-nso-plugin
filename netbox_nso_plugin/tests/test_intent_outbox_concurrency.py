@@ -868,8 +868,8 @@ class TestTemplateAcceptConcurrency(IntentPushResetMixin, _CascadeFlushMixin, Tr
         mutations = []
         real_plan = bgp_reconciler.bgp_reconcile_plan
 
-        def pause_after_planning(device, payload):
-            plan = real_plan(device, payload)
+        def pause_after_planning(device, payload, *, allowed_owners=None):
+            plan = real_plan(device, payload, allowed_owners=allowed_owners)
             if not planned.is_set():
                 planned.set()
                 if not release.wait(30):

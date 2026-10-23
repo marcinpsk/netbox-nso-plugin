@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+from datetime import datetime
 
 from django.db import OperationalError, connection, transaction
 from django.utils import timezone
@@ -26,6 +27,14 @@ class DeploymentTransitionTimeout(RuntimeError):
     """The fleet switch could not acquire its exclusive lock before the deadline."""
 
 
+def report_replaced_gate(stream) -> None:
+    """Tell the operator that the gate this invocation created was replaced and stays quiesced."""
+    if is_quiesced():
+        stream.write(
+            "The deployment gate stays quiesced: another invocation owns the gate now. Its owning operation must release it."
+        )
+
+
 def gate_recovery_guidance(rerun: str, *, created: bool) -> str:
     """Return recovery guidance that respects gate ownership."""
     if created:
@@ -38,6 +47,13 @@ def is_quiesced() -> bool:
     from .models import NSOIntentDeploymentControl
 
     return NSOIntentDeploymentControl.objects.filter(pk=1).exists()
+
+
+def is_paired_activation() -> bool:
+    """Return whether the active gate guards a paired code activation."""
+    from .models import NSOIntentDeploymentControl
+
+    return NSOIntentDeploymentControl.objects.filter(pk=1, paired_activation=True).exists()
 
 
 def _refuse(label: str) -> None:
@@ -118,10 +134,9 @@ def guarded(label: str):
     return _decorate
 
 
-def _set_active(active: bool) -> bool:
-    """Change the switch and return whether activation created it."""
-    from .models import NSOIntentDeploymentControl
-
+@contextlib.contextmanager
+def exclusive_transition():
+    """Hold the exclusive switch lock in this session; nested holds in the same session are reentrant."""
     acquired = False
     try:
         try:
@@ -136,29 +151,49 @@ def _set_active(active: bool) -> bool:
             if getattr(exc.__cause__, "sqlstate", None) == "55P03":
                 raise DeploymentTransitionTimeout("Timed out waiting for active intent operations to finish") from None
             raise
-        with transaction.atomic():
-            if active:
-                _control, created = NSOIntentDeploymentControl.objects.update_or_create(
-                    pk=1,
-                    defaults={"quiesced_at": timezone.now()},
-                )
-                return created
-            NSOIntentDeploymentControl.objects.filter(pk=1).delete()
-            return False
+        yield
     finally:
         if acquired:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_advisory_unlock(%s)", [_LOCK_KEY])
 
 
-def quiesce() -> bool:
-    """Block new operations and return whether this call activated the gate."""
-    return _set_active(True)
+def quiesce(*, paired_activation: bool = False) -> datetime | None:
+    """Block new operations; return the new gate's quiesced_at, or None when a gate already existed.
+
+    An existing gate keeps its quiesced_at, and no call removes the paired mark.
+    """
+    from .models import NSOIntentDeploymentControl
+
+    with exclusive_transition(), transaction.atomic():
+        control, created = NSOIntentDeploymentControl.objects.get_or_create(
+            pk=1,
+            defaults={"quiesced_at": timezone.now()},
+        )
+        if paired_activation:
+            NSOIntentDeploymentControl.objects.filter(pk=1).update(paired_activation=True)
+        return control.quiesced_at if created else None
 
 
-def resume() -> None:
-    """Restore normal intent operation."""
-    _set_active(False)
+def resume(*, paired_verified: bool = False, created_at: datetime | None = None) -> None:
+    """Restore normal intent operation.
+
+    A paired-activation gate needs ``paired_verified``. With ``created_at``, release only that
+    ordinary gate instance and leave a replaced or promoted gate in place.
+    """
+    from .models import NSOIntentDeploymentControl
+
+    with exclusive_transition(), transaction.atomic():
+        control = NSOIntentDeploymentControl.objects.select_for_update().filter(pk=1).first()
+        if control is None:
+            return
+        if created_at is not None and (control.quiesced_at != created_at or control.paired_activation):
+            return
+        if control.verification_attempt_id is not None:
+            raise DeploymentQuiesced("Revoke verification probe authority before resume")
+        if control.paired_activation and not paired_verified:
+            raise DeploymentQuiesced("A paired-activation gate resumes only after paired verification")
+        control.delete()
 
 
 @contextlib.contextmanager

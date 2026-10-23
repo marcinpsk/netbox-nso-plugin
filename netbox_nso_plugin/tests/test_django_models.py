@@ -248,11 +248,11 @@ class TestNSOInterfaceStateModelMethods(TestCase):
         cls.state = NSOInterfaceState.objects.create(interface=cls.interface, attribute="description", status="changed")
 
     def test_str(self):
-        """__str__ includes interface, attribute, and status."""
+        """__str__ identifies the owner without a second sync-state label."""
         result = str(self.state)
         self.assertIn("GigabitEthernet0/0", result)
         self.assertIn("description", result)
-        self.assertIn("changed", result)
+        self.assertNotIn("[changed]", result)
 
     def test_get_absolute_url(self):
         """get_absolute_url returns correct URL."""

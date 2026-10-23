@@ -1,13 +1,13 @@
 {# SPDX-License-Identifier: Apache-2.0 #}
 {# Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com> #}
-{# Lazy fragment: IS-IS category — two grids (interfaces + instances) over ONE payload. #}
+{# IS-IS owner grids share one payload. #}
 {% include "netbox_nso_plugin/categories/_adapter_error.html" %}
 
 {# #78 intent-integrity: name what the mirror carries that the write path does not, #}
 {# so an edit+Accept on those fields is never silently inert. Registry (and the #}
 {# payload-proving test) live in isis_write_policy.py; the per-object detail panel #}
 {# renders on the netbox-routing IS-IS pages themselves. #}
-{% if grid_payload.interfaces.rows or grid_payload.instances.rows %}
+{% if grid_payload.interfaces.rows or grid_payload.instances.rows or grid_payload.flex_algos.rows %}
   <p class="text-muted small mb-2">
     <span class="mdi mdi-pencil-off-outline me-1"></span>
     Some mirrored IS-IS fields are <strong>read-only</strong> (not carried by the NSO write path):
@@ -37,9 +37,15 @@
     {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-isis-inst" json_url=cat_url|add:"?format=json" counts=grid_payload.instances.counts %}
   {% endif %}
 
+  {% if grid_payload.flex_algos.rows %}
+    <h6 class="mb-2 mt-3">IS-IS Flex-Algos</h6>
+    {% include "netbox_nso_plugin/categories/_grid.html" with cls="nso-isis-flex" json_url=cat_url|add:"?format=json" counts=grid_payload.flex_algos.counts %}
+  {% endif %}
+
   <script>
   window.NSOGridIsis && window.NSOGridIsis.mount(document.querySelector('.nso-isis-if'), 'interfaces');
   window.NSOGridIsis && window.NSOGridIsis.mount(document.querySelector('.nso-isis-inst'), 'instances');
+  window.NSOGridIsis && window.NSOGridIsis.mount(document.querySelector('.nso-isis-flex'), 'flex_algos');
   </script>
 {% else %}
   <p class="text-muted mb-0">No IS-IS configuration.</p>

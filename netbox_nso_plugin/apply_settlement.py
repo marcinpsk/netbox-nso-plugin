@@ -874,26 +874,18 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
         for generation in attempt["generations"]
         if generation["row_outcomes"] is not None
     )
-    for generation in generations:
-        identity = generation["generation_id"], generation["job_id"]
-        if generation["status"] in {"pending", "running"} or identity in present:
+    required = [
+        generation
+        for generation in generations
+        if terminal_carrier_requires_certificate(generation)
+        and (generation["generation_id"], generation["job_id"]) not in present
+    ]
+    certificates = consumed_generation_certificates(management, incarnation, required)
+    for generation in required:
+        projection = certificates[generation["generation_id"], generation["job_id"]]
+        if projection is not None:
+            bound.automatic_generations.append(projection)
             continue
-        # An abandoned generation that never had a carrier job has no execution to settle.
-        if generation["status"] == "abandoned" and generation["job_id"] is None:
-            continue
-        cached = (
-            _cursor_epoch_executions(management, incarnation)
-            .filter(
-                generation_id=generation["generation_id"],
-                carrier_job_id=generation["job_id"],
-            )
-            .first()
-        )
-        if cached is not None:
-            projection = _execution_projection(cached)
-            if all(projection[key] == generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
-                bound.automatic_generations.append(projection)
-                continue
         _record_invariant(
             management,
             {"generation_id": generation["generation_id"], "carrier_job_id": generation["job_id"]},
@@ -902,6 +894,101 @@ def _require_terminal_metadata(bound, generations, management, incarnation):
             "missing_generation_evidence",
         )
         raise EvidenceInvariantError("missing_generation_evidence")
+
+
+def terminal_carrier_requires_certificate(generation):
+    """Require terminal evidence because a nullable job FK cannot prove that no carrier ran."""
+    return generation["status"] not in {"pending", "running"}
+
+
+def consumed_generation_certificates(management, incarnation, generations):
+    """Validate local and remote carrier evidence per (generation_id, job_id) with one remote snapshot."""
+    listed = {}
+    for execution in generation_certificates(management, incarnation, *generations).select_related("attempt"):
+        listed.setdefault(execution.generation_id, []).append(execution)
+    certificates, retained = {}, {}
+    for generation in generations:
+        identity = generation["generation_id"], generation["job_id"]
+        candidates = [
+            execution
+            for execution in listed.get(generation["generation_id"], ())
+            if generation["job_id"] is None or execution.carrier_job_id == generation["job_id"]
+        ]
+        certificates[identity] = _local_certificate(generation, candidates)
+        if certificates[identity] is not None and generation["job_id"] is None:
+            retained[identity] = generation, candidates[0]
+    for identity in _unmatched_retained_carriers(management, incarnation, retained):
+        certificates[identity] = None
+    return certificates
+
+
+def _local_certificate(generation, candidates):
+    if len(candidates) != 1:
+        return None
+    cached = candidates[0]
+    if (
+        cached.invariant_code
+        or cached.consumed_at is None
+        or not _positive_int(cached.settle_seq)
+        or not _positive_int(cached.carrier_job_id)
+    ):
+        return None
+    projection = _execution_projection(cached)
+    if any(projection[key] != generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
+        return None
+    return projection
+
+
+def _unmatched_retained_carriers(management, incarnation, retained):
+    """Require remote carrier identity after the adapter deletes a job, from one evidence and feed read."""
+    from . import adapter_client as client
+    from .outcome_settlement import immutable_execution_projection
+
+    if not retained:
+        return set()
+    attempts = {
+        execution.attempt.pk: execution.attempt
+        for _generation, execution in retained.values()
+        if execution.attempt.trigger_kind == "manual"
+        and execution.attempt.adapter_apply_attempt_id == execution.attempt.pk
+    }
+    attempt_ids = tuple(attempts)
+    limit = client.DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT
+    chunks = [attempt_ids[start : start + limit] for start in range(0, len(attempt_ids), limit)] or [()]
+    responses = [(chunk, client.get_deployment_evidence(management.adapter_device_id, chunk)) for chunk in chunks]
+    _page, final_incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=0, limit=1)
+    if incarnation != final_incarnation:
+        raise EvidenceInvariantError("evidence_epoch_changed")
+    rows = {}
+    for chunk, evidence in responses:
+        _reject_unrequested_attempts(evidence, chunk)
+        if evidence.get("device_id") != management.adapter_device_id:
+            raise EvidenceInvariantError("admission_mapping_changed")
+        for raw in evidence["attempts"]:
+            attempt = attempts[UUID(str(raw["apply_attempt_id"]))]
+            rows.setdefault(attempt.pk, []).extend(_validate_attempt(raw, attempt, incarnation)["generations"])
+    head = responses[-1][1]["head"]
+    unmatched = set()
+    for identity, (generation, execution) in retained.items():
+        matches = [
+            row for row in rows.get(execution.attempt.pk, ()) if row["generation_id"] == generation["generation_id"]
+        ]
+        if head is not None and head["generation_id"] == generation["generation_id"]:
+            if head["seq"] != generation["seq"]:
+                unmatched.add(identity)
+                continue
+            matches.append(_validate_generation(_generation_from_carrier(generation, head)))
+        projection = immutable_execution_projection(_execution_projection(execution))
+        if not matches or any(immutable_execution_projection(row) != projection for row in matches):
+            unmatched.add(identity)
+    return unmatched
+
+
+def generation_certificates(management, incarnation, *generations):
+    """Keep all consumed carriers that recovery can request for the listed generations, in any mapping epoch."""
+    return _cursor_epoch_executions(management, incarnation).filter(
+        generation_id__in=[generation["generation_id"] for generation in generations]
+    )
 
 
 def _cursor_epoch_executions(management, incarnation):

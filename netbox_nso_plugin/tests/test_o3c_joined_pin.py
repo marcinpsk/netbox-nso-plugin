@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "83214a24cf6c94e4d5cc0343d168d43a7c97aa20301806c85c4f3c71f309f766"
+_ADAPTER_RUNTIME_DIGEST = "328d12a02dbab3a0acc4ff08e1123af56f401b68b64ce50283ac4aefd399f8a7"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -137,6 +137,7 @@ class _RestconfState:
         self.allow_removal = threading.Event()
         self.nso_devices: set[str] = set()
         self.plugin_callbacks: list[tuple[str, dict]] = []
+        self.unavailable_reads: set[str] = set()
 
     @staticmethod
     def key(entry: dict) -> tuple[str, str, str]:
@@ -276,6 +277,9 @@ class _RestconfHandler(BaseHTTPRequestHandler):
         if device_name == self.state.held_device and not self.state.allow_removal.is_set():
             self.state.removal_read_started.set()
             self.state.allow_removal.wait(45)
+        if device_name in self.state.unavailable_reads:
+            self._send_json(503, {"errors": "service unavailable"})
+            return
         document = self.state.service_document(device_name)
         if document is None:
             self._send_json(404, {"errors": "unknown service instance"})
@@ -678,6 +682,7 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
         adapter_client.reset_session()
         self.addCleanup(adapter_client.reset_session)
         self.addCleanup(self.environment.restconf.allow_removal.set)
+        self.addCleanup(self.environment.restconf.unavailable_reads.clear)
 
     def _link(self, device, instance, name: str):
         from netbox_nso_plugin import adapter_client
@@ -975,6 +980,93 @@ class TestO3CJoinedCrossRepositoryPin(_CascadeFlushMixin, IntentPushResetMixin, 
             route["next-hop"] for route in self.environment.restconf.device_section(retained.nso_device_name)["route"]
         ] == ["198.18.3.2"]
         assert NSODeviceManagement.objects.get(pk=removed.pk).adapter_device_id == removed.adapter_device_id
+
+    def _settle_unprepared_failure(self, name: str, index: int):
+        """Fail a real apply before preparation, then consume it through the unchanged settlement."""
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.models import NSOApplyExecution, NSOInstance, NSOStaticRouteState
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        instance = NSOInstance.objects.create(name="o3c-pin", adapter_instance_id="o3c-pin")
+        device = make_device(name, index=index)
+        management = self._link(device, instance, name)
+        self.environment.restconf.unavailable_reads.add(name)
+        route = own_route(management, f"198.18.{index}.0/28", f"198.18.{index}.1")
+        self._enable_auto_apply(management)
+        assert drain.drain_key(device.pk, "static_route", chain=0) == drain.SUCCEEDED
+        failed = _wait_until(
+            lambda: self._terminal_job(management.adapter_device_id, "apply"),
+            "the unprepared apply did not finish",
+        )
+        assert failed["status"] == "failed", (failed, self.environment.log_text())
+        assert self.environment.restconf.retractions(name) == [], "nothing may reach the device"
+        outcomes = (failed.get("result") or {}).get("row_outcomes")
+        assert outcomes, (failed, self.environment.log_text())
+        assert {row["disposition"] for row in outcomes} == {"not_applied"}, outcomes
+
+        consumed = consume_static_route_settlements(management)
+        management.refresh_from_db()
+        codes = list(NSOApplyExecution.objects.filter(management=management).values_list("invariant_code", flat=True))
+        assert not consumed.stalled, (consumed, codes)
+        assert management.settle_cursor_seq >= failed["settle_seq"]
+        assert set(codes) == {""}, codes
+        state = NSOStaticRouteState.objects.get(management=management, static_route=route)
+        assert state.status != "in_sync", state.status
+        return management, route, failed
+
+    def _blocked_generation_id(self, management, job_id: int) -> int:
+        from netbox_nso_plugin import adapter_client
+
+        [generation] = [
+            row
+            for row in adapter_client.list_device_generations(management.adapter_device_id)
+            if row["job_id"] == job_id
+        ]
+        assert generation["status"] == "failed", generation
+        return generation["generation_id"]
+
+    def _settle_next_apply(self, management, route, after_id: int, next_hop: str) -> None:
+        from netbox_nso_plugin.models import NSOStaticRouteState
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        succeeded = _wait_until(
+            lambda: self._terminal_job(management.adapter_device_id, "apply", after_id=after_id),
+            "the apply behind the consumed failure did not finish",
+        )
+        assert succeeded["status"] == "succeeded", (succeeded, self.environment.log_text())
+        consumed = consume_static_route_settlements(management)
+        management.refresh_from_db()
+        assert not consumed.stalled, consumed
+        assert management.settle_cursor_seq >= succeeded["settle_seq"]
+        state = NSOStaticRouteState.objects.get(management=management, static_route=route)
+        assert state.status == "in_sync", state.status
+        assert state.nso_next_hop == next_hop
+
+    def test_an_unprepared_failure_settles_and_a_retry_settles_behind_it(self):
+        from netbox_nso_plugin import adapter_client
+
+        management, route, failed = self._settle_unprepared_failure("o3c-unprepared-retry", 4)
+        generation_id = self._blocked_generation_id(management, failed["id"])
+
+        self.environment.restconf.unavailable_reads.clear()
+        adapter_client.retry_generation(management.adapter_device_id, generation_id)
+        self._settle_next_apply(management, route, failed["id"], "198.18.4.1")
+
+    def test_an_abandoned_unprepared_failure_does_not_block_the_next_apply(self):
+        from netbox_nso_plugin import adapter_client
+        from netbox_nso_plugin.settlement import consume_static_route_settlements
+
+        from ._static_route_case import _edit_owned_route
+
+        management, route, failed = self._settle_unprepared_failure("o3c-unprepared-abandon", 5)
+        generation_id = self._blocked_generation_id(management, failed["id"])
+        adapter_client.abandon_generation(management.adapter_device_id, generation_id)
+        assert not consume_static_route_settlements(management).stalled
+
+        self.environment.restconf.unavailable_reads.clear()
+        with transaction.atomic():
+            _edit_owned_route(route, next_hop="198.18.5.2")
+        self._settle_next_apply(management, route, failed["id"], "198.18.5.2")
 
 
 @tag("o3c")

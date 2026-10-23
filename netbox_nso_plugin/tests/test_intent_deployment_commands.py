@@ -35,6 +35,32 @@ class _BrokenStderr(io.StringIO):
 
 
 class TestReceiptSelectors(SimpleTestCase):
+    def test_deployment_gate_help_explains_each_action_and_its_required_arguments(self):
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import Command
+
+        parser = Command().create_parser("manage.py", "nso_intent_deployment_gate")
+        actions = {action.dest: action.help or "" for action in parser._actions}
+        required = {
+            "prepare": ("Block fleet", "quiesced", "--paired-activation", "gate this invocation created"),
+            "paired_activation": ("--prepare", "never downgrades"),
+            "verify": ("paired verification", "--device ID", "--settled-probe UUID", "no-deletion static push"),
+            "resume": ("paired verification", "--device ID", "--settled-probe UUID", "paired-activation gate"),
+            "abort": ("paired verification", "--device ID", "--settled-probe UUID", "Release any other gate"),
+            "import_routers": ("--device ID", "no ownership", "paired-activation gate"),
+            "accept_routers": ("--device ID", "exact operator-selected overlay IDs", "paired-activation gate"),
+            "prepare_store": ("--device ID", "--scope", "never enqueues a device Apply", "paired-activation gate"),
+            "start_probe": ("--device ID", "--register-probe", "manual Apply", "paired-activation gate"),
+            "register_probe": ("terminal", "callback", "--revoke-probe", "paired-activation gate"),
+            "revoke_probe": ("quiesced", "permit", "paired-activation gate"),
+        }
+        for action, phrases in required.items():
+            for phrase in phrases:
+                with self.subTest(action=action, phrase=phrase):
+                    self.assertIn(phrase, actions[action])
+        help_text = parser.format_help()
+        for obsolete in ("--adapter-root", "--packages-root", "--plugin-ref", "--adapter-ref"):
+            self.assertNotIn(obsolete, help_text)
+
     def test_deployment_gate_rejects_a_boolean_device_id(self):
         from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import _receipt_for
 
@@ -631,9 +657,9 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             claimed_at=timezone.now(),
         )
 
-        def competing_transition():
+        def competing_transition(**kwargs):
             quiesce()
-            return quiesce()
+            return quiesce(**kwargs)
 
         try:
             with (
@@ -720,6 +746,30 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
             assert [record["route_id"] for record in state.queued_deletions] == [route.pk]
         finally:
             resume()
+
+    def test_store_preparation_releases_a_rejected_replay_and_keeps_its_authority(self):
+        from netbox_nso_plugin import drain
+        from netbox_nso_plugin.management.commands.nso_intent_deployment_gate import Command
+
+        route = own_route(self.mgmt, "198.18.46.0/24", "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+        with without_commit_drain():
+            _unassign_and_retire(route, self.device)
+        claim = drain.claim(self.device.pk, "static_route")
+        assert claim is not None and [record["route_id"] for record in claim.deletions] == [route.pk]
+        state = state_of(self.device, "static_route")
+        state.claimed_at = None
+        state.save(update_fields=["claimed_at"])
+
+        with self.assertRaisesRegex(CommandError, "exact store-only preparation"):
+            Command._store_preparation(self.mgmt, "static_route")
+
+        state = state_of(self.device, "static_route")
+        assert state.claimed_at is None, "the rejected replay kept its lease"
+        assert state.push_seq == claim.push_seq, "a possibly sent replay was abandoned"
+        assert [record["route_id"] for record in state.claim_deletions] == [route.pk]
 
     def test_completed_verification_reports_resume_failure_and_keeps_the_gate(self):
         from netbox_nso_plugin import deployment, drain
@@ -864,6 +914,337 @@ class TestDeploymentGate(_CascadeFlushMixin, IntentPushResetMixin, TransactionTe
         with without_commit_drain(), content_mutation({(self.device.pk, "static_route")}):
             outbox.enqueue(self.device.pk, "static_route")
         assert entries(self.device, "static_route", unconsumed=True), "normal operation did not resume"
+
+    def test_a_failed_paired_verification_keeps_writes_blocked(self):
+        from netbox_nso_plugin import deployment, outbox
+
+        deployment.quiesce(paired_activation=True)
+        for action in ("verify", "resume", "abort"):
+            with self.subTest(action=action), self.assertRaisesRegex(CommandError, "verification probes"):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    **{action: True},
+                    device_id=self.device.pk,
+                    stdout=io.StringIO(),
+                    stderr=io.StringIO(),
+                )
+            self.assertTrue(deployment.is_quiesced())
+        with self.assertRaises(deployment.DeploymentQuiesced), transaction.atomic():
+            outbox.enqueue(self.device.pk, "static_route")
+        self.assertEqual(self.adapter.requests, [])
+
+    def _settled_route(self, prefix):
+        from netbox_nso_plugin import drain
+
+        own_route(self.mgmt, prefix, "198.18.0.1")
+        config, session = self.adapter.patches()
+        with config, session:
+            assert drain.drain_key(self.device.pk, "static_route") == drain.SUCCEEDED
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
+            self._prepare()
+
+    def test_static_verification_refuses_a_gate_upgraded_before_its_locked_recheck(self):
+        from netbox_nso_plugin import deployment
+        from netbox_nso_plugin.management.commands import nso_intent_deployment_gate as gate_command
+        from netbox_nso_plugin.models import NSOIntentDeploymentControl
+
+        self._settled_route("198.18.47.0/24")
+        sent = len(self.adapter.requests)
+        dispatch = gate_command.is_paired_activation
+
+        def upgrade_after_dispatch():
+            answer = dispatch()
+            deployment.quiesce(paired_activation=True)
+            return answer
+
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch.object(gate_command, "is_paired_activation", side_effect=upgrade_after_dispatch),
+                self.assertRaisesRegex(CommandError, "paired-activation gate"),
+            ):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    verify=True,
+                    device_id=self.device.pk,
+                    stdout=io.StringIO(),
+                    stderr=io.StringIO(),
+                )
+            self.assertEqual(len(self.adapter.requests), sent, "an unauthorized static push reached the adapter")
+            self.assertTrue(deployment.is_paired_activation())
+        finally:
+            NSOIntentDeploymentControl.objects.all().delete()
+
+    def test_static_verification_holds_the_transition_lock_against_a_paired_upgrade(self):
+        from netbox_nso_plugin import deployment, drain
+        from netbox_nso_plugin.models import NSOIntentDeploymentControl
+
+        self._settled_route("198.18.48.0/24")
+        sent = len(self.adapter.requests)
+        send = drain.send_claim
+        outcome = []
+
+        def upgrade():
+            close_old_connections()
+            try:
+                outcome.append(deployment.quiesce(paired_activation=True))
+            except BaseException as exc:
+                outcome.append(exc)
+            finally:
+                connection.close()
+
+        def contend_then_send(claim):
+            contender = threading.Thread(target=upgrade)
+            contender.start()
+            contender.join(timeout=10)
+            self.assertFalse(contender.is_alive(), "the paired upgrade ignored its lock timeout")
+            return send(claim)
+
+        stdout = io.StringIO()
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch.object(deployment, "_EXCLUSIVE_LOCK_TIMEOUT_MS", 300),
+                patch(
+                    "netbox_nso_plugin.management.commands.nso_intent_deployment_gate.drain.send_claim",
+                    side_effect=contend_then_send,
+                ),
+            ):
+                call_command(
+                    "nso_intent_deployment_gate",
+                    verify=True,
+                    device_id=self.device.pk,
+                    stdout=stdout,
+                    stderr=io.StringIO(),
+                )
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], deployment.DeploymentTransitionTimeout)
+            self.assertEqual(len(self.adapter.requests), sent + 1)
+            self.assertIn("Deployment verification passed", stdout.getvalue())
+            self.assertFalse(deployment.is_quiesced())
+        finally:
+            NSOIntentDeploymentControl.objects.all().delete()
+
+
+class TestDeploymentGatePurpose(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
+    """Only a gate prepared for paired activation requires the paired predicate."""
+
+    tag = "gatepurpose"
+    adapter_device_id = 7802
+
+    def setUp(self):
+        super().setUp()
+        self.device, self.mgmt = make_managed(self.tag, self.adapter_device_id)
+        self.addCleanup(self._release)
+
+    @staticmethod
+    def _release():
+        from netbox_nso_plugin.models import NSOIntentDeploymentControl
+
+        NSOIntentDeploymentControl.objects.all().delete()
+
+    @staticmethod
+    def _gate():
+        from netbox_nso_plugin.models import NSOIntentDeploymentControl
+
+        return NSOIntentDeploymentControl.objects.get(pk=1)
+
+    def _command(self, **options):
+        stdout = io.StringIO()
+        with patch("netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep"):
+            call_command("nso_intent_deployment_gate", stdout=stdout, stderr=io.StringIO(), **options)
+        return stdout.getvalue()
+
+    def test_plain_abort_releases_a_gate_prepared_without_paired_activation(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        self._command(prepare=True)
+        self.assertFalse(self._gate().paired_activation)
+
+        output = self._command(abort=True)
+
+        self.assertIn("Deployment gate aborted", output)
+        self.assertFalse(is_quiesced())
+
+    def test_abort_of_a_paired_gate_requires_the_paired_predicate(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        self._command(prepare=True, paired_activation=True)
+        self.assertTrue(self._gate().paired_activation)
+
+        with self.assertRaisesRegex(CommandError, "verification probes"):
+            self._command(abort=True, device_id=self.device.pk)
+
+        self.assertTrue(is_quiesced())
+        self.assertTrue(self._gate().paired_activation)
+
+    def test_plain_prepare_never_downgrades_a_paired_gate(self):
+        self._command(prepare=True, paired_activation=True)
+
+        self._command(prepare=True)
+
+        self.assertTrue(self._gate().paired_activation)
+        with self.assertRaisesRegex(CommandError, "verification probes"):
+            self._command(abort=True, device_id=self.device.pk)
+
+    def test_paired_prepare_upgrades_an_existing_runbook_gate(self):
+        from netbox_nso_plugin.deployment import quiesce
+
+        self.assertTrue(quiesce())
+
+        self._command(prepare=True, paired_activation=True)
+
+        self.assertTrue(self._gate().paired_activation)
+
+    def test_direct_resume_refuses_a_paired_gate(self):
+        from netbox_nso_plugin.deployment import DeploymentQuiesced, is_quiesced, quiesce, resume
+
+        quiesce(paired_activation=True)
+        quiesce()
+
+        with self.assertRaisesRegex(DeploymentQuiesced, "paired verification"):
+            resume()
+        self.assertTrue(is_quiesced())
+
+    def test_paired_only_actions_refuse_a_runbook_gate(self):
+        from netbox_nso_plugin.deployment import is_quiesced, quiesce
+
+        quiesce()
+        cases = {
+            "resume": {"resume": True, "device_id": self.device.pk},
+            "start-probe": {"start_probe": "00000000-0000-4000-8000-000000001767", "device_id": self.device.pk},
+            "register-probe": {"register_probe": "00000000-0000-4000-8000-000000001767"},
+            "revoke-probe": {"revoke_probe": True},
+            "import-routers": {"import_routers": True, "device_id": self.device.pk},
+            "accept-routers": {"accept_routers": [1], "device_id": self.device.pk},
+            "prepare-store": {"prepare_store": True, "device_id": self.device.pk, "scope": "static_route"},
+        }
+        for label, options in cases.items():
+            with self.subTest(action=label), self.assertRaisesRegex(CommandError, "--prepare --paired-activation"):
+                self._command(**options)
+            self.assertTrue(is_quiesced())
+            self.assertFalse(self._gate().paired_activation)
+            self.assertIsNone(self._gate().verification_attempt_id)
+
+    def test_paired_activation_flag_requires_prepare(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+
+        with self.assertRaisesRegex(CommandError, "--paired-activation requires --prepare"):
+            self._command(abort=True, paired_activation=True)
+        self.assertFalse(is_quiesced())
+
+    def test_a_failed_runbook_prepare_releases_only_the_gate_it_created(self):
+        from netbox_nso_plugin.deployment import is_quiesced, quiesce
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", revoked_ids=[11])
+        with self.assertRaisesRegex(CommandError, "Deployment gate blocked.*revoked ids"):
+            self._command(prepare=True)
+        self.assertFalse(is_quiesced())
+
+        quiesce()
+        with self.assertRaisesRegex(CommandError, "Deployment gate blocked.*revoked ids"):
+            self._command(prepare=True)
+        self.assertTrue(is_quiesced())
+        self.assertFalse(self._gate().paired_activation)
+
+    def test_a_failed_paired_prepare_stays_quiesced(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", revoked_ids=[11])
+        with self.assertRaisesRegex(CommandError, "Deployment gate blocked.*revoked ids"):
+            self._command(prepare=True, paired_activation=True)
+
+        self.assertTrue(is_quiesced())
+        self.assertTrue(self._gate().paired_activation)
+
+    def test_a_failed_plain_prepare_over_a_paired_gate_stays_quiesced(self):
+        from netbox_nso_plugin.deployment import is_quiesced
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        self._command(prepare=True, paired_activation=True)
+        NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", revoked_ids=[11])
+        with self.assertRaisesRegex(CommandError, "Deployment gate blocked.*revoked ids"):
+            self._command(prepare=True)
+
+        self.assertTrue(is_quiesced())
+        self.assertTrue(self._gate().paired_activation)
+
+    def test_the_database_refuses_a_probe_permit_on_a_runbook_gate(self):
+        from django.db import IntegrityError
+
+        from netbox_nso_plugin.deployment import quiesce
+        from netbox_nso_plugin.models import NSOApplyAttempt, NSOIntentDeploymentControl
+
+        quiesce()
+        attempt = NSOApplyAttempt.objects.create(management=self.mgmt)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            NSOIntentDeploymentControl.objects.filter(pk=1).update(verification_attempt=attempt)
+        NSOIntentDeploymentControl.objects.filter(pk=1).update(paired_activation=True, verification_attempt=attempt)
+        self.assertEqual(self._gate().verification_attempt_id, attempt.pk)
+        NSOIntentDeploymentControl.objects.filter(pk=1).update(verification_attempt=None)
+
+    def test_a_failed_prepare_leaves_a_gate_that_replaced_the_one_it_created(self):
+        from netbox_nso_plugin import deployment
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", revoked_ids=[11])
+        replacement = []
+
+        def abort_and_replace(_seconds):
+            deployment.resume()
+            deployment.quiesce()
+            replacement.append(self._gate().quiesced_at)
+
+        stderr = io.StringIO()
+        with (
+            patch(
+                "netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep",
+                side_effect=abort_and_replace,
+            ),
+            self.assertRaisesRegex(CommandError, "Deployment gate blocked"),
+        ):
+            call_command("nso_intent_deployment_gate", prepare=True, stdout=io.StringIO(), stderr=stderr)
+
+        self.assertTrue(deployment.is_quiesced(), "the failed prepare released another invocation's gate")
+        self.assertEqual(self._gate().quiesced_at, replacement[0])
+        self.assertIn("another invocation owns the gate", stderr.getvalue())
+
+    def test_a_failed_prepare_leaves_its_gate_after_a_paired_promotion(self):
+        from netbox_nso_plugin import deployment
+        from netbox_nso_plugin.models import NSOIntentOutboxState
+
+        NSOIntentOutboxState.objects.create(device=self.device, scope="static_route", revoked_ids=[11])
+        stderr = io.StringIO()
+        with (
+            patch(
+                "netbox_nso_plugin.management.commands.nso_intent_deployment_gate._sleep",
+                side_effect=lambda _seconds: deployment.quiesce(paired_activation=True),
+            ),
+            self.assertRaisesRegex(CommandError, "Deployment gate blocked"),
+        ):
+            call_command("nso_intent_deployment_gate", prepare=True, stdout=io.StringIO(), stderr=stderr)
+
+        self.assertTrue(self._gate().paired_activation)
+        self.assertIn("another invocation owns the gate", stderr.getvalue())
+
+    def test_paired_prepare_promotes_a_retained_gate_without_restarting_it(self):
+        from netbox_nso_plugin.deployment import quiesce
+
+        quiesce()
+        started = self._gate().quiesced_at
+
+        self._command(prepare=True, paired_activation=True)
+        self._command(prepare=True)
+
+        gate = self._gate()
+        self.assertTrue(gate.paired_activation)
+        self.assertEqual(gate.quiesced_at, started)
 
 
 class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushResetMixin, TransactionTestCase):
@@ -1134,6 +1515,33 @@ class TestIntentRestoreResolvesEveryReceiptCase(_CascadeFlushMixin, IntentPushRe
             assert is_quiesced(), "restore resumed another invocation's deployment gate"
         finally:
             resume()
+
+    def test_restore_leaves_a_gate_that_replaced_the_one_it_created(self):
+        from netbox_nso_plugin import adapter_client, deployment
+
+        read = adapter_client.get_intent_receipts
+        replacement = []
+
+        def replace_gate_then_read(*args, **kwargs):
+            if not replacement:
+                deployment.resume()
+                deployment.quiesce()
+                replacement.append(deployment.is_quiesced())
+            return read(*args, **kwargs)
+
+        stderr = io.StringIO()
+        config, session = self.adapter.patches()
+        try:
+            with (
+                config,
+                session,
+                patch.object(adapter_client, "get_intent_receipts", side_effect=replace_gate_then_read),
+            ):
+                call_command("nso_intent_restore", stdout=io.StringIO(), stderr=stderr)
+            self.assertTrue(deployment.is_quiesced(), "restore released another invocation's gate")
+            self.assertIn("another invocation owns the gate", stderr.getvalue())
+        finally:
+            deployment.resume()
 
     def test_lower_receipt_releases_the_restored_lease_for_normal_replay(self):
         from netbox_nso_plugin import drain, outbox
