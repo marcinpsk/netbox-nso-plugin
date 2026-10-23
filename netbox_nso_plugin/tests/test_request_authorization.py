@@ -725,6 +725,56 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         local.refresh_from_db()
         self.assertEqual((remote.peer_state_id, local.address), (local.pk, "198.18.50.1/30"))
 
+    def _unmanaged_pair(self, name):
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._ownership_case import save_overlay_fixture
+
+        unmanaged = Device.objects.create(
+            name=name, device_type=self.device_a.device_type, role=self.device_a.role, site=self.device_a.site
+        )
+        with without_commit_drain():
+            local = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=self.device_a, name=f"{name}-a", type="1000base-t"),
+                address="198.18.57.1/30",
+                auto_assigned=True,
+                status="accepted",
+            )
+            remote = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=unmanaged, name=f"{name}-b", type="1000base-t"),
+                address="198.18.57.2/30",
+                auto_assigned=True,
+                peer_state=local,
+                status="accepted",
+            )
+            local.peer_state = remote
+            save_overlay_fixture(local, update_fields=("peer_state",))
+        return unmanaged, local, remote
+
+    def test_writing_an_unmanaged_peer_row_needs_change_on_its_device(self):
+        """A row on an unmanaged device has no management authority: a write needs change on the device."""
+        from ipam.models import IPAddress
+
+        unmanaged, local, remote = self._unmanaged_pair("authz-peer-write")
+        _grant(self.user, ("change",), NSODeviceManagement, {"pk": self.management_a.pk})
+        _grant(self.user, ("add", "change"), IPAddress)
+        _grant(self.user, ("view",), Device)
+        url = reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": local.pk})
+        for granted, expected in ((False, 403), (True, 404)):
+            if granted:
+                _grant(self.user, ("change",), Device, {"pk": self.device_a.pk})
+            with self.subTest(change_device=granted), CaptureQueriesContext(connection) as queries:
+                response = self.client.post(url, {"address": "198.18.57.5/30"})
+            self.assertEqual(response.status_code, expected)
+            writes = {m.group(1) for q in queries.captured_queries if (m := _DML.match(q["sql"])) is not None}
+            self.assertEqual(writes - _BOOKKEEPING_TABLES, set())
+        remote.refresh_from_db()
+        local.refresh_from_db()
+        self.assertEqual((remote.peer_state_id, local.address), (local.pk, "198.18.57.1/30"))
+        self.assertTrue(Device.objects.filter(pk=unmanaged.pk).exists())
+
     def test_a_superuser_edit_still_clears_an_unmanaged_inverse_peer(self):
         """An interface overlay on an unmanaged device has no management authority; a superuser keeps the edit (A4)."""
         from netbox_nso_plugin.models import NSOInterfaceIPState

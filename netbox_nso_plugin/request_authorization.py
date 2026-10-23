@@ -202,17 +202,21 @@ def overlay_row(model, pk, user, action) -> AuthorizedTarget:
 
 
 def authorize_related_row(row, user, action):
-    """Authorize a second overlay row an operation touches: 404 outside the user's restriction.
+    """Authorize a second overlay row an operation touches: 403 without the permission, 404 outside it.
 
-    An interface overlay on an unmanaged device has no management authority; it needs its device visible.
+    An interface overlay on an unmanaged device has no management authority. A read needs its device
+    visible; any other action writes on that device and needs change on it (NetBox semantics).
     """
     from .models import NSODeviceManagement
 
     device = AUTHZ_TARGETS[row._meta.label_lower].device_of(row)
     if NSODeviceManagement.objects.filter(device=device).exists():
         overlay_row(type(row), row.pk, user, action)
-    else:
-        get_object_or_404(_device_model().objects.restrict(user, "view"), pk=device.pk)
+        return
+    device_action = "view" if action == "view" else "change"
+    if not user.has_perm(f"dcim.{device_action}_device"):
+        raise PermissionDenied
+    get_object_or_404(_device_model().objects.restrict(user, device_action), pk=device.pk)
 
 
 def _management_permissions(action, *, device_view=False):
