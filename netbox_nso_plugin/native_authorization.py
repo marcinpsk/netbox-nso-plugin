@@ -858,6 +858,42 @@ def _guarded_bulk(bulk):
     return guarded
 
 
+def _refuse_foreign_through_rows(model, rows, permit, operation):
+    """Refuse a direct through-row write whose rows do not all belong to the permit's owner.
+
+    Django sends no save or delete signals for auto-created M2M through models, so their
+    queryset entry points carry the owner check. A Collector run keeps its frozen closure.
+    """
+    if permit is not None and permit.kind == "delete":
+        return
+    if not all(_through_owned(model, row, permit) for row in rows):
+        _refuse(f"native {operation} of {model._meta.label_lower} rows of another owner")
+
+
+def _guarded_create(original):
+    @functools.wraps(original)
+    def guarded(self, **kwargs):
+        scope = _guarded_scope()
+        if scope is not None and self.model._meta.auto_created and is_native(self.model):
+            _refuse_foreign_through_rows(self.model, [self.model(**kwargs)], scope.top(), "create")
+        return original(self, **kwargs)
+
+    guarded._nso_native_guard = True
+    return guarded
+
+
+def _guarded_delete(original):
+    @functools.wraps(original)
+    def guarded(self):
+        scope = _guarded_scope()
+        if scope is not None and self.model._meta.auto_created and is_native(self.model):
+            _refuse_foreign_through_rows(self.model, list(self), scope.top(), "delete")
+        return original(self)
+
+    guarded._nso_native_guard = True
+    return guarded
+
+
 def install_guards() -> None:
     """Connect the ambient native-write guards (signals and queryset methods)."""
     from django.db.models import QuerySet, signals
@@ -865,8 +901,10 @@ def install_guards() -> None:
     signals.pre_save.connect(_guard_save, dispatch_uid="nso_native_guard_save")
     signals.pre_delete.connect(_guard_delete, dispatch_uid="nso_native_guard_delete")
     signals.m2m_changed.connect(_guard_m2m, dispatch_uid="nso_native_guard_m2m")
-    if not getattr(QuerySet.update, "_nso_native_guard", False):
-        QuerySet.update = _guarded_update(QuerySet.update)
+    for name, guard in (("update", _guarded_update), ("create", _guarded_create), ("delete", _guarded_delete)):
+        method = getattr(QuerySet, name)
+        if not getattr(method, "_nso_native_guard", False):
+            setattr(QuerySet, name, guard(method))
     for name in ("bulk_create", "bulk_update"):
         method = getattr(QuerySet, name)
         if not getattr(method, "_nso_native_guard", False):

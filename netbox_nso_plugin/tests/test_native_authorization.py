@@ -372,6 +372,35 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
         edge.refresh_from_db()
         self.assertEqual((edge.interface_id, edge.vlan_id), (self.second.pk, vlan.pk))
 
+    def test_direct_through_writes_of_another_owner_inside_an_m2m_permit_are_refused(self):
+        """Inside A's M2M permit the through table is open, but only for A's rows."""
+        from ipam.models import VLAN
+
+        vlan, other = VLAN.objects.create(vid=3008, name="nw-direct"), VLAN.objects.create(vid=3009, name="nw-direct-2")
+        through = Interface.tagged_vlans.through
+        through.objects.create(interface_id=self.second.pk, vlan_id=vlan.pk)
+
+        def inside_first_permit(write):
+            def run():
+                with native.active_native_writer().m2m(self.first, "tagged_vlans", origin=None):
+                    write()
+
+            return run
+
+        writes = {
+            "create": lambda: through.objects.create(interface_id=self.second.pk, vlan_id=other.pk),
+            "delete": lambda: through.objects.filter(interface_id=self.second.pk).delete(),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                self.assertRefused(inside_first_permit(write))
+        self.assertEqual(
+            list(through.objects.filter(interface_id=self.second.pk).values_list("vlan_id", flat=True)), [vlan.pk]
+        )
+        with authority_scope("native_mutation", self.admin):
+            inside_first_permit(lambda: through.objects.create(interface_id=self.first.pk, vlan_id=other.pk))()
+        self.assertTrue(through.objects.filter(interface_id=self.first.pk, vlan_id=other.pk).exists())
+
     def test_a_signal_born_m2m_edge_of_the_same_owner_is_refused(self):
         """A direct through insert is no M2M change of the owner: it needs an M2M permit."""
         from ipam.models import VLAN
