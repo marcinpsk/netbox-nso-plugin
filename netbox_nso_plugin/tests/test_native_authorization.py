@@ -306,24 +306,57 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "one")
 
-    def test_a_signal_born_m2m_edge_of_another_owner_is_refused(self):
-        """A through-table bulk write during A's permitted save must belong to A (C9a)."""
+    def _during_first_save(self, write):
+        """Run *write* from a signal handler while the first interface's permitted save runs."""
         from django.db.models.signals import post_save
+
+        def handler(sender, instance, **kwargs):
+            if instance.pk == self.first.pk:
+                write()
+
+        post_save.connect(handler, sender=Interface, dispatch_uid="nw-during-save")
+        try:
+            candidate = Interface.objects.get(pk=self.first.pk)
+            candidate.description = "during"
+            self.assertRefused(lambda: _plan_save(candidate, ("description",)))
+        finally:
+            post_save.disconnect(sender=Interface, dispatch_uid="nw-during-save")
+
+    def test_signal_born_m2m_edges_of_another_owner_are_refused(self):
+        """Through-table writes during A's permitted save: bulk, direct create, delete, upsert (C9a)."""
         from ipam.models import VLAN
 
-        vlan = VLAN.objects.create(vid=3002, name="nw-edge")
+        vlan, other = VLAN.objects.create(vid=3002, name="nw-edge"), VLAN.objects.create(vid=3003, name="nw-edge-2")
         through = Interface.tagged_vlans.through
+        edge = through.objects.create(interface_id=self.second.pk, vlan_id=vlan.pk)
+        writes = {
+            "bulk create": lambda: through.objects.bulk_create(
+                [through(interface_id=self.second.pk, vlan_id=other.pk)]
+            ),
+            "direct create": lambda: through.objects.create(interface_id=self.second.pk, vlan_id=other.pk),
+            "delete": lambda: through.objects.filter(interface_id=self.second.pk).delete(),
+            "upsert": lambda: through.objects.bulk_create(
+                [through(pk=edge.pk, interface_id=self.first.pk, vlan_id=other.pk)],
+                update_conflicts=True,
+                update_fields=["vlan"],
+                unique_fields=["pk"],
+            ),
+        }
+        for name, write in writes.items():
+            with self.subTest(write=name):
+                self._during_first_save(write)
+        self.assertEqual(
+            list(through.objects.filter(interface_id=self.second.pk).values_list("vlan_id", flat=True)), [vlan.pk]
+        )
 
-        def add_edge(sender, instance, **kwargs):
-            if instance.pk == self.first.pk:
-                through.objects.bulk_create([through(interface_id=self.second.pk, vlan_id=vlan.pk)])
+    def test_a_signal_born_m2m_edge_of_the_same_owner_is_refused(self):
+        """A direct through insert is no M2M change of the owner: it needs an M2M permit."""
+        from ipam.models import VLAN
 
-        post_save.connect(add_edge, sender=Interface, dispatch_uid="nw-edge")
-        self.addCleanup(post_save.disconnect, sender=Interface, dispatch_uid="nw-edge")
-        candidate = Interface.objects.get(pk=self.first.pk)
-        candidate.description = "edge"
-        self.assertRefused(lambda: _plan_save(candidate, ("description",)))
-        self.assertFalse(through.objects.filter(interface_id=self.second.pk).exists())
+        vlan = VLAN.objects.create(vid=3004, name="nw-own-edge")
+        through = Interface.tagged_vlans.through
+        self._during_first_save(lambda: through.objects.create(interface_id=self.first.pk, vlan_id=vlan.pk))
+        self.assertFalse(through.objects.filter(interface_id=self.first.pk).exists())
 
     def test_the_permitted_write_succeeds(self):
         candidate = Interface.objects.get(pk=self.first.pk)
@@ -539,6 +572,23 @@ class TestSystemScope(IntentPushResetMixin, TestCase):
             run(lambda: _plan_save(candidate, ("mode",), origin=Observed("switchport")))
         self.other.refresh_from_db()
         self.assertEqual(self.other.mode, "access")
+
+    def test_an_observed_save_cannot_clear_an_owned_relation(self):
+        """NetBox clears tagged VLANs on a non-tagged interface's save: C14 guards that relation change."""
+        from ipam.models import VLAN
+
+        vlan = VLAN.objects.create(vid=3005, name="nw-owned-tagged")
+        Interface.objects.filter(pk=self.other.pk).update(mode="access")
+        Interface.tagged_vlans.through.objects.create(interface_id=self.other.pk, vlan_id=vlan.pk)
+        with without_commit_drain():
+            acquire_overlay(
+                NSOSwitchportState, management=self.management, interface=self.other, mode="access", status="accepted"
+            )
+        candidate = Interface.objects.get(pk=self.other.pk)
+        candidate.description = "observed"
+        with self.assertRaises(OwnedIntentRefused), _system_scope() as run:
+            run(lambda: _plan_save(candidate, ("description",), origin=Observed("interface")))
+        self.assertEqual(list(self.other.tagged_vlans.all()), [vlan])
 
     def test_a_direct_write_in_a_system_entry_needs_a_permit(self):
         from dcim.models import Site

@@ -291,7 +291,8 @@ def _model_tables(model):
     return frozenset(parent._meta.db_table for parent in (model, *model._meta.get_parent_list()))
 
 
-def _save_tables(model):
+def _cascade_tables(model):
+    """Return the tables a Collector run deleting *model* rows touches directly: the model and its through rows."""
     through = {relation.remote_field.through._meta.db_table for relation in model._meta.many_to_many}
     return _model_tables(model) | through
 
@@ -310,6 +311,9 @@ class _Permit:
     pks: frozenset = frozenset()
     updates: frozenset = frozenset()
     tables: frozenset = frozenset()
+    origin: Any = None
+    # Through tables of the owner's own M2M change while its save runs (between pre_* and post_*).
+    window: set = field(default_factory=set, compare=False)
 
 
 @dataclass(eq=False)
@@ -361,7 +365,7 @@ def _backstop(execute, sql, params, many, context):
             if scope.mode == "no_write":
                 _refuse(f"native write to {table} outside a native-mutation endpoint")
             permit = scope.top()
-            if scope.mode in _GUARDED_MODES and (permit is None or table not in permit.tables):
+            if scope.mode in _GUARDED_MODES and (permit is None or table not in permit.tables | permit.window):
                 _refuse(f"native write to {table} outside its writer permit")
     return execute(sql, params, many, context)
 
@@ -538,7 +542,7 @@ class NativeWriter:
         """Authorize one native save; *created* is True for an insert."""
         model = type(instance)
         self._authorize("save", model, instance=instance, update_fields=update_fields, created=created, origin=origin)
-        permit = _Permit("save", model, instance=instance, tables=_save_tables(model))
+        permit = _Permit("save", model, instance=instance, tables=_model_tables(model), origin=origin)
         with self._scope.holding(permit):
             yield
         self._record(model, (instance.pk,), "add" if created else "change")
@@ -553,7 +557,7 @@ class NativeWriter:
             self._authorize("delete", model, instance=root, origin=origin)
         self.mutated = True
         models = {apps.get_model(label) for label, _pk, _operation in closure}
-        tables = frozenset().union(*(_save_tables(member) for member in models | {model}))
+        tables = frozenset().union(*(_cascade_tables(member) for member in models | {model}))
         deletes = frozenset((label, pk) for label, pk, operation in closure if operation == "delete")
         updates = frozenset((label, pk) for label, pk, operation in closure if operation == "set_update")
         permit = _Permit("delete", model, instance=root, pks=deletes, updates=updates, tables=tables)
@@ -581,6 +585,10 @@ class NativeWriter:
         with self._scope.holding(_Permit("set_update", model, pks=pks, tables=_model_tables(model))):
             yield
         self._record(model, pks, "change")
+
+    def authorize_m2m(self, model, owner, field_name, *, origin):
+        """Authorize an M2M change that the owner's own permitted save makes."""
+        self._authorize("m2m", model, instance=owner, field_name=field_name, origin=origin)
 
     # Operator authorization.
 
@@ -742,14 +750,12 @@ def _guard_delete(sender, instance, **kwargs):
     if scope is None or not is_native(sender):
         return
     permit = scope.top()
-    if _through_owned(sender, instance, permit):
-        return
     if permit is None or permit.kind != "delete" or (sender._meta.label_lower, instance.pk) not in permit.pks:
         _refuse(f"native delete of {sender._meta.label_lower} without its writer permit")
 
 
-def _guard_m2m(sender, instance, action, reverse, **kwargs):
-    if not action.startswith("pre_"):
+def _guard_m2m(sender, instance, action, reverse, pk_set=None, **kwargs):
+    if not action.startswith(("pre_", "post_")):
         return
     scope = _guarded_scope()
     if scope is None or sender._meta.db_table not in native_tables():
@@ -760,7 +766,18 @@ def _guard_m2m(sender, instance, action, reverse, **kwargs):
         (relation.name for relation in type(instance)._meta.many_to_many if relation.remote_field.through is sender),
         None,
     )
-    if owned_by_permit and (permit.kind == "save" or (permit.kind == "m2m" and permit.field_name == field_name)):
+    if action.startswith("post_"):
+        if owned_by_permit and permit.kind == "save":
+            permit.window.discard(sender._meta.db_table)
+        return
+    if owned_by_permit and permit.kind == "m2m" and permit.field_name == field_name:
+        return
+    if owned_by_permit and permit.kind == "save":
+        # The owner's save changes its own relation (NetBox clears tagged VLANs): C14 applies to that change.
+        changes = bool(pk_set) if action != "pre_clear" else getattr(instance, field_name).exists()
+        if changes and scope.mode == "system":
+            scope.writer.authorize_m2m(type(instance), instance, field_name, origin=permit.origin)
+        permit.window.add(sender._meta.db_table)
         return
     _refuse(f"native M2M change of {sender._meta.label_lower} without its writer permit")
 
@@ -820,6 +837,9 @@ def _guarded_bulk(bulk):
         if scope is None or not is_native(self.model):
             return bulk(self, *args, **kwargs)
         permit = scope.top()
+        if kwargs.get("update_conflicts"):
+            # An upsert changes the stored conflict row, which the proposed rows do not name.
+            _refuse(f"native upsert of {self.model._meta.label_lower} inside a request")
         rows = list(args[0] if args else kwargs.get("objs", ()))
         args, kwargs = ((rows, *args[1:]), kwargs) if args else ((), {**kwargs, "objs": rows})
         # M2M add writes the owner's own through rows; another owner's rows need their own permit.
