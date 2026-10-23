@@ -3087,3 +3087,14 @@ def per_row_mirror_refresh(rows, footprint):
     # ok: nso-per-row-mirror-refresh-loop
     with mirror_refresh(rows[0], {"unsupported_members"}) as locked:
         locked.save(update_fields=["unsupported_members"])
+
+
+def digits_in_object_repr(self, rows):
+    # ruleid: nso-test-hex-literal-in-object-repr
+    self.assertNotIn("200", repr(rows))
+    # ruleid: nso-test-hex-literal-in-object-repr
+    self.assertIn("4747", repr(rows))
+    # ok: nso-test-hex-literal-in-object-repr
+    self.assertNotIn("200", shown_fields(rows))
+    # ok: nso-test-hex-literal-in-object-repr
+    self.assertNotIn("Ethernet1:200", repr(rows))
