@@ -58,20 +58,23 @@ def _source_pairs(generation):
     if generation["status"] in {"pending", "running"}:
         return set()
     sources, revisions = generation.get("source_push_seq"), generation.get("stream_revisions")
-    if not isinstance(sources, dict) or not isinstance(revisions, dict) or set(sources) != set(revisions):
+    if (
+        not isinstance(sources, dict)
+        or not isinstance(revisions, dict)
+        or not revisions.keys() <= sources.keys()
+        or any(
+            not isinstance(stream, str) or source is not None and (type(source) is not int or source <= 0)
+            for stream, source in sources.items()
+        )
+    ):
         raise EvidenceInvariantError("invalid_terminal_batch")
     streams = {entry.section for entry in delivery.delivery_keys().values()}
     if any(
-        not isinstance(stream, str)
-        or stream not in streams
-        or type(revisions[stream]) is not int
-        or revisions[stream] <= 0
-        or source is not None
-        and (type(source) is not int or source <= 0)
-        for stream, source in sources.items()
+        not isinstance(stream, str) or stream not in streams or type(revision) is not int or revision <= 0
+        for stream, revision in revisions.items()
     ):
         raise EvidenceInvariantError("invalid_terminal_batch")
-    return {(stream, source) for stream, source in sources.items() if source is not None}
+    return {(stream, sources[stream]) for stream in revisions if sources[stream] is not None}
 
 
 def _captured_claim(selection, management):

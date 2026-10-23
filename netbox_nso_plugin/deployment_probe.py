@@ -191,6 +191,10 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         and row["http_status"] == attempt.http_status,
         "Probe admission changed",
     )
+    from .apply_settlement import reconcile_admission_links
+
+    listing = adapter_client.list_device_generations(management.adapter_device_id)
+    reconcile_admission_links((row["response"], attempt.response), listing)
     generations = row["generations"]
     _require(len(generations) == 1, "Probe requires one generation")
     generation = generations[0]
@@ -201,12 +205,17 @@ def _terminal_evidence(attempt, *, settle_seq=None):
         _response_generation_ids(attempt.response) == {generation["generation_id"]},
         "Probe generation differs from its admitted execution",
     )
+    listed = next(row for row in listing if row["generation_id"] == generation["generation_id"])
+    _require(
+        listed["carrier_job_id"] == generation["carrier_job_id"]
+        and listed["carrier_job_status"] == generation["carrier_job_status"],
+        "Probe carrier differs from the retained listing carrier",
+    )
     _require(generation["source_push_seq"] == attempt.selected, "Probe frozen selection changed")
     link = attempt.response["generations"][0]
     _require(
         len(attempt.response["generations"]) == 1
         and link["mode"] == "networked"
-        and link["job_id"] == generation["carrier_job_id"]
         and link["seq"] == generation["seq"]
         and link["source_push_seq"] == generation["source_push_seq"]
         and link["stream_revisions"] == generation["stream_revisions"],

@@ -256,6 +256,64 @@ def promoted_stream_coverage(generations, expected_selected, skipped):
     return promoted_streams, None
 
 
+_ADMISSION_GENERATION_METADATA = ("generation_id", "seq", "digest", "mode", "stream_revisions", "source_push_seq")
+
+
+def reconcile_admission_links(responses, generations):
+    """Match immutable admission links with the complete generation listing."""
+    by_id = {row["generation_id"]: row for row in generations}
+    for response in responses:
+        if not isinstance(response, dict):
+            raise EvidenceInvariantError("admission_generation_mismatch")
+        _response_generation_ids(response)
+        links = response.get("generations", [])
+        if not isinstance(links, list):
+            raise EvidenceInvariantError("admission_generation_mismatch")
+        for link in links:
+            generation = by_id.get(link["generation_id"])
+            if generation is None:
+                raise EvidenceInvariantError("admission_generation_mismatch")
+            for key in _ADMISSION_GENERATION_METADATA:
+                if key not in link or link[key] != generation[key]:
+                    raise EvidenceInvariantError(f"admission_generation_mismatch: {key}")
+
+
+def _reconcile_admissions(management, attempt_ids, snapshots, answers, generations):
+    from django.db.models import F
+
+    from .models import NSOApplyAttempt
+
+    held_ids = set(attempt_ids)
+    for snapshot in snapshots:
+        head = snapshot["head"]
+        if head is not None:
+            if not isinstance(head, dict):
+                raise EvidenceInvariantError("admission_generation_mismatch")
+            if head["apply_attempt_id"] is not None:
+                try:
+                    held_ids.add(UUID(str(head["apply_attempt_id"])))
+                except (ValueError, TypeError, AttributeError):
+                    raise EvidenceInvariantError("admission_generation_mismatch") from None
+    responses = [raw.get("response") for snapshot in snapshots for raw in snapshot["attempts"]]
+    responses.extend(result for _attempt, result, _error in answers if result is not None)
+    responses.extend(
+        error.rejection_response
+        for _attempt, _result, error in answers
+        if error is not None and error.definitely_not_enqueued
+    )
+    responses.extend(
+        NSOApplyAttempt.objects.filter(
+            management=management,
+            pk__in=held_ids,
+            adapter_device_id=management.adapter_device_id,
+            trigger_kind="manual",
+            adapter_apply_attempt_id=F("pk"),
+            response__isnull=False,
+        ).values_list("response", flat=True)
+    )
+    reconcile_admission_links(responses, generations)
+
+
 def _admission_keep_streams(attempt, response, *, rejected=False):
     """Validate admission before choosing which snapshots can be restored."""
     if rejected:
@@ -318,7 +376,7 @@ def settle_apply_attempts(
         local = local_attempts[attempt_id]
         keep = _admission_keep_streams(local, evidence["response"], rejected=evidence["admission_state"] == "rejected")
         for link in evidence["response"].get("generations") or ():
-            generation_modes[link["generation_id"]] = link["mode"]
+            generation_modes.setdefault(link["generation_id"], link["mode"])
         if keep is not None:
             restorations.append((attempt_id, keep))
         for generation in evidence["generations"]:
@@ -550,6 +608,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         if len(feed) > 10000:
             raise EvidenceInvariantError("settlement_feed_not_bounded")
     evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
+    snapshots = [evidence]
     _reject_unrequested_attempts(evidence, attempt_ids)
     unknown = _validated_unknown_attempt_ids(evidence, attempt_ids)
     replayed = False
@@ -591,7 +650,9 @@ def load_deployment_evidence(management, *, attempt_ids=None):
         evidence = client.get_deployment_evidence(management.adapter_device_id, attempt_ids)
         _reject_unrequested_attempts(evidence, attempt_ids)
         _validated_unknown_attempt_ids(evidence, attempt_ids)
+        snapshots.append(evidence)
     generations = client.list_device_generations(management.adapter_device_id)
+    _reconcile_admissions(management, attempt_ids, snapshots, replay_answers, generations)
     unacknowledged, receipt_document = _load_pending_receipts(management, evidence, generations)
     _last_page, final_incarnation = client.get_settlement_feed(
         management.adapter_device_id, after_settle_seq=last_sequence, limit=1
@@ -601,7 +662,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     if incarnation != final_incarnation or mapping_epoch(management) != epoch:
         raise EvidenceInvariantError("evidence_epoch_changed")
     bound = _bound_evidence(evidence, feed, generations, incarnation, management=management)
-    _restore_consumed_sequences(bound, management, incarnation, cursor)
+    _restore_consumed_sequences(bound, management, incarnation)
     bound.receipt_recoveries = _prepare_receipt_recoveries(
         management, bound, unacknowledged, receipt_document, incarnation
     )
@@ -618,7 +679,7 @@ def load_deployment_evidence(management, *, attempt_ids=None):
     return bound
 
 
-def _restore_consumed_sequences(bound, management, incarnation, cursor):
+def _restore_consumed_sequences(bound, management, incarnation):
     """Recover omitted carrier order from exact durable execution certificates."""
     from .outcome_settlement import immutable_execution_projection
 
@@ -650,7 +711,9 @@ def _restore_consumed_sequences(bound, management, incarnation, cursor):
             raise EvidenceInvariantError("consumed_execution_changed")
         sequence = execution.settle_seq
         known = bound.settlement_sequences.get(execution.carrier_job_id)
-        if sequence is None and (not cursor or known is not None):
+        if sequence is None:
+            if known is None:
+                _missing_generation_evidence(management, incarnation, projection)
             continue
         if not _positive_int(sequence) or known is not None and known != sequence:
             raise EvidenceInvariantError("invalid_consumed_settlement_sequence")
@@ -763,7 +826,7 @@ def _bound_evidence(evidence, jobs, generations, incarnation, *, management):
             "updated_at": job["updated_at"],
         }
         identifiers = _carrier_generation_ids(outcomes) | {
-            generation["generation_id"] for generation in generations if generation["job_id"] == job["id"]
+            generation["generation_id"] for generation in generations if generation["carrier_job_id"] == job["id"]
         }
         for generation_id in identifiers:
             bound.automatic_generations.append(
@@ -797,6 +860,9 @@ def _append_head_evidence(bound, head, by_id, management, incarnation):
         manual_generations = (
             {head["generation_id"]} if local.response is None else _response_generation_ids(local.response)
         )
+    _match_listing_metadata(by_id.get(head["generation_id"]), head)
+    if head["carrier_job_id"] == by_id[head["generation_id"]]["carrier_job_id"]:
+        _match_current_carrier(by_id[head["generation_id"]], head)
     identifiers = _carrier_generation_ids(head["row_outcomes"]) | {head["generation_id"]}
     for generation_id in identifiers:
         bound.automatic_generations.append(
@@ -806,31 +872,28 @@ def _append_head_evidence(bound, head, by_id, management, incarnation):
             bound.manual_attempt_by_generation[(generation_id, head["carrier_job_id"])] = local
 
 
-def _authoritative_carrier_generation(generation, generation_id, carrier, management, incarnation):
+_IMMUTABLE_GENERATION_METADATA = ("generation_id", "seq", "stream_revisions", "source_push_seq")
+
+
+def _match_listing_metadata(generation, evidence):
+    if generation is None or any(evidence.get(key) != generation[key] for key in _IMMUTABLE_GENERATION_METADATA):
+        raise EvidenceInvariantError("generation_evidence_mismatch")
+
+
+def _match_current_carrier(generation, evidence):
+    _match_listing_metadata(generation, evidence)
+    if evidence.get("carrier_job_status") != generation["carrier_job_status"]:
+        raise EvidenceInvariantError("generation_evidence_mismatch")
+
+
+def _missing_generation_evidence(management, incarnation, generation):
     from .outcome_settlement import _record_invariant
 
-    if generation is not None and generation["job_id"] == carrier["carrier_job_id"]:
-        return _generation_from_carrier(generation, carrier)
-    cached = (
-        _cursor_epoch_executions(management, incarnation)
-        .filter(
-            generation_id=generation_id,
-            carrier_job_id=carrier["carrier_job_id"],
+    if generation.get("carrier_job_id") is None:
+        logger.warning(
+            "missing_generation_evidence: terminal generation %s has no retained carrier", generation["generation_id"]
         )
-        .first()
-    )
-    if cached is not None:
-        projection = _execution_projection(cached)
-        if any(projection[key] != carrier[key] for key in _CARRIER_EVIDENCE_FIELDS):
-            raise EvidenceInvariantError("consumed_execution_changed")
-        return projection
-    _record_invariant(
-        management,
-        {"generation_id": generation_id, "carrier_job_id": carrier["carrier_job_id"]},
-        incarnation,
-        None,
-        "missing_generation_evidence",
-    )
+    _record_invariant(management, generation, incarnation, None, "missing_generation_evidence")
     raise EvidenceInvariantError("missing_generation_evidence")
 
 
@@ -861,39 +924,83 @@ def _drop_earlier_epoch_history(bound, management, incarnation):
     bound.automatic_generations = kept
 
 
-def _require_terminal_metadata(bound, generations, management, incarnation):
-    """Block historical carrier gaps before a later execution can consume its cursor."""
-    from .outcome_settlement import _record_invariant
+def _historical_certificate(management, incarnation, generation_id, carrier_id):
+    candidates = list(
+        _cursor_epoch_executions(management, incarnation).filter(
+            generation_id=generation_id,
+            carrier_job_id=carrier_id,
+        )[:2]
+    )
+    if len(candidates) != 1 or candidates[0].invariant_code or candidates[0].consumed_at is None:
+        return None
+    return _execution_projection(candidates[0])
 
-    present = {
-        (generation["generation_id"], generation["carrier_job_id"]) for generation in bound.automatic_generations
-    }
-    present.update(
-        (generation["generation_id"], generation["carrier_job_id"])
+
+def _authoritative_carrier_generation(generation, generation_id, carrier, management, incarnation):
+    if (
+        generation is not None
+        and generation["carrier_job_id"] is not None
+        and generation["carrier_job_id"] == carrier["carrier_job_id"]
+    ):
+        projection = _generation_from_carrier(generation, carrier)
+        _match_current_carrier(generation, projection)
+        return projection
+    cached = _historical_certificate(management, incarnation, generation_id, carrier["carrier_job_id"])
+    if cached is not None and generation is not None:
+        _match_listing_metadata(generation, cached)
+        if any(cached[key] != carrier[key] for key in _CARRIER_EVIDENCE_FIELDS):
+            raise EvidenceInvariantError("consumed_execution_changed")
+        return cached
+    return _missing_generation_evidence(
+        management,
+        incarnation,
+        {
+            "generation_id": generation_id,
+            "carrier_job_id": carrier["carrier_job_id"],
+        },
+    )
+
+
+def _require_terminal_metadata(bound, generations, management, incarnation):
+    """Certify current carriers separately from exact historical certificates."""
+    from .outcome_settlement import immutable_execution_projection
+
+    by_id = {generation["generation_id"]: generation for generation in generations}
+    present = set()
+    evidence = list(bound.automatic_generations)
+    evidence.extend(
+        generation
         for attempt in bound["attempts"]
         for generation in attempt["generations"]
         if generation["row_outcomes"] is not None
     )
-    required = [
+    for row in evidence:
+        generation = by_id.get(row["generation_id"])
+        _match_listing_metadata(generation, row)
+        if generation["carrier_job_id"] is not None and row["carrier_job_id"] == generation["carrier_job_id"]:
+            _match_current_carrier(generation, row)
+            present.add((generation["generation_id"], generation["carrier_job_id"]))
+        else:
+            cached = _historical_certificate(management, incarnation, row["generation_id"], row["carrier_job_id"])
+            if cached is None:
+                _missing_generation_evidence(management, incarnation, row)
+            if immutable_execution_projection(cached) != immutable_execution_projection(row):
+                raise EvidenceInvariantError("consumed_execution_changed")
+    pending = [
         generation
         for generation in generations
         if terminal_carrier_requires_certificate(generation)
-        and (generation["generation_id"], generation["job_id"]) not in present
+        and (generation["generation_id"], generation["carrier_job_id"]) not in present
     ]
-    certificates = consumed_generation_certificates(management, incarnation, required)
-    for generation in required:
-        projection = certificates[generation["generation_id"], generation["job_id"]]
-        if projection is not None:
-            bound.automatic_generations.append(projection)
-            continue
-        _record_invariant(
-            management,
-            {"generation_id": generation["generation_id"], "carrier_job_id": generation["job_id"]},
-            incarnation,
-            None,
-            "missing_generation_evidence",
-        )
-        raise EvidenceInvariantError("missing_generation_evidence")
+    certificates = generation_certificate_candidates(management, incarnation, pending)
+    for generation in pending:
+        identity = generation["generation_id"], generation["carrier_job_id"]
+        if generation["carrier_job_id"] is None:
+            _missing_generation_evidence(management, incarnation, generation)
+        projection = certified_projection(generation, certificates.get(identity, ()))
+        if projection is None:
+            _missing_generation_evidence(management, incarnation, generation)
+        bound.automatic_generations.append(projection)
 
 
 def terminal_carrier_requires_certificate(generation):
@@ -901,87 +1008,29 @@ def terminal_carrier_requires_certificate(generation):
     return generation["status"] not in {"pending", "running"}
 
 
-def consumed_generation_certificates(management, incarnation, generations):
-    """Validate local and remote carrier evidence per (generation_id, job_id) with one remote snapshot."""
-    listed = {}
-    for execution in generation_certificates(management, incarnation, *generations).select_related("attempt"):
-        listed.setdefault(execution.generation_id, []).append(execution)
-    certificates, retained = {}, {}
-    for generation in generations:
-        identity = generation["generation_id"], generation["job_id"]
-        candidates = [
-            execution
-            for execution in listed.get(generation["generation_id"], ())
-            if generation["job_id"] is None or execution.carrier_job_id == generation["job_id"]
-        ]
-        certificates[identity] = _local_certificate(generation, candidates)
-        if certificates[identity] is not None and generation["job_id"] is None:
-            retained[identity] = generation, candidates[0]
-    for identity in _unmatched_retained_carriers(management, incarnation, retained):
-        certificates[identity] = None
-    return certificates
+def generation_certificate_candidates(management, incarnation, generations):
+    """Load the consumed certificates of every listed current carrier in one query."""
+    carriers = [generation for generation in generations if generation["carrier_job_id"] is not None]
+    candidates = {}
+    if not carriers:
+        return candidates
+    for cached in generation_certificates(management, incarnation, *carriers).filter(
+        carrier_job_id__in={generation["carrier_job_id"] for generation in carriers}
+    ):
+        candidates.setdefault((cached.generation_id, cached.carrier_job_id), []).append(cached)
+    return candidates
 
 
-def _local_certificate(generation, candidates):
-    if len(candidates) != 1:
+def certified_projection(generation, candidates):
+    """Require one ordered consumed certificate for the listing's current carrier."""
+    if generation["carrier_job_id"] is None or len(candidates) != 1:
         return None
     cached = candidates[0]
-    if (
-        cached.invariant_code
-        or cached.consumed_at is None
-        or not _positive_int(cached.settle_seq)
-        or not _positive_int(cached.carrier_job_id)
-    ):
+    if cached.invariant_code or cached.consumed_at is None or not _positive_int(cached.settle_seq):
         return None
     projection = _execution_projection(cached)
-    if any(projection[key] != generation[key] for key in ("seq", "stream_revisions", "source_push_seq")):
-        return None
+    _match_current_carrier(generation, projection)
     return projection
-
-
-def _unmatched_retained_carriers(management, incarnation, retained):
-    """Require remote carrier identity after the adapter deletes a job, from one evidence and feed read."""
-    from . import adapter_client as client
-    from .outcome_settlement import immutable_execution_projection
-
-    if not retained:
-        return set()
-    attempts = {
-        execution.attempt.pk: execution.attempt
-        for _generation, execution in retained.values()
-        if execution.attempt.trigger_kind == "manual"
-        and execution.attempt.adapter_apply_attempt_id == execution.attempt.pk
-    }
-    attempt_ids = tuple(attempts)
-    limit = client.DEPLOYMENT_EVIDENCE_ATTEMPT_LIMIT
-    chunks = [attempt_ids[start : start + limit] for start in range(0, len(attempt_ids), limit)] or [()]
-    responses = [(chunk, client.get_deployment_evidence(management.adapter_device_id, chunk)) for chunk in chunks]
-    _page, final_incarnation = client.get_settlement_feed(management.adapter_device_id, after_settle_seq=0, limit=1)
-    if incarnation != final_incarnation:
-        raise EvidenceInvariantError("evidence_epoch_changed")
-    rows = {}
-    for chunk, evidence in responses:
-        _reject_unrequested_attempts(evidence, chunk)
-        if evidence.get("device_id") != management.adapter_device_id:
-            raise EvidenceInvariantError("admission_mapping_changed")
-        for raw in evidence["attempts"]:
-            attempt = attempts[UUID(str(raw["apply_attempt_id"]))]
-            rows.setdefault(attempt.pk, []).extend(_validate_attempt(raw, attempt, incarnation)["generations"])
-    head = responses[-1][1]["head"]
-    unmatched = set()
-    for identity, (generation, execution) in retained.items():
-        matches = [
-            row for row in rows.get(execution.attempt.pk, ()) if row["generation_id"] == generation["generation_id"]
-        ]
-        if head is not None and head["generation_id"] == generation["generation_id"]:
-            if head["seq"] != generation["seq"]:
-                unmatched.add(identity)
-                continue
-            matches.append(_validate_generation(_generation_from_carrier(generation, head)))
-        projection = immutable_execution_projection(_execution_projection(execution))
-        if not matches or any(immutable_execution_projection(row) != projection for row in matches):
-            unmatched.add(identity)
-    return unmatched
 
 
 def generation_certificates(management, incarnation, *generations):

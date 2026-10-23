@@ -200,6 +200,8 @@ class ApplyingStore(SettlementStore):
             seq=generation_id,
             status="settled" if self.logical_disposition == "in_sync" else "failed",
             job_id=job["id"],
+            carrier_job_id=job["id"],
+            carrier_job_status=job["status"],
             mode="networked",
             settlement_cohort=generation_id,
             digest="a" * 64,
@@ -224,6 +226,7 @@ class ApplyingStore(SettlementStore):
                 "mode",
                 "settlement_cohort",
                 "source_push_seq",
+                "stream_revisions",
                 "created_at",
                 "updated_at",
             )

@@ -2,6 +2,54 @@
 
 <!-- version list -->
 
+## v1.12.0 (2026-10-23)
+
+### Bug Fixes
+
+- **api**: Return a fixed detail when the sync-complete callback is deferred
+  ([`06363f0`](https://github.com/marcinpsk/netbox-nso-plugin/commit/06363f07d3bee4e22a00c48c1455b1d7534218f8))
+
+- **deployment-gate**: Parse probe UUID options with argparse
+  ([`0a4a5b5`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0a4a5b51a652360c37f8353d88666bc8997c2431))
+
+- **probe**: Report a changed BGP owner footprint as a blocked probe
+  ([`ddcae52`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ddcae5235913b139b301aab2502a70ed1dfbe3e7))
+
+- **refusal-display**: Read the current-epoch fence in row_projection
+  ([`54c6486`](https://github.com/marcinpsk/netbox-nso-plugin/commit/54c64862214cbaef728e44c4b5c1f3db240daf88))
+
+- **retention**: Print a prune cursor that --after can act on
+  ([`3d657cc`](https://github.com/marcinpsk/netbox-nso-plugin/commit/3d657cc3ac7b18d9269052266aaae95910d7279f))
+
+### Chores
+
+- **deps**: Bump certifi from 2026.5.20 to 2026.10.19
+  ([`ade5d17`](https://github.com/marcinpsk/netbox-nso-plugin/commit/ade5d177ad34e6b0744d913d6b20326b316abce7))
+
+- **deps**: Bump virtualenv from 21.7.13 to 21.14.9
+  ([`0b6b69a`](https://github.com/marcinpsk/netbox-nso-plugin/commit/0b6b69a9fee6c85ca95aa3fb1297618d72518a57))
+
+### Performance Improvements
+
+- **apply-preview**: Load the relations the owner formatters read
+  ([`29f0e8d`](https://github.com/marcinpsk/netbox-nso-plugin/commit/29f0e8dd415221bc9bbe1dc3e3c58de6933f354e))
+
+- **interface-state**: Project only unsettled interface owners in the attention list and state
+  filter
+  ([`1cb8e63`](https://github.com/marcinpsk/netbox-nso-plugin/commit/1cb8e631ed35988a68ad99dc8d6c2ab823e8c233))
+
+- **interface-state**: Project the rendered list page once
+  ([`5c8f5fb`](https://github.com/marcinpsk/netbox-nso-plugin/commit/5c8f5fbfa7e25b019ce8910af7709e806ab97817))
+
+### Testing
+
+- **probe**: Pin owner fencing by the bounded probe read
+  ([`014a226`](https://github.com/marcinpsk/netbox-nso-plugin/commit/014a226dc43d7a9f41b94a125acb676a95303980))
+
+- **settlement**: Use the adapter generation shape for carrierless stalls
+  ([`c608058`](https://github.com/marcinpsk/netbox-nso-plugin/commit/c60805858324ba5c6d6b7ad39fd0b7b923af3190))
+
+
 ## v1.11.0 (2026-10-22)
 
 ### Bug Fixes
