@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "14d4668cb289e7d4cf085a430279a1268d08905050335213c72bb77b8ba09fea"
+_ADAPTER_RUNTIME_DIGEST = "20018b7611065ed0106126ae756698d803f7fa0e1f2760218cfdb690b345bce8"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -183,7 +183,9 @@ class _RestconfState:
     def device_section(self, device_name: str) -> dict:
         with self.lock:
             routes = [dict(route) for route in self.device.get(device_name, [])]
-        return {"status": "ok", "route": routes}
+        manifest = json.loads((_ADAPTER_ROOT / "nso_adapter/nso/collection_manifest.json").read_text(encoding="utf-8"))
+        collections = manifest["families"]["static-route"]["collections"]
+        return {"status": "ok", "route": routes, manifest["marker"]: list(collections)}
 
     def plugin_callback_bodies(self, path: str) -> list[dict]:
         with self.lock:
