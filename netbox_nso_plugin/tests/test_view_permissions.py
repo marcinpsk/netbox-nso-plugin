@@ -167,8 +167,9 @@ class ActionViewPermissionTests(IntentPushResetMixin, TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_onboard_allowed_with_add_permission(self):
-        """With add_nsodevicemanagement the onboard handler runs (redirects, never 403)."""
+        """With add_nsodevicemanagement and device view the onboard handler runs (redirects, never 403)."""
         self._grant("add", NSODeviceManagement)
+        self._grant("view", Device)
         url = reverse("plugins:netbox_nso_plugin:onboard")
         response = self.client.post(url, {"device": self.device.pk})
         self.assertNotEqual(response.status_code, 403)

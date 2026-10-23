@@ -775,6 +775,55 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertEqual((remote.peer_state_id, local.address), (local.pk, "198.18.57.1/30"))
         self.assertTrue(Device.objects.filter(pk=unmanaged.pk).exists())
 
+    def test_an_unchanged_peer_prefill_does_not_need_peer_authority(self):
+        """The edit form submits the peer address unchanged; only a written peer is a second target (A4)."""
+        from dcim.models import Cable, CableTermination
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        unmanaged = Device.objects.create(
+            name="authz-peer-prefill",
+            device_type=self.device_a.device_type,
+            role=self.device_a.role,
+            site=self.device_a.site,
+        )
+        local_iface = Interface.objects.create(device=self.device_a, name="Ethernet61", type="1000base-t")
+        remote_iface = Interface.objects.create(device=unmanaged, name="Ethernet62", type="1000base-t")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=local_iface)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=remote_iface)
+        with without_commit_drain():
+            local = acquire_overlay(
+                NSOInterfaceIPState, interface=local_iface, address="198.18.61.1/30", status="imported"
+            )
+            remote = acquire_overlay(
+                NSOInterfaceIPState, interface=remote_iface, address="198.18.61.2/30", status="imported"
+            )
+        _grant(self.user, ("change",), NSODeviceManagement, {"pk": self.management_a.pk})
+        _grant(self.user, ("add", "change"), IPAddress)
+        _grant(self.user, ("view",), Device)
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": local.pk}),
+            {"address": "198.18.61.5/30", "peer_address": "198.18.61.2/30"},
+        )
+        self.assertEqual(response.status_code, 200)
+        local.refresh_from_db()
+        remote.refresh_from_db()
+        self.assertEqual((local.address, remote.address), ("198.18.61.5/30", "198.18.61.2/30"))
+        changed = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": local.pk}),
+            {"address": "198.18.61.5/30", "peer_address": "198.18.61.6/30"},
+        )
+        self.assertEqual(changed.status_code, 403)
+        remote.refresh_from_db()
+        self.assertEqual(remote.address, "198.18.61.2/30")
+
+    def test_onboarding_without_device_view_is_403(self):
+        _grant(self.user, ("add",), NSODeviceManagement)
+        response = self.client.post(reverse("plugins:netbox_nso_plugin:onboard"), {"device": self.device_a.pk})
+        self.assertEqual(response.status_code, 403)
+
     def test_a_superuser_edit_still_clears_an_unmanaged_inverse_peer(self):
         """An interface overlay on an unmanaged device has no management authority; a superuser keeps the edit (A4)."""
         from netbox_nso_plugin.models import NSOInterfaceIPState
@@ -810,7 +859,7 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
             reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": local.pk}),
             {"address": "198.18.55.5/30"},
         )
-        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.status_code, 200)
         remote.refresh_from_db()
         self.assertIsNone(remote.peer_state_id)
 

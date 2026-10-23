@@ -7003,9 +7003,6 @@ class NSOInterfaceIPStateEditView(AuthorizedView):
         peer_raw = (request.POST.get("peer_address") or "").strip()
         if peer_raw:
             peer_state = _peer_ip_state_for_edit(state)
-            if peer_state is not None:
-                # The cable peer is a second target: it must allow the change too.
-                authorize_related_row(peer_state, request.user, "change")
             if peer_state is None:
                 return JsonResponse(
                     {
@@ -7018,6 +7015,8 @@ class NSOInterfaceIPStateEditView(AuthorizedView):
             if error:
                 return JsonResponse({"status": "error", "errors": {"peer_address": [error]}}, status=400)
             if peer["address"] != peer_state.address:
+                # A written cable peer is a second target: it must allow the change too.
+                authorize_related_row(peer_state, request.user, "change")
                 updates.append(peer)
 
         errors = _ip_update_collision_errors(updates)

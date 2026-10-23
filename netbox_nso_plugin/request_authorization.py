@@ -379,7 +379,7 @@ class Onboarding(TargetSpec):
     """Onboard a device: the posted device must be visible; the instance comes from the view restriction."""
 
     def permissions(self):  # noqa: D102
-        return ("netbox_nso_plugin.add_nsodevicemanagement",)
+        return ("netbox_nso_plugin.add_nsodevicemanagement", "dcim.view_device")
 
     def resolve(self, request, user, kwargs):  # noqa: D102
         raw = request.POST.get("device")
@@ -541,7 +541,7 @@ class ApiOnboarding(TargetSpec):
     """
 
     def permissions(self):  # noqa: D102
-        return ("netbox_nso_plugin.change_nsodevicemanagement",)
+        return ("netbox_nso_plugin.change_nsodevicemanagement", "dcim.view_device")
 
     def resolve(self, request, user, kwargs):  # noqa: D102
         from rest_framework.exceptions import NotFound, ParseError
