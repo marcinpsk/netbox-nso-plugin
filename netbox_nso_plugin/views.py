@@ -808,6 +808,7 @@ def _interface_topology_payload(interfaces, ip_states, user):
     Peers, cables and far-end states load through *user*'s view restrictions.
     """
     from dcim.models import Cable, Interface
+    from django.db.models import Q
 
     from .derived_intent import find_peer
     from .models import NSOInterfaceIPState
@@ -833,8 +834,9 @@ def _interface_topology_payload(interfaces, ip_states, user):
     states_by_peer = {}
     for state in (
         NSOInterfaceIPState.objects.filter(
+            Q(interface__device__nso_management__isnull=True)
+            | Q(interface__device__nso_management__in=NSODeviceManagement.objects.restrict(user, "view")),
             interface_id__in=set(peers),
-            interface__device__nso_management__in=NSODeviceManagement.objects.restrict(user, "view"),
         )
         .select_related("interface", "interface__device")
         .order_by("address")
@@ -2289,7 +2291,25 @@ class NSODeviceNamesView(AuthorizedView):
 # ── Adapter Connection (singleton) ───────────────────────────────────────────
 
 
-class AdapterConnectionEditView(AuthorizedGenericView, generic.ObjectEditView):
+class _SingletonEditMixin:
+    """Edit a settings singleton: change when its row exists, add otherwise, through NetBox's restricted queryset."""
+
+    def get_required_permission(self):
+        """Require change for the existing row and add only for the first one."""
+        from utilities.permissions import get_permission_for_model
+
+        action = "change" if self.queryset.model.objects.exists() else "add"
+        return get_permission_for_model(self.queryset.model, action)
+
+    def get_object(self, **kwargs):
+        """Return the existing row through the restricted queryset (404 outside it), else a blank row."""
+        existing = self.queryset.model.objects.values_list("pk", flat=True).first()
+        if existing is None:
+            return self.queryset.model()
+        return get_object_or_404(self.queryset, pk=existing)
+
+
+class AdapterConnectionEditView(AuthorizedGenericView, _SingletonEditMixin, generic.ObjectEditView):
     """Singleton edit view for AdapterConnection (URL + non-secret settings)."""
 
     policy = generic_policy()
@@ -2297,10 +2317,6 @@ class AdapterConnectionEditView(AuthorizedGenericView, generic.ObjectEditView):
     queryset = AdapterConnection.objects.all()
     form = AdapterConnectionForm
     template_name = "netbox_nso_plugin/adapterconnection.html"
-
-    def get_object(self, **kwargs):
-        """Return the existing singleton or a blank instance for first-time creation."""
-        return AdapterConnection.objects.first() or AdapterConnection()
 
     def get_extra_context(self, request, instance):
         """Surface derived-intent templates + the env-sourced bearer token status.
@@ -2322,7 +2338,7 @@ class AdapterConnectionEditView(AuthorizedGenericView, generic.ObjectEditView):
         }
 
 
-class NSOFailoverSettingsEditView(AuthorizedGenericView, generic.ObjectEditView):
+class NSOFailoverSettingsEditView(AuthorizedGenericView, _SingletonEditMixin, generic.ObjectEditView):
     """Singleton edit view for NSOFailoverSettings (global mgmt-IP failover tuning)."""
 
     policy = generic_policy()
@@ -2331,12 +2347,9 @@ class NSOFailoverSettingsEditView(AuthorizedGenericView, generic.ObjectEditView)
     queryset = NSOFailoverSettings.objects.all()
     form = NSOFailoverSettingsForm
 
-    def get_object(self, **kwargs):
-        """Return the existing singleton or a blank instance for first-time creation."""
-        return NSOFailoverSettings.objects.first() or NSOFailoverSettings()
-
     def get(self, request, *args, **kwargs):
         """Render the form, warning first if failover is off at the adapter deployment level."""
+        self.get_object(**kwargs)  # 404 before the adapter read when the row is outside the restriction
         self._warn_if_deployment_failover_disabled(request)
         return super().get(request, *args, **kwargs)
 
@@ -2367,7 +2380,7 @@ class NSOFailoverSettingsEditView(AuthorizedGenericView, generic.ObjectEditView)
             )
 
 
-class NSOVaultSettingsEditView(AuthorizedGenericView, generic.ObjectEditView):
+class NSOVaultSettingsEditView(AuthorizedGenericView, _SingletonEditMixin, generic.ObjectEditView):
     """Singleton edit view for NSOVaultSettings (Vault KV layout for generated refs)."""
 
     policy = generic_policy()
@@ -2375,10 +2388,6 @@ class NSOVaultSettingsEditView(AuthorizedGenericView, generic.ObjectEditView):
     template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOVaultSettings.objects.all()
     form = NSOVaultSettingsForm
-
-    def get_object(self, **kwargs):
-        """Return the existing singleton or a blank instance for first-time creation."""
-        return NSOVaultSettings.objects.first() or NSOVaultSettings()
 
 
 # ── NSO Instance CRUD ────────────────────────────────────────────────────────
@@ -6958,11 +6967,11 @@ def _ip_edit_plan_and_operations(updates, planned_at):
 
 
 def _authorize_planned_states(state_operations, user):
-    """Require change on the management of every overlay row a plan writes (a cleared inverse peer included)."""
-    from .request_authorization import overlay_row
+    """Authorize every overlay row a plan writes (a cleared inverse peer included) for change."""
+    from .request_authorization import authorize_related_row
 
     for candidate, _fields in state_operations:
-        overlay_row(type(candidate), candidate.pk, user, "change")
+        authorize_related_row(candidate, user, "change")
 
 
 class NSOInterfaceIPStateEditView(AuthorizedView):
@@ -6982,7 +6991,7 @@ class NSOInterfaceIPStateEditView(AuthorizedView):
 
         from .intent_state import RendererTargetsChanged
         from .renderer_writer import IntentPlanStaleError, renderer_mirror_writes, renderer_writes
-        from .request_authorization import overlay_row
+        from .request_authorization import authorize_related_row
         from .signals import _schedule_intent_push, suppress_intent_push
 
         state = self.target.primary
@@ -6995,8 +7004,8 @@ class NSOInterfaceIPStateEditView(AuthorizedView):
         if peer_raw:
             peer_state = _peer_ip_state_for_edit(state)
             if peer_state is not None:
-                # The cable peer is a second target: its management must allow the change too.
-                peer_state = overlay_row(type(peer_state), peer_state.pk, request.user, "change").primary
+                # The cable peer is a second target: it must allow the change too.
+                authorize_related_row(peer_state, request.user, "change")
             if peer_state is None:
                 return JsonResponse(
                     {

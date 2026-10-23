@@ -159,7 +159,13 @@ def build_onboarding_dashboard(instance, user) -> dict:
         else:
             out["orphans"].append(entry)
 
-    visible = set(Device.objects.restrict(user, "view").values_list("pk", flat=True))
+    from .models import NSODeviceManagement
+
+    # A managed device also needs its management visible; an unmanaged device needs only the device.
+    hidden_managed = NSODeviceManagement.objects.exclude(
+        pk__in=NSODeviceManagement.objects.restrict(user, "view").values("pk")
+    ).values_list("device_id", flat=True)
+    visible = set(Device.objects.restrict(user, "view").values_list("pk", flat=True)) - set(hidden_managed)
     out["onboarded"] = [entry for entry in out["onboarded"] if entry["netbox_device"].pk in visible]
     out["candidates"] = [entry for entry in _candidates(by_id, matched_ids, mappings) if entry["device"].pk in visible]
     out["onboarded"].sort(key=lambda e: e["nso_name"])

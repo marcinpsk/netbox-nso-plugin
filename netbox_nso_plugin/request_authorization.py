@@ -54,6 +54,10 @@ class AuthzPath:
         """Return the management row that owns *row*."""
         return operator.attrgetter(self.management.replace("__", "."))(row)
 
+    def device_of(self, row):
+        """Return the device *row* belongs to."""
+        return operator.attrgetter(self.device.replace("__", "."))(row)
+
 
 _BY_MANAGEMENT = AuthzPath("management", "management__device")
 _BY_INTERFACE = AuthzPath("interface__device__nso_management", "interface__device")
@@ -181,6 +185,8 @@ def _device_management(user, device, action):
     management_pk = NSODeviceManagement.objects.filter(device=device).values_list("pk", flat=True).first()
     if management_pk is None:
         return None
+    if not user.has_perm(f"netbox_nso_plugin.{action}_nsodevicemanagement"):
+        raise PermissionDenied
     return get_object_or_404(_managements(user, action), pk=management_pk)
 
 
@@ -193,6 +199,20 @@ def overlay_row(model, pk, user, action) -> AuthorizedTarget:
     row = get_object_or_404(queryset, pk=pk)
     management = path.management_of(row)
     return AuthorizedTarget(user=user, primary=row, device=management.device, management=management, queryset=queryset)
+
+
+def authorize_related_row(row, user, action):
+    """Authorize a second overlay row an operation touches: 404 outside the user's restriction.
+
+    An interface overlay on an unmanaged device has no management authority; it needs its device visible.
+    """
+    from .models import NSODeviceManagement
+
+    device = AUTHZ_TARGETS[row._meta.label_lower].device_of(row)
+    if NSODeviceManagement.objects.filter(device=device).exists():
+        overlay_row(type(row), row.pk, user, action)
+    else:
+        get_object_or_404(_device_model().objects.restrict(user, "view"), pk=device.pk)
 
 
 def _management_permissions(action, *, device_view=False):
@@ -407,6 +427,13 @@ class OwnerRow(TargetSpec):
         spec = OVERLAYS.get(f"netbox_nso_plugin.{kwargs['model']}")
         if spec is None:
             raise NotFound("Unknown owner model.")
+        required = (
+            f"netbox_nso_plugin.view_{spec.model._meta.model_name}",
+            "netbox_nso_plugin.view_nsodevicemanagement",
+            "dcim.view_device",
+        )
+        if not all(user.has_perm(permission) for permission in required):
+            raise PermissionDenied
         path = AUTHZ_TARGETS[spec.model_label]
         queryset = spec.model.objects.restrict(user, "view").filter(
             **{
@@ -594,11 +621,12 @@ _DML = re.compile(r'\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?([A-Za-z0-9_]+
 
 @functools.cache
 def native_tables() -> frozenset[str]:
-    """Return the tables of change-logged models outside this plugin, with their M2M tables."""
+    """Return the tables of change-logged models outside this plugin, their M2M tables, and tag assignments."""
     from django.apps import apps
     from netbox.models.features import ChangeLoggingMixin
 
-    tables = set()
+    # Tag assignments of every model share one explicit relation table; read endpoints write none.
+    tables = {apps.get_model("extras", "TaggedItem")._meta.db_table}
     for model in apps.get_models(include_auto_created=True):
         owner = model._meta.auto_created or model
         if owner._meta.app_label != "netbox_nso_plugin" and issubclass(owner, ChangeLoggingMixin):

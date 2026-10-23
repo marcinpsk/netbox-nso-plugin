@@ -252,6 +252,17 @@ class TestNoWriteScope(TestCase):
         row.refresh_from_db()
         self.assertEqual(row.adapter_job_id, "17")
 
+    def test_read_scope_refuses_tag_assignments(self):
+        from extras.models import Tag
+
+        site = Site.objects.create(name="authz-tagged", slug="authz-tagged")
+        tag = Tag.objects.create(name="authz-tag", slug="authz-tag")
+        site.tags.add(tag)
+        with authority_scope("read"):
+            self.assertRefused(lambda: site.tags.clear())
+            self.assertRefused(lambda: site.tags.add(Tag.objects.create(name="authz-two", slug="authz-two")))
+        self.assertEqual(list(site.tags.all()), [tag])
+
     def test_native_mutation_scope_keeps_todays_native_writes(self):
         with authority_scope("native_mutation"):
             Site.objects.create(name="authz-mutate", slug="authz-mutate")
@@ -714,6 +725,45 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         local.refresh_from_db()
         self.assertEqual((remote.peer_state_id, local.address), (local.pk, "198.18.50.1/30"))
 
+    def test_a_superuser_edit_still_clears_an_unmanaged_inverse_peer(self):
+        """An interface overlay on an unmanaged device has no management authority; a superuser keeps the edit (A4)."""
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        from ._ownership_case import save_overlay_fixture
+
+        unmanaged = Device.objects.create(
+            name="authz-peer-unmanaged",
+            device_type=self.device_a.device_type,
+            role=self.device_a.role,
+            site=self.device_a.site,
+        )
+        with without_commit_drain():
+            local = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=self.device_a, name="Ethernet55", type="1000base-t"),
+                address="198.18.55.1/30",
+                auto_assigned=True,
+                status="accepted",
+            )
+            remote = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=unmanaged, name="Ethernet56", type="1000base-t"),
+                address="198.18.55.2/30",
+                auto_assigned=True,
+                peer_state=local,
+                status="accepted",
+            )
+            local.peer_state = remote
+            save_overlay_fixture(local, update_fields=("peer_state",))
+        self.client.force_login(User.objects.create_superuser(username=f"authz-peer-super-{uuid4().hex[:6]}"))
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": local.pk}),
+            {"address": "198.18.55.5/30"},
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        remote.refresh_from_db()
+        self.assertIsNone(remote.peer_state_id)
+
     def test_the_onboarding_dashboard_lists_only_visible_managed_devices(self):
         from netbox_nso_plugin.models import NSOInstance
 
@@ -740,6 +790,45 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         api = reverse("plugins-api:netbox_nso_plugin-api:nsointerfacestate-detail", kwargs={"pk": row.pk})
         self.assertEqual(self._api().get(api).status_code, 404)
 
+    def test_a_device_read_without_management_view_is_403(self):
+        _grant(self.user, ("view",), Device)
+        url = reverse("plugins:netbox_nso_plugin:device_nso_jobs", kwargs={"pk": self.device_a.pk})
+        self.assertEqual(self.client.get(url).status_code, 403)
+        _grant(self.user, ("view",), NSODeviceManagement, {"pk": self.management_b.pk})
+        self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_the_onboarded_tile_needs_the_management_too(self):
+        from netbox_nso_plugin.models import NSOInstance
+        from netbox_nso_plugin.onboarding import build_onboarding_dashboard
+
+        _grant(self.user, ("view",), NSOInstance)
+        _grant(self.user, ("view",), Device)
+        _grant(self.user, ("view",), NSODeviceManagement, {"pk": self.management_a.pk})
+        nso_devices = [
+            {"name": name, "onboarded_netbox_device_id": device.pk}
+            for name, device in (("nso-a", self.device_a), ("nso-b", self.device_b))
+        ]
+        with patch("netbox_nso_plugin.adapter_client.list_instance_devices", return_value=nso_devices):
+            data = build_onboarding_dashboard(self.management_a.nso_instance, self.user)
+        self.assertEqual([entry["netbox_device"] for entry in data["onboarded"]], [self.device_a])
+
+    def test_settings_singletons_keep_their_model_restriction(self):
+        from netbox_nso_plugin.models import AdapterConnection, NSOFailoverSettings
+
+        connection_row = AdapterConnection.objects.create(url="http://authz-adapter")
+        failover_row = NSOFailoverSettings.objects.create()
+        _CountingSession.calls = []  # saving the settings row pushed it to the adapter
+        _grant(self.user, ("add",), AdapterConnection)
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:adapterconnection"), {"url": "http://authz-overwrite"}
+        )
+        self.assertEqual(response.status_code, 403)
+        connection_row.refresh_from_db()
+        self.assertEqual(connection_row.url, "http://authz-adapter")
+        _grant(self.user, ("change",), NSOFailoverSettings, {"pk": failover_row.pk + 1})
+        self.assertEqual(self.client.get(reverse("plugins:netbox_nso_plugin:nsofailoversettings")).status_code, 404)
+        self.assertEqual(_CountingSession.calls, [])
+
     def test_an_excluded_nso_instance_inventory_is_404(self):
         from netbox_nso_plugin.models import NSOInstance
 
@@ -758,6 +847,7 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
             interface = Interface.objects.create(device=self.device_b, name="Ethernet31", type="1000base-t")
             row = acquire_overlay(NSOInterfaceState, interface=interface, attribute="description")
         _grant(self.user, ("view",), NSOInterfaceState)
+        _grant(self.user, ("view",), Device)
         _grant(self.user, ("view",), NSODeviceManagement, {"pk": self.management_a.pk})
         url = reverse("plugins-api:netbox_nso_plugin-api:owner-state-detail", args=(row._meta.model_name, row.pk))
         self.assertEqual(self._api().get(url).status_code, 404)

@@ -270,7 +270,8 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         token = Token.objects.create(user=user)
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {TOKEN_PREFIX}{token.key}.{token.token}")
         with override_settings(EXEMPT_VIEW_PERMISSIONS=[]):
-            self.assertEqual(api.get(url).status_code, 404)
+            # A missing model permission is 403; an excluded row is 404 (#1709).
+            self.assertEqual(api.get(url).status_code, 403)
 
     def test_preview_refusal_keeps_diffs_and_identity_fields(self):
         cause = self.refused_bgp()
