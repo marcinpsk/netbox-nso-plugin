@@ -6575,7 +6575,7 @@ def _owned_native_gap(state):
         return not BFDInterface.objects.filter(interface_id=state.interface_id).exists()
     if isinstance(state, NSOISISInterfaceState):
         native = state.isis_interface
-        return native is not None and bool(state.process_tag) and native.instance.process_tag != state.process_tag
+        return native is not None and native.instance.process_tag != state.process_tag
     if isinstance(state, NSORedistributionState):
         return state.redistribution_id is None
     return False
@@ -7153,7 +7153,8 @@ def _isis_interface_native_writes(candidate):
     from .renderer_writer import planned_save
 
     native = candidate.isis_interface
-    if native is None or not candidate.process_tag or native.instance.process_tag == candidate.process_tag:
+    # An empty process tag names the untagged process.
+    if native is None or native.instance.process_tag == candidate.process_tag:
         return (), (), (), ()
     device = candidate.interface.device
     instance = ISISInstance.objects.filter(device=device, process_tag=candidate.process_tag).first()

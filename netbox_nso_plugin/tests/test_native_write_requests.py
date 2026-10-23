@@ -251,6 +251,35 @@ class TestIsisConversion(AdapterCase):
         self.native.refresh_from_db()
         self.assertEqual(self.native.instance.process_tag, "P")
 
+    def test_the_untagged_process_is_materialized_by_accept(self):
+        """An empty process tag is the untagged process: the gap shows and Accept repoints to it."""
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        interface = Interface.objects.create(device=self.device, name="ge-0/0/9", type="1000base-t")
+        native_row = ISISInterface.objects.create(
+            interface=interface, address_family="ipv4", instance=self.current, circuit_type="level-2-only"
+        )
+        with without_commit_drain():
+            overlay = acquire_overlay(
+                NSOISISInterfaceState,
+                management=self.management,
+                interface=interface,
+                af="ipv4",
+                process_tag="",
+                circuit_type="level-2-only",
+                isis_interface=native_row,
+                status="accepted",
+            )
+        self.assertTrue(_grid_row(self, self.admin, self.device, "isis", overlay, section="interfaces")["native_gap"])
+        url = reverse("plugins:netbox_nso_plugin:routing_accept_isis_interface", kwargs={"pk": overlay.pk})
+        self.client.force_login(operator())
+        with self.assert_refused_whole():
+            self.assertEqual(self.client.post(url).status_code, 403)
+        self.client.force_login(operator((("change",), ISISInterface, None), (("add",), ISISInstance, None)))
+        self.assertEqual(self.client.post(url).status_code, 302)
+        native_row.refresh_from_db()
+        self.assertEqual(native_row.instance.process_tag, "")
+
 
 class TestBfdConversion(AdapterCase):
     """Owned BFD overlay without a native BFD interface; an unowned interface reports its own profile."""
