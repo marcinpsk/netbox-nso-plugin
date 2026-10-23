@@ -6259,7 +6259,9 @@ def _apply_preview_owner_changes(device_pk):
             continue
         label, relations, item_fn, detail_fn = preview_formatters[model._meta.model_name]
         # Include pending owners and unresolved executions in the confirmation count.
-        rows = model.objects.filter(**{spec.device_lookup: device_pk}).select_related(*relations)
+        rows = model.objects.filter(**{spec.device_lookup: device_pk})
+        if relations:  # select_related() without arguments follows every non-null FK
+            rows = rows.select_related(*relations)
         for r in project_rows(rows):
             projected = row_projection(r)
             if not projected["pending"]:

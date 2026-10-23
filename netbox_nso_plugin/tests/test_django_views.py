@@ -2592,6 +2592,25 @@ class TestNSOApplyPreviewView(ViewTestBase):
             with self.assertRaisesMessage(RuntimeError, "formatter defect"):
                 self.client.get(url)
 
+    def test_owner_rows_without_formatter_relations_join_no_tables(self):
+        """A formatter that reads no relation gets a plain owner query, not select_related() of every FK."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from netbox_nso_plugin.models import NSOLoggingHostState, NSORoutePolicyState, NSOSnmpHostState
+
+        url = reverse("plugins:netbox_nso_plugin:device_apply_preview", args=[self.device.pk])
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        for model in (NSORoutePolicyState, NSOSnmpHostState, NSOLoggingHostState):
+            table = model._meta.db_table
+            owner_queries = [q["sql"] for q in queries.captured_queries if f'FROM "{table}"' in q["sql"]]
+            self.assertTrue(owner_queries, table)
+            for sql in owner_queries:
+                selected = set(re.findall(r'"(\w+)"\."', sql.split(f' FROM "{table}"', 1)[0]))
+                self.assertEqual(selected, {table}, sql)
+
     def test_preview_isis_interface_detail_includes_bfd(self):
         """#77 transparency: a tri-state bfd intent MUST appear in 'properties pushed' —
         the dry-run diff showed bfd-enabled while the intent list stayed silent (operator
