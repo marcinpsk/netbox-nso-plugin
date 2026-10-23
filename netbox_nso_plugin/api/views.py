@@ -2,7 +2,6 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
 
-from django.utils import timezone
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework import status
 from rest_framework.exceptions import NotFound
@@ -10,6 +9,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.routers import APIRootView
 from rest_framework.views import APIView
+from utilities.exceptions import PermissionsViolation
 
 from ..filters import (
     NSODerivedIntentTemplateFilterSet,
@@ -287,18 +287,11 @@ class OnboardView(AuthorizedAPIView, APIView):
 
     def post(self, request):
         """Onboard the posted NetBox device into the selected (or default) NSO instance."""
-        from ..onboarding import normalize_nso_device_name, onboard_candidate, require_management_add
+        from ..onboarding import onboard_candidate
 
-        device, instance = self.target.device, self.target.related["instance"]
-        require_management_add(
-            request.user,
-            device=device,
-            nso_instance=instance,
-            nso_device_name=normalize_nso_device_name(device.name),
-            onboarded_at=timezone.now(),
-            onboard_status="provisioning",
-        )
-        result = onboard_candidate(device, instance)
+        result = onboard_candidate(self.target.device, self.target.related["instance"])
+        if result.get("permission_denied"):
+            raise PermissionsViolation(result["permission_denied"])
         code = result.pop(
             "_http_status",
             status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,

@@ -744,8 +744,11 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                 # Owned intent reaches the native rows only through the operator Accept or Edit.
                 current_native = native_interfaces.get(identity)
                 state.isis_interface = current_native
-                matches = current_native is not None and (
-                    _isis_device_matches_intent(entry, state, current_native, ned_id)
+                # A native interface on another process is a gap the status must show.
+                matches = (
+                    current_native is not None
+                    and current_native.instance.process_tag == state.process_tag
+                    and _isis_device_matches_intent(entry, state, current_native, ned_id)
                     and _isis_interface_children_match(entry, current_native)
                 )
                 state.status = sm.on_reconcile(state.status, matches=matches)

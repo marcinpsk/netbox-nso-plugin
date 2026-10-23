@@ -400,7 +400,7 @@ def authority_scope(effects: str, user=None):
     writes them through the operator NativeWriter inside one transaction.
     """
     if effects in ("read", "adapter_action"):
-        scope = _Scope("no_write")
+        scope = _Scope("no_write", user=user)
         scope.writer = NativeWriter(scope)
         with _entered(scope):
             yield
@@ -448,6 +448,43 @@ def active_native_writer() -> NativeWriter | None:
     """Return the NativeWriter of the running scope, None outside a request."""
     scope = _SCOPE.get()
     return None if scope is None else scope.writer
+
+
+def save_native(instance, *, origin, update_fields=None):
+    """Save one native row through the active NativeWriter (a direct write outside a renderer plan)."""
+    writer = active_native_writer()
+    effect = (
+        writer.save(instance, update_fields=update_fields, created=instance._state.adding, origin=origin)
+        if writer is not None and is_native(type(instance))
+        else contextlib.nullcontext()
+    )
+    with effect:
+        instance.save(update_fields=update_fields)
+    return instance
+
+
+def requesting_user():
+    """Return the operator of the running request, None outside a request."""
+    scope = _SCOPE.get()
+    return next((link.user for link in scope.chain() if link.user is not None), None) if scope else None
+
+
+def require_operator_add(row) -> None:
+    """Refuse a row the requesting operator may not add; NetBox checks add constraints on the saved row.
+
+    Outside a request no operator acts (C4), and the check does not apply.
+    """
+    scope = _SCOPE.get()
+    if scope is None:
+        return
+    user = requesting_user()
+    if user is None:
+        _refuse(f"an add of {row._meta.label_lower} inside a request needs its operator")
+    model = type(row)
+    if not (user.has_perm(_permission(model, "add")) and _restricted(model, user, "add").filter(pk=row.pk).exists()):
+        message = f"You cannot add this {model._meta.verbose_name}."
+        scope.latched = scope.latched or message
+        raise _permissions_violation(message)
 
 
 def refuse_adapter_call_in_mutation_phase(method: str) -> None:
@@ -565,12 +602,13 @@ class NativeWriter:
         if kind == "save" and created:
             self._require_permission(model, "add")
             return
+        selected = set(pks) if kind == "set_update" else {instance.pk}
+        if kind != "delete" and selected <= self._created[label]:
+            # A later write of a row this operation created needs only the add check at phase end (C1).
+            return
         action = "delete" if kind == "delete" else "change"
         self._require_permission(model, action)
-        selected = pks if kind == "set_update" else {instance.pk}
-        stored = selected - self._created[label] if action == "change" else selected
-        if stored:
-            self._require_rows(model, action, stored)
+        self._require_rows(model, action, selected - self._created[label] if action == "change" else selected)
 
     def _record(self, model, pks, action):
         if self._scope.mode != "operator":
@@ -616,7 +654,8 @@ class NativeWriter:
             return (instance,) if mapped is None or field_name in mapped else ()
         if kind == "delete" or (kind == "save" and created):
             return (instance,) if entry.lifecycle else ()
-        names = set(update_fields) if update_fields is not None else None
+        # update_fields and set-update keys may name a field or its attname (instance or instance_id).
+        names = {model._meta.get_field(name).name for name in update_fields} if update_fields is not None else None
         concrete = [
             column
             for column in model._meta.concrete_fields
@@ -676,8 +715,12 @@ def _guard_save(sender, instance, **kwargs):
     if scope is None or not is_native(sender):
         return
     permit = scope.top()
-    if permit is None or permit.kind != "save" or permit.instance is not instance:
-        _refuse(f"native save of {sender._meta.label_lower} without its writer permit")
+    if permit is not None and permit.kind == "save" and permit.instance is instance:
+        return
+    # NetBox clears a deleted row's references by saving the referring row (primary IPs): the closure froze it.
+    if permit is not None and permit.kind == "delete" and (sender._meta.label_lower, instance.pk) in permit.updates:
+        return
+    _refuse(f"native save of {sender._meta.label_lower} without its writer permit")
 
 
 def _through_permitted(model, permit):
@@ -712,14 +755,24 @@ def _guard_m2m(sender, instance, action, reverse, **kwargs):
     _refuse(f"native M2M change of {sender._meta.label_lower} without its writer permit")
 
 
-def _counter_update(model, values):
+def _bookkeeping_update(model, names, permit):
+    """Return whether an update writes only NetBox caches that follow the permitted write.
+
+    Counter caches of related rows, and the underscore-named caches (prefix depth and children)
+    NetBox recomputes on rows of the model being written.
+    """
     from django.core.exceptions import FieldDoesNotExist
     from utilities.fields import CounterCacheField
 
+    if permit is None or not names:
+        return False
     try:
-        return bool(values) and all(isinstance(model._meta.get_field(name), CounterCacheField) for name in values)
+        fields = [model._meta.get_field(name) for name in names]
     except FieldDoesNotExist:
         return False
+    if all(isinstance(field, CounterCacheField) for field in fields):
+        return True
+    return model._meta.db_table in permit.tables and all(field.name.startswith("_") for field in fields)
 
 
 def _guarded_update(original):
@@ -729,9 +782,8 @@ def _guarded_update(original):
         if scope is None or not is_native(self.model):
             return original(self, **kwargs)
         permit = scope.top()
-        if permit is not None and _counter_update(self.model, kwargs):
-            # NetBox's counter cache follows the permitted write that changed the related rows.
-            with scope.holding(_Permit("counter", self.model, tables=_model_tables(self.model))):
+        if _bookkeeping_update(self.model, kwargs, permit):
+            with scope.holding(_Permit("bookkeeping", self.model, tables=_model_tables(self.model))):
                 return original(self, **kwargs)
         selected = set(self.values_list("pk", flat=True))
         if not selected:
@@ -755,9 +807,16 @@ def _guarded_bulk(bulk):
     @functools.wraps(bulk)
     def guarded(self, *args, **kwargs):
         scope = _guarded_scope()
-        if scope is not None and is_native(self.model) and not _through_permitted(self.model, scope.top()):
+        if scope is None or not is_native(self.model):
+            return bulk(self, *args, **kwargs)
+        permit = scope.top()
+        if _through_permitted(self.model, permit):
+            return bulk(self, *args, **kwargs)
+        names = (args[1] if len(args) > 1 else kwargs.get("fields", ())) if bulk.__name__ == "bulk_update" else ()
+        if not _bookkeeping_update(self.model, tuple(names), permit):
             _refuse(f"native bulk write of {self.model._meta.label_lower} without its writer permit")
-        return bulk(self, *args, **kwargs)
+        with scope.holding(_Permit("bookkeeping", self.model, tables=_model_tables(self.model))):
+            return bulk(self, *args, **kwargs)
 
     guarded._nso_native_guard = True
     return guarded

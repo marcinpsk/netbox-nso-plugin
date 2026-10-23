@@ -172,7 +172,8 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
                 state.min_rx,
                 state.multiplier,
             )
-            matches = matches and state.micro_bfd == flags["micro_bfd"]
+            # A missing native BFD interface is a gap the status must show.
+            matches = matches and state.micro_bfd == flags["micro_bfd"] and current_native is not None
             # A matching read is not apply evidence: only a correlated apply result settles deploying.
             state.status = sm.on_reconcile(state.status, matches=matches, settles_deploying=False)
         else:

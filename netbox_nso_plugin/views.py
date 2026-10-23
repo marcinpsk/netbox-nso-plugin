@@ -1921,12 +1921,14 @@ class NSOCategoryView(AuthorizedView):
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                "accept_url": (
-                    reverse(accept_route, args=[st.pk])
-                    if accept_route and any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
-                    else None
-                ),
+                "native_gap": bool(accept_route) and _owned_native_gap(st),
             }
+            row["accept_url"] = (
+                reverse(accept_route, args=[st.pk])
+                if accept_route
+                and (any(item.status in self._ACCEPTABLE_STATUSES for item in status_rows) or row["native_gap"])
+                else None
+            )
             row.update({name: fn(st) for name, fn in fields.items()})
             rows.append(row)
         return {"rows": rows, "counts": counts}
@@ -2002,7 +2004,11 @@ class NSOCategoryView(AuthorizedView):
         # Bulk-accept shows only when something is still unowned — i.e. some row offers
         # an Accept, which is exactly the accept_url the grid itself renders.
         sections = {None: payload} if None in spec["sections"] else {n: payload[n] for n in spec["sections"]}
-        section_has_unowned = {name: any(row["accept_url"] for row in s["rows"]) for name, s in sections.items()}
+        # A native-gap Accept is not a bulk accept: bulk accept takes unowned rows only.
+        section_has_unowned = {
+            name: any(row["accept_url"] and not row.get("native_gap") for row in s["rows"])
+            for name, s in sections.items()
+        }
 
         from .template_content import _STATUS_BADGE
 
@@ -2603,7 +2609,7 @@ class NSOOnboardView(AuthorizedView):
 
     def post(self, request):
         """Onboard the posted device into the selected (or default) NSO instance."""
-        from .onboarding import normalize_nso_device_name, onboard_candidate, require_management_add
+        from .onboarding import onboard_candidate
 
         device, instance = self.target.device, self.target.related["instance"]
 
@@ -2612,14 +2618,6 @@ class NSOOnboardView(AuthorizedView):
             messages.error(request, "No NSO instance configured.")
             return redirect(redirect_url)
 
-        require_management_add(
-            request.user,
-            device=device,
-            nso_instance=instance,
-            nso_device_name=normalize_nso_device_name(device.name),
-            onboarded_at=timezone.now(),
-            onboard_status="provisioning",
-        )
         ned_id = (request.POST.get("ned_id") or "").strip() or None
         try:
             result = onboard_candidate(device, instance, ned_id=ned_id)
@@ -2627,6 +2625,8 @@ class NSOOnboardView(AuthorizedView):
             logger.exception("onboard action failed for device %s", device.pk)
             messages.error(request, f"Onboarding {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+        if result.get("permission_denied"):
+            raise PermissionsViolation(result["permission_denied"])
 
         if result["ok"]:
             messages.success(
@@ -2667,17 +2667,13 @@ class NSOQuickManageView(AuthorizedView):
         nso_name = request.POST.get("nso_name") or device.name
         try:
             result = manage_existing(device, instance, nso_name)
+        except PermissionsViolation:
+            raise
         except Exception as exc:  # never 500 the action
             logger.exception("manage action failed for device %s", device.pk)
             messages.error(request, f"Managing {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
-        if (
-            result["ok"]
-            and not NSODeviceManagement.objects.restrict(request.user, "add").filter(device=device).exists()
-        ):
-            # NetBox save-then-verify: the operator scope rolls the new row back.
-            raise PermissionsViolation("You cannot add an NSO device management row for this device.")
         if result["ok"]:
             messages.success(request, f"{device} is now managed by NSO ({instance.name}).")
         else:
@@ -6565,6 +6561,24 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 
 
 # ── Routing state accept views (Track A) ──────────────────────────────────────
+
+
+def _owned_native_gap(state):
+    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it."""
+    from netbox_routing.models import BFDInterface
+
+    from .status_machine import is_owned
+
+    if not is_owned(state.status):
+        return False
+    if isinstance(state, NSOBFDInterfaceState):
+        return not BFDInterface.objects.filter(interface_id=state.interface_id).exists()
+    if isinstance(state, NSOISISInterfaceState):
+        native = state.isis_interface
+        return native is not None and bool(state.process_tag) and native.instance.process_tag != state.process_tag
+    if isinstance(state, NSORedistributionState):
+        return state.redistribution_id is None
+    return False
 
 
 def _accept_policy(model, *permissions):

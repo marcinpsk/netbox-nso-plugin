@@ -531,7 +531,9 @@ def _ensure_interface_ip_prefixes(writer, prefixes):
             prefix__net_contains_or_equals=str(address_interface.ip), vrf=vrf_obj
         ).first()
         if containing is None:
-            Prefix(prefix=str(address_interface.network), vrf=vrf_obj).save()
+            from .native_authorization import save_native
+
+            save_native(Prefix(prefix=str(address_interface.network), vrf=vrf_obj), origin=_OBSERVED_IP)
 
 
 def _reconcile_interface_ips(device, payload: dict) -> list:

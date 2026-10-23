@@ -26,6 +26,7 @@ import re
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
+from utilities.exceptions import PermissionsViolation
 
 from .deployment import guarded as _deployment_guarded
 
@@ -187,29 +188,6 @@ def normalize_nso_device_name(name: str) -> str:
     cleaned = _NSO_NAME_INVALID.sub("-", (name or "").strip())
     cleaned = cleaned.strip("-.")
     return cleaned or "device"
-
-
-def require_management_add(user, **values) -> None:
-    """Refuse a management row the user may not add, before any adapter call.
-
-    NetBox evaluates add constraints against a saved row: save the prospective row, check it
-    against the add restriction, and roll it back. An identity conflict is left to the caller,
-    which reports it without creating a row.
-    """
-    from utilities.exceptions import PermissionsViolation
-
-    from .management_lifecycle import save_management
-    from .models import NSODeviceManagement
-
-    try:
-        with transaction.atomic():
-            probe = save_management(NSODeviceManagement(**values))
-            permitted = NSODeviceManagement.objects.restrict(user, "add").filter(pk=probe.pk).exists()
-            transaction.set_rollback(True)
-    except IntegrityError:
-        return
-    if not permitted:
-        raise PermissionsViolation("You cannot add an NSO device management row for this device.")
 
 
 def _default_authgroup() -> str:
@@ -415,10 +393,49 @@ def _reconcile_rejected_provision_claim(tombstone):
     _close_rejected_provision_claim(tombstone)
 
 
-def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new):
+def _provision_management(device, instance, nso_name, onboarded_at):
+    """Return the management row an onboarding creates, before the adapter's job id is known."""
+    from .models import NSODeviceManagement
+
+    return NSODeviceManagement(
+        device=device,
+        nso_instance=instance,
+        nso_device_name=nso_name,
+        onboarded_at=onboarded_at,
+        onboard_status="provisioning",
+    )
+
+
+def _refused_management_add(device, instance, nso_name, onboarded_at):
+    """Return why the operator may not add this onboarding's management row, before the adapter call.
+
+    NetBox checks add constraints against a saved row: save the row the onboarding will create,
+    check it, and roll it back.
+    """
+    from .management_lifecycle import save_management
+    from .native_authorization import requesting_user, require_operator_add
+
+    if requesting_user() is None:
+        return ""
+    try:
+        with transaction.atomic():
+            probe = save_management(_provision_management(device, instance, nso_name, onboarded_at))
+            try:
+                require_operator_add(probe)
+            except PermissionsViolation as exc:
+                return str(exc)
+            finally:
+                transaction.set_rollback(True)
+    except IntegrityError:
+        # An identity conflict: the claim below reports it without creating a row.
+        return ""
+    return ""
+
+
+def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new, onboarded_at):
     """Send a claimed request and record its admission while the identity is locked."""
     from . import adapter_client as client
-    from .models import NSODeviceManagement, NSOPlatformNedMapping, NSOProvisionTombstone
+    from .models import NSOPlatformNedMapping, NSOProvisionTombstone
 
     device_id = tombstone.netbox_device_id
     nso_name = tombstone.nso_device_name
@@ -437,6 +454,10 @@ def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new):
                 result["error"] = "The provision attempt is already completing."
                 return result
 
+            from .management_lifecycle import save_management
+            from .native_authorization import require_operator_add
+
+            # The POST holds no device row lock: the management row is written after it.
             try:
                 prov = client.provision_device(**tombstone.canonical_request)
             except client.AdapterError as exc:
@@ -456,18 +477,19 @@ def _submit_claimed_provision(instance, tombstone, result, *, claim_was_new):
 
             # The post_save signal stays gated while NSO builds the node. The tombstone
             # sweep records the terminal outcome and re-fires it after successful completion.
-            from .management_lifecycle import save_management
-
-            save_management(
-                NSODeviceManagement(
-                    device=locked_device,
-                    nso_instance=instance,
-                    nso_device_name=nso_name,
-                    onboarded_at=timezone.now(),
-                    onboard_status="provisioning",
-                    onboard_job_id=job_id,
-                )
-            )
+            management = _provision_management(locked_device, instance, nso_name, onboarded_at)
+            management.onboard_job_id = job_id
+            row_savepoint = transaction.savepoint()
+            save_management(management)
+            try:
+                require_operator_add(management)
+            except PermissionsViolation as exc:
+                # Only a constraint on adapter evidence (job id) or the row key reaches here; the
+                # sweep settles the admitted attempt without a management row (tombstone path).
+                transaction.savepoint_rollback(row_savepoint)
+                result["permission_denied"] = str(exc)
+                return result
+            transaction.savepoint_commit(row_savepoint)
 
             # Learn the platform-to-NED mapping from this onboard. The first explicit NED
             # becomes the default for later devices on the same platform.
@@ -556,6 +578,11 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
         "sync": sync,
         "oob_ip": oob_address,
     }
+    onboarded_at = timezone.now()
+    refused = _refused_management_add(device, instance, nso_name, onboarded_at)
+    if refused:
+        result["permission_denied"] = refused
+        return result
     try:
         with transaction.atomic():
             locked_device, conflict = _lock_provision_identity(device.pk, instance, nso_name)
@@ -589,7 +616,9 @@ def onboard_candidate(device, instance, *, ned_id=None, admin_state="unlocked", 
             message="A different provision attempt is already active for this device or NSO name.",
             detail=_provision_attempt_detail(active) if active is not None else None,
         )
-    return _submit_claimed_provision(instance, tombstone, result, claim_was_new=claim_was_new)
+    return _submit_claimed_provision(
+        instance, tombstone, result, claim_was_new=claim_was_new, onboarded_at=onboarded_at
+    )
 
 
 @_deployment_guarded("provisioning")
@@ -693,7 +722,7 @@ def manage_existing(device, instance, nso_device_name) -> dict:
     try:
         from .management_lifecycle import save_management
 
-        save_management(
+        management = save_management(
             NSODeviceManagement(
                 device=device,
                 nso_instance=instance,
@@ -704,6 +733,10 @@ def manage_existing(device, instance, nso_device_name) -> dict:
         logger.exception("manage_existing: creating the management row for %s failed", name)
         result["error"] = f"Could not create the management row ({type(exc).__name__}); see the server log."
         return result
+    from .native_authorization import require_operator_add
+
+    # NetBox save-then-verify: the operator scope rolls the new row back.
+    require_operator_add(management)
 
     result["ok"] = True
     result["managed"] = True

@@ -335,6 +335,46 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "one")
 
+    def _create_entry(self, user, name):
+        """Create a route-map entry and add its match list in one operation, as policy materialize does."""
+        from netbox_routing.models import PrefixList, RouteMap, RouteMapEntry
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_m2m_add,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        prefix_list = PrefixList.objects.create(name=f"nw-pl-{name}")
+        entry = RouteMapEntry(route_map=RouteMap.objects.create(name=name), sequence=10, action="permit")
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(entry, force_insert=True, natural_key=("route_map", "sequence")),),
+            m2m_writes=(planned_m2m_add(entry, "match_prefix_list", (prefix_list,)),),
+        )
+        with authority_scope("native_mutation", user):
+            with (renderer_writes if plan.changes_content else renderer_mirror_writes)(plan) as writer:
+                writer.save(entry, force_insert=True)
+                writer.m2m_add(entry, "match_prefix_list", (prefix_list,))
+        return prefix_list
+
+    def test_a_row_created_in_the_operation_needs_only_add(self):
+        """C1: the M2M change of a row this operation created needs no change permission."""
+        from netbox_routing.models import RouteMapEntry
+
+        prefix_list = self._create_entry(operator((("add",), RouteMapEntry, None)), "nw-created-map")
+        entry = RouteMapEntry.objects.get(route_map__name="nw-created-map")
+        self.assertEqual(list(entry.match_prefix_list.all()), [prefix_list])
+
+    def test_a_created_row_outside_the_add_constraint_is_refused_at_phase_end(self):
+        from netbox_routing.models import RouteMapEntry
+
+        user = operator((("add",), RouteMapEntry, {"sequence": 20}))
+        with self.assertRaises(PermissionsViolation):
+            self._create_entry(user, "nw-refused-map")
+        self.assertFalse(RouteMapEntry.objects.filter(route_map__name="nw-refused-map").exists())
+
     def test_a_swallowed_denial_still_refuses_the_request(self):
         """The failure latch: a helper that catches the denial cannot commit the request (D9)."""
         user = operator((("change",), Interface, {"name": self.first.name}))
@@ -394,6 +434,32 @@ class TestSystemScope(IntentPushResetMixin, TestCase):
         """Anchored rule: the owned interface's instance stays put whatever the declared origin."""
         with self.assertRaises(OwnedIntentRefused), _system_scope() as run:
             run(lambda: self._repoint(Observed("isis")))
+        self.native.refresh_from_db()
+        self.assertEqual(self.native.instance_id, self.current.pk)
+
+    def test_an_attname_does_not_hide_a_mapped_field(self):
+        """The anchored rule reads instance_id as the mapped field instance, for a save and a set update."""
+        from netbox_routing.models import ISISInterface
+
+        def save_by_attname():
+            candidate = ISISInterface.objects.get(pk=self.native.pk)
+            candidate.instance_id = self.intended.pk
+            effect = native.active_native_writer().save(
+                candidate, update_fields=("instance_id",), created=False, origin=Observed("isis")
+            )
+            with effect:
+                candidate.save(update_fields=("instance_id",))
+
+        def update_by_attname():
+            values = {"instance_id": self.intended.pk}
+            with native.active_native_writer().set_update(
+                ISISInterface, [self.native.pk], values, origin=Observed("isis")
+            ):
+                ISISInterface.objects.filter(pk=self.native.pk).update(**values)
+
+        for write in (save_by_attname, update_by_attname):
+            with self.subTest(write=write.__name__), self.assertRaises(OwnedIntentRefused), _system_scope() as run:
+                run(write)
         self.native.refresh_from_db()
         self.assertEqual(self.native.instance_id, self.current.pk)
 

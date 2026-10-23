@@ -55,15 +55,17 @@ def operator(*native_grants):
 
 
 class FakeAdapter(requests.Session):
-    """The adapter transport. GET documents come from ``documents``; every call is counted."""
+    """The adapter transport. Responses come from ``documents`` (GET) and ``posts`` (POST); every call is counted."""
 
     documents: dict = {}  # noqa: RUF012 (set per test)
+    posts: dict = {}  # noqa: RUF012 (set per test)
     calls: list = []  # noqa: RUF012 (reset per test)
 
     def request(self, method, url, *args, **kwargs):
         type(self).calls.append((method, url))
-        for suffix, body in type(self).documents.items():
-            if method == "GET" and url.endswith(suffix):
+        responses = {"GET": type(self).documents, "POST": type(self).posts}.get(method, {})
+        for suffix, body in responses.items():
+            if url.endswith(suffix):
                 response = requests.Response()
                 response.status_code = 200
                 response._content = json.dumps(body).encode()
@@ -77,6 +79,7 @@ class AdapterCase(IntentPushResetMixin, TestCase):
         from unittest.mock import patch
 
         FakeAdapter.documents = {}
+        FakeAdapter.posts = {}
         FakeAdapter.calls = []
         transport = patch("netbox_nso_plugin.adapter_client.requests.Session", FakeAdapter)
         transport.start()

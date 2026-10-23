@@ -153,6 +153,16 @@ class TestInterfaceWriters(AdapterCase):
 # ── The three owned-intent conversions: refresh leaves the gap, Accept materializes it (C12/C14) ──
 
 
+def _grid_row(test, user, device, key, state, section=None):
+    """Return the persisted grid row of *state* as the NSO tab reloads it."""
+    test.client.force_login(user)
+    url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": device.pk, "key": key})
+    payload = test.client.get(url, {"format": "json"}).json()
+    rows = payload[section]["rows"] if section else payload["rows"]
+    (row,) = [row for row in rows if row["pk"] == state.pk]
+    return row
+
+
 def _refresh(test, user, device, key):
     test.client.force_login(user)
     url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": device.pk, "key": key})
@@ -213,6 +223,18 @@ class TestIsisConversion(AdapterCase):
     def test_refresh_creates_the_observed_process_and_leaves_the_owned_repoint(self):
         self.assertRefreshCreatesTheObservedProcessOnly(self.admin)
 
+    def test_the_gap_stays_visible_and_offers_accept(self):
+        """The device matches the intent, but the native interface is on Q: not in sync, Accept offered."""
+        self.assertRefreshCreatesTheObservedProcessOnly(self.admin)
+        self.overlay.refresh_from_db()
+        self.assertEqual(self.overlay.status, "accepted")
+        row = _grid_row(self, self.admin, self.device, "isis", self.overlay, section="interfaces")
+        self.assertTrue(row["native_gap"])
+        self.assertEqual(
+            row["accept_url"],
+            reverse("plugins:netbox_nso_plugin:routing_accept_isis_interface", kwargs={"pk": self.overlay.pk}),
+        )
+
     def test_refresh_by_a_user_without_routing_permissions_does_the_same(self):
         self.assertRefreshCreatesTheObservedProcessOnly(operator())
 
@@ -256,7 +278,7 @@ class TestBfdConversion(AdapterCase):
         FakeAdapter.documents = {
             "/bfd": {
                 "interfaces": [
-                    {"interface_name": "ge-0/0/10", "min_tx": 510, "min_rx": 520, "multiplier": 4, "micro_bfd": False},
+                    {"interface_name": "ge-0/0/10", "min_tx": 310, "min_rx": 320, "multiplier": 3, "micro_bfd": False},
                     {"interface_name": "ge-0/0/11", "min_tx": 710, "min_rx": 720, "multiplier": 5, "micro_bfd": False},
                 ]
             }
@@ -267,9 +289,17 @@ class TestBfdConversion(AdapterCase):
 
         _refresh(self, operator(), self.device, "bfd")
         self.assertFalse(BFDInterface.objects.filter(interface=self.owned_port).exists())
-        self.assertFalse(BFDProfile.objects.filter(name__in=("bfd-310-320-x3", "bfd-510-520-x4")).exists())
+        self.assertFalse(BFDProfile.objects.filter(name="bfd-310-320-x3").exists())
         observed = BFDInterface.objects.get(interface=self.observed_port)
         self.assertEqual(observed.bfd_profile.name, "bfd-710-720-x5")
+        # The device matches the intent, but the native row is missing: not in sync, Accept offered.
+        self.overlay.refresh_from_db()
+        self.assertEqual(self.overlay.status, "accepted")
+        row = _grid_row(self, self.admin, self.device, "bfd", self.overlay)
+        self.assertTrue(row["native_gap"])
+        self.assertEqual(
+            row["accept_url"], reverse("plugins:netbox_nso_plugin:bfd_accept", kwargs={"pk": self.overlay.pk})
+        )
 
     def test_accept_creates_the_native_rows_with_the_native_permission_only(self):
         from netbox_routing.models import BFDInterface, BFDProfile
@@ -332,6 +362,7 @@ class TestRedistributionConversion(AdapterCase):
 
         _refresh(self, self.admin, self.device, "redistribution")
         self.assertFalse(Redistribution.objects.filter(destination_id=self.ospf.pk).exists())
+        self.assertTrue(_grid_row(self, self.admin, self.device, "redistribution", self.overlay)["native_gap"])
 
         url = reverse("plugins:netbox_nso_plugin:routing_accept_redistribution", kwargs={"pk": self.overlay.pk})
         self.client.force_login(operator())
@@ -397,15 +428,30 @@ class TestRedistributionEditRouteMap(AdapterCase):
 
 
 class TestOnboardingAddConstraint(AdapterCase):
-    """Onboarding creates the management row: the user needs add on that prospective row (NetBox semantics)."""
+    """Onboarding creates the management row: the operator needs add on that row (NetBox semantics).
+
+    The row is saved and checked against the add restriction before the adapter call; the
+    adapter's job id is lifecycle evidence recorded on that same row afterwards.
+    """
 
     @classmethod
     def setUpTestData(cls):
-        from netbox_nso_plugin.models import NSOInstance
+        from dcim.models import Platform
+        from ipam.models import IPAddress
+
+        from netbox_nso_plugin.models import NSOInstance, NSOPlatformNedMapping
+        from netbox_nso_plugin.onboarding import normalize_nso_device_name
 
         from ._outbox_case import make_device
 
+        platform = Platform.objects.create(name="nw-onboard-os", slug="nw-onboard-os")
+        NSOPlatformNedMapping.objects.create(platform=platform, ned_id="cisco-ios-cli-6.114")
         cls.device = make_device("nw-onboard", 1)
+        interface = Interface.objects.create(device=cls.device, name="mgmt0", type="virtual")
+        address = IPAddress.objects.create(address="198.18.44.1/24", assigned_object=interface)
+        Device.objects.filter(pk=cls.device.pk).update(platform=platform, primary_ip4=address)
+        cls.device.refresh_from_db()
+        cls.nso_name = normalize_nso_device_name(cls.device.name)
         cls.instance = NSOInstance.objects.create(name="nw-onboard-inst", adapter_instance_id="nw-onboard-inst")
 
     def _user(self, constraints):
@@ -421,17 +467,39 @@ class TestOnboardingAddConstraint(AdapterCase):
         from netbox_nso_plugin.models import NSOProvisionTombstone
 
         self.assertFalse(NSODeviceManagement.objects.filter(device=self.device).exists())
-        self.assertFalse(NSOProvisionTombstone.objects.filter(netbox_device_id=self.device.pk).exists())
+        self.assertFalse(NSOProvisionTombstone.objects.filter(netbox_device_id=self.device.pk, state="open").exists())
+
+    def _onboard(self, user):
+        self.client.force_login(user)
+        return self.client.post(
+            reverse("plugins:netbox_nso_plugin:onboard"),
+            {"device": self.device.pk, "instance": self.instance.adapter_instance_id},
+        )
 
     def test_ui_onboard_outside_the_add_constraint_is_refused_before_the_adapter(self):
-        self.client.force_login(self._user({"nso_device_name": "nw-only-this-name"}))
         with self.assert_refused_whole():
-            response = self.client.post(
-                reverse("plugins:netbox_nso_plugin:onboard"),
-                {"device": self.device.pk, "instance": self.instance.adapter_instance_id, "ned_id": "test-ned"},
-            )
+            response = self._onboard(self._user({"nso_device_name": "nw-only-this-name"}))
         self.assertEqual(response.status_code, 403)
         self.assertNothingCreated()
+
+    def test_ui_onboard_checks_the_persisted_row_after_the_adapter_receipt(self):
+        """A constraint over the adapter's job id passes the probe; the persisted row is checked too."""
+        from netbox_nso_plugin.models import NSOProvisionTombstone
+
+        FakeAdapter.posts = {"/api/v1/devices/provision": {"job_id": "4418"}}
+        response = self._onboard(self._user({"onboard_job_id": ""}))
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(NSODeviceManagement.objects.filter(device=self.device).exists())
+        # The admitted attempt keeps its adapter evidence; the sweep settles it without a row.
+        attempt = NSOProvisionTombstone.objects.get(netbox_device_id=self.device.pk)
+        self.assertEqual((attempt.state, attempt.adapter_job_id), ("open", "4418"))
+
+    def test_ui_onboard_inside_the_add_constraint_keeps_the_authorized_row(self):
+        FakeAdapter.posts = {"/api/v1/devices/provision": {"job_id": "4417"}}
+        response = self._onboard(self._user({"nso_device_name": self.nso_name, "onboard_status": "provisioning"}))
+        self.assertEqual(response.status_code, 302)
+        (management,) = NSODeviceManagement.objects.filter(device=self.device)
+        self.assertEqual((management.onboard_status, management.onboard_job_id), ("provisioning", "4417"))
 
     def test_quick_manage_outside_the_add_constraint_is_refused(self):
         self.client.force_login(self._user({"nso_device_name": "nw-only-this-name"}))
@@ -482,3 +550,39 @@ class TestOnboardingAddConstraint(AdapterCase):
         with self.assert_refused_whole():
             self.assertEqual(self._api_post(user).status_code, 403)
         self.assertNothingCreated()
+
+
+class TestInterfaceIpPrefixRefresh(AdapterCase):
+    """A refresh with IP auto-create creates the covering Prefix through the system writer."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from ipam.models import Prefix
+
+        cls.device, cls.management = make_managed("nw-prefix", 17188)
+        Interface.objects.create(device=cls.device, name="Loopback1", type="virtual")
+        # The new /24 re-parents this /26: NetBox recomputes the depth cache inside the permitted save.
+        cls.child = Prefix.objects.create(prefix="198.18.61.0/26")
+        cls.admin = User.objects.create_superuser(username=f"nw-prefix-admin-{uuid4().hex[:6]}")
+
+    def test_refresh_creates_the_missing_prefix(self):
+        from unittest.mock import patch
+
+        from django.apps import apps
+        from ipam.models import IPAddress, Prefix
+
+        address = {"address": "198.18.61.200/24", "vrf": "", "family": "ipv4", "secondary": False}
+        FakeAdapter.documents = {
+            "/svi": {"interfaces": []},
+            "/subinterface": {"interfaces": []},
+            "/interface-ips": {
+                "device_id": self.device.pk,
+                "interfaces": [{"interface": "Loopback1", "addresses": [address]}],
+            },
+        }
+        with patch.object(apps.get_app_config("netbox_nso_plugin"), "_interface_ip_auto_create", True):
+            _refresh(self, self.admin, self.device, "interface_ips")
+        self.assertTrue(IPAddress.objects.filter(address="198.18.61.200/24").exists())
+        self.assertTrue(Prefix.objects.filter(prefix="198.18.61.0/24").exists())
+        self.child.refresh_from_db()
+        self.assertEqual(self.child._depth, 1)
