@@ -798,13 +798,14 @@ def _matching_peer_ip_state(state, candidates):
     return in_subnet[0] if len(in_subnet) == 1 else None
 
 
-def _interface_topology_payload(interfaces, ip_states):
+def _interface_topology_payload(interfaces, ip_states, user):
     """Build cable/peer row metadata and an optional peer state per local IP.
 
     ``Interface.link_peers`` is NetBox's canonical cable-path traversal API. Only
     cabled interfaces invoke it, and peer Interface/Device plus Cable objects are
     then bulk-loaded for serialization. Far-end IP states are also loaded in one
     query so a peer on another device can participate in the two-ended editor.
+    Peers, cables and far-end states load through *user*'s view restrictions.
     """
     from dcim.models import Cable, Interface
 
@@ -818,12 +819,23 @@ def _interface_topology_payload(interfaces, ip_states):
             if peer is not None:
                 raw_peers[iface.pk] = peer.pk
 
-    peers = Interface.objects.filter(pk__in=set(raw_peers.values())).select_related("device").in_bulk()
-    cables = Cable.objects.in_bulk({iface.cable_id for iface in interfaces if iface.cable_id is not None})
+    visible_devices = Device.objects.restrict(user, "view")
+    peers = (
+        Interface.objects.restrict(user, "view")
+        .filter(pk__in=set(raw_peers.values()), device__in=visible_devices)
+        .select_related("device")
+        .in_bulk()
+    )
+    cables = Cable.objects.restrict(user, "view").in_bulk(
+        {iface.cable_id for iface in interfaces if iface.cable_id is not None}
+    )
     peer_states = {}
     states_by_peer = {}
     for state in (
-        NSOInterfaceIPState.objects.filter(interface_id__in=set(raw_peers.values()))
+        NSOInterfaceIPState.objects.filter(
+            interface_id__in=set(peers),
+            interface__device__nso_management__in=NSODeviceManagement.objects.restrict(user, "view"),
+        )
         .select_related("interface", "interface__device")
         .order_by("address")
     ):
@@ -1125,6 +1137,13 @@ class NSOCategoryView(AuthorizedView):
 
     policy = EndpointPolicy(DeviceRead(), "read")
 
+    def _may_reconcile(self, request):
+        """Return whether this request refreshes device facts, which needs change authority (system entry)."""
+        if request.GET.get("refresh"):
+            self.target.require("change")
+            return True
+        return self.target.allows("change")
+
     def get(self, request, pk, key):
         """Render one category's rows.
 
@@ -1161,7 +1180,7 @@ class NSOCategoryView(AuthorizedView):
             return HttpResponseBadRequest(f"unknown category: {escape(key)}")
 
         ctx = {"object": device, "mgmt": mgmt, "status_badge": _STATUS_BADGE}
-        if mgmt is not None and mgmt.adapter_device_id is not None:
+        if mgmt is not None and mgmt.adapter_device_id is not None and self._may_reconcile(request):
             try:
                 ctx.update(reconcile_category(device, mgmt, key))
             except (AdapterError, DeploymentQuiesced) as exc:
@@ -1184,7 +1203,7 @@ class NSOCategoryView(AuthorizedView):
                         if pkey in defaults and ctx.get(pkey) == defaults[pkey]:
                             ctx[pkey] = pval
         else:
-            # Unlinked device: nothing to reconcile, but NetBox still holds state.
+            # Unlinked device, or no change authority to refresh: NetBox still holds state.
             ctx.update(_persisted_category_context(device, mgmt, key))
         _annotate_residue_rows(ctx, key, mgmt)
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
@@ -1267,6 +1286,7 @@ class NSOCategoryView(AuthorizedView):
         if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
             from .reconcile import reconcile_category
 
+            self.target.require("change")
             try:
                 reconcile_category(device, mgmt, key)
             except (AdapterError, DeploymentQuiesced) as exc:
@@ -1356,6 +1376,7 @@ class NSOCategoryView(AuthorizedView):
         # live reconcile. Freshness otherwise comes from the sync-complete reconcile.
         adapter_error = None
         if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
+            self.target.require("change")
             try:
                 reconcile_category(device, mgmt, "interface")
             except (AdapterError, DeploymentQuiesced) as exc:
@@ -1405,7 +1426,7 @@ class NSOCategoryView(AuthorizedView):
             Interface.objects.filter(pk__in=ifaces).select_related("untagged_vlan").prefetch_related("tagged_vlans"),
             key=lambda i: i.name,
         )
-        links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states)
+        links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states, request.user)
         native_ips = _native_ip_by_state(ip_states)
 
         projections_by_iface = {
@@ -1983,7 +2004,11 @@ class NSOCategoryView(AuthorizedView):
         # Never reconcile for the JSON reload: the grid re-fetches after every action, so
         # that would be a device read per Accept click.
         may_reconcile = not want_json and mgmt is not None and mgmt.adapter_device_id is not None
-        if may_reconcile and (spec["reconcile_on_expand"] or request.GET.get("refresh")):
+        if (
+            may_reconcile
+            and (spec["reconcile_on_expand"] or request.GET.get("refresh"))
+            and self._may_reconcile(request)
+        ):
             from .reconcile import reconcile_category
 
             try:
@@ -7232,7 +7257,11 @@ class SharedObjectVersionsMixin(AuthorizedView, abstract=True):
 
         state = self.target.primary
         # Versions of managements the user may not view are left out of the list and its verdicts.
-        visible = set(NSODeviceManagement.objects.restrict(request.user, "view").values_list("pk", flat=True))
+        visible = set(
+            NSODeviceManagement.objects.restrict(request.user, "view")
+            .filter(device__in=Device.objects.restrict(request.user, "view"))
+            .values_list("pk", flat=True)
+        )
         items = [
             item
             for item in ownership.version_items(self.model_class, state.family, state.object_name)
@@ -8639,11 +8668,10 @@ class NSORoutePolicyCapabilityView(AuthorizedView):
     the per-object panel badge.
     """
 
-    _PROBE_TARGET = Management("change", "device_pk", by="device")
     policy = MappingProxyType(
         {
             "get": EndpointPolicy(Management("view", "device_pk", by="device", device_view=True), "adapter_action"),
-            "post": EndpointPolicy(_PROBE_TARGET, "adapter_action"),
+            "post": EndpointPolicy(Management("change", "device_pk", by="device"), "adapter_action"),
         }
     )
 
@@ -8652,8 +8680,7 @@ class NSORoutePolicyCapabilityView(AuthorizedView):
         mgmt = self.target.management
         if refresh:
             # A forced probe touches the device: it needs the same authority as the POST.
-            probe = EndpointPolicy(self._PROBE_TARGET, "adapter_action")
-            mgmt = probe.authorize(request, request.user, self.kwargs).management
+            self.target.require("change")
         return render(request, "netbox_nso_plugin/route_policy_capabilities.html", self._context(mgmt, refresh))
 
     def post(self, request, device_pk):  # noqa: D102

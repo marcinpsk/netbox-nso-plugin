@@ -130,6 +130,21 @@ class AuthorizedTarget:
             return model.objects.filter(pk=self.management.pk)
         return model.objects.filter(**{AUTHZ_TARGETS[model._meta.label_lower].management: self.management})
 
+    def allows(self, action):
+        """Return whether the user may perform *action* on the authorized management."""
+        return (
+            self.management is not None
+            and self.user.has_perm(f"netbox_nso_plugin.{action}_nsodevicemanagement")
+            and _managements(self.user, action).filter(pk=self.management.pk).exists()
+        )
+
+    def require(self, action):
+        """Require *action* on the authorized management: 403 without the permission, 404 outside it."""
+        if not self.user.has_perm(f"netbox_nso_plugin.{action}_nsodevicemanagement"):
+            raise PermissionDenied
+        if not self.allows(action):
+            raise Http404
+
     @staticmethod
     def selected(queryset, pks):
         """Return the selected rows, or 404 when any requested key is outside *queryset*."""
@@ -394,7 +409,10 @@ class OwnerRow(TargetSpec):
             raise NotFound("Unknown owner model.")
         path = AUTHZ_TARGETS[spec.model_label]
         queryset = spec.model.objects.restrict(user, "view").filter(
-            **{f"{path.management}__in": _managements(user, "view")}
+            **{
+                f"{path.management}__in": _managements(user, "view"),
+                f"{path.device}__in": _device_model().objects.restrict(user, "view"),
+            }
         )
         if spec.model_label == "netbox_nso_plugin.nsobgprouterstate":
             from .views import _visible_bgp_router_states
@@ -429,14 +447,12 @@ class IntegrationSync(TargetSpec):
         if device_id is None and adapter_device_id is None:
             raise ParseError("netbox_device_id or adapter_device_id is required")
         managements = _managements(user, self.action)
-        if device_id is not None and adapter_device_id is not None:
-            management = managements.filter(device_id=device_id, adapter_device_id=adapter_device_id).first()
-            if management is None:
-                raise ParseError("device identities do not match")
-        elif device_id is not None:
+        if device_id is not None:
             management = managements.filter(device_id=device_id).first()
             if management is None:
                 raise NotFound(f"no managed device for netbox_device_id={device_id}")
+            if adapter_device_id is not None and management.adapter_device_id != adapter_device_id:
+                raise ParseError("device identities do not match")
         else:
             management = managements.filter(adapter_device_id=adapter_device_id).first()
             if management is None:

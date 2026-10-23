@@ -605,6 +605,101 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertEqual(orphan.state, "terminal")
         self.assertEqual(enqueue.call_count, 2)
 
+    def _view_device_a_only(self):
+        _grant(self.user, ("view",), Device, {"pk": self.device_a.pk})
+        _grant(self.user, ("view",), NSODeviceManagement)
+
+    def test_a_category_refresh_needs_change_authority(self):
+        """A refresh enters the system scope, so its trigger needs change on the management (D5)."""
+        _grant(self.user, ("view",), Device)
+        _grant(self.user, ("view",), NSODeviceManagement)
+        category = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device_b.pk, "key": "vlan"}
+        )
+        self.assertEqual(self.client.get(category, {"refresh": "1"}).status_code, 403)
+        _grant(self.user, ("change",), NSODeviceManagement, {"pk": self.management_a.pk})
+        self.assertEqual(self.client.get(category, {"refresh": "1"}).status_code, 404)
+        expand = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device_b.pk, "key": "lacp"}
+        )
+        self.assertEqual(self.client.get(expand).status_code, 200)
+        self.assertEqual(_CountingSession.calls, [])
+
+    def test_the_interface_grid_hides_an_excluded_cable_peer(self):
+        from dcim.models import Cable, CableTermination
+
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        local = Interface.objects.create(device=self.device_a, name="Ethernet41", type="1000base-t")
+        remote = Interface.objects.create(device=self.device_b, name="Ethernet42", type="1000base-t")
+        cable = Cable.objects.create(status="connected")
+        CableTermination.objects.create(cable=cable, cable_end="A", termination=local)
+        CableTermination.objects.create(cable=cable, cable_end="B", termination=remote)
+        with without_commit_drain():
+            acquire_overlay(NSOInterfaceIPState, interface=local, address="198.18.40.1/30", status="imported")
+            acquire_overlay(NSOInterfaceIPState, interface=remote, address="198.18.40.2/30", status="imported")
+        url = reverse(
+            "plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device_a.pk, "key": "interface"}
+        )
+        self.client.force_login(User.objects.create_superuser(username=f"authz-peer-admin-{uuid4().hex[:6]}"))
+        self.assertIn(self.device_b.name, self.client.get(url, {"format": "json"}).content.decode())
+        self.client.force_login(self.user)
+        self._view_device_a_only()
+        _grant(self.user, ("view",), Interface)
+        response = self.client.get(url, {"format": "json"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(self.device_b.name, response.content.decode())
+        self.assertNotIn("198.18.40.2", response.content.decode())
+
+    def test_owner_state_api_needs_the_rows_device(self):
+        with without_commit_drain():
+            interface = Interface.objects.create(device=self.device_b, name="Ethernet32", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceState, interface=interface, attribute="description")
+        _grant(self.user, ("view",), NSOInterfaceState)
+        self._view_device_a_only()
+        url = reverse("plugins-api:netbox_nso_plugin-api:owner-state-detail", args=(row._meta.model_name, row.pk))
+        self.assertEqual(self._api().get(url).status_code, 404)
+
+    def test_sync_complete_with_both_identities(self):
+        _grant(self.user, ("sync",), NSODeviceManagement, {"pk": self.management_a.pk})
+        api = self._api()
+        url = reverse("plugins-api:netbox_nso_plugin-api:sync_complete")
+        with patch("netbox_nso_plugin.reconcile.enqueue_device_reconcile") as enqueue:
+            excluded = api.post(
+                url,
+                {"netbox_device_id": self.device_b.pk, "adapter_device_id": self.management_b.adapter_device_id},
+                format="json",
+            )
+            mismatched = api.post(
+                url,
+                {"netbox_device_id": self.device_a.pk, "adapter_device_id": self.management_b.adapter_device_id},
+                format="json",
+            )
+        self.assertEqual((excluded.status_code, mismatched.status_code), (404, 400))
+        enqueue.assert_not_called()
+
+    def test_an_excluded_nso_instance_inventory_is_404(self):
+        from netbox_nso_plugin.models import NSOInstance
+
+        _grant(self.user, ("view",), NSOInstance, {"pk": self.management_a.nso_instance_id})
+        excluded = self.client.get(
+            reverse(
+                "plugins:netbox_nso_plugin:ajax_nso_device_names",
+                kwargs={"instance_pk": self.management_b.nso_instance_id},
+            )
+        )
+        self.assertEqual(excluded.status_code, 404)
+        self.assertEqual(_CountingSession.calls, [])
+
+    def test_owner_state_api_needs_the_rows_management(self):
+        with without_commit_drain():
+            interface = Interface.objects.create(device=self.device_b, name="Ethernet31", type="1000base-t")
+            row = acquire_overlay(NSOInterfaceState, interface=interface, attribute="description")
+        _grant(self.user, ("view",), NSOInterfaceState)
+        _grant(self.user, ("view",), NSODeviceManagement, {"pk": self.management_a.pk})
+        url = reverse("plugins-api:netbox_nso_plugin-api:owner-state-detail", args=(row._meta.model_name, row.pk))
+        self.assertEqual(self._api().get(url).status_code, 404)
+
     def test_onboarding_needs_a_visible_device(self):
         _grant(self.user, ("add",), NSODeviceManagement)
         _grant(self.user, ("view",), Device, {"pk": self.device_a.pk})
@@ -638,8 +733,8 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
             )
             for management in (self.management_a, self.management_b)
         ]
-        _grant(self.user, ("view",), Device)
-        _grant(self.user, ("view",), NSODeviceManagement, {"pk": self.management_a.pk})
+        # Management view is unconstrained; only the device restriction hides B's version.
+        self._view_device_a_only()
         response = self.client.get(
             reverse("plugins:netbox_nso_plugin:routing_route_policy_versions", kwargs={"pk": rows[0].pk})
         )
