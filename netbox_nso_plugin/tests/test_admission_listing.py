@@ -112,6 +112,34 @@ class TestAdmissionListing(DeploymentCase):
         self.assertEqual(list(NSOAcceptedSelection.objects.order_by("pk").values()), before)
         self.assertFalse(NSOApplyExecution.objects.exists())
 
+    def test_held_rejection_with_null_generations_has_no_admission_links(self):
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal())
+        rejected = NSOApplyAttempt.objects.create(
+            management=self.management,
+            adapter_device_id=self.management.adapter_device_id,
+            selected={"bgp": 1},
+            http_status=409,
+            response={
+                "error": {"code": "apply_unexecutable", "message": "Rejected.", "detail": {}},
+                "generations": None,
+            },
+        )
+        NSOApplyAttempt.objects.filter(pk=rejected.pk).update(adapter_apply_attempt_id=rejected.pk)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = response.json()
+                document["head"]["apply_attempt_id"] = str(rejected.pk)
+                return make_response(200, document)
+            return response
+
+        self.adapter._handle = handle
+        with deployment.gate_bypass():
+            load_deployment_evidence(self.management, attempt_ids=())
+
     def test_retry_carrier_does_not_change_immutable_admission_links(self):
         from netbox_nso_plugin.apply_settlement import settle_device_apply_attempts
 

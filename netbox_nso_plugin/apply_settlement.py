@@ -266,10 +266,7 @@ def reconcile_admission_links(responses, generations):
         if not isinstance(response, dict):
             raise EvidenceInvariantError("admission_generation_mismatch")
         _response_generation_ids(response)
-        links = response.get("generations", [])
-        if not isinstance(links, list):
-            raise EvidenceInvariantError("admission_generation_mismatch")
-        for link in links:
+        for link in response.get("generations") or ():
             generation = by_id.get(link["generation_id"])
             if generation is None:
                 raise EvidenceInvariantError("admission_generation_mismatch")
