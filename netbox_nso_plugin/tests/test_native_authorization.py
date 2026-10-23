@@ -306,6 +306,25 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "one")
 
+    def test_a_signal_born_m2m_edge_of_another_owner_is_refused(self):
+        """A through-table bulk write during A's permitted save must belong to A (C9a)."""
+        from django.db.models.signals import post_save
+        from ipam.models import VLAN
+
+        vlan = VLAN.objects.create(vid=3002, name="nw-edge")
+        through = Interface.tagged_vlans.through
+
+        def add_edge(sender, instance, **kwargs):
+            if instance.pk == self.first.pk:
+                through.objects.bulk_create([through(interface_id=self.second.pk, vlan_id=vlan.pk)])
+
+        post_save.connect(add_edge, sender=Interface, dispatch_uid="nw-edge")
+        self.addCleanup(post_save.disconnect, sender=Interface, dispatch_uid="nw-edge")
+        candidate = Interface.objects.get(pk=self.first.pk)
+        candidate.description = "edge"
+        self.assertRefused(lambda: _plan_save(candidate, ("description",)))
+        self.assertFalse(through.objects.filter(interface_id=self.second.pk).exists())
+
     def test_the_permitted_write_succeeds(self):
         candidate = Interface.objects.get(pk=self.first.pk)
         candidate.description = "permitted"

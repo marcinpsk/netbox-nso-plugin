@@ -723,8 +723,18 @@ def _guard_save(sender, instance, **kwargs):
     _refuse(f"native save of {sender._meta.label_lower} without its writer permit")
 
 
-def _through_permitted(model, permit):
-    return permit is not None and model._meta.auto_created and model._meta.db_table in permit.tables
+def _through_owned(model, row, permit):
+    """Return whether *row* of an M2M through table belongs to the permit's relation owner."""
+    if permit is None or permit.kind not in ("save", "m2m") or not model._meta.auto_created:
+        return False
+    for relation in type(permit.instance)._meta.many_to_many:
+        if relation.remote_field.through is not model:
+            continue
+        if permit.kind == "m2m" and relation.name != permit.field_name:
+            continue
+        owner = model._meta.get_field(relation.m2m_field_name()).attname
+        return getattr(row, owner) == permit.instance.pk
+    return False
 
 
 def _guard_delete(sender, instance, **kwargs):
@@ -732,7 +742,7 @@ def _guard_delete(sender, instance, **kwargs):
     if scope is None or not is_native(sender):
         return
     permit = scope.top()
-    if _through_permitted(sender, permit):
+    if _through_owned(sender, instance, permit):
         return
     if permit is None or permit.kind != "delete" or (sender._meta.label_lower, instance.pk) not in permit.pks:
         _refuse(f"native delete of {sender._meta.label_lower} without its writer permit")
@@ -810,7 +820,10 @@ def _guarded_bulk(bulk):
         if scope is None or not is_native(self.model):
             return bulk(self, *args, **kwargs)
         permit = scope.top()
-        if _through_permitted(self.model, permit):
+        rows = list(args[0] if args else kwargs.get("objs", ()))
+        args, kwargs = ((rows, *args[1:]), kwargs) if args else ((), {**kwargs, "objs": rows})
+        # M2M add writes the owner's own through rows; another owner's rows need their own permit.
+        if rows and all(_through_owned(self.model, row, permit) for row in rows):
             return bulk(self, *args, **kwargs)
         names = (args[1] if len(args) > 1 else kwargs.get("fields", ())) if bulk.__name__ == "bulk_update" else ()
         if not _bookkeeping_update(self.model, tuple(names), permit):

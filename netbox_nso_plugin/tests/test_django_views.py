@@ -7656,6 +7656,10 @@ class TestBfdGrid(ViewTestBase):
             min_rx=100,
             multiplier=5,
         )
+        from netbox_routing.models import BFDInterface
+
+        # Gi0/3's owned intent has its native BFD interface; Gi0/2's native row is missing (a gap).
+        BFDInterface.objects.create(interface=self.ifaces["Gi0/3"], micro_bfd=False, enabled=True)
 
     def _url(self):
         return reverse(
@@ -7684,9 +7688,11 @@ class TestBfdGrid(ViewTestBase):
         self.assertEqual(by_iface["Gi0/2"]["state"], "pending")
         self.assertEqual(by_iface["Gi0/3"]["state"], "in_sync")
 
-        # Accept shows only for a not-yet-owned row (mirrors _accept_cell.html).
+        # Accept shows for a not-yet-owned row, and for an owned row whose native BFD interface is
+        # missing: that Accept creates it (#1717). An owned row with its native row offers none.
         self.assertTrue(by_iface["Gi0/1"]["accept_url"])
-        self.assertIsNone(by_iface["Gi0/2"]["accept_url"])
+        self.assertTrue(by_iface["Gi0/2"]["accept_url"])
+        self.assertTrue(by_iface["Gi0/2"]["native_gap"])
         self.assertIsNone(by_iface["Gi0/3"]["accept_url"])
 
         # Timers + mode survive the round trip.
