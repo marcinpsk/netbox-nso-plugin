@@ -71,11 +71,17 @@ Run migrations:
 python manage.py migrate netbox_nso_plugin
 ```
 
-Give the adapter's NetBox callback token to a service user with an `ObjectPermission`
-for the `change` action on **NSO Provision Tombstone**. The adapter uses this token
-when it posts to `POST /api/plugins/nso/provision-complete/`. An authenticated token
-without `netbox_nso_plugin.change_nsoprovisiontombstone` receives HTTP 403. The
-periodic tombstone sweep still checks jobs when a callback cannot be delivered.
+Give the adapter's NetBox callback token to a service user with two `ObjectPermission`
+rows:
+
+- the `change` action on **NSO Provision Tombstone**, for
+  `POST /api/plugins/nso/provision-complete/`;
+- the custom action `sync` on **NSO Device Management** (enter it under additional
+  actions), for `POST /api/plugins/nso/sync-complete/`.
+
+An authenticated token without the permission receives HTTP 403. A callback for a row
+outside the permission's constraints receives HTTP 404. The periodic tombstone sweep
+still checks jobs when a callback cannot be delivered.
 
 The `adapter_token` setting above authenticates requests from NetBox to the adapter.
 The callback token authenticates requests from the adapter to NetBox.

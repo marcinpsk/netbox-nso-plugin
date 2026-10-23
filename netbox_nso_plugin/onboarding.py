@@ -89,12 +89,15 @@ def _match_netbox_device(nso_dev, by_id, by_name, by_ip):
     return None, None
 
 
-def build_onboarding_dashboard(instance) -> dict:
-    """Build the three-tile structure for *instance* (an NSOInstance).
+def build_onboarding_dashboard(instance, user) -> dict:
+    """Build the three-tile structure for *instance* (an NSOInstance) as *user* may see it.
 
     Returns ``{instance, error, onboarded, candidates, orphans}``. On adapter
     failure ``error`` is set and the lists are empty (the view renders the banner).
+    Matching uses every NetBox device; the tiles keep only devices *user* may view.
     """
+    from dcim.models import Device
+
     from . import adapter_client as client
     from .adapter_client import AdapterError, public_error_message
     from .models import NSOPlatformNedMapping
@@ -156,7 +159,9 @@ def build_onboarding_dashboard(instance) -> dict:
         else:
             out["orphans"].append(entry)
 
-    out["candidates"] = _candidates(by_id, matched_ids, mappings)
+    visible = set(Device.objects.restrict(user, "view").values_list("pk", flat=True))
+    out["onboarded"] = [entry for entry in out["onboarded"] if entry["netbox_device"].pk in visible]
+    out["candidates"] = [entry for entry in _candidates(by_id, matched_ids, mappings) if entry["device"].pk in visible]
     out["onboarded"].sort(key=lambda e: e["nso_name"])
     out["orphans"].sort(key=lambda e: e["nso_name"])
     return out

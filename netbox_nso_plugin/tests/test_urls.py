@@ -44,11 +44,6 @@ PK_LINK_NAMES = [
     "plugins:netbox_nso_plugin:nsointerfacestate_accept",
 ]
 
-# URL names that require a ``job_id`` kwarg instead of ``pk``.
-JOB_ID_LINK_NAMES = [
-    "plugins:netbox_nso_plugin:nsojob_status",
-]
-
 _TEMPLATES_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "templates",
@@ -85,16 +80,10 @@ class TestNavigationLinksResolve(SimpleTestCase):
         if broken:
             self.fail("Broken pk URL names:\n" + "\n".join(broken))
 
-    def test_job_id_links_resolve(self):
-        """Every job_id-based URL resolves with job_id=1."""
-        broken = []
-        for name in JOB_ID_LINK_NAMES:
-            try:
-                reverse(name, kwargs={"job_id": 1})
-            except NoReverseMatch as exc:
-                broken.append(f"{name}: {exc}")
-        if broken:
-            self.fail("Broken job_id URL names:\n" + "\n".join(broken))
+    def test_no_unscoped_job_status_route(self):
+        """Job status is read only through a device's job collection (#1709): no route takes a bare job id."""
+        with self.assertRaises(NoReverseMatch):
+            reverse("plugins:netbox_nso_plugin:nsojob_status", kwargs={"job_id": 1})
 
     def test_action_url_resolves(self):
         """Parametric action URL resolves with pk + action string."""

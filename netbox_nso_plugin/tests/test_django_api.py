@@ -403,7 +403,12 @@ class OnboardAPIPermissionTest(APITestCase):
 class OnboardAPIConflictTest(APITestCase):
     """The onboard API preserves an active adapter provision conflict."""
 
-    user_permissions = ("netbox_nso_plugin.change_nsodevicemanagement",)
+    # The device and the instance resolve through view restrictions (#1709).
+    user_permissions = (
+        "netbox_nso_plugin.change_nsodevicemanagement",
+        "dcim.view_device",
+        "netbox_nso_plugin.view_nsoinstance",
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -465,6 +470,9 @@ class OnboardAPIConflictTest(APITestCase):
 class OnboardingCandidatesAPITest(APITestCase):
     """The CICD-facing candidates API exposes the management IP + oob_only, and onboardable
     OOB-only devices now appear (with primary_ip kept null for backward compatibility)."""
+
+    # The inventory lists only instances and devices the token may view (#1709).
+    user_permissions = ("netbox_nso_plugin.view_nsoinstance", "dcim.view_device")
 
     @classmethod
     def setUpTestData(cls):

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
+from django.contrib.auth import get_user_model
 from django.db import connection, connections, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from ipam.models import IPAddress
@@ -353,12 +354,37 @@ class TestOnboardingDashboard(TestCase):
 
         cls.instance = NSOInstance.objects.create(name="onb", adapter_instance_id="onb")
         cls.ios = Platform.objects.create(name="IOS", slug="ios-onb")
+        cls.viewer = get_user_model().objects.create_superuser(username="onb-viewer")
 
-    def _build(self, nso_devices):
+    def _build(self, nso_devices, user=None):
         from netbox_nso_plugin.onboarding import build_onboarding_dashboard
 
         with patch("netbox_nso_plugin.adapter_client.list_instance_devices", return_value=nso_devices):
-            return build_onboarding_dashboard(self.instance)
+            return build_onboarding_dashboard(self.instance, user or self.viewer)
+
+    def test_tiles_show_only_devices_the_user_may_view(self):
+        """Matching sees every device; the onboarded and candidate tiles keep only visible ones (#1709)."""
+        from core.models import ObjectType
+        from users.models import ObjectPermission
+
+        from netbox_nso_plugin.models import NSOPlatformNedMapping
+
+        NSOPlatformNedMapping.objects.create(platform=self.ios, ned_id="cisco-ios-cli-6.114")
+        visible = _device("vis-cand", platform=self.ios, ip="10.1.2.1/24")
+        _device("hid-cand", platform=self.ios, ip="10.1.2.2/24")
+        hidden_onboarded = _device("hid-onb")
+        user = get_user_model().objects.create_user(username="onb-constrained")
+        permission = ObjectPermission.objects.create(
+            name="onb-view-one", actions=["view"], constraints={"pk": visible.pk}
+        )
+        permission.object_types.add(ObjectType.objects.get_for_model(Device))
+        permission.users.add(user)
+
+        data = self._build([self._nso("nso-hid", nb_id=hidden_onboarded.id)], user)
+
+        self.assertEqual([c["device"] for c in data["candidates"]], [visible])
+        self.assertEqual(data["onboarded"], [])
+        self.assertEqual(data["orphans"], [])
 
     def _nso(self, name, *, ned="cisco-ios-cli-6.114", address=None, nb_id=None, admin="unlocked"):
         return {
@@ -475,7 +501,7 @@ class TestOnboardingDashboard(TestCase):
             "netbox_nso_plugin.adapter_client.list_instance_devices",
             side_effect=AdapterError("boom", code="nso_unreachable"),
         ):
-            data = build_onboarding_dashboard(self.instance)
+            data = build_onboarding_dashboard(self.instance, self.viewer)
         self.assertIsNotNone(data["error"])
         self.assertEqual(data["onboarded"], [])
 

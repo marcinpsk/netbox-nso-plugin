@@ -813,7 +813,7 @@ class TestInterfacesPageNoAttrsHint(ViewTestBase):
 
         req = RequestFactory().get("/x?key=interfaces")
         req.user = self.superuser
-        return NSOCategoryView()._render_interfaces_page(req, device).content.decode()
+        return NSOCategoryView()._render_interfaces_page(req, device, device.nso_management).content.decode()
 
     def test_hint_shown_when_master_on_no_leaves(self):
         """Master on, no leaf attrs, no rows → actionable hint, not the sync message."""
@@ -1269,55 +1269,6 @@ class TestNSODeviceNamesView(ViewTestBase):
         mock_session_cls.return_value = session
 
         url = reverse("plugins:netbox_nso_plugin:ajax_nso_device_names", args=[self.nso_instance.pk])
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 502)
-
-
-# ── NSO Job Status view ──────────────────────────────────────────────────────────
-
-
-class TestNSOJobStatusView(ViewTestBase):
-    """Tests for NSOJobStatusView."""
-
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_get_job_returns_json(self, mock_session_cls, mock_cfg):
-        """GET returns JSON job status from adapter."""
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
-        session = make_session(
-            response=make_response(200, json_data={"id": 42, "type": "apply", "status": "succeeded"})
-        )
-        mock_session_cls.return_value = session
-
-        url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[42])
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 200)
-        data = json.loads(response.content)
-        self.assertEqual(data["id"], 42)
-
-    @patch("netbox_nso_plugin.adapter_client._resolve_config")
-    @patch("netbox_nso_plugin.adapter_client.requests.Session")
-    def test_get_job_adapter_error(self, mock_session_cls, mock_cfg):
-        """GET returns 502 on adapter error."""
-        mock_cfg.return_value = {
-            "url": "http://adapter",
-            "token": "tok",
-            "verify_tls": True,
-            "ca_cert_path": None,
-            "timeout": 30,
-        }
-        session = make_session(
-            response=make_response(404, json_data={"error": {"code": "not_found", "message": "job gone", "detail": {}}})
-        )
-        mock_session_cls.return_value = session
-
-        url = reverse("plugins:netbox_nso_plugin:nsojob_status", args=[99])
         response = self.client.get(url)
         self.assertEqual(response.status_code, 502)
 
@@ -6587,9 +6538,10 @@ class TestOverlayFieldEditView(ViewTestBase):
         row.refresh_from_db()
         self.assertEqual(row.l2_mtu, 9214)
 
-    def test_unknown_key_400(self):
+    def test_unknown_key_404(self):
+        """An unknown family key names no target (#1709): the resolver answers 404 before the handler."""
         r = self.client.post(self._url("does_not_exist", 1), {"anything": "x"})
-        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.status_code, 404)
 
 
 class TestOverlayFieldEditStalePlan(ViewTestBase):

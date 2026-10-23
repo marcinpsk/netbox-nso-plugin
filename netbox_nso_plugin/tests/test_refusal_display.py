@@ -893,15 +893,15 @@ class TestRefusalDisplay(RefusalDisplayHelpers, BGPSettlementHelpers, BGPCapture
         original = self.adapter._handle
 
         def handle(method, url, **kwargs):
-            if method == "GET" and url.endswith("/jobs/501"):
-                return make_response(200, job)
+            if method == "GET" and url.endswith("/jobs"):
+                return make_response(200, [job])
             return original(method, url, **kwargs)
 
         self.adapter._handle = handle
-        response = self.client.get(reverse("plugins:netbox_nso_plugin:nsojob_status", args=(501,)))
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:device_nso_jobs", args=(self.device.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(canary, response.content.decode())
-        self.assertIn("nothing committed", response.json()["refusal_summary"])
+        self.assertIn("nothing committed", response.json()["jobs"][0]["refusal_summary"])
 
     def test_all_category_grids_project_safe_refusal(self):
         from netbox_routing.models import ISISInstance, OSPFInstance
