@@ -80,12 +80,20 @@ def test_refusal_protocol_corpus_row_identities():
 
 def test_refusal_protocol_corpus_messages_parse_and_validate():
     from netbox_nso_plugin.refusal_contract import validate_refusals
-    from netbox_nso_plugin.refusal_protocol import RefusalProtocolError, claims_refusal, parse_refusals, render_refusals
+    from netbox_nso_plugin.refusal_protocol import (
+        PREFIX,
+        RefusalProtocolError,
+        claims_refusal,
+        parse_refusals,
+        render_refusals,
+    )
 
     corpus = json.loads((ROOT / "refusal_protocol_corpus.json").read_bytes())
     for case in corpus["valid"]:
         parsed = parse_refusals(case["message"])
         assert render_refusals(parsed) == case["message"], case["name"]
+        # With the round trip above, this binds the parsed records to the corpus records.
+        assert json.loads(case["message"].removeprefix(PREFIX)) == {"refusals": case["refusals"]}, case["name"]
         attributed = [
             {**record, "logical_rows": [], "provenance": "current", "sender_phase": "commit"}
             for record in case["refusals"]
