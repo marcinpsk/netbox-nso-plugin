@@ -580,6 +580,8 @@ class _VlanClockStore(ApplyingStore):
             seq=generation_id,
             status="settled" if self.settle_vlan else "running",
             job_id=job["id"],
+            carrier_job_id=job["id"] if self.settle_vlan else None,
+            carrier_job_status=job["status"] if self.settle_vlan else None,
             mode="networked",
             settlement_cohort=generation_id,
             digest="a" * 64,

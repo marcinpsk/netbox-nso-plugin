@@ -26,7 +26,7 @@ from django.urls import reverse
 from netbox_nso_plugin.adapter_client import _GENERATION_PAGE_LIMIT
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance
 
-from ._adapter_http import make_response, make_session
+from ._adapter_http import make_generation_listing, make_response, make_session
 
 User = get_user_model()
 TEST_PASSWORD = "testpass789"  # noqa: S105
@@ -96,6 +96,8 @@ def _device_generations():
             "seq": 4,
             "status": "settled",
             "job_id": 501,
+            "carrier_job_id": 501,
+            "carrier_job_status": "succeeded",
             "mode": "detach",
             "settlement_cohort": 73,
             "digest": "a" * 64,
@@ -109,6 +111,8 @@ def _device_generations():
             "seq": 5,
             "status": "pending",
             "job_id": None,
+            "carrier_job_id": None,
+            "carrier_job_status": None,
             "mode": "networked",
             "settlement_cohort": 73,
             "digest": "b" * 64,
@@ -122,6 +126,8 @@ def _device_generations():
             "seq": 9,
             "status": "running",
             "job_id": 510,
+            "carrier_job_id": None,
+            "carrier_job_status": None,
             "mode": "networked",
             "settlement_cohort": None,
             "digest": "c" * 64,
@@ -371,13 +377,14 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
         # One row past a full page, so only a second page can reach it.
         wanted = _GENERATION_PAGE_LIMIT + 1
         generations = [
-            {
-                "generation_id": seq,
-                "seq": seq,
-                "status": "settled",
-                "job_id": wanted if seq == wanted else None,
-                "settlement_cohort": None,
-            }
+            make_generation_listing(
+                generation_id=seq,
+                seq=seq,
+                job_id=wanted if seq == wanted else None,
+                carrier_job_id=wanted if seq == wanted else None,
+                carrier_job_status="succeeded" if seq == wanted else None,
+                settlement_cohort=None,
+            )
             for seq in range(1, wanted + 1)
         ]
         jobs = [_removal_job(wanted, "vlan", "succeeded")]
@@ -390,13 +397,14 @@ class TestDeviceJobsBlockedRemovals(BlockedRemovalTestBase):
     def test_requested_apply_generation_starts_after_the_browser_cursor(self):
         wanted = _GENERATION_PAGE_LIMIT + 1
         generations = [
-            {
-                "generation_id": seq,
-                "seq": seq,
-                "status": "settled",
-                "job_id": wanted if seq == wanted else None,
-                "settlement_cohort": None,
-            }
+            make_generation_listing(
+                generation_id=seq,
+                seq=seq,
+                job_id=wanted if seq == wanted else None,
+                carrier_job_id=wanted if seq == wanted else None,
+                carrier_job_status="succeeded" if seq == wanted else None,
+                settlement_cohort=None,
+            )
             for seq in range(1, wanted + 1)
         ]
         jobs = [_removal_job(wanted, "vlan", "succeeded")]

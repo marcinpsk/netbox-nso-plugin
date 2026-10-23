@@ -68,6 +68,8 @@ class LACPNativeTopologyAdapter(NativeOnlyAdapter):
                         {
                             **deepcopy(admitted),
                             "status": projection["status"],
+                            "carrier_job_id": projection["carrier_job_id"],
+                            "carrier_job_status": projection["carrier_job_status"],
                             "settlement_cohort": None,
                             "created_at": projection["updated_at"],
                             "updated_at": projection["updated_at"],
