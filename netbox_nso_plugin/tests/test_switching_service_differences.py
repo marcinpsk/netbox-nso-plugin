@@ -31,6 +31,7 @@ from netbox_nso_plugin.models import (
 )
 from netbox_nso_plugin.observations import observation_defaults
 
+from ._difference_fields import shown_fields
 from ._scope_observation_case import DOCUMENTS, entry, scope_observation
 from .test_gated_reconcile import _make
 
@@ -378,14 +379,14 @@ class TestLacpDifferences(_ScopeDifferences, TestCase):
         self.assertTrue(all(row.device_value is MISSING for row in rows if row.kind == "ambiguous"))
         self.assertNotIn(member.name, repr(rows))
         self.assertNotIn(self.native.name, repr(rows))
-        self.assertNotIn("123", repr(rows))
+        self.assertNotIn("123", shown_fields(rows))
         permission = ObjectPermission.objects.create(name="Visible bundle overlay", actions=["view"])
         permission.object_types.add(ObjectType.objects.get_for_model(NSOLACPBundleState))
         permission.users.add(self.user)
         self.user = get_user_model().objects.get(pk=self.user.pk)
         rows = self.rows()
         self.assertTrue(any(row.kind == "device_only" and row.identity == ("member", member.name) for row in rows))
-        self.assertIn("123", repr(rows))
+        self.assertIn("123", shown_fields(rows))
 
     def test_membership_uses_native_topology(self):
         self.interface.lag = None
@@ -465,7 +466,7 @@ class TestL2SapDifferences(_ScopeDifferences, TestCase):
         self.assertTrue(all(row.identity == "" and row.device_value is MISSING for row in rows))
         self.assertNotIn(service.name, repr(rows))
         self.assertNotIn("Ethernet1:200", repr(rows))
-        self.assertNotIn("200", repr(rows))
+        self.assertNotIn("200", shown_fields(rows))
         permission = ObjectPermission.objects.create(name="Visible L2 service", actions=["view"])
         permission.object_types.add(ObjectType.objects.get_for_model(L2VPN))
         permission.users.add(self.user)
@@ -474,7 +475,7 @@ class TestL2SapDifferences(_ScopeDifferences, TestCase):
         self.assertTrue(
             any(row.kind == "device_only" and row.identity == (service.name, "Ethernet1:200") for row in rows)
         )
-        self.assertIn("200", repr(rows))
+        self.assertIn("200", shown_fields(rows))
 
     def test_partial_sap_coverage_cannot_claim_absence(self):
         self.document["services"][0].pop("saps")
