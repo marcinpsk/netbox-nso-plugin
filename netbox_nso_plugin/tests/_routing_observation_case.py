@@ -8,6 +8,23 @@ import json
 
 from ._scope_observation_case import entry
 
+
+def redistribution_components(components):
+    """Build all protocol partitions from the inventories a fixture observed."""
+    components = copy.deepcopy(components)
+    for component in components:
+        component["status"] = "covered" if component["inventory"] is not None else "unavailable"
+        if component["status"] == "unavailable":
+            component["present"] = []
+    reported = {component.get("protocol") for component in components}
+    components.extend(
+        {"protocol": protocol, "status": "unavailable", "inventory": None, "present": []}
+        for protocol in ("bgp", "isis", "ospf")
+        if protocol not in reported
+    )
+    return components
+
+
 DOCUMENTS = {
     "bgp": {
         "routers": [
@@ -145,6 +162,8 @@ for family, document in DOCUMENTS.items():
     if family != "redistribution":
         document["present"] = sorted(document)
     document["unprojectable"] = []
+    if family == "redistribution":
+        document["components"] = redistribution_components(document["components"])
 
 COVERAGE = {
     "bgp": [
@@ -355,6 +374,15 @@ def routing_observation(family, *, document=None, coverage=None, revision=1, sou
             coverage["components"] = [
                 {"protocol": "ospf", "destinations": ["1"], "sources": [{"protocol": "bgp", "reference": "64512"}]}
             ]
+    if family == "redistribution":
+        document["components"] = redistribution_components(document["components"])
+        covered = {
+            component.get("protocol") for component in document["components"] if component["status"] == "covered"
+        }
+        coverage = {
+            **coverage,
+            "components": [component for component in coverage["components"] if component["protocol"] in covered],
+        }
     return {
         "family": family,
         "revision": revision,

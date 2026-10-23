@@ -14,7 +14,7 @@ from .test_read_gate import _rs
 
 
 def observation(family, *, revision=1, source_epoch=1, interfaces=None, unprojectable=None):
-    document = {"interfaces": interfaces or [], "unprojectable": unprojectable or []}
+    document = {"interfaces": interfaces or [], "present": ["interfaces"], "unprojectable": unprojectable or []}
     attributes = {
         "interface_attributes": ["description", "enabled"],
         "interface_ip": ["address", "prefix_length", "secondary", "vrf"],
@@ -47,6 +47,7 @@ def ip_observation(interface="Ethernet1", address="198.18.0.1/24", *, bound_port
     return {
         "interface": interface,
         "bound_port": bound_port,
+        "present": ["addresses"],
         "addresses": [
             {"address": address, "prefix_length": prefix_length, "family": "ipv4", "secondary": False, "vrf": vrf}
         ],
@@ -98,7 +99,9 @@ class ObservationTransport(BaseAdapter):
             response.url = request.url
             return response
         assert request.method == "GET", request.method
-        assert f"/devices/{self.device_id}/" in request.url, request.url
+        path = urlsplit(request.url).path
+        device_path = f"/api/v1/devices/{self.device_id}"
+        assert path == device_path or path.startswith(f"{device_path}/"), request.url
         assert endpoint in self.documents, endpoint
         status = 404 if endpoint == "interfaces-doc" and self.legacy else 200
         response = make_response(status, self.documents[endpoint])

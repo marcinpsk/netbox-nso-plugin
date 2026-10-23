@@ -24,17 +24,17 @@ def _observation():
         "family": "interface_attributes",
         "revision": 3,
         "source_epoch": 2,
-        "digest": "52155b66596db46cc9f022b1889b53ee59f70c0a0e619c6e0e46c735fa908b95",
+        "digest": "3960438c7e71c62e4ebcc2a43bff1941fd05dde3bbc7a5714b808df8bbda2e9b",
         "observed_at": "2026-10-01T12:00:00+00:00",
         "coverage": {"attributes": ["description", "enabled"]},
-        "document": {"interfaces": [], "unprojectable": []},
+        "document": {"interfaces": [], "present": ["interfaces"], "unprojectable": []},
     }
 
 
 def test_authoritative_empty_is_valid_and_has_an_aware_timestamp():
     validator = _validator()
     defaults = validator.observation_defaults("interface_attributes", 3, 2, _observation())
-    assert defaults["document"] == {"interfaces": [], "unprojectable": []}
+    assert defaults["document"] == {"interfaces": [], "present": ["interfaces"], "unprojectable": []}
     assert defaults["observed_at"].utcoffset().total_seconds() == 0
 
 
@@ -98,7 +98,7 @@ def test_ip_authoritative_empty_uses_the_same_canonical_digest():
     snapshot["family"] = "interface_ip"
     snapshot["coverage"] = {"attributes": ["address", "prefix_length", "secondary", "vrf"]}
     defaults = validator.observation_defaults("interface_ip", 3, 2, snapshot)
-    assert defaults["digest"] == "52155b66596db46cc9f022b1889b53ee59f70c0a0e619c6e0e46c735fa908b95"
+    assert defaults["digest"] == "3960438c7e71c62e4ebcc2a43bff1941fd05dde3bbc7a5714b808df8bbda2e9b"
 
 
 @pytest.mark.parametrize("field", ["revision", "source_epoch"])

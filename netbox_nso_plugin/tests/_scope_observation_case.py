@@ -31,6 +31,7 @@ DOCUMENTS = {
             {
                 "interface": "Ethernet1",
                 "bound_port": None,
+                "present": ["addresses"],
                 "addresses": [
                     {"address": "198.18.0.1/24", "prefix_length": 24, "family": "ipv4", "secondary": False, "vrf": ""}
                 ],
@@ -126,8 +127,7 @@ DOCUMENTS = {
 }
 
 for family, document in DOCUMENTS.items():
-    if family not in {"interface_attributes", "interface_ip"}:
-        document["present"] = sorted(document)
+    document["present"] = sorted(document)
     document["unprojectable"] = []
 
 

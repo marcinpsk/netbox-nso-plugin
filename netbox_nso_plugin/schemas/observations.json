@@ -645,9 +645,18 @@
             "default": "bgp",
             "title": "Protocol",
             "type": "string"
+          },
+          "status": {
+            "enum": [
+              "covered",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
           }
         },
         "required": [
+          "status",
           "inventory",
           "present"
         ],
@@ -798,10 +807,24 @@
         "additionalProperties": false,
         "properties": {
           "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/InterfaceAttributesEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
             "items": {
-              "$ref": "#/components/schemas/InterfaceAttributesEntry"
+              "type": "string"
             },
-            "title": "Interfaces",
+            "title": "Present",
             "type": "array"
           },
           "unprojectable": {
@@ -814,6 +837,7 @@
         },
         "required": [
           "interfaces",
+          "present",
           "unprojectable"
         ],
         "title": "InterfaceAttributesDocument",
@@ -1014,10 +1038,24 @@
         "additionalProperties": false,
         "properties": {
           "interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/InterfaceIpEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interfaces"
+          },
+          "present": {
             "items": {
-              "$ref": "#/components/schemas/InterfaceIpEntry"
+              "type": "string"
             },
-            "title": "Interfaces",
+            "title": "Present",
             "type": "array"
           },
           "unprojectable": {
@@ -1030,6 +1068,7 @@
         },
         "required": [
           "interfaces",
+          "present",
           "unprojectable"
         ],
         "title": "InterfaceIpDocument",
@@ -1039,11 +1078,18 @@
         "additionalProperties": false,
         "properties": {
           "addresses": {
-            "items": {
-              "$ref": "#/components/schemas/InterfaceIpAddressEntry"
-            },
-            "title": "Addresses",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/InterfaceIpAddressEntry"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Addresses"
           },
           "bound_port": {
             "anyOf": [
@@ -1059,12 +1105,20 @@
           "interface": {
             "title": "Interface",
             "type": "string"
+          },
+          "present": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Present",
+            "type": "array"
           }
         },
         "required": [
           "interface",
           "bound_port",
-          "addresses"
+          "addresses",
+          "present"
         ],
         "title": "InterfaceIpEntry",
         "type": "object"
@@ -2537,9 +2591,18 @@
             "default": "isis",
             "title": "Protocol",
             "type": "string"
+          },
+          "status": {
+            "enum": [
+              "covered",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
           }
         },
         "required": [
+          "status",
           "inventory",
           "present"
         ],
@@ -3972,9 +4035,18 @@
             "default": "ospf",
             "title": "Protocol",
             "type": "string"
+          },
+          "status": {
+            "enum": [
+              "covered",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
           }
         },
         "required": [
+          "status",
           "inventory",
           "present"
         ],
