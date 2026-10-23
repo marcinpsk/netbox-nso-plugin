@@ -11,6 +11,7 @@ from django.db import connections
 from django.test import TestCase, TransactionTestCase
 
 from ._adapter_http import make_session
+from ._authority_case import concurrent_writer
 from ._outbox_case import content_bulk_update
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -991,7 +992,8 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         def reassign_after_discovery(updates, planned_at):
             planned = original_plan(updates, planned_at)
             self.local_ip.assigned_object = self.peer
-            self.local_ip.save()
+            with concurrent_writer():
+                self.local_ip.save()
             return planned
 
         with patch.object(views, "_ip_edit_plan_and_operations", new=reassign_after_discovery):

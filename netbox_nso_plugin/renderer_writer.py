@@ -80,6 +80,8 @@ class RendererWrite:
     selected_before_values: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...] = ()
     cascade: bool = False
     force_insert: bool = False
+    # The value source labels an effect for the system NativeWriter; it is not part of the effect identity.
+    origin: Any = dataclass_field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,7 @@ class RendererSave:
     natural_key_fields: tuple[str, ...] = ()
     reference_fields: tuple[tuple[str, Any], ...] = ()
     expected_before: Any = None
+    origin: Any = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,7 @@ class RendererDelete:
 
     instance: Any
     expected_before: Any = None
+    origin: Any = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +148,7 @@ class RendererSetUpdate:
     selected_pks: tuple[Any, ...]
     selected_before_values: tuple[tuple[Any, tuple[tuple[str, Any], ...]], ...]
     values: tuple[tuple[str, Any], ...]
+    origin: Any = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +158,7 @@ class RendererM2MAdd:
     instance: Any
     field_name: str
     related: tuple[Any, ...]
+    origin: Any = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +168,7 @@ class RendererM2MSet:
     instance: Any
     field_name: str
     related: tuple[Any, ...]
+    origin: Any = None
 
 
 def planned_save(
@@ -172,8 +179,9 @@ def planned_save(
     natural_key=(),
     references=(),
     expected_before=None,
+    origin=None,
 ) -> RendererSave:
-    """Describe one save for :meth:`RendererMutationPlan.build`."""
+    """Describe one save for :meth:`RendererMutationPlan.build`; *origin* names a native row's value source."""
     fields = None if update_fields is None else tuple(sorted(set(update_fields)))
     normalized_references = tuple((instance._meta.get_field(name).attname, related) for name, related in references)
     return RendererSave(
@@ -183,12 +191,13 @@ def planned_save(
         natural_key_fields=tuple(natural_key),
         reference_fields=normalized_references,
         expected_before=expected_before,
+        origin=origin,
     )
 
 
-def planned_delete(instance, *, expected_before=None) -> RendererDelete:
+def planned_delete(instance, *, expected_before=None, origin=None) -> RendererDelete:
     """Describe one delete for :meth:`RendererMutationPlan.build`."""
-    return RendererDelete(instance=instance, expected_before=expected_before)
+    return RendererDelete(instance=instance, expected_before=expected_before, origin=origin)
 
 
 def planned_delete_many(instances) -> RendererDeleteBatch:
@@ -196,7 +205,7 @@ def planned_delete_many(instances) -> RendererDeleteBatch:
     return RendererDeleteBatch(instances=tuple(instances))
 
 
-def planned_set_update(queryset, **values) -> RendererSetUpdate:
+def planned_set_update(queryset, *, origin=None, **values) -> RendererSetUpdate:
     """Freeze one queryset and its exact set-based update values."""
     model = queryset.model
     if model._meta.label_lower in OVERLAY_MODEL_RANKS and "status" in values and not isinstance(values["status"], str):
@@ -216,17 +225,18 @@ def planned_set_update(queryset, **values) -> RendererSetUpdate:
         selected_pks=tuple(row.pk for row in selected),
         selected_before_values=tuple((row.pk, _field_values(row, None)) for row in selected),
         values=normalized,
+        origin=origin,
     )
 
 
-def planned_m2m_add(instance, field_name, related) -> RendererM2MAdd:
+def planned_m2m_add(instance, field_name, related, *, origin=None) -> RendererM2MAdd:
     """Freeze one M2M add operation before lock acquisition."""
-    return RendererM2MAdd(instance=instance, field_name=field_name, related=tuple(related))
+    return RendererM2MAdd(instance=instance, field_name=field_name, related=tuple(related), origin=origin)
 
 
-def planned_m2m_set(instance, field_name, related) -> RendererM2MSet:
+def planned_m2m_set(instance, field_name, related, *, origin=None) -> RendererM2MSet:
     """Freeze the exact final edge set for one M2M field."""
-    return RendererM2MSet(instance=instance, field_name=field_name, related=tuple(related))
+    return RendererM2MSet(instance=instance, field_name=field_name, related=tuple(related), origin=origin)
 
 
 @dataclass(frozen=True)
@@ -587,6 +597,7 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs, before, afte
                     proposed.reference_fields,
                 ),
                 force_insert=True,
+                origin=proposed.origin,
             ),
             MutationFootprint(),
             set(),
@@ -617,6 +628,7 @@ def _plan_save(proposed: RendererSave, creation_refs, support_refs, before, afte
         ),
         before_values=() if before is None else _field_values(before, None),
         force_insert=proposed.force_insert,
+        origin=proposed.origin,
     )
     if spec is None:
         if label in SOURCE_MODEL_RANKS:
@@ -877,7 +889,7 @@ def _plan_delete(proposed: RendererDelete):
         raise IntentMutationProtocolError(f"cannot plan deletion of missing {label} row {instance.pk!r}")
     writes, collector_footprint, changed_keys = _collector_writes(before)
     writes = tuple(
-        replace(write, before_values=_field_values(before, None))
+        replace(write, before_values=_field_values(before, None), origin=proposed.origin)
         if write.model_label == label and write.pk == before.pk and not write.cascade
         else write
         for write in writes
@@ -969,6 +981,7 @@ def _plan_set_update(proposed: RendererSetUpdate, *, grant=None):
         values=proposed.values,
         selected_pks=proposed.selected_pks,
         selected_before_values=proposed.selected_before_values,
+        origin=proposed.origin,
     )
     footprint = MutationFootprint.merge(*footprints) if footprints else MutationFootprint()
     return write, footprint, changed_keys
@@ -1082,6 +1095,7 @@ def _plan_m2m_add(proposed: RendererM2MAdd, creation_refs):
         natural_key=(("field_name", proposed.field_name),),
         selected_pks=added_identities,
         values=(("through_model", through._meta.label_lower),),
+        origin=proposed.origin,
     )
     return write, footprint, keys
 
@@ -1102,6 +1116,7 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
             instance=instance,
             field_name=proposed.field_name,
             related=additions,
+            origin=proposed.origin,
         ),
         creation_refs,
     )
@@ -1112,6 +1127,7 @@ def _plan_m2m_set(proposed: RendererM2MSet, creation_refs):
         natural_key=add_write.natural_key,
         selected_pks=related_identities,
         values=(("before_pks", before_pks), *add_write.values),
+        origin=proposed.origin,
     )
     previous_related = related_model._default_manager.filter(pk__in=before_pks).order_by("pk")
     try:
@@ -1148,8 +1164,33 @@ def _retire_overlay_manifest(instance):
     retire_overlay_manifest(instance)
 
 
+def _native_effect(method, model, *args, **kwargs):
+    """Return the active NativeWriter's permit for one native effect, or a null context."""
+    from .native_authorization import active_native_writer, is_native
+
+    writer = active_native_writer()
+    if writer is None or not is_native(model):
+        return contextlib.nullcontext()
+    return getattr(writer, method)(*args, **kwargs)
+
+
+def _native_delete(root, closure, origin):
+    """Return the active NativeWriter's permit for one Collector run that touches native rows."""
+    from .native_authorization import active_native_writer, is_native
+
+    writer = active_native_writer()
+    labels = {type(root)._meta.label_lower, *(write.model_label for write in closure)}
+    if writer is None or not any(is_native(apps.get_model(label)) for label in labels):
+        return contextlib.nullcontext()
+    identities = tuple((write.model_label, write.pk, write.operation) for write in closure)
+    return writer.delete(root, closure=identities, origin=origin)
+
+
 class RendererWriter:
-    """Consume one frozen plan through exact ORM operations."""
+    """Consume one frozen plan through exact ORM operations.
+
+    Every native effect crosses the active NativeWriter, which authorizes it and holds its permit.
+    """
 
     def __init__(self, plan: RendererMutationPlan, *, content: bool, permit):
         from .lifecycle_fence import protected_read_fields
@@ -1506,12 +1547,21 @@ class RendererWriter:
             if write.before_values and write.model_label in OVERLAY_MODEL_RANKS
             else None
         )
+        effect = _native_effect(
+            "save",
+            type(instance),
+            instance,
+            update_fields=update_fields,
+            created=write.pk is None,
+            origin=write.origin,
+        )
         with self._operation(index, instance):
             if not force_insert:
-                result = save()
+                with effect:
+                    result = save()
             else:
                 try:
-                    with transaction.atomic():
+                    with transaction.atomic(), effect:
                         result = save()
                 except IntegrityError:
                     write = self.plan.write_set[index]
@@ -1595,7 +1645,8 @@ class RendererWriter:
             _retire_overlay_manifest(overlay)
         if current._meta.label_lower not in OVERLAY_MODEL_RANKS:
             _retire_overlay_manifest(current)
-        with self._operation(index, delete_indexes=matched):
+        closure_writes = tuple(self.plan.write_set[position] for position in matched)
+        with self._operation(index, delete_indexes=matched), _native_delete(current, closure_writes, root_write.origin):
             result = current.delete()
         instance.pk = None
         self._consumed.update(matched)
@@ -1640,7 +1691,12 @@ class RendererWriter:
             if identity not in retired:
                 _retire_overlay_manifest(overlay)
                 retired.add(identity)
-        with self._operation(matched[0], delete_indexes=matched):
+        closure_writes = tuple(self.plan.write_set[position] for position in matched)
+        roots = [write for write in closure_writes if write.operation == "delete" and not write.cascade]
+        with (
+            self._operation(matched[0], delete_indexes=matched),
+            _native_delete(instances[0], closure_writes, roots[0].origin if roots else None),
+        ):
             result = collector.delete()
         self._consumed.update(matched)
         for instance in instances:
@@ -1684,7 +1740,8 @@ class RendererWriter:
         """Add exactly the related rows frozen into one planned M2M operation."""
         related = tuple(related)
         index = self._find_m2m_add(instance, field_name, related)
-        with self._operation(index):
+        origin = self.plan.write_set[index].origin
+        with self._operation(index), _native_effect("m2m", type(instance), instance, field_name, origin=origin):
             getattr(instance, field_name).add(*related)
         _maintain_manifest(instance)
         self._consumed.add(index)
@@ -1716,7 +1773,7 @@ class RendererWriter:
         current_pks = tuple(sorted(getattr(instance, field_name).values_list("pk", flat=True)))
         if current_pks != before_pks:
             raise IntentPlanStaleError("the M2M edge set changed after planning")
-        with self._operation(index):
+        with self._operation(index), _native_effect("m2m", type(instance), instance, field_name, origin=write.origin):
             getattr(instance, field_name).set(related)
         _maintain_manifest(instance)
         self._consumed.add(index)
@@ -1755,7 +1812,8 @@ class RendererWriter:
             for name, value in values.items():
                 setattr(after, name, value)
             validate_acquisition(before, after, self.grant)
-        with self._operation(index):
+        effect = _native_effect("set_update", model, model, operation.selected_pks, values, origin=operation.origin)
+        with self._operation(index), effect:
             updated = model._default_manager.filter(pk__in=operation.selected_pks).update(**values)
         if updated != len(operation.selected_pks):
             raise IntentPlanStaleError("the frozen set-based update lost a selected row")

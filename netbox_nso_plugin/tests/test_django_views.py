@@ -30,6 +30,7 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._adapter_http import make_response, make_session
+from ._authority_case import concurrent_writer
 from ._outbox_case import (
     ReceiptAdapter,
     content_bulk_update,
@@ -6018,7 +6019,11 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         def delete_then_load(vlan_model, vlan_id):
             doomed = VLAN.objects.get(pk=vlan_id)
-            with suppress_intent_push(), intent_transaction(deletion_footprint_for_instance(doomed)):
+            with (
+                concurrent_writer(),
+                suppress_intent_push(),
+                intent_transaction(deletion_footprint_for_instance(doomed)),
+            ):
                 doomed.delete()
             revisions_after_delete.append(NSOIntentRevision.objects.get(device=self.device, scope="vlan").revision)
             return None, ()
@@ -6229,13 +6234,14 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         def load_then_collide(vlan_model, vlan_id):
             result = original_rows(vlan_model, vlan_id)
-            VLAN.objects.create(
-                group=second_group,
-                vid=122,
-                name="TAKEN-NAME",
-                qinq_role="cvlan",
-                qinq_svlan=service_vlan,
-            )
+            with concurrent_writer():
+                VLAN.objects.create(
+                    group=second_group,
+                    vid=122,
+                    name="TAKEN-NAME",
+                    qinq_role="cvlan",
+                    qinq_svlan=service_vlan,
+                )
             return result
 
         with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):
@@ -6266,7 +6272,8 @@ class TestOverlayFieldEditView(ViewTestBase):
 
         def load_then_collide(vlan_model, vlan_id):
             result = original_rows(vlan_model, vlan_id)
-            VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
+            with concurrent_writer():
+                VLAN.objects.create(group=group, vid=125, name="RACED-NAME")
             return result
 
         with patch("netbox_nso_plugin.views._vlan_name_edit_rows", side_effect=load_then_collide):

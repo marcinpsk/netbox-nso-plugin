@@ -11,11 +11,8 @@ through restricted querysets (404), before any handler code runs.
 from __future__ import annotations
 
 import contextlib
-import functools
 import operator
-import re
 from collections.abc import Callable, Mapping
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Literal
@@ -23,21 +20,18 @@ from typing import Any, Literal
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
-from django.db import connections
 from django.http import Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import URLResolver, reverse
 from django.views import View
 
-Effect = Literal["read", "native_mutation", "adapter_action"]
-EFFECTS: tuple[str, ...] = ("read", "native_mutation", "adapter_action")
-_NO_WRITE_EFFECTS = frozenset({"read", "adapter_action"})
+from .native_authorization import authority_scope
+
+Effect = Literal["read", "native_mutation", "adapter_action", "unverified_native_mutation"]
+# unverified_native_mutation: native writes not yet routed through the NativeWriter (allocation, increment I3).
+EFFECTS: tuple[str, ...] = ("read", "native_mutation", "adapter_action", "unverified_native_mutation")
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options", "trace"})
 _HANDLER_METHODS = ("get", "post", "put", "patch", "delete")
-
-
-class NativeWriteRefused(RuntimeError):
-    """A read or adapter-action endpoint tried to write a native NetBox row."""
 
 
 # ── Authorization target registry (separate from the OVERLAYS settlement registry) ──
@@ -537,11 +531,11 @@ class IntegrationProvisionAttempt(TargetSpec):
 class ApiOnboarding(TargetSpec):
     """The API onboard action: the body's device must be visible, the instance through the view restriction.
 
-    The API keeps its existing model permission (change), which differs from the UI onboard (add).
+    Onboarding creates the management row, so the API needs add, as the UI onboard does.
     """
 
     def permissions(self):  # noqa: D102
-        return ("netbox_nso_plugin.change_nsodevicemanagement", "dcim.view_device")
+        return ("netbox_nso_plugin.add_nsodevicemanagement", "dcim.view_device")
 
     def resolve(self, request, user, kwargs):  # noqa: D102
         from rest_framework.exceptions import NotFound, ParseError
@@ -615,80 +609,6 @@ def policy_for(view, method: str) -> EndpointPolicy | None:
     if method == "head":
         return policy.get("get")
     return None
-
-
-# ── Authority scopes: no-write for read and adapter-action endpoints, system for allowlisted entries ──
-
-_MODE: ContextVar[str | None] = ContextVar("netbox_nso_plugin_authority", default=None)
-_DML = re.compile(r'\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?([A-Za-z0-9_]+)"?', re.IGNORECASE)
-
-
-@functools.cache
-def native_tables() -> frozenset[str]:
-    """Return every table outside this plugin, except the NetBox bookkeeping a plugin-row write records.
-
-    Bookkeeping: the change log and search cache entries of plugin rows, and the type caches.
-    """
-    from django.apps import apps
-
-    bookkeeping = {
-        apps.get_model(label)._meta.db_table
-        for label in ("core.ObjectChange", "extras.CachedValue", "core.ObjectType", "contenttypes.ContentType")
-    }
-    tables = set()
-    for model in apps.get_models(include_auto_created=True):
-        owner = model._meta.auto_created or model
-        if owner._meta.app_label != "netbox_nso_plugin" and not model._meta.proxy:
-            tables.add(model._meta.db_table)
-    return frozenset(tables - bookkeeping)
-
-
-def _refuse_native_dml(execute, sql, params, many, context):
-    if _MODE.get() == "no_write":
-        match = _DML.match(str(sql))
-        if match is not None and match.group(1) in native_tables():
-            raise NativeWriteRefused(f"native write to {match.group(1)} outside a native-mutation endpoint")
-    return execute(sql, params, many, context)
-
-
-@contextlib.contextmanager
-def authority_scope(effects: str):
-    """Run *effects* under its authority. Read and adapter-action endpoints may not write native rows."""
-    if effects not in _NO_WRITE_EFFECTS:
-        yield
-        return
-    token = _MODE.set("no_write")
-    try:
-        with connections["default"].execute_wrapper(_refuse_native_dml):
-            yield
-    finally:
-        _MODE.reset(token)
-
-
-SYSTEM_ENTRIES: dict[str, str] = {}
-
-
-def system_entry(reason: str):
-    """Mark the function as an allowlisted entry into the system scope (device-fact reconciliation).
-
-    Callers pass only the authorized device or management; the function writes device facts,
-    not operator values. The census test pins the allowlist.
-    """
-
-    def decorate(function):
-        SYSTEM_ENTRIES[f"{function.__module__}.{function.__qualname__}"] = reason
-
-        @functools.wraps(function)
-        def entered(*args, **kwargs):
-            token = _MODE.set("system")
-            try:
-                return function(*args, **kwargs)
-            finally:
-                _MODE.reset(token)
-
-        return entered
-
-    return decorate
 
 
 # ── Enforcement in the class ──
@@ -786,16 +706,25 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
         policy = policy_for(self, request.method)
         if policy is None:
             return self.http_method_not_allowed(request, *args, **kwargs)
-        self.target = policy.authorize(request, _acting_user(request), kwargs)
-        with authority_scope(policy.effects):
-            try:
-                return super().dispatch(request, *args, **kwargs)
-            except OwnershipNotQualified as exc:
-                is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
-                if is_ajax or "key" in kwargs or exc.device_id is None:
-                    return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
-                messages.error(request, exc.public_message)
-                return redirect(_device_nso_tab_url(exc.device_id))
+        from utilities.exceptions import PermissionsViolation
+
+        user = _acting_user(request)
+        self.target = policy.authorize(request, user, kwargs)
+        is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest" or "key" in kwargs
+        try:
+            with authority_scope(policy.effects, user):
+                try:
+                    return super().dispatch(request, *args, **kwargs)
+                except OwnershipNotQualified as exc:
+                    if is_ajax or exc.device_id is None:
+                        return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
+                    messages.error(request, exc.public_message)
+                    return redirect(_device_nso_tab_url(exc.device_id))
+        except PermissionsViolation as exc:
+            # The operator scope rolled back every write of the request.
+            if is_ajax:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=403)
+            raise PermissionDenied(str(exc)) from None
 
 
 class AuthorizedGenericView(_PolicyEnforced):
@@ -810,7 +739,9 @@ class AuthorizedGenericView(_PolicyEnforced):
         if policy is None:
             return self.http_method_not_allowed(request, *args, **kwargs)
         self.target = policy.authorize(request, _acting_user(request), kwargs)
-        with authority_scope(policy.effects):
+        # NetBox's generic views authorize their own object writes (design 2b): no operator scope.
+        native = policy.effects == "native_mutation"
+        with contextlib.nullcontext() if native else authority_scope(policy.effects):
             return super().dispatch(request, *args, **kwargs)
 
 
@@ -823,9 +754,16 @@ class AuthorizedAPIView(_PolicyEnforced):
 
     def dispatch(self, request, *args, **kwargs):
         """Keep the authority scope that ``initial`` opens until the response is final."""
-        with contextlib.ExitStack() as stack:
-            self._authz_scope = stack
-            return super().dispatch(request, *args, **kwargs)
+        from rest_framework.response import Response
+        from utilities.exceptions import PermissionsViolation
+
+        try:
+            with contextlib.ExitStack() as stack:
+                self._authz_scope = stack
+                return super().dispatch(request, *args, **kwargs)
+        except PermissionsViolation as exc:
+            # The operator scope rolled back every write of the request.
+            return self.finalize_response(self.request, Response({"detail": str(exc)}, status=403), *args, **kwargs)
 
     def initial(self, request, *args, **kwargs):
         """Authenticate (DRF), then run the endpoint policy and open its authority scope."""
@@ -835,8 +773,12 @@ class AuthorizedAPIView(_PolicyEnforced):
         policy = policy_for(self, request.method)
         if policy is None:
             raise MethodNotAllowed(request.method)
-        self.target = policy.authorize(request, _acting_user(request), kwargs)
-        self._authz_scope.enter_context(authority_scope(policy.effects))
+        user = _acting_user(request)
+        self.target = policy.authorize(request, user, kwargs)
+        if isinstance(policy.target, NetBoxGeneric) and policy.effects == "native_mutation":
+            # A NetBox viewset authorizes its own object writes (design 2b): no operator scope.
+            return
+        self._authz_scope.enter_context(authority_scope(policy.effects, user))
 
 
 def view_class_of(callback):

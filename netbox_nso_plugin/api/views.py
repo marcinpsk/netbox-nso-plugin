@@ -2,6 +2,7 @@
 # Copyright (C) 2025 Marcin Zieba <marcinpsk@gmail.com>
 import logging
 
+from django.utils import timezone
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework import status
 from rest_framework.exceptions import NotFound
@@ -281,13 +282,23 @@ class OnboardView(AuthorizedAPIView, APIView):
     """
 
     permission_classes = [IsAuthenticated]
-    policy = EndpointPolicy(ApiOnboarding(), "native_mutation")
+    # Provisioning calls the adapter after it commits the durable attempt: no operator transaction.
+    policy = EndpointPolicy(ApiOnboarding(), "adapter_action")
 
     def post(self, request):
         """Onboard the posted NetBox device into the selected (or default) NSO instance."""
-        from ..onboarding import onboard_candidate
+        from ..onboarding import normalize_nso_device_name, onboard_candidate, require_management_add
 
-        result = onboard_candidate(self.target.device, self.target.related["instance"])
+        device, instance = self.target.device, self.target.related["instance"]
+        require_management_add(
+            request.user,
+            device=device,
+            nso_instance=instance,
+            nso_device_name=normalize_nso_device_name(device.name),
+            onboarded_at=timezone.now(),
+            onboard_status="provisioning",
+        )
+        result = onboard_candidate(device, instance)
         code = result.pop(
             "_http_status",
             status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,

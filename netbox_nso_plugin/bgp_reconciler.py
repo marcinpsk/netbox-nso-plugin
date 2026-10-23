@@ -23,7 +23,10 @@ import logging
 from collections.abc import Mapping
 from dataclasses import replace
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("bgp")
 
 
 class _Operations:
@@ -44,6 +47,7 @@ class _Operations:
         force_insert=False,
         natural_key=(),
         references=(),
+        origin=None,
     ):
         from .renderer_writer import planned_save
 
@@ -55,14 +59,15 @@ class _Operations:
                 force_insert=force_insert,
                 natural_key=natural_key,
                 references=references,
+                origin=origin,
             )
         )
         self.operations.append(("save", instance, update_fields, force_insert, references))
 
-    def delete(self, instance):
+    def delete(self, instance, *, origin=None):
         from .renderer_writer import planned_delete
 
-        self.deletes.append(planned_delete(instance))
+        self.deletes.append(planned_delete(instance, origin=origin))
         self.operations.append(("delete", instance, None, False, ()))
 
 
@@ -797,6 +802,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 self.rir,
                 force_insert=True,
                 natural_key=("name",),
+                origin=_OBSERVED,
             )
         return self.rir
 
@@ -807,7 +813,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             return current
         current = self.ASN(asn=number, rir=self._ensure_rir())
         self.asns[number] = current
-        self.save(current, force_insert=True, natural_key=("asn",))
+        self.save(current, force_insert=True, natural_key=("asn",), origin=_OBSERVED)
         return current
 
     def peer_ip(self, value, vrf):
@@ -832,6 +838,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                     current,
                     force_insert=True,
                     natural_key=("address", "vrf"),
+                    origin=_OBSERVED,
                 )
         except ValidationError as exc:
             logger.warning("BGP: peer IP address %r rejected by NetBox: %s", value, exc)
@@ -885,12 +892,13 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 current,
                 force_insert=True,
                 natural_key=("assigned_object_type", "assigned_object_id", "asn"),
+                origin=_OBSERVED,
             )
         elif router_id and not current.router_id:
             current = copy.copy(current)
             current.router_id = router_id
             self.routers[number] = current
-            self.save(current, update_fields=("router_id",))
+            self.save(current, update_fields=("router_id",), origin=_OBSERVED)
         return current
 
     def scope(self, router, vrf_name):
@@ -907,6 +915,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 current,
                 force_insert=True,
                 natural_key=("router", "vrf"),
+                origin=_OBSERVED,
             )
         return current
 
@@ -921,6 +930,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 current,
                 force_insert=True,
                 natural_key=("scope", "address_family"),
+                origin=_OBSERVED,
             )
         return current
 
@@ -952,6 +962,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 update_fields=None if created else ("remote_as",),
                 force_insert=created,
                 natural_key=("name",) if created else (),
+                origin=_OBSERVED,
             )
         return current
 
@@ -1029,10 +1040,11 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 force_insert=created,
                 natural_key=("assigned_object_type", "assigned_object_id", "address_family") if created else (),
                 references=references,
+                origin=_OBSERVED,
             )
         for value, row in existing.items():
             if value not in seen:
-                self.operations.delete(row)
+                self.operations.delete(row, origin=_OBSERVED)
 
     def reconcile_peer(self, scope, entry, asn_str, vrf_name):  # noqa: C901, PLR0915
         from . import status_machine as sm
@@ -1091,6 +1103,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 peer,
                 force_insert=True,
                 natural_key=("scope", "peer", "name"),
+                origin=_OBSERVED,
             )
         peer_ip_changed = not created_peer and current_peer.peer_id != peer_ip.pk
         if peer_ip_changed:
@@ -1146,10 +1159,10 @@ class _BGPGraphPlanner:  # noqa: PLR0904
             if not created_peer:
                 for field, value in desired.items():
                     setattr(peer, field, value)
-                self.save(peer)
+                self.save(peer, origin=_OBSERVED)
             self.plan_address_family_rows(peer, af_entries, scope)
         elif peer_ip_changed:
-            self.save(peer, update_fields=("peer",))
+            self.save(peer, update_fields=("peer",), origin=_OBSERVED)
         state.status = sm.on_reconcile(state.status, matches=matches, conflict=conflict)
         self.peer_states[state_key] = state
         self.seen_peers.add(state_key)
@@ -1372,7 +1385,7 @@ class _BGPGraphPlanner:  # noqa: PLR0904
                 router = copy.copy(router)
                 router.router_id = entry.get("router_id") or None
                 self.routers[int(asn.asn)] = router
-                self.save(router, update_fields=("router_id",))
+                self.save(router, update_fields=("router_id",), origin=_OBSERVED)
         state.bgp_router = router
         state.router_id = entry.get("router_id") or ""
         state.last_sync_at = self.planned_at

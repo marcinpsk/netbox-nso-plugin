@@ -25,9 +25,11 @@ from contextvars import ContextVar
 from dataclasses import replace
 
 from . import shared_object_ownership as ownership
+from .native_authorization import Observed
 from .route_policy_structure import canonical_route_map, prefix_list_entry_unit, structure_entry
 
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("route_policy")
 
 # One route-policy family → the document key that carries it.
 _FAMILY_PAYLOAD_KEYS = {
@@ -54,7 +56,7 @@ class _Operations:
         self.device_ids = set()
         self.read_dependencies = {}
 
-    def save(self, instance, *, update_fields=None, force_insert=False, natural_key=(), references=()):
+    def save(self, instance, *, update_fields=None, force_insert=False, natural_key=(), references=(), origin=None):
         from .renderer_writer import planned_save
 
         references = tuple(references)
@@ -65,6 +67,7 @@ class _Operations:
                 force_insert=force_insert,
                 natural_key=natural_key,
                 references=references,
+                origin=origin,
             )
         )
         self.operations.append(("save", instance, update_fields, force_insert, references, None, ()))
@@ -73,19 +76,19 @@ class _Operations:
         """Record one persisted row a planning decision reads but never writes."""
         self.read_dependencies.setdefault((instance._meta.label_lower, instance.pk), instance)
 
-    def delete(self, instance):
+    def delete(self, instance, *, origin=None):
         from .renderer_writer import planned_delete
 
-        self.deletes.append(planned_delete(instance))
+        self.deletes.append(planned_delete(instance, origin=origin))
         self.operations.append(("delete", instance, None, False, (), None, ()))
 
-    def m2m_add(self, instance, field_name, related):
+    def m2m_add(self, instance, field_name, related, *, origin=None):
         from .renderer_writer import planned_m2m_add
 
         related = tuple(related)
         if not related:
             return
-        self.m2m_writes.append(planned_m2m_add(instance, field_name, related))
+        self.m2m_writes.append(planned_m2m_add(instance, field_name, related, origin=origin))
         self.operations.append(("m2m_add", instance, None, False, (), field_name, related))
 
     def display_m2m_add(self, instance, field_name, related):
@@ -334,7 +337,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             )
             self.roots["route_map"][key[1]] = root
             self.name_maps["route_map"][name] = root
-            self.operations.save(root, force_insert=True, natural_key=("name",))
+            self.operations.save(root, force_insert=True, natural_key=("name",), origin=_OBSERVED)
             self.preplanned_root_keys.add(key)
         for captured in route_maps:
             self.plan_object("route_map", captured)
@@ -492,9 +495,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
 
     def _plan_root_save(self, family, root, created, changed_fields=()):
         if created:
-            self.operations.save(root, force_insert=True, natural_key=("name",))
+            self.operations.save(root, force_insert=True, natural_key=("name",), origin=_OBSERVED)
         elif changed_fields:
-            self.operations.save(root, update_fields=tuple(changed_fields))
+            self.operations.save(root, update_fields=tuple(changed_fields), origin=_OBSERVED)
 
     def plan_object(self, family, captured):  # noqa: C901, PLR0912, PLR0915
         from . import status_machine as sm
@@ -547,7 +550,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.operations.content_groups.add(key)
                 self.operations.device_ids.add(self.device.pk)
             for entry in self._existing_entries(family, root):
-                self.operations.delete(entry)
+                self.operations.delete(entry, origin=_OBSERVED)
         if fill and family == "route_map":
             default_action = self._route_map_default_action(captured.get("entries") or [])
             if root.default_action != default_action:
@@ -715,13 +718,13 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 identity = (row.management_id, row.family, row.object_name)
                 if identity in self.modified_state_pks:
                     continue
-                self.operations.delete(row)
+                self.operations.delete(row, origin=_OBSERVED)
                 self.modified_state_pks.add(identity)
             if root is not None:
                 # The last capture is gone and nothing references the root: it and its entries go.
                 self.operations.content_groups.add(key)
                 self.operations.device_ids.add(self.device.pk)
-                self.operations.delete(root)
+                self.operations.delete(root, origin=_OBSERVED)
 
     def _resolve_route_map_name_maps(self, entries):
         for entry in entries:
@@ -760,7 +763,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
 
     def plan_replace_root(self, family, root, captured):
         for entry in self._existing_entries(family, root):
-            self.operations.delete(entry)
+            self.operations.delete(entry, origin=_OBSERVED)
         changed_fields = []
         candidate = copy.copy(root)
         if family == "prefix_list" and captured.get("family") in (4, 6):
@@ -779,7 +782,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 changed_fields.append("default_action")
             self._resolve_route_map_name_maps(captured.get("entries") or [])
         if changed_fields:
-            self.operations.save(candidate, update_fields=changed_fields)
+            self.operations.save(candidate, update_fields=changed_fields, origin=_OBSERVED)
             root = candidate
         entries = captured.get("entries") or []
         if family == "prefix_list":
@@ -805,7 +808,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             elif family == "route_map":
                 values["default_action"] = self._route_map_default_action(captured.get("entries") or [])
             root = self.models[family](**values)
-            self.operations.save(root, force_insert=True, natural_key=("name",))
+            self.operations.save(root, force_insert=True, natural_key=("name",), origin=_OBSERVED)
         self.roots[family][name] = root
         return root
 
@@ -901,7 +904,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                     logger.warning("route-policy: bad prefix %r in %s: %s", prefix, root.name, exc)
                     continue
                 self.prefixes[prefix] = custom_prefix
-                self.operations.save(custom_prefix, force_insert=True, natural_key=("prefix",))
+                self.operations.save(custom_prefix, force_insert=True, natural_key=("prefix",), origin=_OBSERVED)
             sequence += 1
             row = self.PrefixListEntry(
                 prefix_list=root,
@@ -917,6 +920,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 force_insert=True,
                 natural_key=("prefix_list", "sequence"),
                 references=(("assigned_prefix_id", custom_prefix),),
+                origin=_OBSERVED,
             )
 
     def plan_community_entries(self, root, entries):
@@ -938,7 +942,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             if community is None:
                 community = self.Community(community=value)
                 self.communities[value] = community
-                self.operations.save(community, force_insert=True, natural_key=("community",))
+                self.operations.save(community, force_insert=True, natural_key=("community",), origin=_OBSERVED)
             members.append(community)
             row = self.CommunityListEntry(
                 community_list=root,
@@ -949,6 +953,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 row,
                 force_insert=True,
                 natural_key=("community_list", "action", "community"),
+                origin=_OBSERVED,
             )
         self.community_members[root.name] = tuple(members)
 
@@ -964,6 +969,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 row,
                 force_insert=True,
                 natural_key=("aspath", "sequence"),
+                origin=_OBSERVED,
             )
 
     def plan_route_map_entries(self, root, entries):  # noqa: PLR0915
@@ -985,7 +991,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 call_policy=(self.roots["route_map"].get(structured.call_policy) if structured.call_policy else None),
                 vendor_ext=vendor_ext or None,
             )
-            self.operations.save(row, force_insert=True, natural_key=("route_map", "sequence"))
+            self.operations.save(row, force_insert=True, natural_key=("route_map", "sequence"), origin=_OBSERVED)
             self._plan_route_map_matches(row, entry, vendor_ext)
             unresolved = self.plan_set_communities(row, structured)
             if unresolved:
@@ -1000,7 +1006,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         )
         for field_name, family, names in mappings:
             related = tuple(self.name_maps[family][name] for name in names if name in self.name_maps[family])
-            self.operations.m2m_add(row, field_name, related)
+            self.operations.m2m_add(row, field_name, related, origin=_OBSERVED)
             unresolved = [name for name in names if name not in self.name_maps[family]]
             if unresolved:
                 vendor_ext.setdefault("unmapped", {})[field_name] = unresolved
@@ -1036,6 +1042,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                     set_row,
                     force_insert=True,
                     natural_key=("route_map_entry", "operation", "community_list"),
+                    origin=_OBSERVED,
                 )
                 continue
             if not _looks_like_community_literal(action.name):
@@ -1045,7 +1052,7 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             if community is None:
                 community = self.Community(community=action.name)
                 self.communities[action.name] = community
-                self.operations.save(community, force_insert=True, natural_key=("community",))
+                self.operations.save(community, force_insert=True, natural_key=("community",), origin=_OBSERVED)
             literal_groups.setdefault(action.operation, {})[action.name] = community
         for operation, communities in literal_groups.items():
             set_row = self.RouteMapEntrySetCommunity(route_map_entry=row, operation=operation)
@@ -1053,8 +1060,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 set_row,
                 force_insert=True,
                 natural_key=("route_map_entry", "operation", "community_list"),
+                origin=_OBSERVED,
             )
-            self.operations.m2m_add(set_row, "communities", tuple(communities.values()))
+            self.operations.m2m_add(set_row, "communities", tuple(communities.values()), origin=_OBSERVED)
         return unresolved
 
 

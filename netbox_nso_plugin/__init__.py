@@ -48,11 +48,13 @@ class NSOPluginConfig(PluginConfig):
         # it here guarantees the specs exist in every process (web + worker).
         from .derived_intent import _register_description_from_cable
         from .intent_state import ensure_delete_signal_origin, register_builtin_renderer_inputs
+        from .native_authorization import install_guards
         from .signals import _connect_g_activated
 
         # The field is always available; enabled templates are read live from NetBox.
         _register_description_from_cable()
         ensure_delete_signal_origin()
+        install_guards()
         register_builtin_renderer_inputs()
         _connect_g_activated()
 

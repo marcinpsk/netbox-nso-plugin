@@ -24,8 +24,11 @@ import logging
 from dataclasses import dataclass
 
 from .adapter_client import AdapterError
+from .native_authorization import Observed
 
 logger = logging.getLogger(__name__)
+_OBSERVED_VLAN = Observed("vlan")
+_OBSERVED_SWITCHPORT = Observed("switchport")
 
 
 class VLANRescopeConflict(Exception):
@@ -279,7 +282,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
         if group is not None:
             return group
         group = VLANGroup(name=f"NSO {device.name}", slug=f"nso-{device.pk}")
-        saves.append(planned_save(group, force_insert=True, natural_key=("slug",)))
+        saves.append(planned_save(group, force_insert=True, natural_key=("slug",), origin=_OBSERVED_VLAN))
         operations.append((group, None, True))
         return group
 
@@ -296,6 +299,7 @@ def _vlan_reconcile_operations(device, payload, planned_at):
                 vlan,
                 force_insert=True,
                 natural_key=("group", "vid"),
+                origin=_OBSERVED_VLAN,
             )
             saves.append(proposal)
             operations.append((vlan, None, True))
@@ -516,7 +520,7 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
         if group is not None:
             return group
         group = VLANGroup(name=f"NSO {device.name}", slug=f"nso-{device.pk}")
-        group_saves.append(planned_save(group, force_insert=True, natural_key=("slug",)))
+        group_saves.append(planned_save(group, force_insert=True, natural_key=("slug",), origin=_OBSERVED_SWITCHPORT))
         group_operations.append(("save", group, None, True, None, ()))
         return group
 
@@ -526,7 +530,9 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
             return vlan
         vlan = VLAN(group=ensure_group(), vid=vid, name=placeholder_vlan_name(vid))
         group_vlans[vid] = vlan
-        vlan_saves.append(planned_save(vlan, force_insert=True, natural_key=("group", "vid")))
+        vlan_saves.append(
+            planned_save(vlan, force_insert=True, natural_key=("group", "vid"), origin=_OBSERVED_SWITCHPORT)
+        )
         vlan_operations.append(("save", vlan, None, True, None, ()))
         return vlan
 
@@ -605,13 +611,15 @@ def _switchport_reconcile_operations(device, payload, planned_at, interface_pks)
 
         if native_candidate is not None:
             fields = ("mode", "untagged_vlan")
-            native_saves.append(planned_save(native_candidate, update_fields=fields))
+            native_saves.append(planned_save(native_candidate, update_fields=fields, origin=_OBSERVED_SWITCHPORT))
             native_operations.append(("save", native_candidate, fields, False, None, ()))
             current_tagged = _ordered_tagged_vlans(interface)
             if {row.pk for row in current_tagged} != {row.pk for row in native_tagged if row.pk is not None} or any(
                 row.pk is None for row in native_tagged
             ):
-                m2m_writes.append(planned_m2m_set(native_candidate, "tagged_vlans", native_tagged))
+                m2m_writes.append(
+                    planned_m2m_set(native_candidate, "tagged_vlans", native_tagged, origin=_OBSERVED_SWITCHPORT)
+                )
                 m2m_operations.append(("m2m_set", native_candidate, None, False, "tagged_vlans", native_tagged))
 
         created = current is None

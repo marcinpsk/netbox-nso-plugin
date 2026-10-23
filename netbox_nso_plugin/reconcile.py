@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 
 from .deployment import guarded as _deployment_guarded
-from .request_authorization import system_entry
+from .native_authorization import system_entry
 from .vlan_reconciler import _validated_switchport_items, _validated_vlan_items
 
 logger = logging.getLogger(__name__)

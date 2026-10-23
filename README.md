@@ -86,6 +86,14 @@ still checks jobs when a callback cannot be delivered.
 The `adapter_token` setting above authenticates requests from NetBox to the adapter.
 The callback token authenticates requests from the adapter to NetBox.
 
+An operator action that writes native NetBox objects (for example Accept or an inline edit
+that sets an interface description, MTU, switchport VLANs, a BFD interface, an IS-IS
+interface process or a redistribution) also needs the NetBox permission on each object it
+writes: `add` for a new object, `change` for an existing one (checked on the stored object
+and on the result), `delete` for a removed one, with the permission's constraints. A refusal
+answers HTTP 403 and the action writes nothing. Onboarding (UI and API) needs `add` on
+**NSO Device Management**, and its constraints must admit the new row.
+
 Programmatic writers must wrap each create, save, or delete of a managed intent model in
 `intent_transaction()`. The renderer write, revision bump, and intent outbox entry must
 commit together. The mutation footprint must be complete before the first write.

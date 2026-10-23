@@ -7,7 +7,10 @@ import copy
 import logging
 from dataclasses import replace
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("redistribution")
 
 
 def _validated_redistribution_entries(payload) -> list[dict]:
@@ -193,7 +196,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
     dependencies = {}
     seen = set()
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), references=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), references=(), origin=None):
         saves.append(
             planned_save(
                 instance,
@@ -201,12 +204,13 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
                 force_insert=force_insert,
                 natural_key=natural_key,
                 references=references,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert, references))
 
-    def delete(instance):
-        deletes.append(planned_delete(instance))
+    def delete(instance, *, origin=None):
+        deletes.append(planned_delete(instance, origin=origin))
         operations.append(("delete", instance, None, False, ()))
 
     for entry in entries:
@@ -254,6 +258,8 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
         conflict = False
 
         state.redistribution = None
+        native = None
+        created_native = False
         destination = _resolve_redist_destination(device, destination_protocol, destination_ref)
         if destination is not None:
             dependencies[(destination._meta.label_lower, destination.pk)] = destination
@@ -292,18 +298,10 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
             device_hash = merge_util.content_hash(_redist_device_content(entry, reported_route_map))
             object_hash = merge_util.content_hash(_redist_object_content(native))
             if owned:
+                # Owned intent reaches the native rows only through the operator Accept or Edit.
                 if created_native:
-                    save(
-                        native,
-                        force_insert=True,
-                        natural_key=(
-                            "destination_type",
-                            "destination_id",
-                            "source_protocol",
-                            "source_ref",
-                        ),
-                    )
-                matches = object_hash == device_hash
+                    native = None
+                matches = not created_native and object_hash == device_hash
             else:
                 action = merge_util.three_way(
                     created=created_native,
@@ -315,7 +313,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
                     native.route_map = route_map
                     native.metric = entry.get("metric")
                     native.metric_type = _redist_metric_type(entry)
-                    save(native, update_fields=("route_map", "metric", "metric_type"))
+                    save(native, update_fields=("route_map", "metric", "metric_type"), origin=_OBSERVED)
                 elif created_native:
                     save(
                         native,
@@ -326,6 +324,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
                             "source_protocol",
                             "source_ref",
                         ),
+                        origin=_OBSERVED,
                     )
                 if action in {"seed", "mirror", "insync"}:
                     state.device_base_hash = device_hash
@@ -366,7 +365,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
                 "source_protocol",
                 "source_ref",
             ),
-            references=(("redistribution", native),) if destination is not None and created_native else (),
+            references=(("redistribution", native),) if native is not None and created_native else (),
         )
 
     deleting_state_pks = {
@@ -392,7 +391,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
             deleting_natives[native.pk] = native
 
     for native in deleting_natives.values():
-        delete(native)
+        delete(native, origin=_OBSERVED)
 
     return saves, deletes, operations, tuple(dependencies.values())
 

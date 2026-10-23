@@ -189,6 +189,29 @@ def normalize_nso_device_name(name: str) -> str:
     return cleaned or "device"
 
 
+def require_management_add(user, **values) -> None:
+    """Refuse a management row the user may not add, before any adapter call.
+
+    NetBox evaluates add constraints against a saved row: save the prospective row, check it
+    against the add restriction, and roll it back. An identity conflict is left to the caller,
+    which reports it without creating a row.
+    """
+    from utilities.exceptions import PermissionsViolation
+
+    from .management_lifecycle import save_management
+    from .models import NSODeviceManagement
+
+    try:
+        with transaction.atomic():
+            probe = save_management(NSODeviceManagement(**values))
+            permitted = NSODeviceManagement.objects.restrict(user, "add").filter(pk=probe.pk).exists()
+            transaction.set_rollback(True)
+    except IntegrityError:
+        return
+    if not permitted:
+        raise PermissionsViolation("You cannot add an NSO device management row for this device.")
+
+
 def _default_authgroup() -> str:
     """Resolve the onboarding authgroup from the AdapterConnection setting."""
     try:

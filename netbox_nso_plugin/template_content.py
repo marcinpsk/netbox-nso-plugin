@@ -15,9 +15,12 @@ from netbox.plugins import PluginTemplateExtension
 
 from . import status_machine as sm
 from .intent_state import IntentMutationProtocolError, MutationFootprint, locked_mirror_refresh, mirror_reconciler
+from .native_authorization import Observed
 from .snmp_versions import canonical_snmp_version
 
 logger = logging.getLogger(__name__)
+_OBSERVED_IP = Observed("ip")
+_OBSERVED_STATIC = Observed("static_route")
 
 
 def _cas_mirror_update(queryset, **values):
@@ -344,7 +347,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
         )
         return native_by_assignment.get(key)
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), expected_before=None):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), expected_before=None, origin=None):
         saves.append(
             planned_save(
                 instance,
@@ -352,6 +355,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                 force_insert=force_insert,
                 natural_key=natural_key,
                 expected_before=expected_before,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert))
@@ -394,14 +398,14 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
             ):
                 native = copy.copy(existing_ip)
                 native.status = "active"
-                save(native, update_fields=("status",), expected_before=existing_ip)
+                save(native, update_fields=("status",), expected_before=existing_ip, origin=_OBSERVED_IP)
                 if state.peer_state is not None:
                     peer_vrf = vrf(state.peer_state.vrf)
                     peer_ip = _interface_ip_native(state.peer_state, peer_vrf, IPAddress, interface_type)
                     if peer_ip is not None and peer_ip.status == "reserved":
                         peer_candidate = copy.copy(peer_ip)
                         peer_candidate.status = "active"
-                        save(peer_candidate, update_fields=("status",), expected_before=peer_ip)
+                        save(peer_candidate, update_fields=("status",), expected_before=peer_ip, origin=_OBSERVED_IP)
         elif existing_ip is not None and existing_ip.assigned_object is None:
             if auto_create:
                 native = copy.copy(existing_ip)
@@ -410,6 +414,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                     native,
                     update_fields=("assigned_object_type", "assigned_object_id"),
                     expected_before=existing_ip,
+                    origin=_OBSERVED_IP,
                 )
                 state.status = sm.on_reconcile(state.status, matches=True)
             elif not sm.is_owned(state.status):
@@ -425,7 +430,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                 if not sm.is_owned(state.status):
                     state.status = "conflict"
             else:
-                save(native, force_insert=True, natural_key=("address", "vrf"))
+                save(native, force_insert=True, natural_key=("address", "vrf"), origin=_OBSERVED_IP)
                 prefixes.append((address, vrf_obj))
                 if not sm.is_owned(state.status):
                     state.status = "imported"
@@ -454,6 +459,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                     native_candidate,
                     update_fields=("assigned_object_type", "assigned_object_id"),
                     expected_before=native,
+                    origin=_OBSERVED_IP,
                 )
             delete(stale)
             continue
@@ -467,6 +473,7 @@ def _interface_ip_reconcile_operations(device, payload, planned_at):  # noqa: C9
                 native_candidate,
                 update_fields=("assigned_object_type", "assigned_object_id"),
                 expected_before=native,
+                origin=_OBSERVED_IP,
             )
         candidate = copy.copy(stale)
         candidate.status = next_status
@@ -1322,13 +1329,14 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
     seen_state_pks = set()
     confirmed_drift = False
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), origin=None):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert, None))
@@ -1353,7 +1361,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             if vrf is None:
                 vrf = VRF(name=vrf_name)
                 vrf.full_clean()
-                save(vrf, force_insert=True, natural_key=("name",))
+                save(vrf, force_insert=True, natural_key=("name",), origin=_OBSERVED_STATIC)
                 vrfs[vrf_name] = vrf
 
         identity = static_route_identity(vrf_name, prefix, next_hop, interface_next_hop)
@@ -1387,6 +1395,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
                 route,
                 force_insert=True,
                 natural_key=("vrf", "prefix", "next_hop", "interface_next_hop"),
+                origin=_OBSERVED_STATIC,
             )
         planned_routes[identity] = route
 
@@ -1404,11 +1413,11 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
         assigned = () if created else tuple(route.devices.order_by("pk"))
         on_device = created or any(row.pk == device.pk for row in assigned)
         if not on_device and auto_create:
-            m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
+            m2m_writes.append(planned_m2m_add(route, "devices", (device,), origin=_OBSERVED_STATIC))
             operations.append(("m2m_add", route, None, False, (device,)))
             on_device = True
         elif created:
-            m2m_writes.append(planned_m2m_add(route, "devices", (device,)))
+            m2m_writes.append(planned_m2m_add(route, "devices", (device,), origin=_OBSERVED_STATIC))
             operations.append(("m2m_add", route, None, False, (device,)))
 
         reported_matches = (
@@ -1455,7 +1464,7 @@ def _static_route_reconcile_operations(device, payload, planned_at, *, resolve_s
             continue
         remaining = tuple(row for row in current.static_route.devices.order_by("pk") if row.pk != device.pk)
         if current.static_route.devices.filter(pk=device.pk).exists():
-            m2m_writes.append(planned_m2m_set(current.static_route, "devices", remaining))
+            m2m_writes.append(planned_m2m_set(current.static_route, "devices", remaining, origin=_OBSERVED_STATIC))
             operations.append(("m2m_set", current.static_route, None, False, remaining))
         deletes.append(planned_delete(current))
         operations.append(("delete", current, None, False, None))

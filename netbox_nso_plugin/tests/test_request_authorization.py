@@ -28,19 +28,19 @@ from django.views import View
 from users.models import ObjectPermission
 
 import netbox_nso_plugin
+from netbox_nso_plugin import native_authorization as native
 from netbox_nso_plugin import request_authorization as authz
 from netbox_nso_plugin.api import urls as api_urls
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInterfaceState, NSOStaticRouteState
+from netbox_nso_plugin.native_authorization import NativeWriteRefused, authority_scope
 from netbox_nso_plugin.request_authorization import (
     AUTHZ_TARGETS,
     DeviceRead,
     EndpointPolicy,
     IntegrationSync,
     Management,
-    NativeWriteRefused,
     OverlayFamily,
     OverlayRow,
-    authority_scope,
     missing_authz_targets,
     uncovered_routes,
     view_class_of,
@@ -214,7 +214,7 @@ class TestSystemEntryCensus(SimpleTestCase):
             if ".tests" not in module.name and ".migrations" not in module.name:
                 importlib.import_module(module.name)
         self.assertEqual(
-            authz.SYSTEM_ENTRIES,
+            native.SYSTEM_ENTRIES,
             {
                 "netbox_nso_plugin.reconcile.reconcile_category": "refresh",
                 "netbox_nso_plugin.reconcile.enqueue_device_reconcile": "device reconcile",
@@ -273,22 +273,42 @@ class TestNoWriteScope(TestCase):
         with authority_scope("read"):
             self.assertRefused(lambda: Bookmark.objects.create(object=site, user=user))
         self.assertFalse(Bookmark.objects.filter(user=user).exists())
-        self.assertIn(RouteMapEntrySetCommunity._meta.db_table, authz.native_tables())
-        self.assertIn(RouteMapEntrySetCommunity.communities.through._meta.db_table, authz.native_tables())
-        self.assertNotIn(NSOInterfaceState._meta.db_table, authz.native_tables())
+        self.assertIn(RouteMapEntrySetCommunity._meta.db_table, native.native_tables())
+        self.assertIn(RouteMapEntrySetCommunity.communities.through._meta.db_table, native.native_tables())
+        self.assertNotIn(NSOInterfaceState._meta.db_table, native.native_tables())
 
-    def test_native_mutation_scope_keeps_todays_native_writes(self):
-        with authority_scope("native_mutation"):
-            Site.objects.create(name="authz-mutate", slug="authz-mutate")
-        self.assertTrue(Site.objects.filter(slug="authz-mutate").exists())
+    def test_native_mutation_scope_needs_its_operator(self):
+        with self.assertRaises(NativeWriteRefused), authority_scope("native_mutation"):
+            pass
 
-    def test_a_system_entry_inside_a_read_scope_writes_native_rows(self):
-        entry = authz.system_entry("test")(lambda: Site.objects.create(name="authz-system", slug="authz-system"))
-        self.addCleanup(authz.SYSTEM_ENTRIES.pop, f"{entry.__module__}.{entry.__qualname__}")
+    def test_a_system_entry_inside_a_read_scope_writes_through_the_native_writer(self):
+        from netbox_nso_plugin.native_authorization import Observed
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        from ._outbox_case import make_device
+
+        interface = Interface.objects.create(device=make_device("authz-system"), name="et-0/0/1", type="virtual")
+        interface.description = "observed"
+        plan = RendererMutationPlan.build(
+            saves=(planned_save(interface, update_fields=("description",), origin=Observed("interface")),)
+        )
+
+        def write():
+            with (renderer_writes if plan.changes_content else renderer_mirror_writes)(plan) as writer:
+                writer.save(interface, update_fields=("description",))
+
+        entry = native.system_entry("test")(write)
+        self.addCleanup(native.SYSTEM_ENTRIES.pop, f"{entry.__module__}.{entry.__qualname__}")
         with authority_scope("read"):
             entry()
             self.assertRefused(lambda: Site.objects.create(name="authz-after", slug="authz-after"))
-        self.assertTrue(Site.objects.filter(slug="authz-system").exists())
+        interface.refresh_from_db()
+        self.assertEqual(interface.description, "observed")
 
 
 class _CountingSession(requests.Session):

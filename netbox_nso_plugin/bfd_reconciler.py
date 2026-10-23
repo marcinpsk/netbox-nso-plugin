@@ -8,7 +8,10 @@ import contextlib
 import copy
 import logging
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("bfd")
 
 
 def _profile_values(entry):
@@ -90,19 +93,20 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
     operations = []
     seen_interface_ids = set()
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), origin=None):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                origin=origin,
             )
         )
         operations.append(("save", instance, update_fields, force_insert))
 
-    def delete(instance):
-        deletes.append(planned_delete(instance))
+    def delete(instance, *, origin=None):
+        deletes.append(planned_delete(instance, origin=origin))
         operations.append(("delete", instance, None, False))
 
     def profile_for(entry):
@@ -115,7 +119,7 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
             return profile
         profile = BFDProfile(name=name, min_tx_int=tx, min_rx_int=rx, multiplier=mult)
         profiles[name] = profile
-        save(profile, force_insert=True, natural_key=("name",))
+        save(profile, force_insert=True, natural_key=("name",), origin=_OBSERVED)
         return profile
 
     for interface_id, (interface, entry) in entries_by_interface.items():
@@ -123,28 +127,22 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
         flags = bfd_flag_values(entry)
         current_state = state_by_interface.get(interface_id)
         owned = current_state is not None and sm.is_owned(current_state.status)
-        desired_entry = (
-            {
-                "min_tx": current_state.min_tx,
-                "min_rx": current_state.min_rx,
-                "multiplier": current_state.multiplier,
-            }
-            if owned
-            else entry
-        )
         current_native = native_by_interface.get(interface_id)
-        if current_native is None:
-            profile = profile_for(desired_entry)
+        if owned:
+            # Owned intent reaches the native rows only through the operator Accept or Edit.
+            pass
+        elif current_native is None:
+            profile = profile_for(entry)
             native = BFDInterface(
                 interface=interface,
                 bfd_profile=profile,
-                micro_bfd=current_state.micro_bfd if owned else flags["micro_bfd"],
-                enabled=True if owned else flags["enabled"],
+                micro_bfd=flags["micro_bfd"],
+                enabled=flags["enabled"],
             )
-            save(native, force_insert=True, natural_key=("interface",))
+            save(native, force_insert=True, natural_key=("interface",), origin=_OBSERVED)
             native_by_interface[interface_id] = native
-        elif not owned:
-            profile = profile_for(desired_entry)
+        else:
+            profile = profile_for(entry)
             desired_micro, desired_enabled = flags["micro_bfd"], flags["enabled"]
             if (
                 (profile is not None and profile.pk is None)
@@ -157,7 +155,7 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
                 native.micro_bfd = desired_micro
                 native.enabled = desired_enabled
                 fields = ("bfd_profile", "micro_bfd", "enabled")
-                save(native, update_fields=fields)
+                save(native, update_fields=fields, origin=_OBSERVED)
                 native_by_interface[interface_id] = native
 
         if management is None:
@@ -208,7 +206,7 @@ def _bfd_reconcile_operations(device, interfaces, planned_at):  # noqa: C901
     for interface_id, native in native_by_interface.items():
         if interface_id in seen_interface_ids or interface_id in owned_interface_ids or native.pk is None:
             continue
-        delete(native)
+        delete(native, origin=_OBSERVED)
         deleted_native_ids.add(interface_id)
 
     if management is not None:
