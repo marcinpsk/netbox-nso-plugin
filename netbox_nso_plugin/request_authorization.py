@@ -361,10 +361,10 @@ def shared_vlan_rename(user, state):
 
 
 def permitted_instance(user, selected):
-    """Return the selected NSO instance, else the default one, through the view restriction.
+    """Return the selected NSO instance, else the default one, through the view restriction (pages only).
 
     An excluded selection falls back like an unknown one. A default the user may not view
-    is not offered.
+    is not offered. A mutation resolves an explicit selection strictly instead.
     """
     from .models import NSOInstance
 
@@ -378,17 +378,25 @@ def permitted_instance(user, selected):
 
 @dataclass(frozen=True)
 class Onboarding(TargetSpec):
-    """Onboard a device: the posted device must be visible; the instance comes from the view restriction."""
+    """Onboard a device: the posted device and the selected instance must be visible (404 otherwise)."""
 
     def permissions(self):  # noqa: D102
         return ("netbox_nso_plugin.add_nsodevicemanagement", "dcim.view_device")
 
     def resolve(self, request, user, kwargs):  # noqa: D102
+        from .models import NSOInstance
+
         raw = request.POST.get("device")
         if not str(raw or "").isdigit():
             raise Http404
         device = get_object_or_404(_device_model().objects.restrict(user, "view"), pk=int(raw))
-        instance = permitted_instance(user, request.POST.get("instance"))
+        selected = request.POST.get("instance")
+        if selected:
+            # A mutation never substitutes the default for an explicit selection.
+            visible = NSOInstance.objects.restrict(user, "view")
+            instance = get_object_or_404(visible, adapter_instance_id=selected)
+        else:
+            instance = permitted_instance(user, None)
         return AuthorizedTarget(user=user, primary=device, device=device, related={"instance": instance})
 
 
@@ -617,17 +625,22 @@ _DML = re.compile(r'\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?([A-Za-z0-9_]+
 
 @functools.cache
 def native_tables() -> frozenset[str]:
-    """Return the tables of change-logged models outside this plugin, their M2M tables, and tag assignments."""
-    from django.apps import apps
-    from netbox.models.features import ChangeLoggingMixin
+    """Return every table outside this plugin, except the NetBox bookkeeping a plugin-row write records.
 
-    # Tag assignments of every model share one explicit relation table; read endpoints write none.
-    tables = {apps.get_model("extras", "TaggedItem")._meta.db_table}
+    Bookkeeping: the change log and search cache entries of plugin rows, and the type caches.
+    """
+    from django.apps import apps
+
+    bookkeeping = {
+        apps.get_model(label)._meta.db_table
+        for label in ("core.ObjectChange", "extras.CachedValue", "core.ObjectType", "contenttypes.ContentType")
+    }
+    tables = set()
     for model in apps.get_models(include_auto_created=True):
         owner = model._meta.auto_created or model
-        if owner._meta.app_label != "netbox_nso_plugin" and issubclass(owner, ChangeLoggingMixin):
+        if owner._meta.app_label != "netbox_nso_plugin" and not model._meta.proxy:
             tables.add(model._meta.db_table)
-    return frozenset(tables)
+    return frozenset(tables - bookkeeping)
 
 
 def _refuse_native_dml(execute, sql, params, many, context):

@@ -263,6 +263,20 @@ class TestNoWriteScope(TestCase):
             self.assertRefused(lambda: site.tags.add(Tag.objects.create(name="authz-two", slug="authz-two")))
         self.assertEqual(list(site.tags.all()), [tag])
 
+    def test_read_scope_refuses_native_rows_without_change_logging(self):
+        """Native means every table outside the plugin, change-logged or not, except NetBox bookkeeping."""
+        from extras.models import Bookmark
+        from netbox_routing.models import RouteMapEntrySetCommunity
+
+        user = User.objects.create_user(username=f"authz-bookmark-{uuid4().hex[:6]}")
+        site = Site.objects.create(name="authz-bookmarked", slug="authz-bookmarked")
+        with authority_scope("read"):
+            self.assertRefused(lambda: Bookmark.objects.create(object=site, user=user))
+        self.assertFalse(Bookmark.objects.filter(user=user).exists())
+        self.assertIn(RouteMapEntrySetCommunity._meta.db_table, authz.native_tables())
+        self.assertIn(RouteMapEntrySetCommunity.communities.through._meta.db_table, authz.native_tables())
+        self.assertNotIn(NSOInterfaceState._meta.db_table, authz.native_tables())
+
     def test_native_mutation_scope_keeps_todays_native_writes(self):
         with authority_scope("native_mutation"):
             Site.objects.create(name="authz-mutate", slug="authz-mutate")
@@ -849,6 +863,31 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertEqual(row.address, "198.18.71.5/30")
         self.user = superuser
         self.assertEqual(self._api().get(owner).status_code, 200)
+
+    def test_an_excluded_instance_selection_is_404_not_the_default(self):
+        """A mutating onboard never substitutes the default instance for an excluded selection."""
+        from netbox_nso_plugin.models import NSOInstance
+
+        unmanaged = Device.objects.create(
+            name="authz-manage-me",
+            device_type=self.device_a.device_type,
+            role=self.device_a.role,
+            site=self.device_a.site,
+        )
+        excluded = self.management_b.nso_instance
+        default = self.management_a.nso_instance
+        NSOInstance.objects.filter(pk=default.pk).update(is_default=True)
+        NSOInstance.objects.exclude(pk=default.pk).update(is_default=False)
+        _grant(self.user, ("add",), NSODeviceManagement)
+        _grant(self.user, ("view",), Device)
+        _grant(self.user, ("view",), NSOInstance, {"pk": default.pk})
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:quick_manage"),
+            {"device": unmanaged.pk, "instance": excluded.adapter_instance_id, "nso_name": "authz-manage-me"},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(NSODeviceManagement.objects.filter(device=unmanaged).exists())
+        self.assertEqual(_CountingSession.calls, [])
 
     def test_onboarding_without_device_view_is_403(self):
         _grant(self.user, ("add",), NSODeviceManagement)
