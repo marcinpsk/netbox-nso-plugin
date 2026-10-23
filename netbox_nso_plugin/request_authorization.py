@@ -54,10 +54,6 @@ class AuthzPath:
         """Return the management row that owns *row*."""
         return operator.attrgetter(self.management.replace("__", "."))(row)
 
-    def device_of(self, row):
-        """Return the device *row* belongs to."""
-        return operator.attrgetter(self.device.replace("__", "."))(row)
-
 
 _BY_MANAGEMENT = AuthzPath("management", "management__device")
 _BY_INTERFACE = AuthzPath("interface__device__nso_management", "interface__device")
@@ -190,33 +186,39 @@ def _device_management(user, device, action):
     return get_object_or_404(_managements(user, action), pk=management_pk)
 
 
-def overlay_row(model, pk, user, action) -> AuthorizedTarget:
-    """Resolve one overlay row inside the managements (and, for reads, devices) the user may use."""
+def overlay_row(model, pk, user, action, *, base=None) -> AuthorizedTarget:
+    """Resolve one overlay row inside the managements (and, for reads, devices) the user may use.
+
+    An interface overlay on an unmanaged device has no management authority: its device authorizes
+    it, through view for a read and through change for any other action (NetBox semantics).
+    """
     path = AUTHZ_TARGETS[model._meta.label_lower]
-    queryset = model.objects.filter(**{f"{path.management}__in": _managements(user, action)})
+    rows = model.objects.all() if base is None else base
+    queryset = rows.filter(**{f"{path.management}__in": _managements(user, action)})
     if action == "view":
         queryset = queryset.filter(**{f"{path.device}__in": _device_model().objects.restrict(user, "view")})
-    row = get_object_or_404(queryset, pk=pk)
-    management = path.management_of(row)
-    return AuthorizedTarget(user=user, primary=row, device=management.device, management=management, queryset=queryset)
-
-
-def authorize_related_row(row, user, action):
-    """Authorize a second overlay row an operation touches: 403 without the permission, 404 outside it.
-
-    An interface overlay on an unmanaged device has no management authority. A read needs its device
-    visible; any other action writes on that device and needs change on it (NetBox semantics).
-    """
-    from .models import NSODeviceManagement
-
-    device = AUTHZ_TARGETS[row._meta.label_lower].device_of(row)
-    if NSODeviceManagement.objects.filter(device=device).exists():
-        overlay_row(type(row), row.pk, user, action)
-        return
+    row = queryset.filter(pk=pk).first()
+    if row is not None:
+        management = path.management_of(row)
+        return AuthorizedTarget(
+            user=user, primary=row, device=management.device, management=management, queryset=queryset
+        )
+    if path is not _BY_INTERFACE or not rows.filter(pk=pk, interface__device__nso_management__isnull=True).exists():
+        raise Http404
     device_action = "view" if action == "view" else "change"
     if not user.has_perm(f"dcim.{device_action}_device"):
         raise PermissionDenied
-    get_object_or_404(_device_model().objects.restrict(user, device_action), pk=device.pk)
+    queryset = rows.filter(
+        interface__device__nso_management__isnull=True,
+        interface__device__in=_device_model().objects.restrict(user, device_action),
+    )
+    row = get_object_or_404(queryset, pk=pk)
+    return AuthorizedTarget(user=user, primary=row, device=row.interface.device, queryset=queryset)
+
+
+def authorize_related_row(row, user, action):
+    """Authorize a second overlay row an operation touches: 403 without the permission, 404 outside it."""
+    overlay_row(type(row), row.pk, user, action)
 
 
 def _management_permissions(action, *, device_view=False):
@@ -438,22 +440,12 @@ class OwnerRow(TargetSpec):
         )
         if not all(user.has_perm(permission) for permission in required):
             raise PermissionDenied
-        path = AUTHZ_TARGETS[spec.model_label]
-        queryset = spec.model.objects.restrict(user, "view").filter(
-            **{
-                f"{path.management}__in": _managements(user, "view"),
-                f"{path.device}__in": _device_model().objects.restrict(user, "view"),
-            }
-        )
+        base = spec.model.objects.restrict(user, "view")
         if spec.model_label == "netbox_nso_plugin.nsobgprouterstate":
             from .views import _visible_bgp_router_states
 
-            queryset = queryset.filter(pk__in=_visible_bgp_router_states(user).values("pk"))
-        row = get_object_or_404(queryset, pk=kwargs["pk"])
-        management = path.management_of(row)
-        return AuthorizedTarget(
-            user=user, primary=row, device=management.device, management=management, queryset=queryset
-        )
+            base = base.filter(pk__in=_visible_bgp_router_states(user).values("pk"))
+        return overlay_row(spec.model, kwargs["pk"], user, "view", base=base)
 
 
 @dataclass(frozen=True)

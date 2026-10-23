@@ -819,6 +819,37 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         remote.refresh_from_db()
         self.assertEqual(remote.address, "198.18.61.2/30")
 
+    def test_an_unmanaged_interface_overlay_is_a_device_scoped_target(self):
+        """With no management row, a primary interface overlay is authorized by its device (A4 for superusers)."""
+        from netbox_nso_plugin.models import NSOInterfaceIPState
+
+        unmanaged = Device.objects.create(
+            name="authz-orphan", device_type=self.device_a.device_type, role=self.device_a.role, site=self.device_a.site
+        )
+        with without_commit_drain():
+            row = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=Interface.objects.create(device=unmanaged, name="Ethernet71", type="1000base-t"),
+                address="198.18.71.1/30",
+                status="imported",
+            )
+        edit = reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", kwargs={"pk": row.pk})
+        owner = reverse("plugins-api:netbox_nso_plugin-api:owner-state-detail", args=(row._meta.model_name, row.pk))
+        _grant(self.user, ("change",), NSODeviceManagement)
+        _grant(self.user, ("view",), Device)
+        self.assertEqual(self.client.post(edit, {"address": "198.18.71.5/30"}).status_code, 403)
+        _grant(self.user, ("change",), Device, {"pk": self.device_a.pk})
+        self.assertEqual(self.client.post(edit, {"address": "198.18.71.5/30"}).status_code, 404)
+        row.refresh_from_db()
+        self.assertEqual(row.address, "198.18.71.1/30")
+        superuser = User.objects.create_superuser(username=f"authz-orphan-admin-{uuid4().hex[:6]}")
+        self.client.force_login(superuser)
+        self.assertEqual(self.client.post(edit, {"address": "198.18.71.5/30"}).status_code, 200)
+        row.refresh_from_db()
+        self.assertEqual(row.address, "198.18.71.5/30")
+        self.user = superuser
+        self.assertEqual(self._api().get(owner).status_code, 200)
+
     def test_onboarding_without_device_view_is_403(self):
         _grant(self.user, ("add",), NSODeviceManagement)
         response = self.client.post(reverse("plugins:netbox_nso_plugin:onboard"), {"device": self.device_a.pk})
