@@ -19,6 +19,8 @@ from django.test import TestCase
 from netbox_nso_plugin.models import NSODeviceManagement, NSOInstance, NSORedistributionState
 from netbox_nso_plugin.redistribution_reconciler import reconcile_redistribution
 
+from ._routing_observation_case import redistribution_read_payload
+
 REQUIRED_TOP_KEYS = {"device_id", "last_refreshed_at", "refresh_source", "entries"}
 REQUIRED_ENTRY_KEYS = {"dest_protocol", "dest_ref", "source_protocol", "source_ref"}
 OPTIONAL_ENTRY_KEYS = {"route_map", "metric", "metric_type"}
@@ -64,7 +66,7 @@ class TestRedistributionContractConsumer(TestCase):
 
     def test_consumer_reads_contract_payload(self):
         """reconcile_redistribution ingests the documented shape into NSORedistributionState."""
-        result = reconcile_redistribution(self.device, CONTRACT_PAYLOAD)
+        result = reconcile_redistribution(self.device, redistribution_read_payload(CONTRACT_PAYLOAD))
 
         self.assertEqual(NSORedistributionState.objects.filter(management=self.mgmt).count(), 2)
         self.assertEqual(len(result), 2)

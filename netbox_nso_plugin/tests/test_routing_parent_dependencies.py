@@ -10,6 +10,7 @@ import pytest
 from netbox_nso_plugin import difference_projection
 from netbox_nso_plugin.comparison_values import MISSING, ProjectedEntry
 from netbox_nso_plugin.device_differences import NOT_VISIBLE, SCOPE_SPECS, differences
+from netbox_nso_plugin.models import NSOFamilyObservation, NSOFamilyReadState
 
 
 class _ViewableObjects:
@@ -153,9 +154,11 @@ def _graph_comparison(monkeypatch, scope, native, observed, visible=()):
     document.update(present=list(spec.components), unprojectable=[])
     if scope == "redistribution":
         document["components"] = [
-            {"protocol": protocol, "inventory": [], "present": ["inventory"]} for protocol in spec.components
+            {"protocol": protocol, "status": "covered", "inventory": [], "present": ["inventory"]}
+            for protocol in spec.components
         ]
-    snapshot = SimpleNamespace(
+    snapshot = NSOFamilyObservation(
+        read_state=NSOFamilyReadState(),
         document=document,
         coverage={"attributes": [], "components": [{"protocol": protocol} for protocol in spec.components]},
     )

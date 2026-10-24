@@ -542,6 +542,7 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
 
     from . import merge_util
     from . import status_machine as sm
+    from .collection_coverage import require_collection_coverage
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
     from .template_content import (
         _ISIS_IFACE_SCALAR_ATTRS,
@@ -554,6 +555,8 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
         _isis_process_device_matches_intent,
     )
 
+    if "observation" in payload:
+        require_collection_coverage("isis", payload["observation"])
     management = NSODeviceManagement.objects.filter(device=device).first()
     operations = _Operations()
     if management is None:

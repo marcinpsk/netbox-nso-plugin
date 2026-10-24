@@ -1091,6 +1091,10 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
 
 
 def _route_policy_reconcile_operations(device, payload, planned_at):
+    from .collection_coverage import require_collection_coverage
+
+    if "observation" in payload:
+        require_collection_coverage("route_policy", payload["observation"])
     return _RoutePolicyGraphPlanner(device, payload, planned_at).build()
 
 

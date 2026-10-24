@@ -200,6 +200,17 @@ def _gated(
     ):
         validator(payload)
     context_before = dict(ctx)
+    checked_pre_body = pre_body
+    if family != "redistribution" and isinstance(payload, dict) and "observation" in payload:
+
+        def checked_pre_body():
+            from .collection_coverage import collection_gaps
+
+            gaps = collection_gaps(family, payload["observation"]["document"])
+            if gaps:
+                raise ReconcileScopeError(mgmt, (), f"{family} collection coverage: {', '.join(gaps)}")
+            return pre_body() if pre_body is not None else None
+
     try:
         result = gated_family_run(
             mgmt,
@@ -207,7 +218,7 @@ def _gated(
             read_state,
             body,
             epoch=epoch,
-            pre_body=pre_body,
+            pre_body=checked_pre_body,
             observation=payload.get("observation") if isinstance(payload, dict) else None,
             publish_applied=publish_applied,
         )

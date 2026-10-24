@@ -194,6 +194,22 @@ class TestPeerNativeViews(TestCase):
     def test_unlinked_duplicate_observations_keep_first_scalars_and_any_enabled(self):
         self.assert_duplicate_observations(first_enabled=True, second_enabled=False)
 
+    def test_unlinked_display_refuses_uncovered_peer_collection(self):
+        from netbox_nso_plugin.models import NSOFamilyObservation
+
+        state = self.state(status="accepted")
+        with without_commit_drain():
+            self.peer.delete()
+        state.refresh_from_db()
+        self.publish([entry(peer_address=state.peer_address_str, remote_as="64515", enabled=True)])
+        snapshot = NSOFamilyObservation.objects.get(read_state__management=self.management, read_state__family="bgp")
+        snapshot.document["routers"][0]["scope"][0]["present"].remove("peer")
+        snapshot.save(update_fields=("document",))
+        row = self.grid()[state.peer_address_str]
+        self.assertIsNone(row["remote_as"])
+        self.assertIsNone(row["enabled"])
+        self.assertEqual(self.preview()[0]["detail"], "remote AS unavailable, state unavailable")
+
     def test_unlinked_later_enabled_observation_keeps_first_scalars(self):
         self.assert_duplicate_observations(first_enabled=False, second_enabled=True)
 

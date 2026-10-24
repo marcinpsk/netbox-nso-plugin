@@ -385,6 +385,7 @@ def _bgp_router_display_scopes(state):
 def _bgp_peer_observations(management_id):
     """Index published peer observations by canonical router, VRF, and address."""
     from .bgp_reconciler import canonical_bgp_peer_identity
+    from .comparison_values import observed_items
     from .models import NSOFamilyObservation
 
     document = (
@@ -393,9 +394,9 @@ def _bgp_peer_observations(management_id):
         .first()
     )
     peers = {}
-    for router in (document or {}).get("routers") or []:
-        for scope in router.get("scope") or []:
-            for peer in scope.get("peer") or []:
+    for router in observed_items(document or {}, "routers"):
+        for scope in observed_items(router, "scope"):
+            for peer in observed_items(scope, "peer"):
                 try:
                     identity = canonical_bgp_peer_identity(router["asn"], scope.get("vrf") or "", peer["peer_address"])
                 except ValueError:
@@ -6691,6 +6692,9 @@ class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
         """
         return (), (), (), ()
 
+    def _validate_accept(self, states):
+        """Check family coverage again after the writer acquires its locks."""
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
@@ -6714,6 +6718,7 @@ class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
             grant=OwnershipGrant("accept"),
             saves=(*native_saves, planned_save(candidate, update_fields=fields, references=references)),
             planned_at=candidate.accepted_at,
+            validate_after_acquire=lambda: self._validate_accept((state,)),
         )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
@@ -7684,9 +7689,11 @@ class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
 
 def _redistribution_accept_blocker(state):
     from .ownership_planner import OwnershipNotQualified, require_bgp_redistribution_destination
+    from .redistribution_coverage import require_covered_component
 
     try:
         require_bgp_redistribution_destination(state)
+        require_covered_component(state)
     except OwnershipNotQualified as exc:
         return exc.public_message
     return ""
@@ -7754,6 +7761,16 @@ class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
     def _native_writes(self, candidate):  # noqa: D102
         return _redistribution_native_writes(candidate, self.request.user)
 
+    def _validate_accept(self, states):
+        _validate_redistribution_accept(states)
+
+
+def _validate_redistribution_accept(states):
+    from .redistribution_coverage import require_covered_component
+
+    for state in states:
+        require_covered_component(state)
+
 
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
 
@@ -7777,13 +7794,18 @@ class RoutingBulkAcceptMixin(AuthorizedView, abstract=True):
         """Return why *state* cannot become owned, or an empty string."""
         return ""
 
+    def _validate_accept(self, states):
+        """Check family coverage again after the writer acquires its locks."""
+
     def _build_accept_plan(self, mgmt, accepted, saves):
         """Build the family-specific exact plan and replay operations."""
         from .renderer_writer import RendererMutationPlan
 
-        return RendererMutationPlan.build(grant=OwnershipGrant("accept"), saves=saves), [
-            (*operation, False) for operation in accepted
-        ]
+        return RendererMutationPlan.build(
+            grant=OwnershipGrant("accept"),
+            saves=saves,
+            validate_after_acquire=lambda: self._validate_accept(tuple(row for row, _fields in accepted)),
+        ), [(*operation, False) for operation in accepted]
 
     def post(self, request, device_pk):  # noqa: D102
         import copy
@@ -7948,10 +7970,14 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
     def _accept_blocker(self, state):
         return _redistribution_accept_blocker(state)
 
+    def _validate_accept(self, states):
+        _validate_redistribution_accept(states)
+
     def _push(self, mgmt):
+        from .redistribution_coverage import applied_covered_protocols
         from .signals import _OWNED_PUSH_STATUSES, redistribution_destinations
 
-        supported = redistribution_destinations()
+        supported = set(redistribution_destinations()) & applied_covered_protocols(mgmt.pk)
         destinations = (
             self.model_class.objects.filter(
                 management=mgmt,

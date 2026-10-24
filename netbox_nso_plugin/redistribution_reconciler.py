@@ -22,7 +22,30 @@ def _validated_redistribution_entries(payload) -> list[dict]:
     entries = payload["entries"]
     if any(not isinstance(entry, dict) for entry in entries):
         raise AdapterError("Adapter redistribution entries must be objects", code="invalid_response")
+    if any(
+        not isinstance(entry.get(field), str) or not entry[field]
+        for entry in entries
+        for field in ("dest_protocol", "source_protocol")
+    ):
+        raise AdapterError(
+            "Adapter returned a redistribution entry without a destination or source protocol", code="invalid_response"
+        )
     return entries
+
+
+def _covered_redistribution_protocols(payload):
+    from .adapter_client import AdapterError
+    from .observations import ObservationProtocolError, validate_observation_schema
+    from .redistribution_coverage import covered_protocols
+
+    observation = payload.get("observation")
+    if observation is None:
+        return frozenset()
+    try:
+        validate_observation_schema("redistribution", observation)
+        return covered_protocols(observation["document"], observation["coverage"])
+    except ObservationProtocolError as exc:
+        raise AdapterError(str(exc), code="invalid_response") from exc
 
 
 def redistribution_reconcile_plan(device, payload):
@@ -40,7 +63,11 @@ def redistribution_reconcile_plan(device, payload):
             raise
         return RendererMutationPlan.build(planned_at=planned_at)
     entries = _validated_redistribution_entries(payload)
-    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(device, entries, planned_at)
+    covered = _covered_redistribution_protocols(payload)
+    entries = [entry for entry in entries if entry["dest_protocol"] in covered]
+    saves, deletes, _operations, dependencies = _redistribution_reconcile_operations(
+        device, entries, planned_at, covered=covered
+    )
     plan = RendererMutationPlan.build(
         saves=saves,
         deletes=deletes,
@@ -173,7 +200,7 @@ def _redist_overlay_matches_device(state, entry: dict) -> bool:
     )
 
 
-def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: C901
+def _redistribution_reconcile_operations(device, entries, planned_at, *, covered):  # noqa: C901
     """Build the deterministic redistribution writes used by preflight and apply."""
     from django.contrib.contenttypes.models import ContentType
     from netbox_routing.models import Redistribution, RouteMap
@@ -189,7 +216,7 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
         return [], [], [], []
     states = {
         (row.dest_protocol, row.dest_ref, row.source_protocol, row.source_ref): row
-        for row in NSORedistributionState.objects.filter(management=management)
+        for row in NSORedistributionState.objects.filter(management=management, dest_protocol__in=covered)
         .select_related("redistribution")
         .order_by("pk")
     }
@@ -221,11 +248,6 @@ def _redistribution_reconcile_operations(device, entries, planned_at):  # noqa: 
         destination_ref = entry.get("dest_ref") or ""
         source_protocol = entry.get("source_protocol") or ""
         source_ref = entry.get("source_ref") or ""
-        if not destination_protocol or not source_protocol:
-            raise AdapterError(
-                "Adapter returned a redistribution entry without a destination or source protocol",
-                code="invalid_response",
-            )
         if destination_protocol == "bgp":
             try:
                 destination_ref = _canonical_bgp_destination_ref(destination_ref)
@@ -420,6 +442,8 @@ def reconcile_redistribution(device, payload: dict) -> list:
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return []
+    if not _covered_redistribution_protocols(payload):
+        return list(NSORedistributionState.objects.filter(management=management))
     active = active_renderer_writer()
     mutation = (
         contextlib.nullcontext((active, active.plan))

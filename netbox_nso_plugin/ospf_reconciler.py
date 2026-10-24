@@ -106,10 +106,13 @@ def _ospf_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
 
     from . import merge_util
     from . import status_machine as sm
+    from .collection_coverage import require_collection_coverage
     from .models import NSODeviceManagement, NSOOSPFInstanceState, NSOOSPFInterfaceState
     from .renderer_writer import planned_delete, planned_save
     from .template_content import _adapter_setting, _canonical_area_id, _clean_router_id
 
+    if "observation" in payload:
+        require_collection_coverage("ospf", payload["observation"])
     management = NSODeviceManagement.objects.filter(device=device).first()
     if management is None:
         return [], [], [], []

@@ -895,6 +895,8 @@ def require_router_acquisition_observation(instance):
     from ipam.models import VRF
 
     from .bgp_router_content import canonical_asn
+    from .collection_coverage import collection_gaps
+    from .comparison_values import observed_items
     from .models import NSOFamilyObservation
 
     snapshot = NSOFamilyObservation.objects.filter(
@@ -905,7 +907,7 @@ def require_router_acquisition_observation(instance):
     try:
         routers = [
             router
-            for router in snapshot.document.get("routers") or ()
+            for router in observed_items(snapshot.document, "routers")
             if canonical_asn(router.get("asn")) == instance.asn_str
         ]
     except ValueError as exc:
@@ -913,7 +915,12 @@ def require_router_acquisition_observation(instance):
             "The observed BGP router ASN is invalid. Refresh BGP before accepting it.",
             device_id=instance.management.device_id,
         ) from exc
-    names = {scope["vrf"] for router in routers for scope in router.get("scope") or () if scope.get("vrf")}
+    if collection_gaps("bgp", snapshot.document):
+        raise OwnershipNotQualified(
+            "Refresh BGP with complete collection coverage before accepting this router.",
+            device_id=instance.management.device_id,
+        )
+    names = {scope["vrf"] for router in routers for scope in observed_items(router, "scope") if scope.get("vrf")}
     matches = Counter(VRF.objects.filter(name__in=names).values_list("name", flat=True))
     if any(matches[name] != 1 for name in names):
         raise OwnershipNotQualified(

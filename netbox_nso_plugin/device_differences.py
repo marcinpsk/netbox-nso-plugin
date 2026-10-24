@@ -353,9 +353,10 @@ def _entry_component(spec, item):
 
 def _scope_component_gaps(spec, snapshot):
     if spec.scope == "redistribution":
+        from .redistribution_coverage import refresh_is_unavailable
         from .routing_protocol_projection import component_gaps
 
-        return component_gaps(snapshot)
+        return component_gaps(snapshot, read_unavailable=refresh_is_unavailable(snapshot))
     gaps = {}
     for name in spec.components:
         if name != "system" and name not in snapshot.document["present"]:

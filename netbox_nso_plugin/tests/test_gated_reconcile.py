@@ -30,6 +30,7 @@ from netbox_nso_plugin.ownership_grants import OwnershipGrant
 
 from ._outbox_case import content_update, mirror_update
 from ._ownership_case import acquire_overlay
+from ._routing_observation_case import redistribution_read_payload
 
 User = get_user_model()
 
@@ -894,7 +895,7 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                 *planners,
                 (isis_reconcile_plan, {"processes": [], "interfaces": []}),
                 (ospf_reconcile_plan, {"instances": [], "interfaces": []}),
-                (redistribution_reconcile_plan, {"entries": []}),
+                (redistribution_reconcile_plan, redistribution_read_payload({"entries": []})),
             )
             for planner, payload in missing_dependency_planners:
                 with self.subTest(planner=planner.__name__):
@@ -934,7 +935,10 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             with self.subTest(reconcile=reconcile.__name__), patch.dict(vars(models)):
                 delattr(models, symbol)
                 with self.assertRaisesRegex(ImportError, symbol):
-                    reconcile(device, {"entries": []} if reconcile is reconcile_redistribution else {})
+                    reconcile(
+                        device,
+                        redistribution_read_payload({"entries": []}) if reconcile is reconcile_redistribution else {},
+                    )
 
     def test_redistribution_plan_propagates_missing_destination_models(self):
         from netbox_routing import models
@@ -942,7 +946,9 @@ class TestOptionalRoutingDependencyPlans(TestCase):
         from netbox_nso_plugin.redistribution_reconciler import redistribution_reconcile_plan
 
         device, _management = _make("redistribution-missing-destination")
-        payload = {"entries": [{"dest_protocol": "ospf", "dest_ref": "1", "source_protocol": "connected"}]}
+        payload = redistribution_read_payload(
+            {"entries": [{"dest_protocol": "ospf", "dest_ref": "1", "source_protocol": "connected"}]}
+        )
         with patch.dict(vars(models)):
             del models.BGPRouter
             with self.assertRaisesRegex(ImportError, "BGPRouter"):
@@ -1013,7 +1019,12 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             with self.subTest(planner=planner.__name__), patch.dict(vars(models)):
                 delattr(models, symbol)
                 with self.assertRaisesRegex(ImportError, symbol):
-                    planner(device, {"entries": []} if planner is redistribution_reconcile_plan else {})
+                    planner(
+                        device,
+                        redistribution_read_payload({"entries": []})
+                        if planner is redistribution_reconcile_plan
+                        else {},
+                    )
 
     def test_routing_plans_propagate_unrelated_missing_modules(self):
         import builtins
@@ -1055,7 +1066,9 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             ):
                 planner(
                     device,
-                    {"entries": []} if planner in {redistribution_reconcile_plan, reconcile_redistribution} else {},
+                    redistribution_read_payload({"entries": []})
+                    if planner in {redistribution_reconcile_plan, reconcile_redistribution}
+                    else {},
                 )
 
     def test_routing_plans_allow_only_missing_routing_packages(self):
@@ -1078,7 +1091,12 @@ class TestOptionalRoutingDependencyPlans(TestCase):
                 redistribution_reconcile_plan,
             ):
                 with self.subTest(missing=missing, planner=planner.__name__), patch.dict(sys.modules, {missing: None}):
-                    plan = planner(device, {"entries": []} if planner is redistribution_reconcile_plan else {})
+                    plan = planner(
+                        device,
+                        redistribution_read_payload({"entries": []})
+                        if planner is redistribution_reconcile_plan
+                        else {},
+                    )
                     self.assertEqual(plan.write_set, ())
                     self.assertEqual(plan.lock_footprint, MutationFootprint())
                     self.assertFalse(plan.changes_content)
@@ -1104,7 +1122,7 @@ class TestOptionalRoutingDependencyPlans(TestCase):
             ),
             (
                 reconcile_redistribution,
-                {"entries": []},
+                redistribution_read_payload({"entries": []}),
                 [],
                 "netbox_nso_plugin.redistribution_reconciler",
             ),
@@ -1138,7 +1156,7 @@ _DEVICE_FETCHERS = {
     "get_ospf": {"instances": [], "interfaces": []},
     "get_bgp_config": {"routers": []},
     "get_bfd": {"interfaces": []},
-    "get_redistribution": {"entries": []},
+    "get_redistribution": redistribution_read_payload({"entries": []}),
 }
 
 _ALL_SCOPES = {
@@ -1184,7 +1202,7 @@ class TestRealBodyGateSweep(TestCase):
                 elif fetcher == "get_l2_services":
                     doc = _l2_payload(("gate-sweep-l2",))
                 elif fetcher == "get_route_policy":
-                    doc["prefix_lists"] = [{"name": "GATE-SWEEP-PREFIX", "entries": []}]
+                    doc["prefix_lists"] = [redistribution_read_payload({"name": "GATE-SWEEP-PREFIX", "entries": []})]
                 if fetcher != "get_state" and read_state is not None:
                     doc["read_state"] = read_state
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
