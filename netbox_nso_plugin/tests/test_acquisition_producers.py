@@ -143,7 +143,7 @@ UNRESOLVED_DISPOSITIONS = {
     ),
     ("l2_service_reconciler.py", "_l2_service_reconcile_operations"): (2, "Reconcile preserves existing ownership."),
     ("isis_reconciler.py", "_plan_stale_states"): (2, "Absent rows retain or release ownership."),
-    ("isis_reconciler.py", "_isis_reconcile_operations"): (3, "Reconcile preserves existing ownership."),
+    ("isis_reconciler.py", "_isis_reconcile_operations"): (4, "Reconcile preserves existing ownership."),
     ("subinterface_reconciler.py", "_subinterface_reconcile_operations"): (
         3,
         "Reconcile preserves existing ownership.",

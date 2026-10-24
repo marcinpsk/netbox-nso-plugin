@@ -3102,3 +3102,28 @@ def digits_in_object_repr(self, rows):
     self.assertNotIn("200", shown_fields(rows))
     # ok: nso-test-hex-literal-in-object-repr
     self.assertNotIn("Ethernet1:200", repr(rows))
+
+
+def _isis_interface_matches_intent(entry, state):
+    # ruleid: nso-nullable-isis-intent-bool
+    bfd = bool(state.bfd_enabled)
+    # ruleid: nso-nullable-isis-intent-bool
+    frr = bool(entry.get("frr_enabled"))
+    # ok: nso-nullable-isis-intent-bool
+    exact_bfd = entry.get("bfd_enabled") is state.bfd_enabled
+    # ok: nso-nullable-isis-intent-bool
+    exact_frr = state.frr_enabled is None or entry.get("frr_enabled") is state.frr_enabled
+    return bfd, frr, exact_bfd, exact_frr
+
+
+def _isis_device_matches_intent(entry, state):
+    # ruleid: nso-nullable-isis-intent-bool
+    bfd = bool(entry.get("bfd_enabled", None))
+    # ruleid: nso-nullable-isis-intent-bool
+    frr = bool(state.frr_enabled)
+    return bfd, frr
+
+
+def show_isis_bfd(state):
+    # ok: nso-nullable-isis-intent-bool
+    return bool(state.bfd_enabled)

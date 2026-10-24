@@ -27,6 +27,7 @@ from netbox_nso_plugin.models import (
 from netbox_nso_plugin.signals import _pending_intent_keys, reset_intent_push_state
 
 from ._adapter_http import make_response
+from ._authority_case import concurrent_writer
 from ._observation_case import ObservationTransport, interface_observation, ip_observation, observation
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushResetMixin
@@ -357,7 +358,8 @@ class TestIPSync(SyncCase):
         def edit_once(sender, instance, **kwargs):
             if instance.pk == native.pk and not edits:
                 edits.append(instance.pk)
-                IPAddress.objects.filter(pk=native.pk).update(dns_name="concurrent.example")
+                with concurrent_writer():
+                    IPAddress.objects.filter(pk=native.pk).update(dns_name="concurrent.example")
 
         post_clean.connect(edit_once, sender=IPAddress)
         self.addCleanup(post_clean.disconnect, edit_once, sender=IPAddress)
@@ -388,14 +390,15 @@ class TestIPSync(SyncCase):
 
         def reference_once(sender, instance, **kwargs):
             if instance.pk == self.lag.pk and not references:
-                references.append(
-                    BGPPeer.objects.create(
-                        scope=BGPScope.objects.create(router=router),
-                        peer=doomed,
-                        remote_as=ASN.objects.create(asn=64551, rir=rir),
-                        enabled=True,
+                with concurrent_writer():
+                    references.append(
+                        BGPPeer.objects.create(
+                            scope=BGPScope.objects.create(router=router),
+                            peer=doomed,
+                            remote_as=ASN.objects.create(asn=64551, rir=rir),
+                            enabled=True,
+                        )
                     )
-                )
 
         post_clean.connect(reference_once, sender=Interface)
         self.addCleanup(post_clean.disconnect, reference_once, sender=Interface)

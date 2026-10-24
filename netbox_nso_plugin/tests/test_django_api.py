@@ -378,10 +378,10 @@ class NSOInterfaceStateAPITest(APITestCase):
 
 class OnboardAPIPermissionTest(APITestCase):
     """The onboard API action provisions a device into NSO (create node → host-keys → unlock →
-    sync-from). Like the UI, it must require change_nsodevicemanagement, not just a valid token —
+    sync-from). Like the UI, it must require add_nsodevicemanagement, not just a valid token —
     a read-only monitoring token must not be able to trigger a device provision."""
 
-    user_permissions = ()  # authenticated token, but NO change_nsodevicemanagement
+    user_permissions = ()  # authenticated token, but NO add_nsodevicemanagement
 
     @classmethod
     def setUpTestData(cls):
@@ -392,7 +392,7 @@ class OnboardAPIPermissionTest(APITestCase):
         cls.device = Device.objects.create(name="onb-api-rtr", device_type=dt, role=role, site=site)
         cls.instance = NSOInstance.objects.create(name="onb-api", adapter_instance_id="onb-api")
 
-    def test_onboard_denied_without_change_permission(self):
+    def test_onboard_denied_without_add_permission(self):
         from django.urls import reverse
 
         url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
@@ -403,9 +403,9 @@ class OnboardAPIPermissionTest(APITestCase):
 class OnboardAPIConflictTest(APITestCase):
     """The onboard API preserves an active adapter provision conflict."""
 
-    # The device and the instance resolve through view restrictions (#1709).
+    # The device and the instance resolve through view restrictions (#1709); onboarding adds the row (#1717).
     user_permissions = (
-        "netbox_nso_plugin.change_nsodevicemanagement",
+        "netbox_nso_plugin.add_nsodevicemanagement",
         "dcim.view_device",
         "netbox_nso_plugin.view_nsoinstance",
     )

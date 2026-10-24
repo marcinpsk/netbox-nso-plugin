@@ -2543,7 +2543,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from ipam.models import VLAN
 
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
+            SharedOperationConflict,
             _device_vlan_group,
             placeholder_vlan_name,
             save_vlan_content,
@@ -2565,7 +2565,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with without_commit_drain(), transaction.atomic():
             vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)
             vlan.vid = new_vid
-            with self.assertRaisesMessage(VLANRescopeConflict, "placeholder name"):
+            with self.assertRaisesMessage(SharedOperationConflict, "placeholder name"):
                 save_vlan_content(vlan, update_fields=("vid",))
 
         vlan.refresh_from_db()

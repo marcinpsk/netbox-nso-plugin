@@ -14,7 +14,7 @@ from django.apps import apps
 from django.contrib import messages
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.db import transaction
-from django.http import HttpResponseBadRequest, JsonResponse
+from django.http import Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
@@ -22,6 +22,7 @@ from django.utils.html import escape
 from netbox.object_actions import AddObject, BulkDelete, BulkExport
 from netbox.views import generic
 from netbox.views.generic.feature_views import ObjectChangeLogView, ObjectJournalView
+from utilities.exceptions import PermissionsViolation
 from utilities.forms import restrict_form_fields
 from utilities.views import ViewTab, register_model_view
 
@@ -96,6 +97,8 @@ from .models import (
     NSOVaultSettings,
     NSOVLANState,
 )
+from .native_authorization import shared_operation
+from .native_lookup import operator_lookup, require_operator_view
 from .ownership_grants import OwnershipGrant
 from .ownership_planner import OwnershipNotQualified
 from .request_authorization import (
@@ -345,33 +348,9 @@ def _can_change_bgp_router(user, state):
 _AUTO_DISCOVERED_RIR = "NSO Auto-Discovered"
 
 
-def _can_change_bgp_peer(user, state):
-    from netbox_routing.models import BGPPeer
-
-    return (
-        state.bgp_peer_id is not None
-        and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
-        and user.has_perm("netbox_routing.change_bgppeer")
-        and NSODeviceManagement.objects.restrict(user, "change").filter(pk=state.management_id).exists()
-        and BGPPeer.objects.restrict(user, "change").filter(pk=state.bgp_peer_id).exists()
-    )
-
-
-def _require_bgp_peer_edit_constraints(user, peer, created):
-    """Require the written peer and each created object to satisfy the user's permission constraints."""
-    from netbox_routing.models import BGPPeer
-
-    if not BGPPeer.objects.restrict(user, "change").filter(pk=peer.pk).exists():
-        raise PermissionDenied
-    for instance in created:
-        if not type(instance).objects.restrict(user, "add").filter(pk=instance.pk).exists():
-            raise PermissionDenied
-
-
 def _prepare_bgp_edit(user, family, state):
+    # The NativeWriter authorizes the peer and every row the edit creates; the router owner rule stays here.
     if family == "bgp_router" and not _can_change_bgp_router(user, state):
-        raise PermissionDenied
-    if family == "bgp_peer" and state.bgp_peer_id is not None and not _can_change_bgp_peer(user, state):
         raise PermissionDenied
     if family == "bgp_router":
         state.router_id = str(state.bgp_router.router_id or "")
@@ -1944,12 +1923,16 @@ class NSOCategoryView(AuthorizedView):
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                "accept_url": (
-                    reverse(accept_route, args=[st.pk])
-                    if accept_route and any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
-                    else None
-                ),
+                "native_gap": bool(accept_route)
+                and st.status != "deploying"
+                and _owned_native_gap(st, self.request.user),
             }
+            row["accept_url"] = (
+                reverse(accept_route, args=[st.pk])
+                if accept_route
+                and (any(item.status in self._ACCEPTABLE_STATUSES for item in status_rows) or row["native_gap"])
+                else None
+            )
             row.update({name: fn(st) for name, fn in fields.items()})
             rows.append(row)
         return {"rows": rows, "counts": counts}
@@ -2025,7 +2008,11 @@ class NSOCategoryView(AuthorizedView):
         # Bulk-accept shows only when something is still unowned — i.e. some row offers
         # an Accept, which is exactly the accept_url the grid itself renders.
         sections = {None: payload} if None in spec["sections"] else {n: payload[n] for n in spec["sections"]}
-        section_has_unowned = {name: any(row["accept_url"] for row in s["rows"]) for name, s in sections.items()}
+        # A native-gap Accept is not a bulk accept: bulk accept takes unowned rows only.
+        section_has_unowned = {
+            name: any(row["accept_url"] and not row.get("native_gap") for row in s["rows"])
+            for name, s in sections.items()
+        }
 
         from .template_content import _STATUS_BADGE
 
@@ -2621,7 +2608,8 @@ class NSOOnboardView(AuthorizedView):
     URL: POST /plugins/nso/onboard/  body: device=<pk>, instance=<adapter_instance_id>
     """
 
-    policy = EndpointPolicy(Onboarding(), "native_mutation")
+    # Provisioning calls the adapter after it commits the durable attempt: no operator transaction.
+    policy = EndpointPolicy(Onboarding(), "adapter_action")
 
     def post(self, request):
         """Onboard the posted device into the selected (or default) NSO instance."""
@@ -2641,6 +2629,8 @@ class NSOOnboardView(AuthorizedView):
             logger.exception("onboard action failed for device %s", device.pk)
             messages.error(request, f"Onboarding {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+        if result.get("permission_denied"):
+            raise PermissionsViolation(result["permission_denied"])
 
         if result["ok"]:
             messages.success(
@@ -2681,6 +2671,8 @@ class NSOQuickManageView(AuthorizedView):
         nso_name = request.POST.get("nso_name") or device.name
         try:
             result = manage_existing(device, instance, nso_name)
+        except PermissionsViolation:
+            raise
         except Exception as exc:  # never 500 the action
             logger.exception("manage action failed for device %s", device.pk)
             messages.error(request, f"Managing {device} failed ({type(exc).__name__}); see the server log.")
@@ -4605,7 +4597,11 @@ def _ospf_instance_errors(obj):
         native._meta.get_field("router_id").clean(obj.router_id, native)
     except ValidationError as exc:
         errors["router_id"] = [str(message) for message in exc.messages]
-    if obj.vrf and not native._meta.get_field("vrf").remote_field.model.objects.filter(name=obj.vrf).exists():
+    if (
+        obj.vrf
+        and (native.vrf is None or native.vrf.name != obj.vrf)
+        and operator_lookup(native._meta.get_field("vrf").remote_field.model, name=obj.vrf) is None
+    ):
         errors.setdefault("router_id", []).append(f"The overlay VRF {obj.vrf!r} does not exist in NetBox.")
     return errors
 
@@ -4616,9 +4612,13 @@ def _ospf_interface_errors(obj):
     from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
     errors = {}
-    if not OSPFInterface.objects.filter(interface=obj.interface).exists():
+    native = OSPFInterface.objects.filter(interface=obj.interface).first()
+    if native is None:
         return {"area_id": ["Only a linked NetBox OSPF interface can be edited inline."]}
-    if not OSPFInstance.objects.filter(device=obj.interface.device, process_id=obj.process_id).exists():
+    if (
+        native.instance.process_id != obj.process_id
+        and operator_lookup(OSPFInstance, device=obj.interface.device, process_id=obj.process_id) is None
+    ):
         errors["area_id"] = [f"OSPF process {obj.process_id!r} does not exist on this device in NetBox."]
     if not obj.area_id:
         errors.setdefault("area_id", []).append("Area is required.")
@@ -4669,7 +4669,10 @@ def _isis_interface_errors(obj):
     if native.address_family != obj.af:
         return {"circuit_type": ["The linked NetBox IS-IS interface uses a different address family."]}
     errors = {}
-    if not ISISInstance.objects.filter(device=obj.interface.device, process_tag=obj.process_tag).exists():
+    if (
+        native.instance.process_tag != obj.process_tag
+        and operator_lookup(ISISInstance, device=obj.interface.device, process_tag=obj.process_tag) is None
+    ):
         errors["circuit_type"] = [f"IS-IS process {obj.process_tag!r} does not exist on this device in NetBox."]
     for name in (
         "circuit_type",
@@ -4696,7 +4699,7 @@ def _bgp_peer_errors(obj):
     return {}
 
 
-def _clean_bgp_remote_as(raw):
+def _clean_bgp_remote_as(raw, current=None):
     """Resolve an ASN number to an existing or planned native ASN."""
     from django.core.exceptions import ValidationError
     from ipam.models import ASN
@@ -4710,7 +4713,9 @@ def _clean_bgp_remote_as(raw):
     except (TypeError, ValueError) as exc:
         raise ValidationError("Enter a valid ASN.") from exc
     number = ASN._meta.get_field("asn").clean(number, None)
-    return ASN.objects.filter(asn=number).first() or ASN(asn=number)
+    if current is not None and current.asn == number:
+        return current
+    return operator_lookup(ASN, asn=number, create_if_missing=True) or ASN(asn=number)
 
 
 def _clean_overlay_field(key, field, raw, edit_obj):
@@ -4728,12 +4733,12 @@ def _clean_overlay_field(key, field, raw, edit_obj):
     ):
         raw = raw.strip()
     if key == "bgp_peer" and field.name == "remote_as":
-        return _clean_bgp_remote_as(raw)
+        return _clean_bgp_remote_as(raw, current=edit_obj.remote_as)
     value = raw if raw != "" else (None if field.null else "")
     return field.clean(value, edit_obj)
 
 
-def _redistribution_errors(obj):
+def _redistribution_errors(obj, user):
     """Validate policy knobs against the linked native redistribution scope."""
     from django.core.exceptions import ValidationError
     from netbox_routing.models import RouteMap
@@ -4745,7 +4750,11 @@ def _redistribution_errors(obj):
     errors = {}
     route_map = None
     if obj.route_map:
-        route_map = RouteMap.objects.filter(name=obj.route_map).first()
+        route_map = (
+            native.route_map
+            if native.route_map is not None and native.route_map.name == obj.route_map
+            else RouteMap.objects.restrict(user, "view").filter(name=obj.route_map).first()
+        )
         if route_map is None:
             errors["route_map"] = [f"Route map {obj.route_map!r} does not exist in NetBox."]
 
@@ -4871,38 +4880,43 @@ def _overlay_identity_plan(key, candidate):
             fresh.status = NSOSVIState.objects.filter(pk=candidate.pk).values_list("status", flat=True).first()
         if key == "subinterface" and candidate.parent_interface_id is not None:
             fresh.parent_interface = Interface.objects.filter(pk=candidate.parent_interface_id).first()
-        errors = _overlay_family_errors(key, fresh, {})
+        errors = (_svi_errors if key == "svi" else _subinterface_errors)(fresh)
         if errors:
             raise _IntentTransactionNoOp(errors)
 
     return dependencies, validate_after_acquire
 
 
-def _save_owned_bfd_edit(obj, old_values):
-    """Claim one BFD edit and apply its exact native and overlay write set."""
+def _bfd_native_writes(obj, *, create_only):
+    """Plan the native BFD rows that carry one owned overlay's values (operator Accept or Edit)."""
     import copy
 
     from netbox_routing.models import BFDInterface, BFDProfile
 
-    from . import status_machine as sm
     from .bfd_reconciler import _profile_values
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .renderer_writer import planned_save
 
-    planned_at = timezone.now()
     saves = []
     operations = []
-
+    current_native = BFDInterface.objects.filter(interface=obj.interface).first()
+    if create_only and current_native is not None:
+        return saves, operations
     profile_values = _profile_values({"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier})
     profile = None
     if profile_values is not None:
         name, tx, rx, multiplier = profile_values
-        profile = BFDProfile.objects.filter(name=name).first()
+        profile = (
+            current_native.bfd_profile
+            if current_native is not None
+            and current_native.bfd_profile is not None
+            and current_native.bfd_profile.name == name
+            else operator_lookup(BFDProfile, name=name, create_if_missing=True)
+        )
         if profile is None:
             profile = BFDProfile(name=name, min_tx_int=tx, min_rx_int=rx, multiplier=multiplier)
             saves.append(planned_save(profile, force_insert=True, natural_key=("name",)))
             operations.append((profile, None, True))
 
-    current_native = BFDInterface.objects.filter(interface=obj.interface).first()
     native = (
         BFDInterface(interface=obj.interface, bfd_profile=profile, micro_bfd=obj.micro_bfd, enabled=True)
         if current_native is None
@@ -4930,6 +4944,18 @@ def _save_owned_bfd_edit(obj, old_values):
             )
         )
         operations.append((native, native_fields, native_created))
+    return saves, operations
+
+
+def _save_owned_bfd_edit(obj, old_values):
+    """Claim one BFD edit and apply its exact native and overlay write set."""
+    import copy
+
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    saves, operations = _bfd_native_writes(obj, create_only=False)
 
     state = copy.copy(obj)
     if not sm.is_owned(state.status):
@@ -4950,6 +4976,13 @@ def _save_owned_bfd_edit(obj, old_values):
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
+def _static_route_affected_management_ids(route):
+    """Include native assignments and overlay rows when authorizing a shared route edit."""
+    managements = set(NSOStaticRouteState.objects.filter(static_route=route).values_list("management_id", flat=True))
+    managements.update(NSODeviceManagement.objects.filter(device__in=route.devices.all()).values_list("pk", flat=True))
+    return managements
+
+
 def _save_owned_static_route_edit(obj, old_values):
     """Apply one shared static-route edit and re-arm its owned overlays exactly."""
     from . import status_machine as sm
@@ -4963,6 +4996,7 @@ def _save_owned_static_route_edit(obj, old_values):
     from .signals import _STATIC_ROUTE_TRANSITION_FIELDS, _arm_static_route_generation
 
     route = obj.static_route
+    operation = shared_operation(lambda: _static_route_affected_management_ids(route))
     native_fields = tuple(name for name, value in old_values.items() if getattr(route, name) != value)
     saves = [planned_save(route, update_fields=native_fields)]
     operations = [(route, native_fields)]
@@ -4989,14 +5023,14 @@ def _save_owned_static_route_edit(obj, old_values):
         saves=saves, m2m_writes=assignments, planned_at=planned_at, grant=OwnershipGrant("operator_edit")
     )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
+    with mutation as writer, operation:
         for instance, update_fields in operations:
             writer.save(instance, update_fields=update_fields)
         if assignments:
             writer.m2m_add(route, "devices", (device,))
 
 
-def _save_owned_redistribution_edit(obj, old_values):
+def _save_owned_redistribution_edit(obj, old_values, *, user):
     """Apply one destination-specific redistribution edit through an exact plan."""
     from netbox_routing.models import RouteMap
 
@@ -5005,7 +5039,9 @@ def _save_owned_redistribution_edit(obj, old_values):
 
     planned_at = timezone.now()
     native = copy.copy(obj.redistribution)
-    native.route_map = RouteMap.objects.filter(name=obj.route_map).first() if obj.route_map else None
+    route_maps = RouteMap.objects.restrict(user, "view")
+    if native.route_map is None or native.route_map.name != obj.route_map:
+        native.route_map = route_maps.filter(name=obj.route_map).first() if obj.route_map else None
     native.metric = obj.metric
     native.metric_type = obj.metric_type
     native_fields = ("route_map", "metric", "metric_type")
@@ -5050,19 +5086,27 @@ def _save_owned_ospf_edit(obj, key, old_values):
         native = copy.copy(obj.ospf_instance)
         vrf_model = native._meta.get_field("vrf").remote_field.model
         native.router_id = obj.router_id
-        native.vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
+        if not native.vrf or native.vrf.name != obj.vrf:
+            native.vrf = operator_lookup(vrf_model, name=obj.vrf) if obj.vrf else None
         native_fields = ("router_id", "vrf")
         saves.append(planned_save(native, update_fields=native_fields))
         operations.append((native, native_fields, False))
     else:
         current_native = OSPFInterface.objects.get(interface=obj.interface)
         native = copy.copy(current_native)
-        area = OSPFArea.objects.filter(area_id__in=_area_candidates(obj.area_id)).first()
+        area = (
+            current_native.area
+            if current_native.area is not None and current_native.area.area_id in _area_candidates(obj.area_id)
+            else operator_lookup(OSPFArea, area_id__in=_area_candidates(obj.area_id), create_if_missing=True)
+        )
         if area is None:
             area = OSPFArea(area_id=obj.area_id, area_type="standard")
             saves.append(planned_save(area, force_insert=True, natural_key=("area_id",)))
             operations.append((area, None, True))
-        native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
+        if native.instance.process_id != obj.process_id:
+            native.instance = operator_lookup(OSPFInstance, device=obj.interface.device, process_id=obj.process_id)
+            if native.instance is None:
+                raise Http404
         native.area = area
         native.passive = obj.passive
         native.priority = obj.priority
@@ -5132,10 +5176,12 @@ def _save_owned_isis_edit(obj, key, old_values):
         from netbox_routing.models import ISISInstance
 
         native = copy.copy(candidate.isis_interface)
-        native.instance = ISISInstance.objects.get(
-            device=candidate.interface.device,
-            process_tag=candidate.process_tag,
-        )
+        if native.instance.process_tag != candidate.process_tag:
+            native.instance = operator_lookup(
+                ISISInstance, device=candidate.interface.device, process_tag=candidate.process_tag
+            )
+            if native.instance is None:
+                raise Http404
         native_fields = (
             "instance",
             "circuit_type",
@@ -5216,7 +5262,7 @@ def _save_owned_bgp_router_edit(state, old_values, user):
             raise PermissionDenied
 
 
-def _save_owned_bgp_edit(obj, old_values, user):
+def _save_owned_bgp_edit(obj, old_values):
     """Claim one BGP peer edit and update its native root through an exact plan."""
     from ipam.models import RIR
 
@@ -5229,7 +5275,7 @@ def _save_owned_bgp_edit(obj, old_values, user):
     native = copy.copy(obj.bgp_peer)
     remote_as = native.remote_as
     if remote_as is not None and remote_as.pk is None:
-        rir = RIR.objects.filter(name=_AUTO_DISCOVERED_RIR).first()
+        rir = operator_lookup(RIR, name=_AUTO_DISCOVERED_RIR, create_if_missing=True)
         if rir is None:
             rir = RIR(name=_AUTO_DISCOVERED_RIR, slug="nso-auto-discovered", is_private=True)
             saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
@@ -5256,7 +5302,6 @@ def _save_owned_bgp_edit(obj, old_values, user):
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
-        _require_bgp_peer_edit_constraints(user, native, [instance for instance, _, created in operations if created])
 
 
 def _owned_overlay_edit_footprint(obj, key):
@@ -5442,7 +5487,7 @@ def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
         _save_owned_static_route_edit(obj, old_values)
         return None
     if key == "redistribution":
-        _save_owned_redistribution_edit(obj, old_values)
+        _save_owned_redistribution_edit(obj, old_values, user=user)
         return None
     if key in {"ospf_instance", "ospf_interface"}:
         _save_owned_ospf_edit(obj, key, old_values)
@@ -5454,7 +5499,7 @@ def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
         _save_owned_bgp_router_edit(obj, old_values, user)
         return None
     if key == "bgp_peer":
-        _save_owned_bgp_edit(obj, old_values, user)
+        _save_owned_bgp_edit(obj, old_values)
         return None
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
@@ -5539,6 +5584,23 @@ def _route_map_rename_dependents(route_map, old_name):
         .values_list("route_map__name", flat=True)
     }
     return bgp_states, redistribution_states, dependent_groups
+
+
+def _route_map_affected_management_ids(state, old_name):
+    """Enumerate attachments and every dependent overlay group without visibility filtering."""
+    route_map = state.assigned_object
+    bgp, redistribution, groups = _route_map_rename_dependents(route_map, old_name)
+    managements = set(
+        NSORoutePolicyState.objects.filter(
+            content_type_id=state.content_type_id, object_id=state.object_id
+        ).values_list("management_id", flat=True)
+    )
+    managements.update(row.management_id for row in (*bgp, *redistribution))
+    for family, name in groups:
+        managements.update(
+            NSORoutePolicyState.objects.filter(family=family, object_name=name).values_list("management_id", flat=True)
+        )
+    return managements
 
 
 def _route_map_name_collision_errors(route_map_model, route_map_pk, new_name, class_ids):
@@ -5673,11 +5735,12 @@ def _save_route_map_name_edit(state, old_name):
     from .renderer_writer import renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
+    operation = shared_operation(lambda: _route_map_affected_management_ids(state, old_name))
     plan, operations, targets = _route_map_name_edit_operations(state, old_name, timezone.now())
     route_policy_targets, bgp_targets, redistribution_targets = targets
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     try:
-        with mutation as writer:
+        with mutation as writer, operation:
             try:
                 with transaction.atomic(), suppress_intent_push():
                     for candidate, update_fields in operations:
@@ -5815,13 +5878,14 @@ def _save_vlan_name_edit(obj):
 
     from . import status_machine as sm
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
-    from .vlan_reconciler import vlan_name_matches
+    from .vlan_reconciler import vlan_affected_management_ids, vlan_name_matches
 
     vlan_model = type(obj.vlan)
     desired_name = obj.vlan.name
     stored_vlan, states = _vlan_name_edit_rows(vlan_model, obj.vlan_id)
     if stored_vlan is None:
         return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
+    operation = shared_operation(lambda: vlan_affected_management_ids(stored_vlan, references=False))
     vlan = copy.copy(stored_vlan)
     vlan.name = desired_name
     now = timezone.now()
@@ -5845,7 +5909,7 @@ def _save_vlan_name_edit(obj):
     try:
         plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=now)
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
+        with mutation as writer, operation:
             writer.save(vlan, update_fields=("name",))
             for candidate, fields in candidates:
                 writer.save(candidate, update_fields=fields)
@@ -5882,7 +5946,7 @@ def _logging_levels_errors(obj, old_values):
     return {f: [msg] for f in cleared}
 
 
-def _overlay_family_errors(key, obj, old_values):
+def _overlay_family_errors(key, obj, old_values, *, user):
     """Run validation that spans fields or the linked native object."""
     simple_validator = {
         "logging_host": _logging_host_errors,
@@ -5910,7 +5974,7 @@ def _overlay_family_errors(key, obj, old_values):
     if key == "bgp_peer":
         return _bgp_peer_errors(obj)
     if key == "redistribution":
-        return _redistribution_errors(obj)
+        return _redistribution_errors(obj, user)
     if key == "static_route":
         return _static_route_errors(obj)
     if key in ("lacp_bundle", "lacp_member"):
@@ -6044,7 +6108,7 @@ class NSOOverlayFieldEditView(AuthorizedView):
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
-        errors = _overlay_family_errors(key, obj, old_values)
+        errors = _overlay_family_errors(key, obj, old_values, user=request.user)
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
@@ -6563,6 +6627,30 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
+def _owned_native_gap(state, user):
+    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it."""
+    from netbox_routing.models import BFDInterface
+
+    from .status_machine import is_owned
+
+    if not is_owned(state.status):
+        return False
+    if isinstance(state, NSOBFDInterfaceState):
+        return not BFDInterface.objects.filter(interface_id=state.interface_id).exists()
+    if isinstance(state, NSOISISInterfaceState):
+        native = state.isis_interface
+        return native is not None and native.instance.process_tag != state.process_tag
+    if isinstance(state, NSORedistributionState):
+        if state.redistribution_id is not None:
+            return False
+        from .redistribution_reconciler import _resolve_redist_destination
+
+        return _resolve_redist_destination(
+            state.management.device, state.dest_protocol, state.dest_ref
+        ) is not None and not _redistribution_materialization_blocker(state, user)
+    return False
+
+
 def _accept_policy(model, *permissions):
     """Return the policy of a per-row Accept: change authority on the row's management."""
     return EndpointPolicy(OverlayRow(model, "change"), "native_mutation", permissions=permissions)
@@ -6581,6 +6669,13 @@ class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
         """Return why *state* cannot become owned, or an empty string."""
         return ""
 
+    def _native_writes(self, candidate):
+        """Plan the native rows that carry the accepted row's intent.
+
+        Return (native saves, native operations, overlay fields, overlay references).
+        """
+        return (), (), (), ()
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
@@ -6598,14 +6693,17 @@ class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
         if candidate.accepted_at is None:
             candidate.accepted_at = timezone.now()
         self._arm_accept(candidate)
-        fields = ("status", "accepted_at", *self.accept_extra_fields)
+        native_saves, native_operations, native_fields, references = self._native_writes(candidate)
+        fields = ("status", "accepted_at", *self.accept_extra_fields, *native_fields)
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("accept"),
-            saves=(planned_save(candidate, update_fields=fields),),
+            saves=(*native_saves, planned_save(candidate, update_fields=fields, references=references)),
             planned_at=candidate.accepted_at,
         )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
+            for instance, update_fields, force_insert in native_operations:
+                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
             writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted routing state {candidate.pk}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
@@ -6897,6 +6995,20 @@ def _ip_update_collision_errors(updates):
     return errors
 
 
+def _ip_edit_affected_management_ids(updates):
+    """Include IP owners and BGP consumers whose content reads the changed addresses."""
+    from ipaddress import ip_interface
+
+    from .intent_state import footprint_for_instance
+
+    devices = set()
+    for update in updates:
+        native = update["native"]
+        if native is not None and update["host"] != str(ip_interface(str(native.address)).ip):
+            devices.update(device_id for device_id, _scope in footprint_for_instance(native).revision_keys)
+    return NSODeviceManagement.objects.filter(device_id__in=devices).values_list("pk", flat=True)
+
+
 def _ip_edit_plan_and_operations(updates, planned_at):
     """Freeze every native and overlay write for one paired-address edit."""
     from ipam.models import IPAddress
@@ -7028,11 +7140,12 @@ class NSOInterfaceIPStateEditView(AuthorizedView):
             if not request.user.has_perm(permission):
                 raise PermissionDenied
 
+        operation = shared_operation(lambda: _ip_edit_affected_management_ids(updates))
         try:
             plan, native_operations, state_operations = _ip_edit_plan_and_operations(updates, timezone.now())
             _authorize_planned_states(state_operations, request.user)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-            with mutation as writer:
+            with mutation as writer, operation:
                 with suppress_intent_push():
                     for native, created in native_operations:
                         writer.save(native, force_insert=created)
@@ -7118,8 +7231,40 @@ class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):
         _arm_static_route_generation(state)
 
 
-class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+def _isis_interface_native_writes(candidate):
+    """Plan the repoint of an IS-IS interface to the accepted process, creating that process when missing."""
+    from netbox_routing.models import ISISInstance
+
+    from .renderer_writer import planned_save
+
+    native = candidate.isis_interface
+    # An empty process tag names the untagged process.
+    if native is None or native.instance.process_tag == candidate.process_tag:
+        return (), (), (), ()
+    device = candidate.interface.device
+    instance = operator_lookup(ISISInstance, device=device, process_tag=candidate.process_tag, create_if_missing=True)
+    saves = []
+    operations = []
+    references = ()
+    if instance is None:
+        instance = ISISInstance(device=device, process_tag=candidate.process_tag)
+        saves.append(planned_save(instance, force_insert=True, natural_key=("device", "process_tag")))
+        operations.append((instance, None, True))
+        references = (("instance", instance),)
+    repointed = copy.copy(native)
+    repointed.instance = instance
+    saves.append(planned_save(repointed, update_fields=("instance",), references=references))
+    operations.append((repointed, ("instance",), False))
+    return saves, operations, (), ()
+
+
+class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):
+    """Accept one IS-IS interface; its native interface moves to the accepted process."""
+
     policy = _accept_policy(NSOISISInterfaceState)
+
+    def _native_writes(self, candidate):  # noqa: D102
+        return _isis_interface_native_writes(candidate)
 
 
 class NSOISISInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
@@ -7532,11 +7677,67 @@ def _redistribution_accept_blocker(state):
     return ""
 
 
-class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
+def _redistribution_native_writes(candidate, user):
+    """Plan the native redistribution an accepted overlay without one names, with the accepted values."""
+    from django.contrib.contenttypes.models import ContentType
+    from netbox_routing.models import Redistribution, RouteMap
+
+    from .redistribution_reconciler import _resolve_redist_destination
+    from .renderer_writer import planned_save
+
+    if candidate.redistribution_id is not None:
+        return (), (), (), ()
+    destination = _resolve_redist_destination(candidate.management.device, candidate.dest_protocol, candidate.dest_ref)
+    if destination is None:
+        return (), (), (), ()
+    identity = {
+        "destination_type": ContentType.objects.get_for_model(type(destination)),
+        "destination_id": destination.pk,
+        "source_protocol": candidate.source_protocol,
+        "source_ref": candidate.source_ref,
+    }
+    existing = operator_lookup(Redistribution, create_if_missing=True, **identity)
+    if existing is not None:
+        candidate.redistribution = existing
+        return (), (), ("redistribution",), ()
+    route_map = (
+        RouteMap.objects.restrict(user, "view").filter(name=candidate.route_map).first()
+        if candidate.route_map
+        else None
+    )
+    native = Redistribution(**identity, route_map=route_map, metric=candidate.metric, metric_type=candidate.metric_type)
+    candidate.redistribution = native
+    save = planned_save(
+        native,
+        force_insert=True,
+        natural_key=("destination_type", "destination_id", "source_protocol", "source_ref"),
+    )
+    return (save,), ((native, None, True),), ("redistribution",), (("redistribution", native),)
+
+
+def _redistribution_materialization_blocker(state, user):
+    """Return the shared refusal for a native-gap offer and its Accept request."""
+    from netbox_routing.models import RouteMap
+
+    if (
+        state.redistribution_id is None
+        and state.route_map
+        and not RouteMap.objects.restrict(user, "view").filter(name=state.route_map).exists()
+    ):
+        return f"Route map {state.route_map!r} does not exist in NetBox."
+    return _redistribution_accept_blocker(state)
+
+
+class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
+    """Accept one redistribution; a missing native redistribution is created with the accepted values."""
+
     policy = _accept_policy(NSORedistributionState)
 
     def _accept_blocker(self, state):
-        return _redistribution_accept_blocker(state)
+        return _redistribution_materialization_blocker(state, self.request.user)
+
+    def _native_writes(self, candidate):  # noqa: D102
+        return _redistribution_native_writes(candidate, self.request.user)
 
 
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
@@ -7761,6 +7962,10 @@ class OverlayStateAcceptMixin(AuthorizedView, abstract=True):
 
     renderer_scope = None
 
+    def native_writes(self, candidate):
+        """Plan the native rows that carry the accepted overlay's intent: (saves, operations)."""
+        return (), ()
+
     def push_blocker(self, state) -> str:
         """Why accepting *state* could not be faithfully applied, or "" when it can.
 
@@ -7797,16 +8002,19 @@ class OverlayStateAcceptMixin(AuthorizedView, abstract=True):
             candidate.status = _status_after_accept(current.status)
             candidate.accepted_at = timezone.now()
             dependencies, validate_after_acquire = _overlay_identity_plan(self.renderer_scope, candidate)
+            native_saves, native_operations = self.native_writes(candidate)
             try:
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("accept"),
-                    saves=(planned_save(candidate, update_fields=fields),),
+                    saves=(*native_saves, planned_save(candidate, update_fields=fields)),
                     read_dependencies=dependencies,
                     validate_after_acquire=validate_after_acquire,
                     planned_at=candidate.accepted_at,
                 )
                 mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
                 with mutation as writer:
+                    for instance, update_fields, force_insert in native_operations:
+                        writer.save(instance, update_fields=update_fields, force_insert=force_insert)
                     writer.save(candidate, update_fields=fields)
                 break
             except _IntentTransactionNoOp as exc:
@@ -8175,7 +8383,12 @@ class NSOVLANRescopeView(AuthorizedView):
         vid = state.vlan.vid
         groups = []
         for group in VLANGroup.objects.restrict(request.user, "view").exclude(pk=state.vlan.group_id).order_by("name"):
-            merges = VLAN.objects.filter(group=group, vid=vid).exclude(pk=state.vlan.pk).exists()
+            merges = (
+                VLAN.objects.restrict(request.user, "view")
+                .filter(group=group, vid=vid)
+                .exclude(pk=state.vlan.pk)
+                .exists()
+            )
             groups.append({"group": group, "merges": merges})
         return render(
             request,
@@ -8186,17 +8399,12 @@ class NSOVLANRescopeView(AuthorizedView):
     def post(self, request, pk):  # noqa: D102
         from ipam.models import VLANGroup
 
-        from .vlan_reconciler import VLANRescopeConflict, rescope_vlan
+        from .vlan_reconciler import rescope_vlan
 
         state = self.target.primary
         group = get_object_or_404(VLANGroup.objects.restrict(request.user, "view"), pk=request.POST.get("group"))
         device_id = state.management.device_id
-        try:
-            action, vlan = rescope_vlan(state, group, grant=OwnershipGrant("operator_edit"))
-        # rescope_vlan converts every acquisition-time protocol error into this refusal.
-        except VLANRescopeConflict:
-            messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
-            return redirect(_device_nso_tab_url(device_id))
+        action, vlan = rescope_vlan(state, group, grant=OwnershipGrant("operator_edit"))
         if action == "noop":
             messages.info(request, f"VLAN {vlan.vid} is already in group {group}.")
         elif action == "moved":
@@ -8532,7 +8740,7 @@ class NSOBgpPeerCreateView(AuthorizedView):
         )
         if len(routers) > 1:
             raise BGPIntentError("Resolve duplicate BGP routers for this device and ASN before adding a peer.")
-        router = routers[0] if routers else None
+        router = require_operator_view(routers[0]) if routers else None
         new_router = router is None
         if router is not None:
             state = NSOBGPRouterState.objects.filter(management=management, asn_str=str(data["local_asn"].asn)).first()
@@ -8569,7 +8777,11 @@ class NSOBgpPeerCreateView(AuthorizedView):
                 force_insert=True,
                 natural_key=("assigned_object_type", "assigned_object_id", "asn"),
             )
-        scope = BGPScope.objects.filter(router=router, vrf=data.get("vrf")).first() if router.pk is not None else None
+        scope = (
+            operator_lookup(BGPScope, router=router, vrf=data.get("vrf"), create_if_missing=True)
+            if router.pk is not None
+            else None
+        )
         if scope is None:
             scope = BGPScope(router=router, vrf=data.get("vrf"))
             save(scope, force_insert=True, natural_key=("router", "vrf"))
@@ -8591,7 +8803,7 @@ class NSOBgpPeerCreateView(AuthorizedView):
         address_families = data.get("address_families") or ["ipv4-unicast"]
         for value in address_families:
             address_family = (
-                BGPAddressFamily.objects.filter(scope=scope, address_family=value).first()
+                operator_lookup(BGPAddressFamily, scope=scope, address_family=value, create_if_missing=True)
                 if scope.pk is not None
                 else None
             )
@@ -8843,9 +9055,14 @@ class NSOVLANAttachView(AuthorizedView):
         return redirect(_device_nso_tab_url(mgmt.device_id))
 
 
-class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
+class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):
+    """Accept one BFD overlay; a missing native BFD interface is created with the accepted values."""
+
     policy = _accept_policy(NSOBFDInterfaceState)
     renderer_scope = "bfd"
+
+    def native_writes(self, candidate):  # noqa: D102
+        return _bfd_native_writes(candidate, create_only=True)
 
 
 class NSOSnmpCommunityStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101

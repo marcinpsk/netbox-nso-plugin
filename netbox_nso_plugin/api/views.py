@@ -9,6 +9,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.routers import APIRootView
 from rest_framework.views import APIView
+from utilities.exceptions import PermissionsViolation
 
 from ..filters import (
     NSODerivedIntentTemplateFilterSet,
@@ -284,13 +285,16 @@ class OnboardView(AuthorizedAPIView, APIView):
     """
 
     permission_classes = [IsAuthenticated]
-    policy = EndpointPolicy(ApiOnboarding(), "native_mutation")
+    # Provisioning calls the adapter after it commits the durable attempt: no operator transaction.
+    policy = EndpointPolicy(ApiOnboarding(), "adapter_action")
 
     def post(self, request):
         """Onboard the posted NetBox device into the selected (or default) NSO instance."""
         from ..onboarding import onboard_candidate
 
         result = onboard_candidate(self.target.device, self.target.related["instance"])
+        if result.get("permission_denied"):
+            raise PermissionsViolation(result["permission_denied"])
         code = result.pop(
             "_http_status",
             status.HTTP_200_OK if result["ok"] else status.HTTP_400_BAD_REQUEST,

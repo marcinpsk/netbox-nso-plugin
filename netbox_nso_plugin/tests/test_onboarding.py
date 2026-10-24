@@ -9,6 +9,7 @@ from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer,
 from django.contrib.auth import get_user_model
 from django.db import connection, connections, transaction
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.utils import timezone
 from ipam.models import IPAddress
 from netaddr import IPNetwork
 
@@ -237,6 +238,7 @@ class TestProvisionClaimReconciliation(_CascadeFlushMixin, TransactionTestCase):
                 tombstone,
                 self._result(),
                 claim_was_new=True,
+                onboarded_at=timezone.now(),
             )
 
     def test_new_claim_is_committed_before_adapter_send(self):
@@ -728,7 +730,9 @@ class TestOnboardCandidate(TestCase):
                 side_effect=AdapterError("not found", code="not_found", status_code=404),
             ),
         ):
-            response = _submit_claimed_provision(self.instance, attempt, result, claim_was_new=True)
+            response = _submit_claimed_provision(
+                self.instance, attempt, result, claim_was_new=True, onboarded_at=timezone.now()
+            )
 
         self.assertFalse(response["ok"])
         self.assertIn("Provisioning request failed", response["error"])
