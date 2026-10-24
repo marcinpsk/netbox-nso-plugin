@@ -401,6 +401,49 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
             inside_first_permit(lambda: through.objects.create(interface_id=self.first.pk, vlan_id=other.pk))()
         self.assertTrue(through.objects.filter(interface_id=self.first.pk, vlan_id=other.pk).exists())
 
+    def test_a_deletion_cannot_write_another_owners_through_rows(self):
+        """A delete permit admits only the through rows its Collector closure froze."""
+        from django.db.models.signals import pre_delete
+        from ipam.models import VLAN
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        vlan = VLAN.objects.create(vid=3010, name="nw-delete-edge")
+        other = VLAN.objects.create(vid=3011, name="nw-delete-edge-2")
+        through = Interface.tagged_vlans.through
+        through.objects.create(interface_id=self.second.pk, vlan_id=vlan.pk)
+        writes = {
+            "create": lambda: through.objects.create(interface_id=self.second.pk, vlan_id=other.pk),
+            "delete": lambda: through.objects.filter(interface_id=self.second.pk).delete(),
+        }
+        for index, (name, write) in enumerate(writes.items()):
+            doomed = Interface.objects.create(device=self.device, name=f"ge-0/0/4{index}", type="virtual")
+
+            def handler(sender, instance, write=write, doomed=doomed, **kwargs):
+                if instance.pk == doomed.pk:
+                    write()
+
+            pre_delete.connect(handler, sender=Interface, dispatch_uid="nw-delete-edge")
+            try:
+                plan = RendererMutationPlan.build(deletes=(planned_delete(doomed),))
+
+                def delete(plan=plan, doomed=doomed):
+                    with (renderer_writes if plan.changes_content else renderer_mirror_writes)(plan) as writer:
+                        writer.delete(doomed)
+
+                with self.subTest(write=name):
+                    self.assertRefused(delete)
+            finally:
+                pre_delete.disconnect(sender=Interface, dispatch_uid="nw-delete-edge")
+        self.assertEqual(
+            list(through.objects.filter(interface_id=self.second.pk).values_list("vlan_id", flat=True)), [vlan.pk]
+        )
+
     def test_a_signal_born_m2m_edge_of_the_same_owner_is_refused(self):
         """A direct through insert is no M2M change of the owner: it needs an M2M permit."""
         from ipam.models import VLAN
@@ -705,6 +748,30 @@ class TestSystemScope(IntentPushResetMixin, TestCase):
             run(lambda: move(free))
         native_row.refresh_from_db()
         self.assertEqual(native_row.interface_id, free.pk)
+
+    def test_a_partial_save_is_checked_at_the_anchor_it_persists(self):
+        """Only the written fields reach the row: the guard checks the stored row plus them."""
+        from netbox_routing.models import ISISInterface
+
+        source = Interface.objects.create(device=self.device, name="ge-0/0/23", type="1000base-t")
+        target = Interface.objects.create(device=self.device, name="ge-0/0/24", type="1000base-t")
+        native_row = ISISInterface.objects.create(interface=source, address_family="ipv4", instance=self.current)
+        with without_commit_drain():
+            acquire_overlay(
+                NSOISISInterfaceState,
+                management=self.management,
+                interface=target,
+                af="ipv4",
+                process_tag="Q",
+                status="accepted",
+            )
+        candidate = ISISInterface.objects.get(pk=native_row.pk)
+        candidate.interface = target
+        candidate.address_family = "ipv6"  # not written: the row keeps ipv4
+        with self.assertRaises(OwnedIntentRefused), _system_scope() as run:
+            run(lambda: _plan_save(candidate, ("interface",), origin=Observed("isis")))
+        native_row.refresh_from_db()
+        self.assertEqual((native_row.interface_id, native_row.address_family), (source.pk, "ipv4"))
 
     def test_a_direct_write_in_a_system_entry_needs_a_permit(self):
         from dcim.models import Site

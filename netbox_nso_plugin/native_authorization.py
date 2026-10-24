@@ -685,7 +685,13 @@ class NativeWriter:
                 pairs.append((stored, result))
         else:
             stored = _stored(model, instance.pk)
-            pairs = [(stored, instance)] if stored is not None else []
+            result = instance
+            if stored is not None and names is not None:
+                # A partial save persists only the written fields: the result is the stored row plus them.
+                result = copy.copy(stored)
+                for column in columns:
+                    setattr(result, column.attname, getattr(instance, column.attname))
+            pairs = [(stored, result)] if stored is not None else []
         for stored, result in pairs:
             changed = {
                 column.name for column in columns if getattr(stored, column.attname) != getattr(result, column.attname)
@@ -886,7 +892,11 @@ def _refuse_foreign_through_rows(model, rows, permit, operation):
     queryset entry points carry the owner check. A Collector run keeps its frozen closure.
     """
     if permit is not None and permit.kind == "delete":
-        return
+        # A Collector run deletes only the through rows its closure froze; it creates none.
+        label = model._meta.label_lower
+        if operation == "delete" and all((label, row.pk) in permit.pks for row in rows):
+            return
+        _refuse(f"native {operation} of {label} rows outside the frozen deletion closure")
     if not all(_through_owned(model, row, permit) for row in rows):
         _refuse(f"native {operation} of {model._meta.label_lower} rows of another owner")
 
