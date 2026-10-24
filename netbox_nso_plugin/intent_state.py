@@ -2259,6 +2259,9 @@ def _acquire(
         NSODeviceManagement.objects.select_for_update(of=("self",)).filter(pk__in=management_ids).order_by("pk")
     )
     _lock_rows(footprint.source_rows, level=6, ranks=SOURCE_MODEL_RANKS)
+    from .native_authorization import verify_shared_operations
+
+    verify_shared_operations()
     _revalidate_sources(footprint)
     scopes_by_device: dict[int, list[str]] = {}
     for device_id, scope in footprint.revision_keys:

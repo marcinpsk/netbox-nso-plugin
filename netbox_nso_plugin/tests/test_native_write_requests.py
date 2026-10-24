@@ -238,8 +238,8 @@ class TestIsisConversion(AdapterCase):
     def test_refresh_by_a_user_without_routing_permissions_does_the_same(self):
         self.assertRefreshCreatesTheObservedProcessOnly(operator())
 
-    def test_accept_repoints_with_the_native_permission_only(self):
-        from netbox_routing.models import ISISInterface
+    def test_accept_repoints_with_native_change_and_process_view(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
 
         self.assertRefreshCreatesTheObservedProcessOnly(self.admin)
         with self.assert_refused_whole():
@@ -247,7 +247,9 @@ class TestIsisConversion(AdapterCase):
         self.native.refresh_from_db()
         self.assertEqual(self.native.instance_id, self.current.pk)
 
-        self.assertEqual(self._accept(operator((("change",), ISISInterface, None))).status_code, 302)
+        self.assertEqual(
+            self._accept(operator((("change",), ISISInterface, None), (("view",), ISISInstance, None))).status_code, 302
+        )
         self.native.refresh_from_db()
         self.assertEqual(self.native.instance.process_tag, "P")
 
@@ -387,19 +389,19 @@ class TestRedistributionConversion(AdapterCase):
         }
 
     def test_refresh_creates_nothing_and_accept_needs_the_native_permission(self):
-        from netbox_routing.models import Redistribution
+        from netbox_routing.models import OSPFInstance, Redistribution
 
         _refresh(self, self.admin, self.device, "redistribution")
         self.assertFalse(Redistribution.objects.filter(destination_id=self.ospf.pk).exists())
         self.assertTrue(_grid_row(self, self.admin, self.device, "redistribution", self.overlay)["native_gap"])
 
         url = reverse("plugins:netbox_nso_plugin:routing_accept_redistribution", kwargs={"pk": self.overlay.pk})
-        self.client.force_login(operator())
+        self.client.force_login(operator((("view",), OSPFInstance, None)))
         with self.assert_refused_whole():
             self.assertEqual(self.client.post(url).status_code, 403)
         self.assertFalse(Redistribution.objects.filter(destination_id=self.ospf.pk).exists())
 
-        self.client.force_login(operator((("add",), Redistribution, None)))
+        self.client.force_login(operator((("add",), Redistribution, None), (("view",), OSPFInstance, None)))
         self.assertEqual(self.client.post(url).status_code, 302)
         native_row = Redistribution.objects.get(destination_id=self.ospf.pk)
         self.assertEqual(

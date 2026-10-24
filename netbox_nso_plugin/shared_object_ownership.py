@@ -124,6 +124,11 @@ def group_rows(state):
     return type(state).objects.filter(family=state.family, object_name=state.object_name)
 
 
+def group_management_ids(state_model, family: str, object_name: str):
+    """Enumerate every management in a shared group, including rows without captures."""
+    return state_model.objects.filter(family=family, object_name=object_name).values_list("management_id", flat=True)
+
+
 def materialized_row(state_model, family: str, object_name: str):
     """Return the row whose capture currently populates the shared object (or None)."""
     return state_model.objects.filter(family=family, object_name=object_name, is_materialized=True).first()

@@ -727,6 +727,9 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.operations.delete(root, origin=_OBSERVED)
 
     def _resolve_route_map_name_maps(self, entries):
+        from .native_authorization import operator_user
+        from .native_lookup import operator_lookup
+
         for entry in entries:
             references = [
                 (family, name)
@@ -744,8 +747,13 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             for family, name in references:
                 root = self.roots[family].get(name)
                 if root is None and (family, name) not in self.missing_root_keys:
-                    root = self.models[family].objects.filter(name=name).first()
+                    root = operator_lookup(self.models[family], name=name)
                     if root is None:
+                        self.missing_root_keys.add((family, name))
+                elif root is not None and root.pk is not None and operator_user() is not None:
+                    root = operator_lookup(self.models[family], pk=root.pk)
+                    if root is None:
+                        self.roots[family].pop(name, None)
                         self.missing_root_keys.add((family, name))
                 if root is not None:
                     self.roots[family][name] = root
@@ -796,9 +804,13 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
         return root
 
     def _exact_root(self, family, name, captured):
+        from .native_lookup import require_operator_view
+
         root = self.roots[family].get(name)
         if root is None:
             root = self.models[family].objects.filter(name=name).first()
+        if root is not None:
+            require_operator_view(root)
         if root is None:
             values = {"name": name}
             if family == "prefix_list" and captured.get("family") in (4, 6):
@@ -883,6 +895,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
     def plan_prefix_entries(self, root, entries):
         from django.core.exceptions import ValidationError
 
+        from .native_lookup import require_operator_view
+
         values = {
             entry.get("prefix").strip()
             for entry in entries
@@ -896,6 +910,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             if not prefix:
                 continue
             custom_prefix = self.prefixes.get(prefix)
+            if custom_prefix is not None:
+                require_operator_view(custom_prefix)
             if custom_prefix is None:
                 custom_prefix = self.CustomPrefix(prefix=prefix)
                 try:
@@ -924,6 +940,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
             )
 
     def plan_community_entries(self, root, entries):
+        from .native_lookup import require_operator_view
+
         values = {
             entry.get("community").strip()
             for entry in entries
@@ -939,6 +957,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 logger.info("route-policy: skipping empty community member in %s", root.name)
                 continue
             community = self.communities.get(value)
+            if community is not None:
+                require_operator_view(community)
             if community is None:
                 community = self.Community(community=value)
                 self.communities[value] = community
@@ -1015,6 +1035,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 self.operations.display_m2m_add(row, "match_community", members)
 
     def plan_set_communities(self, row, structured):
+        from .native_lookup import require_operator_view
+
         unresolved = []
         literal_groups = {}
         literal_values = {
@@ -1049,6 +1071,8 @@ class _RoutePolicyGraphPlanner:  # noqa: PLR0904
                 unresolved.append({"operation": action.operation, "name": action.name})
                 continue
             community = self.communities.get(action.name)
+            if community is not None:
+                require_operator_view(community)
             if community is None:
                 community = self.Community(community=action.name)
                 self.communities[action.name] = community
@@ -1109,14 +1133,15 @@ def _replay_operations(writer, operations):
         writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
-def _execute_operations(operations, planned_at, *, suppress_push=True):
+def _execute_operations(operations, planned_at, *, suppress_push=True, authorization=None):
     from .renderer_writer import renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
     plan = _mutation_plan(operations, planned_at)
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     suppression = suppress_intent_push() if suppress_push else nullcontext()
-    with mutation as writer, suppression:
+    authorization = authorization if authorization is not None else nullcontext()
+    with mutation as writer, authorization, suppression:
         _replay_operations(writer, operations)
     return plan
 
@@ -1149,8 +1174,13 @@ def rematerialize_route_policy(state):
     """Make one captured device version the materialized root through an exact plan."""
     from django.utils import timezone
 
+    from .native_authorization import shared_operation
+
+    authorization = shared_operation(
+        lambda: ownership.group_management_ids(type(state), state.family, state.object_name)
+    )
     planned_at = timezone.now()
-    _execute_operations(_rematerialize_operations(state, planned_at), planned_at)
+    _execute_operations(_rematerialize_operations(state, planned_at), planned_at, authorization=authorization)
 
 
 # Resolve exact list names before classifying inline community literals.
@@ -1441,11 +1471,15 @@ def set_classification(family: str, object_name: str, mode: str):
     """
     from django.utils import timezone
 
+    from .models import NSORoutePolicyState
+    from .native_authorization import shared_operation
+
     if mode not in ("master", "local"):
         raise ValueError(f"invalid mode {mode!r}")
+    authorization = shared_operation(lambda: ownership.group_management_ids(NSORoutePolicyState, family, object_name))
     planned_at = timezone.now()
     operations, policy_class = _classification_operations(family, object_name, mode, planned_at)
-    _execute_operations(operations, planned_at)
+    _execute_operations(operations, planned_at, authorization=authorization)
     return policy_class
 
 

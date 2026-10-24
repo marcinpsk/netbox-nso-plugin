@@ -999,11 +999,12 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         with patch.object(views, "_ip_edit_plan_and_operations", new=reassign_after_discovery):
             response = self.client.post(self._url(), {"address": "198.18.20.2/31"})
 
-        self.assertEqual(response.status_code, 400, response.content)
-        self.assertIn("retry", " ".join(response.json()["errors"]["address"]).lower())
+        # The reassignment adds the peer's management to the affected set under the locks (C10).
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertIn("membership changed", response.json()["message"])
         self.local_ip.refresh_from_db()
         self.local_state.refresh_from_db()
-        self.assertEqual(self.local_ip.assigned_object, self.peer)
+        # The simulated writer shares the request transaction, so the 409 rollback also undoes it.
         self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
         self.assertEqual(self.local_state.address, "198.18.20.0/31")
 

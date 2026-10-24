@@ -31,6 +31,7 @@ from netbox_nso_plugin.native_authorization import (
     OwnedIntentRefused,
     authority_scope,
 )
+from netbox_nso_plugin.request_authorization import AuthorizedTarget
 
 from ._authority_case import FakeAdapter, operator
 from ._outbox_case import make_managed, without_commit_drain
@@ -411,7 +412,9 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
         self.assertEqual(
             list(through.objects.filter(interface_id=self.second.pk).values_list("vlan_id", flat=True)), [vlan.pk]
         )
-        with authority_scope("native_mutation", self.admin):
+        with authority_scope(
+            "native_mutation", self.admin, target=AuthorizedTarget(user=self.admin, management=self.management)
+        ):
             inside_first_permit(lambda: through.objects.create(interface_id=self.first.pk, vlan_id=other.pk))()
         self.assertTrue(through.objects.filter(interface_id=self.first.pk, vlan_id=other.pk).exists())
 
@@ -470,7 +473,9 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
     def test_the_permitted_write_succeeds(self):
         candidate = Interface.objects.get(pk=self.first.pk)
         candidate.description = "permitted"
-        with authority_scope("native_mutation", self.admin):
+        with authority_scope(
+            "native_mutation", self.admin, target=AuthorizedTarget(user=self.admin, management=self.management)
+        ):
             _plan_save(candidate, ("description",))
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "permitted")
