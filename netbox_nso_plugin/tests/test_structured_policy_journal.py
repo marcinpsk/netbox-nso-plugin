@@ -481,6 +481,8 @@ class TestStructuredPolicyJournal(_RoutePolicyFixture):
             seq=seq,
             status="failed",
             job_id=job["id"],
+            carrier_job_id=job["id"],
+            carrier_job_status=job["status"],
             mode="networked",
             settlement_cohort=seq,
             digest="a" * 64,

@@ -139,12 +139,21 @@ class NSOInterfaceStateTable(NetBoxTable):
     actions = columns.ActionsColumn(actions=("delete", "changelog"))
 
     def configure(self, request):
-        """Project the rendered page once, so the state badge reads no execution evidence per row."""
+        """Project the rows this request renders once, so the state badge reads no execution evidence per row."""
+        from django_tables2.data import TableData
+        from django_tables2.rows import BoundRows
+
         from .refusal_display import project_rows
 
         super().configure(request)
-        rows = self.page.object_list
-        rows.data = project_rows(rows.data)
+        if "export" not in request.GET:
+            rows = self.page.object_list
+            rows.data = project_rows(rows.data)
+            return
+        # An export renders every row of the ordered queryset, not the page.
+        self.data = TableData.from_data(project_rows(self.data.data))
+        self.data.set_table(self)
+        self.rows = BoundRows(data=self.data, table=self, pinned_data=self.pinned_data)
 
     class Meta(NetBoxTable.Meta):
         model = NSOInterfaceState
