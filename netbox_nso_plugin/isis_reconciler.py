@@ -544,10 +544,12 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
     from . import status_machine as sm
     from .models import NSODeviceManagement, NSOISISInstanceState, NSOISISInterfaceState
     from .template_content import (
+        _ISIS_IFACE_SCALAR_ATTRS,
         _device_ned_id,
         _isis_device_matches_intent,
         _isis_instance_object_hash,
         _isis_interface_children_match,
+        _isis_interface_matches_intent,
         _isis_interface_object_hash,
         _isis_process_device_matches_intent,
     )
@@ -750,10 +752,9 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                     and current_native.instance.process_tag == state.process_tag
                     and _isis_device_matches_intent(entry, state, current_native, ned_id)
                     and _isis_interface_children_match(entry, current_native)
-                    and (current_native.circuit_type or "") == (state.circuit_type or "")
-                    and (current_native.network_type or "") == (state.network_type or "")
-                    and current_native.metric == state.metric
-                    and bool(current_native.passive) == bool(state.passive)
+                    and _isis_interface_matches_intent(
+                        {field: getattr(current_native, field, None) for field in _ISIS_IFACE_SCALAR_ATTRS}, state
+                    )
                 )
                 state.status = sm.on_reconcile(state.status, matches=matches)
                 _state_save(operations, state, created_state, ("management", "interface", "af"))

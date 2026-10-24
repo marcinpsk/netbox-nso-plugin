@@ -1737,14 +1737,22 @@ def _isis_interface_routing_fields(state, entry, ri, bfd_enabled):
     return rf
 
 
-def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
-    """Return True when the device (adapter *entry*) has caught up to the owned overlay intent.
+def _isis_interface_matches_intent(entry, state) -> bool:
+    """Compare interface fields with the owned intent, including optional BFD and FRR values."""
+    return (
+        entry.get("metric") == state.metric
+        and (entry.get("network_type") or "") == (state.network_type or "")
+        and (entry.get("circuit_type") or "") == (state.circuit_type or "")
+        and bool(entry.get("passive", False)) == bool(state.passive)
+        # None leaves BFD and FRR unconfigured; explicit values must match.
+        and (state.bfd_enabled is None or bool(entry.get("bfd_enabled")) == bool(state.bfd_enabled))
+        and (state.frr_enabled is None or bool(entry.get("frr_enabled")) == bool(state.frr_enabled))
+        and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
+    )
 
-    Used for owned IS-IS rows where the clobber guard keeps the overlay == netbox-routing
-    object, so the normal overlay-vs-object match can't tell whether the *device* has the
-    change yet. Mirrors the OSPF device-vs-netbox status semantics.
-    """
-    circuit_matches = (entry.get("circuit_type") or "") == (state.circuit_type or "")
+
+def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
+    """Compare device fields and native-only scalars with the owned intent."""
     long_scalar_fields = ("csnp_interval", "retransmit_interval", "lsp_interval")
     long_scalars_match = all(
         entry.get(field) == getattr(ri, field)
@@ -1753,20 +1761,7 @@ def _isis_device_matches_intent(entry, state, ri=None, ned_id="") -> bool:
         for field in long_scalar_fields
         if ri is not None and hasattr(ri, field)
     )
-    return (
-        entry.get("metric") == state.metric
-        and (entry.get("network_type") or "") == (state.network_type or "")
-        and circuit_matches
-        and long_scalars_match
-        and bool(entry.get("passive", False)) == bool(state.passive)
-        # tri-state: a None intent expresses no opinion, so it never blocks in_sync
-        # (we don't own the device's BFD); True/False must match the device verbatim.
-        and (state.bfd_enabled is None or bool(entry.get("bfd_enabled")) == bool(state.bfd_enabled))
-        # FRR (#83): the same tri-state contract as BFD; the protection kind only
-        # blocks in_sync when the intent asserts one.
-        and (state.frr_enabled is None or bool(entry.get("frr_enabled")) == bool(state.frr_enabled))
-        and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
-    )
+    return long_scalars_match and _isis_interface_matches_intent(entry, state)
 
 
 def _device_uses_timos_ned(device) -> bool:

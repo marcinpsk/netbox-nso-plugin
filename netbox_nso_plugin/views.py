@@ -1921,7 +1921,9 @@ class NSOCategoryView(AuthorizedView):
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                "native_gap": bool(accept_route) and st.status != "deploying" and _owned_native_gap(st),
+                "native_gap": bool(accept_route)
+                and st.status != "deploying"
+                and _owned_native_gap(st, self.request.user),
             }
             row["accept_url"] = (
                 reverse(accept_route, args=[st.pk])
@@ -6563,7 +6565,7 @@ class NSOProvisionLinkRoleView(AuthorizedView):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
-def _owned_native_gap(state):
+def _owned_native_gap(state, user):
     """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it."""
     from netbox_routing.models import BFDInterface
 
@@ -6581,7 +6583,9 @@ def _owned_native_gap(state):
             return False
         from .redistribution_reconciler import _resolve_redist_destination
 
-        return _resolve_redist_destination(state.management.device, state.dest_protocol, state.dest_ref) is not None
+        return _resolve_redist_destination(
+            state.management.device, state.dest_protocol, state.dest_ref
+        ) is not None and not _redistribution_materialization_blocker(state, user)
     return False
 
 
@@ -7634,21 +7638,26 @@ def _redistribution_native_writes(candidate, user):
     return (save,), ((native, None, True),), ("redistribution",), (("redistribution", native),)
 
 
+def _redistribution_materialization_blocker(state, user):
+    """Return the shared refusal for a native-gap offer and its Accept request."""
+    from netbox_routing.models import RouteMap
+
+    if (
+        state.redistribution_id is None
+        and state.route_map
+        and not RouteMap.objects.restrict(user, "view").filter(name=state.route_map).exists()
+    ):
+        return f"Route map {state.route_map!r} does not exist in NetBox."
+    return _redistribution_accept_blocker(state)
+
+
 class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
     """Accept one redistribution; a missing native redistribution is created with the accepted values."""
 
     policy = _accept_policy(NSORedistributionState)
 
     def _accept_blocker(self, state):
-        from netbox_routing.models import RouteMap
-
-        if (
-            state.redistribution_id is None
-            and state.route_map
-            and not RouteMap.objects.restrict(self.request.user, "view").filter(name=state.route_map).exists()
-        ):
-            return f"Route map {state.route_map!r} does not exist in NetBox."
-        return _redistribution_accept_blocker(state)
+        return _redistribution_materialization_blocker(state, self.request.user)
 
     def _native_writes(self, candidate):  # noqa: D102
         return _redistribution_native_writes(candidate, self.request.user)
