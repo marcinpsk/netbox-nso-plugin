@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import BadRequest, ImproperlyConfigured, PermissionDenied
 from django.http import Http404, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import URLResolver, reverse
@@ -347,6 +347,21 @@ def shared_vlan_rename(user, state):
     get_object_or_404(VLAN.objects.restrict(user, "change"), pk=state.vlan_id)
 
 
+def is_valid_instance_id(value):
+    """Validate an instance selection before the ORM receives it."""
+    from rest_framework import serializers
+
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        serializers.CharField(allow_blank=True, trim_whitespace=False).run_validation(value)
+    except serializers.ValidationError:
+        return False
+    return True
+
+
 def permitted_instance(user, selected):
     """Return the selected NSO instance, else the default one, through the view restriction (pages only).
 
@@ -355,6 +370,8 @@ def permitted_instance(user, selected):
     """
     from .models import NSOInstance
 
+    if not is_valid_instance_id(selected):
+        raise BadRequest("Invalid NSO instance identity")
     visible = NSOInstance.objects.restrict(user, "view")
     instance = visible.filter(adapter_instance_id=selected).first() if selected else None
     if instance is not None:
@@ -378,6 +395,8 @@ class Onboarding(TargetSpec):
             raise Http404
         device = get_object_or_404(_device_model().objects.restrict(user, "view"), pk=int(raw))
         selected = request.POST.get("instance")
+        if not is_valid_instance_id(selected):
+            raise BadRequest("Invalid NSO instance identity")
         if selected:
             # A mutation never substitutes the default for an explicit selection.
             visible = NSOInstance.objects.restrict(user, "view")
@@ -539,10 +558,14 @@ class ApiOnboarding(TargetSpec):
         device_id = body.get("netbox_device_id")
         if device_id is None:
             raise ParseError("netbox_device_id is required")
+        if type(device_id) is not int or device_id <= 0:
+            raise ParseError("netbox_device_id must be a positive integer")
         device = _device_model().objects.restrict(user, "view").filter(pk=device_id).first()
         if device is None:
             raise NotFound(f"device {device_id} not found")
         selected = body.get("instance")
+        if not is_valid_instance_id(selected):
+            raise ParseError("Invalid NSO instance identity")
         if selected:
             instance = NSOInstance.objects.restrict(user, "view").filter(adapter_instance_id=selected).first()
             if instance is None:

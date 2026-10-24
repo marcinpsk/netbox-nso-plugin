@@ -3094,6 +3094,10 @@ def digits_in_object_repr(self, rows):
     self.assertNotIn("200", repr(rows))
     # ruleid: nso-test-hex-literal-in-object-repr
     self.assertIn("4747", repr(rows))
+    # ruleid: nso-test-hex-literal-in-object-repr
+    self.assertNotIn("200", repr(rows), "a hidden value is shown")
+    # ruleid: nso-test-hex-literal-in-object-repr
+    self.assertIn("4747", repr(rows), msg="the value is missing")
     # ok: nso-test-hex-literal-in-object-repr
     self.assertNotIn("200", shown_fields(rows))
     # ok: nso-test-hex-literal-in-object-repr

@@ -750,6 +750,10 @@ def _isis_reconcile_operations(device, payload, planned_at):  # noqa: C901, PLR0
                     and current_native.instance.process_tag == state.process_tag
                     and _isis_device_matches_intent(entry, state, current_native, ned_id)
                     and _isis_interface_children_match(entry, current_native)
+                    and (current_native.circuit_type or "") == (state.circuit_type or "")
+                    and (current_native.network_type or "") == (state.network_type or "")
+                    and current_native.metric == state.metric
+                    and bool(current_native.passive) == bool(state.passive)
                 )
                 state.status = sm.on_reconcile(state.status, matches=matches)
                 _state_save(operations, state, created_state, ("management", "interface", "af"))

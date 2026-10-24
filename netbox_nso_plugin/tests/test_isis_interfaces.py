@@ -909,6 +909,42 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         state.refresh_from_db()
         self.assertEqual(state.status, "in_sync")
 
+    def test_owned_native_routing_drift_prevents_in_sync(self):
+        from netbox_routing.models import ISISInstance, ISISInterface
+
+        from netbox_nso_plugin.isis_reconciler import reconcile_isis
+        from netbox_nso_plugin.models import NSOISISInterfaceState
+
+        from ._outbox_case import without_commit_drain
+
+        management = self._make_mgmt()
+        instance = ISISInstance.objects.create(device=self.device, process_tag="")
+        fields = {"circuit_type": "level-1-2", "network_type": "point-to-point", "metric": 10, "passive": False}
+        native = ISISInterface.objects.create(
+            interface=self.iface_ge0, address_family="ipv4", instance=instance, **fields
+        )
+        state = acquire_overlay(
+            NSOISISInterfaceState,
+            management=management,
+            interface=self.iface_ge0,
+            af="ipv4",
+            isis_interface=native,
+            status="accepted",
+            **fields,
+        )
+        payload = {"interfaces": self._payload(self._entry(**fields))}
+        for field, drift in (("circuit_type", "level-2-only"), ("network_type", ""), ("metric", 20), ("passive", True)):
+            with self.subTest(field=field), without_commit_drain():
+                ISISInterface.objects.filter(pk=native.pk).update(**{**fields, field: drift})
+                NSOISISInterfaceState.objects.filter(pk=state.pk).update(status="accepted")
+                reconcile_isis(self.device, payload)
+                state.refresh_from_db()
+                self.assertEqual(state.status, "accepted")
+        ISISInterface.objects.filter(pk=native.pk).update(**fields)
+        reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+
     def test_isis_device_matches_intent_bfd_tri_state(self):
         """The owned-row drift matcher treats bfd_enabled as tri-state: a None intent
         expresses no opinion (never blocks in_sync); True/False must match the device."""
