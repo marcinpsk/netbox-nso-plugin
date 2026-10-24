@@ -330,6 +330,17 @@ class TestBfdConversion(AdapterCase):
             row["accept_url"], reverse("plugins:netbox_nso_plugin:bfd_accept", kwargs={"pk": self.overlay.pk})
         )
 
+    def test_a_deploying_native_gap_does_not_offer_accept(self):
+        from netbox_nso_plugin.models import NSOApplyAttempt
+
+        attempt = NSOApplyAttempt.objects.create(management=self.management, selected={"bfd": 1})
+        NSOBFDInterfaceState.objects.filter(pk=self.overlay.pk).update(status="deploying", apply_attempt_id=attempt.pk)
+        row = _grid_row(self, self.admin, self.device, "bfd", self.overlay)
+        self.assertFalse(row["native_gap"])
+        self.assertIsNone(row["accept_url"])
+        self.overlay.refresh_from_db()
+        self.assertEqual((self.overlay.status, self.overlay.apply_attempt_id), ("deploying", attempt.pk))
+
     def test_accept_creates_the_native_rows_with_the_native_permission_only(self):
         from netbox_routing.models import BFDInterface, BFDProfile
 
@@ -407,6 +418,13 @@ class TestRedistributionConversion(AdapterCase):
         )
         self.overlay.refresh_from_db()
         self.assertEqual(self.overlay.redistribution_id, native_row.pk)
+
+    def test_a_missing_destination_does_not_offer_native_gap_accept(self):
+        with without_commit_drain():
+            self.ospf.delete()
+        row = _grid_row(self, self.admin, self.device, "redistribution", self.overlay)
+        self.assertFalse(row["native_gap"])
+        self.assertIsNone(row["accept_url"])
 
 
 # ── Adjacent holes closed in I2 ──
