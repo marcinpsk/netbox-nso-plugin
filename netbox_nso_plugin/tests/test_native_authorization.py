@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
-"""The NativeWriter, its scopes and guards, and the static write-site census (#1717 increment I2).
-
-Inside a request every native write needs its exact writer permit (C9), a swallowed denial
-still refuses the request (latch), and no adapter call runs in the mutation phase. A system
-entry writes device facts only (C14). The tests use the real ORM and real ObjectPermission rows.
-"""
+"""Native authority scopes, guards, and write-site censuses."""
 
 import ast
 import pathlib
@@ -139,14 +134,21 @@ class TestWriteSiteStructure(SimpleTestCase):
     """Static guards with stated limits: they pin today's sites, so a new one needs review."""
 
     def test_no_system_scope_write_site_declares_owned_intent(self):
-        """Owned intent reaches native rows only through the operator writer (C14): no site declares it."""
+        """Only the pinned operator allocation sites declare OwnedIntent."""
         sites = [
             f"{module}:{function}"
             for module, tree in _plugin_sources()
             if module != "native_authorization.py"
             for function, _name in _calls(tree, {"OwnedIntent"})
         ]
-        self.assertEqual(sites, [])
+        self.assertEqual(
+            sites,
+            [
+                "ip_autoassign.py:carve_p2p_child",
+                "ip_autoassign.py:_assign_one_p2p_family",
+                "ip_autoassign.py:_reserve_single",
+            ],
+        )
 
     def test_raw_sql_sites_are_the_allowlist(self):
         """No raw SQL DML against native tables (C9b): each raw SQL site is reviewed and pinned.
@@ -161,24 +163,35 @@ class TestWriteSiteStructure(SimpleTestCase):
         self.assertEqual(found, sorted(_RAW_SQL_ALLOWLIST))
 
 
-class TestUnverifiedEndpointCensus(SimpleTestCase):
-    """Only the allocation endpoints still write native rows outside the NativeWriter (increment I3)."""
+class TestEndpointEffectCensus(SimpleTestCase):
+    """Every UI and API route declares a supported authority effect."""
 
-    def test_the_unverified_endpoints_are_pinned(self):
+    def test_every_endpoint_has_a_verified_effect(self):
+        from django.urls import URLResolver
+
         from netbox_nso_plugin import urls
         from netbox_nso_plugin.api import urls as api_urls
         from netbox_nso_plugin.request_authorization import EndpointPolicy, view_class_of
 
-        found = set()
-        for pattern in (*urls.urlpatterns, *api_urls.urlpatterns):
+        def patterns(items):
+            for pattern in items:
+                if isinstance(pattern, URLResolver):
+                    yield from patterns(pattern.url_patterns)
+                else:
+                    yield pattern
+
+        found = {}
+        for pattern in patterns((*urls.urlpatterns, *api_urls.urlpatterns)):
             cls = view_class_of(pattern.callback)
             policy = getattr(cls, "policy", None)
             if policy is None:
                 continue
             policies = [policy] if isinstance(policy, EndpointPolicy) else list(policy.values())
-            if any(item.effects == "unverified_native_mutation" for item in policies):
-                found.add(cls.__qualname__)
-        self.assertEqual(found, {"NSOAutoAssignIPView", "NSOProvisionLinkRoleView"})
+            for item in policies:
+                self.assertIn(item.effects, {"read", "native_mutation", "adapter_action"}, cls.__qualname__)
+            found[cls.__qualname__] = {item.effects for item in policies}
+        for endpoint in ("NSOAutoAssignIPView", "NSOProvisionLinkRoleView"):
+            self.assertEqual(found[endpoint], {"native_mutation"})
 
 
 # Advisory locks, sequence reads, transaction settings and plugin-table upserts; the two

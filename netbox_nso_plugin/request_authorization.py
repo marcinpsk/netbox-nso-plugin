@@ -27,9 +27,8 @@ from django.views import View
 
 from .native_authorization import authority_scope
 
-Effect = Literal["read", "native_mutation", "adapter_action", "unverified_native_mutation"]
-# unverified_native_mutation: native writes not yet routed through the NativeWriter (allocation, increment I3).
-EFFECTS: tuple[str, ...] = ("read", "native_mutation", "adapter_action", "unverified_native_mutation")
+Effect = Literal["read", "native_mutation", "adapter_action"]
+EFFECTS: tuple[str, ...] = ("read", "native_mutation", "adapter_action")
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options", "trace"})
 _HANDLER_METHODS = ("get", "post", "put", "patch", "delete")
 

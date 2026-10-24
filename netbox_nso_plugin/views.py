@@ -6465,7 +6465,7 @@ class NSOAutoAssignIPView(AuthorizedView):
     Redirects back to the device NSO tab with a success/error flash.
     """
 
-    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "unverified_native_mutation")
+    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "native_mutation")
 
     def post(self, request, device_pk):
         """Auto-assign IPs from purpose pools to the requested interfaces."""
@@ -6515,7 +6515,7 @@ class NSOProvisionLinkRoleView(AuthorizedView):
     per-interface summary flash.
     """
 
-    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "unverified_native_mutation")
+    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "native_mutation")
 
     def post(self, request, device_pk):
         """Provision the requested interfaces from their assigned link roles."""

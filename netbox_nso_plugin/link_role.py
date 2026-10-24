@@ -307,8 +307,11 @@ def _provisioned_scopes(role) -> list[str]:
 
 def _push_provisioned(role, device_ids) -> None:
     """After a successful commit, push each affected (device, category) intent once."""
+    from utilities.exceptions import PermissionsViolation
+
     from . import drain
     from .models import NSODeviceManagement
+    from .native_authorization import NativeWriteRefused
 
     for device_id in device_ids:
         mgmt = NSODeviceManagement.objects.filter(device_id=device_id).first()
@@ -320,6 +323,8 @@ def _push_provisioned(role, device_ids) -> None:
                 # acknowledged baseline matching this snapshot would otherwise drop the
                 # re-provision silently (intent-integrity: no silent drop).
                 drain.push_now(device_id, scope, force=True)
+            except (PermissionsViolation, NativeWriteRefused):
+                raise
             except Exception as exc:  # noqa: BLE001 — adapter may be down; state already owned
                 logger.warning("provision_link_role: push failed for device %s: %s", device_id, exc)
 

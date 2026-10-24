@@ -415,9 +415,6 @@ def authority_scope(effects: str, user=None):
             raise NativeWriteRefused("a native-mutation endpoint needs its operator")
         with _operator_scope(user):
             yield
-    elif effects == "unverified_native_mutation":
-        # The census pins these endpoints; increment I3 routes their writes through the NativeWriter.
-        yield
     else:
         raise NativeWriteRefused(f"unknown endpoint effect {effects!r}")
 
