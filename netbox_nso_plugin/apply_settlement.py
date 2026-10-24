@@ -266,10 +266,7 @@ def reconcile_admission_links(responses, generations):
         if not isinstance(response, dict):
             raise EvidenceInvariantError("admission_generation_mismatch")
         _response_generation_ids(response)
-        links = response.get("generations", [])
-        if not isinstance(links, list):
-            raise EvidenceInvariantError("admission_generation_mismatch")
-        for link in links:
+        for link in response.get("generations") or ():
             generation = by_id.get(link["generation_id"])
             if generation is None:
                 raise EvidenceInvariantError("admission_generation_mismatch")
@@ -296,6 +293,8 @@ def _reconcile_admissions(management, attempt_ids, snapshots, answers, generatio
                     raise EvidenceInvariantError("admission_generation_mismatch") from None
     responses = [raw.get("response") for snapshot in snapshots for raw in snapshot["attempts"]]
     responses.extend(result for _attempt, result, _error in answers if result is not None)
+    if not all(isinstance(response, dict) for response in responses):
+        raise EvidenceInvariantError("deployment evidence has an invalid stored response")
     responses.extend(
         error.rejection_response
         for _attempt, _result, error in answers

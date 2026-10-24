@@ -914,6 +914,31 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         response = self.client.post(reverse("plugins:netbox_nso_plugin:onboard"), {"device": self.device_a.pk})
         self.assertEqual(response.status_code, 403)
 
+    def test_api_onboarding_rejects_malformed_identities_before_writes(self):
+        _grant(self.user, ("view",), Device)
+        _grant(self.user, ("add", "change"), NSODeviceManagement)
+        api = self._api()
+        url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
+        before = list(NSODeviceManagement.objects.values())
+        invalid = [{"netbox_device_id": value} for value in ("abc", str(self.device_a.pk), True, False, 0, -1, [], {})]
+        invalid += [{"netbox_device_id": self.device_a.pk, "instance": value} for value in ([], {}, 1, True)]
+        for body in invalid:
+            with self.subTest(body=body):
+                response = api.post(url, body, format="json")
+                self.assertEqual(response.status_code, 400, response.content)
+                self.assertEqual(list(NSODeviceManagement.objects.values()), before)
+                self.assertEqual(_CountingSession.calls, [])
+
+    def test_a_sorted_plugin_list_saves_the_users_ordering(self):
+        from netbox_nso_plugin.models import NSOInstance
+        from netbox_nso_plugin.tables import NSOInstanceTable
+
+        _grant(self.user, ("view",), NSOInstance)
+        response = self.client.get(reverse("plugins:netbox_nso_plugin:nsoinstance_list"), {"sort": "-name"})
+        self.assertEqual(response.status_code, 200)
+        self.user.config.refresh_from_db()
+        self.assertEqual(self.user.config.get(f"tables.{NSOInstanceTable.__name__}.ordering"), ["-name"])
+
     def test_a_superuser_edit_still_clears_an_unmanaged_inverse_peer(self):
         """An interface overlay on an unmanaged device has no management authority; a superuser keeps the edit (A4)."""
         from netbox_nso_plugin.models import NSOInterfaceIPState
