@@ -552,10 +552,14 @@ class ApiOnboarding(TargetSpec):
         device_id = body.get("netbox_device_id")
         if device_id is None:
             raise ParseError("netbox_device_id is required")
+        if type(device_id) is not int or device_id <= 0:
+            raise ParseError("netbox_device_id must be a positive integer")
         device = _device_model().objects.restrict(user, "view").filter(pk=device_id).first()
         if device is None:
             raise NotFound(f"device {device_id} not found")
         selected = body.get("instance")
+        if selected is not None and not isinstance(selected, str):
+            raise ParseError("instance must be a string")
         if selected:
             instance = NSOInstance.objects.restrict(user, "view").filter(adapter_instance_id=selected).first()
             if instance is None:
@@ -627,13 +631,19 @@ _DML = re.compile(r'\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?([A-Za-z0-9_]+
 def native_tables() -> frozenset[str]:
     """Return every table outside this plugin, except the NetBox bookkeeping a plugin-row write records.
 
-    Bookkeeping: the change log and search cache entries of plugin rows, and the type caches.
+    Bookkeeping: change logs, search and type caches, and user preferences.
     """
     from django.apps import apps
 
     bookkeeping = {
         apps.get_model(label)._meta.db_table
-        for label in ("core.ObjectChange", "extras.CachedValue", "core.ObjectType", "contenttypes.ContentType")
+        for label in (
+            "core.ObjectChange",
+            "extras.CachedValue",
+            "core.ObjectType",
+            "contenttypes.ContentType",
+            "users.UserConfig",
+        )
     }
     tables = set()
     for model in apps.get_models(include_auto_created=True):
