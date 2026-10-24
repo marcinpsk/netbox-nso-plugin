@@ -96,6 +96,10 @@ class TestOwnedEffectCensus(SimpleTestCase):
                     ("Anchored", "dcim.interface", frozenset({"mode", "untagged_vlan", "tagged_vlans"}), False),
                 ),
                 "netbox_nso_plugin.nsointerfacemtustate": (("Anchored", "dcim.interface", frozenset({"mtu"}), False),),
+                "netbox_nso_plugin.nsointerfacestate": (
+                    ("Anchored", "dcim.interface", frozenset({"description"}), False),
+                    ("Anchored", "dcim.interface", frozenset({"enabled"}), False),
+                ),
             },
         )
         entries = [

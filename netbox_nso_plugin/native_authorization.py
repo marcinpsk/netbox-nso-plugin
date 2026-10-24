@@ -122,6 +122,14 @@ def _interface_scope_owned(model_name, scope):
     return owned
 
 
+def interface_attribute_owned(interface, attribute):
+    """Return whether the overlay or manifest owns this interface attribute."""
+    return interface.pk is not None and (
+        _owned_overlay("nsointerfacestate", interface_id=interface.pk, attribute=attribute)
+        or _owned_manifest("interface", "dcim.interface", native_id=interface.pk, state_key__attribute=attribute)
+    )
+
+
 def _bfd_interface_owned(row):
     return _owned_overlay("nsobfdinterfacestate", interface_id=row.interface_id) or _owned_manifest(
         "bfd", "dcim.interface", native_id=row.interface_id
@@ -212,6 +220,20 @@ OWNED_NATIVE_EFFECTS: Mapping[str, tuple[Anchored | Dependency, ...] | NoNativeI
                 owned=_interface_scope_owned("nsointerfacemtustate", "interface_mtu"),
             ),
         ),
+        "netbox_nso_plugin.nsointerfacestate": (
+            Anchored(
+                "dcim.interface",
+                frozenset({"description"}),
+                lifecycle=False,
+                owned=functools.partial(interface_attribute_owned, attribute="description"),
+            ),
+            Anchored(
+                "dcim.interface",
+                frozenset({"enabled"}),
+                lifecycle=False,
+                owned=functools.partial(interface_attribute_owned, attribute="enabled"),
+            ),
+        ),
         **{
             f"netbox_nso_plugin.{name}": NoNativeIntentEffects(_OVERLAY_ONLY)
             for name in (
@@ -226,7 +248,6 @@ OWNED_NATIVE_EFFECTS: Mapping[str, tuple[Anchored | Dependency, ...] | NoNativeI
         **{
             f"netbox_nso_plugin.{name}": NoNativeIntentEffects(_CENSUS_R3)
             for name in (
-                "nsointerfacestate",
                 "nsointerfaceipstate",
                 "nsosvistate",
                 "nsosubinterfacestate",
