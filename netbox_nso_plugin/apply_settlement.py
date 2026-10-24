@@ -292,9 +292,9 @@ def _reconcile_admissions(management, attempt_ids, snapshots, answers, generatio
                 except (ValueError, TypeError, AttributeError):
                     raise EvidenceInvariantError("admission_generation_mismatch") from None
     responses = [raw.get("response") for snapshot in snapshots for raw in snapshot["attempts"]]
+    responses.extend(result for _attempt, result, _error in answers if result is not None)
     if not all(isinstance(response, dict) for response in responses):
         raise EvidenceInvariantError("deployment evidence has an invalid stored response")
-    responses.extend(result for _attempt, result, _error in answers if result is not None)
     responses.extend(
         error.rejection_response
         for _attempt, _result, error in answers
