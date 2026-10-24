@@ -428,6 +428,30 @@ class TestRedistributionConversion(AdapterCase):
         self.assertFalse(row["native_gap"])
         self.assertIsNone(row["accept_url"])
 
+    def test_a_native_gap_needs_a_visible_route_map_before_accept(self):
+        from netbox_routing.models import OSPFInstance, Redistribution, RouteMap
+
+        from ._ownership_case import save_overlay_fixture
+
+        self.overlay.route_map = "gap-route-map"
+        save_overlay_fixture(self.overlay, update_fields=("route_map",))
+        with self.subTest(route_map="missing"):
+            row = _grid_row(self, self.admin, self.device, "redistribution", self.overlay)
+            self.assertFalse(row["native_gap"])
+            self.assertIsNone(row["accept_url"])
+        route_map = RouteMap.objects.create(name=self.overlay.route_map)
+        with self.subTest(route_map="hidden"):
+            row = _grid_row(self, operator(), self.device, "redistribution", self.overlay)
+            self.assertFalse(row["native_gap"])
+            self.assertIsNone(row["accept_url"])
+        user = operator((("view",), OSPFInstance, None), (("view",), RouteMap, None), (("add",), Redistribution, None))
+        row = _grid_row(self, user, self.device, "redistribution", self.overlay)
+        self.assertTrue(row["native_gap"])
+        self.assertIsNotNone(row["accept_url"])
+        self.assertEqual(self.client.post(row["accept_url"]).status_code, 302)
+        self.overlay.refresh_from_db()
+        self.assertEqual(self.overlay.redistribution.route_map_id, route_map.pk)
+
 
 # ── Adjacent holes closed in I2 ──
 
