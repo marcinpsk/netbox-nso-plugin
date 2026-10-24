@@ -122,13 +122,14 @@ class _AllocationRequests:
         self.assertFalse(NSOInterfaceState.objects.exists())
         self.assertFalse(NSOISISInterfaceState.objects.exists())
         self.assertFalse(NSOIntentOutboxEntry.objects.exists())
+        self.assertFalse(NSOIntentOutboxState.objects.exists())
         self.assertEqual(set(Prefix.objects.values_list("pk", flat=True)), self.prefix_ids)
         self.assertEqual(set(Interface.objects.values_list("description", flat=True)), {""})
 
     def _refused(self, user, interfaces=None):
         with self.assert_refused_whole():
             response = self._post(user, interfaces)
-        self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.status_code, 403)
         self._assert_empty()
 
     def _assert_success(self, user):
@@ -183,6 +184,18 @@ class _P2PRequests:
     def test_prefix_add_checks_the_completed_row(self):
         self._refused(self._user(prefix_constraint={"status": "active"}))
 
+    def test_prefix_add_allows_overlays_created_later_in_the_request(self):
+        self._assert_success(self._user(prefix_constraint={"nso_ip_states_from_pool__interface_id": self.interface.pk}))
+        self.assertEqual(
+            Prefix.objects.exclude(pk__in=self.prefix_ids)
+            .filter(nso_ip_states_from_pool__interface_id=self.interface.pk)
+            .count(),
+            2,
+        )
+
+    def test_prefix_add_refuses_overlays_created_later_in_the_request(self):
+        self._refused(self._user(prefix_constraint={"nso_ip_states_from_pool__isnull": True}))
+
 
 class TestAutoAssignP2P(_P2PRequests, _AllocationRequests, AdapterCase):
     pass
@@ -190,6 +203,12 @@ class TestAutoAssignP2P(_P2PRequests, _AllocationRequests, AdapterCase):
 
 class _LinkRoleRequests:
     link_role = True
+
+    def test_address_add_allows_description_written_later_in_the_request(self):
+        self._assert_success(self._user(ip_constraint={"interface__description": "allocated"}))
+
+    def test_address_add_refuses_description_replaced_later_in_the_request(self):
+        self._refused(self._user(ip_constraint={"interface__description": ""}))
 
     def test_missing_description_change_refuses_the_whole_request(self):
         self._refused(self._user(description=False))
