@@ -997,7 +997,9 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
             return planned
 
         with patch.object(views, "_ip_edit_plan_and_operations", new=reassign_after_discovery):
-            response = self.client.post(self._url(), {"address": "198.18.20.2/31"})
+            response = self.client.post(
+                self._url(), {"address": "198.18.20.2/31"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest"
+            )
 
         # The reassignment adds the peer's management to the affected set under the locks (C10).
         self.assertEqual(response.status_code, 409, response.content)
