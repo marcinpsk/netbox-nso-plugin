@@ -11,6 +11,7 @@ from django.db import connections
 from django.test import TestCase, TransactionTestCase
 
 from ._adapter_http import make_session
+from ._authority_case import concurrent_writer
 from ._outbox_case import content_bulk_update
 from ._ownership_case import acquire_overlay
 from .mixins import IntentPushDeliveryMixin, IntentPushResetMixin, _CascadeFlushMixin
@@ -991,17 +992,21 @@ class TestInterfaceIPInlineEdit(IntentPushResetMixin, TestCase):
         def reassign_after_discovery(updates, planned_at):
             planned = original_plan(updates, planned_at)
             self.local_ip.assigned_object = self.peer
-            self.local_ip.save()
+            with concurrent_writer():
+                self.local_ip.save()
             return planned
 
         with patch.object(views, "_ip_edit_plan_and_operations", new=reassign_after_discovery):
-            response = self.client.post(self._url(), {"address": "198.18.20.2/31"})
+            response = self.client.post(
+                self._url(), {"address": "198.18.20.2/31"}, HTTP_X_REQUESTED_WITH="XMLHttpRequest"
+            )
 
-        self.assertEqual(response.status_code, 400, response.content)
-        self.assertIn("retry", " ".join(response.json()["errors"]["address"]).lower())
+        # The reassignment adds the peer's management to the affected set under the locks (C10).
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertIn("membership changed", response.json()["message"])
         self.local_ip.refresh_from_db()
         self.local_state.refresh_from_db()
-        self.assertEqual(self.local_ip.assigned_object, self.peer)
+        # The simulated writer shares the request transaction, so the 409 rollback also undoes it.
         self.assertEqual(str(self.local_ip.address), "198.18.20.0/31")
         self.assertEqual(self.local_state.address, "198.18.20.0/31")
 

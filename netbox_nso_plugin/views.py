@@ -10,18 +10,20 @@ from types import MappingProxyType
 from uuid import uuid4
 
 from dcim.models import Device
+from django.apps import apps
 from django.contrib import messages
-from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.db import transaction
-from django.http import HttpResponseBadRequest, JsonResponse
+from django.http import Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.html import escape
-from django.views import View
 from netbox.object_actions import AddObject, BulkDelete, BulkExport
 from netbox.views import generic
+from netbox.views.generic.feature_views import ObjectChangeLogView, ObjectJournalView
+from utilities.exceptions import PermissionsViolation
+from utilities.forms import restrict_form_fields
 from utilities.views import ViewTab, register_model_view
 
 from .adapter_client import AdapterError, public_error_message
@@ -62,16 +64,19 @@ from .models import (
     AdapterConnection,
     NSOBFDInterfaceState,
     NSOBGPPeerState,
+    NSOBGPPeerTemplateState,
     NSOBGPRouterState,
     NSODerivedIntentTemplate,
     NSODeviceManagement,
     NSOFailoverSettings,
     NSOInstance,
+    NSOInterfaceIPState,
     NSOInterfaceMtuState,
     NSOInterfaceState,
     NSOISISInstanceState,
     NSOISISInterfaceState,
     NSOL2SapState,
+    NSOLACPBundleState,
     NSOLinkRole,
     NSOLinkRoleAssignment,
     NSOLoggingHostState,
@@ -88,11 +93,29 @@ from .models import (
     NSOStaticRouteState,
     NSOSubinterfaceState,
     NSOSVIState,
+    NSOSwitchportState,
     NSOVaultSettings,
     NSOVLANState,
 )
+from .native_authorization import shared_operation
+from .native_lookup import operator_lookup, require_operator_view
 from .ownership_grants import OwnershipGrant
 from .ownership_planner import OwnershipNotQualified
+from .request_authorization import (
+    AuthorizedGenericView,
+    AuthorizedView,
+    Collection,
+    DeviceRead,
+    EndpointPolicy,
+    Instance,
+    Management,
+    Onboarding,
+    OverlayFamily,
+    OverlayRow,
+    generic_policy,
+    permitted_instance,
+    shared_vlan_rename,
+)
 from .signals import _STATIC_ROUTE_ARMED_FIELDS, LOCAL_PUSH_BLOCK_REASONS, _schedule_intent_push
 from .tables import (
     NSODerivedIntentTemplateTable,
@@ -161,54 +184,26 @@ def _observe_live_read_state(device, mgmt):
     return unknown, mismatch
 
 
-# ── Authorization for NSO action views ───────────────────────────────────────
+class NSOObjectChangeLogView(AuthorizedGenericView, ObjectChangeLogView):
+    """NetBox's change log for a plugin object; it restricts the object by the view action."""
+
+    policy = generic_policy(mutate=())
 
 
-class NSOActionPermissionMixin(LoginRequiredMixin):
-    """Require a NetBox permission (not just authentication) to invoke an NSO action.
+class NSOObjectJournalView(AuthorizedGenericView, ObjectJournalView):
+    """NetBox's journal for a plugin object; it restricts the object by the view action."""
 
-    The NSO action views are RPC-style (Accept / Apply / onboard / sync / re-point)
-    rather than object CRUD, so — unlike NetBox's generic ``ObjectEditView`` etc. — they
-    carry no single restrictable queryset for ``ObjectPermissionRequiredMixin`` to filter.
-    Gating them on ``LoginRequiredMixin`` alone let *any* authenticated user push intent or
-    apply config to a device. Each view names the NetBox permission it needs in
-    ``required_permission``; it is evaluated against the user's ObjectPermissions by
-    NetBox's auth backend (a superuser and any holder of a matching ObjectPermission pass).
-    An authenticated user lacking it gets 403; an anonymous user still follows the normal
-    login redirect (so the login-required behaviour is unchanged).
-
-    ``required_permission`` may name a single permission or a sequence of them — ALL are
-    required. A view that mints objects in ANOTHER app (the in-tab BGP-peer create builds a
-    netbox_routing graph) must name that app's permission too, or the NSO permission alone
-    would silently become a grant to create routing objects.
-    """
-
-    required_permission = "netbox_nso_plugin.change_nsodevicemanagement"
-
-    def dispatch(self, request, *args, **kwargs):
-        """Enforce every ``required_permission`` for authenticated users before the handler runs."""
-        required = self.required_permission
-        if isinstance(required, str):
-            required = (required,)
-        if request.user.is_authenticated and not all(request.user.has_perm(perm) for perm in required):
-            raise PermissionDenied
-        try:
-            return super().dispatch(request, *args, **kwargs)
-        except OwnershipNotQualified as exc:
-            is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
-            if is_ajax or "key" in kwargs or exc.device_id is None:
-                return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
-            messages.error(request, exc.public_message)
-            return redirect(_device_nso_tab_url(exc.device_id))
+    policy = generic_policy(mutate=())
 
 
 # ── Device NSO Tab (registered into dcim.Device detail) ──────────────────────
 
 
 @register_model_view(Device, name="nso", path="nso")
-class DeviceNSOTabView(generic.ObjectView):
+class DeviceNSOTabView(AuthorizedGenericView, generic.ObjectView):
     """NSO tab on the Device detail page — shows management status, actions, and compliance."""
 
+    policy = EndpointPolicy(DeviceRead(), "read")
     queryset = Device.objects.all()
     template_name = "netbox_nso_plugin/device_nso_tab.html"
     tab = ViewTab(
@@ -231,7 +226,7 @@ class DeviceNSOTabView(generic.ObjectView):
         from .template_content import _STATUS_BADGE
 
         device = instance
-        mgmt = getattr(device, "nso_management", None)
+        mgmt = self.target.management
 
         # Give the fenced provision tombstone sweep another completion opportunity. A transient
         # attempt lookup error leaves the row provisioning and never breaks the render.
@@ -353,33 +348,9 @@ def _can_change_bgp_router(user, state):
 _AUTO_DISCOVERED_RIR = "NSO Auto-Discovered"
 
 
-def _can_change_bgp_peer(user, state):
-    from netbox_routing.models import BGPPeer
-
-    return (
-        state.bgp_peer_id is not None
-        and user.has_perm("netbox_nso_plugin.change_nsodevicemanagement")
-        and user.has_perm("netbox_routing.change_bgppeer")
-        and NSODeviceManagement.objects.restrict(user, "change").filter(pk=state.management_id).exists()
-        and BGPPeer.objects.restrict(user, "change").filter(pk=state.bgp_peer_id).exists()
-    )
-
-
-def _require_bgp_peer_edit_constraints(user, peer, created):
-    """Require the written peer and each created object to satisfy the user's permission constraints."""
-    from netbox_routing.models import BGPPeer
-
-    if not BGPPeer.objects.restrict(user, "change").filter(pk=peer.pk).exists():
-        raise PermissionDenied
-    for instance in created:
-        if not type(instance).objects.restrict(user, "add").filter(pk=instance.pk).exists():
-            raise PermissionDenied
-
-
 def _prepare_bgp_edit(user, family, state):
+    # The NativeWriter authorizes the peer and every row the edit creates; the router owner rule stays here.
     if family == "bgp_router" and not _can_change_bgp_router(user, state):
-        raise PermissionDenied
-    if family == "bgp_peer" and state.bgp_peer_id is not None and not _can_change_bgp_peer(user, state):
         raise PermissionDenied
     if family == "bgp_router":
         state.router_id = str(state.bgp_router.router_id or "")
@@ -577,7 +548,7 @@ def _persisted_category_context(device, mgmt, key: str) -> dict:
     return {}
 
 
-class NSOCategoryCountsView(LoginRequiredMixin, View):
+class NSOCategoryCountsView(AuthorizedView):
     """JSON of every category's live counts for the device NSO tab.
 
     The tab renders the category header badges (total / drift / pending apply / in sync)
@@ -587,6 +558,8 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
 
     URL: /plugins/nso/devices/<pk>/category-counts/
     """
+
+    policy = EndpointPolicy(DeviceRead("device_pk"), "read")
 
     def get(self, request, device_pk):
         """Return {categories: {key: {total, drift, pending, read}}, reset_pending}.
@@ -598,8 +571,7 @@ class NSOCategoryCountsView(LoginRequiredMixin, View):
         """
         from .summary import category_summaries
 
-        device = get_object_or_404(Device, pk=device_pk)
-        mgmt = getattr(device, "nso_management", None)
+        device, mgmt = self.target.device, self.target.management
         out = {
             c["key"]: {
                 "total": c["counts"].get("total", 0),
@@ -805,15 +777,17 @@ def _matching_peer_ip_state(state, candidates):
     return in_subnet[0] if len(in_subnet) == 1 else None
 
 
-def _interface_topology_payload(interfaces, ip_states):
+def _interface_topology_payload(interfaces, ip_states, user):
     """Build cable/peer row metadata and an optional peer state per local IP.
 
     ``Interface.link_peers`` is NetBox's canonical cable-path traversal API. Only
     cabled interfaces invoke it, and peer Interface/Device plus Cable objects are
     then bulk-loaded for serialization. Far-end IP states are also loaded in one
     query so a peer on another device can participate in the two-ended editor.
+    Peers, cables and far-end states load through *user*'s view restrictions.
     """
     from dcim.models import Cable, Interface
+    from django.db.models import Q
 
     from .derived_intent import find_peer
     from .models import NSOInterfaceIPState
@@ -825,12 +799,24 @@ def _interface_topology_payload(interfaces, ip_states):
             if peer is not None:
                 raw_peers[iface.pk] = peer.pk
 
-    peers = Interface.objects.filter(pk__in=set(raw_peers.values())).select_related("device").in_bulk()
-    cables = Cable.objects.in_bulk({iface.cable_id for iface in interfaces if iface.cable_id is not None})
+    visible_devices = Device.objects.restrict(user, "view")
+    peers = (
+        Interface.objects.restrict(user, "view")
+        .filter(pk__in=set(raw_peers.values()), device__in=visible_devices)
+        .select_related("device")
+        .in_bulk()
+    )
+    cables = Cable.objects.restrict(user, "view").in_bulk(
+        {iface.cable_id for iface in interfaces if iface.cable_id is not None}
+    )
     peer_states = {}
     states_by_peer = {}
     for state in (
-        NSOInterfaceIPState.objects.filter(interface_id__in=set(raw_peers.values()))
+        NSOInterfaceIPState.objects.filter(
+            Q(interface__device__nso_management__isnull=True)
+            | Q(interface__device__nso_management__in=NSODeviceManagement.objects.restrict(user, "view")),
+            interface_id__in=set(peers),
+        )
         .select_related("interface", "interface__device")
         .order_by("address")
     ):
@@ -931,8 +917,10 @@ def _difference_value(scope, value):
     return "; ".join(f"{name}: {json.dumps(value[name], default=str)}" for name in names if name in value)
 
 
-class NSODeviceDifferencesView(LoginRequiredMixin, View):
+class NSODeviceDifferencesView(AuthorizedView):
     """Render snapshot differences without an adapter read or a reconcile."""
+
+    policy = EndpointPolicy(Management("view", by="device", device_view=True), "read")
 
     def get(self, request, pk):
         from django.core.paginator import Paginator
@@ -947,11 +935,7 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
         from .device_sync import SYNC_SCOPES, SYNCABLE_KINDS, row_token
         from .ownership_planner import converted_scope_rules
 
-        permissions = ("dcim.view_device", "netbox_nso_plugin.view_nsodevicemanagement")
-        if not all(request.user.has_perm(permission) for permission in permissions):
-            raise PermissionDenied
-        device = get_object_or_404(Device.objects.restrict(request.user, "view"), pk=pk)
-        management = get_object_or_404(NSODeviceManagement.objects.restrict(request.user, "view"), device=device)
+        device, management = self.target.device, self.target.management
         scope = request.GET.get("scope", "")
         kind = request.GET.get("kind", "")
         snapshots = observation_snapshots(management)
@@ -1007,27 +991,20 @@ class NSODeviceDifferencesView(LoginRequiredMixin, View):
         )
 
 
-def _sync_management(request, pk):
-    """Return the device and management row that the user may sync."""
-    device = get_object_or_404(Device.objects.restrict(request.user, "view"), pk=pk)
-    management = get_object_or_404(NSODeviceManagement.objects.restrict(request.user, "change"), device=device)
-    return device, management
-
-
-_SYNC_PERMISSIONS = ("dcim.view_device", "netbox_nso_plugin.change_nsodevicemanagement")
+_SYNC_TARGET = Management("change", by="device", device_view=True)
 _MALFORMED_SYNC_SELECTION = "The Sync from NSO selection is malformed."
 
 
-class NSODeviceSyncPreviewView(NSOActionPermissionMixin, View):
+class NSODeviceSyncPreviewView(AuthorizedView):
     """Read the selected scopes again and show the Sync from NSO plan. NetBox does not change."""
 
-    required_permission = _SYNC_PERMISSIONS
+    policy = EndpointPolicy(_SYNC_TARGET, "adapter_action")
 
     def post(self, request, pk):  # noqa: D102
         from .device_differences import observation_snapshots
         from .device_sync import SyncReadFailed, SyncSelection, SyncSelectionError, preview_sync
 
-        device, management = _sync_management(request, pk)
+        device, management = self.target.device, self.target.management
         try:
             selection = SyncSelection.from_post(request.POST)
         except SyncSelectionError:
@@ -1073,15 +1050,15 @@ class NSODeviceSyncPreviewView(NSOActionPermissionMixin, View):
         )
 
 
-class NSODeviceSyncConfirmView(NSOActionPermissionMixin, View):
+class NSODeviceSyncConfirmView(AuthorizedView):
     """Execute exactly the previewed Sync from NSO plan, or write nothing."""
 
-    required_permission = _SYNC_PERMISSIONS
+    policy = EndpointPolicy(_SYNC_TARGET, "native_mutation")
 
     def post(self, request, pk):  # noqa: D102
         from .device_sync import SyncRowFailed, SyncSelection, SyncSelectionError, SyncStale, confirm_sync
 
-        device, management = _sync_management(request, pk)
+        device, management = self.target.device, self.target.management
         try:
             selection = SyncSelection.from_post(request.POST)
         except SyncSelectionError:
@@ -1105,7 +1082,7 @@ class NSODeviceSyncConfirmView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device.pk))
 
 
-class NSOCategoryView(LoginRequiredMixin, View):
+class NSOCategoryView(AuthorizedView):
     """Return one category's rows for the device NSO tab, fetched on expand.
 
     The tab renders counts-first; when an operator expands a category, the browser
@@ -1139,6 +1116,15 @@ class NSOCategoryView(LoginRequiredMixin, View):
     # Rows-per-page for the (potentially huge) interfaces table.
     _INTERFACES_PER_PAGE = 50
 
+    policy = EndpointPolicy(DeviceRead(), "read")
+
+    def _may_reconcile(self, request):
+        """Return whether this request refreshes device facts, which needs change authority (system entry)."""
+        if request.GET.get("refresh"):
+            self.target.require("change")
+            return True
+        return self.target.allows("change")
+
     def get(self, request, pk, key):
         """Render one category's rows.
 
@@ -1148,13 +1134,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
         sync-complete job or the Refresh button. Routing categories are small, so
         they keep the on-expand suppressed scoped reconcile.
         """
-        device = get_object_or_404(Device, pk=pk)
+        device, mgmt = self.target.device, self.target.management
         if key == "interface":
-            return self._render_interface_merged(request, device)
+            return self._render_interface_merged(request, device, mgmt)
         if key == "interfaces":
-            return self._render_interfaces_page(request, device)
-
-        mgmt = getattr(device, "nso_management", None)
+            return self._render_interfaces_page(request, device, mgmt)
 
         # Client-side grids: all rows at once, filtered/sorted in the browser. Must come
         # before the paginated path — static/redistribution used to render from it.
@@ -1177,7 +1161,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             return HttpResponseBadRequest(f"unknown category: {escape(key)}")
 
         ctx = {"object": device, "mgmt": mgmt, "status_badge": _STATUS_BADGE}
-        if mgmt is not None and mgmt.adapter_device_id is not None:
+        if mgmt is not None and mgmt.adapter_device_id is not None and self._may_reconcile(request):
             try:
                 ctx.update(reconcile_category(device, mgmt, key))
             except (AdapterError, DeploymentQuiesced) as exc:
@@ -1200,7 +1184,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
                         if pkey in defaults and ctx.get(pkey) == defaults[pkey]:
                             ctx[pkey] = pval
         else:
-            # Unlinked device: nothing to reconcile, but NetBox still holds state.
+            # Unlinked device, or no change authority to refresh: NetBox still holds state.
             ctx.update(_persisted_category_context(device, mgmt, key))
         _annotate_residue_rows(ctx, key, mgmt)
         ctx["category_has_unowned"] = _ctx_has_unowned(ctx)
@@ -1283,6 +1267,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
             from .reconcile import reconcile_category
 
+            self.target.require("change")
             try:
                 reconcile_category(device, mgmt, key)
             except (AdapterError, DeploymentQuiesced) as exc:
@@ -1349,7 +1334,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
         _annotate_residue_rows(ctx, key, mgmt)
         return render(request, spec["partial"], ctx)
 
-    def _render_interface_merged(self, request, device):
+    def _render_interface_merged(self, request, device, mgmt):
         """Consolidated per-interface view: one row per interface, a column per attribute.
 
         Folds the four scattered per-interface scalar overlays (enabled/description,
@@ -1368,12 +1353,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
         from .reconcile import reconcile_category
         from .refusal_display import project_rows
 
-        mgmt = getattr(device, "nso_management", None)
-
         # Read from last-synced state (fast); the Refresh icon (?refresh=1) forces a
         # live reconcile. Freshness otherwise comes from the sync-complete reconcile.
         adapter_error = None
         if request.GET.get("refresh") and mgmt is not None and mgmt.adapter_device_id is not None:
+            self.target.require("change")
             try:
                 reconcile_category(device, mgmt, "interface")
             except (AdapterError, DeploymentQuiesced) as exc:
@@ -1423,7 +1407,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             Interface.objects.filter(pk__in=ifaces).select_related("untagged_vlan").prefetch_related("tagged_vlans"),
             key=lambda i: i.name,
         )
-        links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states)
+        links_by_iface, peer_ip_states = _interface_topology_payload(ordered, ip_states, request.user)
         native_ips = _native_ip_by_state(ip_states)
 
         projections_by_iface = {
@@ -1939,12 +1923,16 @@ class NSOCategoryView(LoginRequiredMixin, View):
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                "accept_url": (
-                    reverse(accept_route, args=[st.pk])
-                    if accept_route and any(row.status in self._ACCEPTABLE_STATUSES for row in status_rows)
-                    else None
-                ),
+                "native_gap": bool(accept_route)
+                and st.status != "deploying"
+                and _owned_native_gap(st, self.request.user),
             }
+            row["accept_url"] = (
+                reverse(accept_route, args=[st.pk])
+                if accept_route
+                and (any(item.status in self._ACCEPTABLE_STATUSES for item in status_rows) or row["native_gap"])
+                else None
+            )
             row.update({name: fn(st) for name, fn in fields.items()})
             rows.append(row)
         return {"rows": rows, "counts": counts}
@@ -2001,7 +1989,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # Never reconcile for the JSON reload: the grid re-fetches after every action, so
         # that would be a device read per Accept click.
         may_reconcile = not want_json and mgmt is not None and mgmt.adapter_device_id is not None
-        if may_reconcile and (spec["reconcile_on_expand"] or request.GET.get("refresh")):
+        if (
+            may_reconcile
+            and (spec["reconcile_on_expand"] or request.GET.get("refresh"))
+            and self._may_reconcile(request)
+        ):
             from .reconcile import reconcile_category
 
             try:
@@ -2016,7 +2008,11 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # Bulk-accept shows only when something is still unowned — i.e. some row offers
         # an Accept, which is exactly the accept_url the grid itself renders.
         sections = {None: payload} if None in spec["sections"] else {n: payload[n] for n in spec["sections"]}
-        section_has_unowned = {name: any(row["accept_url"] for row in s["rows"]) for name, s in sections.items()}
+        # A native-gap Accept is not a bulk accept: bulk accept takes unowned rows only.
+        section_has_unowned = {
+            name: any(row["accept_url"] and not row.get("native_gap") for row in s["rows"])
+            for name, s in sections.items()
+        }
 
         from .template_content import _STATUS_BADGE
 
@@ -2175,7 +2171,7 @@ class NSOCategoryView(LoginRequiredMixin, View):
             )
         return {"rows": rows, "counts": counts, "adapter_error": adapter_error}
 
-    def _render_interfaces_page(self, request, device):
+    def _render_interfaces_page(self, request, device, mgmt):
         """Per-(interface, attribute) drift/pending view — paginated, filterable, read-only.
 
         One row per managed attribute showing NetBox value vs Device (NSO) value and the
@@ -2242,7 +2238,6 @@ class NSOCategoryView(LoginRequiredMixin, View):
         # is selected, the adapter scope is empty and a sync can never produce rows.
         # Flag it so the empty state tells the operator that — instead of the misleading
         # "wait for the next sync".
-        mgmt = getattr(device, "nso_management", None)
         no_attrs_in_scope = bool(mgmt and mgmt.manage_interfaces and not mgmt.managed_attributes)
 
         return render(
@@ -2263,14 +2258,16 @@ class NSOCategoryView(LoginRequiredMixin, View):
 # ── AJAX: NSO device names for match form datalist ────────────────────────────
 
 
-class NSODeviceNamesView(LoginRequiredMixin, View):
+class NSODeviceNamesView(AuthorizedView):
     """Return enriched JSON device list for a given NSOInstance (for match form datalist)."""
+
+    policy = EndpointPolicy(Instance("instance_pk"), "read")
 
     def get(self, request, instance_pk):
         """Return JSON list of enriched NSO device dicts for the match form."""
         from . import adapter_client as client
 
-        nso_instance = get_object_or_404(NSOInstance, pk=instance_pk)
+        nso_instance = self.target.primary
         try:
             device_names = client.list_nso_devices(nso_instance.adapter_instance_id)
             return JsonResponse({"devices": device_names})
@@ -2281,16 +2278,32 @@ class NSODeviceNamesView(LoginRequiredMixin, View):
 # ── Adapter Connection (singleton) ───────────────────────────────────────────
 
 
-class AdapterConnectionEditView(generic.ObjectEditView):
+class _SingletonEditMixin:
+    """Edit a settings singleton: change when its row exists, add otherwise, through NetBox's restricted queryset."""
+
+    def get_required_permission(self):
+        """Require change for the existing row and add only for the first one."""
+        from utilities.permissions import get_permission_for_model
+
+        action = "change" if self.queryset.model.objects.exists() else "add"
+        return get_permission_for_model(self.queryset.model, action)
+
+    def get_object(self, **kwargs):
+        """Return the existing row through the restricted queryset (404 outside it), else a blank row."""
+        existing = self.queryset.model.objects.values_list("pk", flat=True).first()
+        if existing is None:
+            return self.queryset.model()
+        return get_object_or_404(self.queryset, pk=existing)
+
+
+class AdapterConnectionEditView(AuthorizedGenericView, _SingletonEditMixin, generic.ObjectEditView):
     """Singleton edit view for AdapterConnection (URL + non-secret settings)."""
+
+    policy = generic_policy()
 
     queryset = AdapterConnection.objects.all()
     form = AdapterConnectionForm
     template_name = "netbox_nso_plugin/adapterconnection.html"
-
-    def get_object(self, **kwargs):
-        """Return the existing singleton or a blank instance for first-time creation."""
-        return AdapterConnection.objects.first() or AdapterConnection()
 
     def get_extra_context(self, request, instance):
         """Surface derived-intent templates + the env-sourced bearer token status.
@@ -2312,19 +2325,18 @@ class AdapterConnectionEditView(generic.ObjectEditView):
         }
 
 
-class NSOFailoverSettingsEditView(generic.ObjectEditView):
+class NSOFailoverSettingsEditView(AuthorizedGenericView, _SingletonEditMixin, generic.ObjectEditView):
     """Singleton edit view for NSOFailoverSettings (global mgmt-IP failover tuning)."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOFailoverSettings.objects.all()
     form = NSOFailoverSettingsForm
 
-    def get_object(self, **kwargs):
-        """Return the existing singleton or a blank instance for first-time creation."""
-        return NSOFailoverSettings.objects.first() or NSOFailoverSettings()
-
     def get(self, request, *args, **kwargs):
         """Render the form, warning first if failover is off at the adapter deployment level."""
+        self.get_object(**kwargs)  # 404 before the adapter read when the row is outside the restriction
         self._warn_if_deployment_failover_disabled(request)
         return super().get(request, *args, **kwargs)
 
@@ -2355,23 +2367,23 @@ class NSOFailoverSettingsEditView(generic.ObjectEditView):
             )
 
 
-class NSOVaultSettingsEditView(generic.ObjectEditView):
+class NSOVaultSettingsEditView(AuthorizedGenericView, _SingletonEditMixin, generic.ObjectEditView):
     """Singleton edit view for NSOVaultSettings (Vault KV layout for generated refs)."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOVaultSettings.objects.all()
     form = NSOVaultSettingsForm
 
-    def get_object(self, **kwargs):
-        """Return the existing singleton or a blank instance for first-time creation."""
-        return NSOVaultSettings.objects.first() or NSOVaultSettings()
-
 
 # ── NSO Instance CRUD ────────────────────────────────────────────────────────
 
 
-class NSOInstanceListView(generic.ObjectListView):
+class NSOInstanceListView(AuthorizedGenericView, generic.ObjectListView):
     """List view for NSO instances."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_list.html"
     queryset = NSOInstance.objects.all()
@@ -2383,8 +2395,10 @@ class NSOInstanceListView(generic.ObjectListView):
     actions = (AddObject, BulkExport, BulkDelete)
 
 
-class NSOInstanceBulkDeleteView(generic.BulkDeleteView):
+class NSOInstanceBulkDeleteView(AuthorizedGenericView, generic.BulkDeleteView):
     """Bulk-delete view for NSO instances."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_bulk_delete.html"
     queryset = NSOInstance.objects.all()
@@ -2392,22 +2406,28 @@ class NSOInstanceBulkDeleteView(generic.BulkDeleteView):
     filterset = NSOInstanceFilterSet
 
 
-class NSOInstanceView(generic.ObjectView):
+class NSOInstanceView(AuthorizedGenericView, generic.ObjectView):
     """Detail view for an NSO instance."""
+
+    policy = generic_policy()
 
     queryset = NSOInstance.objects.all()
 
 
-class NSOInstanceEditView(generic.ObjectEditView):
+class NSOInstanceEditView(AuthorizedGenericView, generic.ObjectEditView):
     """Create/edit view for an NSO instance."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOInstance.objects.all()
     form = NSOInstanceForm
 
 
-class NSOInstanceDeleteView(generic.ObjectDeleteView):
+class NSOInstanceDeleteView(AuthorizedGenericView, generic.ObjectDeleteView):
     """Delete view for an NSO instance."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_delete.html"
     queryset = NSOInstance.objects.all()
@@ -2416,8 +2436,10 @@ class NSOInstanceDeleteView(generic.ObjectDeleteView):
 # ── Link-role provisioning ─────────────────────────────────────────────────────
 
 
-class NSOLinkRoleListView(generic.ObjectListView):
+class NSOLinkRoleListView(AuthorizedGenericView, generic.ObjectListView):
     """List view for configurable link roles."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_list.html"
     queryset = NSOLinkRole.objects.all()
@@ -2426,29 +2448,37 @@ class NSOLinkRoleListView(generic.ObjectListView):
     actions = (AddObject, BulkExport, BulkDelete)
 
 
-class NSOLinkRoleView(generic.ObjectView):
+class NSOLinkRoleView(AuthorizedGenericView, generic.ObjectView):
     """Detail view for a link role."""
+
+    policy = generic_policy()
 
     queryset = NSOLinkRole.objects.all()
 
 
-class NSOLinkRoleEditView(generic.ObjectEditView):
+class NSOLinkRoleEditView(AuthorizedGenericView, generic.ObjectEditView):
     """Create/edit view for a link role."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_edit.html"
     queryset = NSOLinkRole.objects.all()
     form = NSOLinkRoleForm
 
 
-class NSOLinkRoleDeleteView(generic.ObjectDeleteView):
+class NSOLinkRoleDeleteView(AuthorizedGenericView, generic.ObjectDeleteView):
     """Delete view for a link role."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOLinkRole.objects.all()
 
 
-class NSOLinkRoleBulkDeleteView(generic.BulkDeleteView):
+class NSOLinkRoleBulkDeleteView(AuthorizedGenericView, generic.BulkDeleteView):
     """Bulk-delete view for link roles."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_bulk_delete.html"
     queryset = NSOLinkRole.objects.all()
@@ -2456,8 +2486,10 @@ class NSOLinkRoleBulkDeleteView(generic.BulkDeleteView):
     filterset = NSOLinkRoleFilterSet
 
 
-class NSOLinkRoleAssignmentListView(generic.ObjectListView):
+class NSOLinkRoleAssignmentListView(AuthorizedGenericView, generic.ObjectListView):
     """List view for link-role assignments."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_list.html"
     queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
@@ -2466,29 +2498,37 @@ class NSOLinkRoleAssignmentListView(generic.ObjectListView):
     actions = (AddObject, BulkExport, BulkDelete)
 
 
-class NSOLinkRoleAssignmentView(generic.ObjectView):
+class NSOLinkRoleAssignmentView(AuthorizedGenericView, generic.ObjectView):
     """Detail view for a link-role assignment."""
+
+    policy = generic_policy()
 
     queryset = NSOLinkRoleAssignment.objects.select_related("role", "cable", "interface")
 
 
-class NSOLinkRoleAssignmentEditView(generic.ObjectEditView):
+class NSOLinkRoleAssignmentEditView(AuthorizedGenericView, generic.ObjectEditView):
     """Create/edit view for a link-role assignment."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_edit.html"
     queryset = NSOLinkRoleAssignment.objects.all()
     form = NSOLinkRoleAssignmentForm
 
 
-class NSOLinkRoleAssignmentDeleteView(generic.ObjectDeleteView):
+class NSOLinkRoleAssignmentDeleteView(AuthorizedGenericView, generic.ObjectDeleteView):
     """Delete view for a link-role assignment."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOLinkRoleAssignment.objects.all()
 
 
-class NSOLinkRoleAssignmentBulkDeleteView(generic.BulkDeleteView):
+class NSOLinkRoleAssignmentBulkDeleteView(AuthorizedGenericView, generic.BulkDeleteView):
     """Bulk-delete view for link-role assignments."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_bulk_delete.html"
     queryset = NSOLinkRoleAssignment.objects.all()
@@ -2496,7 +2536,7 @@ class NSOLinkRoleAssignmentBulkDeleteView(generic.BulkDeleteView):
     filterset = NSOLinkRoleAssignmentFilterSet
 
 
-class NSOOnboardingDashboardView(LoginRequiredMixin, View):
+class NSOOnboardingDashboardView(AuthorizedView):
     """Combined NSO devices view (tabbed): Managed / Onboarded / Onboardable / Unmatched.
 
     Reads the NSO device inventory for the selected instance (default unless
@@ -2505,18 +2545,16 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
     """
 
     template_name = "netbox_nso_plugin/onboarding_dashboard.html"
+    policy = EndpointPolicy(Collection(("netbox_nso_plugin.view_nsoinstance",)), "read")
 
     def get(self, request):
         """Render the tabbed view for the selected (or default) NSO instance."""
         from .onboarding import build_onboarding_dashboard
 
-        instances = list(NSOInstance.objects.all())
-        selected = request.GET.get("instance")
-        instance = None
-        if selected:
-            instance = next((i for i in instances if i.adapter_instance_id == selected), None)
-        if instance is None:
-            instance = NSOInstance.get_default() or (instances[0] if instances else None)
+        instances = list(NSOInstance.objects.restrict(request.user, "view"))
+        instance = permitted_instance(request.user, request.GET.get("instance")) or (
+            instances[0] if instances else None
+        )
 
         if instance is None:
             data = {
@@ -2528,11 +2566,13 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
             }
             managed = []
         else:
-            data = build_onboarding_dashboard(instance)
+            data = build_onboarding_dashboard(instance, request.user)
             # nso_instance: the refresh below classifies every row through it, so without the
             # join the page costs one more query per managed device.
             managed = list(
-                NSODeviceManagement.objects.filter(nso_instance=instance).select_related("device", "nso_instance")
+                NSODeviceManagement.objects.restrict(request.user, "view")
+                .filter(nso_instance=instance, device__in=Device.objects.restrict(request.user, "view"))
+                .select_related("device", "nso_instance")
             )
             # Mirror the adapter's current last-sync state onto the rows before rendering.
             # The periodic job keeps them fresh with nobody watching; this makes the page
@@ -2562,24 +2602,20 @@ class NSOOnboardingDashboardView(LoginRequiredMixin, View):
         )
 
 
-class NSOOnboardView(NSOActionPermissionMixin, View):
+class NSOOnboardView(AuthorizedView):
     """POST action: onboard one candidate device into NSO, then redirect to the dashboard.
 
     URL: POST /plugins/nso/onboard/  body: device=<pk>, instance=<adapter_instance_id>
     """
 
-    required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
+    # Provisioning calls the adapter after it commits the durable attempt: no operator transaction.
+    policy = EndpointPolicy(Onboarding(), "adapter_action")
 
     def post(self, request):
         """Onboard the posted device into the selected (or default) NSO instance."""
         from .onboarding import onboard_candidate
 
-        device = get_object_or_404(Device, pk=request.POST.get("device"))
-        selected = request.POST.get("instance")
-        instance = None
-        if selected:
-            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
-        instance = instance or NSOInstance.get_default()
+        device, instance = self.target.device, self.target.related["instance"]
 
         redirect_url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
         if instance is None:
@@ -2593,6 +2629,8 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
             logger.exception("onboard action failed for device %s", device.pk)
             messages.error(request, f"Onboarding {device} failed ({type(exc).__name__}); see the server log.")
             return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
+        if result.get("permission_denied"):
+            raise PermissionsViolation(result["permission_denied"])
 
         if result["ok"]:
             messages.success(
@@ -2607,7 +2645,7 @@ class NSOOnboardView(NSOActionPermissionMixin, View):
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
 
-class NSOQuickManageView(NSOActionPermissionMixin, View):
+class NSOQuickManageView(AuthorizedView):
     """POST action: bring an already-in-NSO ('external') device under plugin management.
 
     The device exists in both NSO and NetBox but has no NSODeviceManagement record.
@@ -2617,18 +2655,13 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
     nso_name=<NSO device name>
     """
 
-    required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
+    policy = EndpointPolicy(Onboarding(), "native_mutation")
 
     def post(self, request):
         """Create the management record for the posted external device."""
         from .onboarding import manage_existing
 
-        device = get_object_or_404(Device, pk=request.POST.get("device"))
-        selected = request.POST.get("instance")
-        instance = None
-        if selected:
-            instance = NSOInstance.objects.filter(adapter_instance_id=selected).first()
-        instance = instance or NSOInstance.get_default()
+        device, instance = self.target.device, self.target.related["instance"]
 
         redirect_url = reverse("plugins:netbox_nso_plugin:onboarding_dashboard")
         if instance is None:
@@ -2638,6 +2671,8 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
         nso_name = request.POST.get("nso_name") or device.name
         try:
             result = manage_existing(device, instance, nso_name)
+        except PermissionsViolation:
+            raise
         except Exception as exc:  # never 500 the action
             logger.exception("manage action failed for device %s", device.pk)
             messages.error(request, f"Managing {device} failed ({type(exc).__name__}); see the server log.")
@@ -2650,7 +2685,7 @@ class NSOQuickManageView(NSOActionPermissionMixin, View):
         return redirect(f"{redirect_url}?instance={instance.adapter_instance_id}")
 
 
-class NSOOnboardStatusView(NSOActionPermissionMixin, View):
+class NSOOnboardStatusView(AuthorizedView):
     """Run the fenced provision-attempt sweep and report the management status.
 
     The dashboard invokes this view while a row is provisioning. The durable tombstone remains
@@ -2659,18 +2694,19 @@ class NSOOnboardStatusView(NSOActionPermissionMixin, View):
     URL: POST /plugins/nso/onboard-status/<pk>/  (pk = NSODeviceManagement id)
     """
 
-    required_permission = "netbox_nso_plugin.add_nsodevicemanagement"
+    policy = EndpointPolicy(Management("add"), "adapter_action")
 
     def post(self, request, pk):
         """Sweep the provision attempt and return its onboarding status as JSON."""
         from .onboarding import advance_provisioning
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
-        return JsonResponse(advance_provisioning(mgmt))
+        return JsonResponse(advance_provisioning(self.target.management))
 
 
-class NSODerivedIntentTemplateListView(generic.ObjectListView):
+class NSODerivedIntentTemplateListView(AuthorizedGenericView, generic.ObjectListView):
     """List database-managed interface-description templates."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_list.html"
     queryset = NSODerivedIntentTemplate.objects.all()
@@ -2679,8 +2715,10 @@ class NSODerivedIntentTemplateListView(generic.ObjectListView):
     actions = (AddObject, BulkExport, BulkDelete)
 
 
-class NSODerivedIntentTemplateBulkDeleteView(generic.BulkDeleteView):
+class NSODerivedIntentTemplateBulkDeleteView(AuthorizedGenericView, generic.BulkDeleteView):
     """Bulk-delete derived-intent templates."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_bulk_delete.html"
     queryset = NSODerivedIntentTemplate.objects.all()
@@ -2688,29 +2726,37 @@ class NSODerivedIntentTemplateBulkDeleteView(generic.BulkDeleteView):
     filterset = NSODerivedIntentTemplateFilterSet
 
 
-class NSODerivedIntentTemplateView(generic.ObjectView):
+class NSODerivedIntentTemplateView(AuthorizedGenericView, generic.ObjectView):
     """Display a derived-intent template."""
+
+    policy = generic_policy()
 
     queryset = NSODerivedIntentTemplate.objects.all()
 
 
-class NSODerivedIntentTemplateEditView(generic.ObjectEditView):
+class NSODerivedIntentTemplateEditView(AuthorizedGenericView, generic.ObjectEditView):
     """Create or edit a derived-intent template."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSODerivedIntentTemplate.objects.all()
     form = NSODerivedIntentTemplateForm
 
 
-class NSODerivedIntentTemplateDeleteView(generic.ObjectDeleteView):
+class NSODerivedIntentTemplateDeleteView(AuthorizedGenericView, generic.ObjectDeleteView):
     """Delete a derived-intent template."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_delete.html"
     queryset = NSODerivedIntentTemplate.objects.all()
 
 
-class NSOPlatformNedMappingListView(generic.ObjectListView):
+class NSOPlatformNedMappingListView(AuthorizedGenericView, generic.ObjectListView):
     """List view for Platform→NED mappings."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_list.html"
     queryset = NSOPlatformNedMapping.objects.all()
@@ -2719,8 +2765,10 @@ class NSOPlatformNedMappingListView(generic.ObjectListView):
     actions = (AddObject, BulkExport, BulkDelete)
 
 
-class NSOPlatformNedMappingBulkDeleteView(generic.BulkDeleteView):
+class NSOPlatformNedMappingBulkDeleteView(AuthorizedGenericView, generic.BulkDeleteView):
     """Bulk-delete view for Platform→NED mappings."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_bulk_delete.html"
     queryset = NSOPlatformNedMapping.objects.all()
@@ -2728,22 +2776,28 @@ class NSOPlatformNedMappingBulkDeleteView(generic.BulkDeleteView):
     filterset = NSOPlatformNedMappingFilterSet
 
 
-class NSOPlatformNedMappingView(generic.ObjectView):
+class NSOPlatformNedMappingView(AuthorizedGenericView, generic.ObjectView):
     """Detail view for a Platform→NED mapping."""
+
+    policy = generic_policy()
 
     queryset = NSOPlatformNedMapping.objects.all()
 
 
-class NSOPlatformNedMappingEditView(generic.ObjectEditView):
+class NSOPlatformNedMappingEditView(AuthorizedGenericView, generic.ObjectEditView):
     """Create/edit view for a Platform→NED mapping."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_edit.html"
     queryset = NSOPlatformNedMapping.objects.all()
     form = NSOPlatformNedMappingForm
 
 
-class NSOPlatformNedMappingDeleteView(generic.ObjectDeleteView):
+class NSOPlatformNedMappingDeleteView(AuthorizedGenericView, generic.ObjectDeleteView):
     """Delete view for a Platform→NED mapping."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/settings_object_delete.html"
     queryset = NSOPlatformNedMapping.objects.all()
@@ -2762,7 +2816,7 @@ class NSODevicesReturnMixin:
         return super().get_return_url(request)
 
 
-class NSODeviceManagementListView(generic.ObjectListView):
+class NSODeviceManagementListView(AuthorizedGenericView, generic.ObjectListView):
     """List view for managed NSO devices.
 
     Refreshes the cached ``last_sync_*`` columns on each render via one bulk adapter
@@ -2770,6 +2824,8 @@ class NSODeviceManagementListView(generic.ObjectListView):
     open each device's NSO tab. Compliance and per-protocol reconcile are NOT run here
     (those stay on the tab) — only the lightweight last-sync fields are polled.
     """
+
+    policy = generic_policy()
 
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
     table = NSODeviceManagementTable
@@ -2785,8 +2841,10 @@ class NSODeviceManagementListView(generic.ObjectListView):
         return qs
 
 
-class NSODeviceManagementBulkDeleteView(NSODevicesReturnMixin, generic.BulkDeleteView):
+class NSODeviceManagementBulkDeleteView(AuthorizedGenericView, NSODevicesReturnMixin, generic.BulkDeleteView):
     """Bulk-delete view for managed NSO devices."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/nsodevicemanagement_bulk_delete.html"
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
@@ -2794,8 +2852,10 @@ class NSODeviceManagementBulkDeleteView(NSODevicesReturnMixin, generic.BulkDelet
     filterset = NSODeviceManagementFilterSet
 
 
-class NSODeviceManagementView(generic.ObjectView):
+class NSODeviceManagementView(AuthorizedGenericView, generic.ObjectView):
     """Detail view for an NSO device management record."""
+
+    policy = generic_policy()
 
     queryset = NSODeviceManagement.objects.select_related("device", "nso_instance")
 
@@ -2840,8 +2900,10 @@ class NSODeviceManagementView(generic.ObjectView):
         }
 
 
-class NSODeviceManagementEditView(NSODevicesReturnMixin, generic.ObjectEditView):
+class NSODeviceManagementEditView(AuthorizedGenericView, NSODevicesReturnMixin, generic.ObjectEditView):
     """Create/edit view for an NSO device management record."""
+
+    policy = generic_policy()
 
     queryset = NSODeviceManagement.objects.all()
     form = NSODeviceManagementForm
@@ -2858,8 +2920,10 @@ class NSODeviceManagementEditView(NSODevicesReturnMixin, generic.ObjectEditView)
         return context
 
 
-class NSODeviceManagementDeleteView(NSODevicesReturnMixin, generic.ObjectDeleteView):
+class NSODeviceManagementDeleteView(AuthorizedGenericView, NSODevicesReturnMixin, generic.ObjectDeleteView):
     """Delete view for an NSO device management record."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/nsodevicemanagement_delete.html"
     queryset = NSODeviceManagement.objects.all()
@@ -3272,8 +3336,10 @@ def _validated_unexecutable_reasons(detail) -> dict:
     return streams
 
 
-class NSODeviceActionView(NSOActionPermissionMixin, View):
+class NSODeviceActionView(AuthorizedView):
     """Trigger an adapter action (sync / detect-drift / connect) via POST."""
+
+    policy = EndpointPolicy(Management("change"), "adapter_action")
 
     def _incumbent_job(self, request, mgmt, exc, *, action, is_ajax):
         """Report the job that caused the admission conflict with truthful queue wording."""
@@ -3428,7 +3494,7 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         """Fire the requested action against the nso-adapter and redirect back."""
         from . import adapter_client as client
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        mgmt = self.target.management
         label = _ACTION_LABELS.get(action, action)
         is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
@@ -3504,18 +3570,20 @@ class NSODeviceActionView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class NSOIntentResyncView(NSOActionPermissionMixin, View):
+class NSOIntentResyncView(AuthorizedView):
     """POST: re-sync orphaned adapter intent to NetBox ownership (clears split-brain).
 
     Re-pushes the device's current owned intent for every orphaned scope; the adapter's
     full-replace then drops the rows NetBox no longer owns. Never writes to the device.
     """
 
+    policy = EndpointPolicy(Management("change"), "adapter_action")
+
     def post(self, request, pk):
         """Re-sync orphaned adapter intent for the device, then redirect to the NSO tab."""
         from .intent_drift import resync_intent
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        mgmt = self.target.management
         if mgmt.adapter_device_id is None:
             messages.warning(request, "Device is not yet onboarded to the adapter.")
             return redirect(_device_nso_tab_url(mgmt.device.pk))
@@ -3539,7 +3607,7 @@ class NSOIntentResyncView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class NSOAdapterLinkRetryView(NSOActionPermissionMixin, View):
+class NSOAdapterLinkRetryView(AuthorizedView):
     """POST: retry linking a managed device to the adapter after a failed onboard/scope/sync.
 
     Re-fires ``sync_scope_to_adapter`` by re-saving the management row (the same recovery the
@@ -3548,11 +3616,13 @@ class NSOAdapterLinkRetryView(NSOActionPermissionMixin, View):
     ``adapter_device_id`` set; on a repeated failure the error is refreshed for the tab banner.
     """
 
+    policy = EndpointPolicy(Management("change"), "adapter_action")
+
     def post(self, request, pk):
         """Re-attempt the adapter link for the device, then redirect to the NSO tab."""
         from .management_lifecycle import save_management
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        mgmt = self.target.management
         save_management(mgmt)
         mgmt.refresh_from_db()
         if mgmt.adapter_link_error:
@@ -3562,7 +3632,7 @@ class NSOAdapterLinkRetryView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class NSOForceRemovalView(NSOActionPermissionMixin, View):
+class NSOForceRemovalView(AuthorizedView):
     """POST: re-run a blocked removal with the adapter's collateral guard disabled.
 
     The operator override for a ``removal_blocked_collateral`` failure: the tab banner
@@ -3571,11 +3641,13 @@ class NSOForceRemovalView(NSOActionPermissionMixin, View):
     with ``force=true``). Destructive by design — the button carries a confirm dialog.
     """
 
+    policy = EndpointPolicy(Management("change"), "adapter_action")
+
     def post(self, request, pk):
         """Queue the forced removal for the POSTed scope and report the job id."""
         from . import adapter_client as client
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        mgmt = self.target.management
         is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
         scope = (request.POST.get("scope") or "").strip()
 
@@ -3608,7 +3680,7 @@ class NSOForceRemovalView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class _NSOGenerationActionView(NSOActionPermissionMixin, View):
+class _NSOGenerationActionView(AuthorizedView, abstract=True):
     """Apply one generation-scoped barrier action to the blocked head."""
 
     action = ""
@@ -3618,13 +3690,7 @@ class _NSOGenerationActionView(NSOActionPermissionMixin, View):
         """CAS the operator action against the generation shown in the tab."""
         from . import adapter_client as client
 
-        device = get_object_or_404(Device, pk=pk)
-        mgmt = getattr(device, "nso_management", None)
-        if (
-            mgmt is not None
-            and not NSODeviceManagement.objects.restrict(request.user, "change").filter(pk=mgmt.pk).exists()
-        ):
-            raise PermissionDenied
+        device, mgmt = self.target.device, self.target.management
         if mgmt is None or mgmt.adapter_device_id is None:
             messages.warning(request, "Device is not yet onboarded.")
             return redirect(_device_nso_tab_url(device.pk))
@@ -3656,8 +3722,13 @@ class _NSOGenerationActionView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device.pk))
 
 
+_GENERATION_POLICY = EndpointPolicy(Management("change", by="device", optional=True), "adapter_action")
+
+
 class NSOGenerationRetryView(_NSOGenerationActionView):
     """Retry the exact blocked generation shown to the operator."""
+
+    policy = _GENERATION_POLICY
 
     action = "retry"
     client_method = "retry_generation"
@@ -3666,23 +3737,10 @@ class NSOGenerationRetryView(_NSOGenerationActionView):
 class NSOGenerationAbandonView(_NSOGenerationActionView):
     """Abandon the exact blocked generation shown to the operator."""
 
+    policy = _GENERATION_POLICY
+
     action = "abandonment"
     client_method = "abandon_generation"
-
-
-class NSOJobStatusView(LoginRequiredMixin, View):
-    """Return JSON status of an adapter job — used for client-side polling."""
-
-    def get(self, request, job_id):
-        """Proxy a GET /api/v1/jobs/{job_id} call to the adapter and return the result."""
-        from . import adapter_client as client
-
-        try:
-            from .refusal_display import job_projection
-
-            return JsonResponse(_job_with_outcome_counts(job_projection(client.get_job(job_id))))
-        except AdapterError as exc:
-            return JsonResponse({"error": public_error_message(exc)}, status=502)
 
 
 def _job_with_outcome_counts(job):
@@ -3941,7 +3999,7 @@ def _annotate_residue_rows(ctx: dict, key: str, mgmt) -> None:
                 continue
 
 
-class NSODeviceJobsView(LoginRequiredMixin, View):
+class NSODeviceJobsView(AuthorizedView):
     """JSON summary of a device's adapter jobs for the tab's status strip.
 
     Returns the currently-active job (queued/running) if any, the most recent
@@ -3953,11 +4011,11 @@ class NSODeviceJobsView(LoginRequiredMixin, View):
 
     _ACTIVE = ("queued", "running")
     _TERMINAL = ("succeeded", "failed")
+    policy = EndpointPolicy(DeviceRead(), "read")
 
     def get(self, request, pk):
         """Return the device's adapter jobs and the requested Apply generation chain."""
-        device = get_object_or_404(Device, pk=pk)
-        mgmt = getattr(device, "nso_management", None)
+        mgmt = self.target.management
         if mgmt is None or mgmt.adapter_device_id is None:
             return JsonResponse(
                 {
@@ -4055,8 +4113,10 @@ def _refresh_state_snapshot(mgmt):
     return authoritative
 
 
-class NSORefreshStateView(NSOActionPermissionMixin, View):
+class NSORefreshStateView(AuthorizedView):
     """Fetch live compliance + interface data from the adapter and cache it."""
+
+    policy = EndpointPolicy(Management("change"), "adapter_action")
 
     def post(self, request, pk):
         """Retry one stale refresh before asking the operator to try again."""
@@ -4064,7 +4124,7 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
         from .renderer_writer import IntentPlanStaleError
 
         for attempt in range(2):
-            mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+            mgmt = self.target.reload()
             if mgmt.adapter_device_id is None:
                 messages.warning(request, "Device is not yet onboarded to the adapter.")
                 break
@@ -4085,7 +4145,7 @@ class NSORefreshStateView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device.pk))
 
 
-class NSODeviceReconcileView(NSOActionPermissionMixin, View):
+class NSODeviceReconcileView(AuthorizedView):
     """POST: queue a background refresh of the plugin's NSO*State display cache.
 
     Lighter than 'Sync Now' — it does NOT run an NSO/device sync; it just re-pulls
@@ -4093,11 +4153,13 @@ class NSODeviceReconcileView(NSOActionPermissionMixin, View):
     same reconcile the adapter's sync-complete callback runs automatically.
     """
 
+    policy = EndpointPolicy(Management("change"), "adapter_action")
+
     def post(self, request, pk):
         """Enqueue the reconcile and redirect back to the device NSO tab."""
         from .reconcile import enqueue_device_reconcile
 
-        mgmt = get_object_or_404(NSODeviceManagement, pk=pk)
+        mgmt = self.target.management
         if mgmt.adapter_device_id is None:
             messages.warning(request, "Device is not yet onboarded to the adapter.")
         else:
@@ -4109,8 +4171,10 @@ class NSODeviceReconcileView(NSOActionPermissionMixin, View):
 # ── NSO Interface State CRUD ─────────────────────────────────────────────────
 
 
-class NSOInterfaceStateListView(generic.ObjectListView):
+class NSOInterfaceStateListView(AuthorizedGenericView, generic.ObjectListView):
     """Show interface owners whose projected state needs attention across devices."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_list.html"
     queryset = NSOInterfaceState.objects.select_related("interface", "interface__device")
@@ -4129,8 +4193,10 @@ class NSOInterfaceStateListView(generic.ObjectListView):
         return queryset.filter(pk__in=pks)
 
 
-class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
+class NSOInterfaceStateBulkDeleteView(AuthorizedGenericView, generic.BulkDeleteView):
     """Bulk-delete view for NSOInterfaceState rows (cleanup)."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_bulk_delete.html"
     queryset = NSOInterfaceState.objects.all()
@@ -4166,7 +4232,8 @@ class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
                 },
             )
         if request.POST.get("_all"):
-            queryset = model.objects.all()
+            # self.queryset is the delete-restricted queryset NetBox's permission check built.
+            queryset = self.queryset
             if self.filterset is not None:
                 queryset = self.filterset(request.GET, queryset, request=request).qs
         else:
@@ -4215,14 +4282,18 @@ class NSOInterfaceStateBulkDeleteView(generic.BulkDeleteView):
         return redirect(self.get_return_url(request))
 
 
-class NSOInterfaceStateView(generic.ObjectView):
+class NSOInterfaceStateView(AuthorizedGenericView, generic.ObjectView):
     """Detail view for an NSOInterfaceState record."""
+
+    policy = generic_policy()
 
     queryset = NSOInterfaceState.objects.select_related("interface")
 
 
-class NSOInterfaceStateDeleteView(generic.ObjectDeleteView):
+class NSOInterfaceStateDeleteView(AuthorizedGenericView, generic.ObjectDeleteView):
     """Delete view for an NSOInterfaceState record."""
+
+    policy = generic_policy()
 
     template_name = "netbox_nso_plugin/links_object_delete.html"
     queryset = NSOInterfaceState.objects.all()
@@ -4299,8 +4370,10 @@ def _status_after_accept(source_status: str) -> str:
     return "in_sync" if source_status in _MATCHING_SOURCE_STATUSES else "accepted"
 
 
-class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
+class NSOAcceptAttributeView(AuthorizedView):
     """Accept a single interface attribute as NetBox intent."""
+
+    policy = EndpointPolicy(OverlayRow(NSOInterfaceState, "change"), "native_mutation")
 
     def post(self, request, pk):
         """Accept the interface state.
@@ -4310,7 +4383,7 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         """
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        state = self.target.primary
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(state.status)
         candidate.accepted_at = timezone.now()
@@ -4331,7 +4404,7 @@ class NSOAcceptAttributeView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(candidate.interface.device_id))
 
 
-class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
+class NSOAcceptDeviceView(AuthorizedView):
     """Accept the DEVICE's value into NetBox for a drifted interface attribute.
 
     The opposite of 'Keep NetBox': when the device changed out-of-band, this pulls the
@@ -4340,12 +4413,14 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
     intent (the device already has the value — nothing to apply).
     """
 
+    policy = EndpointPolicy(OverlayRow(NSOInterfaceState, "change"), "native_mutation")
+
     def post(self, request, pk):
         """Copy the device value onto the interface and mark the state in_sync."""
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
         from .signals import suppress_intent_push
 
-        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        state = self.target.primary
         iface = state.interface
         dev_val = state.nso_value
         iface_candidate = copy.copy(iface)
@@ -4377,7 +4452,7 @@ class NSOAcceptDeviceView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(iface.device_id))
 
 
-class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
+class NSOInterfaceEditFieldView(AuthorizedView):
     """Inline-edit a managed interface attribute (description / enabled) from the NSO tab.
 
     One exact writer changes the native value and acquires the matching overlay.
@@ -4386,10 +4461,11 @@ class NSOInterfaceEditFieldView(NSOActionPermissionMixin, View):
 
     _EDITABLE = ("description", "enabled")
     _TRUE = ("true", "1", "on", "yes")
+    policy = EndpointPolicy(OverlayRow(NSOInterfaceState, "change"), "native_mutation")
 
     def post(self, request, pk):
         """Apply and acquire the new value through one frozen mutation plan."""
-        state = get_object_or_404(NSOInterfaceState, pk=pk)
+        state = self.target.primary
         attribute = state.attribute
         if attribute not in self._EDITABLE:
             return JsonResponse({"status": "error", "message": f"{attribute} is not editable here."}, status=400)
@@ -4521,7 +4597,11 @@ def _ospf_instance_errors(obj):
         native._meta.get_field("router_id").clean(obj.router_id, native)
     except ValidationError as exc:
         errors["router_id"] = [str(message) for message in exc.messages]
-    if obj.vrf and not native._meta.get_field("vrf").remote_field.model.objects.filter(name=obj.vrf).exists():
+    if (
+        obj.vrf
+        and (native.vrf is None or native.vrf.name != obj.vrf)
+        and operator_lookup(native._meta.get_field("vrf").remote_field.model, name=obj.vrf) is None
+    ):
         errors.setdefault("router_id", []).append(f"The overlay VRF {obj.vrf!r} does not exist in NetBox.")
     return errors
 
@@ -4532,9 +4612,13 @@ def _ospf_interface_errors(obj):
     from netbox_routing.models import OSPFArea, OSPFInstance, OSPFInterface
 
     errors = {}
-    if not OSPFInterface.objects.filter(interface=obj.interface).exists():
+    native = OSPFInterface.objects.filter(interface=obj.interface).first()
+    if native is None:
         return {"area_id": ["Only a linked NetBox OSPF interface can be edited inline."]}
-    if not OSPFInstance.objects.filter(device=obj.interface.device, process_id=obj.process_id).exists():
+    if (
+        native.instance.process_id != obj.process_id
+        and operator_lookup(OSPFInstance, device=obj.interface.device, process_id=obj.process_id) is None
+    ):
         errors["area_id"] = [f"OSPF process {obj.process_id!r} does not exist on this device in NetBox."]
     if not obj.area_id:
         errors.setdefault("area_id", []).append("Area is required.")
@@ -4585,7 +4669,10 @@ def _isis_interface_errors(obj):
     if native.address_family != obj.af:
         return {"circuit_type": ["The linked NetBox IS-IS interface uses a different address family."]}
     errors = {}
-    if not ISISInstance.objects.filter(device=obj.interface.device, process_tag=obj.process_tag).exists():
+    if (
+        native.instance.process_tag != obj.process_tag
+        and operator_lookup(ISISInstance, device=obj.interface.device, process_tag=obj.process_tag) is None
+    ):
         errors["circuit_type"] = [f"IS-IS process {obj.process_tag!r} does not exist on this device in NetBox."]
     for name in (
         "circuit_type",
@@ -4612,7 +4699,7 @@ def _bgp_peer_errors(obj):
     return {}
 
 
-def _clean_bgp_remote_as(raw):
+def _clean_bgp_remote_as(raw, current=None):
     """Resolve an ASN number to an existing or planned native ASN."""
     from django.core.exceptions import ValidationError
     from ipam.models import ASN
@@ -4626,7 +4713,9 @@ def _clean_bgp_remote_as(raw):
     except (TypeError, ValueError) as exc:
         raise ValidationError("Enter a valid ASN.") from exc
     number = ASN._meta.get_field("asn").clean(number, None)
-    return ASN.objects.filter(asn=number).first() or ASN(asn=number)
+    if current is not None and current.asn == number:
+        return current
+    return operator_lookup(ASN, asn=number, create_if_missing=True) or ASN(asn=number)
 
 
 def _clean_overlay_field(key, field, raw, edit_obj):
@@ -4644,12 +4733,12 @@ def _clean_overlay_field(key, field, raw, edit_obj):
     ):
         raw = raw.strip()
     if key == "bgp_peer" and field.name == "remote_as":
-        return _clean_bgp_remote_as(raw)
+        return _clean_bgp_remote_as(raw, current=edit_obj.remote_as)
     value = raw if raw != "" else (None if field.null else "")
     return field.clean(value, edit_obj)
 
 
-def _redistribution_errors(obj):
+def _redistribution_errors(obj, user):
     """Validate policy knobs against the linked native redistribution scope."""
     from django.core.exceptions import ValidationError
     from netbox_routing.models import RouteMap
@@ -4661,7 +4750,11 @@ def _redistribution_errors(obj):
     errors = {}
     route_map = None
     if obj.route_map:
-        route_map = RouteMap.objects.filter(name=obj.route_map).first()
+        route_map = (
+            native.route_map
+            if native.route_map is not None and native.route_map.name == obj.route_map
+            else RouteMap.objects.restrict(user, "view").filter(name=obj.route_map).first()
+        )
         if route_map is None:
             errors["route_map"] = [f"Route map {obj.route_map!r} does not exist in NetBox."]
 
@@ -4787,38 +4880,43 @@ def _overlay_identity_plan(key, candidate):
             fresh.status = NSOSVIState.objects.filter(pk=candidate.pk).values_list("status", flat=True).first()
         if key == "subinterface" and candidate.parent_interface_id is not None:
             fresh.parent_interface = Interface.objects.filter(pk=candidate.parent_interface_id).first()
-        errors = _overlay_family_errors(key, fresh, {})
+        errors = (_svi_errors if key == "svi" else _subinterface_errors)(fresh)
         if errors:
             raise _IntentTransactionNoOp(errors)
 
     return dependencies, validate_after_acquire
 
 
-def _save_owned_bfd_edit(obj, old_values):
-    """Claim one BFD edit and apply its exact native and overlay write set."""
+def _bfd_native_writes(obj, *, create_only):
+    """Plan the native BFD rows that carry one owned overlay's values (operator Accept or Edit)."""
     import copy
 
     from netbox_routing.models import BFDInterface, BFDProfile
 
-    from . import status_machine as sm
     from .bfd_reconciler import _profile_values
-    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+    from .renderer_writer import planned_save
 
-    planned_at = timezone.now()
     saves = []
     operations = []
-
+    current_native = BFDInterface.objects.filter(interface=obj.interface).first()
+    if create_only and current_native is not None:
+        return saves, operations
     profile_values = _profile_values({"min_tx": obj.min_tx, "min_rx": obj.min_rx, "multiplier": obj.multiplier})
     profile = None
     if profile_values is not None:
         name, tx, rx, multiplier = profile_values
-        profile = BFDProfile.objects.filter(name=name).first()
+        profile = (
+            current_native.bfd_profile
+            if current_native is not None
+            and current_native.bfd_profile is not None
+            and current_native.bfd_profile.name == name
+            else operator_lookup(BFDProfile, name=name, create_if_missing=True)
+        )
         if profile is None:
             profile = BFDProfile(name=name, min_tx_int=tx, min_rx_int=rx, multiplier=multiplier)
             saves.append(planned_save(profile, force_insert=True, natural_key=("name",)))
             operations.append((profile, None, True))
 
-    current_native = BFDInterface.objects.filter(interface=obj.interface).first()
     native = (
         BFDInterface(interface=obj.interface, bfd_profile=profile, micro_bfd=obj.micro_bfd, enabled=True)
         if current_native is None
@@ -4846,6 +4944,18 @@ def _save_owned_bfd_edit(obj, old_values):
             )
         )
         operations.append((native, native_fields, native_created))
+    return saves, operations
+
+
+def _save_owned_bfd_edit(obj, old_values):
+    """Claim one BFD edit and apply its exact native and overlay write set."""
+    import copy
+
+    from . import status_machine as sm
+    from .renderer_writer import RendererMutationPlan, planned_save, renderer_writes
+
+    planned_at = timezone.now()
+    saves, operations = _bfd_native_writes(obj, create_only=False)
 
     state = copy.copy(obj)
     if not sm.is_owned(state.status):
@@ -4866,6 +4976,13 @@ def _save_owned_bfd_edit(obj, old_values):
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
 
 
+def _static_route_affected_management_ids(route):
+    """Include native assignments and overlay rows when authorizing a shared route edit."""
+    managements = set(NSOStaticRouteState.objects.filter(static_route=route).values_list("management_id", flat=True))
+    managements.update(NSODeviceManagement.objects.filter(device__in=route.devices.all()).values_list("pk", flat=True))
+    return managements
+
+
 def _save_owned_static_route_edit(obj, old_values):
     """Apply one shared static-route edit and re-arm its owned overlays exactly."""
     from . import status_machine as sm
@@ -4879,6 +4996,7 @@ def _save_owned_static_route_edit(obj, old_values):
     from .signals import _STATIC_ROUTE_TRANSITION_FIELDS, _arm_static_route_generation
 
     route = obj.static_route
+    operation = shared_operation(lambda: _static_route_affected_management_ids(route))
     native_fields = tuple(name for name, value in old_values.items() if getattr(route, name) != value)
     saves = [planned_save(route, update_fields=native_fields)]
     operations = [(route, native_fields)]
@@ -4905,14 +5023,14 @@ def _save_owned_static_route_edit(obj, old_values):
         saves=saves, m2m_writes=assignments, planned_at=planned_at, grant=OwnershipGrant("operator_edit")
     )
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
+    with mutation as writer, operation:
         for instance, update_fields in operations:
             writer.save(instance, update_fields=update_fields)
         if assignments:
             writer.m2m_add(route, "devices", (device,))
 
 
-def _save_owned_redistribution_edit(obj, old_values):
+def _save_owned_redistribution_edit(obj, old_values, *, user):
     """Apply one destination-specific redistribution edit through an exact plan."""
     from netbox_routing.models import RouteMap
 
@@ -4921,7 +5039,9 @@ def _save_owned_redistribution_edit(obj, old_values):
 
     planned_at = timezone.now()
     native = copy.copy(obj.redistribution)
-    native.route_map = RouteMap.objects.filter(name=obj.route_map).first() if obj.route_map else None
+    route_maps = RouteMap.objects.restrict(user, "view")
+    if native.route_map is None or native.route_map.name != obj.route_map:
+        native.route_map = route_maps.filter(name=obj.route_map).first() if obj.route_map else None
     native.metric = obj.metric
     native.metric_type = obj.metric_type
     native_fields = ("route_map", "metric", "metric_type")
@@ -4966,19 +5086,27 @@ def _save_owned_ospf_edit(obj, key, old_values):
         native = copy.copy(obj.ospf_instance)
         vrf_model = native._meta.get_field("vrf").remote_field.model
         native.router_id = obj.router_id
-        native.vrf = vrf_model.objects.filter(name=obj.vrf).first() if obj.vrf else None
+        if not native.vrf or native.vrf.name != obj.vrf:
+            native.vrf = operator_lookup(vrf_model, name=obj.vrf) if obj.vrf else None
         native_fields = ("router_id", "vrf")
         saves.append(planned_save(native, update_fields=native_fields))
         operations.append((native, native_fields, False))
     else:
         current_native = OSPFInterface.objects.get(interface=obj.interface)
         native = copy.copy(current_native)
-        area = OSPFArea.objects.filter(area_id__in=_area_candidates(obj.area_id)).first()
+        area = (
+            current_native.area
+            if current_native.area is not None and current_native.area.area_id in _area_candidates(obj.area_id)
+            else operator_lookup(OSPFArea, area_id__in=_area_candidates(obj.area_id), create_if_missing=True)
+        )
         if area is None:
             area = OSPFArea(area_id=obj.area_id, area_type="standard")
             saves.append(planned_save(area, force_insert=True, natural_key=("area_id",)))
             operations.append((area, None, True))
-        native.instance = OSPFInstance.objects.get(device=obj.interface.device, process_id=obj.process_id)
+        if native.instance.process_id != obj.process_id:
+            native.instance = operator_lookup(OSPFInstance, device=obj.interface.device, process_id=obj.process_id)
+            if native.instance is None:
+                raise Http404
         native.area = area
         native.passive = obj.passive
         native.priority = obj.priority
@@ -5048,10 +5176,12 @@ def _save_owned_isis_edit(obj, key, old_values):
         from netbox_routing.models import ISISInstance
 
         native = copy.copy(candidate.isis_interface)
-        native.instance = ISISInstance.objects.get(
-            device=candidate.interface.device,
-            process_tag=candidate.process_tag,
-        )
+        if native.instance.process_tag != candidate.process_tag:
+            native.instance = operator_lookup(
+                ISISInstance, device=candidate.interface.device, process_tag=candidate.process_tag
+            )
+            if native.instance is None:
+                raise Http404
         native_fields = (
             "instance",
             "circuit_type",
@@ -5132,7 +5262,7 @@ def _save_owned_bgp_router_edit(state, old_values, user):
             raise PermissionDenied
 
 
-def _save_owned_bgp_edit(obj, old_values, user):
+def _save_owned_bgp_edit(obj, old_values):
     """Claim one BGP peer edit and update its native root through an exact plan."""
     from ipam.models import RIR
 
@@ -5145,7 +5275,7 @@ def _save_owned_bgp_edit(obj, old_values, user):
     native = copy.copy(obj.bgp_peer)
     remote_as = native.remote_as
     if remote_as is not None and remote_as.pk is None:
-        rir = RIR.objects.filter(name=_AUTO_DISCOVERED_RIR).first()
+        rir = operator_lookup(RIR, name=_AUTO_DISCOVERED_RIR, create_if_missing=True)
         if rir is None:
             rir = RIR(name=_AUTO_DISCOVERED_RIR, slug="nso-auto-discovered", is_private=True)
             saves.append(planned_save(rir, force_insert=True, natural_key=("name",)))
@@ -5172,7 +5302,6 @@ def _save_owned_bgp_edit(obj, old_values, user):
     with renderer_writes(plan) as writer:
         for instance, update_fields, force_insert in operations:
             writer.save(instance, update_fields=update_fields, force_insert=force_insert)
-        _require_bgp_peer_edit_constraints(user, native, [instance for instance, _, created in operations if created])
 
 
 def _owned_overlay_edit_footprint(obj, key):
@@ -5358,7 +5487,7 @@ def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
         _save_owned_static_route_edit(obj, old_values)
         return None
     if key == "redistribution":
-        _save_owned_redistribution_edit(obj, old_values)
+        _save_owned_redistribution_edit(obj, old_values, user=user)
         return None
     if key in {"ospf_instance", "ospf_interface"}:
         _save_owned_ospf_edit(obj, key, old_values)
@@ -5370,7 +5499,7 @@ def _save_owned_overlay_edit(obj, key, old_values, *, user=None):
         _save_owned_bgp_router_edit(obj, old_values, user)
         return None
     if key == "bgp_peer":
-        _save_owned_bgp_edit(obj, old_values, user)
+        _save_owned_bgp_edit(obj, old_values)
         return None
     if key == "interface_mtu":
         _save_owned_interface_mtu_edit(obj, old_values)
@@ -5455,6 +5584,23 @@ def _route_map_rename_dependents(route_map, old_name):
         .values_list("route_map__name", flat=True)
     }
     return bgp_states, redistribution_states, dependent_groups
+
+
+def _route_map_affected_management_ids(state, old_name):
+    """Enumerate attachments and every dependent overlay group without visibility filtering."""
+    route_map = state.assigned_object
+    bgp, redistribution, groups = _route_map_rename_dependents(route_map, old_name)
+    managements = set(
+        NSORoutePolicyState.objects.filter(
+            content_type_id=state.content_type_id, object_id=state.object_id
+        ).values_list("management_id", flat=True)
+    )
+    managements.update(row.management_id for row in (*bgp, *redistribution))
+    for family, name in groups:
+        managements.update(
+            NSORoutePolicyState.objects.filter(family=family, object_name=name).values_list("management_id", flat=True)
+        )
+    return managements
 
 
 def _route_map_name_collision_errors(route_map_model, route_map_pk, new_name, class_ids):
@@ -5589,11 +5735,12 @@ def _save_route_map_name_edit(state, old_name):
     from .renderer_writer import renderer_mirror_writes, renderer_writes
     from .signals import suppress_intent_push
 
+    operation = shared_operation(lambda: _route_map_affected_management_ids(state, old_name))
     plan, operations, targets = _route_map_name_edit_operations(state, old_name, timezone.now())
     route_policy_targets, bgp_targets, redistribution_targets = targets
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
     try:
-        with mutation as writer:
+        with mutation as writer, operation:
             try:
                 with transaction.atomic(), suppress_intent_push():
                     for candidate, update_fields in operations:
@@ -5731,13 +5878,14 @@ def _save_vlan_name_edit(obj):
 
     from . import status_machine as sm
     from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
-    from .vlan_reconciler import vlan_name_matches
+    from .vlan_reconciler import vlan_affected_management_ids, vlan_name_matches
 
     vlan_model = type(obj.vlan)
     desired_name = obj.vlan.name
     stored_vlan, states = _vlan_name_edit_rows(vlan_model, obj.vlan_id)
     if stored_vlan is None:
         return {"name": ["This VLAN no longer exists. Refresh the page before editing it."]}
+    operation = shared_operation(lambda: vlan_affected_management_ids(stored_vlan, references=False))
     vlan = copy.copy(stored_vlan)
     vlan.name = desired_name
     now = timezone.now()
@@ -5761,7 +5909,7 @@ def _save_vlan_name_edit(obj):
     try:
         plan = RendererMutationPlan.build(grant=OwnershipGrant("operator_edit"), saves=saves, planned_at=now)
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-        with mutation as writer:
+        with mutation as writer, operation:
             writer.save(vlan, update_fields=("name",))
             for candidate, fields in candidates:
                 writer.save(candidate, update_fields=fields)
@@ -5798,7 +5946,7 @@ def _logging_levels_errors(obj, old_values):
     return {f: [msg] for f in cleared}
 
 
-def _overlay_family_errors(key, obj, old_values):
+def _overlay_family_errors(key, obj, old_values, *, user):
     """Run validation that spans fields or the linked native object."""
     simple_validator = {
         "logging_host": _logging_host_errors,
@@ -5826,7 +5974,7 @@ def _overlay_family_errors(key, obj, old_values):
     if key == "bgp_peer":
         return _bgp_peer_errors(obj)
     if key == "redistribution":
-        return _redistribution_errors(obj)
+        return _redistribution_errors(obj, user)
     if key == "static_route":
         return _static_route_errors(obj)
     if key in ("lacp_bundle", "lacp_member"):
@@ -5851,7 +5999,7 @@ def _save_overlay_edit(obj, key, old_values, *, user):
     return None
 
 
-class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
+class NSOOverlayFieldEditView(AuthorizedView):
     """Inline (popover) field edit on an overlay row from the NSO tab.
 
     One endpoint for every family the tab edits in place; each family names an
@@ -5904,19 +6052,23 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         "subinterface": ("NSOSubinterfaceState", ("dot1q_vlan", "vrf")),
         "route_map_name": ("NSORoutePolicyState", ("object_name",)),
     }
+    policy = EndpointPolicy(
+        OverlayFamily(
+            {key: apps.get_model("netbox_nso_plugin", model) for key, (model, _fields) in _FAMILIES.items()},
+            "change",
+            rules={"vlan_name": shared_vlan_rename},
+        ),
+        "native_mutation",
+    )
 
     def post(self, request, key, pk):
         """Validate and apply whitelisted field values; JSON in, JSON out."""
-        from django.apps import apps
         from django.core.exceptions import ValidationError
 
         from .intent_state import RendererTargetsChanged
         from .renderer_writer import IntentPlanStaleError
 
-        spec = self._FAMILIES.get(key)
-        if spec is None:
-            return JsonResponse({"status": "error", "message": f"unknown overlay family: {key}"}, status=400)
-        model_name, editable = spec
+        _model_name, editable = self._FAMILIES[key]
 
         rejected = sorted(f for f in request.POST if f not in editable and f != "csrfmiddlewaretoken")
         if rejected:
@@ -5927,9 +6079,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         if not supplied:
             return JsonResponse({"status": "error", "message": "no editable field supplied"}, status=400)
 
-        obj = get_object_or_404(apps.get_model("netbox_nso_plugin", model_name), pk=pk)
-        if key == "vlan_name":
-            self._require_vlan_name_permissions(request, obj)
+        obj = self.target.primary
         _prepare_bgp_edit(request.user, key, obj)
         if key == "bgp_peer" and obj.bgp_peer_id is None:
             return JsonResponse({"status": "error", "errors": _bgp_peer_errors(obj)}, status=400)
@@ -5958,7 +6108,7 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
-        errors = _overlay_family_errors(key, obj, old_values)
+        errors = _overlay_family_errors(key, obj, old_values, user=request.user)
         if errors:
             return JsonResponse({"status": "error", "errors": errors}, status=400)
 
@@ -5983,30 +6133,11 @@ class NSOOverlayFieldEditView(NSOActionPermissionMixin, View):
                 return JsonResponse({"status": "error", "errors": errors}, status=400)
         return JsonResponse({"status": "ok", "changed": changed})
 
-    @staticmethod
-    def _require_vlan_name_permissions(request, state):
-        """Require native VLAN access and every device affected by a shared rename."""
-        from ipam.models import VLAN
 
-        if not request.user.has_perm("ipam.change_vlan"):
-            raise PermissionDenied
-        if not VLAN.objects.restrict(request.user, "change").filter(pk=state.vlan_id).exists():
-            raise PermissionDenied
-
-        from .models import NSODeviceManagement, NSOVLANState
-
-        management_ids = set(NSOVLANState.objects.filter(vlan_id=state.vlan_id).values_list("management_id", flat=True))
-        permitted_ids = set(
-            NSODeviceManagement.objects.restrict(request.user, "change")
-            .filter(pk__in=management_ids)
-            .values_list("pk", flat=True)
-        )
-        if permitted_ids != management_ids:
-            raise PermissionDenied
-
-
-class NSOBulkAcceptView(NSOActionPermissionMixin, View):
+class NSOBulkAcceptView(AuthorizedView):
     """Bulk-accept all 'changed' interface states for a device and push a single intent snapshot."""
+
+    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "native_mutation")
 
     def post(self, request, device_pk):
         """Accept all acceptable states for the given device.
@@ -6014,9 +6145,9 @@ class NSOBulkAcceptView(NSOActionPermissionMixin, View):
         Matching (imported) values become in_sync (nothing to apply); differing
         (changed) values become accepted and trigger a single intent push.
         """
-        device = get_object_or_404(Device, pk=device_pk)  # 404 a bad pk BEFORE mutating anything
+        device = self.target.device
         now = timezone.now()
-        base = NSOInterfaceState.objects.filter(interface__device_id=device_pk)
+        base = self.target.scoped(NSOInterfaceState)
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
         candidates = list(base.filter(status__in=("imported", "changed")).order_by("pk"))
@@ -6290,19 +6421,20 @@ def _apply_preview_owner_changes(device_pk):
     return routing_changes
 
 
-class NSOApplyPreviewView(LoginRequiredMixin, View):
+class NSOApplyPreviewView(AuthorizedView):
     """JSON preview of what 'Apply Intent' would push to the device.
 
     Lists the pending-apply changes (NetBox intent that differs from the device) so the
     operator can confirm before pushing. Drives the apply-confirmation modal.
     """
 
+    policy = EndpointPolicy(DeviceRead("device_pk"), "read")
+
     def get(self, request, device_pk):
         """Return {auto_apply, changes:[{interface, attribute, device, netbox}], routing}."""
         from django.http import JsonResponse
 
-        device = get_object_or_404(Device.objects.restrict(request.user, "view"), pk=device_pk)
-        mgmt = getattr(device, "nso_management", None)
+        mgmt = self.target.management
         auto_apply = bool(mgmt and mgmt.auto_apply)
 
         changes = _apply_preview_interface_changes(device_pk)
@@ -6390,12 +6522,14 @@ class NSOApplyPreviewView(LoginRequiredMixin, View):
 # ── IP auto-assignment operator actions ──────────────────────────────────
 
 
-class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
+class NSOAutoAssignIPView(AuthorizedView):
     """Operator action: auto-assign IPs to one or more interfaces from purpose pools.
 
     POST body: ``interface_pks`` (comma-separated or repeated query param).
     Redirects back to the device NSO tab with a success/error flash.
     """
+
+    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "native_mutation")
 
     def post(self, request, device_pk):
         """Auto-assign IPs from purpose pools to the requested interfaces."""
@@ -6403,7 +6537,7 @@ class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
 
         from .ip_autoassign import auto_assign_ip
 
-        device = get_object_or_404(Device, pk=device_pk)
+        device = self.target.device
         pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
         pks = [int(p.strip()) for p in pks_raw if p.strip().isdigit()]
 
@@ -6411,7 +6545,7 @@ class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
             messages.warning(request, "No interfaces selected for IP auto-assignment.")
             return redirect(_device_nso_tab_url(device.pk))
 
-        interfaces = Interface.objects.filter(pk__in=pks, device=device)
+        interfaces = self.target.selected(Interface.objects.filter(device=device), pks)
         allocated_total, skipped_total, error_total = 0, 0, 0
 
         for iface in interfaces:
@@ -6436,7 +6570,7 @@ class NSOAutoAssignIPView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(device.pk))
 
 
-class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
+class NSOProvisionLinkRoleView(AuthorizedView):
     """Operator action: provision one or more interfaces from their link roles.
 
     POST body: ``interface_pks`` (comma-separated or repeated). For each interface
@@ -6445,13 +6579,15 @@ class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
     per-interface summary flash.
     """
 
+    policy = EndpointPolicy(Management("change", "device_pk", by="device"), "native_mutation")
+
     def post(self, request, device_pk):
         """Provision the requested interfaces from their assigned link roles."""
         from dcim.models import Interface
 
         from .link_role import provision_link_role
 
-        device = get_object_or_404(Device, pk=device_pk)
+        device = self.target.device
         pks_raw = request.POST.getlist("interface_pks") or request.POST.get("interface_pks", "").split(",")
         pks = [int(p.strip()) for p in pks_raw if p.strip().isdigit()]
 
@@ -6461,7 +6597,7 @@ class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
 
         provisioned, skipped, rolled_back = 0, 0, 0
         covered: set[int] = set()  # ends already provisioned this batch (p2p link dedup)
-        for iface in Interface.objects.filter(pk__in=pks, device=device):
+        for iface in self.target.selected(Interface.objects.filter(device=device), pks):
             if iface.pk in covered:
                 continue  # far end of a link already provisioned from the other side
             summary = provision_link_role(iface)
@@ -6491,10 +6627,38 @@ class NSOProvisionLinkRoleView(NSOActionPermissionMixin, View):
 # ── Routing state accept views (Track A) ──────────────────────────────────────
 
 
-class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
+def _owned_native_gap(state, user):
+    """Return whether an owned overlay's native row is missing or apart from it; its Accept materializes it."""
+    from netbox_routing.models import BFDInterface
+
+    from .status_machine import is_owned
+
+    if not is_owned(state.status):
+        return False
+    if isinstance(state, NSOBFDInterfaceState):
+        return not BFDInterface.objects.filter(interface_id=state.interface_id).exists()
+    if isinstance(state, NSOISISInterfaceState):
+        native = state.isis_interface
+        return native is not None and native.instance.process_tag != state.process_tag
+    if isinstance(state, NSORedistributionState):
+        if state.redistribution_id is not None:
+            return False
+        from .redistribution_reconciler import _resolve_redist_destination
+
+        return _resolve_redist_destination(
+            state.management.device, state.dest_protocol, state.dest_ref
+        ) is not None and not _redistribution_materialization_blocker(state, user)
+    return False
+
+
+def _accept_policy(model, *permissions):
+    """Return the policy of a per-row Accept: change authority on the row's management."""
+    return EndpointPolicy(OverlayRow(model, "change"), "native_mutation", permissions=permissions)
+
+
+class RoutingStateAcceptMixin(AuthorizedView, abstract=True):
     """Accept one routing row through an exact renderer mutation plan."""
 
-    model_class = None
     # Extra columns _arm_accept() writes, saved in the same UPDATE as the status.
     accept_extra_fields: tuple[str, ...] = ()
 
@@ -6505,12 +6669,19 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         """Return why *state* cannot become owned, or an empty string."""
         return ""
 
+    def _native_writes(self, candidate):
+        """Plan the native rows that carry the accepted row's intent.
+
+        Return (native saves, native operations, overlay fields, overlay references).
+        """
+        return (), (), (), ()
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        state = get_object_or_404(self.model_class, pk=pk)
+        state = self.target.primary
         if blocker := self._accept_blocker(state):
             messages.error(request, f"Cannot accept {state}: {blocker}")
             return redirect(_device_nso_tab_url(state.management.device_id))
@@ -6522,32 +6693,37 @@ class RoutingStateAcceptMixin(NSOActionPermissionMixin, View):
         if candidate.accepted_at is None:
             candidate.accepted_at = timezone.now()
         self._arm_accept(candidate)
-        fields = ("status", "accepted_at", *self.accept_extra_fields)
+        native_saves, native_operations, native_fields, references = self._native_writes(candidate)
+        fields = ("status", "accepted_at", *self.accept_extra_fields, *native_fields)
         plan = RendererMutationPlan.build(
             grant=OwnershipGrant("accept"),
-            saves=(planned_save(candidate, update_fields=fields),),
+            saves=(*native_saves, planned_save(candidate, update_fields=fields, references=references)),
             planned_at=candidate.accepted_at,
         )
         mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
         with mutation as writer:
+            for instance, update_fields, force_insert in native_operations:
+                writer.save(instance, update_fields=update_fields, force_insert=force_insert)
             writer.save(candidate, update_fields=fields)
         messages.success(request, f"Accepted routing state {candidate.pk}.")
         return redirect(_device_nso_tab_url(candidate.management.device_id))
 
 
-class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
+class NSOL2SapStateAcceptView(AuthorizedView):
     """Accept one Nokia L2 SAP — mark owned (accepted_at) so NetBox is the source of truth.
 
     The exact writer saves the accepted row, finalizes its fingerprint, and lets the
     writer-gated signal schedule the device's complete L2 SAP intent snapshot.
     """
 
+    policy = _accept_policy(NSOL2SapState)
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        state = get_object_or_404(NSOL2SapState, pk=pk)
+        state = self.target.primary
         if state.service_type not in ("epipe", "vpls"):
             messages.error(
                 request,
@@ -6570,7 +6746,7 @@ class NSOL2SapStateAcceptView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(state.management.device_id))
 
 
-class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
+class NSOLACPBundleStateAcceptView(AuthorizedView):
     """Accept one LACP bundle (and its member rows) — mark owned so NetBox is the source of truth.
 
     Accept only marks the rows owned; the device commit is deferred to the single
@@ -6578,12 +6754,13 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
     post_save signal still commits immediately (lag-reconciler write path).
     """
 
+    policy = _accept_policy(NSOLACPBundleState)
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
         from .intent_state import IntentMutationProtocolError, reconcile_family_footprint
         from .lacp_topology import acquisition_validator, member_states
-        from .models import NSOLACPBundleState
         from .renderer_writer import (
             RendererMutationPlan,
             planned_save,
@@ -6593,7 +6770,7 @@ class NSOLACPBundleStateAcceptView(NSOActionPermissionMixin, View):
 
         for attempt in range(2):
             try:
-                state = get_object_or_404(NSOLACPBundleState, pk=pk)
+                state = self.target.reload()
                 validate = acquisition_validator(state)
                 now = timezone.now()
                 candidates = []
@@ -6669,7 +6846,7 @@ def _switchport_accept_plan(state):
     return plan, interface, candidate, tagged
 
 
-class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
+class NSOSwitchportStateAcceptView(AuthorizedView):
     """Accept one L2 switchport: native-write the observed mode/VLANs + mark owned.
 
     Writes the NSO-observed mode/VLANs onto the native NetBox interface (NetBox
@@ -6678,13 +6855,14 @@ class NSOSwitchportStateAcceptView(NSOActionPermissionMixin, View):
     immediately (switchport-reconciler).
     """
 
+    policy = _accept_policy(NSOSwitchportState)
+
     def post(self, request, pk):  # noqa: D102
         from .intent_state import IntentMutationProtocolError
-        from .models import NSOSwitchportState
         from .renderer_writer import renderer_mirror_writes, renderer_writes
 
         for _attempt in range(2):
-            state = get_object_or_404(NSOSwitchportState, pk=pk)
+            state = self.target.reload()
             if state.management.device_id != state.interface.device_id:
                 continue
             plan, interface, candidate, tagged = _switchport_accept_plan(state)
@@ -6817,6 +6995,20 @@ def _ip_update_collision_errors(updates):
     return errors
 
 
+def _ip_edit_affected_management_ids(updates):
+    """Include IP owners and BGP consumers whose content reads the changed addresses."""
+    from ipaddress import ip_interface
+
+    from .intent_state import footprint_for_instance
+
+    devices = set()
+    for update in updates:
+        native = update["native"]
+        if native is not None and update["host"] != str(ip_interface(str(native.address)).ip):
+            devices.update(device_id for device_id, _scope in footprint_for_instance(native).revision_keys)
+    return NSODeviceManagement.objects.filter(device_id__in=devices).values_list("pk", flat=True)
+
+
 def _ip_edit_plan_and_operations(updates, planned_at):
     """Freeze every native and overlay write for one paired-address edit."""
     from ipam.models import IPAddress
@@ -6886,7 +7078,15 @@ def _ip_edit_plan_and_operations(updates, planned_at):
     )
 
 
-class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
+def _authorize_planned_states(state_operations, user):
+    """Authorize every overlay row a plan writes (a cleared inverse peer included) for change."""
+    from .request_authorization import authorize_related_row
+
+    for candidate, _fields in state_operations:
+        authorize_related_row(candidate, user, "change")
+
+
+class NSOInterfaceIPStateEditView(AuthorizedView):
     """Edit/materialize an interface IP from the merged grid, optionally with its peer.
 
     The local address is always updated. ``peer_address`` is opt-in: the popover
@@ -6894,20 +7094,19 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
     Both requested updates validate before writing and commit atomically.
     """
 
+    policy = EndpointPolicy(OverlayRow(NSOInterfaceIPState, "change"), "native_mutation")
+
     def post(self, request, pk):
         """Validate, atomically write native IPAM + overlays, then push owned intent."""
         from django.core.exceptions import ValidationError
         from django.db import IntegrityError
 
         from .intent_state import RendererTargetsChanged
-        from .models import NSODeviceManagement, NSOInterfaceIPState
         from .renderer_writer import IntentPlanStaleError, renderer_mirror_writes, renderer_writes
+        from .request_authorization import authorize_related_row
         from .signals import _schedule_intent_push, suppress_intent_push
 
-        state = get_object_or_404(
-            NSOInterfaceIPState.objects.select_related("interface", "interface__device"),
-            pk=pk,
-        )
+        state = self.target.primary
         local, error = _prepare_ip_update(state, "address", request.POST.get("address"))
         if error:
             return JsonResponse({"status": "error", "errors": {"address": [error]}}, status=400)
@@ -6928,6 +7127,8 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
             if error:
                 return JsonResponse({"status": "error", "errors": {"peer_address": [error]}}, status=400)
             if peer["address"] != peer_state.address:
+                # A written cable peer is a second target: it must allow the change too.
+                authorize_related_row(peer_state, request.user, "change")
                 updates.append(peer)
 
         errors = _ip_update_collision_errors(updates)
@@ -6939,10 +7140,12 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
             if not request.user.has_perm(permission):
                 raise PermissionDenied
 
+        operation = shared_operation(lambda: _ip_edit_affected_management_ids(updates))
         try:
             plan, native_operations, state_operations = _ip_edit_plan_and_operations(updates, timezone.now())
+            _authorize_planned_states(state_operations, request.user)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-            with mutation as writer:
+            with mutation as writer, operation:
                 with suppress_intent_push():
                     for native, created in native_operations:
                         writer.save(native, force_insert=created)
@@ -6974,22 +7177,20 @@ class NSOInterfaceIPStateEditView(NSOActionPermissionMixin, View):
         )
 
 
-class NSOInterfaceIPStateAcceptView(NSOActionPermissionMixin, View):
+class NSOInterfaceIPStateAcceptView(AuthorizedView):
     """Accept one interface IP as NetBox intent. NetBox IPAM does not change.
 
     The status machine's accept event takes ownership; Apply delivers the address.
     Sync from NSO is the verb that corrects NetBox to the device.
     """
 
+    policy = _accept_policy(NSOInterfaceIPState)
+
     def post(self, request, pk):  # noqa: D102
         from . import status_machine as sm
-        from .models import NSOInterfaceIPState
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes, renderer_writes
 
-        permitted = NSODeviceManagement.objects.restrict(request.user, "change").values("device_id")
-        state = get_object_or_404(
-            NSOInterfaceIPState.objects.select_related("interface").filter(interface__device_id__in=permitted), pk=pk
-        )
+        state = self.target.primary
         device_id = state.interface.device_id
         if not sm.can(sm.ACCEPT, state.status):
             messages.error(
@@ -7021,7 +7222,7 @@ class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):
     operator is re-accepting away would still name this row and could settle it.
     """
 
-    model_class = NSOStaticRouteState
+    policy = _accept_policy(NSOStaticRouteState)
     accept_extra_fields = _STATIC_ROUTE_ARMED_FIELDS
 
     def _arm_accept(self, state):  # noqa: D102
@@ -7030,17 +7231,48 @@ class NSOStaticRouteStateAcceptView(RoutingStateAcceptMixin):
         _arm_static_route_generation(state)
 
 
-class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
-    model_class = NSOISISInterfaceState
+def _isis_interface_native_writes(candidate):
+    """Plan the repoint of an IS-IS interface to the accepted process, creating that process when missing."""
+    from netbox_routing.models import ISISInstance
+
+    from .renderer_writer import planned_save
+
+    native = candidate.isis_interface
+    # An empty process tag names the untagged process.
+    if native is None or native.instance.process_tag == candidate.process_tag:
+        return (), (), (), ()
+    device = candidate.interface.device
+    instance = operator_lookup(ISISInstance, device=device, process_tag=candidate.process_tag, create_if_missing=True)
+    saves = []
+    operations = []
+    references = ()
+    if instance is None:
+        instance = ISISInstance(device=device, process_tag=candidate.process_tag)
+        saves.append(planned_save(instance, force_insert=True, natural_key=("device", "process_tag")))
+        operations.append((instance, None, True))
+        references = (("instance", instance),)
+    repointed = copy.copy(native)
+    repointed.instance = instance
+    saves.append(planned_save(repointed, update_fields=("instance",), references=references))
+    operations.append((repointed, ("instance",), False))
+    return saves, operations, (), ()
+
+
+class NSOISISInterfaceStateAcceptView(RoutingStateAcceptMixin):
+    """Accept one IS-IS interface; its native interface moves to the accepted process."""
+
+    policy = _accept_policy(NSOISISInterfaceState)
+
+    def _native_writes(self, candidate):  # noqa: D102
+        return _isis_interface_native_writes(candidate)
 
 
 class NSOISISInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
-    model_class = NSOISISInstanceState
+    policy = _accept_policy(NSOISISInstanceState)
 
 
 class NSOBGPRouterStateAcceptView(RoutingStateAcceptMixin):
-    model_class = NSOBGPRouterState
-    required_permission = ("netbox_nso_plugin.change_nsodevicemanagement", "netbox_routing.change_bgprouter")
+    policy = _accept_policy(NSOBGPRouterState, "netbox_routing.change_bgprouter")
 
     def _arm_accept(self, state):
         """Require a qualified matching read to confirm router intent after Accept."""
@@ -7051,14 +7283,13 @@ class NSOBGPRouterStateAcceptView(RoutingStateAcceptMixin):
         return " ".join(message for values in errors.values() for message in values)
 
     def post(self, request, pk):
-        state = get_object_or_404(self.model_class, pk=pk)
-        if not _can_change_bgp_router(request.user, state):
+        if not _can_change_bgp_router(request.user, self.target.primary):
             raise PermissionDenied
         return super().post(request, pk)
 
 
 class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
-    model_class = NSOBGPPeerState
+    policy = _accept_policy(NSOBGPPeerState)
 
     def _arm_accept(self, state):
         """Require a qualified matching read to confirm peer intent after Accept."""
@@ -7068,7 +7299,7 @@ class NSOBGPPeerStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
         return "the state has no linked NetBox BGP peer." if state.bgp_peer_id is None else ""
 
 
-class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
+class NSOBGPPeerTemplateStateAcceptView(AuthorizedView):
     """Accept one BGP peer-group template — take ownership (no device apply path).
 
     Peer-group templates have no apply path, so accepting just marks the row owned
@@ -7076,13 +7307,14 @@ class NSOBGPPeerTemplateStateAcceptView(NSOActionPermissionMixin, View):
     accepting acknowledges the drift so it stops showing as un-owned.
     """
 
+    policy = _accept_policy(NSOBGPPeerTemplateState)
+
     def post(self, request, pk):  # noqa: D102
         import copy
 
-        from .models import NSOBGPPeerTemplateState
         from .renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
-        state = get_object_or_404(NSOBGPPeerTemplateState, pk=pk)
+        state = self.target.primary
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(candidate.status)
         candidate.accepted_at = timezone.now()
@@ -7128,7 +7360,7 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
     community-lists / as-paths so they're pushed too.
     """
 
-    model_class = NSORoutePolicyState
+    policy = _accept_policy(NSORoutePolicyState)
 
     def post(self, request, pk):  # noqa: D102
         import copy
@@ -7136,7 +7368,7 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
         from .renderer_writer import renderer_mirror_writes, renderer_writes
         from .signals import _route_policy_acquisition_plan
 
-        state = get_object_or_404(NSORoutePolicyState, pk=pk)
+        state = self.target.primary
         candidate = copy.copy(state)
         candidate.status = _status_after_accept(candidate.status)
         if candidate.accepted_at is None:
@@ -7168,7 +7400,7 @@ class NSORoutePolicyStateAcceptView(RoutingStateAcceptMixin):
 # ── Shared-object versions + re-point (universal: route-policy now, ACL later) ──
 
 
-class SharedObjectVersionsMixin(LoginRequiredMixin, View):
+class SharedObjectVersionsMixin(AuthorizedView, abstract=True):
     """Show every device's captured version of one globally-deduped named object.
 
     Globally-deduped objects (a route-map / community-list / … shared by name across
@@ -7185,8 +7417,18 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
     def get(self, request, pk):  # noqa: D102
         from . import shared_object_ownership as ownership
 
-        state = get_object_or_404(self.model_class, pk=pk)
-        items = ownership.version_items(self.model_class, state.family, state.object_name)
+        state = self.target.primary
+        # Versions of managements the user may not view are left out of the list and its verdicts.
+        visible = set(
+            NSODeviceManagement.objects.restrict(request.user, "view")
+            .filter(device__in=Device.objects.restrict(request.user, "view"))
+            .values_list("pk", flat=True)
+        )
+        items = [
+            item
+            for item in ownership.version_items(self.model_class, state.family, state.object_name)
+            if item["row"].management_id in visible
+        ]
         self.decorate_items(items, state)
         return render(
             request,
@@ -7217,20 +7459,18 @@ class SharedObjectVersionsMixin(LoginRequiredMixin, View):
         return {}
 
 
-class SharedObjectMaterializeMixin(NSOActionPermissionMixin, View):
+class SharedObjectMaterializeMixin(AuthorizedView, abstract=True):
     """Re-point a shared object's content to a chosen device's captured version.
 
     Refills the NetBox object from this device's capture and flips ownership (the former
     owner becomes the conflict).  Writes only into NetBox — pushing the new content to
-    other devices is a separate, explicit Accept.  Family-agnostic via ``model_class``.
+    other devices is a separate, explicit Accept.  Family-agnostic: the policy names the row model.
     """
-
-    model_class = None
 
     def post(self, request, pk):  # noqa: D102
         from . import shared_object_ownership as ownership
 
-        state = get_object_or_404(self.model_class, pk=pk)
+        state = self.target.primary
         try:
             ownership.rematerialize(state)
         except ValueError as exc:
@@ -7246,6 +7486,7 @@ class SharedObjectMaterializeMixin(NSOActionPermissionMixin, View):
 
 class NSORoutePolicyVersionsView(SharedObjectVersionsMixin):  # noqa: D101
     model_class = NSORoutePolicyState
+    policy = EndpointPolicy(OverlayRow(NSORoutePolicyState, "view"), "read")
     materialize_url_name = "plugins:netbox_nso_plugin:routing_materialize_route_policy"
 
     def decorate_items(self, items, state):
@@ -7278,7 +7519,7 @@ class NSORoutePolicyVersionsView(SharedObjectVersionsMixin):  # noqa: D101
         }
 
 
-class NSORoutePolicyClassifyView(NSOActionPermissionMixin, View):
+class NSORoutePolicyClassifyView(AuthorizedView):
     """Classify a route-policy object group MASTER (shared, dedup) or LOCAL (per-device).
 
     POST ``mode=local`` clears the false drift of a group that legitimately differs per device
@@ -7287,10 +7528,12 @@ class NSORoutePolicyClassifyView(NSOActionPermissionMixin, View):
     change permission as the other route-policy actions.
     """
 
+    policy = _accept_policy(NSORoutePolicyState)
+
     def post(self, request, pk):  # noqa: D102
         from .route_policy_reconciler import set_classification
 
-        state = get_object_or_404(NSORoutePolicyState, pk=pk)
+        state = self.target.primary
         mode = request.POST.get("mode")
         if mode not in ("master", "local"):
             messages.error(request, "Invalid classification.")
@@ -7301,7 +7544,7 @@ class NSORoutePolicyClassifyView(NSOActionPermissionMixin, View):
         return redirect("plugins:netbox_nso_plugin:routing_route_policy_versions", pk=pk)
 
 
-class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
+class NSORoutePolicyClassifyBulkView(AuthorizedView):
     """Bulk-mark a device's divergent route-policy groups as per-device (LOCAL).
 
     Lists this device's drifted (conflict/changed) shared route-policy objects with a Diff link
@@ -7310,6 +7553,12 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
     """
 
     template_name = "netbox_nso_plugin/route_policy_classify_bulk.html"
+    policy = MappingProxyType(
+        {
+            "get": EndpointPolicy(Management("change", "device_pk", by="device"), "read"),
+            "post": EndpointPolicy(Management("change", "device_pk", by="device"), "native_mutation"),
+        }
+    )
 
     def _divergent_rows(self, mgmt):
         from .refusal_display import project_rows, row_projection
@@ -7322,7 +7571,7 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
         return [row for row in project_rows(rows) if row_projection(row)["state"] == "drift"]
 
     def get(self, request, device_pk):  # noqa: D102
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         return render(
             request,
             self.template_name,
@@ -7332,7 +7581,7 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
     def post(self, request, device_pk):  # noqa: D102
         from .route_policy_reconciler import set_classification
 
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         wanted = set(request.POST.getlist("state"))
         seen: set[tuple] = set()
         for state in self._divergent_rows(mgmt):
@@ -7349,13 +7598,13 @@ class NSORoutePolicyClassifyBulkView(NSOActionPermissionMixin, View):
 class NSORoutePolicyMaterializeView(SharedObjectMaterializeMixin):
     """Re-point one route-policy group through its exact graph plan."""
 
-    model_class = NSORoutePolicyState
+    policy = _accept_policy(NSORoutePolicyState)
 
 
 # ── Drift delta: what differs between the device and what NetBox holds ──────────
 
 
-class NSORoutePolicyDiffView(LoginRequiredMixin, View):
+class NSORoutePolicyDiffView(AuthorizedView):
     """Show the concrete delta between a device's captured route-map and the NetBox object.
 
     The status badge says *that* a route-map drifted (``conflict`` / ``changed``); this shows
@@ -7366,11 +7615,12 @@ class NSORoutePolicyDiffView(LoginRequiredMixin, View):
 
     template_name = "netbox_nso_plugin/route_policy_diff.html"
     modal_template_name = "netbox_nso_plugin/route_policy_diff_modal.html"
+    policy = EndpointPolicy(OverlayRow(NSORoutePolicyState, "view"), "read")
 
     def get(self, request, pk):  # noqa: D102
         from .route_policy_diff import route_policy_state_diff, unified_policy_diff
 
-        state = get_object_or_404(NSORoutePolicyState, pk=pk)
+        state = self.target.primary
         diff = route_policy_state_diff(state)
         template_name = self.modal_template_name if request.headers.get("HX-Request") == "true" else self.template_name
         return render(
@@ -7387,15 +7637,16 @@ class NSORoutePolicyDiffView(LoginRequiredMixin, View):
         )
 
 
-class NSORedistributionDiffView(LoginRequiredMixin, View):
+class NSORedistributionDiffView(AuthorizedView):
     """Show the device-vs-NetBox delta for a redistribution overlay row (field-level)."""
 
     template_name = "netbox_nso_plugin/redistribution_diff.html"
+    policy = EndpointPolicy(OverlayRow(NSORedistributionState, "view"), "read")
 
     def get(self, request, pk):  # noqa: D102
         from .route_policy_diff import redistribution_diff, unified_redistribution_diff
 
-        state = get_object_or_404(NSORedistributionState.objects.select_related("redistribution__route_map"), pk=pk)
+        state = self.target.primary
         return render(
             request,
             self.template_name,
@@ -7409,11 +7660,11 @@ class NSORedistributionDiffView(LoginRequiredMixin, View):
 
 
 class NSOOSPFInstanceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
-    model_class = NSOOSPFInstanceState
+    policy = _accept_policy(NSOOSPFInstanceState)
 
 
 class NSOOSPFInterfaceStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
-    model_class = NSOOSPFInterfaceState
+    policy = _accept_policy(NSOOSPFInterfaceState)
 
 
 def _redistribution_accept_blocker(state):
@@ -7426,17 +7677,76 @@ def _redistribution_accept_blocker(state):
     return ""
 
 
-class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):  # noqa: D101
-    model_class = NSORedistributionState
+def _redistribution_native_writes(candidate, user):
+    """Plan the native redistribution an accepted overlay without one names, with the accepted values."""
+    from django.contrib.contenttypes.models import ContentType
+    from netbox_routing.models import Redistribution, RouteMap
+
+    from .redistribution_reconciler import _resolve_redist_destination
+    from .renderer_writer import planned_save
+
+    if candidate.redistribution_id is not None:
+        return (), (), (), ()
+    destination = _resolve_redist_destination(candidate.management.device, candidate.dest_protocol, candidate.dest_ref)
+    if destination is None:
+        return (), (), (), ()
+    identity = {
+        "destination_type": ContentType.objects.get_for_model(type(destination)),
+        "destination_id": destination.pk,
+        "source_protocol": candidate.source_protocol,
+        "source_ref": candidate.source_ref,
+    }
+    existing = operator_lookup(Redistribution, create_if_missing=True, **identity)
+    if existing is not None:
+        candidate.redistribution = existing
+        return (), (), ("redistribution",), ()
+    route_map = (
+        RouteMap.objects.restrict(user, "view").filter(name=candidate.route_map).first()
+        if candidate.route_map
+        else None
+    )
+    native = Redistribution(**identity, route_map=route_map, metric=candidate.metric, metric_type=candidate.metric_type)
+    candidate.redistribution = native
+    save = planned_save(
+        native,
+        force_insert=True,
+        natural_key=("destination_type", "destination_id", "source_protocol", "source_ref"),
+    )
+    return (save,), ((native, None, True),), ("redistribution",), (("redistribution", native),)
+
+
+def _redistribution_materialization_blocker(state, user):
+    """Return the shared refusal for a native-gap offer and its Accept request."""
+    from netbox_routing.models import RouteMap
+
+    if (
+        state.redistribution_id is None
+        and state.route_map
+        and not RouteMap.objects.restrict(user, "view").filter(name=state.route_map).exists()
+    ):
+        return f"Route map {state.route_map!r} does not exist in NetBox."
+    return _redistribution_accept_blocker(state)
+
+
+class NSORedistributionStateAcceptView(RoutingStateAcceptMixin):
+    """Accept one redistribution; a missing native redistribution is created with the accepted values."""
+
+    policy = _accept_policy(NSORedistributionState)
 
     def _accept_blocker(self, state):
-        return _redistribution_accept_blocker(state)
+        return _redistribution_materialization_blocker(state, self.request.user)
+
+    def _native_writes(self, candidate):  # noqa: D102
+        return _redistribution_native_writes(candidate, self.request.user)
 
 
 # ── Routing bulk accept views (Track A) ───────────────────────────────────────
 
 
-class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
+_BULK_ACCEPT_POLICY = EndpointPolicy(Management("change", "device_pk", by="device", optional=True), "native_mutation")
+
+
+class RoutingBulkAcceptMixin(AuthorizedView, abstract=True):
     """Bulk 'Keep NetBox' for all DRIFTED routing rows of a device, then push intent."""
 
     model_class = None
@@ -7466,9 +7776,8 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         from .intent_state import IntentMutationProtocolError
         from .renderer_writer import planned_save, renderer_mirror_writes, renderer_writes
 
-        try:
-            mgmt = NSODeviceManagement.objects.get(device_id=device_pk)
-        except NSODeviceManagement.DoesNotExist:
+        mgmt = self.target.management
+        if mgmt is None:
             messages.warning(request, "Device is not NSO-managed.")
             return redirect(_device_nso_tab_url(device_pk))
 
@@ -7479,7 +7788,8 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
         count = 0
         for _attempt in range(2):
             candidates = list(
-                self.model_class.objects.filter(management=mgmt, status__in=["imported", "changed", "conflict"])
+                self.target.scoped(self.model_class)
+                .filter(status__in=["imported", "changed", "conflict"])
                 .select_related("management")
                 .order_by("pk")
             )
@@ -7530,6 +7840,7 @@ class RoutingBulkAcceptMixin(NSOActionPermissionMixin, View):
 
 
 class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSOStaticRouteState
 
     def _prepare_accept(self, current, candidate, *, drift):
@@ -7546,6 +7857,7 @@ class NSOStaticRouteBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSOISISInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSOISISInterfaceState
 
     def _push(self, mgmt):
@@ -7553,6 +7865,7 @@ class NSOISISInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSOISISInstanceState
 
     def _push(self, mgmt):
@@ -7560,6 +7873,7 @@ class NSOISISInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSOBGPPeerState
 
     def _prepare_accept(self, current, candidate, *, drift):
@@ -7574,6 +7888,7 @@ class NSOBGPPeerBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSORoutePolicyState
 
     def _build_accept_plan(self, mgmt, accepted, saves):
@@ -7596,6 +7911,7 @@ class NSORoutePolicyBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSOOSPFInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSOOSPFInstanceState
 
     def _push(self, mgmt):
@@ -7603,6 +7919,7 @@ class NSOOSPFInstanceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSOOSPFInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSOOSPFInterfaceState
 
     def _push(self, mgmt):
@@ -7610,6 +7927,7 @@ class NSOOSPFInterfaceBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 
 
 class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
+    policy = _BULK_ACCEPT_POLICY
     model_class = NSORedistributionState
 
     def _accept_blocker(self, state):
@@ -7639,11 +7957,14 @@ class NSORedistributionBulkAcceptView(RoutingBulkAcceptMixin):  # noqa: D101
 # never stored; the push resolves them from Vault via each row's vault_ref.
 
 
-class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
+class OverlayStateAcceptMixin(AuthorizedView, abstract=True):
     """Per-row accept for an SNMP/logging overlay — mark owned (accepted_at + status)."""
 
-    model_class = None
     renderer_scope = None
+
+    def native_writes(self, candidate):
+        """Plan the native rows that carry the accepted overlay's intent: (saves, operations)."""
+        return (), ()
 
     def push_blocker(self, state) -> str:
         """Why accepting *state* could not be faithfully applied, or "" when it can.
@@ -7655,8 +7976,7 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
         return ""
 
     def post(self, request, pk):  # noqa: D102
-        state = get_object_or_404(self.model_class, pk=pk)
-        return self._post_with_renderer_writer(request, state)
+        return self._post_with_renderer_writer(request, self.target.primary)
 
     def _post_with_renderer_writer(self, request, state):
         """Accept one converted overlay through its exact renderer plan."""
@@ -7672,7 +7992,8 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
         fields = ("status", "accepted_at")
         for attempt in range(2):
-            current = get_object_or_404(self.model_class, pk=state.pk)
+            # Re-read the authorized row under the retry; its identity does not change.
+            current = get_object_or_404(type(state), pk=state.pk)
             blocker = self.push_blocker(current)
             if blocker:
                 messages.error(request, f"Cannot accept {current}: {blocker}")
@@ -7681,16 +8002,19 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
             candidate.status = _status_after_accept(current.status)
             candidate.accepted_at = timezone.now()
             dependencies, validate_after_acquire = _overlay_identity_plan(self.renderer_scope, candidate)
+            native_saves, native_operations = self.native_writes(candidate)
             try:
                 plan = RendererMutationPlan.build(
                     grant=OwnershipGrant("accept"),
-                    saves=(planned_save(candidate, update_fields=fields),),
+                    saves=(*native_saves, planned_save(candidate, update_fields=fields)),
                     read_dependencies=dependencies,
                     validate_after_acquire=validate_after_acquire,
                     planned_at=candidate.accepted_at,
                 )
                 mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
                 with mutation as writer:
+                    for instance, update_fields, force_insert in native_operations:
+                        writer.save(instance, update_fields=update_fields, force_insert=force_insert)
                     writer.save(candidate, update_fields=fields)
                 break
             except _IntentTransactionNoOp as exc:
@@ -7709,12 +8033,12 @@ class OverlayStateAcceptMixin(NSOActionPermissionMixin, View):
 
 
 class NSOSnmpCommunityStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOSnmpCommunityState
+    policy = _accept_policy(NSOSnmpCommunityState)
     renderer_scope = "snmp"
 
 
 class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOSnmpV3UserState
+    policy = _accept_policy(NSOSnmpV3UserState)
     renderer_scope = "snmp"
 
     def push_blocker(self, state):
@@ -7725,7 +8049,7 @@ class NSOSnmpV3UserStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 
 class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOSnmpHostState
+    policy = _accept_policy(NSOSnmpHostState)
     renderer_scope = "snmp"
 
     def push_blocker(self, state):
@@ -7736,7 +8060,7 @@ class NSOSnmpHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 
 class NSOSnmpSystemInfoStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOSnmpSystemInfoState
+    policy = _accept_policy(NSOSnmpSystemInfoState)
     renderer_scope = "snmp"
 
 
@@ -7754,7 +8078,7 @@ def _vault_version_label(version) -> str:
     return "?" if version is None else str(version)
 
 
-class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
+class NSOSnmpCommunityStateVerifyView(AuthorizedView):
     """Resolve the row's Vault ref via the adapter and store the value fingerprint.
 
     Sets ``vault_secret_hash``/``vault_secret_version`` so the badge can state
@@ -7762,11 +8086,13 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
     leave the adapter. Only a sha256[:16] fingerprint travels.
     """
 
+    policy = EndpointPolicy(OverlayRow(NSOSnmpCommunityState, "change"), "adapter_action")
+
     def post(self, request, pk):  # noqa: D102
         from . import adapter_client
         from .vault_refs import VaultRefError, parse_vault_ref
 
-        state = get_object_or_404(NSOSnmpCommunityState, pk=pk)
+        state = self.target.primary
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
             messages.error(request, "No Vault ref on this community. Set one (or a secret value) first.")
@@ -7801,14 +8127,16 @@ class NSOSnmpCommunityStateVerifyView(NSOActionPermissionMixin, View):
         return redirect(redirect_url)
 
 
-class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
+class NSOSnmpV3UserStateVerifyView(AuthorizedView):
     """Resolve the v3 user's Vault path and record its fixed auth and priv flags."""
+
+    policy = EndpointPolicy(OverlayRow(NSOSnmpV3UserState, "change"), "adapter_action")
 
     def post(self, request, pk):  # noqa: D102
         from . import adapter_client
         from .vault_refs import VaultRefError, parse_vault_ref
 
-        state = get_object_or_404(NSOSnmpV3UserState, pk=pk)
+        state = self.target.primary
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if not state.vault_ref:
             messages.error(request, "No Vault ref on this v3 user. Set one (or secret values) first.")
@@ -7838,7 +8166,7 @@ class NSOSnmpV3UserStateVerifyView(NSOActionPermissionMixin, View):
         return redirect(redirect_url)
 
 
-class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
+class NSOSnmpCommunityStateHarvestView(AuthorizedView):
     """Adopt the device-held community string into Vault by its fingerprint.
 
     The adapter reads the plaintext from NSO's config mirror (targeted per-NED
@@ -7846,11 +8174,13 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
     secret is never displayed or stored in NetBox.
     """
 
+    policy = EndpointPolicy(OverlayRow(NSOSnmpCommunityState, "change"), "adapter_action")
+
     def post(self, request, pk):  # noqa: D102
         from . import adapter_client
         from .forms import _vault_settings_layout
 
-        state = get_object_or_404(NSOSnmpCommunityState, pk=pk)
+        state = self.target.primary
         redirect_url = _device_nso_tab_url(state.management.device_id)
         if state.management.adapter_device_id is None:
             messages.error(request, "Device is not linked to the adapter — cannot harvest.")
@@ -7887,12 +8217,12 @@ class NSOSnmpCommunityStateHarvestView(NSOActionPermissionMixin, View):
 
 
 class NSOLoggingHostStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOLoggingHostState
+    policy = _accept_policy(NSOLoggingHostState)
     renderer_scope = "logging"
 
 
 class NSOLoggingLevelStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOLoggingLevelState
+    policy = _accept_policy(NSOLoggingLevelState)
     renderer_scope = "logging"
 
     def push_blocker(self, state):
@@ -7902,7 +8232,7 @@ class NSOLoggingLevelStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
         return ""
 
 
-class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
+class NSOLoggingLevelStateUnacceptView(AuthorizedView):
     """Release ownership of the logging-levels singleton (un-accept = RETRACT).
 
     Dropping the row from the owned set makes the next snapshot push carry
@@ -7914,10 +8244,12 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
     in-flight Apply must settle before ownership can be released.
     """
 
+    policy = _accept_policy(NSOLoggingLevelState)
+
     def post(self, request, pk):  # noqa: D102
         from . import status_machine as sm
 
-        state = get_object_or_404(NSOLoggingLevelState, pk=pk)
+        state = self.target.primary
         device_id = state.management.device_id
         if state.status == "deploying":
             messages.error(request, f"Cannot un-accept {state}: an Apply is in flight.")
@@ -7946,7 +8278,7 @@ class NSOLoggingLevelStateUnacceptView(NSOActionPermissionMixin, View):
 
 
 class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOSVIState
+    policy = _accept_policy(NSOSVIState)
     renderer_scope = "svi"
 
     def push_blocker(self, state):
@@ -7957,7 +8289,7 @@ class NSOSVIStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
 
 
 class NSOSubinterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOSubinterfaceState
+    policy = _accept_policy(NSOSubinterfaceState)
     renderer_scope = "subinterface"
 
     def push_blocker(self, state):
@@ -7974,7 +8306,7 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     ip-mtu/mpls-mtu ride the overlay only.
     """
 
-    model_class = NSOInterfaceMtuState
+    policy = _accept_policy(NSOInterfaceMtuState)
 
     # NetBox dcim.Interface.mtu max (and the read-side clamp ceiling).
     _NETBOX_MTU_MAX = 65536
@@ -8013,7 +8345,7 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
     def post(self, request, pk):  # noqa: D102
         from .renderer_writer import IntentPlanStaleError
 
-        state = get_object_or_404(self.model_class.objects.select_related("interface", "management"), pk=pk)
+        state = self.target.primary
         try:
             candidate = self._accept(state)
         except IntentPlanStaleError:
@@ -8024,11 +8356,11 @@ class NSOInterfaceMtuStateAcceptView(OverlayStateAcceptMixin):
 
 
 class NSOVLANStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOVLANState
+    policy = _accept_policy(NSOVLANState)
     renderer_scope = "vlan"
 
 
-class NSOVLANRescopeView(NSOActionPermissionMixin, View):
+class NSOVLANRescopeView(AuthorizedView):
     """Re-scope a synced VLAN into a different (e.g. site-wide/shared) VLAN group.
 
     The device↔VLAN link is anchored on the overlay row, so a VLAN can leave its
@@ -8037,14 +8369,26 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     move-or-merge via :func:`vlan_reconciler.rescope_vlan`.
     """
 
+    policy = MappingProxyType(
+        {
+            "get": EndpointPolicy(OverlayRow(NSOVLANState, "change"), "read"),
+            "post": EndpointPolicy(OverlayRow(NSOVLANState, "change"), "native_mutation"),
+        }
+    )
+
     def get(self, request, pk):  # noqa: D102
         from ipam.models import VLAN, VLANGroup
 
-        state = get_object_or_404(NSOVLANState, pk=pk)
+        state = self.target.primary
         vid = state.vlan.vid
         groups = []
-        for group in VLANGroup.objects.exclude(pk=state.vlan.group_id).order_by("name"):
-            merges = VLAN.objects.filter(group=group, vid=vid).exclude(pk=state.vlan.pk).exists()
+        for group in VLANGroup.objects.restrict(request.user, "view").exclude(pk=state.vlan.group_id).order_by("name"):
+            merges = (
+                VLAN.objects.restrict(request.user, "view")
+                .filter(group=group, vid=vid)
+                .exclude(pk=state.vlan.pk)
+                .exists()
+            )
             groups.append({"group": group, "merges": merges})
         return render(
             request,
@@ -8055,17 +8399,12 @@ class NSOVLANRescopeView(NSOActionPermissionMixin, View):
     def post(self, request, pk):  # noqa: D102
         from ipam.models import VLANGroup
 
-        from .vlan_reconciler import VLANRescopeConflict, rescope_vlan
+        from .vlan_reconciler import rescope_vlan
 
-        state = get_object_or_404(NSOVLANState, pk=pk)
-        group = get_object_or_404(VLANGroup, pk=request.POST.get("group"))
+        state = self.target.primary
+        group = get_object_or_404(VLANGroup.objects.restrict(request.user, "view"), pk=request.POST.get("group"))
         device_id = state.management.device_id
-        try:
-            action, vlan = rescope_vlan(state, group, grant=OwnershipGrant("operator_edit"))
-        # rescope_vlan converts every acquisition-time protocol error into this refusal.
-        except VLANRescopeConflict:
-            messages.error(request, "The VLAN attachment changed. Refresh the page and try again.")
-            return redirect(_device_nso_tab_url(device_id))
+        action, vlan = rescope_vlan(state, group, grant=OwnershipGrant("operator_edit"))
         if action == "noop":
             messages.info(request, f"VLAN {vlan.vid} is already in group {group}.")
         elif action == "moved":
@@ -8083,7 +8422,18 @@ _RP_ATTACH_LABELS = {
 }
 
 
-class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
+def _attach_policy(*permissions):
+    """Return the per-method policy of an attach or create form on one managed device."""
+    target = Management("change", "device_pk", by="device")
+    return MappingProxyType(
+        {
+            "get": EndpointPolicy(target, "read", permissions=permissions),
+            "post": EndpointPolicy(target, "native_mutation", permissions=permissions),
+        }
+    )
+
+
+class NSORoutePolicyAttachView(AuthorizedView):
     """Attach an existing netbox-routing policy object to this device (greenfield write).
 
     Handles prefix-list / route-map / community-list / as-path.
@@ -8093,19 +8443,20 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
     owned route-policy intent), written on the next Apply.
     """
 
+    policy = _attach_policy()
+
     def get(self, request, device_pk):  # noqa: D102
-        from django.apps import apps
         from django.contrib.contenttypes.models import ContentType
 
         from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
 
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         attached = set(NSORoutePolicyState.objects.filter(management=mgmt).values_list("content_type_id", "object_id"))
         candidates = []
         for family, native_model_label in ROUTE_POLICY_NATIVE_MODEL_LABELS.items():
             model = apps.get_model(native_model_label)
             ct = ContentType.objects.get_for_model(model)
-            for obj in model.objects.all().order_by("name"):
+            for obj in model.objects.restrict(request.user, "view").order_by("name"):
                 if (ct.id, obj.pk) in attached:
                     continue
                 candidates.append(
@@ -8123,11 +8474,12 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
 
         from .ownership_planner import ROUTE_POLICY_NATIVE_MODEL_LABELS
 
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         try:
             family, ct_id, obj_pk = request.POST.get("policy", "").split(":")
             ct = ContentType.objects.get_for_id(int(ct_id))
-            obj = ct.get_object_for_this_type(pk=int(obj_pk))
+            # The shared object must be visible to the user: an excluded one is an invalid selection.
+            obj = ct.model_class().objects.restrict(request.user, "view").get(pk=int(obj_pk))
             if ROUTE_POLICY_NATIVE_MODEL_LABELS.get(family) != obj._meta.label_lower:
                 raise ValueError
         except (ValueError, ContentType.DoesNotExist, Exception):  # noqa: BLE001
@@ -8228,20 +8580,15 @@ class NSORoutePolicyAttachView(NSOActionPermissionMixin, View):
         )
 
 
-class NSOSubinterfaceCreateView(NSOActionPermissionMixin, View):
+class NSOSubinterfaceCreateView(AuthorizedView):
     """Create a device-scoped owned dot1q subinterface."""
 
-    required_permission = (
-        "netbox_nso_plugin.change_nsodevicemanagement",
-        "netbox_nso_plugin.add_nsosubinterfacestate",
-        "dcim.add_interface",
-    )
+    policy = _attach_policy("netbox_nso_plugin.add_nsosubinterfacestate", "dcim.add_interface")
 
     def get(self, request, device_pk):
-        management = get_object_or_404(
-            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
-        )
+        management = self.target.management
         form = NSOSubinterfaceCreateForm(device=management.device)
+        restrict_form_fields(form, request.user)
         return render(request, "netbox_nso_plugin/subinterface_form.html", {"form": form, "object": management.device})
 
     def post(self, request, device_pk):
@@ -8251,10 +8598,9 @@ class NSOSubinterfaceCreateView(NSOActionPermissionMixin, View):
         from .renderer_writer import IntentPlanStaleError
         from .subinterface_create import create_subinterface
 
-        management = get_object_or_404(
-            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
-        )
+        management = self.target.management
         form = NSOSubinterfaceCreateForm(request.POST, device=management.device)
+        restrict_form_fields(form, request.user)
         if form.is_valid():
             try:
                 create_subinterface(management, **form.cleaned_data)
@@ -8270,20 +8616,15 @@ class NSOSubinterfaceCreateView(NSOActionPermissionMixin, View):
         return render(request, "netbox_nso_plugin/subinterface_form.html", {"form": form, "object": management.device})
 
 
-class NSOSVICreateView(NSOActionPermissionMixin, View):
+class NSOSVICreateView(AuthorizedView):
     """Create a device-scoped owned SVI."""
 
-    required_permission = (
-        "netbox_nso_plugin.change_nsodevicemanagement",
-        "netbox_nso_plugin.add_nsosvistate",
-        "dcim.add_interface",
-    )
+    policy = _attach_policy("netbox_nso_plugin.add_nsosvistate", "dcim.add_interface")
 
     def get(self, request, device_pk):
-        management = get_object_or_404(
-            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
-        )
+        management = self.target.management
         form = NSOSVICreateForm(management=management)
+        restrict_form_fields(form, request.user)
         return render(request, "netbox_nso_plugin/svi_form.html", {"form": form, "object": management.device})
 
     def post(self, request, device_pk):
@@ -8293,10 +8634,9 @@ class NSOSVICreateView(NSOActionPermissionMixin, View):
         from .renderer_writer import IntentPlanStaleError
         from .svi_create import create_svi
 
-        management = get_object_or_404(
-            NSODeviceManagement.objects.restrict(request.user, "change"), device_id=device_pk
-        )
+        management = self.target.management
         form = NSOSVICreateForm(request.POST, management=management)
+        restrict_form_fields(form, request.user)
         if form.is_valid():
             try:
                 create_svi(management, **form.cleaned_data, svi_type=form.svi_type)
@@ -8316,7 +8656,7 @@ class NSOSVICreateView(NSOActionPermissionMixin, View):
         return render(request, "netbox_nso_plugin/svi_form.html", {"form": form, "object": management.device})
 
 
-class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
+class NSOBgpPeerCreateView(AuthorizedView):
     """Create a greenfield BGP peer scoped to one managed device (in-tab "Add BGP peer").
 
     Builds the netbox-routing object graph (BGPRouter → BGPScope → BGPPeer + address
@@ -8331,8 +8671,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
     subset of devices is honoured here as it is in NetBox's own object views.
     """
 
-    required_permission = (
-        "netbox_nso_plugin.change_nsodevicemanagement",
+    policy = _attach_policy(
         "netbox_routing.add_bgppeer",
         "netbox_routing.add_bgprouter",
         "netbox_routing.add_bgpscope",
@@ -8340,23 +8679,18 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         "netbox_routing.add_bgppeeraddressfamily",
     )
 
-    @staticmethod
-    def _mgmt_for(request, device_pk):
-        return get_object_or_404(
-            NSODeviceManagement.objects.restrict(request.user, "change"),
-            device_id=device_pk,
-        )
-
     def get(self, request, device_pk):  # noqa: D102
-        mgmt = self._mgmt_for(request, device_pk)
+        mgmt = self.target.management
         form = NSOBgpPeerGreenfieldForm(device=mgmt.device)
+        restrict_form_fields(form, request.user)
         return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
 
     def post(self, request, device_pk):  # noqa: D102
         from .bgp_router_content import BGPIntentError
 
-        mgmt = self._mgmt_for(request, device_pk)
+        mgmt = self.target.management
         form = NSOBgpPeerGreenfieldForm(request.POST, device=mgmt.device)
+        restrict_form_fields(form, request.user)
         if not form.is_valid():
             return render(request, "netbox_nso_plugin/bgp_peer_form.html", self._ctx(mgmt, form))
         try:
@@ -8406,7 +8740,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         )
         if len(routers) > 1:
             raise BGPIntentError("Resolve duplicate BGP routers for this device and ASN before adding a peer.")
-        router = routers[0] if routers else None
+        router = require_operator_view(routers[0]) if routers else None
         new_router = router is None
         if router is not None:
             state = NSOBGPRouterState.objects.filter(management=management, asn_str=str(data["local_asn"].asn)).first()
@@ -8443,7 +8777,11 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
                 force_insert=True,
                 natural_key=("assigned_object_type", "assigned_object_id", "asn"),
             )
-        scope = BGPScope.objects.filter(router=router, vrf=data.get("vrf")).first() if router.pk is not None else None
+        scope = (
+            operator_lookup(BGPScope, router=router, vrf=data.get("vrf"), create_if_missing=True)
+            if router.pk is not None
+            else None
+        )
         if scope is None:
             scope = BGPScope(router=router, vrf=data.get("vrf"))
             save(scope, force_insert=True, natural_key=("router", "vrf"))
@@ -8465,7 +8803,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         address_families = data.get("address_families") or ["ipv4-unicast"]
         for value in address_families:
             address_family = (
-                BGPAddressFamily.objects.filter(scope=scope, address_family=value).first()
+                operator_lookup(BGPAddressFamily, scope=scope, address_family=value, create_if_missing=True)
                 if scope.pk is not None
                 else None
             )
@@ -8549,7 +8887,7 @@ class NSOBgpPeerCreateView(NSOActionPermissionMixin, View):
         return peer
 
 
-class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
+class NSORoutePolicyCapabilityView(AuthorizedView):
     """Operator-facing capability matrix for one device's route-policy support.
 
     Lists, per ``(ned_id, sw_version)``, which route-map / community constructs this device
@@ -8559,24 +8897,23 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
     the per-object panel badge.
     """
 
-    #: A live NSO probe (POST, or GET ?refresh=1) is a device-touching action; a plain
-    #: cache-only GET is a read (login-only). Gate only the probe on the change permission.
-    _PROBE_PERMISSION = "netbox_nso_plugin.change_nsodevicemanagement"
-
-    def _require_probe_perm(self, request):
-        if request.user.is_authenticated and not request.user.has_perm(self._PROBE_PERMISSION):
-            raise PermissionDenied
+    policy = MappingProxyType(
+        {
+            "get": EndpointPolicy(Management("view", "device_pk", by="device", device_view=True), "adapter_action"),
+            "post": EndpointPolicy(Management("change", "device_pk", by="device"), "adapter_action"),
+        }
+    )
 
     def get(self, request, device_pk):  # noqa: D102
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
         refresh = request.GET.get("refresh") == "1"
+        mgmt = self.target.management
         if refresh:
-            self._require_probe_perm(request)  # a forced probe touches the device
+            # A forced probe touches the device: it needs the same authority as the POST.
+            self.target.require("change")
         return render(request, "netbox_nso_plugin/route_policy_capabilities.html", self._context(mgmt, refresh))
 
     def post(self, request, device_pk):  # noqa: D102
-        self._require_probe_perm(request)
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         ctx = self._context(mgmt, refresh=True)
         if ctx["known"]:
             messages.success(request, f"Refreshed capabilities for {mgmt.device.name}.")
@@ -8623,7 +8960,7 @@ class NSORoutePolicyCapabilityView(LoginRequiredMixin, View):
         }
 
 
-class NSOVLANAttachView(NSOActionPermissionMixin, View):
+class NSOVLANAttachView(AuthorizedView):
     """Attach an existing (shared) ipam.VLAN to this device — greenfield write path.
 
     The device↔VLAN link is the NSOVLANState overlay, *not* the VLAN group, so the
@@ -8633,12 +8970,19 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
     pushes the owned VLAN intent), so the vid+name is written on the next Apply.
     """
 
+    policy = _attach_policy()
+
     def get(self, request, device_pk):  # noqa: D102
         from ipam.models import VLAN
 
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         attached = NSOVLANState.objects.filter(management=mgmt).values_list("vlan_id", flat=True)
-        vlans = VLAN.objects.exclude(pk__in=list(attached)).select_related("group").order_by("vid")
+        vlans = (
+            VLAN.objects.restrict(request.user, "view")
+            .exclude(pk__in=list(attached))
+            .select_related("group")
+            .order_by("vid")
+        )
         return render(
             request,
             "netbox_nso_plugin/attach_vlan.html",
@@ -8651,13 +8995,14 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         from django.utils import timezone
         from ipam.models import VLAN
 
-        mgmt = get_object_or_404(NSODeviceManagement, device_id=device_pk)
+        mgmt = self.target.management
         try:
             vlan_id = int(request.POST.get("vlan", ""))
         except (TypeError, ValueError):
             messages.error(request, "Select a valid VLAN.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
-        vlan = VLAN.objects.filter(pk=vlan_id).first()
+        # An attach needs view on the shared VLAN; an excluded VLAN reads as unavailable.
+        vlan = VLAN.objects.restrict(request.user, "view").filter(pk=vlan_id).first()
         if vlan is None:
             messages.error(request, "The selected VLAN is no longer available.")
             return redirect(_device_nso_tab_url(mgmt.device_id))
@@ -8710,41 +9055,53 @@ class NSOVLANAttachView(NSOActionPermissionMixin, View):
         return redirect(_device_nso_tab_url(mgmt.device_id))
 
 
-class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):  # noqa: D101
-    model_class = NSOBFDInterfaceState
+class NSOBFDInterfaceStateAcceptView(OverlayStateAcceptMixin):
+    """Accept one BFD overlay; a missing native BFD interface is created with the accepted values."""
+
+    policy = _accept_policy(NSOBFDInterfaceState)
     renderer_scope = "bfd"
 
+    def native_writes(self, candidate):  # noqa: D102
+        return _bfd_native_writes(candidate, create_only=True)
 
-class NSOSnmpCommunityStateEditView(generic.ObjectEditView):  # noqa: D101
+
+class NSOSnmpCommunityStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOSnmpCommunityState.objects.all()
     form = NSOSnmpCommunityStateForm
 
 
-class NSOSnmpV3UserStateEditView(generic.ObjectEditView):  # noqa: D101
+class NSOSnmpV3UserStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOSnmpV3UserState.objects.all()
     form = NSOSnmpV3UserStateForm
 
 
-class NSOSnmpHostStateEditView(generic.ObjectEditView):  # noqa: D101
+class NSOSnmpHostStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOSnmpHostState.objects.all()
     form = NSOSnmpHostStateForm
 
 
-class NSOSnmpSystemInfoStateEditView(generic.ObjectEditView):  # noqa: D101
+class NSOSnmpSystemInfoStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOSnmpSystemInfoState.objects.all()
     form = NSOSnmpSystemInfoStateForm
 
 
-class NSOLoggingHostStateEditView(generic.ObjectEditView):  # noqa: D101
+class NSOLoggingHostStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOLoggingHostState.objects.all()
     form = NSOLoggingHostStateForm
 
 
-class NSOLoggingLevelStateEditView(generic.ObjectEditView):  # noqa: D101
+class NSOLoggingLevelStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOLoggingLevelState.objects.all()
     form = NSOLoggingLevelStateForm
 
 
-class NSOInterfaceMtuStateEditView(generic.ObjectEditView):  # noqa: D101
+class NSOInterfaceMtuStateEditView(AuthorizedGenericView, generic.ObjectEditView):  # noqa: D101
+    policy = generic_policy()
     queryset = NSOInterfaceMtuState.objects.all()
     form = NSOInterfaceMtuStateForm

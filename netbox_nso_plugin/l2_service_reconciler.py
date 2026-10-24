@@ -8,7 +8,10 @@ import contextlib
 import copy
 import logging
 
+from .native_authorization import Observed
+
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("l2_sap")
 
 # SR OS service-type to NetBox vpn.L2VPNTypeChoices code.
 _L2VPN_TYPE = {"epipe": "vpws", "vpls": "vpls"}
@@ -137,13 +140,14 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
     reported = set()
     reported_services = set()
 
-    def save(instance, *, update_fields=None, force_insert=False, natural_key=()):
+    def save(instance, *, update_fields=None, force_insert=False, natural_key=(), origin=None):
         saves.append(
             planned_save(
                 instance,
                 update_fields=update_fields,
                 force_insert=force_insert,
                 natural_key=natural_key,
+                origin=origin,
             )
         )
         operations.append((instance, update_fields, force_insert))
@@ -164,7 +168,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
                 type=l2vpn_type,
                 identifier=service.get("service_id"),
             )
-            save(l2vpn, force_insert=True, natural_key=("slug",))
+            save(l2vpn, force_insert=True, natural_key=("slug",), origin=_OBSERVED)
             l2vpns[slug] = l2vpn
         else:
             l2vpn = current_l2vpn
@@ -179,7 +183,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
                 fields.append("identifier")
             if fields:
                 l2vpn = candidate
-                save(l2vpn, update_fields=fields)
+                save(l2vpn, update_fields=fields, origin=_OBSERVED)
                 l2vpns[slug] = l2vpn
 
         for sap in service.get("saps", []):
@@ -216,6 +220,7 @@ def _l2_service_reconcile_operations(device, payload, planned_at):  # noqa: C901
                     termination,
                     force_insert=True,
                     natural_key=("assigned_object_type", "assigned_object_id"),
+                    origin=_OBSERVED,
                 )
                 terminations[interface.pk] = termination
             state.termination = termination

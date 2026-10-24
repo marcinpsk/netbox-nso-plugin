@@ -1380,7 +1380,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
     def test_vid_edit_rejects_a_taken_placeholder_name(self):
         from netbox_nso_plugin.signals import vlan_intent_item
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
+            SharedOperationConflict,
             reconcile_vlan_database,
             save_vlan_content,
         )
@@ -1392,7 +1392,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
         VLAN.objects.create(group=state.vlan.group, vid=7, name="VLAN 6")
         state.vlan.vid = 6
 
-        with self.assertRaises(VLANRescopeConflict):
+        with self.assertRaises(SharedOperationConflict):
             save_vlan_content(state.vlan, update_fields=("vid",))
 
         state.refresh_from_db()
@@ -1692,7 +1692,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
 
         from netbox_nso_plugin import intent_state
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
+            SharedOperationConflict,
             reconcile_vlan_database,
             rescope_vlan,
         )
@@ -1728,7 +1728,7 @@ class TestVlanReconciler(IntentPushResetMixin, TestCase):
                 "netbox_nso_plugin.vlan_reconciler._rescope_plan_ready",
                 side_effect=attach_before_transaction,
             ),
-            self.assertRaisesRegex(VLANRescopeConflict, "membership changed"),
+            self.assertRaisesRegex(SharedOperationConflict, "membership changed"),
         ):
             rescope_vlan(source_state, target_group, grant=OwnershipGrant("operator_edit"))
 

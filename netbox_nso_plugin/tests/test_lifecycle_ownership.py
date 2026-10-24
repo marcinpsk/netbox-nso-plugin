@@ -62,6 +62,10 @@ class TestInterfaceOwnershipLifecycle(IntentPushDeliveryMixin, TestCase):
         permission = ObjectPermission.objects.create(name="lifecycle-change-management", actions=["change"])
         permission.object_types.add(ObjectType.objects.get_for_model(NSODeviceManagement))
         permission.users.add(user)
+        # The interface writers write dcim.Interface through the NativeWriter (#1717).
+        native = ObjectPermission.objects.create(name="lifecycle-change-interface", actions=["change"])
+        native.object_types.add(ObjectType.objects.get_for_model(Interface))
+        native.users.add(user)
         self.client.force_login(user)
 
     def _classify(self, attribute="description"):

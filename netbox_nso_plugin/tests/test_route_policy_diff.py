@@ -20,6 +20,21 @@ def _rm(name, entries):
     return {"route_maps": [{"name": name, "entries": entries}]}
 
 
+def _grant_device_reads(user):
+    """Device-scoped pages need view on the device and its management (#1709)."""
+    from core.models import ObjectType
+    from dcim.models import Device
+    from users.models import ObjectPermission
+
+    from netbox_nso_plugin.models import NSODeviceManagement
+
+    permission = ObjectPermission.objects.create(name=f"diff-view-{user.username}", actions=["view"])
+    permission.object_types.add(
+        ObjectType.objects.get_for_model(Device), ObjectType.objects.get_for_model(NSODeviceManagement)
+    )
+    permission.users.add(user)
+
+
 def _entry(seq, action="permit", match=None, set_=None, **refs):
     e = {"sequence": seq, "action": action, "match": json.dumps(match or {}), "set": json.dumps(set_ or {})}
     e.update(refs)
@@ -204,6 +219,7 @@ class TestDiffViews(_RPBase):
         from django.contrib.auth import get_user_model
 
         user = get_user_model().objects.create_user(username="diff-op", password="pw")  # noqa: S106
+        _grant_device_reads(user)
         self.client.force_login(user)
 
     def _diverged_state(self, name):
@@ -623,6 +639,7 @@ class TestSimpleFamilyDiff(_RPBase):
         from netbox_nso_plugin.route_policy_reconciler import reconcile_route_policy
 
         user = get_user_model().objects.create_user(username="apdiff", password="pw")  # noqa: S106
+        _grant_device_reads(user)
         self.client.force_login(user)
         self._mgmt(self.d1)
         self._mgmt(self.d2)
@@ -725,6 +742,7 @@ class TestUnifiedPolicyDiff(_RPBase):
         from django.urls import reverse
 
         user = get_user_model().objects.create_user(username="diff-2panel", password="pw")  # noqa: S106
+        _grant_device_reads(user)
         self.client.force_login(user)
         st = self._diverged_route_map_state(name="RM-2P")
         resp = self.client.get(reverse("plugins:netbox_nso_plugin:routing_route_policy_diff", kwargs={"pk": st.pk}))

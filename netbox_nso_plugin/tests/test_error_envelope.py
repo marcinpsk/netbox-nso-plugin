@@ -19,6 +19,7 @@ from unittest.mock import patch
 import requests
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Platform, Site
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from ipam.models import IPAddress
@@ -164,7 +165,6 @@ class TestAdapterErrorEnvelopeInResponses(_UnreachableAdapterMixin, ViewTestBase
         interface = self._url("device_nso_category", pk=self.device.pk, key="interface")
         return [
             ("NSODeviceNamesView", self._url("ajax_nso_device_names", instance_pk=self.nso_instance.pk), "get", None),
-            ("NSOJobStatusView", self._url("nsojob_status", job_id=7), "get", None),
             ("NSODeviceJobsView", self._url("device_nso_jobs", pk=self.device.pk), "get", None),
             ("NSOCategoryView grid", f"{category}?refresh=1", "get", None),
             ("NSOCategoryView interface JSON", f"{interface}?refresh=1&format=json", "get", None),
@@ -251,7 +251,7 @@ class TestOnboardingErrorEnvelope(TestCase):
             patch("netbox_nso_plugin.adapter_client.list_instance_devices", side_effect=RuntimeError(_LEAK)),
             self.assertLogs(_ONBOARDING_LOG, level="ERROR") as logs,
         ):
-            data = build_onboarding_dashboard(self.instance)
+            data = build_onboarding_dashboard(self.instance, get_user_model().objects.create_superuser("env-viewer"))
 
         self.assertEnvelopeOnly(data["error"], expected_type="RuntimeError")
         self.assertTrue(any(_LEAK in line for line in logs.output))
@@ -406,12 +406,9 @@ class TestMalformedAdapterPayloadIsRefused(_UnreachableAdapterMixin, ViewTestBas
         return view.as_view()(request, **kwargs)
 
     def test_the_job_endpoints_answer_502_not_500(self):
-        from netbox_nso_plugin.views import NSODeviceJobsView, NSOJobStatusView
+        from netbox_nso_plugin.views import NSODeviceJobsView
 
-        for label, view, kwargs in (
-            ("NSOJobStatusView", NSOJobStatusView, {"job_id": 7}),
-            ("NSODeviceJobsView", NSODeviceJobsView, {"pk": self.device.pk}),
-        ):
+        for label, view, kwargs in (("NSODeviceJobsView", NSODeviceJobsView, {"pk": self.device.pk}),):
             with self.subTest(site=label):
                 resp = self._get(view, **kwargs)
 

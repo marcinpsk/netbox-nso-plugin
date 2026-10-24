@@ -265,7 +265,8 @@ class TestReconcileRedistribution(TestCase):
         self.assertIsNone(reconciled.redistribution_id)
         self.assertEqual(Redistribution.objects.count(), 1)
 
-    def test_owned_state_recreates_a_missing_native_redistribution(self):
+    def test_owned_state_with_a_missing_native_redistribution_keeps_the_gap(self):
+        """Owned intent reaches the native row only through the operator Accept (C12/C14)."""
         from django.db import transaction
         from django.utils import timezone
         from netbox_routing.models import ISISInstance, Redistribution, RouteMap
@@ -304,18 +305,10 @@ class TestReconcileRedistribution(TestCase):
         reconciled = reconcile_redistribution(self.device, payload)[0]
 
         revision.refresh_from_db()
-        self.assertIsNotNone(reconciled.redistribution_id)
+        self.assertIsNone(reconciled.redistribution_id)
         self.assertEqual(
             (reconciled.route_map, reconciled.metric, reconciled.metric_type),
             (accepted_route_map.name, 20, "internal"),
-        )
-        self.assertEqual(
-            (
-                reconciled.redistribution.route_map_id,
-                reconciled.redistribution.metric,
-                reconciled.redistribution.metric_type,
-            ),
-            (accepted_route_map.pk, 20, "internal"),
         )
         self.assertEqual(
             redistribution_intent_item(reconciled),
@@ -327,7 +320,7 @@ class TestReconcileRedistribution(TestCase):
                 "metric_type": "internal",
             },
         )
-        self.assertEqual(Redistribution.objects.count(), 1)
+        self.assertFalse(Redistribution.objects.exists())
         self.assertEqual(revision.revision, before)
 
     def test_category_reconcile_declares_its_native_and_overlay_writes(self):

@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 
 from .deployment import guarded as _deployment_guarded
+from .native_authorization import system_entry
 from .vlan_reconciler import _validated_switchport_items, _validated_vlan_items
 
 logger = logging.getLogger(__name__)
@@ -778,6 +779,7 @@ def reconcile_device(device, mgmt=None, *, call_class: str = "rq") -> dict:
 
 
 @_deployment_guarded("reconcile")
+@system_entry("refresh")
 def reconcile_category(device, mgmt, key: str) -> dict:  # noqa: C901
     """Reconcile a SINGLE category and return its display context (for lazy expand).
 
@@ -1455,6 +1457,7 @@ def run_device_reconcile(device_id: int, notify_class: bool = False) -> dict:
     return summary
 
 
+@system_entry("device reconcile")
 def enqueue_device_reconcile(device_id: int):
     """Enqueue a background reconcile for *device_id* via the READSEM 1334 queued-carrier arbiter.
 

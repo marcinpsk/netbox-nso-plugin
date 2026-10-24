@@ -20,6 +20,7 @@ from ._manual_capture_case import store_apply_selection
 from ._outbox_case import (
     ReceiptAdapter,
     content_update,
+    in_thread,
     make_managed,
     mirror_update,
     own_vlan,
@@ -693,6 +694,8 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         """A selector and the NetBox rows promoted with it must describe one intent."""
         from unittest.mock import patch
 
+        from ipam.models import VLAN
+
         from netbox_nso_plugin import delivery
 
         adapter = _ApplyContractAdapter(lambda selected: (202, _promoted(selected)))
@@ -703,10 +706,15 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
             answer = real_send(rendered, *args, **kwargs)
             if rendered.key[1] == "vlan" and not renamed:
                 renamed.append(True)
-                with without_commit_drain(), transaction.atomic():
-                    vlan = self.vlan_state.vlan
-                    vlan.name = "intent-changed-after-receipt"
-                    vlan.save(update_fields=["name"])
+
+                def rename():
+                    # Another operator's write commits on its own connection, outside this Apply request.
+                    with without_commit_drain(), transaction.atomic():
+                        vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)
+                        vlan.name = "intent-changed-after-receipt"
+                        vlan.save(update_fields=["name"])
+
+                in_thread(rename)
             return answer
 
         with patch("netbox_nso_plugin.delivery.send", side_effect=send_then_rename):
@@ -1133,7 +1141,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         request.session = {}
         request._messages = FallbackStorage(request)
         with suppress_intent_push():
-            response = NSOBFDInterfaceStateAcceptView().post(request, state.pk)
+            response = NSOBFDInterfaceStateAcceptView.as_view()(request, pk=state.pk)
         updater.join(10)
 
         self.assertTrue(accept_waited.is_set(), "the accept view did not wait for the concurrent row update")
@@ -2535,7 +2543,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         from ipam.models import VLAN
 
         from netbox_nso_plugin.vlan_reconciler import (
-            VLANRescopeConflict,
+            SharedOperationConflict,
             _device_vlan_group,
             placeholder_vlan_name,
             save_vlan_content,
@@ -2557,7 +2565,7 @@ class TestApplySelectorFlow(_CascadeFlushMixin, IntentPushResetMixin, Transactio
         with without_commit_drain(), transaction.atomic():
             vlan = VLAN.objects.get(pk=self.vlan_state.vlan_id)
             vlan.vid = new_vid
-            with self.assertRaisesMessage(VLANRescopeConflict, "placeholder name"):
+            with self.assertRaisesMessage(SharedOperationConflict, "placeholder name"):
                 save_vlan_content(vlan, update_fields=("vid",))
 
         vlan.refresh_from_db()

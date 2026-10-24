@@ -23,9 +23,11 @@ from .lacp_topology import (
     topology_validator,
 )
 from .models import NSODeviceManagement, NSOLACPBundleState, NSOLACPMemberState
+from .native_authorization import Observed
 from .renderer_writer import RendererMutationPlan, planned_delete, planned_save
 
 logger = logging.getLogger(__name__)
+_OBSERVED = Observed("lacp")
 
 
 def lacp_bundle_values(item):
@@ -132,7 +134,7 @@ class _LACPReconcilePlanner:
             )
             return
         self.projected[interface.name] = candidate
-        self.saves.append(planned_save(candidate, update_fields=(field,), expected_before=original))
+        self.saves.append(planned_save(candidate, update_fields=(field,), expected_before=original, origin=_OBSERVED))
 
     def project_native_topology(self):
         for bundle, _item in self.bundles:

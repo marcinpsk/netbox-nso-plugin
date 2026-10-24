@@ -10,7 +10,7 @@ const parsed = new DOMParser().parseFromString(source, 'text/html');
 const script = [...parsed.querySelectorAll('script')].find(node => node.textContent.includes('function renderIntentPanel(')).textContent;
 
 async function open(payload) {
-  document.body.innerHTML = `<div id="nso-job-status" data-job-status-url="/jobs/0/">
+  document.body.innerHTML = `<div id="nso-job-status">
     <div class="alert"></div><span id="nso-job-spinner"></span><span id="nso-job-message"></span></div>
     <form class="nso-action-form nso-apply-form" data-preview-url="/preview/"></form>
     <div id="nso-apply-modal" class="d-none"><div id="nso-apply-modal-body"></div></div>`;

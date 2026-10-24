@@ -5,6 +5,7 @@
 from unittest.mock import patch
 from uuid import uuid4
 
+from django.contrib.auth import get_user_model
 from django.test import TestCase, TransactionTestCase
 
 from ._outbox_case import content_update, make_device, make_managed, mirror_update, own_route, own_vlan
@@ -1920,9 +1921,10 @@ class TestOwnershipActionRecheck(_CascadeFlushMixin, IntentPushResetMixin, Trans
                     status="imported",
                 )
                 request = RequestFactory().post("/")
+                request.user = get_user_model().objects.create_superuser(username="recheck-operator")
                 request.session = {}
                 request._messages = FallbackStorage(request)
-                response = NSOBFDInterfaceStateAcceptView().post(request, current.pk)
+                response = NSOBFDInterfaceStateAcceptView.as_view()(request, pk=current.pk)
             self.assertEqual(response.status_code, 302)
             replacement.append(current.pk)
 

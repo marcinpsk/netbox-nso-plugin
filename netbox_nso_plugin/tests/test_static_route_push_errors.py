@@ -506,11 +506,14 @@ class TestStaticRouteFailureRender(IntentPushResetMixin, TestCase):
     def setUpTestData(cls):
         cls.device = _make_device("rnd")
         cls.mgmt = _make_mgmt(cls.device, "rnd", 9104)
+        cls.user = get_user_model().objects.create_user(username="route-grid-reader", is_superuser=True)
 
     def _grid(self):
-        from netbox_nso_plugin.views import NSOCategoryView
-
-        return NSOCategoryView()._grid_payload("static", self.device, self.mgmt)
+        self.client.force_login(self.user)
+        url = reverse("plugins:netbox_nso_plugin:device_nso_category", kwargs={"pk": self.device.pk, "key": "static"})
+        response = self.client.get(url, {"format": "json"})
+        self.assertEqual(response.status_code, 200)
+        return response.json()
 
     def test_a_failed_route_renders_its_own_error_and_a_failed_state(self):
         """P6.6 — a blue 'pending apply' chip with no text tells the operator to Apply again;
