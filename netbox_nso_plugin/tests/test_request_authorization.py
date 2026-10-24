@@ -9,6 +9,7 @@ ObjectPermission rows, real requests and the real ORM; only the adapter transpor
 """
 
 import importlib
+import json
 import pkgutil
 import re
 from contextlib import contextmanager
@@ -915,16 +916,42 @@ class TestTargetKinds(IntentPushResetMixin, TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_api_onboarding_rejects_malformed_identities_before_writes(self):
+        from netbox_nso_plugin.models import NSOInstance
+
         _grant(self.user, ("view",), Device)
         _grant(self.user, ("add", "change"), NSODeviceManagement)
+        _grant(self.user, ("view",), NSOInstance)
         api = self._api()
         url = reverse("plugins-api:netbox_nso_plugin-api:onboard")
         before = list(NSODeviceManagement.objects.values())
         invalid = [{"netbox_device_id": value} for value in ("abc", str(self.device_a.pk), True, False, 0, -1, [], {})]
-        invalid += [{"netbox_device_id": self.device_a.pk, "instance": value} for value in ([], {}, 1, True)]
+        invalid += [
+            {"netbox_device_id": self.device_a.pk, "instance": value}
+            for value in ([], {}, 1, True, "invalid\x00instance", "\ud800")
+        ]
         for body in invalid:
             with self.subTest(body=body):
-                response = api.post(url, body, format="json")
+                response = api.post(url, json.dumps(body), content_type="application/json")
+                self.assertEqual(response.status_code, 400, response.content)
+                self.assertEqual(list(NSODeviceManagement.objects.values()), before)
+                self.assertEqual(_CountingSession.calls, [])
+
+    def test_instance_selections_reject_null_characters_before_lookup(self):
+        from netbox_nso_plugin.models import NSOInstance
+
+        _grant(self.user, ("view",), Device)
+        _grant(self.user, ("view", "add", "change"), NSODeviceManagement)
+        _grant(self.user, ("view",), NSOInstance)
+        api = self._api()
+        before = list(NSODeviceManagement.objects.values())
+        for route, client, method, body in (
+            ("plugins:netbox_nso_plugin:onboard", self.client, "post", {"device": self.device_a.pk}),
+            ("plugins:netbox_nso_plugin:quick_manage", self.client, "post", {"device": self.device_a.pk}),
+            ("plugins:netbox_nso_plugin:onboarding_dashboard", self.client, "get", {}),
+            ("plugins-api:netbox_nso_plugin-api:onboarding_candidates", api, "get", {}),
+        ):
+            with self.subTest(route=route):
+                response = getattr(client, method)(reverse(route), {**body, "instance": "invalid\x00instance"})
                 self.assertEqual(response.status_code, 400, response.content)
                 self.assertEqual(list(NSODeviceManagement.objects.values()), before)
                 self.assertEqual(_CountingSession.calls, [])
