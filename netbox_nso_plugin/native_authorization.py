@@ -13,6 +13,7 @@ owned intent never reaches a native row through it. Outside a request no mode ap
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import inspect
 import re
@@ -534,7 +535,6 @@ class NativeWriter:
         self.mutated = False
         self._created = defaultdict(set)
         self._changed = defaultdict(set)
-        self._deleted = defaultdict(set)
 
     # The effects. Each authorizes first, holds its permit for the ORM call, then records it.
 
@@ -564,8 +564,6 @@ class NativeWriter:
         permit = _Permit("delete", model, instance=root, pks=deletes, updates=updates, tables=tables)
         with self._scope.holding(permit):
             yield
-        for label, pk in deletes:
-            self._deleted[label].add(pk)
 
     @contextlib.contextmanager
     def m2m(self, owner, field_name, *, origin):
@@ -582,7 +580,7 @@ class NativeWriter:
     def set_update(self, model, pks, values, *, origin):
         """Authorize one set-based update of exactly the rows *pks*."""
         pks = frozenset(pks)
-        self._authorize("set_update", model, pks=pks, update_fields=tuple(values), origin=origin)
+        self._authorize("set_update", model, pks=pks, update_fields=tuple(values), values=values, origin=origin)
         with self._scope.holding(_Permit("set_update", model, pks=pks, tables=_model_tables(model))):
             yield
         self._record(model, pks, "change")
@@ -630,18 +628,22 @@ class NativeWriter:
                 self._changed[label].add(pk)
 
     def verify(self):
-        """Require every completed native row in the user's add or change restriction (phase end)."""
+        """Require every surviving created or changed native row in the add or change restriction (phase end).
+
+        A row a savepoint rollback restored is verified again; a deleted row has nothing to verify.
+        """
         from django.apps import apps
 
         for rows, action in ((self._created, "add"), (self._changed, "change")):
             for label, pks in rows.items():
-                live = pks - self._deleted[label]
-                if live:
-                    self._require_rows(apps.get_model(label), action, live)
+                model = apps.get_model(label)
+                surviving = set(model._default_manager.filter(pk__in=pks).values_list("pk", flat=True))
+                if surviving:
+                    self._require_rows(model, action, surviving)
 
     # System authorization (C14).
 
-    def _system_check(self, kind, model, *, instance, pks, update_fields, created, field_name, origin):
+    def _system_check(self, kind, model, *, instance, pks, update_fields, created, field_name, values, origin):
         label = model._meta.label_lower
         if origin is None:
             _refuse(f"the system-scope {kind} of {label} declares no value source")
@@ -652,33 +654,50 @@ class NativeWriter:
         if not isinstance(origin, Observed):
             _refuse(f"unknown value source {origin!r}")
         for scope_label, entry in _anchored_entries(label):
-            for row in self._touched_rows(entry, kind, model, instance, pks, update_fields, created, field_name):
-                if entry.owned(row):
-                    _refuse(f"{label} row carries the owned intent of {scope_label}", OwnedIntentRefused)
+            if self._carries_owned_intent(
+                entry, kind, model, instance, pks, update_fields, created, field_name, values
+            ):
+                _refuse(f"{label} row carries the owned intent of {scope_label}", OwnedIntentRefused)
 
     @staticmethod
-    def _touched_rows(entry, kind, model, instance, pks, update_fields, created, field_name):
+    def _carries_owned_intent(entry, kind, model, instance, pks, update_fields, created, field_name, values):
+        """Return whether the effect writes the anchored entry's intent while its scope is owned (C14b).
+
+        A mapped change is checked at the stored and at the resulting anchor; any other change only
+        when it moves the row into an owned anchor.
+        """
         mapped = entry.fields
         if kind == "m2m":
-            return (instance,) if mapped is None or field_name in mapped else ()
-        if kind == "delete" or (kind == "save" and created):
-            return (instance,) if entry.lifecycle else ()
+            return (mapped is None or field_name in mapped) and entry.owned(instance)
+        if kind == "delete":
+            return entry.lifecycle and entry.owned(instance)
+        if kind == "save" and created:
+            return entry.owned(instance)
         # update_fields and set-update keys may name a field or its attname (instance or instance_id).
         names = {model._meta.get_field(name).name for name in update_fields} if update_fields is not None else None
-        concrete = [
-            column
-            for column in model._meta.concrete_fields
-            if (mapped is None or column.name in mapped) and (names is None or column.name in names)
-        ]
-        if not concrete:
-            return ()
+        columns = [column for column in model._meta.concrete_fields if names is None or column.name in names]
         if kind == "set_update":
-            return tuple(model._default_manager.filter(pk__in=pks))
-        stored = _stored(model, instance.pk)
-        if stored is None:
-            return ()
-        changed = any(getattr(stored, column.attname) != getattr(instance, column.attname) for column in concrete)
-        return (stored,) if changed else ()
+            pairs = []
+            for stored in model._default_manager.filter(pk__in=pks):
+                result = copy.copy(stored)
+                for name, value in values.items():
+                    setattr(result, model._meta.get_field(name).attname, value)
+                pairs.append((stored, result))
+        else:
+            stored = _stored(model, instance.pk)
+            pairs = [(stored, instance)] if stored is not None else []
+        for stored, result in pairs:
+            changed = {
+                column.name for column in columns if getattr(stored, column.attname) != getattr(result, column.attname)
+            }
+            if not changed:
+                continue
+            if mapped is None or changed & mapped:
+                if entry.owned(stored) or entry.owned(result):
+                    return True
+            elif entry.owned(result) and not entry.owned(stored):
+                return True
+        return False
 
     def _authorize(
         self,
@@ -690,6 +709,7 @@ class NativeWriter:
         update_fields=None,
         created=False,
         field_name=None,
+        values=None,
         origin,
     ):
         scope = self._scope
@@ -707,6 +727,7 @@ class NativeWriter:
                 update_fields=update_fields,
                 created=created,
                 field_name=field_name,
+                values=values,
                 origin=origin,
             )
 

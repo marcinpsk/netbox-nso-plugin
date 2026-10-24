@@ -479,6 +479,40 @@ class TestOperatorScopeGuards(IntentPushResetMixin, TestCase):
             self._create_entry(user, "nw-refused-map")
         self.assertFalse(RouteMapEntry.objects.filter(route_map__name="nw-refused-map").exists())
 
+    def test_a_rolled_back_delete_does_not_skip_the_completed_check(self):
+        """A delete a savepoint rolled back restores the row: its later change is verified at phase end."""
+        from django.db import transaction
+        from netbox_routing.models import RouteMap
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_delete,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        route_map = RouteMap.objects.create(name="ok-rolled-back")
+        user = operator((("change",), RouteMap, {"name__startswith": "ok"}), (("delete",), RouteMap, None))
+
+        def delete_then_fail():
+            doomed = RouteMap.objects.get(pk=route_map.pk)
+            plan = RendererMutationPlan.build(deletes=(planned_delete(doomed),))
+            with (
+                transaction.atomic(),
+                (renderer_writes if plan.changes_content else renderer_mirror_writes)(plan) as writer,
+            ):
+                writer.delete(doomed)
+                raise RuntimeError("a helper fails after its delete")
+
+        with self.assertRaises(PermissionsViolation), authority_scope("native_mutation", user):
+            with suppress(RuntimeError):
+                delete_then_fail()
+            candidate = RouteMap.objects.get(pk=route_map.pk)
+            candidate.name = "bad-rolled-back"
+            _plan_save(candidate, ("name",))
+        route_map.refresh_from_db()
+        self.assertEqual(route_map.name, "ok-rolled-back")
+
     def test_a_swallowed_denial_still_refuses_the_request(self):
         """The failure latch: a helper that catches the denial cannot commit the request (D9)."""
         user = operator((("change",), Interface, {"name": self.first.name}))
@@ -641,6 +675,36 @@ class TestSystemScope(IntentPushResetMixin, TestCase):
         with self.assertRaises(OwnedIntentRefused), _system_scope() as run:
             run(lambda: _plan_save(candidate, ("description",), origin=Observed("interface")))
         self.assertEqual(list(self.other.tagged_vlans.all()), [vlan])
+
+    def test_moving_a_native_row_into_an_owned_anchor_is_refused(self):
+        """C14b checks the resulting anchor too: an observed BFD row cannot move under an owned overlay."""
+        from netbox_routing.models import BFDInterface
+
+        source = Interface.objects.create(device=self.device, name="ge-0/0/20", type="1000base-t")
+        free = Interface.objects.create(device=self.device, name="ge-0/0/22", type="1000base-t")
+        native_row = BFDInterface.objects.create(interface=source, micro_bfd=False, enabled=True)
+        with without_commit_drain():
+            acquire_overlay(
+                NSOBFDInterfaceState,
+                management=self.management,
+                interface=self.other,
+                min_tx=300,
+                min_rx=300,
+                multiplier=3,
+                status="accepted",
+            )
+
+        def move(target):
+            candidate = BFDInterface.objects.get(pk=native_row.pk)
+            candidate.interface = target
+            _plan_save(candidate, ("interface",), origin=Observed("bfd"))
+
+        with self.assertRaises(OwnedIntentRefused), _system_scope() as run:
+            run(lambda: move(self.other))
+        with _system_scope() as run:
+            run(lambda: move(free))
+        native_row.refresh_from_db()
+        self.assertEqual(native_row.interface_id, free.pk)
 
     def test_a_direct_write_in_a_system_entry_needs_a_permit(self):
         from dcim.models import Site
