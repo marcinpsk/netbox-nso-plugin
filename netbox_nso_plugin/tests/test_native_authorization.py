@@ -23,6 +23,7 @@ from netbox_nso_plugin import native_authorization as native
 from netbox_nso_plugin.models import (
     NSOBFDInterfaceState,
     NSOISISInterfaceState,
+    NSORedistributionState,
     NSOSwitchportState,
 )
 from netbox_nso_plugin.native_authorization import (
@@ -772,6 +773,53 @@ class TestSystemScope(IntentPushResetMixin, TestCase):
             run(lambda: _plan_save(candidate, ("interface",), origin=Observed("isis")))
         native_row.refresh_from_db()
         self.assertEqual((native_row.interface_id, native_row.address_family), (source.pk, "ipv4"))
+
+    def test_an_observed_redistribution_cannot_fill_an_owned_gap(self):
+        """An owned redistribution without its native row: the system scope cannot create that row."""
+        from django.contrib.contenttypes.models import ContentType
+        from netbox_routing.models import OSPFInstance, Redistribution
+
+        from netbox_nso_plugin.renderer_writer import (
+            RendererMutationPlan,
+            planned_save,
+            renderer_mirror_writes,
+            renderer_writes,
+        )
+
+        owned = OSPFInstance.objects.create(device=self.device, process_id="11", name="11", router_id="198.18.0.11")
+        free = OSPFInstance.objects.create(device=self.device, process_id="12", name="12", router_id="198.18.0.12")
+        with without_commit_drain():
+            acquire_overlay(
+                NSORedistributionState,
+                management=self.management,
+                dest_protocol="ospf",
+                dest_ref="11",
+                source_protocol="static",
+                source_ref="",
+                metric=10,
+                status="accepted",
+            )
+
+        def create(destination):
+            row = Redistribution(
+                destination_type=ContentType.objects.get_for_model(OSPFInstance),
+                destination_id=destination.pk,
+                source_protocol="static",
+                source_ref="",
+                metric=20,
+            )
+            key = ("destination_type", "destination_id", "source_protocol", "source_ref")
+            plan = RendererMutationPlan.build(
+                saves=(planned_save(row, force_insert=True, natural_key=key, origin=Observed("redistribution")),)
+            )
+            with (renderer_writes if plan.changes_content else renderer_mirror_writes)(plan) as writer:
+                writer.save(row, force_insert=True)
+
+        with self.assertRaises(OwnedIntentRefused), _system_scope() as run:
+            run(lambda: create(owned))
+        with _system_scope() as run:
+            run(lambda: create(free))
+        self.assertEqual(list(Redistribution.objects.values_list("destination_id", flat=True)), [free.pk])
 
     def test_a_direct_write_in_a_system_entry_needs_a_permit(self):
         from dcim.models import Site
