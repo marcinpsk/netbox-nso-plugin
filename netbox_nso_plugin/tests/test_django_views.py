@@ -8724,14 +8724,21 @@ class TestReviewRegressionPins(ViewTestBase):
 class TestNSOVLANRescopeView(ViewTestBase):
     """POST-level cover for the rescope refusals the acquisition can raise."""
 
-    def test_rescope_refuses_when_a_device_attaches_before_acquisition(self):
-        """A device that attaches after the membership snapshot must get the refusal redirect."""
+    def test_rescope_returns_conflict_for_ajax_attachment_during_acquisition(self):
+        self.assertRescopeConflict(ajax=True)
+
+    def test_rescope_redirects_with_a_message_for_form_attachment_during_acquisition(self):
+        self.assertRescopeConflict(ajax=False)
+
+    def assertRescopeConflict(self, *, ajax):
         from django.contrib.messages import get_messages
+        from django.db import connection
         from ipam.models import VLAN, VLANGroup
 
-        from netbox_nso_plugin import intent_state, vlan_reconciler
         from netbox_nso_plugin.models import NSOIntentRevision, NSOVLANState
         from netbox_nso_plugin.vlan_reconciler import reconcile_vlan_database
+
+        from ._authority_case import FakeAdapter, concurrent_writer
 
         reconcile_vlan_database(self.device, {"vlans": [{"vlan_id": 44, "name": "MGMT"}]})
         state = NSOVLANState.objects.get(management=self.mgmt, vlan__vid=44)
@@ -8745,59 +8752,51 @@ class TestNSOVLANRescopeView(ViewTestBase):
             site=self.device.site,
         )
         late_mgmt = NSODeviceManagement.objects.create(
-            device=late_device,
-            nso_instance=self.nso_instance,
-            nso_device_name="late-rescope-router",
+            device=late_device, nso_instance=self.nso_instance, nso_device_name="late-rescope-router"
         )
-        original_managed_device_ids = vlan_reconciler._rescope_managed_device_ids
+        before = dict(NSOIntentRevision.objects.values_list("id", "revision"))
         attached = False
-        revisions_after_attach = {}
-        late_state_pk = None
 
-        def attach_before_acquisition(old_vlan):
-            nonlocal attached, late_state_pk
-            device_ids = original_managed_device_ids(old_vlan)
-            if not attached and old_vlan.pk == source_vlan.pk:
+        def attach_before_acquisition(execute, sql, params, many, context):
+            nonlocal attached
+            if not attached and "pg_advisory_xact_lock" in str(sql):
                 attached = True
-                late_state = NSOVLANState(
-                    management=late_mgmt,
-                    vlan=source_vlan,
-                    device_name="MGMT",
-                    status="imported",
-                )
-                with intent_state.intent_transaction(intent_state.footprint_for_instance(late_state)):
-                    late_state.save()
-                late_state_pk = late_state.pk
-                revisions_after_attach.update(
-                    dict(NSOIntentRevision.objects.values_list("id", "revision")),
-                )
-            # The stale membership snapshot is what makes the rescope find the extra device.
-            return device_ids
+                with concurrent_writer():
+                    NSOVLANState.objects.create(
+                        management=late_mgmt, vlan=source_vlan, device_name="MGMT", status="imported"
+                    )
+            return execute(sql, params, many, context)
 
-        with patch(
-            "netbox_nso_plugin.vlan_reconciler._rescope_managed_device_ids",
-            side_effect=attach_before_acquisition,
+        FakeAdapter.calls = []
+        with (
+            connection.execute_wrapper(attach_before_acquisition),
+            patch("netbox_nso_plugin.adapter_client.requests.Session", FakeAdapter),
+            self.captureOnCommitCallbacks() as callbacks,
         ):
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
                 {"group": target_group.pk},
+                **({"HTTP_X_REQUESTED_WITH": "XMLHttpRequest"} if ajax else {}),
             )
-
         self.assertTrue(attached)
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response["Location"], reverse("dcim:device_nso", kwargs={"pk": self.device.pk}))
-        self.assertEqual(
-            [str(message) for message in get_messages(response.wsgi_request)],
-            ["The VLAN attachment changed. Refresh the page and try again."],
-        )
+        if ajax:
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json()["status"], "error")
+        else:
+            self.assertRedirects(
+                response, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}), fetch_redirect_response=False
+            )
+            self.assertTrue(list(get_messages(response.wsgi_request)))
+        self.assertEqual(callbacks, [])
+        self.assertEqual(FakeAdapter.calls, [])
         source_vlan.refresh_from_db()
         target_vlan.refresh_from_db()
         state.refresh_from_db()
         self.assertNotEqual(source_vlan.group_id, target_group.pk)
         self.assertEqual(target_vlan.group_id, target_group.pk)
         self.assertEqual(state.vlan_id, source_vlan.pk)
-        self.assertEqual(NSOVLANState.objects.get(pk=late_state_pk).vlan_id, source_vlan.pk)
-        self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), revisions_after_attach)
+        self.assertFalse(NSOVLANState.objects.filter(management=late_mgmt, vlan=source_vlan).exists())
+        self.assertEqual(dict(NSOIntentRevision.objects.values_list("id", "revision")), before)
 
 
 class _ApplyBoundaryAdapter(ReceiptAdapter):

@@ -25,11 +25,10 @@ from django.shortcuts import get_object_or_404, redirect
 from django.urls import URLResolver, reverse
 from django.views import View
 
-from .native_authorization import authority_scope
+from .native_authorization import SharedOperationConflict, authority_scope, keep_authorized_target
 
-Effect = Literal["read", "native_mutation", "adapter_action", "unverified_native_mutation"]
-# unverified_native_mutation: native writes not yet routed through the NativeWriter (allocation, increment I3).
-EFFECTS: tuple[str, ...] = ("read", "native_mutation", "adapter_action", "unverified_native_mutation")
+Effect = Literal["read", "native_mutation", "adapter_action"]
+EFFECTS: tuple[str, ...] = ("read", "native_mutation", "adapter_action")
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options", "trace"})
 _HANDLER_METHODS = ("get", "post", "put", "patch", "delete")
 
@@ -212,7 +211,7 @@ def overlay_row(model, pk, user, action, *, base=None) -> AuthorizedTarget:
 
 def authorize_related_row(row, user, action):
     """Authorize a second overlay row an operation touches: 403 without the permission, 404 outside it."""
-    overlay_row(type(row), row.pk, user, action)
+    keep_authorized_target(overlay_row(type(row), row.pk, user, action))
 
 
 def _management_permissions(action, *, device_view=False):
@@ -340,18 +339,12 @@ class OverlayFamily(TargetSpec):
 
 
 def shared_vlan_rename(user, state):
-    """Require change on the shared VLAN and on every management attached to it (VLAN rename)."""
+    """Require change on the shared native root before validating a VLAN edit."""
     from ipam.models import VLAN
-
-    from .models import NSOVLANState
 
     if not user.has_perm("ipam.change_vlan"):
         raise PermissionDenied
     get_object_or_404(VLAN.objects.restrict(user, "change"), pk=state.vlan_id)
-    attached = set(NSOVLANState.objects.filter(vlan_id=state.vlan_id).values_list("management_id", flat=True))
-    permitted = set(_managements(user, "change").filter(pk__in=attached).values_list("pk", flat=True))
-    if permitted != attached:
-        raise Http404
 
 
 def is_valid_instance_id(value):
@@ -735,7 +728,7 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
         self.target = policy.authorize(request, user, kwargs)
         is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest" or "key" in kwargs
         try:
-            with authority_scope(policy.effects, user):
+            with authority_scope(policy.effects, user, target=self.target):
                 try:
                     return super().dispatch(request, *args, **kwargs)
                 except OwnershipNotQualified as exc:
@@ -743,6 +736,11 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
                         return JsonResponse({"status": "error", "message": exc.public_message}, status=400)
                     messages.error(request, exc.public_message)
                     return redirect(_device_nso_tab_url(exc.device_id))
+        except SharedOperationConflict as exc:
+            if is_ajax or self.target.device is None:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+            messages.error(request, str(exc))
+            return redirect(_device_nso_tab_url(self.target.device.pk))
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
             if is_ajax:
@@ -784,6 +782,8 @@ class AuthorizedAPIView(_PolicyEnforced):
             with contextlib.ExitStack() as stack:
                 self._authz_scope = stack
                 return super().dispatch(request, *args, **kwargs)
+        except SharedOperationConflict as exc:
+            return self.finalize_response(self.request, Response({"detail": str(exc)}, status=409), *args, **kwargs)
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
             return self.finalize_response(self.request, Response({"detail": str(exc)}, status=403), *args, **kwargs)
@@ -801,7 +801,7 @@ class AuthorizedAPIView(_PolicyEnforced):
         if isinstance(policy.target, NetBoxGeneric) and policy.effects == "native_mutation":
             # A NetBox viewset authorizes its own object writes (design 2b): no operator scope.
             return
-        self._authz_scope.enter_context(authority_scope(policy.effects, user))
+        self._authz_scope.enter_context(authority_scope(policy.effects, user, target=self.target))
 
 
 def view_class_of(callback):

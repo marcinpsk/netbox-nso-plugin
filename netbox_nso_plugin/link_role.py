@@ -307,8 +307,11 @@ def _provisioned_scopes(role) -> list[str]:
 
 def _push_provisioned(role, device_ids) -> None:
     """After a successful commit, push each affected (device, category) intent once."""
+    from utilities.exceptions import PermissionsViolation
+
     from . import drain
     from .models import NSODeviceManagement
+    from .native_authorization import NativeWriteRefused
 
     for device_id in device_ids:
         mgmt = NSODeviceManagement.objects.filter(device_id=device_id).first()
@@ -320,6 +323,8 @@ def _push_provisioned(role, device_ids) -> None:
                 # acknowledged baseline matching this snapshot would otherwise drop the
                 # re-provision silently (intent-integrity: no silent drop).
                 drain.push_now(device_id, scope, force=True)
+            except (PermissionsViolation, NativeWriteRefused):
+                raise
             except Exception as exc:  # noqa: BLE001 — adapter may be down; state already owned
                 logger.warning("provision_link_role: push failed for device %s: %s", device_id, exc)
 
@@ -380,7 +385,8 @@ def provision_link_role(interface) -> dict:
     from ipam.models import Prefix
 
     from .intent_state import _intent_transaction
-    from .ip_autoassign import _resolve_role_pool, assign_ips_for_role
+    from .ip_autoassign import _management_ids_for_interfaces, _resolve_role_pool, assign_ips_for_role
+    from .native_authorization import shared_operation
     from .signals import suppress_intent_push
 
     role, other_end = resolve_role(interface)
@@ -430,6 +436,8 @@ def provision_link_role(interface) -> dict:
             return summary
         mgmt_by_device[end.device_id] = end_mgmt
 
+    interface_ids = tuple(end.pk for end, _peer in pairs)
+    authorization = shared_operation(lambda: _management_ids_for_interfaces(interface_ids))
     site = getattr(interface.device, "site", None)
     resolved_pool_ids = {}
     for spec in intent_bundle(role).pools:
@@ -451,9 +459,12 @@ def provision_link_role(interface) -> dict:
                 .order_by("pk")
             }
             resolved_pools = {family: locked_pools.get(pool_id) for family, pool_id in resolved_pool_ids.items()}
-            with _intent_transaction(
-                _provision_link_footprint(role, pairs, device_ids),
-                bump_keys={(device_id, scope) for device_id in device_ids for scope in _provisioned_scopes(role)},
+            with (
+                _intent_transaction(
+                    _provision_link_footprint(role, pairs, device_ids),
+                    bump_keys={(device_id, scope) for device_id in device_ids for scope in _provisioned_scopes(role)},
+                ),
+                authorization,
             ):
                 with suppress_intent_push():
                     ip_res = assign_ips_for_role(

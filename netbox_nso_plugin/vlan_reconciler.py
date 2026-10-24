@@ -24,15 +24,11 @@ import logging
 from dataclasses import dataclass
 
 from .adapter_client import AdapterError
-from .native_authorization import Observed
+from .native_authorization import Observed, SharedOperationConflict, operator_user, shared_operation
 
 logger = logging.getLogger(__name__)
 _OBSERVED_VLAN = Observed("vlan")
 _OBSERVED_SWITCHPORT = Observed("switchport")
-
-
-class VLANRescopeConflict(Exception):
-    """The VLAN membership changed while a rescope request waited for admission."""
 
 
 @dataclass(frozen=True)
@@ -700,10 +696,17 @@ def _rescope_managed_device_ids(old_vlan) -> set[int]:
     return device_ids
 
 
-def _validate_rescope_managed_device_ids(old_vlan, locked_device_ids) -> None:
-    """Reject a managed VLAN attachment that arrived before membership locking."""
-    if not _rescope_managed_device_ids(old_vlan).issubset(locked_device_ids):
-        raise VLANRescopeConflict("a managed device attached to the VLAN while the rescope request waited")
+def vlan_affected_management_ids(vlan, *, references=True):
+    """Enumerate attachments and, for reference changes, every native and overlay consumer."""
+    from .models import NSODeviceManagement, NSOVLANState
+
+    if references:
+        return set(
+            NSODeviceManagement.objects.filter(device_id__in=_rescope_managed_device_ids(vlan)).values_list(
+                "pk", flat=True
+            )
+        )
+    return set(NSOVLANState.objects.filter(vlan=vlan).values_list("management_id", flat=True))
 
 
 def _vlan_repoint_plan(old_vlan, target_vlan, *, grant):  # noqa: C901
@@ -818,6 +821,17 @@ def _vlan_repoint_plan(old_vlan, target_vlan, *, grant):  # noqa: C901
     return plan, save_operations, m2m_operations, delete_operations, push_targets, device_ids
 
 
+def _rescope_target_vlan(old_vlan, target_group):
+    from django.shortcuts import get_object_or_404
+    from ipam.models import VLAN
+
+    existing = VLAN.objects.filter(group=target_group, vid=old_vlan.vid).exclude(pk=old_vlan.pk).first()
+    user = operator_user()
+    if existing is not None and user is not None:
+        return get_object_or_404(VLAN.objects.restrict(user, "view"), pk=existing.pk)
+    return existing
+
+
 def rescope_vlan(state, target_group, *, grant, _retry_on_stale=True):
     """Re-scope this device's VLAN into *target_group*, keeping it synced.
 
@@ -851,16 +865,15 @@ def rescope_vlan(state, target_group, *, grant, _retry_on_stale=True):
 
     state = NSOVLANState.objects.select_related("management", "vlan").filter(pk=state.pk).first()
     if state is None:
-        raise VLANRescopeConflict("the VLAN attachment no longer exists")
+        raise SharedOperationConflict("the VLAN attachment no longer exists")
     old_vlan = state.vlan
-    vid = old_vlan.vid
     if old_vlan.group_id == target_group.pk:
         return "noop", old_vlan
-    existing = VLAN.objects.filter(group=target_group, vid=vid).exclude(pk=old_vlan.pk).first()
+    existing = _rescope_target_vlan(old_vlan, target_group)
+    operation = shared_operation(lambda: vlan_affected_management_ids(old_vlan))
     old_key = {"group_id": old_vlan.group_id, "vid": old_vlan.vid}
     source_identity = (old_vlan.vid, old_vlan.group_id)
     target_identity = (existing.vid, existing.group_id) if existing is not None else None
-    managed_device_ids = _rescope_managed_device_ids(old_vlan)
     with transaction.atomic():
         try:
             if existing is None:
@@ -875,7 +888,7 @@ def rescope_vlan(state, target_group, *, grant, _retry_on_stale=True):
                     overlay_candidates.append(overlay)
                     saves.append(planned_save(overlay, update_fields=("status",)))
                 plan = _rescope_plan_ready(RendererMutationPlan.build(grant=grant, saves=saves))
-                with renderer_mirror_writes(plan) as writer, suppress_intent_push():
+                with renderer_mirror_writes(plan) as writer, operation, suppress_intent_push():
                     current_identity = VLAN.objects.filter(pk=old_vlan.pk).values_list("vid", "group_id").first()
                     if current_identity != source_identity:
                         raise IntentPlanStaleError("the source VLAN identity changed after planning")
@@ -896,8 +909,7 @@ def rescope_vlan(state, target_group, *, grant, _retry_on_stale=True):
             )
             plan = _rescope_plan_ready(plan)
             mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-            with mutation as writer:
-                _validate_rescope_managed_device_ids(old_vlan, managed_device_ids)
+            with mutation as writer, operation:
                 current_source = VLAN.objects.filter(pk=old_vlan.pk).values_list("vid", "group_id").first()
                 current_target = VLAN.objects.filter(pk=existing.pk).values_list("vid", "group_id").first()
                 current_state_vlan = NSOVLANState.objects.filter(pk=state.pk).values_list("vlan_id", flat=True).first()
@@ -930,11 +942,11 @@ def rescope_vlan(state, target_group, *, grant, _retry_on_stale=True):
                 writer.delete(old_vlan)
             return "merged", existing
         except IntegrityError as exc:
-            raise VLANRescopeConflict("the VLAN membership changed while the rescope request waited") from exc
+            raise SharedOperationConflict("the VLAN membership changed while the rescope request waited") from exc
         except IntentMutationProtocolError as exc:
             retryable = isinstance(exc, IntentPlanStaleError)
             if not _retry_on_stale or not retryable:
-                raise VLANRescopeConflict("the VLAN membership changed while the rescope request waited") from exc
+                raise SharedOperationConflict("the VLAN membership changed while the rescope request waited") from exc
             transaction.set_rollback(True)
     return rescope_vlan(state, target_group, grant=grant, _retry_on_stale=False)
 
@@ -1005,13 +1017,14 @@ def save_vlan_content(vlan, *, update_fields):
 
     stored = type(vlan).objects.filter(pk=vlan.pk).first()
     if stored is None:
-        raise VLANRescopeConflict("the VLAN no longer exists")
+        raise SharedOperationConflict("the VLAN no longer exists")
     update_fields = set(update_fields)
     changed_fields = {
         field_name for field_name in update_fields if getattr(stored, field_name) != getattr(vlan, field_name)
     }
     if not changed_fields:
         return stored
+    operation = shared_operation(lambda: vlan_affected_management_ids(stored, references="vid" in changed_fields))
     candidate = copy.copy(stored)
     for field_name in changed_fields:
         setattr(candidate, field_name, getattr(vlan, field_name))
@@ -1036,7 +1049,7 @@ def save_vlan_content(vlan, *, update_fields):
             .exists()
         )
         if name_taken:
-            raise VLANRescopeConflict("the placeholder name for the new VLAN ID is already in use")
+            raise SharedOperationConflict("the placeholder name for the new VLAN ID is already in use")
         candidate.name = derived_name
         changed_fields.add("name")
     state_candidates = []
@@ -1066,7 +1079,7 @@ def save_vlan_content(vlan, *, update_fields):
     saves.extend(planned_save(state, update_fields=fields) for state, fields in state_candidates)
     plan = RendererMutationPlan.build(saves=saves)
     mutation = renderer_writes(plan) if plan.changes_content else renderer_mirror_writes(plan)
-    with mutation as writer:
+    with mutation as writer, operation:
         writer.save(candidate, update_fields=changed_fields)
         for state_candidate, fields in state_candidates:
             writer.save(state_candidate, update_fields=fields)

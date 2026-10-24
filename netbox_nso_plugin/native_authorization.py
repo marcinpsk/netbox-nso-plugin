@@ -38,6 +38,10 @@ class OwnedIntentRefused(NativeWriteRefused):
     """The system scope refused a native effect that carries owned intent."""
 
 
+class SharedOperationConflict(RuntimeError):
+    """The affected management set changed before the mutation acquired its locks."""
+
+
 def _permissions_violation(message):
     from utilities.exceptions import PermissionsViolation
 
@@ -116,6 +120,14 @@ def _interface_scope_owned(model_name, scope):
         )
 
     return owned
+
+
+def interface_attribute_owned(interface, attribute):
+    """Return whether the overlay or manifest owns this interface attribute."""
+    return interface.pk is not None and (
+        _owned_overlay("nsointerfacestate", interface_id=interface.pk, attribute=attribute)
+        or _owned_manifest("interface", "dcim.interface", native_id=interface.pk, state_key__attribute=attribute)
+    )
 
 
 def _bfd_interface_owned(row):
@@ -208,6 +220,20 @@ OWNED_NATIVE_EFFECTS: Mapping[str, tuple[Anchored | Dependency, ...] | NoNativeI
                 owned=_interface_scope_owned("nsointerfacemtustate", "interface_mtu"),
             ),
         ),
+        "netbox_nso_plugin.nsointerfacestate": (
+            Anchored(
+                "dcim.interface",
+                frozenset({"description"}),
+                lifecycle=False,
+                owned=functools.partial(interface_attribute_owned, attribute="description"),
+            ),
+            Anchored(
+                "dcim.interface",
+                frozenset({"enabled"}),
+                lifecycle=False,
+                owned=functools.partial(interface_attribute_owned, attribute="enabled"),
+            ),
+        ),
         **{
             f"netbox_nso_plugin.{name}": NoNativeIntentEffects(_OVERLAY_ONLY)
             for name in (
@@ -222,7 +248,6 @@ OWNED_NATIVE_EFFECTS: Mapping[str, tuple[Anchored | Dependency, ...] | NoNativeI
         **{
             f"netbox_nso_plugin.{name}": NoNativeIntentEffects(_CENSUS_R3)
             for name in (
-                "nsointerfacestate",
                 "nsointerfaceipstate",
                 "nsosvistate",
                 "nsosubinterfacestate",
@@ -334,6 +359,10 @@ class _Scope:
     latched: str = ""
     refused: str = ""
     writer: NativeWriter | None = None
+    kept: set = field(default_factory=set)
+    effects: set = field(default_factory=set)
+    shared: list = field(default_factory=list)
+    conflict: str = ""
 
     def top(self):
         return self.permits[-1] if self.permits else None
@@ -392,11 +421,14 @@ def _entered(scope):
 
 
 @contextlib.contextmanager
-def _operator_scope(user):
+def _operator_scope(user, target=None):
     scope = _Scope("operator", user=user)
     scope.writer = NativeWriter(scope)
     with transaction.atomic(), _entered(scope):
+        keep_authorized_target(target)
         yield scope
+        if scope.conflict:
+            raise SharedOperationConflict(scope.conflict)
         # A denial latches: a helper that swallowed it still refuses the request.
         if scope.latched:
             raise _permissions_violation(scope.latched)
@@ -405,7 +437,7 @@ def _operator_scope(user):
 
 
 @contextlib.contextmanager
-def authority_scope(effects: str, user=None):
+def authority_scope(effects: str, user=None, *, target=None):
     """Run an endpoint's handler under the authority of its declared effect.
 
     Read and adapter-action endpoints may not write native rows. A native-mutation endpoint
@@ -419,11 +451,8 @@ def authority_scope(effects: str, user=None):
     elif effects == "native_mutation":
         if user is None:
             raise NativeWriteRefused("a native-mutation endpoint needs its operator")
-        with _operator_scope(user):
+        with _operator_scope(user, target):
             yield
-    elif effects == "unverified_native_mutation":
-        # The census pins these endpoints; increment I3 routes their writes through the NativeWriter.
-        yield
     else:
         raise NativeWriteRefused(f"unknown endpoint effect {effects!r}")
 
@@ -479,6 +508,166 @@ def requesting_user():
     """Return the operator of the running request, None outside a request."""
     scope = _SCOPE.get()
     return next((link.user for link in scope.chain() if link.user is not None), None) if scope else None
+
+
+def operator_user():
+    """Return the active operator, with no inherited authority inside a system entry."""
+    scope = _SCOPE.get()
+    return scope.user if scope is not None and scope.mode == "operator" else None
+
+
+def operator_created(row):
+    """Return whether this operator operation created the exact native row."""
+    scope = _SCOPE.get()
+    return scope is not None and scope.mode == "operator" and row.pk in scope.writer._created[row._meta.label_lower]
+
+
+def refuse_operator_write(message):
+    """Latch a permission refusal so a helper cannot swallow it and commit."""
+    scope = _SCOPE.get()
+    if scope is None or scope.mode != "operator":
+        raise NativeWriteRefused("a permission refusal needs its operator scope")
+    scope.writer._deny(message)
+
+
+def keep_authorized_target(target):
+    """Keep the management or unmanaged device that target authorization checked."""
+    scope = _SCOPE.get()
+    if scope is None or scope.mode != "operator" or target is None:
+        return
+    if target.management is not None:
+        scope.kept.add(("management", target.management.pk))
+    elif target.device is not None:
+        scope.kept.add(("device", target.device.pk))
+
+
+class shared_operation:
+    """Authorize one complete management set, then freeze it under the mutation locks."""
+
+    def __init__(self, affected):
+        from django.http import Http404
+
+        from .models import NSODeviceManagement
+
+        self.affected = affected
+        self.expected = frozenset(affected())
+        self.scope = _SCOPE.get()
+        self.checked = False
+        if self.scope is not None and self.scope.mode == "operator":
+            allowed = NSODeviceManagement.objects.restrict(self.scope.user, "change").filter(pk__in=self.expected)
+            if allowed.count() != len(self.expected):
+                raise Http404
+            self.scope.shared.append(self)
+
+    def verify(self):
+        """Re-enumerate before the first write, with the existing mutation locks held."""
+        if self.checked:
+            return
+        if frozenset(self.affected()) != self.expected:
+            message = "The shared object membership changed. Refresh the page and try again."
+            if self.scope is not None and self.scope.mode == "operator":
+                self.scope.conflict = self.scope.conflict or message
+            raise SharedOperationConflict(message)
+        if self.scope is not None and self.scope.mode == "operator":
+            self.scope.kept.update(("management", pk) for pk in self.expected)
+        self.checked = True
+
+    def __enter__(self):
+        self.verify()
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def verify_shared_operations():
+    """Check pending shared operations after source locks and before revision writes."""
+    scope = _SCOPE.get()
+    if scope is not None and scope.mode == "operator":
+        for operation in scope.shared:
+            operation.verify()
+
+
+def _record_effect(instance):
+    """Record both overlay ownership and direct native device references for phase-end checks."""
+    scope = _SCOPE.get()
+    if scope is None or scope.mode != "operator":
+        return
+    import operator
+
+    from django.core.exceptions import ObjectDoesNotExist
+
+    from .models import NSODeviceManagement
+    from .request_authorization import AUTHZ_TARGETS
+
+    for model, field_name in _overlay_through_owners(type(instance)):
+        _record_rows(model, (getattr(instance, field_name),))
+    path = AUTHZ_TARGETS.get(instance._meta.label_lower)
+    if path is not None:
+        try:
+            management = path.management_of(instance)
+        except ObjectDoesNotExist:
+            management = None
+        if management is not None:
+            scope.effects.add(("management", management.pk))
+        else:
+            device = operator.attrgetter(path.device.replace("__", "."))(instance)
+            scope.effects.add(("device", device.pk))
+        scope.writer.mutated = True
+    elif is_native(type(instance)) and any(
+        field.name == "device" and field.many_to_one and field.remote_field.model._meta.label_lower == "dcim.device"
+        for field in instance._meta.concrete_fields
+    ):
+        management_id = (
+            NSODeviceManagement.objects.filter(device_id=instance.device_id).values_list("pk", flat=True).first()
+        )
+        if management_id is not None:
+            scope.effects.add(("management", management_id))
+
+
+def _record_rows(model, pks):
+    scope = _SCOPE.get()
+    if scope is not None and scope.mode == "operator" and _records_effects(model):
+        for row in model._default_manager.filter(pk__in=pks):
+            _record_effect(row)
+
+
+@functools.cache
+def _overlay_through_owners(model):
+    from django.apps import apps
+
+    from .request_authorization import AUTHZ_TARGETS
+
+    return tuple(
+        (owner, model._meta.get_field(relation.m2m_field_name()).attname)
+        for label in AUTHZ_TARGETS
+        for owner in (apps.get_model(label),)
+        for relation in owner._meta.many_to_many
+        if relation.remote_field.through is model
+    )
+
+
+@functools.cache
+def _records_effects(model):
+    from .request_authorization import AUTHZ_TARGETS
+
+    return (
+        model._meta.label_lower in AUTHZ_TARGETS
+        or bool(_overlay_through_owners(model))
+        or (
+            is_native(model)
+            and any(
+                field.name == "device"
+                and field.many_to_one
+                and field.remote_field.model._meta.label_lower == "dcim.device"
+                for field in model._meta.concrete_fields
+            )
+        )
+    )
+
+
+def _record_saved(sender, instance, **kwargs):
+    _record_effect(instance)
 
 
 def require_operator_add(row) -> None:
@@ -626,6 +815,7 @@ class NativeWriter:
     def _record(self, model, pks, action):
         if self._scope.mode != "operator":
             return
+        _record_rows(model, pks)
         label = model._meta.label_lower
         for pk in pks:
             if action == "add":
@@ -638,7 +828,18 @@ class NativeWriter:
 
         A row a savepoint rollback restored is verified again; a deleted row has nothing to verify.
         """
+        from dcim.models import Device
         from django.apps import apps
+
+        from .models import NSODeviceManagement
+
+        scope = self._scope
+        if not scope.effects <= scope.kept:
+            self._deny("Write refused: an affected management was not declared by this operation.")
+        for kind, model in (("management", NSODeviceManagement), ("device", Device)):
+            pks = {pk for effect_kind, pk in scope.effects if effect_kind == kind}
+            if pks and _restricted(model, scope.user, "change").filter(pk__in=pks).count() != len(pks):
+                self._deny(f"Write refused: you cannot change every affected {model._meta.verbose_name}.")
 
         for rows, action in ((self._created, "add"), (self._changed, "change")):
             for label, pks in rows.items():
@@ -753,6 +954,9 @@ def _guarded_scope():
 
 
 def _guard_save(sender, instance, **kwargs):
+    if instance.pk is not None:
+        _record_rows(sender, (instance.pk,))
+    _record_effect(instance)
     scope = _guarded_scope()
     if scope is None or not is_native(sender):
         return
@@ -780,6 +984,7 @@ def _through_owned(model, row, permit):
 
 
 def _guard_delete(sender, instance, **kwargs):
+    _record_effect(instance)
     scope = _guarded_scope()
     if scope is None or not is_native(sender):
         return
@@ -791,6 +996,27 @@ def _guard_delete(sender, instance, **kwargs):
 def _guard_m2m(sender, instance, action, reverse, pk_set=None, **kwargs):
     if not action.startswith(("pre_", "post_")):
         return
+    if reverse:
+        owners = [
+            field
+            for field in sender._meta.fields
+            if field.many_to_one and field.remote_field.model is not type(instance)
+        ]
+        if len(owners) == 1:
+            owner_model = owners[0].remote_field.model
+            selected = pk_set
+            if selected is None:
+                relation_field = next(
+                    field
+                    for field in sender._meta.fields
+                    if field.many_to_one and field.remote_field.model is type(instance)
+                )
+                selected = sender.objects.filter(**{relation_field.attname: instance.pk}).values_list(
+                    owners[0].attname, flat=True
+                )
+            _record_rows(owner_model, selected)
+    else:
+        _record_effect(instance)
     scope = _guarded_scope()
     if scope is None or sender._meta.db_table not in native_tables():
         return
@@ -841,9 +1067,16 @@ def _guarded_update(original):
     def guarded(self, **kwargs):
         scope = _guarded_scope()
         if scope is None or not is_native(self.model):
-            return original(self, **kwargs)
+            if scope is None or scope.mode != "operator" or not _records_effects(self.model):
+                return original(self, **kwargs)
+            selected = set(self.values_list("pk", flat=True))
+            _record_rows(self.model, selected)
+            result = original(self, **kwargs)
+            _record_rows(self.model, selected)
+            return result
         permit = scope.top()
         if _bookkeeping_update(self.model, kwargs, permit):
+            _record_rows(self.model, self.values_list("pk", flat=True))
             with scope.holding(_Permit("bookkeeping", self.model, tables=_model_tables(self.model))):
                 return original(self, **kwargs)
         selected = set(self.values_list("pk", flat=True))
@@ -858,7 +1091,10 @@ def _guarded_update(original):
         )
         if not (exact and selected == permit.pks) and not collected:
             _refuse(f"native queryset update of {label} without its writer permit")
-        return original(self, **kwargs)
+        _record_rows(self.model, selected)
+        result = original(self, **kwargs)
+        _record_rows(self.model, selected)
+        return result
 
     guarded._nso_native_guard = True
     return guarded
@@ -871,7 +1107,16 @@ def _guarded_bulk(bulk):
     def guarded(self, *args, **kwargs):
         scope = _guarded_scope()
         if scope is None or not is_native(self.model):
-            return bulk(self, *args, **kwargs)
+            if scope is None or scope.mode != "operator" or not _records_effects(self.model):
+                return bulk(self, *args, **kwargs)
+            call = signature.bind(self, *args, **kwargs)
+            call.arguments["objs"] = rows = list(call.arguments["objs"])
+            _record_rows(self.model, [row.pk for row in rows if row.pk is not None])
+            for row in rows:
+                _record_effect(row)
+            result = bulk(*call.args, **call.kwargs)
+            _record_rows(self.model, [row.pk for row in rows if row.pk is not None])
+            return result
         call = signature.bind(self, *args, **kwargs)
         if call.arguments.get("update_conflicts"):
             # An upsert changes the stored conflict row, which the proposed rows do not name.
@@ -884,6 +1129,7 @@ def _guarded_bulk(bulk):
         names = tuple(call.arguments.get("fields", ())) if bulk.__name__ == "bulk_update" else ()
         if not _bookkeeping_update(self.model, names, permit):
             _refuse(f"native bulk write of {self.model._meta.label_lower} without its writer permit")
+        _record_rows(self.model, [row.pk for row in rows])
         with scope.holding(_Permit("bookkeeping", self.model, tables=_model_tables(self.model))):
             return bulk(*call.args, **call.kwargs)
 
@@ -913,6 +1159,8 @@ def _guarded_create(original):
         scope = _guarded_scope()
         if scope is not None and self.model._meta.auto_created and is_native(self.model):
             _refuse_foreign_through_rows(self.model, [self.model(**kwargs)], scope.top(), "create")
+        if scope is not None and scope.mode == "operator" and _overlay_through_owners(self.model):
+            _record_effect(self.model(**kwargs))
         return original(self, **kwargs)
 
     guarded._nso_native_guard = True
@@ -925,6 +1173,8 @@ def _guarded_delete(original):
         scope = _guarded_scope()
         if scope is not None and self.model._meta.auto_created and is_native(self.model):
             _refuse_foreign_through_rows(self.model, list(self), scope.top(), "delete")
+        if scope is not None and scope.mode == "operator" and _overlay_through_owners(self.model):
+            _record_rows(self.model, self.values_list("pk", flat=True))
         return original(self)
 
     guarded._nso_native_guard = True
@@ -936,6 +1186,7 @@ def install_guards() -> None:
     from django.db.models import QuerySet, signals
 
     signals.pre_save.connect(_guard_save, dispatch_uid="nso_native_guard_save")
+    signals.post_save.connect(_record_saved, dispatch_uid="nso_overlay_effect_save")
     signals.pre_delete.connect(_guard_delete, dispatch_uid="nso_native_guard_delete")
     signals.m2m_changed.connect(_guard_m2m, dispatch_uid="nso_native_guard_m2m")
     for name, guard in (("update", _guarded_update), ("create", _guarded_create), ("delete", _guarded_delete)):
