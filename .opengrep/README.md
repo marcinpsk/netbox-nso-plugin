@@ -105,3 +105,9 @@ The ownership refusal check rejects `str`, `repr`, and `.args` reads inside
 bare and module-qualified `OwnershipNotQualified` handlers. Use the authored
 `public_message` field. This check covers direct reads, not aliases or helper
 functions. CodeQL still checks exception diagnostics in HTTP responses.
+
+The `nso-nullable-isis-intent-bool` rule rejects direct Boolean conversion of
+BFD and FRR intent fields in the shared IS-IS interface and device comparisons.
+It also rejects conversion of their dictionary values. Display conversions
+outside those comparisons remain valid. The rule does not follow aliases or
+detect comparisons under other function names.
