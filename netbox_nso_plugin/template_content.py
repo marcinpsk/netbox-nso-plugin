@@ -1745,8 +1745,8 @@ def _isis_interface_matches_intent(entry, state) -> bool:
         and (entry.get("circuit_type") or "") == (state.circuit_type or "")
         and bool(entry.get("passive", False)) == bool(state.passive)
         # None leaves BFD and FRR unconfigured; explicit values must match.
-        and (state.bfd_enabled is None or bool(entry.get("bfd_enabled")) == bool(state.bfd_enabled))
-        and (state.frr_enabled is None or bool(entry.get("frr_enabled")) == bool(state.frr_enabled))
+        and (state.bfd_enabled is None or entry.get("bfd_enabled") is state.bfd_enabled)
+        and (state.frr_enabled is None or entry.get("frr_enabled") is state.frr_enabled)
         and (not state.frr_protection or (entry.get("frr_protection") or "") == state.frr_protection)
     )
 

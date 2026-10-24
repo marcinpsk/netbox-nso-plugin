@@ -841,3 +841,21 @@ rules:
     paths:
       include: ["netbox_nso_plugin/**/*.py"]
       exclude: ["**/tests/**"]
+
+  - id: nso-nullable-isis-intent-bool
+    languages: [python]
+    severity: ERROR
+    message: Keep nullable IS-IS intent flags distinct. Boolean conversion treats unconfigured as disabled.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              def _isis_interface_matches_intent(...):
+                  ...
+          - pattern-inside: |
+              def _isis_device_matches_intent(...):
+                  ...
+      - pattern-either:
+          - pattern: bool($STATE.bfd_enabled)
+          - pattern: bool($STATE.frr_enabled)
+          - pattern: bool($ENTRY.get("bfd_enabled", ...))
+          - pattern: bool($ENTRY.get("frr_enabled", ...))
