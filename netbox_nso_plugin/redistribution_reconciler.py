@@ -97,14 +97,16 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     """Resolve the native destination object for one redistribution entry."""
     from netbox_routing.models import BGPAddressFamily, BGPRouter, BGPScope, ISISInstance, OSPFInstance
 
+    from .native_lookup import operator_lookup
+
     if dest_protocol == "ospf":
         try:
             process_id = int(dest_ref)
         except (TypeError, ValueError):
             return None
-        return OSPFInstance.objects.filter(device=device, process_id=process_id).first()
+        return operator_lookup(OSPFInstance, device=device, process_id=process_id)
     if dest_protocol == "isis":
-        return ISISInstance.objects.filter(device=device, process_tag=dest_ref or "").first()
+        return operator_lookup(ISISInstance, device=device, process_tag=dest_ref or "")
     if dest_protocol != "bgp":
         return None
 
@@ -117,26 +119,27 @@ def _resolve_redist_destination(device, dest_protocol: str, dest_ref: str):
     except ValueError:
         return None
     try:
-        asn = ASN.objects.filter(asn=int(asn_value)).first()
+        asn = operator_lookup(ASN, asn=int(asn_value))
     except (TypeError, ValueError):
         return None
     if asn is None or not address_family:
         return None
     device_type = ContentType.objects.get_for_model(Device)
-    router = BGPRouter.objects.filter(
+    router = operator_lookup(
+        BGPRouter,
         assigned_object_type=device_type,
         assigned_object_id=device.pk,
         asn=asn,
-    ).first()
+    )
     if router is None:
         return None
-    vrf = VRF.objects.filter(name=vrf_name).first() if vrf_name else None
+    vrf = operator_lookup(VRF, name=vrf_name) if vrf_name else None
     if vrf_name and vrf is None:
         return None
-    scope = BGPScope.objects.filter(router=router, vrf=vrf).first()
+    scope = operator_lookup(BGPScope, router=router, vrf=vrf)
     if scope is None:
         return None
-    return BGPAddressFamily.objects.filter(scope=scope, address_family=address_family).first()
+    return operator_lookup(BGPAddressFamily, scope=scope, address_family=address_family)
 
 
 def _redist_metric_type(entry: dict) -> str:

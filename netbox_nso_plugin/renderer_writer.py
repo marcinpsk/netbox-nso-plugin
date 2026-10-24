@@ -1409,6 +1409,9 @@ class RendererWriter:
         )
 
     def _resolve_reference(self, reference):
+        from .native_authorization import is_native, operator_created, operator_user
+        from .native_lookup import operator_lookup
+
         model = apps.get_model(reference.model_label)
         filters = {}
         for attname, expected in reference.natural_key:
@@ -1418,7 +1421,10 @@ class RendererWriter:
                     return None
                 expected = related.pk
             filters[attname] = thaw_field_value(model._meta.get_field(attname), expected)
-        return model._default_manager.filter(**filters).first()
+        existing = model._default_manager.filter(**filters).first()
+        if existing is not None and operator_user() is not None and is_native(model) and not operator_created(existing):
+            return operator_lookup(model, create_if_missing=True, **filters)
+        return existing
 
     def _resolve_creation(self, write):
         return self._resolve_reference(
@@ -1442,6 +1448,9 @@ class RendererWriter:
 
     def consume_existing_creation(self, instance) -> bool:
         """Consume a planned insert that a concurrent writer materialized first."""
+        from .native_authorization import is_native
+        from .native_lookup import require_operator_view
+
         if instance.pk is None:
             return False
         index = next(
@@ -1458,6 +1467,8 @@ class RendererWriter:
         )
         if index is None:
             return False
+        if is_native(type(instance)):
+            require_operator_view(instance)
         write = self.plan.write_set[index]
         if not self._creation_matches(write, instance):
             raise IntentPlanStaleError(f"{write.model_label} creation {write.natural_key!r} changed after planning")
