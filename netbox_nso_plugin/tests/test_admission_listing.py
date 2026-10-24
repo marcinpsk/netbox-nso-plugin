@@ -86,6 +86,34 @@ class TestAdmissionListing(DeploymentCase):
     def test_replayed_admission_links_match_the_listing_before_persistence(self):
         self.assert_admission_links_reconciled("replayed")
 
+    def test_non_object_replay_response_is_invalid_before_persistence(self):
+        self.prepare()
+        self.serve_terminal_evidence(self.terminal())
+        NSOApplyAttempt.objects.filter(pk=self.attempt.pk).update(response=None, http_status=None)
+        original = self.adapter._handle
+
+        def handle(method, url, **kwargs):
+            response = original(method, url, **kwargs)
+            if method == "POST" and url.endswith("/deployment-evidence"):
+                document = response.json()
+                document["unknown_apply_attempt_ids"] = [str(self.attempt.pk)]
+                return make_response(200, document)
+            return response
+
+        self.adapter._handle = handle
+        before_attempts = list(NSOApplyAttempt.objects.values())
+        before_selections = list(NSOAcceptedSelection.objects.values())
+        for result in ("invalid", ["invalid"], 42, False):
+            with self.subTest(result=result):
+                self.adapter.apply_response = lambda selected: (202, result)
+                with self.assertRaisesRegex(
+                    EvidenceInvariantError, "deployment evidence has an invalid stored response"
+                ):
+                    load_deployment_evidence(self.management)
+                self.assertEqual(list(NSOApplyAttempt.objects.values()), before_attempts)
+                self.assertEqual(list(NSOAcceptedSelection.objects.values()), before_selections)
+                self.assertFalse(NSOApplyExecution.objects.exists())
+
     def test_retained_full_promotion_links_match_the_listing_before_use(self):
         self.assert_admission_links_reconciled("retained")
 
