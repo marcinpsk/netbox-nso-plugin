@@ -2,7 +2,8 @@
 # Copyright (C) 2026 Marcin Zieba <marcinpsk@gmail.com>
 """Operator-selected native dependencies require view permission on the selected row."""
 
-from dcim.models import Interface
+from dcim.models import Device, Interface
+from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.urls import reverse
 from ipam.models import ASN, RIR, VRF, IPAddress
@@ -27,6 +28,8 @@ from netbox_nso_plugin.intent_state import offline_mutation
 from netbox_nso_plugin.models import (
     NSOBFDInterfaceState,
     NSOBGPPeerState,
+    NSODeviceManagement,
+    NSOInterfaceIPState,
     NSOISISInterfaceState,
     NSOOSPFInstanceState,
     NSOOSPFInterfaceState,
@@ -36,9 +39,51 @@ from netbox_nso_plugin.native_authorization import authority_scope
 from netbox_nso_plugin.ownership_grants import OwnershipGrant
 from netbox_nso_plugin.renderer_writer import RendererMutationPlan, planned_save, renderer_mirror_writes
 
-from ._authority_case import AdapterCase, FakeAdapter, operator
+from ._authority_case import AdapterCase, FakeAdapter, grant, operator
 from ._outbox_case import make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
+
+
+class TestStoredInterfaceIpVrf(AdapterCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.device, cls.management = make_managed("stored-ip-vrf", 17217)
+        cls.interface = Interface.objects.create(device=cls.device, name="Ethernet1", type="1000base-t")
+        cls.vrf = VRF.objects.create(name="stored-ip-vrf")
+        cls.native = IPAddress.objects.create(address="198.18.40.1/31", vrf=cls.vrf, assigned_object=cls.interface)
+        with without_commit_drain():
+            cls.state = acquire_overlay(
+                NSOInterfaceIPState,
+                interface=cls.interface,
+                address="198.18.40.1/31",
+                vrf=cls.vrf.name,
+                family="ipv4",
+                status="in_sync",
+            )
+
+    def test_address_edit_preserves_stored_vrf_without_view_permission(self):
+        user = get_user_model().objects.create_user(username="stored-ip-vrf-editor")
+        grant(user, ("view",), Device, {"pk": self.device.pk})
+        grant(user, ("view", "change"), NSODeviceManagement, {"pk": self.management.pk})
+        grant(user, ("view", "change"), IPAddress, {"pk": self.native.pk})
+        self.assertFalse(user.has_perm("ipam.view_vrf"))
+        self.assertFalse(VRF.objects.restrict(user, "view").filter(pk=self.vrf.pk).exists())
+        self.client.force_login(user)
+
+        response = self.client.post(
+            reverse("plugins:netbox_nso_plugin:nsointerfaceipstate_edit", args=(self.state.pk,)),
+            {"address": "198.18.40.3/31"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.native.refresh_from_db()
+        self.state.refresh_from_db()
+        self.assertEqual(str(self.native.address), "198.18.40.3/31")
+        self.assertEqual(self.native.vrf_id, self.vrf.pk)
+        self.assertEqual(self.native.assigned_object, self.interface)
+        self.assertEqual(self.state.address, "198.18.40.3/31")
+        self.assertEqual(self.state.vrf, self.vrf.name)
+        self.assertEqual(self.state.status, "accepted")
 
 
 class TestBfdProfileLookup(AdapterCase):

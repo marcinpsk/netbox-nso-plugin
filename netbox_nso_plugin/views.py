@@ -6937,7 +6937,7 @@ def _prepare_ip_update(state, field, raw):
         return None, "Enter a valid IPv4 or IPv6 address with a prefix length."
     if "/" not in value:
         return None, "Include the prefix length (for example, /31 or /128)."
-    vrf_obj = operator_lookup(VRF, name=state.vrf) if state.vrf else None
+    vrf_obj = VRF.objects.filter(name=state.vrf).first() if state.vrf else None
     if state.vrf and vrf_obj is None:
         return None, f"VRF '{state.vrf}' does not exist in NetBox."
     return {

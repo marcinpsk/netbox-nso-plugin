@@ -10,10 +10,19 @@ from django.db import connection
 from django.urls import reverse
 from ipam.models import VLAN, VLANGroup
 
-from netbox_nso_plugin.models import NSODeviceManagement, NSOSwitchportState, NSOVLANState
+from netbox_nso_plugin.models import (
+    NSODeviceManagement,
+    NSOIntentOutboxEntry,
+    NSOIntentOutboxState,
+    NSOIntentRevision,
+    NSOOwnershipAcquisition,
+    NSOOwnershipManifest,
+    NSOSwitchportState,
+    NSOVLANState,
+)
 
 from ._authority_case import AdapterCase, concurrent_writer, grant
-from ._outbox_case import make_managed, without_commit_drain
+from ._outbox_case import make_device, make_managed, without_commit_drain
 from ._ownership_case import acquire_overlay
 
 
@@ -105,6 +114,66 @@ class TestSharedVlanRequests(AdapterCase):
             response = self._rescope(user)
         self.assertEqual(response.status_code, 403)
         self._assert_original()
+
+    def _unmanaged_consumer(self):
+        device = make_device("shared-vlan-unmanaged")
+        self.assertFalse(NSODeviceManagement.objects.filter(device=device).exists())
+        interface = Interface.objects.create(
+            device=device, name="Ethernet1", type="1000base-t", mode="tagged", untagged_vlan=self.source
+        )
+        interface.tagged_vlans.add(self.source)
+        return interface
+
+    def _snapshot(self):
+        return {
+            model._meta.label_lower: list(model.objects.order_by("pk").values())
+            for model in (
+                VLAN,
+                VLANGroup,
+                Interface,
+                Interface.tagged_vlans.through,
+                NSOVLANState,
+                NSOSwitchportState,
+                NSOSwitchportState.tagged_vlans.through,
+                NSOOwnershipAcquisition,
+                NSOOwnershipManifest,
+                NSOIntentRevision,
+                NSOIntentOutboxEntry,
+                NSOIntentOutboxState,
+            )
+        }
+
+    def test_merge_refuses_an_excluded_unmanaged_interface_and_rolls_back(self):
+        interface = self._unmanaged_consumer()
+        user = self._user(interface=False)
+        grant(user, ("change",), Interface, {"device_id__in": [self.device_a.pk, self.device_b.pk]})
+        self.assertTrue(Interface.objects.restrict(user, "change").filter(pk=self.interface.pk).exists())
+        self.assertFalse(Interface.objects.restrict(user, "change").filter(pk=interface.pk).exists())
+        before = self._snapshot()
+        with self.assert_refused_whole():
+            response = self._rescope(user)
+        self.assertEqual(response.status_code, 403, response.content)
+        self.assertEqual(self._snapshot(), before)
+        self._assert_original()
+        interface.refresh_from_db()
+        self.assertEqual(interface.untagged_vlan_id, self.source.pk)
+        self.assertEqual(list(interface.tagged_vlans.all()), [self.source])
+        self.assertFalse(NSOVLANState.objects.filter(vlan=self.target).exists())
+
+    def test_merge_moves_an_unmanaged_interface_with_native_change_permission(self):
+        interface = self._unmanaged_consumer()
+        user = self._user()
+        self.assertFalse(user.has_perm("dcim.change_device"))
+        response = self._rescope(user)
+        self.assertEqual(response.status_code, 302, response.content)
+        self.assertFalse(VLAN.objects.filter(pk=self.source.pk).exists())
+        interface.refresh_from_db()
+        self.interface.refresh_from_db()
+        self.switchport.refresh_from_db()
+        for consumer in (interface, self.interface, self.switchport):
+            self.assertEqual(consumer.untagged_vlan_id, self.target.pk)
+            self.assertEqual(list(consumer.tagged_vlans.all()), [self.target])
+        self.assertEqual(NSOVLANState.objects.filter(vlan=self.target).count(), 2)
 
     def test_merge_without_native_delete_rolls_back(self):
         with self.assert_refused_whole():
