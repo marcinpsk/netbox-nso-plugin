@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from dcim.models import Device, Interface
 from django.contrib.auth import get_user_model
+from django.contrib.messages import get_messages
 from django.db import connection
 from django.urls import reverse
 from ipam.models import VLAN, VLANGroup
@@ -250,7 +251,10 @@ class TestSharedVlanRequests(AdapterCase):
         with connection.execute_wrapper(concurrent_attachment), self.assert_refused_whole():
             response = self._rescope(user, self.empty_group if move else self.target_group)
         self.assertTrue(attached)
-        self.assertEqual(response.status_code, 409)
+        self.assertRedirects(
+            response, reverse("dcim:device_nso", kwargs={"pk": self.device_a.pk}), fetch_redirect_response=False
+        )
+        self.assertTrue(list(get_messages(response.wsgi_request)))
         self._assert_original()
 
     def test_merge_refuses_a_new_unauthorized_attachment_with_conflict(self):

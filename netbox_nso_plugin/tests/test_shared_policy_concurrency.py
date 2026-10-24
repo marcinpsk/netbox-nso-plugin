@@ -4,6 +4,7 @@
 
 from dcim.models import Device
 from django.contrib.auth import get_user_model
+from django.contrib.messages import get_messages
 from django.db import connection
 from django.urls import reverse
 from netbox_routing.models import CustomPrefix, PrefixList, PrefixListEntry
@@ -100,7 +101,10 @@ class TestPolicyMembershipConflict(AdapterCase):
                 {"mode": "master"} if action == "classify" else {},
             )
         self.assertTrue(attached)
-        self.assertEqual(response.status_code, 409)
+        self.assertRedirects(
+            response, reverse("dcim:device_nso", kwargs={"pk": self.second.pk}), fetch_redirect_response=False
+        )
+        self.assertTrue(list(get_messages(response.wsgi_request)))
         self.assertEqual(self._snapshot(), before)
 
     def test_materialize_conflicts_with_a_late_permitted_management(self):

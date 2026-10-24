@@ -4,6 +4,7 @@
 
 from core.models import ObjectType
 from dcim.models import Interface
+from django.contrib.messages import get_messages
 from django.db import connection
 from django.urls import reverse
 from ipam.models import IPAddress, Prefix
@@ -112,7 +113,10 @@ class TestSharedAutoAssign(_SharedAllocationRequests, AdapterCase):
         with connection.execute_wrapper(move_at_endpoint_lock), self.assert_refused_whole():
             response = self._post(self._user(peer=True))
         self.assertTrue(changed)
-        self.assertEqual(response.status_code, 409)
+        self.assertRedirects(
+            response, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}), fetch_redirect_response=False
+        )
+        self.assertTrue(list(get_messages(response.wsgi_request)))
         self.assertEqual(prefix_inserts, [])
         self.assertFalse(IPAddress.objects.exists())
         self.assertEqual(set(Prefix.objects.values_list("pk", flat=True)), self.prefix_ids)
