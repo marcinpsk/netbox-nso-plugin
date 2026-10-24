@@ -8724,7 +8724,14 @@ class TestReviewRegressionPins(ViewTestBase):
 class TestNSOVLANRescopeView(ViewTestBase):
     """POST-level cover for the rescope refusals the acquisition can raise."""
 
-    def test_rescope_returns_conflict_for_attachment_during_acquisition(self):
+    def test_rescope_returns_conflict_for_ajax_attachment_during_acquisition(self):
+        self.assertRescopeConflict(ajax=True)
+
+    def test_rescope_redirects_with_a_message_for_form_attachment_during_acquisition(self):
+        self.assertRescopeConflict(ajax=False)
+
+    def assertRescopeConflict(self, *, ajax):
+        from django.contrib.messages import get_messages
         from django.db import connection
         from ipam.models import VLAN, VLANGroup
 
@@ -8769,9 +8776,17 @@ class TestNSOVLANRescopeView(ViewTestBase):
             response = self.client.post(
                 reverse("plugins:netbox_nso_plugin:vlan_rescope", kwargs={"pk": state.pk}),
                 {"group": target_group.pk},
+                **({"HTTP_X_REQUESTED_WITH": "XMLHttpRequest"} if ajax else {}),
             )
         self.assertTrue(attached)
-        self.assertEqual(response.status_code, 409)
+        if ajax:
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json()["status"], "error")
+        else:
+            self.assertRedirects(
+                response, reverse("dcim:device_nso", kwargs={"pk": self.device.pk}), fetch_redirect_response=False
+            )
+            self.assertTrue(list(get_messages(response.wsgi_request)))
         self.assertEqual(callbacks, [])
         self.assertEqual(FakeAdapter.calls, [])
         source_vlan.refresh_from_db()

@@ -714,7 +714,10 @@ class AuthorizedView(_PolicyEnforced, LoginRequiredMixin, View):
                     messages.error(request, exc.public_message)
                     return redirect(_device_nso_tab_url(exc.device_id))
         except SharedOperationConflict as exc:
-            return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+            if is_ajax or self.target.device is None:
+                return JsonResponse({"status": "error", "message": str(exc)}, status=409)
+            messages.error(request, str(exc))
+            return redirect(_device_nso_tab_url(self.target.device.pk))
         except PermissionsViolation as exc:
             # The operator scope rolled back every write of the request.
             if is_ajax:
