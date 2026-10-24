@@ -4,7 +4,7 @@ import logging
 
 from netbox.api.viewsets import NetBoxModelViewSet
 from rest_framework import status
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ParseError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.routers import APIRootView
@@ -39,6 +39,7 @@ from ..request_authorization import (
     IntegrationSync,
     OwnerRow,
     generic_policy,
+    is_valid_instance_id,
     permitted_instance,
 )
 from .serializers import (
@@ -226,6 +227,8 @@ class OnboardingCandidatesView(AuthorizedAPIView, APIView):
         from ..onboarding import build_onboarding_dashboard
 
         selected = request.query_params.get("instance")
+        if not is_valid_instance_id(selected):
+            raise ParseError("Invalid NSO instance identity")
         if selected:
             instance = NSOInstance.objects.restrict(request.user, "view").filter(adapter_instance_id=selected).first()
             if instance is None:

@@ -1921,7 +1921,7 @@ class NSOCategoryView(AuthorizedView):
                 "residue": bool(getattr(st, "residue_survivor", False)),
                 "residue_job": getattr(st, "residue_job_id", None),
                 "last_sync": st.last_sync_at.strftime("%Y-%m-%d %H:%M") if st.last_sync_at else None,
-                "native_gap": bool(accept_route) and _owned_native_gap(st),
+                "native_gap": bool(accept_route) and st.status != "deploying" and _owned_native_gap(st),
             }
             row["accept_url"] = (
                 reverse(accept_route, args=[st.pk])
@@ -6577,7 +6577,11 @@ def _owned_native_gap(state):
         native = state.isis_interface
         return native is not None and native.instance.process_tag != state.process_tag
     if isinstance(state, NSORedistributionState):
-        return state.redistribution_id is None
+        if state.redistribution_id is not None:
+            return False
+        from .redistribution_reconciler import _resolve_redist_destination
+
+        return _resolve_redist_destination(state.management.device, state.dest_protocol, state.dest_ref) is not None
     return False
 
 
