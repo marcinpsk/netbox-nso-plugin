@@ -916,10 +916,19 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
         from netbox_nso_plugin.models import NSOISISInterfaceState
 
         from ._outbox_case import without_commit_drain
+        from ._ownership_case import save_overlay_fixture
 
         management = self._make_mgmt()
         instance = ISISInstance.objects.create(device=self.device, process_tag="")
-        fields = {"circuit_type": "level-1-2", "network_type": "point-to-point", "metric": 10, "passive": False}
+        fields = {
+            "circuit_type": "level-1-2",
+            "network_type": "point-to-point",
+            "metric": 10,
+            "passive": False,
+            "bfd_enabled": True,
+            "frr_enabled": True,
+            "frr_protection": "node",
+        }
         native = ISISInterface.objects.create(
             interface=self.iface_ge0, address_family="ipv4", instance=instance, **fields
         )
@@ -933,7 +942,15 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
             **fields,
         )
         payload = {"interfaces": self._payload(self._entry(**fields))}
-        for field, drift in (("circuit_type", "level-2-only"), ("network_type", ""), ("metric", 20), ("passive", True)):
+        for field, drift in (
+            ("circuit_type", "level-2-only"),
+            ("network_type", ""),
+            ("metric", 20),
+            ("passive", True),
+            ("bfd_enabled", False),
+            ("frr_enabled", False),
+            ("frr_protection", "link"),
+        ):
             with self.subTest(field=field), without_commit_drain():
                 ISISInterface.objects.filter(pk=native.pk).update(**{**fields, field: drift})
                 NSOISISInterfaceState.objects.filter(pk=state.pk).update(status="accepted")
@@ -941,6 +958,14 @@ class TestReconcileIsisInterfaces(IntentPushDeliveryMixin, TestCase):
                 state.refresh_from_db()
                 self.assertEqual(state.status, "accepted")
         ISISInterface.objects.filter(pk=native.pk).update(**fields)
+        reconcile_isis(self.device, payload)
+        state.refresh_from_db()
+        self.assertEqual(state.status, "in_sync")
+        state.bfd_enabled = None
+        state.frr_enabled = None
+        state.frr_protection = ""
+        state.status = "accepted"
+        save_overlay_fixture(state, update_fields=("bfd_enabled", "frr_enabled", "frr_protection", "status"))
         reconcile_isis(self.device, payload)
         state.refresh_from_db()
         self.assertEqual(state.status, "in_sync")
