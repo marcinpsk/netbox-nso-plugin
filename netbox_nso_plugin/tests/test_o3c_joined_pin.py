@@ -412,7 +412,7 @@ class _O3CEnvironment:
             *(
                 path
                 for path in (_ADAPTER_ROOT / "nso_adapter").rglob("*")
-                if path.is_file() and "__pycache__" not in path.parts
+                if path.is_file() and path.suffix != ".pyc" and "__pycache__" not in path.parts
             ),
             *(_ADAPTER_ROOT / "alembic").rglob("*.py"),
             *(
@@ -1107,9 +1107,12 @@ class TestO3CRuntimeDigest(SimpleTestCase):
             bytecode = root / "nso_adapter/nso/__pycache__/collection_coverage.cpython-312.pyc"
             bytecode.parent.mkdir()
             bytecode.write_bytes(b"one")
+            legacy_bytecode = root / "nso_adapter/nso/collection_coverage.pyc"
+            legacy_bytecode.write_bytes(b"one")
             with patch(f"{__name__}._ADAPTER_ROOT", root):
                 original = _O3CEnvironment._runtime_digest()
                 bytecode.write_bytes(b"two")
+                legacy_bytecode.write_bytes(b"two")
                 assert _O3CEnvironment._runtime_digest() == original
                 manifest.write_text('{"marker": "covered"}', encoding="utf-8")
                 assert _O3CEnvironment._runtime_digest() != original
