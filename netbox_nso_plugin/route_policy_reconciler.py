@@ -1117,7 +1117,7 @@ def _mutation_plan(operations, planned_at):
 
 
 def _replay_operations(writer, operations):
-    from .renderer_writer import replay_creation_references
+    from .renderer_writer import _native_effect, replay_creation_references
 
     for operation, instance, update_fields, force_insert, references, field_name, related in operations.operations:
         if operation == "delete":
@@ -1127,7 +1127,8 @@ def _replay_operations(writer, operations):
             writer.m2m_add(instance, field_name, related)
             continue
         if operation == "display_m2m_add":
-            getattr(instance, field_name).add(*related)
+            with _native_effect("m2m", type(instance), instance, field_name, origin=_OBSERVED):
+                getattr(instance, field_name).add(*related)
             continue
         replay_creation_references(instance, references)
         writer.save(instance, update_fields=update_fields, force_insert=force_insert)

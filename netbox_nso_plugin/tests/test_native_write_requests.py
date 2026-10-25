@@ -661,6 +661,39 @@ class TestInterfaceIpPrefixRefresh(AdapterCase):
         self.assertEqual(self.child._depth, 1)
 
 
+class TestRoutePolicyDisplayProjection(AdapterCase):
+    """A category refresh links a matched community-list's members into match_community."""
+
+    def test_refresh_expands_the_matched_community_list(self):
+        from netbox_routing.models import RouteMapEntry
+
+        device, management = make_managed("nw-route-policy", 17191)
+        NSODeviceManagement.objects.filter(pk=management.pk).update(manage_routing=True, manage_route_policy=True)
+        FakeAdapter.documents = {
+            "/route-policy": {
+                "community_lists": [
+                    {
+                        "name": "CL-M",
+                        "entries": [
+                            {"action": "permit", "community": "65000:1"},
+                            {"action": "permit", "community": "65000:2"},
+                        ],
+                    }
+                ],
+                "route_maps": [
+                    {
+                        "name": "RM-M",
+                        "entries": [{"sequence": 10, "action": "permit", "match_community_lists": ["CL-M"]}],
+                    }
+                ],
+            }
+        }
+        admin = User.objects.create_superuser(username=f"nw-rp-admin-{uuid4().hex[:6]}")
+        _refresh(self, admin, device, "route_policy")
+        entry = RouteMapEntry.objects.get(route_map__name="RM-M")
+        self.assertEqual({str(row.community) for row in entry.match_community.all()}, {"65000:1", "65000:2"})
+
+
 class TestBulkAllocationFailures(AdapterCase):
     """A failed allocation rolls back its interface and the remaining batch continues."""
 
@@ -709,7 +742,8 @@ class TestBulkAllocationFailures(AdapterCase):
         self.assertFalse(NSOInterfaceIPState.objects.filter(interface=rejected).exists())
         text = " ".join(str(message) for message in get_messages(response.wsgi_request))
         self.assertIn(rejected.name, text)
-        expected = "Provisioned 2 interface(s)" if database_failure else "Auto-assigned 4 IP address(es)"
+        link_role = route == "device_provision_link_role"
+        expected = "Provisioned 2 interface(s)" if link_role else "Auto-assigned 4 IP address(es)"
         self.assertIn(expected, text)
         self.assertNotIn("private allocation failure", text)
         self.assertNotIn("division by zero", text)
@@ -735,6 +769,13 @@ class TestBulkAllocationFailures(AdapterCase):
     def test_link_role_provisioning_continues_after_an_allocation_failure(self):
         self._assign_link_role()
         self._post_with_rejected_address("device_provision_link_role", database_failure=True)
+
+    def test_auto_assignment_continues_after_a_database_failure(self):
+        self._post_with_rejected_address("device_auto_assign_ip", database_failure=True)
+
+    def test_link_role_provisioning_continues_after_a_validation_failure(self):
+        self._assign_link_role()
+        self._post_with_rejected_address("device_provision_link_role")
 
     def _assert_comma_selection(self, route):
         from ipam.models import IPAddress
