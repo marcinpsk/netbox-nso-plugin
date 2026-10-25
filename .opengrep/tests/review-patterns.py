@@ -3166,3 +3166,23 @@ def bulk_allocation_with_failure_isolation(interfaces):
                 provision_link_role(interface)
         except (ValidationError, DatabaseError, ObjectDoesNotExist):
             report_failure(interface)
+
+
+def qualified_bulk_allocation_without_failure_isolation(interfaces):
+    for interface in interfaces:
+        # ruleid: nso-bulk-allocation-failure-isolation
+        allocations.auto_assign_ip(interface)
+        # ruleid: nso-bulk-allocation-failure-isolation
+        roles.provision_link_role(interface)
+
+
+def qualified_bulk_allocation_with_failure_isolation(interfaces):
+    for interface in interfaces:
+        try:
+            with db.transaction.atomic():
+                # ok: nso-bulk-allocation-failure-isolation
+                allocations.auto_assign_ip(interface)
+                # ok: nso-bulk-allocation-failure-isolation
+                roles.provision_link_role(interface)
+        except (ValidationError, DatabaseError, ObjectDoesNotExist):
+            report_failure(interface)

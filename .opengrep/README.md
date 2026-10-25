@@ -120,7 +120,8 @@ validators in other modules. Behavioral tests cover onboarding and both bulk act
 
 The `nso-bulk-allocation-failure-isolation` rule requires direct bulk allocation
 and link-role calls in UI views to use a savepoint with the known allocation
-failure handler. The rule recognizes the literal call names, context manager,
-and exception tuple. It does not follow aliases or prove loop continuation.
+failure handler. The rule recognizes bare and module-qualified call names,
+an `atomic()` context, and the literal exception tuple. It does not follow
+renamed functions, validate the context receiver, or prove loop continuation.
 Real request tests verify rollback, continuation, public warnings, and whole-request
 permission refusal. Unexpected protocol errors still propagate.

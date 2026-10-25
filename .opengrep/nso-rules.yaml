@@ -881,10 +881,12 @@ rules:
     patterns:
       - pattern-either:
           - pattern: auto_assign_ip($INTERFACE)
+          - pattern: $MODULE.auto_assign_ip($INTERFACE)
           - pattern: provision_link_role($INTERFACE)
+          - pattern: $MODULE.provision_link_role($INTERFACE)
       - pattern-not-inside: |
           try:
-              with transaction.atomic():
+              with $TRANSACTION.atomic():
                   ...
           except (ValidationError, DatabaseError, ObjectDoesNotExist):
               ...
