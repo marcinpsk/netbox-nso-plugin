@@ -45,7 +45,7 @@ def _adapter_commit_from_workflow() -> str:
     return match.group(1)
 
 
-_ADAPTER_RUNTIME_DIGEST = "20018b7611065ed0106126ae756698d803f7fa0e1f2760218cfdb690b345bce8"
+_ADAPTER_RUNTIME_DIGEST = "f2cc6c49402848a04b56364a439d69653555559d9caae0c754f4f43b75d84df4"
 _ADAPTER_ROOT = Path(
     os.environ.get("NSO_JOINED_ADAPTER_ROOT", Path(__file__).resolve().parents[2].parent / ".o3c-adapter")
 )
@@ -408,7 +408,12 @@ class _O3CEnvironment:
     @staticmethod
     def _runtime_digest() -> str:
         files = [
-            *(_ADAPTER_ROOT / "nso_adapter").rglob("*.py"),
+            # Every package file: the runtime also reads data files such as collection_manifest.json.
+            *(
+                path
+                for path in (_ADAPTER_ROOT / "nso_adapter").rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts
+            ),
             *(_ADAPTER_ROOT / "alembic").rglob("*.py"),
             *(
                 _ADAPTER_ROOT / name
@@ -1087,6 +1092,27 @@ class TestO3CJoinedPinUvVersion(SimpleTestCase):
         assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"setup-uv must pin an exact uv version, got {version!r}"
         # uv rejects --system-certs before 0.11.0.
         assert tuple(int(part) for part in version.split(".")) >= (0, 11, 0)
+
+
+class TestO3CRuntimeDigest(SimpleTestCase):
+    def test_the_digest_covers_package_data_files_and_ignores_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("scripts/docker-entrypoint.sh", "alembic.ini", "pyproject.toml", "uv.lock", "alembic/env.py"):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(name, encoding="utf-8")
+            manifest = root / "nso_adapter/nso/collection_manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"marker": "covered-collections"}', encoding="utf-8")
+            bytecode = root / "nso_adapter/nso/__pycache__/collection_coverage.cpython-312.pyc"
+            bytecode.parent.mkdir()
+            bytecode.write_bytes(b"one")
+            with patch(f"{__name__}._ADAPTER_ROOT", root):
+                original = _O3CEnvironment._runtime_digest()
+                bytecode.write_bytes(b"two")
+                assert _O3CEnvironment._runtime_digest() == original
+                manifest.write_text('{"marker": "covered"}', encoding="utf-8")
+                assert _O3CEnvironment._runtime_digest() != original
 
 
 class TestO3CEnvironmentFailFast(SimpleTestCase):
