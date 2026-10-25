@@ -1202,7 +1202,7 @@ class TestRealBodyGateSweep(TestCase):
                 elif fetcher == "get_l2_services":
                     doc = _l2_payload(("gate-sweep-l2",))
                 elif fetcher == "get_route_policy":
-                    doc["prefix_lists"] = [redistribution_read_payload({"name": "GATE-SWEEP-PREFIX", "entries": []})]
+                    doc["prefix_lists"] = [{"name": "GATE-SWEEP-PREFIX", "family": 4, "entries": []}]
                 if fetcher != "get_state" and read_state is not None:
                     doc["read_state"] = read_state
                 stack.enter_context(patch(f"netbox_nso_plugin.adapter_client.{fetcher}", return_value=doc))
